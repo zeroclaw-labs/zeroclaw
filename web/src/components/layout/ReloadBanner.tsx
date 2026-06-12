@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useLocation } from 'react-router-dom';
-import { AlertTriangle } from 'lucide-react';
+import { AlertTriangle, X } from 'lucide-react';
 import { getDrift, getReloadStatus, type DriftEntry } from '@/lib/api';
 import ReloadDaemonButton from '@/components/sections/ReloadDaemonButton';
 
@@ -26,6 +26,10 @@ interface BannerState {
 export default function ReloadBanner() {
   const [state, setState] = useState<BannerState | null>(null);
   const [pollKey, setPollKey] = useState(0);
+  // Signature of the banner content the user last dismissed. The banner
+  // re-appears when the underlying signal changes (new drift paths, or
+  // pending flips back on) because the recomputed signature won't match.
+  const [dismissedSig, setDismissedSig] = useState<string | null>(null);
   const location = useLocation();
 
   useEffect(() => {
@@ -83,6 +87,16 @@ export default function ReloadBanner() {
     );
   }
 
+  // Content signature for the warning banner. Dismissal is keyed to this so
+  // a fresh change (different pending/drift state) surfaces the banner again.
+  const sig = `${pendingReload ? 1 : 0}|${drifted
+    .map((d) => d.path)
+    .sort()
+    .join(',')}`;
+  if (dismissedSig === sig) {
+    return null;
+  }
+
   return (
     <div
       className="px-4 py-3 border-b flex items-center gap-3"
@@ -131,6 +145,16 @@ export default function ReloadBanner() {
         )}
       </div>
       <ReloadDaemonButton onReloaded={() => setPollKey((k) => k + 1)} />
+      <button
+        type="button"
+        onClick={() => setDismissedSig(sig)}
+        aria-label="Dismiss"
+        title="Dismiss"
+        className="flex-shrink-0 p-1 rounded transition-colors hover:opacity-80"
+        style={{ color: 'var(--pc-text-muted)' }}
+      >
+        <X className="h-4 w-4" />
+      </button>
     </div>
   );
 }

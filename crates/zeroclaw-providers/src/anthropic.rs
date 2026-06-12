@@ -25,7 +25,7 @@ const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90)
 use crate::stream_guard::AbortOnDrop;
 
 pub struct AnthropicModelProvider {
-    /// `[model_providers.anthropic.<alias>]` config-key alias.
+    /// `[providers.models.anthropic.<alias>]` config-key alias.
     alias: String,
     credential: Option<String>,
     base_url: String,

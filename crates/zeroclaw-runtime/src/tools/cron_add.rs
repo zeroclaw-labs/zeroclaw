@@ -166,7 +166,7 @@ impl Tool for CronAddTool {
          For relative one-shot reminders such as 'in 10 minutes' or 'after 2 hours', \
          use schedule={\"kind\":\"after\",\"after_seconds\":...}; the runtime resolves it \
          with the live clock when the tool executes. \
-         To deliver output to a channel (Discord, Telegram, Slack, Mattermost, Matrix, QQ, Webhook), set \
+         To deliver output to a configured channel, set \
          delivery={\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id_or_chat_id>\"}. \
          For webhook deliveries that must thread through the originating conversation, also set \
          delivery.thread_id=\"<reply_target>\". \
@@ -252,7 +252,7 @@ impl Tool for CronAddTool {
                 "allowed_tools": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Optional allowlist of tool names for agent jobs. When omitted, all tools remain available."
+                    "description": "Optional allowlist of tool names for agent jobs. When omitted, cron-launched agent runs keep non-scheduler tools available but exclude scheduler mutation tools such as cron_add, cron_update, cron_remove, cron_run, and schedule. Include those names explicitly to opt back in."
                 },
                 "delivery": {
                     "type": "object",
@@ -265,7 +265,7 @@ impl Tool for CronAddTool {
                         },
                         "channel": {
                             "type": "string",
-                            "enum": ["telegram", "discord", "slack", "mattermost", "matrix", "qq", "webhook", "lark", "feishu"],
+                            "enum": cron::CRON_DELIVERY_SCHEMA_CHANNELS,
                             "description": "Channel type to deliver output to"
                         },
                         "to": {
@@ -1129,18 +1129,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delivery_schema_includes_matrix_channel() {
+    async fn allowed_tools_schema_documents_scheduler_mutation_default() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
         let tool = CronAddTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
 
-        let values =
-            tool.parameters_schema()["properties"]["delivery"]["properties"]["channel"]["enum"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
+        let schema = tool.parameters_schema();
+        let description = schema["properties"]["allowed_tools"]["description"]
+            .as_str()
+            .unwrap_or_default();
 
-        assert!(values.iter().any(|value| value == "matrix"));
+        assert!(description.contains("exclude scheduler mutation tools"));
+        assert!(description.contains("cron_add"));
+        assert!(description.contains("opt back in"));
+    }
+
+    #[tokio::test]
+    async fn delivery_schema_includes_supported_channels() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        let schema = tool.parameters_schema();
+        let values: Vec<&str> = schema["properties"]["delivery"]["properties"]["channel"]["enum"]
+            .as_array()
+            .expect("delivery.channel must have an enum")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect();
+
+        assert_eq!(values.as_slice(), cron::CRON_DELIVERY_SCHEMA_CHANNELS);
+        assert!(values.contains(&"dingtalk"));
     }
 
     #[tokio::test]

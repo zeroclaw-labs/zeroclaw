@@ -10,6 +10,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use zeroclaw_config::schema::{ChannelAliasInfo, Config};
+use zeroclaw_memory::MemoryEntry;
+
+const MEMORY_API_CONTENT_MAX_CHARS: usize = 4096;
 
 // ── Bearer token auth extractor ─────────────────────────────────
 
@@ -952,7 +955,10 @@ pub async fn handle_api_memory_list(
                         .collect(),
                     None => entries,
                 };
-                Json(serde_json::json!({"entries": entries})).into_response()
+                Json(serde_json::json!({
+                    "entries": sanitize_memory_entries_for_api(entries)
+                }))
+                .into_response()
             }
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -970,7 +976,10 @@ pub async fn handle_api_memory_list(
         });
 
         match mem.list(category.as_ref(), None).await {
-            Ok(entries) => Json(serde_json::json!({"entries": entries})).into_response(),
+            Ok(entries) => Json(serde_json::json!({
+                "entries": sanitize_memory_entries_for_api(entries)
+            }))
+            .into_response(),
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Memory list failed: {e}")})),
@@ -978,6 +987,32 @@ pub async fn handle_api_memory_list(
                 .into_response(),
         }
     }
+}
+
+fn sanitize_memory_entries_for_api(entries: Vec<MemoryEntry>) -> Vec<MemoryEntry> {
+    entries
+        .into_iter()
+        .map(|mut entry| {
+            entry.content = truncate_with_ellipsis_total_chars(entry.content);
+            entry
+        })
+        .collect()
+}
+
+fn truncate_with_ellipsis_total_chars(mut s: String) -> String {
+    if s.char_indices().nth(MEMORY_API_CONTENT_MAX_CHARS).is_none() {
+        return s;
+    }
+
+    let keep_chars = MEMORY_API_CONTENT_MAX_CHARS - 3;
+    let cut_idx = s
+        .char_indices()
+        .nth(keep_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(s.len());
+    s.truncate(cut_idx);
+    s.push_str("...");
+    s
 }
 
 /// POST /api/memory — store a memory entry
@@ -1118,7 +1153,27 @@ pub async fn handle_api_cli_tools(
         return e.into_response();
     }
 
-    let tools = zeroclaw_tools::cli_discovery::discover_cli_tools(&[], &[]);
+    // `discover_cli_tools` spawns child processes and blocks; keep it off the
+    // async executor so a slow PATH scan can't stall other gateway requests.
+    let tools = match tokio::task::spawn_blocking(|| {
+        zeroclaw_tools::cli_discovery::discover_cli_tools(&[], &[])
+    })
+    .await
+    {
+        Ok(tools) => tools,
+        Err(e) => {
+            // The blocking task panicked; degrade to an empty list rather
+            // than failing the request, but record why it was empty.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "cli-tools discovery task failed; returning empty list"
+            );
+            Vec::new()
+        }
+    };
 
     Json(serde_json::json!({"cli_tools": tools})).into_response()
 }
@@ -1871,7 +1926,10 @@ mod tests {
     use zeroclaw_providers::ModelProvider;
     use zeroclaw_runtime::security::pairing::PairingGuard;
 
-    struct MockMemory;
+    #[derive(Default)]
+    struct MockMemory {
+        entries: Vec<MemoryEntry>,
+    }
 
     #[async_trait]
     impl Memory for MockMemory {
@@ -1897,7 +1955,7 @@ mod tests {
             _since: Option<&str>,
             _until: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
-            Ok(Vec::new())
+            Ok(self.entries.clone())
         }
 
         async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
@@ -1909,7 +1967,7 @@ mod tests {
             _category: Option<&MemoryCategory>,
             _session_id: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
-            Ok(Vec::new())
+            Ok(self.entries.clone())
         }
 
         async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
@@ -1921,7 +1979,7 @@ mod tests {
         }
 
         async fn count(&self) -> anyhow::Result<usize> {
-            Ok(0)
+            Ok(self.entries.len())
         }
 
         async fn health_check(&self) -> bool {
@@ -2021,7 +2079,14 @@ mod tests {
             model_provider: Arc::new(MockModelProvider),
             model: "test-model".into(),
             temperature: None,
-            mem: Arc::new(MockMemory),
+            mem: Arc::new(MockMemory::default()),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(MockMemory::default()),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             auto_save: false,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -2068,6 +2133,16 @@ mod tests {
         }
     }
 
+    fn test_state_with_memory(
+        config: zeroclaw_config::schema::Config,
+        entries: Vec<MemoryEntry>,
+    ) -> AppState {
+        AppState {
+            mem: Arc::new(MockMemory { entries }),
+            ..test_state(config)
+        }
+    }
+
     async fn response_json(response: axum::response::Response) -> serde_json::Value {
         let body = response
             .into_body()
@@ -2076,6 +2151,104 @@ mod tests {
             .expect("response body")
             .to_bytes();
         serde_json::from_slice(&body).expect("valid json response")
+    }
+
+    fn memory_entry_with_content(content: String) -> MemoryEntry {
+        MemoryEntry {
+            id: "entry-1".into(),
+            key: "huge-memory".into(),
+            content,
+            category: MemoryCategory::Conversation,
+            timestamp: "2026-04-06T00:00:00Z".into(),
+            session_id: None,
+            score: None,
+            namespace: "default".into(),
+            importance: Some(0.5),
+            superseded_by: None,
+            agent_alias: None,
+            agent_id: None,
+        }
+    }
+
+    fn memory_content_from_response(json: &serde_json::Value) -> &str {
+        json["entries"][0]["content"]
+            .as_str()
+            .expect("string content")
+    }
+
+    #[test]
+    fn truncate_memory_api_content_caps_total_chars_with_ellipsis() {
+        let exact = "x".repeat(MEMORY_API_CONTENT_MAX_CHARS);
+        assert_eq!(truncate_with_ellipsis_total_chars(exact.clone()), exact);
+
+        let short = "short memory".to_string();
+        assert_eq!(truncate_with_ellipsis_total_chars(short.clone()), short);
+
+        let over = "火".repeat(MEMORY_API_CONTENT_MAX_CHARS + 1);
+        let truncated = truncate_with_ellipsis_total_chars(over.clone());
+        assert_eq!(truncated.chars().count(), MEMORY_API_CONTENT_MAX_CHARS);
+        assert!(truncated.ends_with("..."));
+        assert_ne!(truncated, over);
+    }
+
+    #[tokio::test]
+    async fn handle_api_memory_list_truncates_oversized_content() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        let huge = "x".repeat(MEMORY_API_CONTENT_MAX_CHARS + 128);
+        let state = test_state_with_memory(config, vec![memory_entry_with_content(huge.clone())]);
+
+        let response = handle_api_memory_list(
+            State(state),
+            HeaderMap::new(),
+            Query(MemoryQuery {
+                query: None,
+                category: None,
+                since: None,
+                until: None,
+                agent: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        let json = response_json(response).await;
+        let content = memory_content_from_response(&json);
+
+        assert_eq!(content.chars().count(), MEMORY_API_CONTENT_MAX_CHARS);
+        assert!(content.ends_with("..."));
+        assert_eq!(json["entries"][0]["key"], "huge-memory");
+        assert_eq!(json["entries"][0]["category"], "conversation");
+        assert_ne!(content, huge);
+    }
+
+    #[tokio::test]
+    async fn handle_api_memory_search_truncates_oversized_content_after_filtering() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        let huge = "火".repeat(MEMORY_API_CONTENT_MAX_CHARS + 128);
+        let state = test_state_with_memory(config, vec![memory_entry_with_content(huge.clone())]);
+
+        let response = handle_api_memory_list(
+            State(state),
+            HeaderMap::new(),
+            Query(MemoryQuery {
+                query: Some("huge".into()),
+                category: Some("conversation".into()),
+                since: None,
+                until: None,
+                agent: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        let json = response_json(response).await;
+        let content = memory_content_from_response(&json);
+
+        assert_eq!(content.chars().count(), MEMORY_API_CONTENT_MAX_CHARS);
+        assert!(content.ends_with("..."));
+        assert_ne!(content, huge);
     }
 
     #[test]
@@ -3251,5 +3424,319 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ── Token rotation / device revocation security tests ────────────────────
+    //
+    // GHSA-f385-f6h2-3gqj follow-up (#6984): `POST /api/devices/{id}/token/rotate`
+    // and `DELETE /api/devices/{id}` must both invalidate the bearer token
+    // associated with the device, not just rotate a code or delete the row.
+
+    use crate::api_pairing::{
+        DeviceInfo, DeviceRegistry, revoke_device, rotate_token as rotate_device_token,
+        submit_pairing_enhanced,
+    };
+    use chrono::Utc;
+
+    async fn paired_state_with_device(tmp: &tempfile::TempDir) -> (AppState, String, String) {
+        let data_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: data_dir.clone(),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+
+        let pairing = Arc::new(PairingGuard::new(true, &[]));
+        let code = pairing.pairing_code().unwrap();
+        let token = pairing.try_pair(&code, "test").await.unwrap().unwrap();
+        let token_hash = PairingGuard::token_hash(&token);
+
+        let registry = Arc::new(DeviceRegistry::new(&data_dir));
+        let device_id = "dev-1".to_string();
+        registry.register(
+            token_hash,
+            DeviceInfo {
+                id: device_id.clone(),
+                name: None,
+                device_type: None,
+                paired_at: Utc::now(),
+                last_seen: Utc::now(),
+                ip_address: None,
+                capabilities: None,
+            },
+        );
+
+        let mut state = test_state(config);
+        state.pairing = pairing;
+        state.device_registry = Some(registry);
+        (state, token, device_id)
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        h
+    }
+
+    /// Regression: `POST /api/devices/{id}/token/rotate` MUST invalidate the
+    /// old bearer token. The pre-fix handler only issued a new pairing code
+    /// and left the leaked token authenticating (GHSA-f385-f6h2-3gqj
+    /// incident-response gap).
+    #[tokio::test]
+    async fn rotate_token_invalidates_old_bearer_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (state, old_token, device_id) = paired_state_with_device(&tmp).await;
+        assert!(state.pairing.is_authenticated(&old_token));
+
+        let response = rotate_device_token(
+            State(state.clone()),
+            bearer_headers(&old_token),
+            Path(device_id.clone()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert!(
+            !state.pairing.is_authenticated(&old_token),
+            "old bearer token must not authenticate after rotate"
+        );
+
+        let json = response_json(response).await;
+        assert_eq!(json["device_id"], device_id);
+        assert!(json["pairing_code"].is_string());
+    }
+
+    /// Enforcement: after rotate, the on-disk `gateway.paired_tokens` field
+    /// must not still contain the revoked token, so a daemon restart cannot
+    /// resurrect it.
+    #[tokio::test]
+    async fn rotate_token_persists_revocation_to_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (state, old_token, device_id) = paired_state_with_device(&tmp).await;
+        let old_hash = PairingGuard::token_hash(&old_token);
+
+        let response = rotate_device_token(
+            State(state.clone()),
+            bearer_headers(&old_token),
+            Path(device_id),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let persisted = state.config.read().gateway.paired_tokens.clone();
+        assert!(
+            !persisted.contains(&old_hash),
+            "revoked token hash must not remain in gateway.paired_tokens"
+        );
+    }
+
+    /// Regression: `POST /api/pair` MUST persist the newly issued token to
+    /// `gateway.paired_tokens` before reporting success. The pre-fix handler
+    /// registered the device and returned "Pairing successful" but left the
+    /// token only in memory, so a restart after rotate/re-pair silently
+    /// dropped the replacement credential (GHSA-f385-f6h2-3gqj §5).
+    #[tokio::test]
+    async fn submit_pairing_enhanced_persists_new_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (state, _old_token, _device_id) = paired_state_with_device(&tmp).await;
+
+        let code = state
+            .pairing
+            .generate_new_pairing_code()
+            .expect("require_pairing was enabled");
+
+        let response = submit_pairing_enhanced(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(serde_json::json!({ "code": code, "device_name": "repaired" })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let json = response_json(response).await;
+        assert_eq!(json["persisted"], true);
+        let new_token = json["token"].as_str().expect("token in response");
+        let new_hash = PairingGuard::token_hash(new_token);
+        assert!(
+            state
+                .config
+                .read()
+                .gateway
+                .paired_tokens
+                .contains(&new_hash),
+            "newly paired token hash must be persisted to gateway.paired_tokens"
+        );
+    }
+
+    /// Enforcement: `DELETE /api/devices/{id}` must also invalidate the
+    /// device's bearer token, not just the SQLite row.
+    #[tokio::test]
+    async fn revoke_device_invalidates_bearer_token() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (state, old_token, device_id) = paired_state_with_device(&tmp).await;
+
+        let response = revoke_device(
+            State(state.clone()),
+            bearer_headers(&old_token),
+            Path(device_id),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert!(
+            !state.pairing.is_authenticated(&old_token),
+            "bearer token must not authenticate after device delete"
+        );
+        let old_hash = PairingGuard::token_hash(&old_token);
+        assert!(
+            !state
+                .config
+                .read()
+                .gateway
+                .paired_tokens
+                .contains(&old_hash),
+            "deleted device's token must be dropped from persisted paired_tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_unknown_device_returns_not_found() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (state, token, _) = paired_state_with_device(&tmp).await;
+
+        let response = rotate_device_token(
+            State(state.clone()),
+            bearer_headers(&token),
+            Path("does-not-exist".into()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(
+            state.pairing.is_authenticated(&token),
+            "unknown-device rotate must not touch existing tokens"
+        );
+    }
+
+    /// Enforcement: when a pairing code is already pending, rotate still
+    /// revokes the bearer token (that is the load-bearing security effect)
+    /// but does not issue a new code; the pending code from the other flow
+    /// is preserved. The check + write must be atomic — see
+    /// `concurrent_rotates_do_not_both_issue_a_pairing_code` below.
+    #[tokio::test]
+    async fn rotate_with_pending_code_revokes_but_returns_null_code() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (state, token, device_id) = paired_state_with_device(&tmp).await;
+
+        let pending_code = state
+            .pairing
+            .generate_new_pairing_code()
+            .expect("require_pairing was enabled");
+
+        let response = rotate_device_token(
+            State(state.clone()),
+            bearer_headers(&token),
+            Path(device_id.clone()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert!(
+            !state.pairing.is_authenticated(&token),
+            "old bearer token must be revoked even when a pairing code is pending"
+        );
+        assert_eq!(
+            state.pairing.pairing_code().as_deref(),
+            Some(pending_code.as_str()),
+            "pending pairing code must survive rotate",
+        );
+
+        let json = response_json(response).await;
+        assert!(json["pairing_code"].is_null());
+        assert_eq!(json["device_id"], device_id);
+    }
+
+    /// Enforcement: two rotates that race must not both succeed in issuing
+    /// a pairing code. The first one wins the slot; the second observes the
+    /// occupied slot atomically and returns `pairing_code: null`. Both
+    /// rotates revoke the bearer token they target, because revocation is
+    /// the load-bearing action and must not depend on the slot.
+    #[tokio::test]
+    async fn concurrent_rotates_do_not_both_issue_a_pairing_code() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: data_dir.clone(),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+
+        let pairing = Arc::new(PairingGuard::new(true, &[]));
+        let code = pairing.pairing_code().unwrap();
+        let admin_token = pairing.try_pair(&code, "admin").await.unwrap().unwrap();
+
+        let registry = Arc::new(DeviceRegistry::new(&data_dir));
+        for id in ["dev-a", "dev-b"] {
+            // Each device needs its own paired token so revoke has a hash.
+            let code = pairing
+                .generate_new_pairing_code()
+                .expect("pairing enabled");
+            let tok = pairing.try_pair(&code, id).await.unwrap().unwrap();
+            registry.register(
+                PairingGuard::token_hash(&tok),
+                DeviceInfo {
+                    id: id.to_string(),
+                    name: None,
+                    device_type: None,
+                    paired_at: Utc::now(),
+                    last_seen: Utc::now(),
+                    ip_address: None,
+                    capabilities: None,
+                },
+            );
+        }
+
+        let mut state = test_state(config);
+        state.pairing = pairing;
+        state.device_registry = Some(registry);
+
+        let s1 = state.clone();
+        let s2 = state.clone();
+        let h1 = bearer_headers(&admin_token);
+        let h2 = bearer_headers(&admin_token);
+        let (r1, r2) = tokio::join!(
+            async move {
+                rotate_device_token(State(s1), h1, Path("dev-a".into()))
+                    .await
+                    .into_response()
+            },
+            async move {
+                rotate_device_token(State(s2), h2, Path("dev-b".into()))
+                    .await
+                    .into_response()
+            },
+        );
+
+        assert_eq!(r1.status(), StatusCode::OK);
+        assert_eq!(r2.status(), StatusCode::OK);
+        let j1 = response_json(r1).await;
+        let j2 = response_json(r2).await;
+        let codes_issued = usize::from(j1["pairing_code"].is_string())
+            + usize::from(j2["pairing_code"].is_string());
+        assert_eq!(
+            codes_issued, 1,
+            "exactly one of two racing rotates must win the pairing slot, \
+             got {codes_issued} (j1={j1}, j2={j2})"
+        );
     }
 }

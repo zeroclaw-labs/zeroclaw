@@ -24,6 +24,8 @@ pub mod media_pipeline;
 pub mod mqtt;
 
 // Channel types imported directly from source crates (no shim files)
+#[cfg(feature = "channel-amqp")]
+pub use crate::amqp::AmqpChannel;
 #[cfg(feature = "channel-bluesky")]
 pub use crate::bluesky::BlueskyChannel;
 #[cfg(feature = "channel-clawdtalk")]
@@ -66,6 +68,8 @@ pub use crate::signal::SignalChannel;
 pub use crate::slack::SlackChannel;
 pub use crate::transcription;
 pub use crate::tts::{TtsManager, TtsProvider};
+#[cfg(feature = "channel-twitch")]
+pub use crate::twitch::TwitchChannel;
 #[cfg(feature = "channel-twitter")]
 pub use crate::twitter::TwitterChannel;
 #[cfg(feature = "channel-voice-call")]
@@ -111,6 +115,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
+
+use zeroclaw_api::memory_traits::MemoryStrategy;
 use zeroclaw_api::session_keys::sanitize_session_key;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
@@ -224,7 +230,6 @@ const MIN_CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 30;
 const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 300;
 /// Cap timeout scaling so large max_tool_iterations values do not create unbounded waits.
 const CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP: u64 = 4;
-const CHANNEL_PARALLELISM_PER_CHANNEL: usize = 4;
 const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
@@ -279,9 +284,8 @@ fn channel_message_timeout_budget_secs_with_cap(
 struct ChannelRouteSelection {
     model_provider: String,
     model: String,
-    /// Route-specific API key override. When set, this takes precedence over
-    /// the global `api_key` in [`ChannelRuntimeContext`] when creating the
-    /// model_provider for this route.
+    /// Route-specific API key override. When set, this credential is passed
+    /// directly to the requested provider instead of the alias entry's key.
     api_key: Option<String>,
 }
 
@@ -316,6 +320,21 @@ struct ChannelRuntimeDefaults {
     reliability: zeroclaw_config::schema::ReliabilityConfig,
 }
 
+#[derive(Debug, Clone)]
+struct ChannelRuntimeDefaultsSnapshot {
+    config: Arc<Config>,
+    defaults: ChannelRuntimeDefaults,
+    hot: bool,
+    generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ChannelRuntimeOverride {
+    config: Arc<Config>,
+    defaults: ChannelRuntimeDefaults,
+    generation: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ConfigFileStamp {
     modified: SystemTime,
@@ -335,6 +354,7 @@ struct InterruptOnNewMessageConfig {
     discord: bool,
     mattermost: bool,
     matrix: bool,
+    whatsapp: bool,
 }
 
 impl InterruptOnNewMessageConfig {
@@ -345,8 +365,40 @@ impl InterruptOnNewMessageConfig {
             "discord" => self.discord,
             "mattermost" => self.mattermost,
             "matrix" => self.matrix,
+            "whatsapp" => self.whatsapp,
             _ => false,
         }
+    }
+}
+
+fn interrupt_on_new_message_config(
+    channels: &zeroclaw_config::schema::ChannelsConfig,
+) -> InterruptOnNewMessageConfig {
+    InterruptOnNewMessageConfig {
+        telegram: channels
+            .telegram
+            .get("default")
+            .is_some_and(|tg| tg.interrupt_on_new_message),
+        slack: channels
+            .slack
+            .get("default")
+            .is_some_and(|sl| sl.interrupt_on_new_message),
+        discord: channels
+            .discord
+            .get("default")
+            .is_some_and(|dc| dc.interrupt_on_new_message),
+        mattermost: channels
+            .mattermost
+            .get("default")
+            .is_some_and(|mm| mm.interrupt_on_new_message),
+        matrix: channels
+            .matrix
+            .get("default")
+            .is_some_and(|mx| mx.interrupt_on_new_message),
+        whatsapp: channels
+            .whatsapp
+            .get("default")
+            .is_some_and(|wa| wa.interrupt_on_new_message),
     }
 }
 
@@ -361,17 +413,18 @@ struct ChannelCostTrackingState {
 struct ChannelRuntimeContext {
     channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
     model_provider: Arc<dyn ModelProvider>,
-    default_model_provider: Arc<String>,
+    model_provider_ref: Arc<String>,
     /// Alias of the agent that owns this runtime context. Stamped onto
     /// every per-message tracing span so descendant events inherit the
     /// attribution without each call site re-passing it.
     agent_alias: Arc<String>,
     /// Resolved aliased-agent config for the agent owning this
     /// runtime context. Per-channel agent dispatch (one agent per
-    /// channel.<type>.<alias>) is a follow-up.
+    /// channel.`<type>`.`<alias>`) is a follow-up.
     agent_cfg: Arc<zeroclaw_config::schema::AliasedAgentConfig>,
     prompt_config: Arc<zeroclaw_config::schema::Config>,
     memory: Arc<dyn Memory>,
+    memory_strategy: Arc<dyn MemoryStrategy>,
     tools_registry: Arc<Vec<Box<dyn Tool>>>,
     observer: Arc<dyn Observer>,
     system_prompt: Arc<String>,
@@ -384,8 +437,6 @@ struct ChannelRuntimeContext {
     pending_new_sessions: PendingNewSessionSet,
     provider_cache: ProviderCacheMap,
     route_overrides: RouteSelectionMap,
-    api_key: Option<String>,
-    api_url: Option<String>,
     reliability: Arc<zeroclaw_config::schema::ReliabilityConfig>,
     provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions,
     workspace_dir: Arc<PathBuf>,
@@ -429,6 +480,7 @@ struct ChannelRuntimeContext {
     /// `Tool receipts:` block sent after the main reply.
     show_receipts_in_response: bool,
     last_applied_config_stamp: Arc<Mutex<Option<ConfigFileStamp>>>,
+    runtime_defaults_override: Arc<Mutex<Option<Arc<ChannelRuntimeOverride>>>>,
 }
 
 #[derive(Clone)]
@@ -615,6 +667,58 @@ pub(crate) fn strip_tool_call_tags(message: &str) -> String {
         }
     }
 
+    // Does the tag structure run to the end of the message? A *real* truncated
+    // tool call is the model getting cut off, so the unterminated structure is
+    // the last thing in the message. If natural-language prose resumes after the
+    // tags, this is an inline *example* (the model is discussing tool calls), not
+    // a truncation — so we should keep it. Bias toward keeping: a little leaked
+    // XML beats eating the user's text.
+    fn tool_structure_runs_to_end(inner: &str) -> bool {
+        let mut rest = inner.trim_start();
+        while rest.starts_with('<') {
+            match rest.find('>') {
+                Some(gt) => rest = rest[gt + 1..].trim_start(),
+                None => return true,
+            }
+        }
+        let tail = rest.trim();
+        if tail.is_empty() {
+            return true;
+        }
+        !looks_like_prose(tail)
+    }
+
+    // Heuristic: does `text` read like resumed natural-language prose (as opposed
+    // to a cut-off parameter value)? True on an internal sentence boundary
+    // (". " / "! " / "? " + a letter) or a multi-word string that ends like a
+    // sentence. Deliberately lenient so ambiguous tails are kept, not dropped.
+    fn looks_like_prose(text: &str) -> bool {
+        let bytes = text.as_bytes();
+        for i in 0..bytes.len().saturating_sub(1) {
+            if matches!(bytes[i], b'.' | b'!' | b'?')
+                && matches!(bytes[i + 1], b' ' | b'\n' | b'\t')
+                && text[i + 1..]
+                    .trim_start()
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphabetic())
+            {
+                return true;
+            }
+        }
+        let trimmed = text.trim_end();
+        let ends_like_sentence = trimmed
+            .chars()
+            .last()
+            .is_some_and(|c| matches!(c, '.' | '!' | '?'))
+            && trimmed
+                .chars()
+                .rev()
+                .nth(1)
+                .is_some_and(|c| c.is_alphabetic());
+        ends_like_sentence && text.trim().contains(' ')
+    }
+
     let mut kept_segments = Vec::new();
     let mut remaining = message;
 
@@ -637,6 +741,26 @@ pub(crate) fn strip_tool_call_tags(message: &str) -> String {
         if let Some(consumed_end) = extract_first_json_end(after_open) {
             remaining = strip_leading_close_tags(&after_open[consumed_end..]);
             continue;
+        }
+
+        // Unterminated open tag with no parseable JSON body. Drop the broken
+        // tail ONLY when it looks like tool-call structure AND that structure
+        // runs to the end of the message — a real truncation where the model was
+        // cut off mid-call. If prose resumes after the structure, the model is
+        // showing an *example*, not making a call, so keep it verbatim (a little
+        // leaked XML beats eating the reply). Text merely mentioning a tag is
+        // likewise kept.
+        let inner = after_open.trim_start();
+        let inner_lower = inner.to_ascii_lowercase();
+        let looks_like_tool_structure = inner_lower.starts_with("<invoke")
+            || inner_lower.starts_with("<parameter")
+            || inner_lower.starts_with("<tool")
+            || inner_lower.starts_with("<function")
+            || inner.starts_with('{')
+            || inner.starts_with('[');
+        if looks_like_tool_structure && tool_structure_runs_to_end(inner) {
+            remaining = "";
+            break;
         }
 
         kept_segments.push(remaining[start..].to_string());
@@ -844,6 +968,61 @@ fn timestamp_channel_user_content(content: &str) -> String {
     format!("[{}] {}", now.format("%Y-%m-%d %H:%M:%S %Z"), content)
 }
 
+fn channel_history_content_for_user_turn(content: &str) -> String {
+    let (cleaned, image_refs) = zeroclaw_providers::multimodal::parse_image_markers(content);
+    if image_refs.is_empty() {
+        return content.to_string();
+    }
+
+    let mut cleaned = cleaned.trim().to_string();
+    while cleaned.contains("\n\n\n") {
+        cleaned = cleaned.replace("\n\n\n", "\n\n");
+    }
+
+    if cleaned.is_empty() {
+        "[Image attachment processed by vision model]".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn restore_current_user_turn_media_payload(
+    turns: &mut [ChatMessage],
+    history_content: &str,
+    full_content: &str,
+) {
+    if history_content == full_content {
+        return;
+    }
+
+    if let Some(turn) = turns
+        .iter_mut()
+        .rev()
+        .find(|turn| turn.role == "user" && turn.content == history_content)
+    {
+        turn.content = full_content.to_string();
+    }
+}
+
+fn strip_historical_image_payloads(turns: &mut Vec<ChatMessage>) {
+    if turns.len() <= 1 {
+        return;
+    }
+
+    let last_idx = turns.len() - 1;
+    for turn in &mut turns[..last_idx] {
+        if turn.content.contains("[IMAGE:") {
+            turn.content = channel_history_content_for_user_turn(&turn.content);
+        }
+    }
+
+    let current = turns.pop();
+    turns.retain(|turn| !turn.content.trim().is_empty());
+    if let Some(current) = current {
+        turns.push(current);
+    }
+}
+
 fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
     let mut normalized = Vec::with_capacity(turns.len());
     let mut expecting_user = true;
@@ -998,71 +1177,138 @@ fn canonical_model_provider_name(name: &str) -> Option<String> {
         .map(|model_provider| model_provider.name.to_string())
 }
 
-fn resolved_default_provider(config: &Config) -> String {
-    config
-        .providers
-        .models
-        .iter_entries()
-        .next()
-        .map(|(ty, alias, _)| format!("{ty}.{alias}"))
-        .unwrap_or_else(|| "openrouter".to_string())
+/// Outcome of resolving a `/models <arg>` request to a configured,
+/// alias-backed provider ref. The bare family path must never construct a
+/// provider that ignores the configured `[providers.models.<family>.<alias>]`
+/// key/URI — every accepted route resolves to a real alias entry.
+#[cfg_attr(test, derive(Debug))]
+enum ModelsCommandResolution {
+    /// A dotted `<family>.<alias>` ref backed by a configured entry.
+    Resolved(String),
+    /// The family is valid but has more than one configured alias; the user
+    /// must qualify which one. Carries the canonical family and its aliases.
+    Ambiguous {
+        family: String,
+        aliases: Vec<String>,
+    },
+    /// The family is valid but has no configured alias entry, so there is no
+    /// credentialed provider to switch to.
+    NoAlias(String),
+    /// The argument names no known provider family.
+    Unknown,
 }
 
-/// Resolve the default model for channel startup: the first configured
-/// `[providers.models.<type>.<alias>]` entry's `model` field. Hard-fails
-/// with an actionable error when nothing is configured. There is no
-/// global fallback provider — every callsite either resolves through an
-/// agent's `model_provider` or comes through `first_provider()`.
-fn resolved_default_model(config: &Config) -> anyhow::Result<String> {
-    for (_, _, entry) in config.providers.models.iter_entries() {
-        if let Some(m) = entry
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-        {
-            return Ok(m.to_string());
+/// Resolve a `/models <arg>` argument to a configured, alias-backed provider
+/// ref. Accepts either a dotted `<family>.<alias>` that resolves to a real
+/// `[providers.models.<family>.<alias>]` entry, or a bare family name that has
+/// exactly one configured alias. A bare family with several aliases is
+/// ambiguous; one with none has no credentialed provider. This keeps `/models`
+/// inside the v0.8 alias model rather than constructing a bare provider that
+/// silently ignores the configured key/URI.
+fn resolve_models_command(
+    config: &zeroclaw_config::schema::Config,
+    raw: &str,
+) -> ModelsCommandResolution {
+    let candidate = raw.trim();
+    if let Some((family, alias)) = candidate.split_once('.') {
+        return match config.providers.models.find(family, alias) {
+            Some(_) => ModelsCommandResolution::Resolved(format!("{family}.{alias}")),
+            None => ModelsCommandResolution::NoAlias(candidate.to_string()),
+        };
+    }
+
+    let Some(family) = canonical_model_provider_name(candidate) else {
+        return ModelsCommandResolution::Unknown;
+    };
+
+    let mut aliases: Vec<String> = config
+        .providers
+        .models
+        .aliases_of(&family)
+        .map(ToString::to_string)
+        .collect();
+    aliases.sort();
+    match aliases.len() {
+        0 => ModelsCommandResolution::NoAlias(family),
+        1 => ModelsCommandResolution::Resolved(format!("{family}.{}", aliases[0])),
+        _ => ModelsCommandResolution::Ambiguous { family, aliases },
+    }
+}
+
+fn resolve_provider_ref_for_runtime_switch(config: &Config, raw: &str) -> anyhow::Result<String> {
+    match resolve_models_command(config, raw) {
+        ModelsCommandResolution::Resolved(provider_ref) => Ok(provider_ref),
+        ModelsCommandResolution::Ambiguous { family, aliases } => {
+            let list = aliases
+                .iter()
+                .map(|alias| format!("{family}.{alias}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "model_provider `{family}` has multiple configured aliases; use one of: {list}"
+            )
+        }
+        ModelsCommandResolution::NoAlias(ref_or_family) => {
+            anyhow::bail!(
+                "model_provider `{ref_or_family}` does not resolve to a configured provider"
+            )
+        }
+        ModelsCommandResolution::Unknown => {
+            anyhow::bail!("unknown model_provider `{raw}`")
         }
     }
-    anyhow::bail!(
-        "no model configured: no [providers.models.<type>.<alias>] entry has a \
-         `model` field set. Configure at least one [providers.models.<type>.<alias>] \
-         model = \"...\", or define a [[model_routes]] hint, before starting channels.",
-    )
+}
+
+fn resolved_runtime_model_provider_ref(
+    config: &Config,
+    agent_alias: &str,
+) -> anyhow::Result<String> {
+    let agent = config
+        .agents
+        .get(agent_alias)
+        .with_context(|| format!("agents.{agent_alias} is not configured"))?;
+    let configured = agent.model_provider.trim();
+    if configured.is_empty() {
+        anyhow::bail!(
+            "agents.{agent_alias}.model_provider is empty; runtime reload requires a dotted `<type>.<alias>` provider reference"
+        );
+    }
+    let (model_provider, _) = model_provider_entry_for_ref(config, configured)?;
+    Ok(model_provider)
+}
+
+fn model_provider_entry_for_ref<'a>(
+    config: &'a Config,
+    model_provider: &str,
+) -> anyhow::Result<(String, &'a zeroclaw_config::schema::ModelProviderConfig)> {
+    let trimmed = model_provider.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("model_provider reference must not be empty");
+    }
+
+    let Some((provider_type, provider_alias)) = trimmed.split_once('.') else {
+        anyhow::bail!("model_provider `{trimmed}` must use `<type>.<alias>` form");
+    };
+    let Some(entry) = config.providers.models.find(provider_type, provider_alias) else {
+        anyhow::bail!("model_provider `{trimmed}` does not resolve to a configured provider");
+    };
+    Ok((trimmed.to_string(), entry))
 }
 
 /// Resolve runtime defaults from `config` against a specific dotted
 /// `model_provider` reference (`"<type>.<alias>"`) — the per-agent
-/// resolution path. Falls back to `iter_entries().next()` when
-/// the reference is empty or doesn't resolve, preserving the conservative
-/// legacy behavior so misconfigured callsites still get safe defaults.
+/// resolution path.
 fn runtime_defaults_from_config(
     config: &Config,
     model_provider: &str,
 ) -> anyhow::Result<ChannelRuntimeDefaults> {
-    let dotted = model_provider.split_once('.');
-    let entry = dotted
-        .and_then(|(type_key, alias_key)| config.providers.models.find(type_key, alias_key))
-        .or_else(|| {
-            config
-                .providers
-                .models
-                .iter_entries()
-                .next()
-                .map(|(_, _, e)| e)
-        });
-    // `default_model_provider` carries the dotted `<type>.<alias>` ref so
-    // it compares equal to `route.model_provider` entries (also dotted),
-    // letting `get_or_create_provider` short-circuit the cache when a
-    // route targets the same alias as the default.
-    let default_model_provider = if !model_provider.is_empty() {
-        model_provider.to_string()
-    } else {
-        resolved_default_provider(config)
-    };
+    let (default_model_provider, entry) = model_provider_entry_for_ref(config, model_provider)?;
     let model = entry
-        .and_then(|e| e.model.clone())
-        .or_else(|| resolved_default_model(config).ok())
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToString::to_string)
         .ok_or_else(|| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -1083,9 +1329,9 @@ fn runtime_defaults_from_config(
     Ok(ChannelRuntimeDefaults {
         default_model_provider,
         model,
-        temperature: entry.and_then(|e| e.temperature),
-        api_key: entry.and_then(|e| e.api_key.clone()),
-        api_url: entry.and_then(|e| e.uri.clone()),
+        temperature: entry.temperature,
+        api_key: entry.api_key.clone(),
+        api_url: entry.uri.clone(),
         reliability: config.reliability.clone(),
     })
 }
@@ -1097,14 +1343,33 @@ fn runtime_config_path(ctx: &ChannelRuntimeContext) -> Option<PathBuf> {
         .map(|dir| dir.join("config.toml"))
 }
 
-fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefaults {
-    ChannelRuntimeDefaults {
-        default_model_provider: ctx.default_model_provider.as_str().to_string(),
-        model: ctx.model.as_str().to_string(),
-        temperature: ctx.temperature,
-        api_key: ctx.api_key.clone(),
-        api_url: ctx.api_url.clone(),
-        reliability: (*ctx.reliability).clone(),
+fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefaultsSnapshot {
+    if let Some(runtime_override) = ctx
+        .runtime_defaults_override
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        return ChannelRuntimeDefaultsSnapshot {
+            config: Arc::clone(&runtime_override.config),
+            defaults: runtime_override.defaults.clone(),
+            hot: true,
+            generation: runtime_override.generation,
+        };
+    }
+
+    ChannelRuntimeDefaultsSnapshot {
+        config: Arc::clone(&ctx.prompt_config),
+        defaults: ChannelRuntimeDefaults {
+            default_model_provider: ctx.model_provider_ref.as_str().to_string(),
+            model: ctx.model.as_str().to_string(),
+            temperature: ctx.temperature,
+            api_key: None,
+            api_url: None,
+            reliability: (*ctx.reliability).clone(),
+        },
+        hot: false,
+        generation: 0,
     }
 }
 
@@ -1119,13 +1384,13 @@ async fn config_file_stamp(path: &Path) -> Option<ConfigFileStamp> {
 
 async fn load_runtime_config_and_defaults(
     path: &Path,
-    model_provider: &str,
+    agent_alias: &str,
 ) -> Result<(Config, ChannelRuntimeDefaults)> {
     let contents = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("Failed to read {}", path.display()))?;
-    let mut parsed: Config =
-        toml::from_str(&contents).with_context(|| format!("Failed to parse {}", path.display()))?;
+    let mut parsed: Config = zeroclaw_config::migration::migrate_to_current(&contents)
+        .with_context(|| format!("Failed to migrate {}", path.display()))?;
     parsed.config_path = path.to_path_buf();
 
     if let Some(zeroclaw_dir) = path.parent() {
@@ -1133,8 +1398,12 @@ async fn load_runtime_config_and_defaults(
             zeroclaw_runtime::security::SecretStore::new(zeroclaw_dir, parsed.secrets.encrypt);
         parsed.decrypt_secrets(&store)?;
     }
+    let applied = zeroclaw_config::env_overrides::apply_env_overrides(&mut parsed)?;
+    parsed.env_overridden_paths = applied.paths;
+    parsed.pre_override_snapshots = applied.snapshots;
 
-    let defaults = runtime_defaults_from_config(&parsed, model_provider)?;
+    let model_provider = resolved_runtime_model_provider_ref(&parsed, agent_alias)?;
+    let defaults = runtime_defaults_from_config(&parsed, &model_provider)?;
     Ok((parsed, defaults))
 }
 
@@ -1158,51 +1427,74 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     }
 
     let (next_config, next_defaults) =
-        load_runtime_config_and_defaults(&config_path, &ctx.agent_cfg.model_provider).await?;
+        load_runtime_config_and_defaults(&config_path, ctx.agent_alias.as_str()).await?;
+    let next_config = Arc::new(next_config);
     let next_options = zeroclaw_providers::options_for_provider_ref(
-        &next_config,
+        next_config.as_ref(),
         &next_defaults.default_model_provider,
         &ctx.provider_runtime_options,
     );
-    let next_default_model_provider = zeroclaw_providers::create_resilient_model_provider_from_ref(
-        &next_config,
+    let model_provider_instance = zeroclaw_providers::create_resilient_model_provider_from_ref(
+        next_config.as_ref(),
         &next_defaults.default_model_provider,
         next_defaults.api_key.as_deref(),
         next_defaults.api_url.as_deref(),
         &next_defaults.reliability,
         &next_options,
     )?;
-    let next_default_model_provider: Arc<dyn ModelProvider> =
-        Arc::from(next_default_model_provider);
+    let model_provider_instance: Arc<dyn ModelProvider> = Arc::from(model_provider_instance);
 
-    if let Err(err) = next_default_model_provider.warmup().await {
+    if let Err(err) = model_provider_instance.warmup().await {
         if zeroclaw_providers::reliable::is_non_retryable(&err) {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": next_defaults.default_model_provider, "model": next_defaults.model, "err": err.to_string()})), "Rejecting config reload: model not available (non-retryable)");
             return Ok(());
         }
-        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": next_defaults.default_model_provider, "err": err.to_string()})), "ModelProvider warmup failed after config reload (retryable, applying anyway)");
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(
+                    ::serde_json::json!({"model_provider": next_defaults.default_model_provider, "err": err.to_string()})
+                ),
+            "ModelProvider warmup failed after config reload (retryable, applying anyway)"
+        );
     }
 
     {
+        let mut override_guard = ctx
+            .runtime_defaults_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let next_generation = override_guard.as_ref().map_or(1, |runtime_override| {
+            runtime_override.generation.saturating_add(1)
+        });
+        let next_override = Arc::new(ChannelRuntimeOverride {
+            config: Arc::clone(&next_config),
+            defaults: next_defaults.clone(),
+            generation: next_generation,
+        });
+        let cache_key =
+            provider_cache_key(&next_defaults.default_model_provider, None, next_generation);
+
         let mut cache = ctx.provider_cache.lock().unwrap_or_else(|e| e.into_inner());
         cache.clear();
-        cache.insert(
-            next_defaults.default_model_provider.clone(),
-            Arc::clone(&next_default_model_provider),
-        );
+        cache.insert(cache_key, Arc::clone(&model_provider_instance));
+        *override_guard = Some(next_override);
     }
 
     *ctx.last_applied_config_stamp
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = Some(stamp);
 
-    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"path": config_path.display().to_string(), "model_provider": next_defaults.default_model_provider, "model": next_defaults.model, "temperature": next_defaults.temperature, "agent_model_provider": ctx.agent_cfg.model_provider})), "Applied updated channel runtime config from disk");
+    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"path": config_path.display().to_string(), "model_provider": next_defaults.default_model_provider, "model": next_defaults.model, "temperature": next_defaults.temperature, "agent_model_provider": next_defaults.default_model_provider})), "Applied updated channel runtime config from disk");
 
     Ok(())
 }
 
-fn default_route_selection(ctx: &ChannelRuntimeContext) -> ChannelRouteSelection {
-    let defaults = runtime_defaults_snapshot(ctx);
+fn default_route_selection_from_snapshot(
+    defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
+) -> ChannelRouteSelection {
+    let defaults = defaults_snapshot.defaults.clone();
     ChannelRouteSelection {
         model_provider: defaults.default_model_provider,
         model: defaults.model,
@@ -1210,17 +1502,26 @@ fn default_route_selection(ctx: &ChannelRuntimeContext) -> ChannelRouteSelection
     }
 }
 
-fn get_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str) -> ChannelRouteSelection {
+fn get_route_selection(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
+) -> ChannelRouteSelection {
     ctx.route_overrides
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(sender_key)
         .cloned()
-        .unwrap_or_else(|| default_route_selection(ctx))
+        .unwrap_or_else(|| default_route_selection_from_snapshot(defaults_snapshot))
 }
 
-fn set_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str, next: ChannelRouteSelection) {
-    let default_route = default_route_selection(ctx);
+fn set_route_selection(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    next: ChannelRouteSelection,
+    defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
+) {
+    let default_route = default_route_selection_from_snapshot(defaults_snapshot);
     let mut routes = ctx
         .route_overrides
         .lock()
@@ -1447,32 +1748,37 @@ fn strip_old_tool_context(ctx: &ChannelRuntimeContext, sender_key: &str, keep_tu
         return;
     };
 
-    // Walk backwards to find the boundary: count user messages to
-    // identify which turns are "recent" (protected from stripping).
+    // Walk backwards to find the oldest user message that still belongs to the
+    // most recent `keep_turns` exchanges. Everything before that boundary is
+    // old enough to strip. If the session has fewer than `keep_turns` user
+    // turns, preserve every message.
     let mut user_count = 0;
-    let mut protect_from = turns.len();
+    let mut strip_before = 0;
     for (i, turn) in turns.iter().enumerate().rev() {
         if turn.role == "user" {
             user_count += 1;
-            if user_count > keep_turns {
-                // Everything before this index is old enough to strip.
-                protect_from = i + 1; // protect from next message onward
+            if user_count == keep_turns {
+                strip_before = i;
                 break;
             }
         }
     }
 
+    if user_count < keep_turns {
+        return;
+    }
+
     // Remove tool and intermediate assistant messages before the boundary.
     // An "intermediate assistant" is one whose content looks like a tool
-    // call (contains `<tool_call>` or starts with `{\"tool_call`).
+    // call, either in legacy XML / JSON forms or in native `tool_calls` JSON.
     let mut i = 0;
-    while i < protect_from && i < turns.len() {
+    while i < strip_before && i < turns.len() {
         let dominated = turns[i].role == "tool"
             || (turns[i].role == "assistant" && is_tool_call_content(&turns[i].content));
         if dominated {
             turns.remove(i);
             // Adjust boundary since we removed an element.
-            protect_from = protect_from.saturating_sub(1);
+            strip_before = strip_before.saturating_sub(1);
         } else {
             i += 1;
         }
@@ -1485,7 +1791,43 @@ fn is_tool_call_content(content: &str) -> bool {
     let trimmed = content.trim();
     trimmed.contains("<tool_call>")
         || trimmed.starts_with("{\"tool_call\"")
-        || trimmed.starts_with("{\"name\"")
+        || is_named_tool_call_json(trimmed)
+        || is_native_tool_call_json(trimmed)
+}
+
+fn is_named_tool_call_json(content: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return false;
+    };
+
+    value
+        .get("name")
+        .and_then(|name| name.as_str())
+        .is_some_and(|name| {
+            !name.is_empty()
+                && (value.get("args").is_some()
+                    || value.get("arguments").is_some()
+                    || value.get("parameters").is_some())
+        })
+}
+
+fn is_native_tool_call_json(content: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return false;
+    };
+
+    let Some(tool_calls) = value.get("tool_calls").and_then(|calls| calls.as_array()) else {
+        return false;
+    };
+
+    !tool_calls.is_empty()
+        && tool_calls.iter().all(|call| {
+            call.get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(|name| name.as_str())
+                .or_else(|| call.get("name").and_then(|name| name.as_str()))
+                .is_some()
+        })
 }
 
 fn rollback_orphan_user_turn(
@@ -1619,12 +1961,12 @@ fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<S
         .unwrap_or_default()
 }
 
-/// Build a cache key that includes the model_provider name and, when a
-/// route-specific API key is supplied, a hash of that key. This prevents
-/// cache poisoning when multiple routes target the same model_provider with
-/// different credentials.
-fn provider_cache_key(provider_name: &str, route_api_key: Option<&str>) -> String {
-    match route_api_key {
+/// Build a cache key that includes the runtime-defaults generation, the
+/// model_provider name, and, when a route-specific API key is supplied, a hash
+/// of that key. Generation `0` is the immutable startup config, so its key shape
+/// stays unchanged; hot-reload generations get isolated cache entries.
+fn provider_cache_key(provider_name: &str, route_api_key: Option<&str>, generation: u64) -> String {
+    let base = match route_api_key {
         Some(key) => {
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1632,15 +1974,43 @@ fn provider_cache_key(provider_name: &str, route_api_key: Option<&str>) -> Strin
             format!("{provider_name}@{:x}", hasher.finish())
         }
         None => provider_name.to_string(),
+    };
+    if generation == 0 {
+        base
+    } else {
+        format!("g{generation}:{base}")
     }
+}
+
+/// Resolve a provider ref's own credentials strictly from its
+/// `[providers.models.<type>.<alias>]` entry. No default/global fallback: a
+/// provider only ever uses its own `api_key` / `uri`. Returns `(None, None)`
+/// for a ref that does not parse or does not resolve, so the provider factory
+/// surfaces the misconfiguration instead of silently borrowing another
+/// provider's key.
+fn provider_credentials_for_ref(
+    config: &zeroclaw_config::schema::Config,
+    provider_ref: &str,
+) -> (Option<String>, Option<String>) {
+    let Some((type_key, alias_key)) = provider_ref.trim().split_once('.') else {
+        return (None, None);
+    };
+    config
+        .providers
+        .models
+        .find(type_key, alias_key)
+        .map_or((None, None), |entry| {
+            (entry.api_key.clone(), entry.uri.clone())
+        })
 }
 
 async fn get_or_create_provider(
     ctx: &ChannelRuntimeContext,
     provider_name: &str,
     route_api_key: Option<&str>,
+    defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
 ) -> anyhow::Result<Arc<dyn ModelProvider>> {
-    let cache_key = provider_cache_key(provider_name, route_api_key);
+    let cache_key = provider_cache_key(provider_name, route_api_key, defaults_snapshot.generation);
 
     if let Some(existing) = ctx
         .provider_cache
@@ -1652,31 +2022,35 @@ async fn get_or_create_provider(
         return Ok(existing);
     }
 
-    // Only return the pre-built default model_provider when there is no
-    // route-specific credential override — otherwise the default was
-    // created with the global key and would be wrong.
-    if route_api_key.is_none() && provider_name == ctx.default_model_provider.as_str() {
+    let config = Arc::clone(&defaults_snapshot.config);
+    let defaults = defaults_snapshot.defaults.clone();
+
+    // Only return the pre-built startup default model_provider while the
+    // current runtime defaults still match startup and there is no
+    // route-specific credential override. Once config reload changes defaults,
+    // the cache/store path above owns the live default provider.
+    if route_api_key.is_none()
+        && provider_name == defaults.default_model_provider.as_str()
+        && provider_name == ctx.model_provider_ref.as_str()
+        && !defaults_snapshot.hot
+    {
         return Ok(Arc::clone(&ctx.model_provider));
     }
-
-    let defaults = runtime_defaults_snapshot(ctx);
-    let api_url = if provider_name == defaults.default_model_provider.as_str() {
-        defaults.api_url.as_deref()
-    } else {
-        None
-    };
-
-    // Prefer route-specific credential; fall back to the global key.
-    let effective_api_key = route_api_key
-        .map(ToString::to_string)
-        .or_else(|| ctx.api_key.clone());
+    // Resolve credentials and URL strictly from the requested provider's own
+    // `[providers.models.<type>.<alias>]` entry. There is no global/default
+    // fallback: a provider never inherits another provider's api_key or
+    // api_url. An unresolved ref yields no credentials so the factory
+    // surfaces the misconfiguration.
+    let (entry_api_key, entry_api_url) =
+        provider_credentials_for_ref(config.as_ref(), provider_name);
+    let effective_api_key = route_api_key.map(ToString::to_string).or(entry_api_key);
 
     let model_provider = create_resilient_model_provider_nonblocking(
-        Arc::clone(&ctx.prompt_config),
+        config,
         provider_name,
         effective_api_key,
-        api_url.map(ToString::to_string),
-        ctx.reliability.as_ref().clone(),
+        entry_api_url,
+        defaults.reliability,
         ctx.provider_runtime_options.clone(),
     )
     .await?;
@@ -1964,34 +2338,54 @@ async fn handle_runtime_command_if_needed(
     };
 
     let sender_key = conversation_history_key(msg);
-    let mut current = get_route_selection(ctx, &sender_key);
+    let defaults_snapshot = runtime_defaults_snapshot(ctx);
+    let mut current = get_route_selection(ctx, &sender_key, &defaults_snapshot);
 
     let response = match command {
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
         ChannelRuntimeCommand::SetProvider(raw_model_provider) => {
-            match canonical_model_provider_name(&raw_model_provider) {
-                Some(provider_name) => {
-                    match get_or_create_provider(ctx, &provider_name, None).await {
+            match resolve_models_command(defaults_snapshot.config.as_ref(), &raw_model_provider) {
+                ModelsCommandResolution::Resolved(provider_ref) => {
+                    match get_or_create_provider(ctx, &provider_ref, None, &defaults_snapshot).await
+                    {
                         Ok(_) => {
-                            if provider_name != current.model_provider {
-                                current.model_provider = provider_name.clone();
-                                set_route_selection(ctx, &sender_key, current.clone());
+                            if provider_ref != current.model_provider {
+                                current.model_provider = provider_ref.clone();
+                                set_route_selection(
+                                    ctx,
+                                    &sender_key,
+                                    current.clone(),
+                                    &defaults_snapshot,
+                                );
                             }
 
                             format!(
-                                "ModelProvider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
+                                "ModelProvider switched to `{provider_ref}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
                                 current.model
                             )
                         }
                         Err(err) => {
                             let safe_err = zeroclaw_providers::sanitize_api_error(&err.to_string());
                             format!(
-                                "Failed to initialize model_provider `{provider_name}`. Route unchanged.\nDetails: {safe_err}"
+                                "Failed to initialize model_provider `{provider_ref}`. Route unchanged.\nDetails: {safe_err}"
                             )
                         }
                     }
                 }
-                None => format!(
+                ModelsCommandResolution::Ambiguous { family, aliases } => {
+                    let list = aliases
+                        .iter()
+                        .map(|a| format!("`{family}.{a}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(
+                        "ModelProvider `{family}` has multiple configured aliases. Qualify which one with `/models {family}.<alias>`: {list}"
+                    )
+                }
+                ModelsCommandResolution::NoAlias(ref_or_family) => format!(
+                    "No configured provider entry for `{ref_or_family}`. Add `[providers.models.{ref_or_family}]` (with its api_key/uri) or select a configured provider — `/models` lists valid ones."
+                ),
+                ModelsCommandResolution::Unknown => format!(
                     "Unknown model_provider `{raw_model_provider}`. Use `/models` to list valid model_providers."
                 ),
             }
@@ -2014,7 +2408,7 @@ async fn handle_runtime_command_if_needed(
                 } else {
                     current.model = model.clone();
                 }
-                set_route_selection(ctx, &sender_key, current.clone());
+                set_route_selection(ctx, &sender_key, current.clone(), &defaults_snapshot);
 
                 format!(
                     "Model switched to `{}` (model_provider: `{}`). Context preserved.",
@@ -2451,7 +2845,7 @@ fn parse_reply_intent(response: &str) -> AssistantChannelOutcome {
 /// Resolve a per-agent `classifier_provider` ref to a (provider, model, temperature)
 /// triple for `classify_channel_reply_intent`. Returns `None` when the
 /// ref is empty or unresolvable; the caller MUST then fall back to the
-/// main agent's `active_model_provider` + `route.model` + `runtime_defaults.temperature`.
+/// main agent's `active_model_provider` plus the active route/defaults snapshot.
 ///
 /// Per AGENTS.md SINGLE SOURCE OF TRUTH: this function reads the
 /// referenced `[providers.models.<type>.<alias>]` entry on every call
@@ -2460,6 +2854,7 @@ fn parse_reply_intent(response: &str) -> AssistantChannelOutcome {
 async fn resolve_classifier_route(
     ctx: &ChannelRuntimeContext,
     provider_ref: &zeroclaw_config::providers::ModelProviderRef,
+    defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
 ) -> Option<(Arc<dyn ModelProvider>, String, Option<f64>)> {
     let provider_str = provider_ref.as_str().trim();
     if provider_str.is_empty() {
@@ -2480,7 +2875,12 @@ async fn resolve_classifier_route(
         }
     };
 
-    let model_cfg = match ctx.prompt_config.providers.models.find(type_key, alias_key) {
+    let model_cfg = match defaults_snapshot
+        .config
+        .providers
+        .models
+        .find(type_key, alias_key)
+    {
         Some(cfg) => cfg,
         None => {
             ::zeroclaw_log::record!(
@@ -2507,8 +2907,13 @@ async fn resolve_classifier_route(
         return None;
     }
 
-    let provider = match get_or_create_provider(ctx, provider_str, model_cfg.api_key.as_deref())
-        .await
+    let provider = match get_or_create_provider(
+        ctx,
+        provider_str,
+        model_cfg.api_key.as_deref(),
+        defaults_snapshot,
+    )
+    .await
     {
         Ok(p) => p,
         Err(e) => {
@@ -2663,15 +3068,14 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
         return String::new();
     }
     let stripped_summary = strip_tool_summary_prefix(trimmed_response);
-    // Strip XML-style tool-call tags (e.g. <tool_call>...</tool_call>)
     let stripped_xml = if starts_with_visible_tool_call_tag_example(&stripped_summary) {
         stripped_summary
     } else {
         strip_tool_call_tags(&stripped_summary)
     };
-    // Strip isolated tool-call JSON artifacts
+    let stripped_results = strip_tool_result_content(&stripped_xml);
     let stripped_fenced_json =
-        strip_fenced_tool_protocol_artifacts(&stripped_xml, &known_tool_names);
+        strip_fenced_tool_protocol_artifacts(&stripped_results, &known_tool_names);
     let stripped_json =
         strip_isolated_tool_json_artifacts(&stripped_fenced_json, &known_tool_names);
     // Strip leading narration lines that announce tool usage
@@ -3240,13 +3644,23 @@ fn is_non_retryable_channel_listener_error(channel_name: &str, error: &anyhow::E
     }
 }
 
-fn compute_max_in_flight_messages(channel_count: usize) -> usize {
+fn compute_max_in_flight_messages(
+    channel_count: usize,
+    max_concurrent_per_channel: usize,
+) -> usize {
     channel_count
-        .saturating_mul(CHANNEL_PARALLELISM_PER_CHANNEL)
+        .saturating_mul(max_concurrent_per_channel)
         .clamp(
             CHANNEL_MIN_IN_FLIGHT_MESSAGES,
             CHANNEL_MAX_IN_FLIGHT_MESSAGES,
         )
+}
+
+fn max_in_flight_messages_for_config(
+    channel_count: usize,
+    config: &zeroclaw_config::schema::ChannelsConfig,
+) -> usize {
+    compute_max_in_flight_messages(channel_count, config.max_concurrent_per_channel)
 }
 
 fn log_worker_join_result(result: Result<(), tokio::task::JoinError>) {
@@ -3486,7 +3900,8 @@ async fn process_channel_message_body(
             );
         }
     }
-    let mut route = get_route_selection(ctx.as_ref(), &history_key);
+    let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
+    let mut route = get_route_selection(ctx.as_ref(), &history_key, &runtime_defaults);
 
     // ── Query classification: override route when a rule matches ──
     if let Some(hint) =
@@ -3504,11 +3919,11 @@ async fn process_channel_message_body(
         };
     }
 
-    let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
     let mut active_model_provider = match get_or_create_provider(
         ctx.as_ref(),
         &route.model_provider,
         route.api_key.as_deref(),
+        &runtime_defaults,
     )
     .await
     {
@@ -3525,16 +3940,17 @@ async fn process_channel_message_body(
             return;
         }
     };
+    let history_user_content = channel_history_content_for_user_turn(&msg.content);
     if ctx.auto_save_memory
-        && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-        && !zeroclaw_memory::should_skip_autosave_content(&msg.content)
+        && history_user_content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+        && !zeroclaw_memory::should_skip_autosave_content(&history_user_content)
     {
         let autosave_key = conversation_memory_key(&msg);
         let _ = ctx
             .memory
             .store(
                 &autosave_key,
-                &msg.content,
+                &history_user_content,
                 zeroclaw_memory::MemoryCategory::Conversation,
                 Some(&history_key),
             )
@@ -3567,16 +3983,18 @@ async fn process_channel_message_body(
     };
 
     // Preserve the dated user turn before the LLM call so interrupted requests
-    // keep the same temporal context as CLI turns.
+    // keep the same temporal context as CLI turns. Keep history compact so
+    // inline image payloads are not reloaded into later requests.
     let timestamped_content = timestamp_channel_user_content(&msg.content);
+    let timestamped_history_content = timestamp_channel_user_content(&history_user_content);
     append_sender_turn(
         ctx.as_ref(),
         &history_key,
-        ChatMessage::user(&timestamped_content),
+        ChatMessage::user(&timestamped_history_content),
     );
 
     // Build history from per-sender conversation cache.
-    let prior_turns_raw = if force_fresh_session {
+    let mut prior_turns_raw = if force_fresh_session {
         vec![ChatMessage::user(&timestamped_content)]
     } else {
         ctx.conversation_histories
@@ -3586,6 +4004,13 @@ async fn process_channel_message_body(
             .cloned()
             .unwrap_or_default()
     };
+    if !force_fresh_session {
+        restore_current_user_turn_media_payload(
+            &mut prior_turns_raw,
+            &timestamped_history_content,
+            &timestamped_content,
+        );
+    }
     let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
 
     // Strip stale tool_result blocks from cached turns so the LLM never
@@ -3605,29 +4030,10 @@ async fn process_channel_message_body(
         }
     }
 
-    // Strip [IMAGE:] markers from *older* history messages when the active
-    // model_provider does not support vision. This prevents "history poisoning"
-    // where a previously-sent image marker gets reloaded from the JSONL
-    // session file and permanently breaks the conversation (fixes #3674).
-    // We skip the last turn (the current message) so the vision check can
-    // still reject fresh image sends with a proper error.
-    if !active_model_provider.supports_vision() && prior_turns.len() > 1 {
-        let last_idx = prior_turns.len() - 1;
-        for turn in &mut prior_turns[..last_idx] {
-            if turn.content.contains("[IMAGE:") {
-                let (cleaned, _refs) =
-                    zeroclaw_providers::multimodal::parse_image_markers(&turn.content);
-                turn.content = cleaned;
-            }
-        }
-        // Drop older turns that became empty after marker removal (e.g. image-only messages).
-        // Keep the last turn (current message) intact.
-        let current = prior_turns.pop();
-        prior_turns.retain(|turn| !turn.content.trim().is_empty());
-        if let Some(current) = current {
-            prior_turns.push(current);
-        }
-    }
+    // Strip [IMAGE:] markers from older cached turns before context
+    // compression. The current message keeps its full payload so vision still
+    // works for the active turn; historical turns keep compact annotations.
+    strip_historical_image_payloads(&mut prior_turns);
 
     // Proactively trim conversation history before sending to the model_provider
     // to prevent context-window-exceeded errors (bug #3460).
@@ -3711,7 +4117,7 @@ async fn process_channel_message_body(
                 &mut history,
                 active_model_provider.as_ref(),
                 route.model.as_str(),
-                ctx.temperature,
+                runtime_defaults.defaults.temperature,
             )
             .await
         {
@@ -3741,22 +4147,26 @@ async fn process_channel_message_body(
             Arc<dyn ModelProvider>,
             String,
             Option<f64>,
-        ) = resolve_classifier_route(ctx.as_ref(), &ctx.agent_cfg.classifier_provider)
-            .await
-            .unwrap_or_else(|| {
-                (
-                    Arc::clone(&active_model_provider),
-                    route.model.clone(),
-                    None,
-                )
-            });
+        ) = resolve_classifier_route(
+            ctx.as_ref(),
+            &ctx.agent_cfg.classifier_provider,
+            &runtime_defaults,
+        )
+        .await
+        .unwrap_or_else(|| {
+            (
+                Arc::clone(&active_model_provider),
+                route.model.clone(),
+                None,
+            )
+        });
 
         classify_channel_reply_intent(
             classifier_provider_arc.as_ref(),
             history[0].content.as_str(),
             &history,
             classifier_model_owned.as_str(),
-            classifier_temperature.or(runtime_defaults.temperature),
+            classifier_temperature.or(runtime_defaults.defaults.temperature),
         )
         .await
         .unwrap_or(AssistantChannelOutcome::Reply(String::new()))
@@ -4086,7 +4496,7 @@ async fn process_channel_message_body(
                         notify_observer.as_ref() as &dyn Observer,
                         route.model_provider.as_str(),
                         route.model.as_str(),
-                        runtime_defaults.temperature,
+                        runtime_defaults.defaults.temperature,
                         true,
                         Some(&*ctx.approval_manager),
                         msg.channel.as_str(),
@@ -4145,25 +4555,47 @@ async fn process_channel_message_body(
                     )
                 );
 
-                match create_resilient_model_provider_nonblocking(
-                    Arc::clone(&ctx.prompt_config),
+                let resolved_model_provider = match resolve_provider_ref_for_runtime_switch(
+                    runtime_defaults.config.as_ref(),
                     &new_model_provider,
-                    ctx.api_key.clone(),
-                    ctx.api_url.clone(),
-                    ctx.reliability.as_ref().clone(),
-                    ctx.provider_runtime_options.clone(),
+                ) {
+                    Ok(provider_ref) => provider_ref,
+                    Err(err) => {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"err": err.to_string()})),
+                            "Failed to resolve model_provider after model switch"
+                        );
+                        clear_model_switch_request();
+                        break loop_result;
+                    }
+                };
+
+                match get_or_create_provider(
+                    ctx.as_ref(),
+                    &resolved_model_provider,
+                    None,
+                    &runtime_defaults,
                 )
                 .await
                 {
                     Ok(new_prov) => {
-                        active_model_provider = Arc::from(new_prov);
-                        route.model_provider = new_model_provider;
+                        active_model_provider = new_prov;
+                        route.model_provider = resolved_model_provider;
                         route.model = new_model;
                         clear_model_switch_request();
 
                         ctx.observer.record_event(&ObserverEvent::AgentStart {
                             model_provider: route.model_provider.clone(),
                             model: route.model.clone(),
+                            channel: None,
+                            agent_alias: None,
+                            turn_id: None,
                         });
 
                         continue;
@@ -4416,22 +4848,22 @@ async fn process_channel_message_body(
             // means the provider sends no `temperature` field (necessary
             // for models that reject it, e.g. claude-opus-4-7).
             if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+                let memory_strategy = Arc::clone(&ctx.memory_strategy);
                 let model_provider = Arc::clone(&ctx.model_provider);
                 let model = ctx.model.to_string();
                 let temperature = ctx.temperature;
-                let memory = Arc::clone(&ctx.memory);
                 let user_msg = msg.content.clone();
                 let assistant_resp = delivered_response.clone();
                 zeroclaw_spawn::spawn!(async move {
-                    if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
-                        model_provider.as_ref(),
-                        &model,
-                        temperature,
-                        memory.as_ref(),
-                        &user_msg,
-                        &assistant_resp,
-                    )
-                    .await
+                    if let Err(e) = memory_strategy
+                        .consolidate_turn(
+                            &user_msg,
+                            &assistant_resp,
+                            model_provider.as_ref(),
+                            &model,
+                            temperature,
+                        )
+                        .await
                     {
                         ::zeroclaw_log::record!(
                             DEBUG,
@@ -4629,8 +5061,11 @@ async fn process_channel_message_body(
                 // Evict cached model_provider on auth errors so the next request
                 // re-creates it with fresh OAuth credentials.
                 if zeroclaw_providers::reliable::is_auth_error(&e) {
-                    let cache_key =
-                        provider_cache_key(&route.model_provider, route.api_key.as_deref());
+                    let cache_key = provider_cache_key(
+                        &route.model_provider,
+                        route.api_key.as_deref(),
+                        runtime_defaults.generation,
+                    );
                     let mut cache = ctx.provider_cache.lock().unwrap_or_else(|p| p.into_inner());
                     if cache.remove(&cache_key).is_some() {
                         ::zeroclaw_log::record!(
@@ -4664,7 +5099,11 @@ async fn process_channel_message_body(
                 );
                 let should_rollback_user_turn = should_rollback_failed_user_turn(&e);
                 let rolled_back = should_rollback_user_turn
-                    && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &timestamped_content);
+                    && rollback_orphan_user_turn(
+                        ctx.as_ref(),
+                        &history_key,
+                        &timestamped_history_content,
+                    );
 
                 if !rolled_back {
                     // Close the orphan user turn so subsequent messages don't
@@ -5351,12 +5790,8 @@ fn build_channel_by_id(
                     .matrix
                     .get("default")
                     .context("Matrix channel is not configured")?;
-                let state_dir = config
-                    .config_path
-                    .parent()
-                    .map(|p| p.join("state").join("matrix"))
-                    .unwrap_or_else(|| std::path::PathBuf::from(".zeroclaw/state/matrix"));
                 let alias = "default".to_string();
+                let state_dir = matrix_state_dir(&config.config_path, &alias);
                 let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                     let cfg_arc = config_arc.clone();
                     let alias = alias.clone();
@@ -5439,7 +5874,12 @@ fn build_channel_by_id(
                     let alias = alias.clone();
                     Arc::new(move || cfg_arc.read().channel_external_peers("lark", &alias))
                 };
-                Ok(Arc::new(LarkChannel::from_config(lk, alias, peer_resolver)))
+                Ok(Arc::new(
+                    LarkChannel::from_config(lk, alias, peer_resolver)
+                        .with_approval_timeout_secs(lk.approval_timeout_secs)
+                        .with_per_user_session(lk.per_user_session)
+                        .with_streaming(lk.stream_mode, lk.draft_update_interval_ms),
+                ))
             }
             #[cfg(not(feature = "channel-lark"))]
             {
@@ -5758,6 +6198,32 @@ fn build_channel_by_id(
         "irc" => {
             anyhow::bail!("IRC channel requires the `channel-irc` feature");
         }
+        #[cfg(feature = "channel-twitch")]
+        "twitch" => {
+            let tw_cfg = config
+                .channels
+                .twitch
+                .get("default")
+                .context("Twitch channel is not configured")?;
+            let alias = "default".to_string();
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || cfg_arc.read().channel_external_peers("twitch", &alias))
+            };
+            Ok(Arc::new(TwitchChannel::new(
+                tw_cfg.bot_username.clone(),
+                tw_cfg.oauth_token.clone(),
+                tw_cfg.channels.clone(),
+                tw_cfg.mention_only,
+                alias,
+                peer_resolver,
+            )))
+        }
+        #[cfg(not(feature = "channel-twitch"))]
+        "twitch" => {
+            anyhow::bail!("Twitch channel requires the `channel-twitch` feature");
+        }
         #[cfg(feature = "channel-twitter")]
         "twitter" => {
             let tw = config
@@ -6027,6 +6493,18 @@ pub fn register_channels_for_tools(
     names
 }
 
+/// Per-alias Matrix state directory. Each `[channels.matrix.<alias>]` block
+/// must own its own session/crypto store so two bots under one daemon don't
+/// restore each other's `session.json` and run as the wrong account. The
+/// alias component is what keeps them distinct.
+#[cfg(feature = "channel-matrix")]
+fn matrix_state_dir(config_path: &std::path::Path, alias: &str) -> std::path::PathBuf {
+    config_path
+        .parent()
+        .map(|p| p.join("state").join("matrix").join(alias))
+        .unwrap_or_else(|| std::path::PathBuf::from(".zeroclaw/state/matrix").join(alias))
+}
+
 fn collect_configured_channels(
     config_arc: &Arc<RwLock<Config>>,
     matrix_skip_context: &str,
@@ -6068,23 +6546,26 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "Telegram",
             alias: Some(alias.clone()),
-            channel: Arc::new(
-                TelegramChannel::new(
-                    tg.bot_token.clone(),
-                    alias.clone(),
-                    peer_resolver,
-                    tg.mention_only,
-                )
-                .with_persistence(config_arc.clone())
-                .with_ack_reactions(ack)
-                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
-                .with_transcription(config.transcription.clone())
-                .with_tts(&config)
-                .with_voice_peer_prefs(&config, "telegram", alias)
-                .with_workspace_dir(config.channel_workspace_dir(&format!("telegram.{alias}")))
-                .with_proxy_url(tg.proxy_url.clone())
-                .with_tool_command_specs(tool_specs.to_vec())
-                .with_approval_timeout_secs(tg.approval_timeout_secs),
+            channel: crate::paced_channel::PacedChannel::wrap(
+                Arc::new(
+                    TelegramChannel::new(
+                        tg.bot_token.clone(),
+                        alias.clone(),
+                        peer_resolver,
+                        tg.mention_only,
+                    )
+                    .with_persistence(config_arc.clone())
+                    .with_ack_reactions(ack)
+                    .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+                    .with_transcription(config.transcription.clone())
+                    .with_tts(&config)
+                    .with_voice_peer_prefs(&config, "telegram", alias)
+                    .with_workspace_dir(config.channel_workspace_dir(&format!("telegram.{alias}")))
+                    .with_proxy_url(tg.proxy_url.clone())
+                    .with_tool_command_specs(tool_specs.to_vec())
+                    .with_approval_timeout_secs(tg.approval_timeout_secs),
+                ),
+                tg,
             ),
         });
     }
@@ -6151,7 +6632,7 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "Discord",
             alias: Some(alias.clone()),
-            channel: Arc::new(discord_ch),
+            channel: crate::paced_channel::PacedChannel::wrap(Arc::new(discord_ch), dc),
         });
     }
 
@@ -6182,24 +6663,27 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "Slack",
             alias: Some(alias.clone()),
-            channel: Arc::new(
-                SlackChannel::new(
-                    sl.bot_token.clone(),
-                    sl.app_token.clone(),
-                    sl.channel_ids.clone(),
-                    alias.clone(),
-                    peer_resolver,
-                )
-                .with_thread_replies(sl.thread_replies.unwrap_or(true))
-                .with_group_reply_policy(sl.mention_only, Vec::new())
-                .with_strict_mention_in_thread(sl.strict_mention_in_thread)
-                .with_workspace_dir(config.channel_workspace_dir(&format!("slack.{alias}")))
-                .with_markdown_blocks(sl.use_markdown_blocks)
-                .with_proxy_url(sl.proxy_url.clone())
-                .with_transcription(config.transcription.clone())
-                .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms)
-                .with_cancel_reaction(sl.cancel_reaction.clone())
-                .with_approval_timeout_secs(sl.approval_timeout_secs),
+            channel: crate::paced_channel::PacedChannel::wrap(
+                Arc::new(
+                    SlackChannel::new(
+                        sl.bot_token.clone(),
+                        sl.app_token.clone(),
+                        sl.channel_ids.clone(),
+                        alias.clone(),
+                        peer_resolver,
+                    )
+                    .with_thread_replies(sl.thread_replies.unwrap_or(true))
+                    .with_group_reply_policy(sl.mention_only, Vec::new())
+                    .with_strict_mention_in_thread(sl.strict_mention_in_thread)
+                    .with_workspace_dir(config.channel_workspace_dir(&format!("slack.{alias}")))
+                    .with_markdown_blocks(sl.use_markdown_blocks)
+                    .with_proxy_url(sl.proxy_url.clone())
+                    .with_transcription(config.transcription.clone())
+                    .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms)
+                    .with_cancel_reaction(sl.cancel_reaction.clone())
+                    .with_approval_timeout_secs(sl.approval_timeout_secs),
+                ),
+                sl,
             ),
         });
     }
@@ -6231,22 +6715,25 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "Mattermost",
             alias: Some(alias.clone()),
-            channel: Arc::new(
-                MattermostChannel::new(
-                    mm.url.clone(),
-                    mm.bot_token.clone(),
-                    mm.login_id.clone(),
-                    mm.password.clone(),
-                    mm.channel_ids.clone(),
-                    alias.clone(),
-                    peer_resolver,
-                    mm.thread_replies.unwrap_or(true),
-                    mm.mention_only.unwrap_or(false),
-                )
-                .with_team_ids(mm.team_ids.clone())
-                .with_discover_dms(mm.discover_dms.unwrap_or(true))
-                .with_proxy_url(mm.proxy_url.clone())
-                .with_transcription(config.transcription.clone()),
+            channel: crate::paced_channel::PacedChannel::wrap(
+                Arc::new(
+                    MattermostChannel::new(
+                        mm.url.clone(),
+                        mm.bot_token.clone(),
+                        mm.login_id.clone(),
+                        mm.password.clone(),
+                        mm.channel_ids.clone(),
+                        alias.clone(),
+                        peer_resolver,
+                        mm.thread_replies.unwrap_or(true),
+                        mm.mention_only.unwrap_or(false),
+                    )
+                    .with_team_ids(mm.team_ids.clone())
+                    .with_discover_dms(mm.discover_dms.unwrap_or(true))
+                    .with_proxy_url(mm.proxy_url.clone())
+                    .with_transcription(config.transcription.clone()),
+                ),
+                mm,
             ),
         });
     }
@@ -6279,7 +6766,10 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "iMessage",
             alias: Some(alias.clone()),
-            channel: Arc::new(IMessageChannel::new(alias.clone(), peer_resolver)),
+            channel: crate::paced_channel::PacedChannel::wrap(
+                Arc::new(IMessageChannel::new(alias.clone(), peer_resolver)),
+                im,
+            ),
         });
     }
 
@@ -6302,11 +6792,7 @@ fn collect_configured_channels(
         if !mx.enabled {
             continue;
         }
-        let state_dir = config
-            .config_path
-            .parent()
-            .map(|p| p.join("state").join("matrix"))
-            .unwrap_or_else(|| std::path::PathBuf::from(".zeroclaw/state/matrix"));
+        let state_dir = matrix_state_dir(&config.config_path, alias);
         let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
             let cfg_arc = config_arc.clone();
             let alias = alias.clone();
@@ -6322,7 +6808,7 @@ fn collect_configured_channels(
                 channels.push(ConfiguredChannel {
                     display_name: "Matrix",
                     alias: Some(alias.clone()),
-                    channel: Arc::new(channel),
+                    channel: crate::paced_channel::PacedChannel::wrap(Arc::new(channel), mx),
                 });
             }
             Err(e) => {
@@ -6366,19 +6852,22 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "Signal",
             alias: Some(alias.clone()),
-            channel: Arc::new(
-                SignalChannel::new(
-                    sig.http_url.clone(),
-                    sig.account.clone(),
-                    sig.group_ids.clone(),
-                    sig.dm_only,
-                    alias.clone(),
-                    peer_resolver,
-                    sig.ignore_attachments,
-                    sig.ignore_stories,
-                )
-                .with_proxy_url(sig.proxy_url.clone())
-                .with_approval_timeout_secs(sig.approval_timeout_secs),
+            channel: crate::paced_channel::PacedChannel::wrap(
+                Arc::new(
+                    SignalChannel::new(
+                        sig.http_url.clone(),
+                        sig.account.clone(),
+                        sig.group_ids.clone(),
+                        sig.dm_only,
+                        alias.clone(),
+                        peer_resolver,
+                        sig.ignore_attachments,
+                        sig.ignore_stories,
+                    )
+                    .with_proxy_url(sig.proxy_url.clone())
+                    .with_approval_timeout_secs(sig.approval_timeout_secs),
+                ),
+                sig,
             ),
         });
     }
@@ -6424,18 +6913,21 @@ fn collect_configured_channels(
                     channels.push(ConfiguredChannel {
                         display_name: "WhatsApp",
                         alias: Some(alias.clone()),
-                        channel: Arc::new(
-                            WhatsAppChannel::new(
-                                wa.access_token.clone().unwrap_or_default(),
-                                wa.phone_number_id.clone().unwrap_or_default(),
-                                wa.verify_token.clone().unwrap_or_default(),
-                                alias.clone(),
-                                peer_resolver,
-                            )
-                            .with_proxy_url(wa.proxy_url.clone())
-                            .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
-                            .with_group_mention_patterns(wa.group_mention_patterns.clone())
-                            .with_approval_timeout_secs(wa.approval_timeout_secs),
+                        channel: crate::paced_channel::PacedChannel::wrap(
+                            Arc::new(
+                                WhatsAppChannel::new(
+                                    wa.access_token.clone().unwrap_or_default(),
+                                    wa.phone_number_id.clone().unwrap_or_default(),
+                                    wa.verify_token.clone().unwrap_or_default(),
+                                    alias.clone(),
+                                    peer_resolver,
+                                )
+                                .with_proxy_url(wa.proxy_url.clone())
+                                .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
+                                .with_group_mention_patterns(wa.group_mention_patterns.clone())
+                                .with_approval_timeout_secs(wa.approval_timeout_secs),
+                            ),
+                            wa,
                         ),
                     });
                 } else {
@@ -6477,12 +6969,15 @@ fn collect_configured_channels(
                     channels.push(ConfiguredChannel {
                         display_name: "WhatsApp",
                         alias: Some(alias.clone()),
-                        channel: Arc::new(
-                            WhatsAppWebChannel::new(wa, alias.clone(), peer_resolver)
-                                .with_transcription(config.transcription.clone())
-                                .with_tts(&config)
-                                .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
-                                .with_group_mention_patterns(wa.group_mention_patterns.clone()),
+                        channel: crate::paced_channel::PacedChannel::wrap(
+                            Arc::new(
+                                WhatsAppWebChannel::new(wa, alias.clone(), peer_resolver)
+                                    .with_transcription(config.transcription.clone())
+                                    .with_tts(&config)
+                                    .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
+                                    .with_group_mention_patterns(wa.group_mention_patterns.clone()),
+                            ),
+                            wa,
                         ),
                     });
                 } else {
@@ -6739,6 +7234,89 @@ fn collect_configured_channels(
         );
     }
 
+    #[cfg(feature = "channel-amqp")]
+    for (alias, amqp) in &config.channels.amqp {
+        if !active_channel_aliases.contains(&format!("amqp.{alias}")) {
+            continue;
+        }
+        if !amqp.enabled {
+            continue;
+        }
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || cfg_arc.read().channel_external_peers("amqp", &alias))
+        };
+        channels.push(ConfiguredChannel {
+            display_name: "AMQP",
+            alias: Some(alias.clone()),
+            channel: Arc::new(AmqpChannel::new(crate::amqp::AmqpChannelConfig {
+                amqp_url: amqp.amqp_url.clone(),
+                exchange: amqp.exchange.clone(),
+                routing_keys: amqp.routing_keys.clone(),
+                queue: amqp.queue.clone(),
+                ca_cert: amqp.ca_cert.clone(),
+                client_cert: amqp.client_cert.clone(),
+                client_key: amqp.client_key.clone(),
+                sender_label: amqp.sender_label.clone(),
+                content_template: amqp.content_template.clone(),
+                thread_id_field: amqp.thread_id_field.clone(),
+                durable_ack: amqp.durable_ack,
+                alias: alias.clone(),
+                peer_resolver,
+            })),
+        });
+    }
+
+    #[cfg(not(feature = "channel-amqp"))]
+    if !config.channels.amqp.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "AMQP channel is configured but this build was compiled without \
+             `channel-amqp`; skipping AMQP."
+        );
+    }
+
+    #[cfg(feature = "channel-twitch")]
+    for (alias, tw) in &config.channels.twitch {
+        if !active_channel_aliases.contains(&format!("twitch.{alias}")) {
+            continue;
+        }
+        if !tw.enabled {
+            continue;
+        }
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || cfg_arc.read().channel_external_peers("twitch", &alias))
+        };
+        channels.push(ConfiguredChannel {
+            display_name: "Twitch",
+            alias: Some(alias.clone()),
+            channel: Arc::new(TwitchChannel::new(
+                tw.bot_username.clone(),
+                tw.oauth_token.clone(),
+                tw.channels.clone(),
+                tw.mention_only,
+                alias.clone(),
+                peer_resolver,
+            )),
+        });
+    }
+
+    #[cfg(not(feature = "channel-twitch"))]
+    if !config.channels.twitch.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Twitch channel is configured but this build was compiled without \
+             `channel-twitch`; skipping Twitch."
+        );
+    }
+
     #[cfg(feature = "channel-lark")]
     for (alias, lk) in &config.channels.lark {
         if !active_channel_aliases.contains(&format!("lark.{alias}")) {
@@ -6758,6 +7336,9 @@ fn collect_configured_channels(
             alias: Some(alias.clone()),
             channel: Arc::new(
                 LarkChannel::from_config(lk, alias.clone(), peer_resolver)
+                    .with_approval_timeout_secs(lk.approval_timeout_secs)
+                    .with_per_user_session(lk.per_user_session)
+                    .with_streaming(lk.stream_mode, lk.draft_update_interval_ms)
                     .with_transcription(config.transcription.clone()),
             ),
         });
@@ -7311,18 +7892,21 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name: "Webhook",
             alias: Some(alias.clone()),
-            channel: Arc::new(WebhookChannel::new(
-                alias.clone(),
-                wh.port,
-                wh.listen_path.clone(),
-                wh.send_url.clone(),
-                wh.send_method.clone(),
-                wh.auth_header.clone(),
-                wh.secret.clone(),
-                wh.max_retries,
-                wh.retry_base_delay_ms,
-                wh.retry_max_delay_ms,
-            )),
+            channel: crate::paced_channel::PacedChannel::wrap(
+                Arc::new(WebhookChannel::new(
+                    alias.clone(),
+                    wh.port,
+                    wh.listen_path.clone(),
+                    wh.send_url.clone(),
+                    wh.send_method.clone(),
+                    wh.auth_header.clone(),
+                    wh.secret.clone(),
+                    wh.max_retries,
+                    wh.retry_base_delay_ms,
+                    wh.retry_max_delay_ms,
+                )),
+                wh,
+            ),
         });
     }
 
@@ -7521,13 +8105,19 @@ pub async fn start_channels(
     // via a one-time clone; channels themselves consult `config_arc`.
     let config_arc = Arc::new(RwLock::new(config));
     let config: Config = config_arc.read().clone();
-    // No model resolves yet — the user has channels configured but hasn't
-    // finished onboarding their model_provider. Returning Ok() here lets the
-    // daemon supervisor mark the channels component "done" instead of
-    // restart-looping on the bail in `resolved_default_model`. The user
-    // completes onboarding at /onboard and reloads via /admin/reload to
-    // bring channels up.
-    if resolved_default_model(&config).is_err() {
+    // No agent's model provider resolves yet — the user has channels
+    // configured but hasn't finished onboarding their model_provider.
+    // Returning Ok() here lets the daemon supervisor mark the channels
+    // component "done" instead of restart-looping. The user completes
+    // onboarding at /onboard and reloads via /admin/reload to bring channels
+    // up. Resolution is strict: an enabled agent counts only if its mandatory
+    // `<type>.<alias>` ref resolves to a configured entry with a `model`.
+    let any_agent_provider_resolves = config
+        .agents
+        .iter()
+        .filter(|(_, a)| a.enabled)
+        .any(|(_, a)| runtime_defaults_from_config(&config, a.model_provider.as_str()).is_ok());
+    if !any_agent_provider_resolves {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -7636,22 +8226,27 @@ pub async fn start_channels(
             })?
             .clone();
 
-        let agent_provider_entry = config.model_provider_for_agent(agent_alias);
-        let provider_name = config
-            .agents
-            .get(agent_alias)
-            .map(|a| a.model_provider.as_str().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| resolved_default_provider(&config));
+        // Resolve the agent's model provider strictly from its mandatory
+        // `<type>.<alias>` reference. No fallback to a first/default provider:
+        // an agent whose ref does not resolve to a configured entry with a
+        // `model` is rejected here.
+        let runtime_defaults = runtime_defaults_from_config(&config, agent.model_provider.as_str())
+            .with_context(|| format!("agents.{agent_alias}.model_provider"))?;
+        let provider_name = runtime_defaults.default_model_provider.clone();
+        let model = runtime_defaults.model.clone();
+        let temperature = runtime_defaults.temperature;
+        let provider_api_key = runtime_defaults.api_key.clone();
+        let provider_api_url = runtime_defaults.api_url.clone();
+        let provider_reliability = runtime_defaults.reliability.clone();
         let provider_runtime_options =
             zeroclaw_providers::provider_runtime_options_for_agent(&config, agent_alias);
         let model_provider: Arc<dyn ModelProvider> = Arc::from(
             create_resilient_model_provider_nonblocking(
                 Arc::new(config.clone()),
                 &provider_name,
-                agent_provider_entry.and_then(|e| e.api_key.clone()),
-                agent_provider_entry.and_then(|e| e.uri.clone()),
-                config.reliability.clone(),
+                provider_api_key.clone(),
+                provider_api_url.clone(),
+                provider_reliability.clone(),
                 provider_runtime_options.clone(),
             )
             .await?,
@@ -7670,35 +8265,10 @@ pub async fn start_channels(
         }
 
         let security = Arc::new(SecurityPolicy::for_agent(&config, agent_alias)?);
-        let model = agent_provider_entry
-            .and_then(|e| e.model.clone())
-            .or_else(|| {
-                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"agent": agent_alias})), "model_provider has no `model` set; falling back to resolved_default_model");
-                resolved_default_model(&config).ok()
-            })
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "agent": agent_alias,
-                            "reason": "no_model_configured",
-                        })),
-                    "orchestrator: agent has no resolvable model"
-                );
-                anyhow::Error::msg(format!(
-                    "no model configured: agents.{agent_alias}.model_provider does not resolve to a \
-                     ModelProviderConfig with a `model` field, and providers.models is empty. \
-                     Configure `[providers.models.<type>.<alias>] model = \"...\"` and reference it \
-                     from `agents.{agent_alias}.model_provider`."
-                ))
-            })?;
-        let temperature: Option<f64> = agent_provider_entry.and_then(|e| e.temperature);
         let mem: Arc<dyn Memory> = zeroclaw_memory::create_memory_for_agent(
             &config,
             agent_alias,
-            agent_provider_entry.and_then(|e| e.api_key.as_deref()),
+            provider_api_key.as_deref(),
         )
         .await?;
         let (composio_key, composio_entity_id) = if config.composio.enabled {
@@ -7736,7 +8306,7 @@ pub async fn start_channels(
             &config.web_fetch,
             &workspace,
             &config.agents,
-            agent_provider_entry.and_then(|e| e.api_key.as_deref()),
+            provider_api_key.as_deref(),
             &config,
             canvas_store.clone(),
             false,
@@ -8179,7 +8749,7 @@ pub async fn start_channels(
                 .write()
                 .unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&cbn));
 
-            let in_flight = compute_max_in_flight_messages(channels.len());
+            let in_flight = max_in_flight_messages_for_config(channels.len(), &config.channels);
             println!("  🚦 In-flight message limit: {in_flight}");
 
             max_in_flight_messages = Some(in_flight);
@@ -8224,40 +8794,25 @@ pub async fn start_channels(
         provider_cache_seed.insert(provider_name.clone(), Arc::clone(&model_provider));
         let message_timeout_secs =
             effective_channel_message_timeout_secs(config.channels.message_timeout_secs);
-        let interrupt_on_new_message = config
-            .channels
-            .telegram
-            .get("default")
-            .is_some_and(|tg| tg.interrupt_on_new_message);
-        let interrupt_on_new_message_slack = config
-            .channels
-            .slack
-            .get("default")
-            .is_some_and(|sl| sl.interrupt_on_new_message);
-        let interrupt_on_new_message_discord = config
-            .channels
-            .discord
-            .get("default")
-            .is_some_and(|dc| dc.interrupt_on_new_message);
-        let interrupt_on_new_message_mattermost = config
-            .channels
-            .mattermost
-            .get("default")
-            .is_some_and(|mm| mm.interrupt_on_new_message);
-        let interrupt_on_new_message_matrix = config
-            .channels
-            .matrix
-            .get("default")
-            .is_some_and(|mx| mx.interrupt_on_new_message);
+        let interrupt_on_new_message = interrupt_on_new_message_config(&config.channels);
+
+        let memory_strategy: Arc<dyn MemoryStrategy> = Arc::new(
+            zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                Arc::clone(&mem),
+                config.memory.clone(),
+                config.data_dir.clone(),
+            ),
+        );
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::clone(&channels_by_name),
             model_provider: Arc::clone(&model_provider),
-            default_model_provider: Arc::new(provider_name.clone()),
+            model_provider_ref: Arc::new(provider_name.clone()),
             agent_alias: Arc::new(agent_alias.clone()),
             agent_cfg: Arc::new(agent.clone()),
             prompt_config: Arc::new(config.clone()),
             memory: Arc::clone(&mem),
+            memory_strategy,
             tools_registry: Arc::clone(&tools_registry),
             observer: Arc::clone(&observer),
             system_prompt: Arc::new(system_prompt),
@@ -8272,19 +8827,18 @@ pub async fn start_channels(
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: agent_provider_entry.and_then(|e| e.api_key.clone()),
-            api_url: agent_provider_entry.and_then(|e| e.uri.clone()),
             reliability: Arc::new(config.reliability.clone()),
             provider_runtime_options,
-            workspace_dir: Arc::new(config.data_dir.clone()),
+            // Use this agent's workspace (not the install-wide data dir): the
+            // channel runtime context drives per-message skill reloads, prompt
+            // refresh, and file-access scoping, all of which must resolve to the
+            // same agent workspace that boot-time registration loads from.
+            // Pointing at `config.data_dir` silently breaks per-message skill
+            // activation (candidates load from `<data_dir>/skills`, which is
+            // empty) and mis-scopes file tools.
+            workspace_dir: Arc::new(workspace.clone()),
             message_timeout_secs,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: interrupt_on_new_message,
-                slack: interrupt_on_new_message_slack,
-                discord: interrupt_on_new_message_discord,
-                mattermost: interrupt_on_new_message_mattermost,
-                matrix: interrupt_on_new_message_matrix,
-            },
+            interrupt_on_new_message,
             multimodal: config.multimodal.clone(),
             media_pipeline: config.media_pipeline.clone(),
             transcription_config: config.transcription.clone(),
@@ -8382,6 +8936,7 @@ pub async fn start_channels(
             },
             show_receipts_in_response: agent.resolved.tool_receipts.show_in_response,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         agent_ctxs.insert(agent_alias.clone(), runtime_ctx);
@@ -8707,7 +9262,10 @@ pub async fn deliver_announcement(
             let peers = config.channel_external_peers("lark", alias);
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
-            let ch = LarkChannel::from_config(lk, alias, peer_resolver);
+            let ch = LarkChannel::from_config(lk, alias, peer_resolver)
+                .with_approval_timeout_secs(lk.approval_timeout_secs)
+                .with_per_user_session(lk.per_user_session)
+                .with_streaming(lk.stream_mode, lk.draft_update_interval_ms);
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(not(feature = "channel-lark"))]
@@ -8784,6 +9342,49 @@ mod tests {
             "expected `zeroclaw quickstart` reference, got: {msg}"
         );
     }
+
+    #[tokio::test]
+    async fn channel_runtime_reload_applies_env_overrides_after_migration() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+default_provider = "openrouter"
+
+[model_providers.openrouter]
+name = "openrouter"
+
+[agents.demo]
+provider = "openrouter"
+model = "meta-llama/llama-3.1-8b-instruct"
+temperature = 0.3
+"#,
+        )
+        .unwrap();
+
+        let env_name = "ZEROCLAW_providers__models__openrouter__agent_demo__api_key";
+        // SAFETY: this test owns this specific env-var key and restores it
+        // before returning. The value is synthetic and not a real credential.
+        unsafe { std::env::set_var(env_name, "sk-or-v1-test-channel-reload") };
+
+        let result = load_runtime_config_and_defaults(&config_path, "demo").await;
+
+        // SAFETY: undo the test-only process env mutation above.
+        unsafe { std::env::remove_var(env_name) };
+
+        let (config, defaults) = result.unwrap();
+        assert_eq!(
+            defaults.api_key.as_deref(),
+            Some("sk-or-v1-test-channel-reload")
+        );
+        assert!(
+            config
+                .env_overridden_paths
+                .contains("providers.models.openrouter.agent_demo.api_key")
+        );
+    }
+
     use zeroclaw_runtime::observability::NoopObserver;
     use zeroclaw_runtime::tools::{Tool, ToolResult};
 
@@ -9051,10 +9652,17 @@ mod tests {
         Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(HashMap::new()),
             model_provider: Arc::new(DummyModelProvider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new(String::new()),
@@ -9069,8 +9677,6 @@ mod tests {
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -9078,6 +9684,7 @@ mod tests {
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -9110,6 +9717,7 @@ mod tests {
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -9117,7 +9725,12 @@ mod tests {
     async fn resolve_classifier_route_returns_none_for_empty_ref() {
         let ctx = router_test_ctx();
         let empty = zeroclaw_config::providers::ModelProviderRef::default();
-        let result = resolve_classifier_route(ctx.as_ref(), &empty).await;
+        let result = resolve_classifier_route(
+            ctx.as_ref(),
+            &empty,
+            &runtime_defaults_snapshot(ctx.as_ref()),
+        )
+        .await;
         assert!(result.is_none(), "empty ref must fall back to main agent");
     }
 
@@ -9125,7 +9738,12 @@ mod tests {
     async fn resolve_classifier_route_returns_none_for_unresolvable_ref() {
         let ctx = router_test_ctx();
         let bogus = zeroclaw_config::providers::ModelProviderRef::from("custom.does-not-exist");
-        let result = resolve_classifier_route(ctx.as_ref(), &bogus).await;
+        let result = resolve_classifier_route(
+            ctx.as_ref(),
+            &bogus,
+            &runtime_defaults_snapshot(ctx.as_ref()),
+        )
+        .await;
         assert!(result.is_none(), "unresolvable ref must soft-fail to None");
     }
 
@@ -9151,7 +9769,12 @@ mod tests {
         });
 
         let alias_ref = zeroclaw_config::providers::ModelProviderRef::from("openai.my-classifier");
-        let result = resolve_classifier_route(ctx.as_ref(), &alias_ref).await;
+        let result = resolve_classifier_route(
+            ctx.as_ref(),
+            &alias_ref,
+            &runtime_defaults_snapshot(ctx.as_ref()),
+        )
+        .await;
 
         let (_, _, temp) = result.expect("must resolve to alias");
         assert_eq!(
@@ -9159,6 +9782,29 @@ mod tests {
             Some(0.0),
             "alias temperature must be returned, not runtime_defaults.temperature"
         );
+    }
+
+    fn seed_sender_history(ctx: &ChannelRuntimeContext, sender: &str, turns: Vec<ChatMessage>) {
+        let mut histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        histories.push(sender.to_string(), turns);
+    }
+
+    fn cloned_sender_history(ctx: &ChannelRuntimeContext, sender: &str) -> Vec<ChatMessage> {
+        let histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        histories.peek(sender).cloned().unwrap_or_default()
+    }
+
+    fn history_signature(turns: &[ChatMessage]) -> Vec<(String, String)> {
+        turns
+            .iter()
+            .map(|turn| (turn.role.clone(), turn.content.clone()))
+            .collect()
     }
 
     #[test]
@@ -9303,6 +9949,34 @@ mod tests {
             MIN_CHANNEL_MESSAGE_TIMEOUT_SECS
         );
         assert_eq!(effective_channel_message_timeout_secs(300), 300);
+    }
+
+    #[test]
+    fn compute_max_in_flight_messages_uses_configured_per_channel_budget() {
+        assert_eq!(compute_max_in_flight_messages(3, 4), 12);
+        assert_eq!(compute_max_in_flight_messages(3, 8), 24);
+    }
+
+    #[test]
+    fn max_in_flight_messages_for_config_uses_channel_budget() {
+        let config = zeroclaw_config::schema::ChannelsConfig {
+            max_concurrent_per_channel: 8,
+            ..Default::default()
+        };
+
+        assert_eq!(max_in_flight_messages_for_config(3, &config), 24);
+    }
+
+    #[test]
+    fn compute_max_in_flight_messages_preserves_global_bounds() {
+        assert_eq!(
+            compute_max_in_flight_messages(1, 1),
+            CHANNEL_MIN_IN_FLIGHT_MESSAGES
+        );
+        assert_eq!(
+            compute_max_in_flight_messages(100, 4),
+            CHANNEL_MAX_IN_FLIGHT_MESSAGES
+        );
     }
 
     #[test]
@@ -9576,6 +10250,320 @@ mod tests {
         ));
     }
 
+    fn channel_runtime_context_for_defaults_test(
+        zeroclaw_dir: &std::path::Path,
+        agent_alias: &str,
+        default_model_provider: &str,
+        model: &str,
+    ) -> ChannelRuntimeContext {
+        ChannelRuntimeContext {
+            channels_by_name: Arc::new(HashMap::new()),
+            model_provider: Arc::new(DummyModelProvider),
+            model_provider_ref: Arc::new(default_model_provider.to_string()),
+            agent_alias: Arc::new(agent_alias.to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: default_model_provider.into(),
+                ..Default::default()
+            }),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    zeroclaw_dir.to_path_buf(),
+                ),
+            ),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("system".to_string()),
+            model: Arc::new(model.to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions {
+                zeroclaw_dir: Some(zeroclaw_dir.to_path_buf()),
+                ..Default::default()
+            },
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[test]
+    fn runtime_defaults_are_scoped_by_runtime_context() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let agent_a = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "agent_a",
+            "openrouter.default",
+            "startup-a",
+        );
+        let agent_b = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "agent_b",
+            "anthropic.default",
+            "startup-b",
+        );
+        assert!(!runtime_defaults_snapshot(&agent_a).hot);
+        assert!(!runtime_defaults_snapshot(&agent_b).hot);
+
+        let hot_override = ChannelRuntimeOverride {
+            config: Arc::new(zeroclaw_config::schema::Config::default()),
+            defaults: ChannelRuntimeDefaults {
+                default_model_provider: "openrouter.reloaded".to_string(),
+                model: "hot-model".to_string(),
+                temperature: Some(0.7),
+                api_key: Some("hot-key".to_string()),
+                api_url: Some("https://example.test/v1".to_string()),
+                reliability: zeroclaw_config::schema::ReliabilityConfig::default(),
+            },
+            generation: 1,
+        };
+        *agent_a
+            .runtime_defaults_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(hot_override));
+
+        let route_a = default_route_selection_from_snapshot(&runtime_defaults_snapshot(&agent_a));
+        assert_eq!(route_a.model_provider, "openrouter.reloaded");
+        assert_eq!(route_a.model, "hot-model");
+        let snapshot_a = runtime_defaults_snapshot(&agent_a);
+        assert!(snapshot_a.hot);
+        assert_eq!(snapshot_a.generation, 1);
+
+        let route_b = default_route_selection_from_snapshot(&runtime_defaults_snapshot(&agent_b));
+        assert_eq!(route_b.model_provider, "anthropic.default");
+        assert_eq!(route_b.model, "startup-b");
+        assert!(!runtime_defaults_snapshot(&agent_b).hot);
+    }
+
+    #[tokio::test]
+    async fn load_runtime_config_uses_resolved_agent_provider() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        tokio::fs::write(
+            &config_path,
+            r#"
+schema_version = 3
+
+[agents.agent_a]
+model_provider = "openrouter.hot"
+
+[agents.agent_b]
+model_provider = "anthropic.default"
+
+[providers.models.openrouter.hot]
+model = "hot-model"
+api_key = "hot-key"
+uri = "https://hot.example.test/v1"
+temperature = 0.2
+
+[providers.models.anthropic.default]
+model = "cold-model"
+api_key = "cold-key"
+"#,
+        )
+        .await
+        .unwrap();
+
+        let (_config, defaults) = load_runtime_config_and_defaults(&config_path, "agent_a")
+            .await
+            .unwrap();
+
+        assert_eq!(defaults.default_model_provider, "openrouter.hot");
+        assert_eq!(defaults.model, "hot-model");
+        assert_eq!(defaults.api_key.as_deref(), Some("hot-key"));
+        assert_eq!(
+            defaults.api_url.as_deref(),
+            Some("https://hot.example.test/v1")
+        );
+        assert_eq!(defaults.temperature, Some(0.2));
+    }
+
+    #[tokio::test]
+    async fn load_runtime_config_rejects_unresolved_agent_provider() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        tokio::fs::write(
+            &config_path,
+            r#"
+[agents.agent_a]
+model_provider = "openrouter.missing"
+
+[providers.models.anthropic.default]
+model = "cold-model"
+api_key = "cold-key"
+"#,
+        )
+        .await
+        .unwrap();
+
+        let err = load_runtime_config_and_defaults(&config_path, "agent_a")
+            .await
+            .expect_err("unresolved agent provider should reject reload");
+
+        assert!(
+            err.to_string()
+                .contains("model_provider `openrouter.missing` does not resolve")
+        );
+    }
+
+    #[tokio::test]
+    async fn load_runtime_config_rejects_missing_agent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        tokio::fs::write(
+            &config_path,
+            r#"
+[agents.agent_b]
+model_provider = "anthropic.default"
+
+[providers.models.anthropic.default]
+model = "cold-model"
+api_key = "cold-key"
+"#,
+        )
+        .await
+        .unwrap();
+
+        let err = load_runtime_config_and_defaults(&config_path, "agent_a")
+            .await
+            .expect_err("runtime reload should reject a config missing the active agent");
+
+        assert!(err.to_string().contains("agents.agent_a is not configured"));
+    }
+
+    #[tokio::test]
+    async fn load_runtime_config_rejects_empty_agent_provider() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        tokio::fs::write(
+            &config_path,
+            r#"
+[agents.agent_a]
+model_provider = ""
+
+[providers.models.anthropic.default]
+model = "first-model"
+api_key = "first-key"
+
+[providers.models.openrouter.default]
+model = "second-model"
+api_key = "second-key"
+"#,
+        )
+        .await
+        .unwrap();
+
+        let err = load_runtime_config_and_defaults(&config_path, "agent_a")
+            .await
+            .expect_err("empty agent provider should reject reload");
+
+        assert!(err.to_string().contains("model_provider is empty"));
+    }
+
+    #[test]
+    fn provider_credentials_use_target_alias_key_after_reload() {
+        let config: Config = toml::from_str(
+            r#"
+[providers.models.openrouter.default]
+model = "openrouter-model"
+api_key = "openrouter-key"
+uri = "https://openrouter.example.test/v1"
+
+[providers.models.anthropic.default]
+model = "anthropic-model"
+api_key = "anthropic-key"
+uri = "https://anthropic.example.test/v1"
+"#,
+        )
+        .unwrap();
+        let (api_key, api_url) = provider_credentials_for_ref(&config, "anthropic.default");
+
+        assert_eq!(api_key.as_deref(), Some("anthropic-key"));
+        assert_eq!(
+            api_url.as_deref(),
+            Some("https://anthropic.example.test/v1")
+        );
+    }
+
+    #[test]
+    fn provider_credentials_do_not_fall_back_to_default_alias() {
+        let config: Config = toml::from_str(
+            r#"
+[providers.models.openrouter.default]
+model = "openrouter-model"
+api_key = "openrouter-key"
+
+[providers.models.anthropic.default]
+model = "anthropic-model"
+api_key = "anthropic-key"
+"#,
+        )
+        .unwrap();
+
+        let (api_key, api_url) = provider_credentials_for_ref(&config, "anthropic");
+
+        assert_eq!(api_key, None);
+        assert_eq!(api_url, None);
+    }
+
+    #[test]
+    fn provider_cache_key_isolates_hot_generations() {
+        let startup = provider_cache_key("openrouter.default", None, 0);
+        let hot_1 = provider_cache_key("openrouter.default", None, 1);
+        let hot_2 = provider_cache_key("openrouter.default", None, 2);
+
+        assert_eq!(startup, "openrouter.default");
+        assert_ne!(hot_1, startup);
+        assert_ne!(hot_1, hot_2);
+    }
+
     #[test]
     fn strip_tool_result_content_removes_blocks_and_header() {
         let input = r#"[Tool results]
@@ -9750,10 +10738,17 @@ mod tests {
         let ctx = ChannelRuntimeContext {
             channels_by_name: Arc::new(HashMap::new()),
             model_provider: Arc::new(DummyModelProvider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
@@ -9766,8 +10761,6 @@ mod tests {
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -9775,6 +10768,7 @@ mod tests {
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -9807,6 +10801,7 @@ mod tests {
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -9880,10 +10875,17 @@ mod tests {
         let ctx = ChannelRuntimeContext {
             channels_by_name: Arc::new(HashMap::new()),
             model_provider: Arc::new(DummyModelProvider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
@@ -9898,8 +10900,6 @@ mod tests {
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -9907,6 +10907,7 @@ mod tests {
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -9939,6 +10940,7 @@ mod tests {
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -9985,10 +10987,17 @@ mod tests {
         let ctx = ChannelRuntimeContext {
             channels_by_name: Arc::new(HashMap::new()),
             model_provider: Arc::new(DummyModelProvider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
@@ -10001,8 +11010,6 @@ mod tests {
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -10010,6 +11017,7 @@ mod tests {
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -10042,6 +11050,7 @@ mod tests {
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -10092,10 +11101,17 @@ mod tests {
         let ctx = ChannelRuntimeContext {
             channels_by_name: Arc::new(HashMap::new()),
             model_provider: Arc::new(DummyModelProvider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
@@ -10108,8 +11124,6 @@ mod tests {
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -10117,6 +11131,7 @@ mod tests {
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -10149,6 +11164,7 @@ mod tests {
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         };
 
         assert!(rollback_orphan_user_turn(
@@ -10267,6 +11283,11 @@ mod tests {
         sent_messages: tokio::sync::Mutex<Vec<String>>,
     }
 
+    #[derive(Default)]
+    struct WhatsAppRecordingChannel {
+        sent_messages: tokio::sync::Mutex<Vec<String>>,
+    }
+
     impl ::zeroclaw_api::attribution::Attributable for TelegramRecordingChannel {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Channel(
@@ -10323,6 +11344,47 @@ mod tests {
     impl Channel for SlackRecordingChannel {
         fn name(&self) -> &str {
             "slack"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages
+                .lock()
+                .await
+                .push(format!("{}:{}", message.recipient, message.content));
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for WhatsAppRecordingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for WhatsAppRecordingChannel {
+        fn name(&self) -> &str {
+            "whatsapp"
         }
 
         async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
@@ -10420,12 +11482,12 @@ mod tests {
         }
     }
 
-    fn test_runtime_ctx_with_config_agent_and_default_provider(
+    fn test_runtime_ctx_with_config_agent_and_provider_ref(
         channel: Arc<dyn Channel>,
         model_provider: Arc<dyn ModelProvider>,
         prompt_config: zeroclaw_config::schema::Config,
         agent_cfg: zeroclaw_config::schema::AliasedAgentConfig,
-        default_model_provider: &str,
+        model_provider_ref: &str,
     ) -> Arc<ChannelRuntimeContext> {
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
@@ -10433,10 +11495,17 @@ mod tests {
         Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider,
-            default_model_provider: Arc::new(default_model_provider.to_string()),
+            model_provider_ref: Arc::new(model_provider_ref.to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(agent_cfg),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
@@ -10451,8 +11520,6 @@ mod tests {
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -10464,6 +11531,7 @@ mod tests {
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -10492,6 +11560,7 @@ mod tests {
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -10609,7 +11678,17 @@ mod tests {
                 .iter()
                 .find(|msg| msg.role == "user" && msg.content.contains("[Tool results]"))
             {
-                Ok(format!("session result:\n{}", tool_results.content))
+                if tool_results
+                    .content
+                    .contains("Current session: test-channel_chat-42_alice")
+                    && tool_results.content.contains("Messages: 1")
+                {
+                    return Ok(
+                        "Current session: test-channel_chat-42_alice\nMessages: 1".to_string()
+                    );
+                }
+
+                Ok("session result unavailable".to_string())
             } else {
                 self.chat_with_system(None, "", "", None).await
             }
@@ -10767,6 +11846,7 @@ BTC is currently around $65,000 based on latest tool output."#
     #[derive(Default)]
     struct HistoryCaptureModelProvider {
         calls: std::sync::Mutex<Vec<Vec<(String, String)>>>,
+        vision: bool,
     }
 
     #[async_trait::async_trait]
@@ -10794,6 +11874,10 @@ BTC is currently around $65,000 based on latest tool output."#
             let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
             calls.push(snapshot);
             Ok(format!("response-{}", calls.len()))
+        }
+
+        fn supports_vision(&self) -> bool {
+            self.vision
         }
     }
     impl ::zeroclaw_api::attribution::Attributable for HistoryCaptureModelProvider {
@@ -11072,10 +12156,17 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(ToolCallingModelProvider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -11090,8 +12181,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -11103,6 +12192,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -11131,6 +12221,7 @@ BTC is currently around $65,000 based on latest tool output."#
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         process_channel_message(
@@ -11176,9 +12267,16 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(SessionsCurrentModelProvider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![Box::new(
                 zeroclaw_runtime::tools::SessionsCurrentTool::new(Arc::clone(&session_store)),
             )]),
@@ -11195,8 +12293,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -11208,6 +12304,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -11237,6 +12334,7 @@ BTC is currently around $65,000 based on latest tool output."#
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -11284,9 +12382,16 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(ToolCallingModelProvider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -11301,8 +12406,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -11314,6 +12417,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             // Full autonomy + auto-approve mock_price so the loop actually
@@ -11355,6 +12459,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             show_receipts_in_response: true,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -11429,9 +12534,16 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(ToolCallingModelProvider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -11446,8 +12558,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -11459,6 +12569,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             // Match the enabled-test setup so the tool actually runs; the
@@ -11496,6 +12607,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -11545,9 +12657,16 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(ToolCallingModelProvider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -11562,8 +12681,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -11575,6 +12692,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::Full,
@@ -11606,6 +12724,7 @@ BTC is currently around $65,000 based on latest tool output."#
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             agent_transcription_provider: String::new(),
         });
@@ -11675,10 +12794,17 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(ToolCallingModelProvider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -11693,8 +12819,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -11706,6 +12830,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -11734,6 +12859,7 @@ BTC is currently around $65,000 based on latest tool output."#
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         process_channel_message(
@@ -11789,10 +12915,17 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(RawToolArtifactModelProvider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -11807,8 +12940,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -11820,6 +12951,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -11848,6 +12980,7 @@ BTC is currently around $65,000 based on latest tool output."#
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         process_channel_message(
@@ -11888,10 +13021,17 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(ToolCallingAliasModelProvider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -11906,8 +13046,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -11919,6 +13057,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -11947,6 +13086,7 @@ BTC is currently around $65,000 based on latest tool output."#
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         process_channel_message(
@@ -11985,25 +13125,39 @@ BTC is currently around $65,000 based on latest tool output."#
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
-        let default_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
-        let default_model_provider: Arc<dyn ModelProvider> = default_model_provider_impl.clone();
+        let agent_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
+        let agent_model_provider: Arc<dyn ModelProvider> = agent_model_provider_impl.clone();
         let alt_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
         let alt_model_provider: Arc<dyn ModelProvider> = alt_model_provider_impl.clone();
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
         provider_cache_seed.insert(
             "test-provider".to_string(),
-            Arc::clone(&default_model_provider),
+            Arc::clone(&agent_model_provider),
         );
-        provider_cache_seed.insert("openrouter".to_string(), alt_model_provider);
+        provider_cache_seed.insert("openrouter.default".to_string(), alt_model_provider);
+
+        let mut prompt_config = zeroclaw_config::schema::Config::default();
+        prompt_config
+            .providers
+            .models
+            .ensure("openrouter", "default")
+            .expect("openrouter slot must exist");
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
-            model_provider: Arc::clone(&default_model_provider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider: Arc::clone(&agent_model_provider),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -12018,12 +13172,10 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            prompt_config: Arc::new(prompt_config),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -12031,6 +13183,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -12059,6 +13212,7 @@ BTC is currently around $65,000 based on latest tool output."#
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         process_channel_message(
@@ -12082,7 +13236,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let sent = channel_impl.sent_messages.lock().await;
         assert_eq!(sent.len(), 1);
-        assert!(sent[0].contains("ModelProvider switched to `openrouter`"));
+        assert!(sent[0].contains("ModelProvider switched to `openrouter.default`"));
 
         let route_key = "telegram_chat-1_alice";
         let route = runtime_ctx
@@ -12092,13 +13246,11 @@ BTC is currently around $65,000 based on latest tool output."#
             .get(route_key)
             .cloned()
             .expect("route should be stored for sender");
-        assert_eq!(route.model_provider, "openrouter");
+        assert_eq!(route.model_provider, "openrouter.default");
         assert_eq!(route.model, "default-model");
 
         assert_eq!(
-            default_model_provider_impl
-                .call_count
-                .load(Ordering::SeqCst),
+            agent_model_provider_impl.call_count.load(Ordering::SeqCst),
             0
         );
         assert_eq!(alt_model_provider_impl.call_count.load(Ordering::SeqCst), 0);
@@ -12112,15 +13264,15 @@ BTC is currently around $65,000 based on latest tool output."#
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
-        let default_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
-        let default_model_provider: Arc<dyn ModelProvider> = default_model_provider_impl.clone();
+        let agent_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
+        let agent_model_provider: Arc<dyn ModelProvider> = agent_model_provider_impl.clone();
         let routed_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
         let routed_model_provider: Arc<dyn ModelProvider> = routed_model_provider_impl.clone();
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
         provider_cache_seed.insert(
             "test-provider".to_string(),
-            Arc::clone(&default_model_provider),
+            Arc::clone(&agent_model_provider),
         );
         provider_cache_seed.insert("openrouter".to_string(), routed_model_provider);
 
@@ -12137,11 +13289,18 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
-            model_provider: Arc::clone(&default_model_provider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider: Arc::clone(&agent_model_provider),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -12156,8 +13315,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(route_overrides)),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -12169,6 +13326,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -12197,6 +13355,7 @@ BTC is currently around $65,000 based on latest tool output."#
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         process_channel_message(
@@ -12219,9 +13378,7 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         assert_eq!(
-            default_model_provider_impl
-                .call_count
-                .load(Ordering::SeqCst),
+            agent_model_provider_impl.call_count.load(Ordering::SeqCst),
             0
         );
         assert_eq!(
@@ -12263,7 +13420,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ),
             ..Default::default()
         };
-        let runtime_ctx = test_runtime_ctx_with_config_agent_and_default_provider(
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
             channel,
             main_provider,
             prompt_config,
@@ -12339,10 +13496,17 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::clone(&startup_model_provider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -12357,8 +13521,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -12370,6 +13532,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -12398,6 +13561,7 @@ BTC is currently around $65,000 based on latest tool output."#
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         process_channel_message(
@@ -12433,10 +13597,17 @@ BTC is currently around $65,000 based on latest tool output."#
             model_provider: Arc::new(IterativeToolModelProvider {
                 required_tool_iterations: 11,
             }),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -12451,8 +13622,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -12464,6 +13633,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -12495,6 +13665,7 @@ BTC is currently around $65,000 based on latest tool output."#
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         process_channel_message(
@@ -12537,10 +13708,17 @@ BTC is currently around $65,000 based on latest tool output."#
             model_provider: Arc::new(IterativeToolModelProvider {
                 required_tool_iterations: 20,
             }),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -12555,8 +13733,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -12568,6 +13744,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -12599,6 +13776,7 @@ BTC is currently around $65,000 based on latest tool output."#
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         process_channel_message(
@@ -12900,10 +14078,17 @@ BTC is currently around $65,000 based on latest tool output."#
                 in_flight: in_flight.clone(),
                 peak_in_flight: peak_in_flight.clone(),
             }),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -12918,8 +14103,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -12931,6 +14114,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -12959,6 +14143,7 @@ BTC is currently around $65,000 based on latest tool output."#
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(4);
@@ -13033,10 +14218,17 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: provider_impl.clone(),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -13051,8 +14243,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -13064,6 +14254,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -13092,6 +14283,7 @@ BTC is currently around $65,000 based on latest tool output."#
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -13176,10 +14368,17 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: provider_impl.clone(),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -13194,8 +14393,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -13207,6 +14404,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             ack_reactions: true,
             show_tool_calls: true,
@@ -13235,6 +14433,7 @@ BTC is currently around $65,000 based on latest tool output."#
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -13304,22 +14503,42 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn message_dispatch_interrupt_scope_is_same_sender_same_chat() {
-        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+    async fn message_dispatch_interrupts_in_flight_whatsapp_request_and_preserves_context() {
+        let channel_impl = Arc::new(WhatsAppRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
+        let provider_impl = Arc::new(DelayedHistoryCaptureModelProvider {
+            delay: Duration::from_millis(250),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+
+        let mut channel_config = zeroclaw_config::schema::ChannelsConfig::default();
+        channel_config.whatsapp.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                session_path: Some("/tmp/zeroclaw-whatsapp-session.db".into()),
+                interrupt_on_new_message: true,
+                ..Default::default()
+            },
+        );
+
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
-            model_provider: Arc::new(SlowModelProvider {
-                delay: Duration::from_millis(180),
-            }),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider: provider_impl.clone(),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -13334,8 +14553,142 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: interrupt_on_new_message_config(&channel_config),
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let send_task = zeroclaw_spawn::spawn!(async move {
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: "msg-1".to_string(),
+                sender: "15555550123".to_string(),
+                reply_target: "15555550123".to_string(),
+                content: "first WhatsApp question".to_string(),
+                channel: "whatsapp".to_string(),
+                channel_alias: Some("default".to_string()),
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+            })
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            tx.send(zeroclaw_api::channel::ChannelMessage {
+                id: "msg-2".to_string(),
+                sender: "15555550123".to_string(),
+                reply_target: "15555550123".to_string(),
+                content: "second WhatsApp question".to_string(),
+                channel: "whatsapp".to_string(),
+                channel_alias: Some("default".to_string()),
+                timestamp: 2,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+            })
+            .await
+            .unwrap();
+        });
+
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 4).await;
+        send_task.await.unwrap();
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 1);
+        assert!(sent_messages[0].starts_with("15555550123:"));
+        assert!(sent_messages[0].contains("response-2"));
+        drop(sent_messages);
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 2);
+        let second_call = &calls[1];
+        assert!(second_call.iter().any(|(role, content)| {
+            role == "user" && content.contains("first WhatsApp question")
+        }));
+        assert!(second_call.iter().any(|(role, content)| {
+            role == "user" && content.contains("second WhatsApp question")
+        }));
+        assert!(
+            !second_call.iter().any(|(role, _)| role == "assistant"),
+            "cancelled turn should not persist an assistant response"
+        );
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_interrupt_scope_is_same_sender_same_chat() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: Arc::new(SlowModelProvider {
+                delay: Duration::from_millis(180),
+            }),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -13347,6 +14700,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -13375,6 +14729,7 @@ BTC is currently around $65,000 based on latest tool output."#
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -13434,10 +14789,17 @@ BTC is currently around $65,000 based on latest tool output."#
             model_provider: Arc::new(SlowModelProvider {
                 delay: Duration::from_millis(20),
             }),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -13452,8 +14814,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -13465,6 +14825,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -13493,6 +14854,7 @@ BTC is currently around $65,000 based on latest tool output."#
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         process_channel_message(
@@ -13533,10 +14895,17 @@ BTC is currently around $65,000 based on latest tool output."#
             model_provider: Arc::new(SlowModelProvider {
                 delay: Duration::from_millis(5),
             }),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -13551,8 +14920,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -13564,6 +14931,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -13592,6 +14960,7 @@ BTC is currently around $65,000 based on latest tool output."#
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         process_channel_message(
@@ -14180,6 +15549,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 tool: "file_write".to_string(),
                 tool_call_id: None,
                 arguments: Some(payload),
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
             },
         );
 
@@ -14379,6 +15751,137 @@ BTC is currently around $65,000 based on latest tool output."#
             parse_runtime_command("wecom_ws", "/model qwen-max"),
             Some(ChannelRuntimeCommand::SetModel("qwen-max".into()))
         );
+    }
+
+    /// `/models <family>` must resolve to a configured alias-backed ref so the
+    /// switched provider uses the alias entry's key/URI — never construct a bare
+    /// family provider that ignores `[providers.models.<family>.<alias>]`.
+    #[test]
+    fn resolve_models_command_resolves_bare_family_to_configured_alias() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        {
+            let base = config
+                .providers
+                .models
+                .ensure("openrouter", "default")
+                .expect("openrouter slot must exist");
+            base.api_key = Some("sk-configured".into());
+            base.uri = Some("https://router.example/v1".into());
+            base.model = Some("some-model".into());
+        }
+
+        match resolve_models_command(&config, "openrouter") {
+            ModelsCommandResolution::Resolved(r) => assert_eq!(r, "openrouter.default"),
+            other => panic!("expected Resolved(openrouter.default), got {other:?}"),
+        }
+
+        // The resolved ref must carry the configured alias credentials.
+        let (key, uri) = provider_credentials_for_ref(&config, "openrouter.default");
+        assert_eq!(key.as_deref(), Some("sk-configured"));
+        assert_eq!(uri.as_deref(), Some("https://router.example/v1"));
+    }
+
+    /// A bare family with no configured alias has no credentialed provider to
+    /// switch to — the command must fail clearly instead of building a bare one.
+    #[test]
+    fn resolve_models_command_rejects_family_without_alias() {
+        let config = zeroclaw_config::schema::Config::default();
+        match resolve_models_command(&config, "openrouter") {
+            ModelsCommandResolution::NoAlias(f) => assert_eq!(f, "openrouter"),
+            other => panic!("expected NoAlias(openrouter), got {other:?}"),
+        }
+    }
+
+    /// A bare family with several configured aliases is ambiguous; the user must
+    /// qualify which one rather than silently picking.
+    #[test]
+    fn resolve_models_command_flags_ambiguous_family() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config
+            .providers
+            .models
+            .ensure("openrouter", "default")
+            .unwrap();
+        config
+            .providers
+            .models
+            .ensure("openrouter", "secondary")
+            .unwrap();
+
+        match resolve_models_command(&config, "openrouter") {
+            ModelsCommandResolution::Ambiguous { family, aliases } => {
+                assert_eq!(family, "openrouter");
+                assert_eq!(
+                    aliases,
+                    vec!["default".to_string(), "secondary".to_string()]
+                );
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    /// A dotted ref resolves only when the alias entry exists.
+    #[test]
+    fn resolve_models_command_accepts_existing_dotted_ref() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config
+            .providers
+            .models
+            .ensure("openrouter", "default")
+            .unwrap();
+
+        match resolve_models_command(&config, "openrouter.default") {
+            ModelsCommandResolution::Resolved(r) => assert_eq!(r, "openrouter.default"),
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+        match resolve_models_command(&config, "openrouter.missing") {
+            ModelsCommandResolution::NoAlias(r) => assert_eq!(r, "openrouter.missing"),
+            other => panic!("expected NoAlias, got {other:?}"),
+        }
+    }
+
+    /// An unrecognized family is rejected.
+    #[test]
+    fn resolve_models_command_rejects_unknown_family() {
+        let config = zeroclaw_config::schema::Config::default();
+        assert!(matches!(
+            resolve_models_command(&config, "definitely-not-a-provider"),
+            ModelsCommandResolution::Unknown
+        ));
+    }
+
+    #[test]
+    fn runtime_model_switch_resolves_bare_family_to_configured_alias() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config
+            .providers
+            .models
+            .ensure("openrouter", "default")
+            .unwrap();
+
+        let resolved = resolve_provider_ref_for_runtime_switch(&config, "openrouter").unwrap();
+
+        assert_eq!(resolved, "openrouter.default");
+    }
+
+    #[test]
+    fn runtime_model_switch_rejects_ambiguous_bare_family() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config
+            .providers
+            .models
+            .ensure("openrouter", "default")
+            .unwrap();
+        config
+            .providers
+            .models
+            .ensure("openrouter", "secondary")
+            .unwrap();
+
+        let err = resolve_provider_ref_for_runtime_switch(&config, "openrouter")
+            .expect_err("ambiguous model switch provider should reject");
+
+        assert!(err.to_string().contains("multiple configured aliases"));
     }
 
     #[test]
@@ -14712,10 +16215,17 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: provider_impl.clone(),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -14730,8 +16240,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -14743,6 +16251,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -14771,6 +16280,7 @@ BTC is currently around $65,000 based on latest tool output."#
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         process_channel_message(
@@ -14871,10 +16381,17 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: provider_impl.clone(),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new(initial_system_prompt),
@@ -14889,8 +16406,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(config.data_dir.clone()),
@@ -14902,6 +16417,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -14930,6 +16446,7 @@ BTC is currently around $65,000 based on latest tool output."#
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         process_channel_message(
@@ -15070,10 +16587,17 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: provider_impl.clone(),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(RecallMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(RecallMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -15088,8 +16612,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -15101,6 +16623,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -15129,6 +16652,7 @@ BTC is currently around $65,000 based on latest tool output."#
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         process_channel_message(
@@ -15186,6 +16710,144 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn process_channel_message_sends_image_payload_without_persisting_it() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(HistoryCaptureModelProvider {
+            vision: true,
+            ..Default::default()
+        });
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: provider_impl.clone(),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-image-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-image".to_string(),
+                content: "please inspect this".to_string(),
+                channel: "test-channel".to_string(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![zeroclaw_api::media::MediaAttachment {
+                    file_name: "sticker.png".to_string(),
+                    data: vec![1, 2, 3, 4],
+                    mime_type: Some("image/png".to_string()),
+                }],
+                subject: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 1);
+        let current_user = calls[0]
+            .iter()
+            .rev()
+            .find(|(role, _)| role == "user")
+            .expect("provider call should include current user message");
+        assert!(current_user.1.contains("[IMAGE:data:image/png;base64,"));
+        assert!(current_user.1.contains("please inspect this"));
+        drop(calls);
+
+        let histories = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories
+            .peek("test-channel_chat-image_alice")
+            .expect("history should be stored for sender");
+        assert_eq!(turns[0].role, "user");
+        assert!(turns[0].content.starts_with('['));
+        assert!(turns[0].content.contains("[Image: sticker.png attached"));
+        assert!(turns[0].content.contains("please inspect this"));
+        assert!(!turns[0].content.contains("[IMAGE:data:"));
+        assert!(!turns[0].content.contains("AQIDBA"));
+    }
+
+    #[tokio::test]
     async fn process_channel_message_telegram_keeps_system_instruction_at_top_only() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -15208,10 +16870,17 @@ BTC is currently around $65,000 based on latest tool output."#
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: provider_impl.clone(),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -15224,8 +16893,6 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -15237,6 +16904,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -15265,6 +16933,7 @@ BTC is currently around $65,000 based on latest tool output."#
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         process_channel_message(
@@ -15600,6 +17269,30 @@ This is an example JSON object for profile settings."#;
         assert_eq!(state, ChannelHealthState::Timeout);
     }
 
+    #[cfg(feature = "channel-matrix")]
+    #[test]
+    fn matrix_state_dir_is_distinct_per_alias() {
+        // Regression: two [channels.matrix.<alias>] blocks previously resolved
+        // to the same <config>/state/matrix dir, so the second listener to
+        // start restored the first's session.json and ran as the wrong Matrix
+        // account. The alias component must keep them separate.
+        let config_path = std::path::Path::new("/home/u/.zeroclaw/config.toml");
+        let clamps = matrix_state_dir(config_path, "clamps");
+        let bender = matrix_state_dir(config_path, "bender");
+        assert_ne!(
+            clamps, bender,
+            "distinct matrix aliases must not share a state dir"
+        );
+        assert_eq!(
+            clamps,
+            std::path::Path::new("/home/u/.zeroclaw/state/matrix/clamps")
+        );
+        assert_eq!(
+            bender,
+            std::path::Path::new("/home/u/.zeroclaw/state/matrix/bender")
+        );
+    }
+
     #[cfg(feature = "channel-mattermost")]
     #[test]
     fn collect_configured_channels_includes_mattermost_when_configured() {
@@ -15620,6 +17313,8 @@ This is an example JSON object for profile settings."#;
                 interrupt_on_new_message: false,
                 proxy_url: None,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         // A channel is only collected when an enabled agent references it.
@@ -15666,6 +17361,8 @@ This is an example JSON object for profile settings."#;
                 interrupt_on_new_message: false,
                 proxy_url: None,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         config.agents.clear();
@@ -16181,6 +17878,53 @@ This is an example JSON object for profile settings."#;
         assert!(result.is_empty());
     }
 
+    #[test]
+    fn channel_history_content_for_user_turn_strips_inline_image_payload() {
+        let content =
+            "[Image: sticker.webp attached]\n[IMAGE:data:image/png;base64,abcd]\n\nwhat is this?";
+
+        let history_content = channel_history_content_for_user_turn(content);
+
+        assert_eq!(
+            history_content,
+            "[Image: sticker.webp attached]\n\nwhat is this?"
+        );
+        assert!(!history_content.contains("[IMAGE:data:"));
+        assert!(!history_content.contains("abcd"));
+    }
+
+    #[test]
+    fn channel_history_content_for_image_only_turn_keeps_compact_placeholder() {
+        let history_content =
+            channel_history_content_for_user_turn("[IMAGE:data:image/png;base64,abcd]");
+
+        assert_eq!(
+            history_content,
+            "[Image attachment processed by vision model]"
+        );
+    }
+
+    #[test]
+    fn strip_historical_image_payloads_preserves_current_turn_payload() {
+        let mut turns = vec![
+            ChatMessage::user("[Image: old.png attached]\n[IMAGE:data:image/png;base64,old]"),
+            ChatMessage::assistant("I saw the old image."),
+            ChatMessage::user("[Image: now.png attached]\n[IMAGE:data:image/png;base64,current]"),
+        ];
+
+        strip_historical_image_payloads(&mut turns);
+
+        assert_eq!(turns.len(), 3);
+        assert!(turns[0].content.contains("[Image: old.png attached]"));
+        assert!(!turns[0].content.contains("[IMAGE:data:"));
+        assert!(!turns[0].content.contains("base64,old"));
+        assert!(
+            turns[2]
+                .content
+                .contains("[IMAGE:data:image/png;base64,current]")
+        );
+    }
+
     // ── E2E: photo [IMAGE:] marker rejected by non-vision model_provider ───
 
     /// End-to-end test: a photo attachment message (containing `[IMAGE:]`
@@ -16199,10 +17943,17 @@ This is an example JSON object for profile settings."#;
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(DummyModelProvider),
-            default_model_provider: Arc::new("dummy".to_string()),
+            model_provider_ref: Arc::new("dummy".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
@@ -16217,8 +17968,6 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -16230,6 +17979,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -16258,6 +18008,7 @@ This is an example JSON object for profile settings."#;
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -16305,10 +18056,17 @@ This is an example JSON object for profile settings."#;
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(DummyModelProvider),
-            default_model_provider: Arc::new("dummy".to_string()),
+            model_provider_ref: Arc::new("dummy".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
@@ -16323,8 +18081,6 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -16336,6 +18092,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -16364,6 +18121,7 @@ This is an example JSON object for profile settings."#;
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         process_channel_message(
@@ -16451,10 +18209,17 @@ This is an example JSON object for profile settings."#;
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             model_provider: Arc::new(FormatErrorModelProvider),
-            default_model_provider: Arc::new("dummy".to_string()),
+            model_provider_ref: Arc::new("dummy".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
@@ -16469,8 +18234,6 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -16482,6 +18245,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             hooks: None,
@@ -16507,6 +18271,7 @@ This is an example JSON object for profile settings."#;
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
@@ -16614,15 +18379,15 @@ This is an example JSON object for profile settings."#;
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
-        let default_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
-        let default_model_provider: Arc<dyn ModelProvider> = default_model_provider_impl.clone();
+        let agent_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
+        let agent_model_provider: Arc<dyn ModelProvider> = agent_model_provider_impl.clone();
         let vision_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
         let vision_model_provider: Arc<dyn ModelProvider> = vision_model_provider_impl.clone();
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
         provider_cache_seed.insert(
             "test-provider".to_string(),
-            Arc::clone(&default_model_provider),
+            Arc::clone(&agent_model_provider),
         );
         provider_cache_seed.insert("vision-provider".to_string(), vision_model_provider);
 
@@ -16644,11 +18409,18 @@ This is an example JSON object for profile settings."#;
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
-            model_provider: Arc::clone(&default_model_provider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider: Arc::clone(&agent_model_provider),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -16663,8 +18435,6 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -16676,6 +18446,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -16704,6 +18475,7 @@ This is an example JSON object for profile settings."#;
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         process_channel_message(
@@ -16727,9 +18499,7 @@ This is an example JSON object for profile settings."#;
 
         // Vision model_provider should have been called instead of the default.
         assert_eq!(
-            default_model_provider_impl
-                .call_count
-                .load(Ordering::SeqCst),
+            agent_model_provider_impl.call_count.load(Ordering::SeqCst),
             0
         );
         assert_eq!(
@@ -16754,15 +18524,15 @@ This is an example JSON object for profile settings."#;
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
-        let default_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
-        let default_model_provider: Arc<dyn ModelProvider> = default_model_provider_impl.clone();
+        let agent_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
+        let agent_model_provider: Arc<dyn ModelProvider> = agent_model_provider_impl.clone();
         let vision_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
         let vision_model_provider: Arc<dyn ModelProvider> = vision_model_provider_impl.clone();
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
         provider_cache_seed.insert(
             "test-provider".to_string(),
-            Arc::clone(&default_model_provider),
+            Arc::clone(&agent_model_provider),
         );
         provider_cache_seed.insert("vision-provider".to_string(), vision_model_provider);
 
@@ -16785,11 +18555,18 @@ This is an example JSON object for profile settings."#;
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
-            model_provider: Arc::clone(&default_model_provider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider: Arc::clone(&agent_model_provider),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -16804,8 +18581,6 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -16817,6 +18592,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -16845,6 +18621,7 @@ This is an example JSON object for profile settings."#;
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         process_channel_message(
@@ -16868,9 +18645,7 @@ This is an example JSON object for profile settings."#;
 
         // Default model_provider should be used since classification is disabled.
         assert_eq!(
-            default_model_provider_impl
-                .call_count
-                .load(Ordering::SeqCst),
+            agent_model_provider_impl.call_count.load(Ordering::SeqCst),
             1
         );
         assert_eq!(
@@ -16887,15 +18662,15 @@ This is an example JSON object for profile settings."#;
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
-        let default_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
-        let default_model_provider: Arc<dyn ModelProvider> = default_model_provider_impl.clone();
+        let agent_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
+        let agent_model_provider: Arc<dyn ModelProvider> = agent_model_provider_impl.clone();
         let vision_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
         let vision_model_provider: Arc<dyn ModelProvider> = vision_model_provider_impl.clone();
 
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
         provider_cache_seed.insert(
             "test-provider".to_string(),
-            Arc::clone(&default_model_provider),
+            Arc::clone(&agent_model_provider),
         );
         provider_cache_seed.insert("vision-provider".to_string(), vision_model_provider);
 
@@ -16918,11 +18693,18 @@ This is an example JSON object for profile settings."#;
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
-            model_provider: Arc::clone(&default_model_provider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider: Arc::clone(&agent_model_provider),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -16937,8 +18719,6 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -16950,6 +18730,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -16978,6 +18759,7 @@ This is an example JSON object for profile settings."#;
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         process_channel_message(
@@ -17001,9 +18783,7 @@ This is an example JSON object for profile settings."#;
 
         // Default model_provider should be used since no classification rule matched.
         assert_eq!(
-            default_model_provider_impl
-                .call_count
-                .load(Ordering::SeqCst),
+            agent_model_provider_impl.call_count.load(Ordering::SeqCst),
             1
         );
         assert_eq!(
@@ -17020,8 +18800,8 @@ This is an example JSON object for profile settings."#;
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
-        let default_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
-        let default_model_provider: Arc<dyn ModelProvider> = default_model_provider_impl.clone();
+        let agent_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
+        let agent_model_provider: Arc<dyn ModelProvider> = agent_model_provider_impl.clone();
         let fast_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
         let fast_model_provider: Arc<dyn ModelProvider> = fast_model_provider_impl.clone();
         let code_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
@@ -17030,7 +18810,7 @@ This is an example JSON object for profile settings."#;
         let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
         provider_cache_seed.insert(
             "test-provider".to_string(),
-            Arc::clone(&default_model_provider),
+            Arc::clone(&agent_model_provider),
         );
         provider_cache_seed.insert("fast-provider".to_string(), fast_model_provider);
         provider_cache_seed.insert("code-provider".to_string(), code_model_provider);
@@ -17071,11 +18851,18 @@ This is an example JSON object for profile settings."#;
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
-            model_provider: Arc::clone(&default_model_provider),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider: Arc::clone(&agent_model_provider),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -17090,8 +18877,6 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -17103,6 +18888,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -17131,6 +18917,7 @@ This is an example JSON object for profile settings."#;
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         process_channel_message(
@@ -17154,9 +18941,7 @@ This is an example JSON object for profile settings."#;
 
         // Higher-priority "code" rule (priority=10) should win over "fast" (priority=1).
         assert_eq!(
-            default_model_provider_impl
-                .call_count
-                .load(Ordering::SeqCst),
+            agent_model_provider_impl.call_count.load(Ordering::SeqCst),
             0
         );
         assert_eq!(
@@ -17211,6 +18996,8 @@ This is an example JSON object for profile settings."#;
                 proxy_url: None,
                 approval_timeout_secs: 120,
                 excluded_tools: vec![],
+                reply_min_interval_secs: 0,
+                reply_queue_depth_max: 0,
             },
         );
         let config_arc = Arc::new(RwLock::new(config));
@@ -17316,6 +19103,7 @@ This is an example JSON object for profile settings."#;
             discord: false,
             mattermost: true,
             matrix: false,
+            whatsapp: false,
         };
         assert!(cfg.enabled_for_channel("mattermost"));
     }
@@ -17328,6 +19116,7 @@ This is an example JSON object for profile settings."#;
             discord: false,
             mattermost: false,
             matrix: false,
+            whatsapp: false,
         };
         assert!(!cfg.enabled_for_channel("mattermost"));
     }
@@ -17340,8 +19129,40 @@ This is an example JSON object for profile settings."#;
             discord: true,
             mattermost: false,
             matrix: false,
+            whatsapp: false,
         };
         assert!(cfg.enabled_for_channel("discord"));
+    }
+
+    #[test]
+    fn interrupt_on_new_message_enabled_for_whatsapp() {
+        let cfg = InterruptOnNewMessageConfig {
+            telegram: false,
+            slack: false,
+            discord: false,
+            mattermost: false,
+            matrix: false,
+            whatsapp: true,
+        };
+        assert!(cfg.enabled_for_channel("whatsapp"));
+    }
+
+    #[test]
+    fn interrupt_on_new_message_config_reads_whatsapp_default_alias() {
+        let mut channels = zeroclaw_config::schema::ChannelsConfig::default();
+        channels.whatsapp.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                session_path: Some("/tmp/zeroclaw-whatsapp-session.db".into()),
+                interrupt_on_new_message: true,
+                ..Default::default()
+            },
+        );
+
+        let cfg = interrupt_on_new_message_config(&channels);
+
+        assert!(cfg.enabled_for_channel("whatsapp"));
+        assert!(!cfg.enabled_for_channel("telegram"));
     }
 
     #[test]
@@ -17352,6 +19173,7 @@ This is an example JSON object for profile settings."#;
             discord: false,
             mattermost: false,
             matrix: false,
+            whatsapp: false,
         };
         assert!(!cfg.enabled_for_channel("discord"));
     }
@@ -17426,10 +19248,17 @@ This is an example JSON object for profile settings."#;
             model_provider: Arc::new(SlowModelProvider {
                 delay: Duration::from_millis(150),
             }),
-            default_model_provider: Arc::new("test-provider".to_string()),
+            model_provider_ref: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
             agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
             memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             tools_registry: Arc::new(vec![]),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
@@ -17444,8 +19273,6 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -17457,6 +19284,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
@@ -17485,6 +19313,7 @@ This is an example JSON object for profile settings."#;
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -17850,6 +19679,30 @@ Done."#;
         assert!(!result.contains("shell"));
     }
 
+    #[test]
+    fn sanitize_channel_response_strips_xml_tool_result_blocks() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let input = "<tool_result>\n{\"results\":[]}\n</tool_result>\n<tool_result>\n{\"command\":\"ls\",\"exit_code\":0}\n</tool_result>Here is what I found.";
+
+        let result = sanitize_channel_response(input, &tools);
+
+        assert!(!result.contains("tool_result"));
+        assert!(!result.contains("exit_code"));
+        assert!(result.contains("Here is what I found."));
+    }
+
+    #[test]
+    fn sanitize_channel_response_strips_mixed_tool_result_and_text() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let input = "Let me check.\n<tool_result name=\"shell\">\noutput here\n</tool_result>\nThe answer is 42.";
+
+        let result = sanitize_channel_response(input, &tools);
+
+        assert!(!result.contains("<tool_result"));
+        assert!(!result.contains("output here"));
+        assert!(result.contains("The answer is 42."));
+    }
+
     // ── Tests for strip_think_tags_inline (streaming draft sanitization) ──
 
     #[test]
@@ -17950,6 +19803,115 @@ Done."#;
         ));
         assert!(!is_tool_call_content("The iPad has been blocked."));
         assert!(!is_tool_call_content(""));
+    }
+
+    #[test]
+    fn is_tool_call_content_does_not_misclassify_regular_name_json() {
+        assert!(!is_tool_call_content(
+            "{\"name\":\"Alice\",\"role\":\"admin\"}"
+        ));
+    }
+
+    #[test]
+    fn strip_old_tool_context_preserves_recent_tool_context_when_history_within_keep_window() {
+        let ctx = router_test_ctx();
+        let sender = "tool-window-short";
+        seed_sender_history(
+            ctx.as_ref(),
+            sender,
+            vec![
+                ChatMessage::user("block the iPad"),
+                ChatMessage::assistant("{\"tool_call\": \"shell\"}"),
+                ChatMessage::tool(r#"{"tool_call_id":"call_1","content":"ok"}"#),
+                ChatMessage::assistant("Done, iPad is blocked."),
+            ],
+        );
+
+        strip_old_tool_context(ctx.as_ref(), sender, 2);
+
+        let turns = cloned_sender_history(ctx.as_ref(), sender);
+        assert_eq!(
+            turns.len(),
+            4,
+            "tool context in protected turns must not be stripped"
+        );
+        assert_eq!(turns[1].role, "assistant");
+        assert!(turns[1].content.contains("tool_call"));
+        assert_eq!(turns[2].role, "tool");
+    }
+
+    #[test]
+    fn strip_old_tool_context_strips_tool_context_before_keep_window_boundary() {
+        let ctx = router_test_ctx();
+        let sender = "tool-window-boundary";
+        seed_sender_history(
+            ctx.as_ref(),
+            sender,
+            vec![
+                ChatMessage::user("first task"),
+                ChatMessage::assistant("{\"tool_call\": \"shell\"}"),
+                ChatMessage::tool("ok"),
+                ChatMessage::assistant("first task done"),
+                ChatMessage::user("second task"),
+                ChatMessage::assistant("second task done"),
+                ChatMessage::user("third task"),
+                ChatMessage::assistant("third task done"),
+            ],
+        );
+
+        strip_old_tool_context(ctx.as_ref(), sender, 2);
+
+        let turns = cloned_sender_history(ctx.as_ref(), sender);
+        assert_eq!(
+            history_signature(&turns),
+            vec![
+                ("user".to_string(), "first task".to_string()),
+                ("assistant".to_string(), "first task done".to_string()),
+                ("user".to_string(), "second task".to_string()),
+                ("assistant".to_string(), "second task done".to_string()),
+                ("user".to_string(), "third task".to_string()),
+                ("assistant".to_string(), "third task done".to_string()),
+            ],
+            "tool context older than the protected keep window should be stripped"
+        );
+    }
+
+    #[test]
+    fn strip_old_tool_context_removes_native_tool_call_assistant_messages() {
+        let ctx = router_test_ctx();
+        let sender = "tool-window-native";
+        seed_sender_history(
+            ctx.as_ref(),
+            sender,
+            vec![
+                ChatMessage::user("first task"),
+                ChatMessage::assistant(
+                    r#"{"content":"Need to call tool","tool_calls":[{"id":"call_1","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#,
+                ),
+                ChatMessage::tool(r#"{"tool_call_id":"call_1","content":"ok"}"#),
+                ChatMessage::assistant("first task done"),
+                ChatMessage::user("second task"),
+                ChatMessage::assistant("second task done"),
+                ChatMessage::user("third task"),
+                ChatMessage::assistant("third task done"),
+            ],
+        );
+
+        strip_old_tool_context(ctx.as_ref(), sender, 1);
+
+        let turns = cloned_sender_history(ctx.as_ref(), sender);
+        assert_eq!(
+            history_signature(&turns),
+            vec![
+                ("user".to_string(), "first task".to_string()),
+                ("assistant".to_string(), "first task done".to_string()),
+                ("user".to_string(), "second task".to_string()),
+                ("assistant".to_string(), "second task done".to_string()),
+                ("user".to_string(), "third task".to_string()),
+                ("assistant".to_string(), "third task done".to_string()),
+            ],
+            "native assistant tool-call JSON should be stripped together with old tool results"
+        );
     }
 
     #[test]
@@ -18188,6 +20150,8 @@ Done."#;
                 use_feishu: false,
                 app_id: "cli_test".to_string(),
                 app_secret: "secret".to_string(),
+                approval_timeout_secs: 300,
+                per_user_session: false,
                 ..Default::default()
             },
         );

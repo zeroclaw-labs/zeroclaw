@@ -111,7 +111,13 @@ pub async fn handle_events_history(
 ///
 /// Contract: broadcast events must not include `session_id` unless they are
 /// intentionally scoped to that session and hidden from global `/api/events`.
+/// Observability telemetry (events tagged `source: "observability"`) is
+/// explicitly public — it is global monitoring data intended for the
+/// dashboard SSE stream even though it never carries a chat `session_id`.
 fn is_public_sse_event(event: &serde_json::Value) -> bool {
+    if event.get("source").and_then(serde_json::Value::as_str) == Some("observability") {
+        return true;
+    }
     event
         .get("session_id")
         .and_then(serde_json::Value::as_str)
@@ -144,6 +150,13 @@ impl BroadcastObserver {
 
 impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
     fn record_event(&self, event: &zeroclaw_runtime::observability::ObserverEvent) {
+        // Helper for optional string fields
+        fn add_optional_string(json: &mut serde_json::Value, key: &str, value: &Option<String>) {
+            if let Some(value) = value {
+                json[key] = serde_json::Value::String(value.clone());
+            }
+        }
+
         // Recording into the primary observer (logs / Prometheus) is the
         // responsibility of whoever built the event source; `TeeObserver`
         // takes care of that fan-out. Here we only translate to JSON and
@@ -152,35 +165,68 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
             zeroclaw_runtime::observability::ObserverEvent::LlmRequest {
                 model_provider,
                 model,
-                ..
-            } => serde_json::json!({
-                "type": "llm_request",
-                "model_provider": model_provider,
-                "model": model,
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-            }),
+                messages_count,
+                channel,
+                agent_alias,
+                turn_id,
+            } => {
+                let mut json = serde_json::json!({
+                    "type": "llm_request",
+                    "source": "observability",
+                    "model_provider": model_provider,
+                    "model": model,
+                    "messages_count": messages_count,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                });
+                add_optional_string(&mut json, "channel", channel);
+                add_optional_string(&mut json, "agent_alias", agent_alias);
+                add_optional_string(&mut json, "turn_id", turn_id);
+                json
+            }
             zeroclaw_runtime::observability::ObserverEvent::ToolCall {
                 tool,
                 duration,
                 success,
+                channel,
+                agent_alias,
+                turn_id,
                 ..
-            } => serde_json::json!({
-                "type": "tool_call",
-                "tool": tool,
-                "duration_ms": duration.as_millis(),
-                "success": success,
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-            }),
-            zeroclaw_runtime::observability::ObserverEvent::ToolCallStart { tool, .. } => {
-                serde_json::json!({
+            } => {
+                let mut json = serde_json::json!({
+                    "type": "tool_call",
+                    "source": "observability",
+                    "tool": tool,
+                    "duration_ms": duration.as_millis(),
+                    "success": success,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                });
+                add_optional_string(&mut json, "channel", channel);
+                add_optional_string(&mut json, "agent_alias", agent_alias);
+                add_optional_string(&mut json, "turn_id", turn_id);
+                json
+            }
+            zeroclaw_runtime::observability::ObserverEvent::ToolCallStart {
+                tool,
+                channel,
+                agent_alias,
+                turn_id,
+                ..
+            } => {
+                let mut json = serde_json::json!({
                     "type": "tool_call_start",
+                    "source": "observability",
                     "tool": tool,
                     "timestamp": chrono::Utc::now().to_rfc3339(),
-                })
+                });
+                add_optional_string(&mut json, "channel", channel);
+                add_optional_string(&mut json, "agent_alias", agent_alias);
+                add_optional_string(&mut json, "turn_id", turn_id);
+                json
             }
             zeroclaw_runtime::observability::ObserverEvent::Error { component, message } => {
                 serde_json::json!({
                     "type": "error",
+                    "source": "observability",
                     "component": component,
                     "message": message,
                     "timestamp": chrono::Utc::now().to_rfc3339(),
@@ -189,13 +235,21 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
             zeroclaw_runtime::observability::ObserverEvent::AgentStart {
                 model_provider,
                 model,
+                channel,
+                agent_alias,
+                turn_id,
             } => {
-                serde_json::json!({
+                let mut json = serde_json::json!({
                     "type": "agent_start",
+                    "source": "observability",
                     "model_provider": model_provider,
                     "model": model,
                     "timestamp": chrono::Utc::now().to_rfc3339(),
-                })
+                });
+                add_optional_string(&mut json, "channel", channel);
+                add_optional_string(&mut json, "agent_alias", agent_alias);
+                add_optional_string(&mut json, "turn_id", turn_id);
+                json
             }
             zeroclaw_runtime::observability::ObserverEvent::AgentEnd {
                 model_provider,
@@ -203,15 +257,37 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 duration,
                 tokens_used,
                 cost_usd,
-            } => serde_json::json!({
-                "type": "agent_end",
-                "model_provider": model_provider,
-                "model": model,
-                "duration_ms": duration.as_millis(),
-                "tokens_used": tokens_used,
-                "cost_usd": cost_usd,
-                "timestamp": chrono::Utc::now().to_rfc3339(),
-            }),
+                channel,
+                agent_alias,
+                turn_id,
+            } => {
+                let (tokens_total, input_tokens, output_tokens) = tokens_used
+                    .as_ref()
+                    .map(|usage| {
+                        (
+                            Some(usage.input_tokens.saturating_add(usage.output_tokens)),
+                            Some(usage.input_tokens),
+                            Some(usage.output_tokens),
+                        )
+                    })
+                    .unwrap_or((None, None, None));
+                let mut json = serde_json::json!({
+                    "type": "agent_end",
+                    "source": "observability",
+                    "model_provider": model_provider,
+                    "model": model,
+                    "duration_ms": duration.as_millis(),
+                    "tokens_used": tokens_total,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "cost_usd": cost_usd,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                });
+                add_optional_string(&mut json, "channel", channel);
+                add_optional_string(&mut json, "agent_alias", agent_alias);
+                add_optional_string(&mut json, "turn_id", turn_id);
+                json
+            }
             _ => return, // Skip events we don't broadcast
         };
 
@@ -259,6 +335,9 @@ mod tests {
             success: true,
             arguments: None,
             result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
 
         let value = rx.try_recv().expect("event should be broadcast");
@@ -279,6 +358,9 @@ mod tests {
             tool: "mcp_filesystem__read_file".into(),
             tool_call_id: None,
             arguments: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
 
         let value = rx.try_recv().expect("event should be broadcast");
@@ -310,6 +392,114 @@ mod tests {
 
         assert!(!is_public_sse_event(&session_event));
         assert!(is_public_sse_event(&global_event));
+    }
+
+    #[test]
+    fn observability_tagged_events_are_public_even_without_session_id() {
+        // After #7151, observability frames keep the SSE pathway open even
+        // though they would not otherwise carry a session_id discriminator.
+        let obs = serde_json::json!({
+            "type": "tool_call",
+            "source": "observability",
+            "tool": "shell",
+        });
+        assert!(is_public_sse_event(&obs));
+    }
+
+    #[test]
+    fn broadcast_agent_end_includes_turn_metadata_and_token_total() {
+        let (obs, mut rx, _buffer) = make_broadcast();
+
+        obs.record_event(&ObserverEvent::AgentEnd {
+            model_provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            duration: std::time::Duration::from_millis(42),
+            tokens_used: Some(zeroclaw_api::observability_traits::TurnTokenUsage {
+                input_tokens: 12,
+                output_tokens: 34,
+            }),
+            cost_usd: Some(0.001),
+            channel: Some("wss".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
+        });
+
+        let value = rx.try_recv().expect("event should be broadcast");
+        assert_eq!(value["type"], "agent_end");
+        assert_eq!(value["source"], "observability");
+        assert_eq!(value["tokens_used"], 46);
+        assert_eq!(value["input_tokens"], 12);
+        assert_eq!(value["output_tokens"], 34);
+        assert_eq!(value["channel"], "wss");
+        assert_eq!(value["agent_alias"], "default");
+        assert_eq!(value["turn_id"], "turn-1");
+    }
+
+    #[test]
+    fn broadcast_observer_tags_every_event_with_observability_source() {
+        // The chat-WS filter relies on this tag as a defense-in-depth check
+        // (any future emitter that forgets to set session_id still gets
+        // routed correctly). Cover every variant the observer broadcasts.
+        let (obs, mut rx, _buffer) = make_broadcast();
+
+        let cases: Vec<ObserverEvent> = vec![
+            ObserverEvent::LlmRequest {
+                model_provider: "p".into(),
+                model: "m".into(),
+                messages_count: 0,
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+            },
+            ObserverEvent::ToolCall {
+                tool: "shell".into(),
+                tool_call_id: None,
+                duration: std::time::Duration::from_millis(1),
+                success: true,
+                arguments: None,
+                result: None,
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+            },
+            ObserverEvent::ToolCallStart {
+                tool: "shell".into(),
+                tool_call_id: None,
+                arguments: None,
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+            },
+            ObserverEvent::Error {
+                component: "any".into(),
+                message: "boom".into(),
+            },
+            ObserverEvent::AgentStart {
+                model_provider: "p".into(),
+                model: "m".into(),
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+            },
+            ObserverEvent::AgentEnd {
+                model_provider: "p".into(),
+                model: "m".into(),
+                duration: std::time::Duration::from_millis(1),
+                tokens_used: None,
+                cost_usd: None,
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+            },
+        ];
+        for ev in cases {
+            obs.record_event(&ev);
+            let v = rx.try_recv().expect("event must broadcast");
+            assert_eq!(
+                v["source"], "observability",
+                "every BroadcastObserver event must be tagged source=observability: {v}"
+            );
+        }
     }
 
     /// End-to-end coverage of the wiring `run_gateway` performs at startup:
@@ -347,6 +537,9 @@ mod tests {
             success: true,
             arguments: None,
             result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
 
         let value = rx
