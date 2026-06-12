@@ -1687,6 +1687,84 @@ impl Channel for WhatsAppWebChannel {
         );
         Ok(())
     }
+
+    async fn add_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        if message_id.is_empty() || emoji.is_empty() {
+            return Ok(());
+        }
+        let client = self.client.lock().clone();
+        let Some(client) = client else {
+            anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
+        };
+        let deliverable = Self::resolve_outbound_recipient(channel_id);
+        let to = self.recipient_to_jid(&deliverable)?;
+        let outgoing = waproto::whatsapp::Message {
+            reaction_message: Some(
+                waproto::whatsapp::message::ReactionMessage {
+                    key: Some(waproto::whatsapp::MessageKey {
+                        remote_jid: Some(to.to_string()),
+                        from_me: Some(false),
+                        id: Some(message_id.to_string()),
+                        ..Default::default()
+                    }),
+                    text: Some(emoji.to_string()),
+                    ..Default::default()
+                },
+            ),
+            ..Default::default()
+        };
+        Box::pin(client.send_message(to, outgoing)).await?;
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("reaction {emoji} added to {message_id}")
+        );
+        Ok(())
+    }
+
+    async fn remove_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        if message_id.is_empty() {
+            return Ok(());
+        }
+        let client = self.client.lock().clone();
+        let Some(client) = client else {
+            anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
+        };
+        let deliverable = Self::resolve_outbound_recipient(channel_id);
+        let to = self.recipient_to_jid(&deliverable)?;
+        let outgoing = waproto::whatsapp::Message {
+            reaction_message: Some(
+                waproto::whatsapp::message::ReactionMessage {
+                    key: Some(waproto::whatsapp::MessageKey {
+                        remote_jid: Some(to.to_string()),
+                        from_me: Some(false),
+                        id: Some(message_id.to_string()),
+                        ..Default::default()
+                    }),
+                    text: Some(String::new()),
+                    ..Default::default()
+                },
+            ),
+            ..Default::default()
+        };
+        Box::pin(client.send_message(to, outgoing)).await?;
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("reaction {emoji} removed from {message_id}")
+        );
+        Ok(())
+    }
 }
 
 // Stub implementation when feature is not enabled
@@ -1764,6 +1842,28 @@ impl Channel for WhatsAppWebChannel {
     }
 
     async fn stop_typing(&self, _recipient: &str) -> Result<()> {
+        anyhow::bail!(i18n::get_required_cli_string(
+            "channel-whatsapp-web-feature-missing-error"
+        ));
+    }
+
+    async fn add_reaction(
+        &self,
+        _channel_id: &str,
+        _message_id: &str,
+        _emoji: &str,
+    ) -> Result<()> {
+        anyhow::bail!(i18n::get_required_cli_string(
+            "channel-whatsapp-web-feature-missing-error"
+        ));
+    }
+
+    async fn remove_reaction(
+        &self,
+        _channel_id: &str,
+        _message_id: &str,
+        _emoji: &str,
+    ) -> Result<()> {
         anyhow::bail!(i18n::get_required_cli_string(
             "channel-whatsapp-web-feature-missing-error"
         ));
