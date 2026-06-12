@@ -37,7 +37,7 @@ pub(crate) const BASE_URL: &str = "https://api.telnyx.com/v2/ai";
 /// let response = model_provider.chat("Hello!", "openai/gpt-4o", 0.7).await?;
 /// ```
 pub struct TelnyxModelProvider {
-    /// `[model_providers.telnyx.<alias>]` config-key alias.
+    /// `[providers.models.telnyx.<alias>]` config-key alias.
     alias: String,
     /// Telnyx API key
     api_key: Option<String>,

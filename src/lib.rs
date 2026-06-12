@@ -42,7 +42,7 @@ pub mod agent;
 #[cfg(feature = "agent-runtime")]
 pub(crate) mod approval;
 #[cfg(feature = "agent-runtime")]
-pub(crate) mod auth;
+pub mod auth;
 #[cfg(feature = "agent-runtime")]
 pub mod channels;
 pub mod commands;
@@ -180,7 +180,7 @@ registry, and issues a fresh code. Use this after a suspected token \
 leak when you do not know which token was compromised; every client \
 must re-pair.
 
-With --rotate-device <id>, revokes just that device's bearer token \
+With --rotate-device ID, revokes just that device's bearer token \
 and issues a fresh code for re-pairing that one device.
 
 Examples:

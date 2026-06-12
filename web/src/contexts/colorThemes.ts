@@ -2,6 +2,7 @@ import themesData from './themes.json';
 
 export type ColorThemeId =
   | 'default-dark' | 'default-light' | 'oled-black'
+  | 'icy-blue'
   | 'nord-dark' | 'nord-light'
   | 'dracula' | 'monokai'
   | 'solarized-dark' | 'solarized-light'

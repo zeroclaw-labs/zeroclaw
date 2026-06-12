@@ -54,7 +54,7 @@ import {
 } from "../../lib/api";
 import { useConfigDraft } from "../../lib/draftStore";
 import { fuzzyFilter } from "../../lib/fuzzy";
-import { isLocalModelProviderName } from "../../lib/modelProviders";
+import { isLocalModelProviderName, primeModelProviderCatalog } from "../../lib/modelProviders";
 import EntityEnabledToggle from "../EntityEnabledToggle";
 
 function entryValue(entry: ListResponseEntry): unknown {
@@ -1100,6 +1100,7 @@ function FieldRow({
 
   useEffect(() => {
     if (!isProviderModelField) return;
+    void primeModelProviderCatalog();
     const [, , provider, alias] = entry.path.split('.');
     if (!provider || !alias) return;
     const cacheKey = `${provider}.${alias}`;

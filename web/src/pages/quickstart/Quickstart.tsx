@@ -6,7 +6,6 @@ import {
   ChevronRight,
   Cpu,
   FileText,
-  Gauge,
   HardDrive,
   Plus,
   Radio,
@@ -146,7 +145,7 @@ export default function Quickstart() {
     const res = await quickstartApply({
       model_provider: { mode: "fresh", value: form.provider! },
       risk_profile: { mode: "fresh", value: form.risk!.preset_name },
-      runtime_profile: { mode: "fresh", value: form.runtime!.preset_name },
+      runtime_profile: { mode: "fresh", value: "unbounded" },
       memory: { mode: "fresh", value: form.memory!.preset_name },
       channels: form.channels.map((c) =>
         c.mode === "existing"
@@ -185,7 +184,6 @@ export default function Quickstart() {
   const allDone =
     providerDone &&
     form.risk !== null &&
-    form.runtime !== null &&
     form.memory !== null &&
     form.agentName.trim() !== "";
 
@@ -238,21 +236,6 @@ export default function Quickstart() {
         onChange={(v) => {
           setForm((f) => ({ ...f, risk: { preset_name: v } }));
           recordStep("risk_profile");
-        }}
-      />
-
-      <PresetSection
-        icon={<Gauge className="h-4 w-4" />}
-        title="Runtime profile"
-        rows={(state?.runtime_presets ?? []).map((p) => ({
-          value: p.preset_name,
-          label: p.label,
-          help: p.help,
-        }))}
-        value={form.runtime?.preset_name ?? ""}
-        onChange={(v) => {
-          setForm((f) => ({ ...f, runtime: { preset_name: v } }));
-          recordStep("runtime_profile");
         }}
       />
 

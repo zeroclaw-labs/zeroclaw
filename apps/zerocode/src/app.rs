@@ -32,6 +32,10 @@ pub struct CrossReconnectState {
     /// Agent alias the next `run()` invocation should switch the
     /// Chat tab onto. Consumed (cleared) after the first read.
     pub start_chat_with: Option<String>,
+    /// Agent alias that should be opened immediately without waiting
+    /// for a reconnect. Quickstart uses this when apply succeeds but
+    /// the daemon reports that no reload supervisor was signalled.
+    pub start_chat_now: Option<String>,
 }
 
 pub type SharedReconnectState = Arc<Mutex<CrossReconnectState>>;
@@ -103,6 +107,23 @@ async fn switch_mode(
         }
     }
     *mode = next;
+}
+
+async fn consume_immediate_start_chat(
+    reconnect_state: &SharedReconnectState,
+    mode: &mut Mode,
+    chat_pane: &mut chat::Chat,
+) {
+    let alias = {
+        let Ok(mut guard) = reconnect_state.lock() else {
+            return;
+        };
+        guard.start_chat_now.take()
+    };
+    if let Some(alias) = alias {
+        chat_pane.focus_agent(&alias).await;
+        *mode = Mode::Chat;
+    }
 }
 
 // ── Top-level entry point ────────────────────────────────────────
@@ -471,6 +492,9 @@ pub async fn run(
             if mode == Mode::Logs {
                 logs_pane.tick().await;
             }
+            if mode == Mode::Quickstart {
+                quickstart.tick().await;
+            }
             continue;
         }
 
@@ -606,6 +630,7 @@ pub async fn run(
                     )
                     .await;
                 }
+                consume_immediate_start_chat(&reconnect_state, &mut mode, &mut chat_pane).await;
             }
             Event::Mouse(mouse) => {
                 // Dismiss help on any click
@@ -661,6 +686,7 @@ pub async fn run(
                             quickstart.handle_mouse(mouse, content_area).await;
                         }
                     }
+                    consume_immediate_start_chat(&reconnect_state, &mut mode, &mut chat_pane).await;
                 }
             }
             Event::Paste(text) if !matches!(conn_state, ConnectionState::Disconnected { .. }) => {
@@ -783,8 +809,11 @@ fn draw_status_bar(
     spans.push(Span::styled(label, style));
     frame.render_widget(Paragraph::new(Line::from(spans)), right_area);
 
-    // Left: ctx bar, left-aligned in its own column.
-    if let Some(w) = ctx.widget() {
+    // Left: ctx bar, left-aligned in its own column. The bar is held back
+    // until the context-accounting feature is ready to show; there is no
+    // user-facing switch — the gate flips when the work lands.
+    const SHOW_CTX_BAR: bool = false;
+    if SHOW_CTX_BAR && let Some(w) = ctx.widget() {
         frame.render_widget(w, left_area);
     }
 }
