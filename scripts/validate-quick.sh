@@ -46,5 +46,26 @@ else
   report 1 "UPSTREAM_SYNC.md missing on both main and feat branch"
 fi
 
+# PLAN-1.2 FILL — workspace skeleton + binary split
+test -f bins/engineer/Cargo.toml -a -f bins/engineer/src/main.rs && report 0 "bins/engineer/ exists" || report 1 "bins/engineer/ missing"
+test -f bins/wizard/Cargo.toml -a -f bins/wizard/src/main.rs && report 0 "bins/wizard/ exists" || report 1 "bins/wizard/ missing"
+grep -q 'name = "osagent-engineer"' bins/engineer/Cargo.toml 2>/dev/null && report 0 "engineer package named correctly" || report 1 "engineer package name wrong"
+grep -q 'name = "osagent-wizard"' bins/wizard/Cargo.toml 2>/dev/null && report 0 "wizard package named correctly" || report 1 "wizard package name wrong"
+# WS-02 prep: wizard Cargo.toml must NOT have an actual dep declaration on osagent-tools-mcp
+# (structural exclusion). Comments mentioning the crate name are fine — they document the rule.
+# Match only TOML key-assignment lines: `^name =` or `^name.workspace = ...` etc.
+if grep -nE '^(osagent-tools-mcp|osagent-mcp)\s*(=|\.)' bins/wizard/Cargo.toml 2>/dev/null; then
+  report 1 "wizard Cargo.toml has an MCP dep declaration — violates wizard-no-MCP property"
+else
+  report 0 "wizard Cargo.toml has no MCP dep declaration"
+fi
+# WS-04: deny.toml bans inventory/linkme/ctor
+grep -qE '"(inventory|linkme|ctor)"' deny.toml 2>/dev/null && report 0 "deny.toml bans distributed-slice crates" || report 1 "deny.toml missing inventory/linkme/ctor ban"
+# WS-04 source-grep: no actual invocations in our tree
+INV_HITS=$(grep -rnE "^[^/]*\b(inventory::submit!|linkme::distributed_slice|#\[ctor::ctor\])" --include="*.rs" crates/ src/ bins/ 2>/dev/null | grep -cv '//' || true)
+[ "${INV_HITS:-0}" -eq 0 ] && report 0 "no distributed-slice invocations in source" || report 1 "found $INV_HITS distributed-slice invocations"
+# bins/ added to workspace.members
+grep -qE '"bins/(engineer|wizard)"' Cargo.toml && report 0 "bins/ in workspace.members" || report 1 "bins/ NOT in workspace.members"
+
 echo "=== $PASS passed, $FAIL failed ==="
 [ $FAIL -eq 0 ]

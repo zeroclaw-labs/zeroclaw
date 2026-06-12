@@ -1,5 +1,13 @@
 [workspace]
-members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "crates/zeroclaw-tui", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
+members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "crates/zeroclaw-tui", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask",
+    # ── osAgent additions (Phase 1.2) ─────────────────────────────────
+    # bins/engineer and bins/wizard are the two osAgent binaries. Their
+    # Cargo.toml files are the human-readable manifest of compiled-in
+    # capabilities. The wizard's Cargo.toml never depends on osagent-tools-mcp
+    # (load-bearing safety property; see bins/wizard/Cargo.toml header).
+    "bins/engineer",
+    "bins/wizard",
+]
 resolver = "2"
 exclude = ["plugins/image-gen-fal"]
 

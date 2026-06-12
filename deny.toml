@@ -122,6 +122,20 @@ deny = [
     # in defaults). Listed so Phase 1.4 has an obvious deletion target and a future workspace
     # re-feature wiring cannot silently relink it.
     { name = "opentelemetry-otlp", reason = "OTLP exporter is phone-home; opentelemetry facade is permitted" },
+
+    # ── Distributed-slice / auto-registration crates banned (WS-04 enforcement; Phase 1.2) ──
+    # These crates auto-register types at link time via global static initialisers.
+    # That bypasses the explicit-registration pattern that makes the wizard binary's
+    # no-MCP property auditable: an `inventory!`-style registration in `crates/zeroclaw-tools/`
+    # would cause MCP code to link into the wizard binary at static-init time, even though
+    # bins/wizard/Cargo.toml lists no dependency on the MCP crate.
+    #
+    # Upstream v0.7.5 does NOT use any of these crates (verified by full grep at Phase 1.2
+    # entry). This ban ratifies the existing pattern and blocks any PR that would introduce
+    # them.
+    { name = "inventory", reason = "auto-registration defeats explicit-registration discipline (WS-04); use `pub fn register(&mut Registry)` instead" },
+    { name = "linkme", reason = "distributed-slice defeats explicit-registration discipline (WS-04); use `pub fn register(&mut Registry)` instead" },
+    { name = "ctor", reason = "global static-init defeats explicit-registration discipline (WS-04); use `pub fn register(&mut Registry)` instead" },
 ]
 
 # skip-tree: leaving empty at M1. Phase 1.5 may add entries if a kept-but-trimmed crate has

@@ -1,0 +1,40 @@
+# bins/engineer/Cargo.toml — osAgent engineer binary
+#
+# This Cargo.toml is the HUMAN-READABLE MANIFEST of every capability the engineer
+# binary is allowed to link in. Anything listed here gets compiled into the binary;
+# anything NOT here is structurally excluded by Cargo (resolver=2 still unifies
+# *features* across workspace members, but it cannot link a crate that is not a
+# dependency of any binary in the build target). See Phase 1.2 CONTEXT.md and
+# Phase 1.3 plan for the rationale.
+#
+# Registration discipline (WS-04):
+#   Distributed-slice / auto-registration crates MUST NOT be added here or to any
+#   transitive dep. This includes `inventory`, `linkme`, and `ctor`. They are
+#   banned in deny.toml. Explicit registration via `register(&mut Registry)` is
+#   the only permitted wiring pattern.
+#
+# Default-features audit (WS-05):
+#   Every entry in [dependencies] uses `default-features = false` and lists features
+#   explicitly. `cargo tree --duplicates -p osagent-engineer` runs in CI to catch
+#   feature-unification surprises.
+
+[package]
+name = "osagent-engineer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false                    # never goes to crates.io
+description = "osAgent engineer — platform-maintenance agent (engineer-amqp-bridge to operator)"
+
+# Phase 1.2 ships a hollow placeholder. M2 fills the binary with shared-crate
+# imports (osagent-runtime, osagent-channels, osagent-tools, osagent-bridge,
+# osagent-exchange, osagent-lifecycle, osagent-audit, osagent-tools-mcp).
+# Phase 1.3+ wires the MCP dep — this is what differentiates engineer's manifest
+# from wizard's (wizard.Cargo.toml will NEVER list osagent-tools-mcp).
+[dependencies]
+
+[[bin]]
+name = "engineer"
+path = "src/main.rs"

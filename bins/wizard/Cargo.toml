@@ -1,0 +1,62 @@
+# bins/wizard/Cargo.toml — osAgent wizard binary
+#
+# This Cargo.toml is the HUMAN-READABLE MANIFEST of every capability the wizard
+# binary is allowed to link in. Anything listed here gets compiled into the binary;
+# anything NOT here is structurally excluded.
+#
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# LOAD-BEARING SAFETY PROPERTY (decision #1, decision #25):
+#
+#   This file MUST NOT, under any circumstances, list `osagent-tools-mcp`
+#   (or its eventual rename) as a dependency. Not as a direct dep, not as
+#   an optional dep, not as a feature-gated dep, not as a transitive dep
+#   through a shared crate. This is the structural enforcement of the
+#   wizard-has-zero-MCP property.
+#
+#   Phase 1.3 extracts MCP code from `crates/zeroclaw-tools/` into a
+#   standalone `crates/osagent-tools-mcp/` crate. The engineer binary's
+#   Cargo.toml depends on it; this binary's Cargo.toml does not. The CI
+#   gate `wizard-no-mcp-gate` (4-layer: source-grep + nm --defined-only +
+#   cargo-bloat --crates + strings) enforces this property on every PR
+#   and release build.
+#
+#   The wizard handles Vault writes. An MCP server is an arbitrary-code-
+#   execution surface that could exfiltrate secrets even if benign-looking.
+#   Compile-time separation is the only sound defense — config-flag based
+#   exclusion would not survive Cargo resolver=2 feature unification on
+#   `cargo build --workspace`.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#
+# Registration discipline (WS-04):
+#   Distributed-slice / auto-registration crates MUST NOT be added here or to any
+#   transitive dep. This includes `inventory`, `linkme`, and `ctor`. They are
+#   banned in deny.toml.
+#
+# Default-features audit (WS-05):
+#   Every entry in [dependencies] uses `default-features = false` and lists
+#   features explicitly.
+
+[package]
+name = "osagent-wizard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false                    # never goes to crates.io
+description = "osAgent wizard — strategist/install agent with Vault write capability; compile-time zero MCP"
+
+# Phase 1.2 ships a hollow placeholder. M3 fills the binary with shared-crate
+# imports MINUS osagent-tools-mcp. Specifically:
+#
+#   osagent-runtime, osagent-channels, osagent-tools (minus MCP),
+#   osagent-vault (NEW in M3), osagent-2person-approval (NEW in M3),
+#   osagent-bootstrap-secret (NEW in M3), osagent-subagent (NEW in M3),
+#   osagent-exchange, osagent-lifecycle, osagent-audit, osagent-codeword
+#
+# Notably absent: osagent-tools-mcp.
+[dependencies]
+
+[[bin]]
+name = "wizard"
+path = "src/main.rs"
