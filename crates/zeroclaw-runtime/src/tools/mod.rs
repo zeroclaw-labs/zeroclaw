@@ -40,40 +40,16 @@ pub mod verifiable_intent;
 // Tool types from zeroclaw-tools (direct imports, no shims)
 pub use zeroclaw_tools::ask_user::AskUserTool;
 pub use zeroclaw_tools::ask_user::ChannelMapHandle;
-pub use zeroclaw_tools::backup_tool::BackupTool;
-pub use zeroclaw_tools::browser::{BrowserTool, ComputerUseConfig};
-pub use zeroclaw_tools::browser_delegate::BrowserDelegateTool;
-pub use zeroclaw_tools::browser_open::BrowserOpenTool;
 pub use zeroclaw_tools::calculator::CalculatorTool;
-pub use zeroclaw_tools::canvas::{ALLOWED_CONTENT_TYPES, MAX_CONTENT_SIZE};
-pub use zeroclaw_tools::canvas::{CanvasStore, CanvasTool};
-pub use zeroclaw_tools::claude_code::ClaudeCodeTool;
-pub use zeroclaw_tools::claude_code_runner::ClaudeCodeRunnerTool;
 pub use zeroclaw_tools::cli_discovery::{DiscoveredCli, discover_cli_tools};
-pub use zeroclaw_tools::cloud_ops::CloudOpsTool;
-pub use zeroclaw_tools::cloud_patterns::CloudPatternsTool;
-pub use zeroclaw_tools::codex_cli::CodexCliTool;
-pub use zeroclaw_tools::composio::ComposioTool;
 pub use zeroclaw_tools::content_search::ContentSearchTool;
 pub use zeroclaw_tools::data_management::DataManagementTool;
-pub use zeroclaw_tools::discord_search::DiscordSearchTool;
-pub use zeroclaw_tools::escalate::EscalateToHumanTool;
 pub use zeroclaw_tools::file_edit::FileEditTool;
 pub use zeroclaw_tools::file_write::FileWriteTool;
-pub use zeroclaw_tools::gemini_cli::GeminiCliTool;
 pub use zeroclaw_tools::git_operations::GitOperationsTool;
 pub use zeroclaw_tools::glob_search::GlobSearchTool;
-pub use zeroclaw_tools::google_workspace::GoogleWorkspaceTool;
-pub use zeroclaw_tools::hardware_board_info::HardwareBoardInfoTool;
-pub use zeroclaw_tools::hardware_memory_map::HardwareMemoryMapTool;
-pub use zeroclaw_tools::hardware_memory_read::HardwareMemoryReadTool;
-pub use zeroclaw_tools::http_request::HttpRequestTool;
-pub use zeroclaw_tools::image_gen::ImageGenTool;
 pub use zeroclaw_tools::image_info::ImageInfoTool;
-pub use zeroclaw_tools::jira_tool::JiraTool;
 pub use zeroclaw_tools::knowledge_tool::KnowledgeTool;
-pub use zeroclaw_tools::linkedin::LinkedInTool;
-pub use zeroclaw_tools::llm_task::LlmTaskTool;
 // MCP re-exports now flow through the engineer-only `osagent-tools-mcp` crate.
 // Adding `osagent-tools-mcp` as a dep of `zeroclaw-runtime` means any binary
 // that depends on `zeroclaw-runtime` transitively gets MCP. That's why the
@@ -90,30 +66,18 @@ pub use zeroclaw_tools::memory_forget::MemoryForgetTool;
 pub use zeroclaw_tools::memory_purge::MemoryPurgeTool;
 pub use zeroclaw_tools::memory_recall::MemoryRecallTool;
 pub use zeroclaw_tools::memory_store::MemoryStoreTool;
-pub use zeroclaw_tools::microsoft365::Microsoft365Tool;
 pub use zeroclaw_tools::model_routing_config::ModelRoutingConfigTool;
-pub use zeroclaw_tools::notion_tool::NotionTool;
-pub use zeroclaw_tools::opencode_cli::OpenCodeCliTool;
 #[cfg(feature = "rag-pdf")]
 pub use zeroclaw_tools::pdf_read::PdfReadTool;
 pub use zeroclaw_tools::pipeline::PipelineTool;
 pub use zeroclaw_tools::poll::PollTool;
-pub use zeroclaw_tools::project_intel::ProjectIntelTool;
 pub use zeroclaw_tools::proxy_config::ProxyConfigTool;
-pub use zeroclaw_tools::pushover::PushoverTool;
-pub use zeroclaw_tools::reaction::ReactionTool;
 pub use zeroclaw_tools::report_template_tool::ReportTemplateTool;
-pub use zeroclaw_tools::screenshot::ScreenshotTool;
 pub use zeroclaw_tools::sessions::{
     SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
     SessionsListTool, SessionsSendTool,
 };
-pub use zeroclaw_tools::swarm::SwarmTool;
-pub use zeroclaw_tools::text_browser::TextBrowserTool;
 pub use zeroclaw_tools::tool_search::ToolSearchTool;
-pub use zeroclaw_tools::weather_tool::WeatherTool;
-pub use zeroclaw_tools::web_fetch::WebFetchTool;
-pub use zeroclaw_tools::web_search_tool::WebSearchTool;
 pub use zeroclaw_tools::workspace_tool::WorkspaceTool;
 pub use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
 
