@@ -233,7 +233,7 @@ fn warn_once_missing_pricing(model_provider: &str, model: &str) {
             "Cost tracking: no pricing entry found for {model_provider}/{model} — \
              token usage will be recorded with zero cost and budget enforcement \
              is inert for this model. Add a `pricing` table to the model provider \
-             entry in config.toml (under `[model_providers.\"{model_provider}\"]`) \
+             entry in config.toml (under `[providers.models.\"{model_provider}\"]`) \
              with `\"{model}.input\"` and `\"{model}.output\"` keys (USD per 1M tokens). \
              This warning fires once per (model_provider, model) pair per process."
         );

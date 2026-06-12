@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use zeroclaw_api::tool::ToolSpec;
 
 pub struct OpenRouterModelProvider {
-    /// `[model_providers.<family>.<alias>]` config-key alias.
+    /// `[providers.models.<family>.<alias>]` config-key alias.
     alias: String,
     credential: Option<String>,
     timeout_secs: u64,
