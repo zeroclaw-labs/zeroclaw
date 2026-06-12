@@ -2411,6 +2411,14 @@ impl Channel for LarkChannel {
         message_id: &str,
         emoji: &str,
     ) -> anyhow::Result<()> {
+        // When the per-channel or global `[channels].ack_reactions` is
+        // `false`, all reaction paths (Lark-local fast-ack spawns in
+        // `listen_ws` / `listen_http` and the generic orchestrator
+        // add_reaction / remove_reaction calls) become no-ops.
+        if !self.ack_reactions {
+            return Ok(());
+        }
+
         if message_id.is_empty() {
             return Ok(());
         }
@@ -2532,6 +2540,12 @@ impl Channel for LarkChannel {
         message_id: &str,
         emoji: &str,
     ) -> anyhow::Result<()> {
+        // When the per-channel or global `[channels].ack_reactions` is
+        // `false`, all reaction paths become no-ops.
+        if !self.ack_reactions {
+            return Ok(());
+        }
+
         if message_id.is_empty() {
             return Ok(());
         }
@@ -3364,7 +3378,9 @@ impl LarkChannel {
 
             // Parse event messages first; then issue an inbound fast-ack via
             // the same trait-level Channel::add_reaction path that the generic
-            // orchestrator uses. The trait impl writes Feishu's returned
+            // orchestrator uses. The trait impl checks `self.ack_reactions`
+            // first — when disabled this spawn is skipped entirely to avoid
+            // unnecessary work. The trait impl writes Feishu's returned
             // reaction_id into the shared reaction_ids cache and dedupes
             // subsequent duplicate POSTs via a cache-hit fast-path, so the
             // later generic orchestrator add_reaction("👀") call becomes a
@@ -3373,6 +3389,7 @@ impl LarkChannel {
             // `lark_fast_ack_and_generic_path_dedupe_on_cache_hit` test.
             let messages = state.channel.parse_event_payload_async(&payload).await;
             if !messages.is_empty()
+                && state.channel.ack_reactions
                 && let Some(message_id) = payload
                     .pointer("/event/message/message_id")
                     .and_then(|m| m.as_str())
