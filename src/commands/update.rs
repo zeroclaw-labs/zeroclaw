@@ -269,7 +269,15 @@ fn is_sha256sums_asset(name: &str) -> bool {
 }
 
 fn is_installable_release_asset(name: &str, target: &str) -> bool {
-    name == format!("zeroclaw-{target}.tar.gz") || name == format!("zeroclaw-{target}.tgz")
+    // .tar.gz and .tgz are universal across all platforms
+    if name == format!("zeroclaw-{target}.tar.gz") || name == format!("zeroclaw-{target}.tgz") {
+        return true;
+    }
+    // On Windows the release artifacts are published as .zip
+    if target.contains("windows") && name == format!("zeroclaw-{target}.zip") {
+        return true;
+    }
+    false
 }
 
 /// Return the exact Rust target triple for the current platform.
@@ -698,8 +706,10 @@ mod tests {
         ]);
 
         let url = find_asset_url(&release).expect("should select archive asset");
+        let is_tar = url.ends_with(".tar.gz");
+        let is_zip = url.ends_with(".zip");
         assert!(
-            url.ends_with(".tar.gz"),
+            is_tar || is_zip,
             "should select release archive, got: {url}"
         );
     }
