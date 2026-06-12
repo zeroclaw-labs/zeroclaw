@@ -174,9 +174,7 @@ pub async fn run_tool_call_loop(
     channel: Option<&dyn Channel>,
     receipt_generator: Option<&crate::agent::tool_receipts::ReceiptGenerator>,
     collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
-    // event_tx is consumed by the C2 emission commit; underscore-named until
-    // then so C1 stays warning-free.
-    _event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
+    event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
     mut steering: Option<&mut tokio::sync::mpsc::Receiver<String>>,
     mut new_messages_out: Option<&mut Vec<ChatMessage>>,
     // knobs take effect in the C3 commit; underscore-named until then.
@@ -228,6 +226,7 @@ pub async fn run_tool_call_loop(
         multimodal_config,
         cancellation_token: cancellation_token.as_ref(),
         on_delta: on_delta.as_ref(),
+        event_tx: event_tx.as_ref(),
         hooks,
         excluded_tools,
         dedup_exempt_tools,
@@ -350,10 +349,10 @@ pub async fn run_tool_call_loop(
         } else {
             None
         };
-        let should_consume_provider_stream = on_delta.is_some()
+        let should_consume_provider_stream = (on_delta.is_some() || event_tx.is_some())
             && model_provider.supports_streaming()
             && (request_tools.is_none() || model_provider.supports_streaming_tool_events());
-        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"has_on_delta": on_delta.is_some(), "supports_streaming": model_provider.supports_streaming(), "should_consume_provider_stream": should_consume_provider_stream})), &format!("Streaming decision for iteration {}", iteration + 1));
+        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"has_on_delta": on_delta.is_some(), "has_event_tx": event_tx.is_some(), "supports_streaming": model_provider.supports_streaming(), "should_consume_provider_stream": should_consume_provider_stream})), &format!("Streaming decision for iteration {}", iteration + 1));
 
         let ProviderCallOutcome {
             chat_result,
@@ -388,7 +387,8 @@ pub async fn run_tool_call_loop(
                     streamed_protocol_suppressed,
                     llm_started_at,
                     iteration,
-                );
+                )
+                .await;
                 (
                     interpreted.response_text,
                     interpreted.parsed_text,
@@ -511,6 +511,12 @@ pub async fn run_tool_call_loop(
             );
             // No tool calls — this is the final response.
             accumulated_display_text.push_str(&display_text);
+
+            // If text wasn't streamed live, send it now post-hoc. Gated on
+            // event_tx independently of on_delta (never nested — §8.4).
+            if !response_streamed_live && !protocol_suppressed {
+                events::emit_posthoc_turn_chunk(event_tx.as_ref(), &display_text).await;
+            }
 
             // If text wasn't streamed live, send it now via post-hoc chunking.
             // When streamed live, the channel already received the deltas.

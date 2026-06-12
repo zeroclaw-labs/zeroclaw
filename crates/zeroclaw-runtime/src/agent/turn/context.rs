@@ -9,6 +9,7 @@ use crate::tools::{ActivatedToolSet, Tool};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
+use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_config::schema::{MultimodalConfig, PacingConfig};
 use zeroclaw_providers::ModelProvider;
@@ -38,6 +39,7 @@ pub(crate) struct TurnCtx<'a> {
     pub(crate) multimodal_config: &'a MultimodalConfig,
     pub(crate) cancellation_token: Option<&'a CancellationToken>,
     pub(crate) on_delta: Option<&'a Sender<DraftEvent>>,
+    pub(crate) event_tx: Option<&'a Sender<TurnEvent>>,
     pub(crate) hooks: Option<&'a HookRunner>,
     pub(crate) excluded_tools: &'a [String],
     pub(crate) dedup_exempt_tools: &'a [String],

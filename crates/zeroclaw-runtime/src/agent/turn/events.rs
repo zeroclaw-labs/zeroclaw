@@ -1,9 +1,13 @@
-//! Stream/draft event types and pacing constants for the turn loop.
+//! Stream/draft event types and pacing constants for the turn loop, plus the
+//! loop's `TurnEvent` emission helpers (#7415 consolidation).
 
 use super::outcome::ToolLoopCancelled;
+use crate::agent::tool_execution::ToolExecutionOutcome;
 use anyhow::Result;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
+use zeroclaw_api::agent::TurnEvent;
+use zeroclaw_tool_call_parser::ParsedToolCall;
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
 pub(crate) const STREAM_CHUNK_MIN_CHARS: usize = 80;
@@ -56,4 +60,50 @@ pub(crate) async fn stream_text_posthoc_chunks(
         let _ = on_delta.send(StreamDelta::Text(chunk)).await;
     }
     Ok(())
+}
+
+/// Bridge `TurnEvent` → `StreamDelta` for the existing channel draft path.
+/// Consumed by the E2/E3 wrapper commits (C5); inert until then.
+#[allow(dead_code)]
+pub(crate) fn turn_event_to_stream_delta(event: &TurnEvent) -> Option<StreamDelta> {
+    match event {
+        TurnEvent::Chunk { delta } => Some(StreamDelta::Text(delta.clone())),
+        _ => None,
+    }
+}
+
+/// Emit the `TurnEvent::ToolCall`/`ToolResult` pair for one executed tool
+/// call (upstream E2 parity: per-outcome emission after execution).
+pub(crate) async fn emit_tool_call_pair(
+    event_tx: &Sender<TurnEvent>,
+    call: &ParsedToolCall,
+    outcome: &ToolExecutionOutcome,
+) {
+    let call_id = call.tool_call_id.clone().unwrap_or_default();
+    let _ = event_tx
+        .send(TurnEvent::ToolCall {
+            id: call_id.clone(),
+            name: call.name.clone(),
+            args: call.arguments.clone(),
+        })
+        .await;
+    let _ = event_tx
+        .send(TurnEvent::ToolResult {
+            id: call_id,
+            name: call.name.clone(),
+            output: outcome.output.clone(),
+        })
+        .await;
+}
+
+/// `TurnEvent` variant of [`stream_text_posthoc_chunks`]: when the final
+/// response was not streamed live, emit it as one post-hoc `Chunk`.
+pub(crate) async fn emit_posthoc_turn_chunk(event_tx: Option<&Sender<TurnEvent>>, text: &str) {
+    if let Some(tx) = event_tx {
+        let _ = tx
+            .send(TurnEvent::Chunk {
+                delta: text.to_string(),
+            })
+            .await;
+    }
 }

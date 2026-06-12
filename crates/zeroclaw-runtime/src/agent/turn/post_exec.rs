@@ -25,6 +25,10 @@ pub(crate) async fn record_executed_outcomes(
         .zip(executable_calls.iter())
         .zip(executed_outcomes)
     {
+        if let Some(tx) = ctx.event_tx {
+            super::events::emit_tool_call_pair(tx, call, &outcome).await;
+        }
+
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)

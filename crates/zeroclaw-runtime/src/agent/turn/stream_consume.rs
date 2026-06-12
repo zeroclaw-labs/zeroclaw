@@ -6,6 +6,8 @@ use super::stream_guard::{StreamTextGuard, StreamThinkTagStripper};
 use anyhow::Result;
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::model_provider::StreamEvent;
 use zeroclaw_providers::{ChatMessage, ChatRequest, ModelProvider, ToolCall};
 
@@ -35,6 +37,7 @@ pub(crate) async fn consume_provider_streaming_response(
     temperature: Option<f64>,
     cancellation_token: Option<&CancellationToken>,
     on_delta: Option<&tokio::sync::mpsc::Sender<DraftEvent>>,
+    event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
     strict_tool_parsing: bool,
 ) -> Result<StreamedChatOutcome> {
     let mut provider_stream = model_provider.stream_chat(
@@ -55,6 +58,12 @@ pub(crate) async fn consume_provider_streaming_response(
     let mut suppress_forwarding = false;
     let mut text_guard = StreamTextGuard::new(request_tools);
     let mut think_stripper = StreamThinkTagStripper::default();
+    // Correlates PreExecutedToolCall events with their later results so both
+    // TurnEvents share a stable id (FIFO per tool name).
+    let mut pre_executed_ids: std::collections::HashMap<
+        String,
+        std::collections::VecDeque<String>,
+    > = std::collections::HashMap::new();
 
     loop {
         let next_chunk = if let Some(token) = cancellation_token {
@@ -90,10 +99,33 @@ pub(crate) async fn consume_provider_streaming_response(
                 suppress_forwarding = true;
                 text_guard.suppress_forwarding = true;
             }
-            StreamEvent::PreExecutedToolCall { .. } | StreamEvent::PreExecutedToolResult { .. } => {
-                // Pre-executed tool events are for observability only.
-                // They are forwarded to the gateway via turn_streamed but
-                // do not affect the agent's tool dispatch loop.
+            // Pre-executed tool events are for observability only: they are
+            // relayed as TurnEvents but do not affect the agent's tool
+            // dispatch loop.
+            StreamEvent::PreExecutedToolCall { name, args } => {
+                let id = Uuid::new_v4().to_string();
+                pre_executed_ids
+                    .entry(name.clone())
+                    .or_default()
+                    .push_back(id.clone());
+                if let Some(tx) = event_tx {
+                    let _ = tx
+                        .send(TurnEvent::ToolCall {
+                            id,
+                            name,
+                            args: serde_json::from_str(&args).unwrap_or(serde_json::Value::Null),
+                        })
+                        .await;
+                }
+            }
+            StreamEvent::PreExecutedToolResult { name, output } => {
+                let id = pre_executed_ids
+                    .get_mut(&name)
+                    .and_then(|ids| ids.pop_front())
+                    .unwrap_or_else(|| Uuid::new_v4().to_string());
+                if let Some(tx) = event_tx {
+                    let _ = tx.send(TurnEvent::ToolResult { id, name, output }).await;
+                }
             }
             StreamEvent::TextDelta(chunk) => {
                 // Reasoning/thinking deltas arrive on the same `TextDelta`
@@ -109,6 +141,15 @@ pub(crate) async fn consume_provider_streaming_response(
                     && !reasoning.is_empty()
                 {
                     outcome.reasoning_content.push_str(reasoning);
+                    // Thinking is surfaced as its own TurnEvent variant; it
+                    // must never reach the Chunk/draft text surfaces.
+                    if let Some(tx) = event_tx {
+                        let _ = tx
+                            .send(TurnEvent::Thinking {
+                                delta: reasoning.to_string(),
+                            })
+                            .await;
+                    }
                 }
 
                 if chunk.delta.is_empty() {
@@ -127,6 +168,17 @@ pub(crate) async fn consume_provider_streaming_response(
                 }
 
                 if strict_tool_parsing {
+                    // Every event_tx send is gated on event_tx ALONE — never
+                    // nested under on_delta. Nesting doubles chunks when both
+                    // are Some and drops them when on_delta is None.
+                    if let Some(tx) = event_tx {
+                        outcome.forwarded_live_deltas = true;
+                        let _ = tx
+                            .send(TurnEvent::Chunk {
+                                delta: sanitized_delta.clone(),
+                            })
+                            .await;
+                    }
                     if let Some(tx) = delta_sender {
                         outcome.forwarded_live_deltas = true;
                         if tx.send(StreamDelta::Text(sanitized_delta)).await.is_err() {
@@ -140,6 +192,14 @@ pub(crate) async fn consume_provider_streaming_response(
                     continue;
                 };
 
+                if let Some(tx) = event_tx {
+                    outcome.forwarded_live_deltas = true;
+                    let _ = tx
+                        .send(TurnEvent::Chunk {
+                            delta: forward_text.clone(),
+                        })
+                        .await;
+                }
                 if let Some(tx) = delta_sender {
                     outcome.forwarded_live_deltas = true;
                     if tx.send(StreamDelta::Text(forward_text)).await.is_err() {
@@ -155,28 +215,52 @@ pub(crate) async fn consume_provider_streaming_response(
         outcome.response_text.push_str(&trailing_delta);
         if !suppress_forwarding {
             if strict_tool_parsing {
+                if let Some(tx) = event_tx {
+                    outcome.forwarded_live_deltas = true;
+                    let _ = tx
+                        .send(TurnEvent::Chunk {
+                            delta: trailing_delta.clone(),
+                        })
+                        .await;
+                }
                 if let Some(tx) = delta_sender {
                     outcome.forwarded_live_deltas = true;
                     if tx.send(StreamDelta::Text(trailing_delta)).await.is_err() {
                         delta_sender = None;
                     }
                 }
-            } else if let Some(forward_text) = text_guard.push(&trailing_delta)
-                && let Some(tx) = delta_sender
-            {
-                outcome.forwarded_live_deltas = true;
-                if tx.send(StreamDelta::Text(forward_text)).await.is_err() {
-                    delta_sender = None;
+            } else if let Some(forward_text) = text_guard.push(&trailing_delta) {
+                if let Some(tx) = event_tx {
+                    outcome.forwarded_live_deltas = true;
+                    let _ = tx
+                        .send(TurnEvent::Chunk {
+                            delta: forward_text.clone(),
+                        })
+                        .await;
+                }
+                if let Some(tx) = delta_sender {
+                    outcome.forwarded_live_deltas = true;
+                    if tx.send(StreamDelta::Text(forward_text)).await.is_err() {
+                        delta_sender = None;
+                    }
                 }
             }
         }
     }
 
-    if let Some(forward_text) = text_guard.finish()
-        && let Some(tx) = delta_sender
-    {
-        outcome.forwarded_live_deltas = true;
-        let _ = tx.send(StreamDelta::Text(forward_text)).await;
+    if let Some(forward_text) = text_guard.finish() {
+        if let Some(tx) = event_tx {
+            outcome.forwarded_live_deltas = true;
+            let _ = tx
+                .send(TurnEvent::Chunk {
+                    delta: forward_text.clone(),
+                })
+                .await;
+        }
+        if let Some(tx) = delta_sender {
+            outcome.forwarded_live_deltas = true;
+            let _ = tx.send(StreamDelta::Text(forward_text)).await;
+        }
     }
     outcome.suppressed_protocol = text_guard.suppressed_protocol;
 

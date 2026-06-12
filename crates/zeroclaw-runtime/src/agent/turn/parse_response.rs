@@ -11,6 +11,7 @@ use super::tool_specs::IterationToolSpecs;
 use crate::agent::cost::record_tool_loop_cost_usage;
 use crate::observability::ObserverEvent;
 use std::time::Instant;
+use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_providers::{ChatResponse, ToolCall};
 use zeroclaw_tool_call_parser::{
     ParsedToolCall, build_native_assistant_history_from_parsed_calls,
@@ -92,7 +93,7 @@ pub(crate) struct InterpretedResponse {
 
 /// Interpret a successful chat response. Takes the response by value and
 /// holds no borrows of `ctx` past the call (RUN_SHEET `turn.parse_response`).
-pub(crate) fn interpret_chat_response(
+pub(crate) async fn interpret_chat_response(
     ctx: &TurnCtx<'_>,
     resp: ChatResponse,
     specs: &IterationToolSpecs,
@@ -118,6 +119,21 @@ pub(crate) fn interpret_chat_response(
         agent_alias: None,
         turn_id: None,
     });
+
+    // Per-LLM-call usage event, right after the observer success event
+    // (upstream E2 parity, agent.rs Usage emission).
+    if let Some(tx) = ctx.event_tx
+        && let Some(ref usage) = resp.usage
+    {
+        let _ = tx
+            .send(TurnEvent::Usage {
+                input_tokens: usage.input_tokens,
+                cached_input_tokens: usage.cached_input_tokens,
+                output_tokens: usage.output_tokens,
+                cost_usd: None,
+            })
+            .await;
+    }
 
     // Record cost via task-local tracker (no-op when not scoped)
     let _ = resp

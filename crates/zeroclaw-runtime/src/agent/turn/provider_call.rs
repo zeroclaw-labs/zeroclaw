@@ -147,6 +147,7 @@ pub(crate) async fn call_provider(
                 ctx.temperature,
                 ctx.cancellation_token,
                 ctx.on_delta,
+                ctx.event_tx,
                 ctx.strict_tool_parsing,
             )
         )
