@@ -1896,7 +1896,7 @@ fn format_paircode_recovery_command(_host: &str, port: u16) -> String {
 
 fn format_paircode_recovery_curl(host: &str, port: u16, path_prefix: &str) -> String {
     // Admin paircode routes are localhost-only, so the curl fallback must point
-    // at loopback. When the gateway is bound non-loopback the advertised host is
+    // at loopback. Bind-only hosts and non-loopback advertised hosts are
     // normalized to `127.0.0.1`; explicit loopback hosts are preserved.
     let recovery_host = paircode_recovery_curl_host(host);
     format!("curl -s -X POST http://{recovery_host}:{port}{path_prefix}/admin/paircode/new")
@@ -1904,7 +1904,8 @@ fn format_paircode_recovery_curl(host: &str, port: u16, path_prefix: &str) -> St
 
 fn paircode_recovery_curl_host(host: &str) -> &str {
     match host {
-        "127.0.0.1" | "localhost" | "::1" | "0.0.0.0" | "::" => host,
+        "127.0.0.1" | "localhost" => host,
+        "::1" => "[::1]",
         _ => "127.0.0.1",
     }
 }
@@ -3929,6 +3930,30 @@ mod tests {
         assert_eq!(
             format_paircode_recovery_curl("127.0.0.1", 42617, ""),
             "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new"
+        );
+    }
+
+    #[test]
+    fn paircode_recovery_curl_normalizes_unspecified_bind_hosts() {
+        assert_eq!(
+            format_paircode_recovery_curl("0.0.0.0", 42617, ""),
+            "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new"
+        );
+        assert_eq!(
+            format_paircode_recovery_curl("::", 42617, ""),
+            "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new"
+        );
+    }
+
+    #[test]
+    fn paircode_recovery_curl_preserves_actual_loopback_hosts() {
+        assert_eq!(
+            format_paircode_recovery_curl("localhost", 42617, ""),
+            "curl -s -X POST http://localhost:42617/admin/paircode/new"
+        );
+        assert_eq!(
+            format_paircode_recovery_curl("::1", 42617, ""),
+            "curl -s -X POST http://[::1]:42617/admin/paircode/new"
         );
     }
 
