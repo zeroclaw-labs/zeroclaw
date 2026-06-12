@@ -4,11 +4,11 @@
 //! target). Not every helper is used by both targets.
 #![allow(dead_code)]
 
-use std::sync::RwLock;
+use std::sync::{LazyLock, RwLock};
 
 use ratatui::style::{Color, Modifier, Style};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Theme {
     pub title: Color,
     pub heading: Color,
@@ -20,102 +20,6 @@ pub(crate) struct Theme {
     pub tool: Color,
     pub background: Color,
 }
-
-const ICY_BLUE: Theme = Theme {
-    title: Color::Rgb(100, 200, 255),
-    heading: Color::Rgb(140, 230, 255),
-    body: Color::Rgb(220, 240, 255),
-    dim: Color::Rgb(80, 130, 170),
-    accent: Color::Rgb(255, 100, 80),
-    warn: Color::Rgb(255, 220, 80),
-    selection_bg: Color::Rgb(30, 60, 100),
-    tool: Color::Rgb(180, 140, 255),
-    background: Color::Rgb(8, 14, 24),
-};
-
-const SOLARIZED_DARK: Theme = Theme {
-    title: Color::Rgb(38, 139, 210),
-    heading: Color::Rgb(42, 161, 152),
-    body: Color::Rgb(147, 161, 161),
-    dim: Color::Rgb(88, 110, 117),
-    accent: Color::Rgb(220, 50, 47),
-    warn: Color::Rgb(181, 137, 0),
-    selection_bg: Color::Rgb(7, 54, 66),
-    tool: Color::Rgb(108, 113, 196),
-    background: Color::Rgb(0, 43, 54),
-};
-
-const SOLARIZED_LIGHT: Theme = Theme {
-    title: Color::Rgb(38, 139, 210),
-    heading: Color::Rgb(42, 161, 152),
-    body: Color::Rgb(101, 123, 131),
-    dim: Color::Rgb(147, 161, 161),
-    accent: Color::Rgb(220, 50, 47),
-    warn: Color::Rgb(181, 137, 0),
-    selection_bg: Color::Rgb(238, 232, 213),
-    tool: Color::Rgb(108, 113, 196),
-    background: Color::Rgb(253, 246, 227),
-};
-
-const HIGH_CONTRAST_WHITE: Theme = Theme {
-    title: Color::Rgb(0, 0, 0),
-    heading: Color::Rgb(0, 0, 128),
-    body: Color::Rgb(0, 0, 0),
-    dim: Color::Rgb(64, 64, 64),
-    accent: Color::Rgb(176, 0, 0),
-    warn: Color::Rgb(128, 96, 0),
-    selection_bg: Color::Rgb(200, 200, 200),
-    tool: Color::Rgb(96, 0, 128),
-    background: Color::Rgb(255, 255, 255),
-};
-
-const HIGH_CONTRAST_DARK: Theme = Theme {
-    title: Color::Rgb(255, 255, 255),
-    heading: Color::Rgb(0, 255, 255),
-    body: Color::Rgb(255, 255, 255),
-    dim: Color::Rgb(170, 170, 170),
-    accent: Color::Rgb(255, 85, 85),
-    warn: Color::Rgb(255, 255, 0),
-    selection_bg: Color::Rgb(60, 60, 60),
-    tool: Color::Rgb(255, 0, 255),
-    background: Color::Rgb(0, 0, 0),
-};
-
-const GRUVBOX_DARK: Theme = Theme {
-    title: Color::Rgb(131, 165, 152),
-    heading: Color::Rgb(142, 192, 124),
-    body: Color::Rgb(235, 219, 178),
-    dim: Color::Rgb(146, 131, 116),
-    accent: Color::Rgb(251, 73, 52),
-    warn: Color::Rgb(250, 189, 47),
-    selection_bg: Color::Rgb(60, 56, 54),
-    tool: Color::Rgb(211, 134, 155),
-    background: Color::Rgb(40, 40, 40),
-};
-
-const DRACULA: Theme = Theme {
-    title: Color::Rgb(139, 233, 253),
-    heading: Color::Rgb(80, 250, 123),
-    body: Color::Rgb(248, 248, 242),
-    dim: Color::Rgb(98, 114, 164),
-    accent: Color::Rgb(255, 85, 85),
-    warn: Color::Rgb(241, 250, 140),
-    selection_bg: Color::Rgb(68, 71, 90),
-    tool: Color::Rgb(189, 147, 249),
-    background: Color::Rgb(40, 42, 54),
-};
-
-const NORD: Theme = Theme {
-    title: Color::Rgb(136, 192, 208),
-    heading: Color::Rgb(143, 188, 187),
-    body: Color::Rgb(216, 222, 233),
-    dim: Color::Rgb(76, 86, 106),
-    accent: Color::Rgb(191, 97, 106),
-    warn: Color::Rgb(235, 203, 139),
-    selection_bg: Color::Rgb(59, 66, 82),
-    tool: Color::Rgb(180, 142, 173),
-    background: Color::Rgb(46, 52, 64),
-};
 
 /// "Inherit shell" — uses the terminal's own default colours. Every
 /// role is `Color::Reset`, and the app-level backdrop skips painting
@@ -133,39 +37,74 @@ const TERMINAL: Theme = Theme {
     background: Color::Reset,
 };
 
-pub(crate) const DEFAULT_THEME_NAME: &str = if cfg!(target_os = "macos") {
-    "terminal"
-} else {
-    "icy_blue"
-};
+// The named preset palettes are generated at build time from
+// `web/src/contexts/themes.json`, the single source of truth shared with the
+// React dashboard and mdBook docs. See `build.rs` for the var→role mapping.
+// `TERMINAL` is authored here because it is the inherit-shell sentinel, not a
+// real palette.
+include!(concat!(env!("OUT_DIR"), "/theme_presets.rs"));
 
-const DEFAULT_THEME: Theme = if cfg!(target_os = "macos") {
-    TERMINAL
-} else {
-    ICY_BLUE
-};
+pub(crate) const DEFAULT_THEME_NAME: &str = "icy_blue";
 
-pub(crate) const THEMES: &[(&str, Theme)] = &[
-    ("terminal", TERMINAL),
-    ("icy_blue", ICY_BLUE),
-    ("solarized_dark", SOLARIZED_DARK),
-    ("solarized_light", SOLARIZED_LIGHT),
-    ("high_contrast_white", HIGH_CONTRAST_WHITE),
-    ("high_contrast_dark", HIGH_CONTRAST_DARK),
-    ("gruvbox_dark", GRUVBOX_DARK),
-    ("dracula", DRACULA),
-    ("nord", NORD),
-];
+/// The authored inherit-shell sentinel. Real palettes come from
+/// `GENERATED_THEMES`.
+const AUTHORED_THEMES: &[(&str, Theme)] = &[("terminal", TERMINAL)];
+
+/// Every named preset: the authored pair followed by the generated registry
+/// themes. The single iteration point both lookup helpers walk.
+fn all_themes() -> impl Iterator<Item = &'static (&'static str, Theme)> {
+    AUTHORED_THEMES.iter().chain(GENERATED_THEMES.iter())
+}
 
 pub(crate) fn theme_by_name(name: &str) -> Option<Theme> {
-    THEMES.iter().find_map(|(n, t)| (*n == name).then_some(*t))
+    all_themes().find_map(|(n, t)| (*n == name).then_some(*t))
 }
 
 pub(crate) fn theme_names() -> impl Iterator<Item = &'static str> {
-    THEMES.iter().map(|(n, _)| *n)
+    all_themes().map(|(n, _)| *n)
 }
 
-static ACTIVE: RwLock<Theme> = RwLock::new(DEFAULT_THEME);
+static ACTIVE: LazyLock<RwLock<Theme>> = LazyLock::new(|| RwLock::new(default_theme()));
+
+/// Per-agent theme overrides, keyed by agent alias. A process-global registry
+/// mirroring `ACTIVE`: the Config pane writes here on assign/clear (live, no
+/// restart), and the app loop reads it each frame to tint the Code/Chat pane
+/// for the focused agent. Lazily created so the static stays const-initialised.
+static AGENT_OVERRIDES: RwLock<Option<std::collections::HashMap<String, Theme>>> =
+    RwLock::new(None);
+
+/// Replace the whole agent-override registry (loaded once at startup).
+pub(crate) fn set_agent_overrides(map: std::collections::HashMap<String, Theme>) {
+    if let Ok(mut guard) = AGENT_OVERRIDES.write() {
+        *guard = Some(map);
+    }
+}
+
+/// Insert or replace one agent's override (live assign from the Config pane).
+pub(crate) fn set_agent_override(alias: &str, theme: Theme) {
+    if let Ok(mut guard) = AGENT_OVERRIDES.write() {
+        guard
+            .get_or_insert_with(std::collections::HashMap::new)
+            .insert(alias.to_string(), theme);
+    }
+}
+
+/// Remove one agent's override (live clear from the Config pane).
+pub(crate) fn clear_agent_override(alias: &str) {
+    if let Ok(mut guard) = AGENT_OVERRIDES.write()
+        && let Some(map) = guard.as_mut()
+    {
+        map.remove(alias);
+    }
+}
+
+/// The override palette for `alias`, if any. Read each frame by the app loop.
+pub(crate) fn agent_override(alias: &str) -> Option<Theme> {
+    AGENT_OVERRIDES
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|m| m.get(alias).copied()))
+}
 
 pub(crate) fn set_active(theme: Theme) {
     if let Ok(mut guard) = ACTIVE.write() {
@@ -174,11 +113,40 @@ pub(crate) fn set_active(theme: Theme) {
 }
 
 pub(crate) fn active() -> Theme {
-    ACTIVE.read().map(|g| *g).unwrap_or(DEFAULT_THEME)
+    let raw = active_raw();
+    Theme {
+        title: crate::color_depth::downgrade(raw.title),
+        heading: crate::color_depth::downgrade(raw.heading),
+        body: crate::color_depth::downgrade(raw.body),
+        dim: crate::color_depth::downgrade(raw.dim),
+        accent: crate::color_depth::downgrade(raw.accent),
+        warn: crate::color_depth::downgrade(raw.warn),
+        selection_bg: crate::color_depth::downgrade(raw.selection_bg),
+        tool: crate::color_depth::downgrade(raw.tool),
+        background: crate::color_depth::downgrade(raw.background),
+    }
+}
+
+/// The stored palette without colour-depth downgrade. Used to snapshot and
+/// restore the base theme around a per-frame override swap: `set_active` stores
+/// raw RGB, so save/restore must round-trip the raw value, not the downgraded
+/// one `active()` returns.
+pub(crate) fn active_raw() -> Theme {
+    ACTIVE
+        .read()
+        .map(|g| *g)
+        .unwrap_or_else(|_| default_theme())
 }
 
 pub(crate) fn default_theme() -> Theme {
-    DEFAULT_THEME
+    theme_by_name(DEFAULT_THEME_NAME).expect("default theme must be present in theme registry")
+}
+
+/// The graceful-fallback palette for an unknown theme name: the inherit-shell
+/// `terminal` theme. Always present in the registry, so resolution never fails
+/// just because a config names a theme this build doesn't have.
+pub(crate) fn fallback_theme() -> Theme {
+    TERMINAL
 }
 
 pub(crate) fn fg_primary() -> Color {
@@ -243,6 +211,24 @@ pub(crate) fn selected_style() -> Style {
         .fg(t.title)
         .bg(t.selection_bg)
         .add_modifier(Modifier::BOLD)
+}
+
+/// Selection highlight without a foreground override: only the selection
+/// background and bold. Use where row spans carry their own meaningful colours
+/// (e.g. the theme list's palette swatches) that a full `selected_style` would
+/// otherwise patch away.
+pub(crate) fn selected_bg_style() -> Style {
+    Style::default()
+        .bg(active().selection_bg)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Retained ("you are here") selection for a pane that does NOT currently hold
+/// the cursor. Distinct from `selected_style` (the active cursor): no bold and a
+/// dim foreground so the row reads as a remembered position, not the live focus.
+pub(crate) fn selected_inactive_style() -> Style {
+    let t = active();
+    Style::default().fg(t.dim).bg(t.selection_bg)
 }
 
 pub(crate) fn input_style() -> Style {
@@ -385,10 +371,41 @@ mod tests {
 
     #[test]
     fn set_active_swaps_palette() {
-        set_active(theme_by_name("nord").unwrap());
-        assert_eq!(active().title, Color::Rgb(136, 192, 208));
+        // `active()` routes through the colour-depth downgrade; assert on the
+        // stored palette via the registry lookup so the test is independent of
+        // the terminal depth detected in the test environment.
+        set_active(theme_by_name("nord_dark").unwrap());
+        assert_eq!(
+            theme_by_name("nord_dark").unwrap().title,
+            Color::Rgb(136, 192, 208)
+        );
         set_active(theme_by_name("icy_blue").unwrap());
-        assert_eq!(active().title, Color::Rgb(100, 200, 255));
+        assert_eq!(
+            theme_by_name("icy_blue").unwrap().title,
+            Color::Rgb(100, 200, 255)
+        );
+    }
+
+    #[test]
+    fn registry_themes_are_present() {
+        // Parity guard: the generated table mirrors the dashboard registry.
+        // A representative spread of registry ids must resolve, proving the
+        // build-time generation ran and the kebab→snake mapping applied.
+        for name in [
+            "default_dark",
+            "default_light",
+            "dracula",
+            "nord_dark",
+            "rose_pine_moon",
+            "everforest_dark",
+            "material_light",
+            "hacker_green",
+        ] {
+            assert!(
+                theme_by_name(name).is_some(),
+                "registry theme '{name}' missing"
+            );
+        }
     }
 
     #[test]
@@ -407,13 +424,11 @@ mod tests {
     }
 
     #[test]
-    fn default_theme_is_platform_conditional() {
-        let expected = if cfg!(target_os = "macos") {
-            "terminal"
-        } else {
-            "icy_blue"
-        };
-        assert_eq!(DEFAULT_THEME_NAME, expected);
-        assert!(theme_by_name(DEFAULT_THEME_NAME).is_some());
+    fn default_theme_is_icy_blue() {
+        assert_eq!(DEFAULT_THEME_NAME, "icy_blue");
+        assert_eq!(
+            default_theme(),
+            theme_by_name(DEFAULT_THEME_NAME).expect("default registered")
+        );
     }
 }

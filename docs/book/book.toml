@@ -32,5 +32,9 @@ level = 0
 [preprocessor.gettext]
 after = ["links"]
 
+[preprocessor.peer-groups]
+command = "../../target/release/mdbook preprocess"
+before = ["links"]
+
 [preprocessor.mermaid]
 command = "mdbook-mermaid"
