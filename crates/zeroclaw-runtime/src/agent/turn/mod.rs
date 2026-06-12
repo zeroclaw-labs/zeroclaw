@@ -431,8 +431,9 @@ pub async fn run_tool_call_loop(
                     && !interrupted.partial_text.is_empty()
                 {
                     let msg = ChatMessage::assistant(format!(
-                        "{}\n\n[stream interrupted]",
-                        interrupted.partial_text
+                        "{}\n\n{}",
+                        interrupted.partial_text,
+                        crate::i18n::get_required_cli_string("turn-stream-interrupted")
                     ));
                     if let Some(out) = new_messages_out.as_deref_mut() {
                         out.push(msg.clone());
@@ -446,8 +447,9 @@ pub async fn run_tool_call_loop(
                     && !cancelled.partial_text.is_empty()
                 {
                     let msg = ChatMessage::assistant(format!(
-                        "{}\n\n[interrupted by user]",
-                        cancelled.partial_text
+                        "{}\n\n{}",
+                        cancelled.partial_text,
+                        crate::i18n::get_required_cli_string("turn-interrupted-by-user")
                     ));
                     if let Some(out) = new_messages_out.as_deref_mut() {
                         out.push(msg.clone());
@@ -680,8 +682,9 @@ pub async fn run_tool_call_loop(
                         call.name.clone(),
                         call.tool_call_id.clone(),
                         crate::agent::tool_execution::ToolExecutionOutcome {
-                            output: "[interrupted by user before this tool produced a result]"
-                                .to_string(),
+                            output: crate::i18n::get_required_cli_string(
+                                "turn-tool-interrupted-before-result",
+                            ),
                             success: false,
                             error_reason: None,
                             duration: std::time::Duration::ZERO,

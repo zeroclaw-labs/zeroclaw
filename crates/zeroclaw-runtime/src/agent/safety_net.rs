@@ -987,7 +987,11 @@ async fn safety_net_streaming_tool_results_input_order_and_midbatch_cancel() {
         "calls after the cancel point must not execute"
     );
     assert!(
-        err.committed_response.contains("[interrupted by user]"),
+        err.committed_response
+            .contains(&crate::i18n::get_english_cli_string_with_args(
+                "turn-interrupted-by-user",
+                &[]
+            )),
         "unexpected committed_response: {}",
         err.committed_response
     );
@@ -1493,7 +1497,11 @@ async fn safety_net_cancel_after_streamed_output_persists_partial() {
         .expect_err("cancel must surface as StreamedTurnError");
 
     assert_eq!(
-        err.committed_response, "partial answer\n\n[interrupted by user]",
+        err.committed_response,
+        format!(
+            "partial answer\n\n{}",
+            crate::i18n::get_english_cli_string_with_args("turn-interrupted-by-user", &[])
+        ),
         "committed_response must carry the watched partial with the marker"
     );
     let interruption_messages: Vec<&ConversationMessage> = err
@@ -1503,7 +1511,8 @@ async fn safety_net_cancel_after_streamed_output_persists_partial() {
             matches!(
                 m,
                 ConversationMessage::Chat(c)
-                    if c.role == "assistant" && c.content.contains("[interrupted by user]")
+                    if c.role == "assistant"
+                    && c.content.contains(&crate::i18n::get_english_cli_string_with_args("turn-interrupted-by-user", &[]))
             )
         })
         .collect();
@@ -1556,7 +1565,8 @@ async fn safety_net_stream_error_persists_only_forwarded_text() {
         .expect_err("stream error after visible output must fail the turn (no fallback retry)");
 
     assert_eq!(
-        err.committed_response, "[stream interrupted]",
+        err.committed_response,
+        crate::i18n::get_english_cli_string_with_args("turn-stream-interrupted", &[]),
         "nothing was forwarded, so nothing may be committed as delivered"
     );
     assert!(

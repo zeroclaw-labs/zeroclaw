@@ -844,7 +844,7 @@ impl Agent {
         let mut results = completed;
         results.extend(remaining.iter().map(|call| ToolResultMessage {
             tool_call_id: call.id.clone(),
-            content: "[interrupted by user before this tool produced a result]".to_string(),
+            content: crate::i18n::get_required_cli_string("turn-tool-interrupted-before-result"),
         }));
         if results.is_empty() {
             return;
@@ -2564,12 +2564,12 @@ impl Agent {
                 .as_ref()
                 .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
             {
-                let interruption = ConversationMessage::Chat(ChatMessage::assistant(
-                    "[interrupted by user]".to_string(),
-                ));
+                let marker = crate::i18n::get_required_cli_string("turn-interrupted-by-user");
+                let interruption =
+                    ConversationMessage::Chat(ChatMessage::assistant(marker.clone()));
                 new_msgs.push(interruption.clone());
                 self.history.push(interruption);
-                committed_response.push_str("[interrupted by user]");
+                committed_response.push_str(&marker);
                 return Err(StreamedTurnError {
                     error: crate::agent::loop_::ToolLoopCancelled.into(),
                     committed_response,
@@ -2707,14 +2707,14 @@ impl Agent {
                         // literal, so suffix-matching round_added would
                         // misfire. Synthesize the bare marker only when no
                         // interruption text was persisted this round.
+                        let marker =
+                            crate::i18n::get_required_cli_string("turn-interrupted-by-user");
                         let persisted_interruption = error
                             .downcast_ref::<crate::agent::loop_::StreamCancelledAfterOutput>()
-                            .map(|cancelled| {
-                                format!("{}\n\n[interrupted by user]", cancelled.partial_text)
-                            });
+                            .map(|cancelled| format!("{}\n\n{marker}", cancelled.partial_text));
                         match persisted_interruption {
                             Some(text) => {
-                                if !committed_response.ends_with("[interrupted by user]") {
+                                if !committed_response.ends_with(&marker) {
                                     if !committed_response.is_empty() {
                                         committed_response.push_str("\n\n");
                                     }
@@ -2722,9 +2722,9 @@ impl Agent {
                                 }
                             }
                             None => {
-                                committed_response.push_str("[interrupted by user]");
+                                committed_response.push_str(&marker);
                                 let interruption = ConversationMessage::Chat(
-                                    ChatMessage::assistant("[interrupted by user]".to_string()),
+                                    ChatMessage::assistant(marker.clone()),
                                 );
                                 new_msgs.push(interruption.clone());
                                 self.history.push(interruption);
@@ -2739,7 +2739,9 @@ impl Agent {
                     // Mark the interruption only when nothing was committed —
                     // prior-round text must round-trip unmodified.
                     if committed_response.is_empty() {
-                        committed_response.push_str("[stream interrupted]");
+                        committed_response.push_str(&crate::i18n::get_required_cli_string(
+                            "turn-stream-interrupted",
+                        ));
                     }
                     return Err(StreamedTurnError {
                         error,
@@ -6293,7 +6295,7 @@ mod tests {
         );
         assert!(
             !outcome.new_messages.iter().any(|msg| {
-                matches!(msg, ConversationMessage::Chat(message) if message.role == "assistant" && message.content.contains("[stream interrupted]"))
+                matches!(msg, ConversationMessage::Chat(message) if message.role == "assistant" && message.content.contains(&crate::i18n::get_english_cli_string_with_args("turn-stream-interrupted", &[])))
             }),
             "successful fallback should not persist interrupted stream text"
         );
@@ -6365,7 +6367,11 @@ mod tests {
             err.error
         );
         assert!(
-            err.committed_response.contains("[stream interrupted]"),
+            err.committed_response
+                .contains(&crate::i18n::get_english_cli_string_with_args(
+                    "turn-stream-interrupted",
+                    &[]
+                )),
             "persisted partial text should mark that the visible stream was interrupted"
         );
         assert!(
@@ -6427,10 +6433,13 @@ mod tests {
             "unexpected error: {}",
             err.error
         );
-        assert_eq!(err.committed_response, "[interrupted by user]");
+        assert_eq!(
+            err.committed_response,
+            crate::i18n::get_english_cli_string_with_args("turn-interrupted-by-user", &[])
+        );
         assert!(
             err.new_messages.iter().any(|msg| {
-                matches!(msg, ConversationMessage::Chat(message) if message.role == "assistant" && message.content == "[interrupted by user]")
+                matches!(msg, ConversationMessage::Chat(message) if message.role == "assistant" && message.content == crate::i18n::get_english_cli_string_with_args("turn-interrupted-by-user", &[]))
             }),
             "pre-output fallback cancellation should include an interruption marker"
         );
@@ -6480,10 +6489,13 @@ mod tests {
             "unexpected error: {}",
             err.error
         );
-        assert_eq!(err.committed_response, "[interrupted by user]");
+        assert_eq!(
+            err.committed_response,
+            crate::i18n::get_english_cli_string_with_args("turn-interrupted-by-user", &[])
+        );
         assert!(
             err.new_messages.iter().any(|msg| {
-                matches!(msg, ConversationMessage::Chat(message) if message.role == "assistant" && message.content == "[interrupted by user]")
+                matches!(msg, ConversationMessage::Chat(message) if message.role == "assistant" && message.content == crate::i18n::get_english_cli_string_with_args("turn-interrupted-by-user", &[]))
             }),
             "cancelled turn should include an assistant interruption marker for persistence"
         );
@@ -6528,7 +6540,12 @@ mod tests {
 
         assert!(
             err.committed_response.contains("draft")
-                && err.committed_response.contains("[stream interrupted]"),
+                && err
+                    .committed_response
+                    .contains(&crate::i18n::get_english_cli_string_with_args(
+                        "turn-stream-interrupted",
+                        &[]
+                    )),
             "unexpected committed_response: {}",
             err.committed_response
         );
