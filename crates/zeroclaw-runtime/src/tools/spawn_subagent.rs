@@ -28,6 +28,12 @@ pub struct SpawnSubagentTool {
     /// mirroring `DelegateTool`, so the dedup exemption for re-entrant
     /// agent tools cannot turn one model turn into unbounded child
     /// agent starts.
+    ///
+    /// Also carries session-scoped policy fields — most importantly
+    /// `workspace_dir`, which IDE/ACP clients pin to the session cwd —
+    /// into the SubAgent context via `SubAgentSpawn::for_agent_with_policy`,
+    /// so child file/shell tools jail to the same boundary as the
+    /// parent rather than the per-agent install dir (issue #7263).
     security: Arc<SecurityPolicy>,
     /// `true` when this tool is registered inside a run that is itself
     /// a SubAgent. Triggers a depth-1 cap refusal in `execute` before
@@ -173,8 +179,12 @@ impl Tool for SpawnSubagentTool {
             });
         }
 
-        let subagent_ctx = match SubAgentSpawn::for_agent(&self.config, &self.parent_alias)
-            .and_then(|spawn| spawn.build(SubAgentOverrides::default()))
+        let subagent_ctx = match SubAgentSpawn::for_agent_with_policy(
+            &self.config,
+            &self.parent_alias,
+            Arc::clone(&self.security),
+        )
+        .and_then(|spawn| spawn.build(SubAgentOverrides::default()))
         {
             Ok(ctx) => ctx,
             Err(e) => {
@@ -291,7 +301,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_parent_alias_surfaces_spawn_failure() {
-        // Parent alias that is not configured: SubAgentSpawn::for_agent
+        // Parent alias that is not configured: SubAgentSpawn::for_agent_with_policy
         // returns Err, the tool reports a structured spawn failure
         // (no panic, no recursion attempt).
         let tool = SpawnSubagentTool::new(
