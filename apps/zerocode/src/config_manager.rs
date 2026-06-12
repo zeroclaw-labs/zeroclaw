@@ -269,6 +269,10 @@ pub(crate) struct App {
     last_section_pane_area: Rect,
     last_section_list_area: Rect,
     last_list_offset: usize,
+    /// Draw-time map of section-pane display rows to `sections` indices.
+    /// `None` rows are group headers; mouse clicks resolve through this
+    /// so headers are dead zones instead of off-by-N selections.
+    last_section_rows: Vec<Option<usize>>,
     last_tab_area: Option<Rect>,
     double_click: crate::mouse::DoubleClickTracker,
 }
@@ -322,6 +326,7 @@ impl App {
             last_section_pane_area: Rect::default(),
             last_section_list_area: Rect::default(),
             last_list_offset: 0,
+            last_section_rows: Vec::new(),
             last_tab_area: None,
             double_click: crate::mouse::DoubleClickTracker::new(),
         }
@@ -330,6 +335,13 @@ impl App {
     /// Load initial data from the daemon. Call once before draw/handle_key.
     pub(crate) async fn init(&mut self) -> Result<()> {
         self.sections = self.rpc.config_sections().await?;
+        // Group the section list for display: stable sort by group rank
+        // keeps the canonical (dependency-correct) order within each
+        // group. Daemons that predate group plumbing send "" for every
+        // entry — all ranks tie, the sort is a no-op, and the pane
+        // renders the flat list exactly as before.
+        self.sections
+            .sort_by_key(|s| Self::group_rank(&s.group));
         self.templates = self.rpc.config_templates().await?;
         // Eagerly load the first section so the right pane previews content on
         // first paint, matching the zerocode Config tab.
@@ -2667,6 +2679,30 @@ impl App {
     /// Persistent left pane: the section list. `active` is true while the
     /// SectionList screen holds focus (bright highlight); once a section is
     /// entered the list dims to a "you are here" marker.
+    /// Display rank of a section-group label. Mirror of
+    /// `zeroclaw_config::sections::SECTION_GROUPS` — zerocode talks to
+    /// remote daemons over the wire, so like the dashboard's
+    /// `GROUP_ORDER` (web/src/pages/Config.tsx) it carries its own copy
+    /// of the order instead of linking the config crate. Unknown and
+    /// empty labels rank with "Other" so nothing ever vanishes.
+    fn group_rank(label: &str) -> usize {
+        const ORDER: &[&str] = &[
+            "Foundation",
+            "Agent",
+            "Multi-agent",
+            "Tools",
+            "Integrations",
+            "Network",
+            "Storage",
+            "Operations",
+            "Other",
+        ];
+        ORDER
+            .iter()
+            .position(|g| *g == label)
+            .unwrap_or(ORDER.len() - 1)
+    }
+
     fn draw_sections_pane(&mut self, frame: &mut Frame, area: Rect, active: bool) {
         use ratatui::layout::{Constraint, Direction, Layout};
         // Reserve one line at the top for the filter bar when filtering.
@@ -2690,24 +2726,48 @@ impl App {
         let labels: Vec<String> = self.sections.iter().map(|s| s.label.clone()).collect();
         let visible = self.filtered_indices(&labels);
 
-        let items: Vec<ListItem> = visible
-            .iter()
-            .map(|&i| {
-                let s = &self.sections[i];
-                let badge = if s.completed { " ✓" } else { "" };
-                ListItem::new(Line::from(Span::styled(
-                    format!("{}{badge}", s.label),
-                    theme::body_style(),
-                )))
-            })
-            .collect();
+        // Grouped display: dim header rows between groups, sections
+        // beneath. Active only when the daemon sent group labels and no
+        // filter narrows the list — filtering and old daemons render the
+        // flat all-sections list unchanged. `row_map` records what each
+        // display row is so the cursor and mouse hit-testing resolve
+        // through it instead of assuming row == section position.
+        let grouped = self.filter.is_none() && self.sections.iter().any(|s| !s.group.is_empty());
+        let mut row_map: Vec<Option<usize>> = Vec::with_capacity(visible.len());
+        let mut items: Vec<ListItem> = Vec::with_capacity(visible.len());
+        let mut last_group: Option<&str> = None;
+        for &i in &visible {
+            let s = &self.sections[i];
+            if grouped {
+                let group = if s.group.is_empty() {
+                    "Other"
+                } else {
+                    s.group.as_str()
+                };
+                if last_group != Some(group) {
+                    items.push(ListItem::new(Line::from(Span::styled(
+                        group.to_string(),
+                        theme::dim_style().add_modifier(Modifier::BOLD),
+                    ))));
+                    row_map.push(None);
+                    last_group = Some(group);
+                }
+            }
+            let badge = if s.completed { " ✓" } else { "" };
+            let indent = if grouped { " " } else { "" };
+            items.push(ListItem::new(Line::from(Span::styled(
+                format!("{indent}{}{badge}", s.label),
+                theme::body_style(),
+            ))));
+            row_map.push(Some(i));
+        }
 
         let cursor = if self.filter.is_some() {
             self.filter_cursor
         } else {
-            visible
+            row_map
                 .iter()
-                .position(|&i| i == self.section_cursor)
+                .position(|r| *r == Some(self.section_cursor))
                 .unwrap_or(0)
         };
 
@@ -2732,6 +2792,7 @@ impl App {
         );
         self.last_main_area = list_area;
         self.last_section_list_area = list_area;
+        self.last_section_rows = row_map;
         self.last_list_offset = state.offset();
         self.last_tab_area = None;
     }
