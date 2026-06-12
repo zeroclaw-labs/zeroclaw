@@ -16,8 +16,7 @@ zeroclaw-providers.workspace = true
 zeroclaw-channels = { workspace = true, default-features = true, features = ["channel-acp-server", "channel-email", "channel-telegram"] }
 zeroclaw-runtime.workspace = true
 zeroclaw-tools.workspace = true
-zeroclaw-hardware.workspace = true
-zeroclaw-plugins = { workspace = true, optional = true }
+# zeroclaw-hardware and zeroclaw-plugins removed in Phase 1.4 (whole-crate drops)
 
 # HTTP server
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws", "macros"] }
@@ -79,7 +78,7 @@ tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 
 [features]
 default = ["schema-export"]
-plugins-wasm = ["dep:zeroclaw-plugins"]
+# plugins-wasm feature removed in Phase 1.4 (zeroclaw-plugins crate dropped)
 webauthn = ["zeroclaw-runtime/webauthn"]
 observability-prometheus = ["zeroclaw-runtime/observability-prometheus"]
 channel-nostr = ["zeroclaw-channels/channel-nostr"]

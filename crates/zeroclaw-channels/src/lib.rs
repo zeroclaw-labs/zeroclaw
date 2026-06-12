@@ -66,8 +66,7 @@ pub mod voice_call;
 pub mod voice_wake;
 #[cfg(feature = "channel-wati")]
 pub mod wati;
-#[cfg(feature = "channel-webhook")]
-pub mod webhook;
+// channel-webhook removed in Phase 1.4 (user-rejected on security grounds — STRIP-06)
 #[cfg(feature = "channel-wechat")]
 pub mod wechat;
 #[cfg(feature = "channel-wecom")]

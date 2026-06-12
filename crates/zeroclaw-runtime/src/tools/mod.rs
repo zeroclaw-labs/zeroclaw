@@ -74,11 +74,17 @@ pub use zeroclaw_tools::jira_tool::JiraTool;
 pub use zeroclaw_tools::knowledge_tool::KnowledgeTool;
 pub use zeroclaw_tools::linkedin::LinkedInTool;
 pub use zeroclaw_tools::llm_task::LlmTaskTool;
-pub use zeroclaw_tools::mcp_client::McpRegistry;
-pub use zeroclaw_tools::mcp_deferred::{
+// MCP re-exports now flow through the engineer-only `osagent-tools-mcp` crate.
+// Adding `osagent-tools-mcp` as a dep of `zeroclaw-runtime` means any binary
+// that depends on `zeroclaw-runtime` transitively gets MCP. That's why the
+// wizard binary MUST NOT depend on `zeroclaw-runtime` until M3 splits it
+// into `core` (no MCP) + `mcp-glue` (engineer-only). The wizard-no-mcp-gate
+// CI job will fail otherwise.
+pub use osagent_tools_mcp::mcp_client::McpRegistry;
+pub use osagent_tools_mcp::mcp_deferred::{
     ActivatedToolSet, DeferredMcpToolSet, build_deferred_tools_section,
 };
-pub use zeroclaw_tools::mcp_tool::McpToolWrapper;
+pub use osagent_tools_mcp::mcp_tool::McpToolWrapper;
 pub use zeroclaw_tools::memory_export::MemoryExportTool;
 pub use zeroclaw_tools::memory_forget::MemoryForgetTool;
 pub use zeroclaw_tools::memory_purge::MemoryPurgeTool;

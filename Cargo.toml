@@ -1,5 +1,21 @@
 [workspace]
-members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-runtime", "crates/zeroclaw-tui", "crates/zeroclaw-plugins", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask",
+# Phase 1.4 dropped: crates/zeroclaw-hardware, crates/robot-kit,
+# crates/aardvark-sys, crates/zeroclaw-plugins, apps/tauri.
+members = [".",
+    "crates/zeroclaw-api",
+    "crates/zeroclaw-infra",
+    "crates/zeroclaw-config",
+    "crates/zeroclaw-providers",
+    "crates/zeroclaw-memory",
+    "crates/zeroclaw-channels",
+    "crates/zeroclaw-tools",
+    "crates/zeroclaw-runtime",
+    "crates/zeroclaw-tui",
+    "crates/zeroclaw-gateway",
+    "crates/zeroclaw-tool-call-parser",
+    "crates/zeroclaw-macros",
+    "tools/fill-translations",
+    "xtask",
     # ── osAgent additions (Phase 1.2) ─────────────────────────────────
     # bins/engineer and bins/wizard are the two osAgent binaries. Their
     # Cargo.toml files are the human-readable manifest of compiled-in
@@ -44,12 +60,11 @@ zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.1.0", defa
 zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.1.0" }
 zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.1.0", default-features = false }
 zeroclaw-tui = { path = "crates/zeroclaw-tui", version = "0.1.0" }
-zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.1.0" }
 zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.1.0" }
-zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.1.0" }
 zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.1.0" }
 zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.1.0" }
-aardvark-sys = { path = "crates/aardvark-sys", version = "0.1.0" }
+# Phase 1.4 dropped: zeroclaw-plugins (WASM/Extism), zeroclaw-hardware (USB/GPIO/I2C/SPI),
+# aardvark-sys (Total Phase Aardvark adapter FFI).
 
 [package]
 name = "zeroclawlabs"
@@ -104,9 +119,8 @@ zeroclaw-channels = { workspace = true, optional = true }
 zeroclaw-tools = { workspace = true, optional = true }
 zeroclaw-runtime = { workspace = true, optional = true }
 zeroclaw-tui = { workspace = true, optional = true }
-zeroclaw-plugins = { workspace = true, optional = true }
 zeroclaw-gateway = { workspace = true, optional = true }
-zeroclaw-hardware = { workspace = true, optional = true }
+# zeroclaw-plugins + zeroclaw-hardware removed in Phase 1.4
 zeroclaw-tool-call-parser.workspace = true
 zeroclaw-macros.workspace = true
 # CLI - minimal and fast
@@ -168,8 +182,7 @@ zip = { version = "8.1", default-features = false, features = ["deflate-flate2"]
 anyhow = "1.0"
 thiserror = "2.0"
 
-# Aardvark I2C/SPI/GPIO USB adapter (Total Phase) — stub when SDK absent
-aardvark-sys.workspace = true
+# (Aardvark I2C/SPI/GPIO USB adapter removed in Phase 1.4 — hardware crate dropped)
 
 # UUID generation
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
@@ -290,7 +303,7 @@ agent-runtime = [
     "channel-twitter", "channel-reddit", "channel-notion",
     "channel-linq", "channel-wati", "channel-nextcloud",
     "channel-mochat", "channel-wecom", "channel-clawdtalk",
-    "channel-webhook", "channel-acp-server", "channel-whatsapp-cloud",
+    "channel-acp-server", "channel-whatsapp-cloud",
     "channel-voice-call",
 ]
 
@@ -329,7 +342,6 @@ channel-mochat = ["zeroclaw-channels/channel-mochat"]
 channel-wechat = ["zeroclaw-channels/channel-wechat"]
 channel-wecom = ["zeroclaw-channels/channel-wecom"]
 channel-clawdtalk = ["zeroclaw-channels/channel-clawdtalk"]
-channel-webhook = ["zeroclaw-channels/channel-webhook"]
 channel-acp-server = ["zeroclaw-channels/channel-acp-server"]
 channel-whatsapp-cloud = ["zeroclaw-channels/channel-whatsapp-cloud"]
 channel-voice-call = ["zeroclaw-channels/channel-voice-call"]
@@ -343,14 +355,11 @@ observability-prometheus = [
     "zeroclaw-runtime/observability-prometheus",
     "zeroclaw-gateway/observability-prometheus",
 ]
-observability-otel = ["zeroclaw-runtime/observability-otel"]
-hardware = ["dep:zeroclaw-hardware", "zeroclaw-hardware/hardware"]
-peripheral-rpi = ["dep:zeroclaw-hardware", "zeroclaw-hardware/peripheral-rpi"]
+# observability-otel feature removed in Phase 1.4 (OTLP exporter is phone-home; banned in deny.toml)
+# hardware/peripheral-rpi/probe/plugins-wasm features removed in Phase 1.4
 sandbox-landlock = ["zeroclaw-runtime/sandbox-landlock"]
 sandbox-bubblewrap = ["zeroclaw-runtime/sandbox-bubblewrap"]
 browser-native = ["zeroclaw-tools/browser-native"]
-plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-runtime/plugins-wasm"]
-probe = ["dep:zeroclaw-hardware", "zeroclaw-hardware/probe"]
 rag-pdf = ["zeroclaw-tools/rag-pdf", "zeroclaw-runtime/rag-pdf"]
 webauthn = ["zeroclaw-runtime/webauthn"]
 embedded-web = ["zeroclaw-gateway/embedded-web"]
@@ -361,13 +370,14 @@ landlock = ["sandbox-landlock"]
 metrics = ["observability-prometheus"]
 
 # CI meta-feature
+# Phase 1.4 stripped: hardware, peripheral-rpi, probe, plugins-wasm, whatsapp-web
+# Phase 1.5 will strip the remaining non-v1 channels (nostr/matrix/etc.).
 ci-all = [
     "agent-runtime",
-    "channel-nostr", "channel-matrix", "whatsapp-web",
-    "observability-prometheus", "observability-otel",
-    "hardware", "peripheral-rpi",
+    "channel-matrix",
+    "observability-prometheus",
     "sandbox-landlock", "sandbox-bubblewrap",
-    "browser-native", "plugins-wasm", "probe", "rag-pdf",
+    "browser-native", "rag-pdf",
     "webauthn", "memory-postgres",
 ]
 

@@ -13,7 +13,10 @@ zeroclaw-config.workspace = true
 zeroclaw-providers.workspace = true
 zeroclaw-memory.workspace = true
 zeroclaw-tools.workspace = true
-zeroclaw-plugins = { workspace = true, optional = true }
+# Phase 1.4: osagent-tools-mcp added because the MCP modules migrated here from
+# zeroclaw-tools. Wizard binary MUST NOT depend on zeroclaw-runtime in M3 unless
+# the runtime is split into core (no MCP) + mcp-glue (engineer-only).
+osagent-tools-mcp = { path = "../osagent-tools-mcp" }
 zeroclaw-tool-call-parser.workspace = true
 fluent = "0.16"
 anyhow = "1.0"
@@ -72,11 +75,11 @@ zip = { version = "8.1", default-features = false, features = ["deflate-flate2"]
 zeroclaw-macros.workspace = true
 
 # Optional deps
-aardvark-sys.workspace = true
 prometheus = { version = "0.14", default-features = false, optional = true }
-opentelemetry = { version = "0.31", default-features = false, features = ["trace", "metrics"], optional = true }
-opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics"], optional = true }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots"], optional = true }
+# Phase 1.4 TELEMETRY STRIP: opentelemetry / opentelemetry_sdk / opentelemetry-otlp
+# (OTLP exporter is phone-home; banned in deny.toml). The base opentelemetry facade
+# crate would be acceptable but pulling it in only for tracing instrumentation that
+# we don't ship is dead weight. observability-otel feature dropped below.
 # Optional deps for specific features
 pdf-extract = { version = "0.10", optional = true }
 
@@ -89,7 +92,7 @@ libc = "0.2"
 [features]
 default = ["observability-prometheus", "schema-export"]
 observability-prometheus = ["dep:prometheus"]
-observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+# observability-otel feature removed in Phase 1.4 (telemetry strip)
 sandbox-landlock = ["dep:landlock"]
 schema-export = ["dep:schemars", "zeroclaw-config/schema-export"]
 
@@ -97,7 +100,7 @@ schema-export = ["dep:schemars", "zeroclaw-config/schema-export"]
 channel-nostr = ["zeroclaw-config/channel-nostr"]
 browser-native = []
 rag-pdf = ["dep:pdf-extract"]
-plugins-wasm = ["dep:zeroclaw-plugins"]
+# plugins-wasm feature removed in Phase 1.4 (zeroclaw-plugins crate dropped)
 webauthn = []
 sandbox-bubblewrap = []
 

@@ -154,8 +154,7 @@ mod daemon;
 mod doctor;
 #[cfg(feature = "gateway")]
 mod gateway;
-#[cfg(feature = "agent-runtime")]
-mod hardware;
+// hardware module removed in Phase 1.4 (zeroclaw-hardware crate dropped)
 #[cfg(feature = "agent-runtime")]
 mod health;
 #[cfg(feature = "agent-runtime")]
@@ -175,12 +174,9 @@ mod migration;
 mod multimodal;
 #[cfg(feature = "agent-runtime")]
 mod observability;
-#[cfg(feature = "agent-runtime")]
-mod peripherals;
+// peripherals + plugins modules removed in Phase 1.4
 #[cfg(feature = "agent-runtime")]
 mod platform;
-#[cfg(feature = "plugins-wasm")]
-mod plugins;
 mod providers;
 #[cfg(feature = "schema-export")]
 mod schema_markdown;

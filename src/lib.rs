@@ -76,8 +76,7 @@ pub(crate) mod multimodal;
 pub mod nodes;
 #[cfg(feature = "agent-runtime")]
 pub mod observability;
-#[cfg(feature = "agent-runtime")]
-pub mod peripherals;
+// peripherals module removed in Phase 1.4 (hardware crate dropped)
 #[cfg(feature = "agent-runtime")]
 pub mod platform;
 pub mod providers;
@@ -102,8 +101,7 @@ pub(crate) mod tunnel;
 #[cfg(feature = "agent-runtime")]
 pub mod verifiable_intent;
 
-#[cfg(feature = "plugins-wasm")]
-pub mod plugins;
+// plugins module removed in Phase 1.4 (zeroclaw-plugins crate dropped)
 
 pub use config::Config;
 

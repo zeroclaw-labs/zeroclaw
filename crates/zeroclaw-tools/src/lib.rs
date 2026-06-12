@@ -38,11 +38,10 @@ pub mod knowledge_tool;
 pub mod linkedin;
 pub mod linkedin_client;
 pub mod llm_task;
-pub mod mcp_client;
-pub mod mcp_deferred;
-pub mod mcp_protocol;
-pub mod mcp_tool;
-pub mod mcp_transport;
+// MCP modules migrated to crates/osagent-tools-mcp (Phase 1.4).
+// Consumers must re-import from `osagent_tools_mcp::mcp_*` instead of
+// `zeroclaw_tools::mcp_*`. The wizard binary's Cargo.toml MUST NOT list
+// osagent-tools-mcp as a dependency — see bins/wizard/Cargo.toml.
 pub mod memory_export;
 pub mod memory_forget;
 pub mod memory_purge;
