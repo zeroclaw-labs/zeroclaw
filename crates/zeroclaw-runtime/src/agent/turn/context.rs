@@ -20,8 +20,9 @@ use zeroclaw_providers::ModelProvider;
 /// passed as an explicit individual argument. Never add a `&mut` field:
 /// it creates overlapping-borrow errors across step calls (RUN_SHEET
 /// `turn.context.TurnCtx`).
-// Fields are consumed progressively as G1 carves the loop body into step
-// functions (commits 8–19); drop the allow once carving is complete.
+// Some fields are not yet read through `ctx` — the orchestrator still passes
+// them as explicit step arguments per the RUN_SHEET contracts. G2 (event_tx
+// wiring, knobs) consumes the remainder; drop the allow then.
 #[allow(dead_code)]
 pub(crate) struct TurnCtx<'a> {
     pub(crate) model_provider: &'a dyn ModelProvider,
