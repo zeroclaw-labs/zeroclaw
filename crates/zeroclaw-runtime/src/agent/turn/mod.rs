@@ -5,10 +5,12 @@
 //! `/opt/notes/work/zeroclaw/unification_modular/RUN_SHEET.md` during the
 //! #7415 migration.
 
+pub(crate) mod delivery_defaults;
 pub(crate) mod events;
 pub(crate) mod outcome;
 pub(crate) mod redact;
 
+pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
 pub use events::{DraftEvent, PROGRESS_MIN_INTERVAL_MS, StreamDelta};
 pub(crate) use events::STREAM_CHUNK_MIN_CHARS;
 pub use outcome::{
