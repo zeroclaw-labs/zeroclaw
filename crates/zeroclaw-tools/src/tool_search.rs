@@ -57,11 +57,16 @@ impl ToolAccessPolicy {
     }
 
     pub fn is_tool_allowed(&self, name: &str) -> bool {
-        // MCP tools (names containing "__") discovered at runtime are
-        // implicitly admitted when an explicit allow-list is present,
-        // mirroring the fix in DelegateTool::resolve_allowed_tools.
-        // They can still be blocked via excluded_tools / denied.
+        // When an explicit (non-empty) allow-list is present, any MCP tool
+        // discovered at runtime (names containing "__") is auto-admitted
+        // unless explicitly blocked via excluded_tools/denied.
+        // An empty allow-list (`Some(vec![])`) still means "deny everything".
         if name.contains("__") {
+            if let Some(list) = &self.allowed {
+                if list.is_empty() {
+                    return false; // explicit empty list = deny all
+                }
+            }
             let in_deny = self
                 .denied
                 .as_ref()
