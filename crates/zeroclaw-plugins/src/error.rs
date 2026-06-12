@@ -42,4 +42,26 @@ pub enum PluginError {
 
     #[error("TOML parse error: {0}")]
     TomlParse(#[from] toml::de::Error),
+
+    /// Errors originating from the wasmtime runtime (Component Model path).
+    ///
+    /// `wasmtime::Error` uses its own internal error type rather than
+    /// `std::error::Error` directly, so we capture the message string here
+    /// to stay compatible with the `thiserror`/`anyhow` error hierarchy.
+    #[cfg(feature = "plugins-wasmtime")]
+    #[error("wasmtime error: {0}")]
+    Wasmtime(String),
+}
+
+/// Convert a `wasmtime::Error` into a [`PluginError::Wasmtime`].
+///
+/// This explicit impl (rather than `#[from]`) avoids requiring
+/// `wasmtime::Error: std::error::Error` — wasmtime's error type uses
+/// `core::error::Error` internally and the two impls are the same on
+/// Rust ≥ 1.81, but an explicit conversion is clearer at call sites.
+#[cfg(feature = "plugins-wasmtime")]
+impl From<wasmtime::Error> for PluginError {
+    fn from(e: wasmtime::Error) -> Self {
+        PluginError::Wasmtime(format!("{e:#}"))
+    }
 }

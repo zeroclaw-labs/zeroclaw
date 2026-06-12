@@ -10,6 +10,9 @@ pub mod signature;
 pub mod wasm_channel;
 pub mod wasm_tool;
 
+#[cfg(feature = "plugins-wasmtime")]
+pub mod component;
+
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 

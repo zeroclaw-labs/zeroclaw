@@ -9,14 +9,15 @@ publish = false
 [features]
 default = ["plugins-wit-v0"]
 plugins-wit-v0 = []
-plugins-wasmtime = ["dep:wasmtime"]
+plugins-wasmtime = ["dep:wasmtime", "dep:wasmtime-wasi"]
 plugins-wasm-cranelift = ["plugins-wasmtime", "wasmtime/cranelift"]
 plugins-wasm-pulley = ["plugins-wasmtime", "wasmtime/pulley"]
 
 [dependencies]
-zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
 zeroclaw-infra.workspace = true
+zeroclaw-log.workspace = true
+zeroclaw-spawn.workspace = true
 anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"
@@ -28,9 +29,13 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 thiserror = "2.0"
 tokio = { version = "1.50", default-features = false, features = ["sync", "macros", "rt"] }
 toml = "1.0"
-wasmtime = { version = "43", default-features = false, features = [
+wasmtime = { version = "45", default-features = false, features = [
+  "async",
   "component-model",
   "runtime",
+], optional = true }
+wasmtime-wasi = { version = "45", default-features = false, features = [
+  "p2",            # WASIP2 component-model streams/poll support
 ], optional = true }
 
 [dev-dependencies]
