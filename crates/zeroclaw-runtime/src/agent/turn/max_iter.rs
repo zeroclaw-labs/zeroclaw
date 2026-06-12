@@ -27,6 +27,8 @@ pub(crate) async fn finish_after_max_iterations(
     max_iterations: usize,
     mut accumulated_display_text: String,
     turn_id: &str,
+    mut new_messages_out: Option<&mut Vec<ChatMessage>>,
+    initial_history_len: usize,
 ) -> Result<String> {
     ::zeroclaw_log::record!(
         WARN,
@@ -104,6 +106,9 @@ pub(crate) async fn finish_after_max_iterations(
                 anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
             }
             accumulated_display_text.push_str(&text);
+            if let Some(out) = new_messages_out.as_deref_mut() {
+                *out = history[initial_history_len..].to_vec();
+            }
             Ok(accumulated_display_text)
         }
         Err(e) => {

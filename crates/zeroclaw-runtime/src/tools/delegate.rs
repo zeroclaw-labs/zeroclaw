@@ -1,4 +1,4 @@
-use crate::agent::loop_::{TOOL_LOOP_SESSION_KEY, run_tool_call_loop};
+use crate::agent::loop_::{LoopKnobs, TOOL_LOOP_SESSION_KEY, run_tool_call_loop};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::security::SecurityPolicy;
@@ -1767,6 +1767,10 @@ impl DelegateTool {
                 None, // channel: delegate subagents don't support approval
                 receipt_generator,
                 collected_receipts,
+                None, // event_tx
+                None, // steering
+                None, // new_messages_out
+                &LoopKnobs::default(),
             )
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(agent_name)

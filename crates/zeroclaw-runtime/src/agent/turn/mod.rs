@@ -55,6 +55,7 @@ pub(crate) mod delivery_defaults;
 pub(crate) mod events;
 pub(crate) mod history_append;
 pub(crate) mod history_window;
+pub(crate) mod knobs;
 pub(crate) mod max_iter;
 pub(crate) mod outcome;
 pub(crate) mod parse_response;
@@ -63,6 +64,7 @@ pub(crate) mod protocol_detect;
 pub(crate) mod provider_call;
 pub(crate) mod redact;
 pub(crate) mod results_collect;
+pub(crate) mod steering;
 pub(crate) mod stream_consume;
 pub(crate) mod stream_guard;
 pub(crate) mod tool_specs;
@@ -76,6 +78,7 @@ pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
 pub use events::{DraftEvent, PROGRESS_MIN_INTERVAL_MS, StreamDelta};
 pub(crate) use history_append::append_tool_round_to_history;
 pub(crate) use history_window::preflight_history_maintenance;
+pub use knobs::{LoopKnobs, MaxIterationBehavior};
 pub(crate) use max_iter::finish_after_max_iterations;
 pub use outcome::{
     ModelSwitchCallback, ModelSwitchRequested, ToolLoopCancelled, is_model_switch_requested,
@@ -92,6 +95,7 @@ pub use redact::scrub_credentials;
 pub(crate) use results_collect::{
     CollectedResults, check_identical_output_abort, collect_tool_results,
 };
+pub use steering::drain_steering_messages;
 #[cfg(test)]
 pub(crate) use stream_consume::StreamedChatOutcome;
 #[cfg(test)]
@@ -113,6 +117,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_providers::{ChatMessage, ModelProvider};
 
@@ -169,6 +174,13 @@ pub async fn run_tool_call_loop(
     channel: Option<&dyn Channel>,
     receipt_generator: Option<&crate::agent::tool_receipts::ReceiptGenerator>,
     collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
+    // event_tx is consumed by the C2 emission commit; underscore-named until
+    // then so C1 stays warning-free.
+    _event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
+    mut steering: Option<&mut tokio::sync::mpsc::Receiver<String>>,
+    mut new_messages_out: Option<&mut Vec<ChatMessage>>,
+    // knobs take effect in the C3 commit; underscore-named until then.
+    _knobs: &LoopKnobs,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -197,6 +209,7 @@ pub async fn run_tool_call_loop(
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
     let mut malformed_tool_protocol_retries: usize = 0;
+    let initial_history_len = history.len();
 
     // Shared-ref context for the turn step functions. Every `&mut` the loop
     // owns stays a loop local passed as an explicit argument (RUN_SHEET
@@ -230,6 +243,12 @@ pub async fn run_tool_call_loop(
     };
 
     for iteration in 0..max_iterations {
+        // Steering: fold caller-pushed mid-turn messages into history before
+        // this iteration's provider request.
+        for steering_message in drain_steering_messages(&mut steering) {
+            history.push(ChatMessage::user(steering_message));
+        }
+
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
         if cancellation_token
@@ -458,6 +477,9 @@ pub async fn run_tool_call_loop(
                 let _ = tx.send(StreamDelta::Text(fallback.to_string())).await;
             }
             history.push(ChatMessage::assistant(fallback.to_string()));
+            if let Some(out) = new_messages_out.as_deref_mut() {
+                *out = history[initial_history_len..].to_vec();
+            }
             return Ok(accumulated_display_text);
         }
 
@@ -501,6 +523,9 @@ pub async fn run_tool_call_loop(
             }
 
             history.push(ChatMessage::assistant(response_text.clone()));
+            if let Some(out) = new_messages_out.as_deref_mut() {
+                *out = history[initial_history_len..].to_vec();
+            }
             return Ok(accumulated_display_text);
         }
 
@@ -619,6 +644,8 @@ pub async fn run_tool_call_loop(
         max_iterations,
         accumulated_display_text,
         &turn_id,
+        new_messages_out,
+        initial_history_len,
     )
     .await
 }
