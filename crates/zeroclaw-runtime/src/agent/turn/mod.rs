@@ -386,6 +386,7 @@ pub async fn run_tool_call_loop(
                     streamed_protocol_suppressed,
                     llm_started_at,
                     iteration,
+                    knobs.detect_protocol_without_tools,
                 )
                 .await;
                 (

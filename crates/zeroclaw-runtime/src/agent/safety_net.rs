@@ -1016,3 +1016,77 @@ async fn safety_net_streaming_tool_results_input_order_and_midbatch_cancel() {
         "unrun calls must be synthesized as interrupted"
     );
 }
+
+// ── seam 9: AgentEnd carries token totals on Agent::turn ────────────────
+// E3 summed per-response usage straight into its TurnGuard. After the C4
+// consolidation the wrapper no longer sees per-call responses; totals flow
+// through the usage-only cost-tracking context instead (plan flag §8.6).
+// Pins: AgentEnd.tokens_used = usage summed across ALL loop iterations.
+
+/// Captures observer events for assertion; no-op for metrics.
+#[derive(Default)]
+struct EventCapture {
+    events: parking_lot::Mutex<Vec<ObserverEvent>>,
+}
+
+impl Observer for EventCapture {
+    fn record_event(&self, event: &ObserverEvent) {
+        self.events.lock().push(event.clone());
+    }
+    fn record_metric(&self, _metric: &zeroclaw_api::observability_traits::ObserverMetric) {}
+    fn name(&self) -> &str {
+        "event-capture"
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+#[tokio::test]
+async fn safety_net_agent_turn_agent_end_reports_token_totals() {
+    let mut tool_round = tool_response(vec![tool_call("tc1", "echo")]);
+    tool_round.usage = Some(token_usage(7, 3));
+    let mut final_round = text_response("done");
+    final_round.usage = Some(token_usage(11, 5));
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let capture = Arc::new(EventCapture::default());
+    let mut agent = Agent::builder()
+        .model_provider(Box::new(ScriptedProvider::new(vec![
+            tool_round,
+            final_round,
+        ])))
+        .tools(vec![Box::new(CountingTool {
+            name: "echo",
+            calls: Arc::clone(&calls),
+        })])
+        .memory(mem_none())
+        .observer(Arc::clone(&capture) as Arc<dyn Observer>)
+        .tool_dispatcher(Box::new(NativeToolDispatcher))
+        .workspace_dir(std::path::PathBuf::from("/tmp"))
+        .build()
+        .expect("agent builder should succeed");
+
+    agent
+        .turn("count tokens")
+        .await
+        .expect("turn should succeed");
+
+    let events = capture.events.lock();
+    let tokens = events
+        .iter()
+        .find_map(|event| match event {
+            ObserverEvent::AgentEnd { tokens_used, .. } => Some(tokens_used.clone()),
+            _ => None,
+        })
+        .expect("AgentEnd must be recorded")
+        .expect("AgentEnd must carry tokens_used");
+    assert_eq!(
+        tokens.input_tokens, 18,
+        "input tokens must sum across all loop iterations"
+    );
+    assert_eq!(
+        tokens.output_tokens, 8,
+        "output tokens must sum across all loop iterations"
+    );
+}

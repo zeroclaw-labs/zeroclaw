@@ -100,6 +100,7 @@ pub(crate) async fn interpret_chat_response(
     streamed_protocol_suppressed: bool,
     llm_started_at: Instant,
     iteration: usize,
+    detect_protocol_without_tools: bool,
 ) -> InterpretedResponse {
     let (resp_input_tokens, resp_output_tokens) = resp
         .usage
@@ -184,11 +185,17 @@ pub(crate) async fn interpret_chat_response(
     let parse_issue = if ctx.strict_tool_parsing {
         None
     } else if specs.tool_specs.is_empty() {
-        detect_internal_protocol_without_tools(&response_text).or_else(|| {
-            streamed_protocol_suppressed.then(|| {
-                "streaming text guard suppressed an internal tool protocol envelope".to_string()
+        // Knob-gated (embedders return model text verbatim); a live stream
+        // suppression already altered the visible text, so it is always
+        // reported regardless of the knob.
+        detect_protocol_without_tools
+            .then(|| detect_internal_protocol_without_tools(&response_text))
+            .flatten()
+            .or_else(|| {
+                streamed_protocol_suppressed.then(|| {
+                    "streaming text guard suppressed an internal tool protocol envelope".to_string()
+                })
             })
-        })
     } else {
         detect_tool_call_parse_issue_for_known_tools(
             &response_text,

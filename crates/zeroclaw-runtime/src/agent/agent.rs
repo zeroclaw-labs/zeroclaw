@@ -11,7 +11,6 @@ use crate::tools::{self, Tool, ToolSpec};
 use anyhow::{Context, Result};
 use chrono::{Datelike, Timelike};
 use std::collections::{HashMap, VecDeque};
-use std::io::Write as IoWrite;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -2174,174 +2173,215 @@ impl Agent {
             done: false,
         };
 
-        for _ in 0..self.config.resolved.max_tool_iterations {
-            let messages = self.tool_dispatcher.to_provider_messages(&self.history);
-            let prepared_messages = self.prepare_provider_messages(&messages).await?;
+        // Response cache: check once before entering the loop (only for
+        // deterministic, text-only prompts). The key must include the whole
+        // provider-visible transcript, not just the last user message,
+        // otherwise distinct conversations can collide when their final
+        // prompt matches. Keyed on the raw provider transcript — multimodal
+        // preparation is a per-iteration loop concern now.
+        let provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+        let cache_key = self.response_cache_key_for_messages(&provider_messages, &effective_model);
 
-            // Response cache: check before LLM call (only for deterministic, text-only prompts).
-            // The key must include the whole provider-visible transcript, not just the last user
-            // message, otherwise distinct conversations can collide when their final prompt matches.
-            let cache_key =
-                self.response_cache_key_for_messages(&prepared_messages, &effective_model);
-
-            if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
-                if let Ok(Some(cached)) = cache.get(key) {
-                    self.observer.record_event(&ObserverEvent::CacheHit {
-                        cache_type: "response".into(),
-                        tokens_saved: 0,
-                    });
-                    self.history
-                        .push(ConversationMessage::Chat(ChatMessage::assistant(
-                            cached.clone(),
-                        )));
-                    self.trim_history();
-                    return Ok(cached);
-                }
-                self.observer.record_event(&ObserverEvent::CacheMiss {
+        if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
+            if let Ok(Some(cached)) = cache.get(key) {
+                self.observer.record_event(&ObserverEvent::CacheHit {
                     cache_type: "response".into(),
+                    tokens_saved: 0,
                 });
-            }
-
-            // Outbound prompt size diagnostic — see streaming site for notes.
-            {
-                let msg_count = prepared_messages.len();
-                let content_chars: usize = prepared_messages.iter().map(|m| m.content.len()).sum();
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
-                        .with_attrs(::serde_json::json!({
-                            "msg_count": msg_count,
-                            "content_chars": content_chars,
-                            "approx_tokens": content_chars / 4,
-                            "model": effective_model,
-                        })),
-                    "agent: outbound prompt size (non-streaming)"
-                );
-            }
-
-            let llm_started_at = Instant::now();
-            self.observer.record_event(&ObserverEvent::LlmRequest {
-                model_provider: self.model_provider_name.clone(),
-                model: effective_model.clone(),
-                messages_count: messages.len(),
-                channel: None,
-                agent_alias: self.observer_agent_alias(),
-                turn_id: Some(turn_id.clone()),
-            });
-
-            let response = match self
-                .model_provider
-                .chat(
-                    ChatRequest {
-                        messages: &prepared_messages,
-                        tools: if self.should_send_tool_specs() {
-                            Some(&self.tool_specs)
-                        } else {
-                            None
-                        },
-                        thinking: None,
-                    },
-                    &effective_model,
-                    self.temperature,
-                )
-                .await
-            {
-                Ok(resp) => {
-                    let (resp_input_tokens, resp_output_tokens) = resp
-                        .usage
-                        .as_ref()
-                        .map(|u| (u.input_tokens, u.output_tokens))
-                        .unwrap_or((None, None));
-                    if let Some(input) = resp_input_tokens {
-                        guard.total_input_tokens = guard.total_input_tokens.saturating_add(input);
-                        guard.saw_usage = true;
-                    }
-                    if let Some(output) = resp_output_tokens {
-                        guard.total_output_tokens =
-                            guard.total_output_tokens.saturating_add(output);
-                        guard.saw_usage = true;
-                    }
-                    self.observer.record_event(&ObserverEvent::LlmResponse {
-                        model_provider: self.model_provider_name.clone(),
-                        model: effective_model.clone(),
-                        duration: llm_started_at.elapsed(),
-                        success: true,
-                        error_message: None,
-                        input_tokens: resp_input_tokens,
-                        output_tokens: resp_output_tokens,
-                        channel: None,
-                        agent_alias: self.observer_agent_alias(),
-                        turn_id: Some(turn_id.clone()),
-                    });
-                    resp
-                }
-                Err(err) => {
-                    let safe_error = zeroclaw_providers::sanitize_api_error(&err.to_string());
-                    self.observer.record_event(&ObserverEvent::LlmResponse {
-                        model_provider: self.model_provider_name.clone(),
-                        model: effective_model.clone(),
-                        duration: llm_started_at.elapsed(),
-                        success: false,
-                        error_message: Some(safe_error),
-                        input_tokens: None,
-                        output_tokens: None,
-                        channel: None,
-                        agent_alias: self.observer_agent_alias(),
-                        turn_id: Some(turn_id.clone()),
-                    });
-                    return Err(err);
-                }
-            };
-
-            let (text, calls) = self.parse_response_for_effective_tools(&response);
-            if calls.is_empty() {
-                let final_text = if text.is_empty() && !self.tool_specs.is_empty() {
-                    response.text.unwrap_or_default()
-                } else {
-                    text
-                };
-
-                // Store in response cache (text-only, no tool calls)
-                if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
-                    let token_count = response
-                        .usage
-                        .as_ref()
-                        .and_then(|u| u.output_tokens)
-                        .unwrap_or(0);
-                    #[allow(clippy::cast_possible_truncation)]
-                    let _ = cache.put(key, &effective_model, &final_text, token_count as u32);
-                }
-
                 self.history
                     .push(ConversationMessage::Chat(ChatMessage::assistant(
-                        final_text.clone(),
+                        cached.clone(),
                     )));
                 self.trim_history();
-
-                return Ok(final_text);
+                return Ok(cached);
             }
-
-            if !text.is_empty() {
-                print!("{text}");
-                let _ = std::io::stdout().flush();
-            }
-
-            self.history.push(ConversationMessage::AssistantToolCalls {
-                text: response.text.clone(),
-                tool_calls: response.tool_calls.clone(),
-                reasoning_content: response.reasoning_content.clone(),
+            self.observer.record_event(&ObserverEvent::CacheMiss {
+                cache_type: "response".into(),
             });
-
-            let results = self.execute_tools(&calls, &turn_id).await;
-            let formatted = self.tool_dispatcher.format_results(&results);
-            self.history.push(formatted);
-            self.trim_history();
         }
 
-        anyhow::bail!(
-            "Agent exceeded maximum tool iterations ({})",
-            self.config.resolved.max_tool_iterations
-        )
+        let mut loop_history = provider_messages;
+        let mut loop_new_messages: Vec<ChatMessage> = Vec::new();
+
+        let knobs = crate::agent::loop_::LoopKnobs {
+            dedup_enabled: false,
+            max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::ErrorAtCap,
+            detect_protocol_without_tools: false,
+        };
+        // E3 never had pattern-based loop detection; default pacing turns it
+        // on. Keep the embedder contract (an N-step identical-args tool chain
+        // completes) until the Agent surface grows a pacing config of its own.
+        let pacing = zeroclaw_config::schema::PacingConfig {
+            loop_detection_enabled: false,
+            ..zeroclaw_config::schema::PacingConfig::default()
+        };
+
+        // Usage-only cost context: the loop's per-call recording accumulates
+        // token totals here so AgentEnd keeps reporting them, without
+        // persisting cost records or enforcing budgets (this path never did
+        // either). The loop call below must stay a plain `.await` on this
+        // task — caller-scoped task-locals (thread id, session key, tool
+        // choice / thinking overrides) silently vanish across a spawn.
+        let cost_context = crate::agent::loop_::ToolLoopCostTrackingContext::usage_only();
+        let loop_result = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(cost_context.clone()),
+                crate::agent::loop_::run_tool_call_loop(
+                    self.model_provider.as_ref(),
+                    &mut loop_history,
+                    &self.tools,
+                    self.observer.as_ref(),
+                    &self.model_provider_name,
+                    &effective_model,
+                    self.temperature,
+                    false,
+                    self.approval_manager.as_deref(),
+                    "cli",
+                    None,
+                    &self.multimodal_config,
+                    self.config.resolved.max_tool_iterations,
+                    None,
+                    None,
+                    self.hook_runner.as_deref(),
+                    &[],
+                    &self.config.resolved.tool_call_dedup_exempt,
+                    self.activated_tools.as_ref(),
+                    None,
+                    &pacing,
+                    self.config.resolved.strict_tool_parsing,
+                    self.config.resolved.parallel_tools,
+                    self.config.resolved.max_tool_result_chars,
+                    self.config.resolved.max_context_tokens,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&mut loop_new_messages),
+                    &knobs,
+                ),
+            )
+            .await;
+
+        // Feed the accumulated per-call usage into the AgentEnd guard before
+        // any return below drops it — including the error path, which must
+        // still report usage from calls that succeeded earlier in the turn.
+        let usage = cost_context.snapshot_turn_usage();
+        if usage.input_tokens > 0 || usage.output_tokens > 0 {
+            guard.total_input_tokens = usage.input_tokens;
+            guard.total_output_tokens = usage.output_tokens;
+            guard.saw_usage = true;
+        }
+        let response = loop_result?;
+
+        // Replay the loop's transcript additions into the conversation
+        // history. Assistant messages carrying the loop's JSON tool-call
+        // encoding (`{"content", "tool_calls", "reasoning_content"?}`)
+        // round-trip back into `AssistantToolCalls` so multi-turn history
+        // keeps its structured shape; `role=tool` messages carry JSON tool
+        // results (an array for native parallel calls, a single object
+        // otherwise); everything else round-trips as a plain chat message.
+        for msg in &loop_new_messages {
+            if msg.role == "assistant"
+                && let Ok(serde_json::Value::Object(obj)) =
+                    serde_json::from_str::<serde_json::Value>(&msg.content)
+                && let Some(calls) = obj.get("tool_calls").and_then(|c| c.as_array())
+                && !calls.is_empty()
+                && calls.iter().all(|c| {
+                    c.get("id").is_some_and(serde_json::Value::is_string)
+                        && c.get("name").is_some_and(serde_json::Value::is_string)
+                })
+            {
+                let tool_calls = calls
+                    .iter()
+                    .map(|c| zeroclaw_providers::ToolCall {
+                        id: c
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        name: c
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        arguments: c
+                            .get("arguments")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        extra_content: None,
+                    })
+                    .collect();
+                self.history.push(ConversationMessage::AssistantToolCalls {
+                    text: obj
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    tool_calls,
+                    reasoning_content: obj
+                        .get("reasoning_content")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                });
+                continue;
+            }
+            if msg.role == "tool" {
+                if let Ok(vals) = serde_json::from_str::<Vec<serde_json::Value>>(&msg.content) {
+                    let results: Vec<ToolResultMessage> = vals
+                        .into_iter()
+                        .filter_map(|v| {
+                            Some(ToolResultMessage {
+                                tool_call_id: v.get("tool_call_id")?.as_str()?.to_string(),
+                                content: v
+                                    .get("content")
+                                    .and_then(|c| c.as_str())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                            })
+                        })
+                        .collect();
+                    if !results.is_empty() {
+                        self.history.push(ConversationMessage::ToolResults(results));
+                        continue;
+                    }
+                }
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg.content) {
+                    let result = ToolResultMessage {
+                        tool_call_id: v
+                            .get("tool_call_id")
+                            .and_then(|id| id.as_str())
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        content: v
+                            .get("content")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    };
+                    self.history
+                        .push(ConversationMessage::ToolResults(vec![result]));
+                    continue;
+                }
+            }
+            self.history.push(ConversationMessage::Chat(msg.clone()));
+        }
+
+        // Store in the response cache only when the turn was a single
+        // tool-free exchange (exactly one assistant message), mirroring the
+        // old "no tool calls" put condition.
+        if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key)
+            && loop_new_messages.len() == 1
+            && loop_new_messages[0].role == "assistant"
+        {
+            #[allow(clippy::cast_possible_truncation)]
+            let _ = cache.put(key, &effective_model, &response, usage.output_tokens as u32);
+        }
+
+        self.trim_history();
+
+        Ok(response)
     }
 
     /// Execute a single agent turn while streaming intermediate events.
