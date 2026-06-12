@@ -1,5 +1,26 @@
 # cargo-deny configuration -- v2 schema
 # https://embarkstudios.github.io/cargo-deny/
+#
+# osAgent policy (inherits upstream zeroclaw deny.toml; layered with our adds):
+#   1. AGPL Signal SDKs hard-banned — see [bans].deny below (signal-cli subprocess only).
+#   2. WTFPL frankenstein hard-banned — teloxide is the Telegram bot crate.
+#   3. Phone-home telemetry transports banned (sentry, posthog, honeycomb, opentelemetry-otlp).
+#      opentelemetry the facade crate is permitted (no transport).
+#   4. wildcards = "deny" — stricter than upstream's "allow"; reproducible builds property.
+#   5. all-features = false — only the default-feature resolved graph is checked. The wizard
+#      binary's no-MCP property depends on this NOT being flipped to true on workspace builds.
+#
+# Many of upstream's advisory ignores below target the `plugins-wasm` (Extism/wasmtime) crate
+# tree. Phase 1.4 drops zeroclaw-plugins entirely; those advisory ignores become irrelevant
+# at that point and will be cleaned up there. Left in place for M1 so the first PR ships
+# green.
+
+[graph]
+# Only the default-feature graph is checked. The wizard binary's structural MCP exclusion
+# (no Cargo.toml dependency edge to osagent-mcp) would be undermined by `all-features = true`
+# during `cargo build --workspace` (Cargo resolver=2 feature unification). Do not flip.
+all-features = false
+no-default-features = false
 
 [advisories]
 # In v2, vulnerability advisories always emit errors (not configurable).
@@ -67,8 +88,46 @@ allow = [
 unused-allowed-license = "allow"
 
 [bans]
-multiple-versions = "warn"
-wildcards = "allow"
+multiple-versions = "warn"   # promote to "deny" once Phase 1.5 strip stabilises the dep tree
+wildcards = "deny"           # `x = "*"` blocks reproducible builds; stricter than upstream
+highlight = "all"
+
+# Hard-banned crates. Each entry has a reason for future-Claude/future-Andreas.
+deny = [
+    # ── AGPL contamination defense (research/STACK.md Refinement #3) ──
+    # All Rust Signal SDKs are AGPL-3.0 and would force the entire osAgent binary under AGPL
+    # via transitive linking. Signal support ships as subprocess management around the
+    # standalone `signal-cli` (GPLv3 Java daemon, mere-aggregation via Unix-socket JSON-RPC).
+    # M4 scope. Until then, anyone trying to `cargo add presage` gets blocked at CI.
+    { name = "presage", reason = "AGPL-3.0; use signal-cli subprocess instead (M4)" },
+    { name = "libsignal-service", reason = "AGPL-3.0; use signal-cli subprocess instead (M4)" },
+    { name = "libsignal", reason = "AGPL-3.0; use signal-cli subprocess instead (M4)" },
+
+    # ── License audit ban: WTFPL ──
+    # frankenstein is a Telegram bot SDK alternative; license WTFPL is rejected by enterprise
+    # SBOM scanners. teloxide (MIT) is the adopted alternative for M2 Telegram channel work.
+    { name = "frankenstein", reason = "WTFPL; use teloxide instead" },
+
+    # ── Phone-home transports (telemetry strip, Phase 1.4) ──
+    # Explicit telemetry/observability transports that send data out-of-band. We do not ship them.
+    # opentelemetry the facade crate is permitted (no transport); opentelemetry-otlp the OTLP
+    # exporter is not.
+    { name = "sentry", reason = "phone-home telemetry transport; not shipping" },
+    { name = "sentry-core", reason = "phone-home telemetry transport; not shipping" },
+    { name = "sentry-tracing", reason = "phone-home telemetry transport; not shipping" },
+    { name = "posthog-rust", reason = "phone-home telemetry transport; not shipping" },
+    { name = "honeycomb-tracing", reason = "phone-home telemetry transport; not shipping" },
+    # TODO(phase-1.4): the opentelemetry-otlp ban is currently unreachable under
+    # all-features=false (it's optional, behind the `observability-otel` feature which is OFF
+    # in defaults). Listed so Phase 1.4 has an obvious deletion target and a future workspace
+    # re-feature wiring cannot silently relink it.
+    { name = "opentelemetry-otlp", reason = "OTLP exporter is phone-home; opentelemetry facade is permitted" },
+]
+
+# skip-tree: leaving empty at M1. Phase 1.5 may add entries if a kept-but-trimmed crate has
+# a duplicate-version cluster we want to ignore for `multiple-versions` purposes.
+skip = []
+skip-tree = []
 
 [sources]
 unknown-registry = "deny"
