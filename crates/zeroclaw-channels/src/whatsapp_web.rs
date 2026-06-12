@@ -2706,18 +2706,16 @@ impl Channel for WhatsAppWebChannel {
         let deliverable = Self::resolve_outbound_recipient(channel_id);
         let to = self.recipient_to_jid(&deliverable)?;
         let outgoing = waproto::whatsapp::Message {
-            reaction_message: Some(
-                waproto::whatsapp::message::ReactionMessage {
-                    key: Some(waproto::whatsapp::MessageKey {
-                        remote_jid: Some(to.to_string()),
-                        from_me: Some(false),
-                        id: Some(message_id.to_string()),
-                        ..Default::default()
-                    }),
-                    text: Some(emoji.to_string()),
+            reaction_message: Some(waproto::whatsapp::message::ReactionMessage {
+                key: Some(waproto::whatsapp::MessageKey {
+                    remote_jid: Some(to.to_string()),
+                    from_me: Some(false),
+                    id: Some(message_id.to_string()),
                     ..Default::default()
-                },
-            ),
+                }),
+                text: Some(emoji.to_string()),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         Box::pin(client.send_message(to, outgoing)).await?;
@@ -2745,18 +2743,16 @@ impl Channel for WhatsAppWebChannel {
         let deliverable = Self::resolve_outbound_recipient(channel_id);
         let to = self.recipient_to_jid(&deliverable)?;
         let outgoing = waproto::whatsapp::Message {
-            reaction_message: Some(
-                waproto::whatsapp::message::ReactionMessage {
-                    key: Some(waproto::whatsapp::MessageKey {
-                        remote_jid: Some(to.to_string()),
-                        from_me: Some(false),
-                        id: Some(message_id.to_string()),
-                        ..Default::default()
-                    }),
-                    text: Some(String::new()),
+            reaction_message: Some(waproto::whatsapp::message::ReactionMessage {
+                key: Some(waproto::whatsapp::MessageKey {
+                    remote_jid: Some(to.to_string()),
+                    from_me: Some(false),
+                    id: Some(message_id.to_string()),
                     ..Default::default()
-                },
-            ),
+                }),
+                text: Some(String::new()),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         Box::pin(client.send_message(to, outgoing)).await?;
@@ -2849,12 +2845,7 @@ impl Channel for WhatsAppWebChannel {
         ));
     }
 
-    async fn add_reaction(
-        &self,
-        _channel_id: &str,
-        _message_id: &str,
-        _emoji: &str,
-    ) -> Result<()> {
+    async fn add_reaction(&self, _channel_id: &str, _message_id: &str, _emoji: &str) -> Result<()> {
         anyhow::bail!(i18n::get_required_cli_string(
             "channel-whatsapp-web-feature-missing-error"
         ));
