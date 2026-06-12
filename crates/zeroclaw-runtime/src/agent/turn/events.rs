@@ -62,16 +62,6 @@ pub(crate) async fn stream_text_posthoc_chunks(
     Ok(())
 }
 
-/// Bridge `TurnEvent` → `StreamDelta` for the existing channel draft path.
-/// Consumed by the E2/E3 wrapper commits (C5); inert until then.
-#[allow(dead_code)]
-pub(crate) fn turn_event_to_stream_delta(event: &TurnEvent) -> Option<StreamDelta> {
-    match event {
-        TurnEvent::Chunk { delta } => Some(StreamDelta::Text(delta.clone())),
-        _ => None,
-    }
-}
-
 /// Emit the `TurnEvent::ToolCall`/`ToolResult` pair for one executed tool
 /// call (upstream E2 parity: per-outcome emission after execution).
 pub(crate) async fn emit_tool_call_pair(

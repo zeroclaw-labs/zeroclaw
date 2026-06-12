@@ -118,8 +118,6 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_api::channel::Channel;
-#[cfg(test)]
-use zeroclaw_api::model_provider::StreamEvent;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{
     self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory, MemoryCategory, decay,
@@ -620,7 +618,7 @@ pub async fn agent_turn(
 // stays the canonical public path via these re-exports.
 #[cfg(test)]
 pub(crate) use super::turn::{
-    DEFAULT_MAX_TOOL_ITERATIONS, MAX_MALFORMED_TOOL_PROTOCOL_RETRIES, StreamedChatOutcome,
+    DEFAULT_MAX_TOOL_ITERATIONS, MAX_MALFORMED_TOOL_PROTOCOL_RETRIES,
     build_native_assistant_history, consume_provider_streaming_response,
     maybe_inject_channel_delivery_defaults, resolve_display_text,
 };

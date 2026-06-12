@@ -97,8 +97,6 @@ pub(crate) use results_collect::{
 };
 pub use steering::drain_steering_messages;
 #[cfg(test)]
-pub(crate) use stream_consume::StreamedChatOutcome;
-#[cfg(test)]
 pub(crate) use stream_consume::consume_provider_streaming_response;
 pub(crate) use tool_specs::{IterationToolSpecs, build_iteration_tool_specs};
 pub(crate) use vision_route::{prepare_messages_for_iteration, resolve_vision_provider};

@@ -655,10 +655,10 @@ async fn safety_net_streaming_approval_deny_with_edit_round_trip() {
     assert!(!summary.is_empty(), "arguments_summary must be populated");
     let mut saw_edited_result_event = false;
     while let Ok(ev) = rx.try_recv() {
-        if let TurnEvent::ToolResult { output, .. } = &ev {
-            if output.contains("EDITED-RESULT") {
-                saw_edited_result_event = true;
-            }
+        if let TurnEvent::ToolResult { output, .. } = &ev
+            && output.contains("EDITED-RESULT")
+        {
+            saw_edited_result_event = true;
         }
     }
     assert!(

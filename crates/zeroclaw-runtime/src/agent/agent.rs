@@ -21,7 +21,6 @@ use zeroclaw_providers::ChatRequest;
 use zeroclaw_providers::{
     self, ChatMessage, ConversationMessage, ModelProvider, ToolResultMessage,
 };
-use zeroclaw_tool_call_parser::strip_think_tags;
 
 // Re-export TurnEvent from zeroclaw-types for backwards compatibility.
 pub use zeroclaw_api::agent::TurnEvent;
@@ -796,27 +795,6 @@ impl Agent {
         ))
     }
 
-    // Superseded by the run_tool_call_loop consolidation (#7415);
-    // scheduled for deletion in the helper-removal commit.
-    #[allow(dead_code)]
-    fn drain_steering_messages(
-        steering_rx: &mut Option<&mut tokio::sync::mpsc::Receiver<String>>,
-    ) -> Vec<String> {
-        let Some(rx) = steering_rx.as_deref_mut() else {
-            return Vec::new();
-        };
-
-        let mut messages = Vec::new();
-        loop {
-            match rx.try_recv() {
-                Ok(message) => messages.push(message),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-            }
-        }
-        messages
-    }
-
     async fn append_streamed_user_message_to_history(
         &mut self,
         user_message: &str,
@@ -852,65 +830,6 @@ impl Agent {
         self.history.push(user_msg);
     }
 
-    // Superseded by the run_tool_call_loop consolidation (#7415);
-    // scheduled for deletion in the helper-removal commit.
-    #[allow(dead_code)]
-    fn marked_partial_response(partial: &str, marker: &str) -> String {
-        if partial.is_empty() {
-            marker.to_string()
-        } else {
-            format!("{partial}\n\n{marker}")
-        }
-    }
-
-    /// Forward a turn event to the consumer without ever blocking the turn on a
-    /// stalled receiver. The streamed `event_tx` is bounded; if the consumer
-    /// stops draining (e.g. it is itself blocked on a contended write) a bare
-    /// `send().await` would park here forever, and because these sends sit
-    /// outside the turn's `select!` arms a fired cancel token could never
-    /// interrupt them — the turn would wedge on "working" with no cancel path.
-    /// Racing the send against the cancel token guarantees the producer yields
-    /// the moment cancellation fires. Returns `false` when cancellation won the
-    /// race (the event was not delivered); the send error itself is intentionally
-    /// ignored — a gone consumer is not a turn failure.
-    // Superseded by the run_tool_call_loop consolidation (#7415);
-    // scheduled for deletion in the helper-removal commit.
-    #[allow(dead_code)]
-    async fn send_turn_event(
-        event_tx: &tokio::sync::mpsc::Sender<TurnEvent>,
-        cancel_token: Option<&tokio_util::sync::CancellationToken>,
-        event: TurnEvent,
-    ) -> bool {
-        match cancel_token {
-            Some(token) => {
-                tokio::select! {
-                    biased;
-                    () = token.cancelled() => false,
-                    _ = event_tx.send(event) => true,
-                }
-            }
-            None => {
-                let _ = event_tx.send(event).await;
-                true
-            }
-        }
-    }
-
-    // Superseded by the run_tool_call_loop consolidation (#7415);
-    // scheduled for deletion in the helper-removal commit.
-    #[allow(dead_code)]
-    fn append_streamed_assistant_message_to_history(
-        &mut self,
-        content: String,
-        new_msgs: &mut Vec<ConversationMessage>,
-        committed_response: &mut String,
-    ) {
-        let assistant_msg = ConversationMessage::Chat(ChatMessage::assistant(content.clone()));
-        new_msgs.push(assistant_msg.clone());
-        self.history.push(assistant_msg);
-        committed_response.push_str(&content);
-    }
-
     // The turn loop appends a tool round to history only after execution,
     // so a mid-tool cancel leaves no orphaned tool-call entry needing runtime
     // synthesis; kept for its direct unit test (lib-dead since the
@@ -933,31 +852,6 @@ impl Agent {
         let msg = ConversationMessage::ToolResults(results);
         new_msgs.push(msg.clone());
         self.history.push(msg);
-    }
-
-    // Superseded by the run_tool_call_loop consolidation (#7415);
-    // scheduled for deletion in the helper-removal commit.
-    #[allow(dead_code)]
-    fn should_send_tool_specs(&self) -> bool {
-        self.tool_dispatcher.should_send_tool_specs() && !self.tool_specs.is_empty()
-    }
-
-    // Superseded by the run_tool_call_loop consolidation (#7415);
-    // scheduled for deletion in the helper-removal commit.
-    #[allow(dead_code)]
-    fn parse_response_for_effective_tools(
-        &self,
-        response: &zeroclaw_providers::ChatResponse,
-    ) -> (String, Vec<ParsedToolCall>) {
-        if self.tool_specs.is_empty() {
-            return (strip_think_tags(response.text_or_empty()), Vec::new());
-        }
-
-        if self.config.resolved.strict_tool_parsing && response.tool_calls.is_empty() {
-            return (strip_think_tags(response.text_or_empty()), Vec::new());
-        }
-
-        self.tool_dispatcher.parse_response(response)
     }
 
     pub fn set_memory_session_id(&mut self, session_id: Option<String>) {
@@ -1732,22 +1626,6 @@ impl Agent {
         self.prompt_builder.build(&ctx)
     }
 
-    // Superseded by the run_tool_call_loop consolidation (#7415);
-    // scheduled for deletion in the helper-removal commit.
-    #[allow(dead_code)]
-    async fn prepare_provider_messages(
-        &mut self,
-        messages: &[ChatMessage],
-    ) -> Result<Vec<ChatMessage>> {
-        let prepared = zeroclaw_providers::multimodal::prepare_messages_for_provider_cached(
-            messages,
-            &self.multimodal_config,
-            &mut self.image_cache,
-        )
-        .await?;
-        Ok(prepared.messages)
-    }
-
     // Superseded by the loop's prepare/approve/execute pipeline (#7415).
     // Lib-dead since the consolidation; kept while the ACP-approval and
     // shell approved-arg tests exercise it directly.
@@ -2060,34 +1938,6 @@ impl Agent {
             success,
             tool_call_id: call.tool_call_id.clone(),
         }
-    }
-
-    // Superseded by the loop's execution dispatch (#7415); see
-    // `execute_tool_call`.
-    #[allow(dead_code)]
-    async fn execute_tools(
-        &self,
-        calls: &[ParsedToolCall],
-        turn_id: &str,
-    ) -> Vec<ToolExecutionResult> {
-        let approval_required = self.approval_manager.as_deref().is_some_and(|mgr| {
-            calls
-                .iter()
-                .any(|call| mgr.needs_approval(call.name.as_str()))
-        });
-        if !self.config.resolved.parallel_tools || approval_required {
-            let mut results = Vec::with_capacity(calls.len());
-            for call in calls {
-                results.push(self.execute_tool_call(call, turn_id).await);
-            }
-            return results;
-        }
-
-        let futs: Vec<_> = calls
-            .iter()
-            .map(|call| self.execute_tool_call(call, turn_id))
-            .collect();
-        futures_util::future::join_all(futs).await
     }
 
     fn classify_model(&self, user_message: &str) -> String {
