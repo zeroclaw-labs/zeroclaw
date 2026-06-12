@@ -635,18 +635,29 @@ pub async fn run_tool_call_loop(
             Err(e) => return Err(e),
         };
 
-        // Cancelled mid-batch: persist the round atomically (assistant
-        // tool-call message + per-call results, completed outcomes kept,
-        // never-ran calls synthesized as interrupted — #1043 semantics),
-        // then surface the cancellation. Appending the results together
-        // with the assistant message keeps the no-orphaned-tool-call
-        // invariant the Responses API requires.
-        if executed_outcomes.len() < executable_calls.len() {
-            for (outcome, slot) in executed_outcomes.into_iter().zip(&executable_indices) {
-                let call = &tool_calls[*slot];
-                ordered_results[*slot] =
-                    Some((call.name.clone(), call.tool_call_id.clone(), outcome));
-            }
+        // Cancelled mid-batch: the round still persists atomically below
+        // (assistant tool-call message + per-call results, completed
+        // outcomes kept, never-ran calls synthesized as interrupted —
+        // #1043 semantics), and the completed prefix is recorded exactly
+        // like a finished batch: those tools RAN, so their TurnEvent
+        // pairs, `after_tool_call` hooks, and result logs must fire even
+        // though the cancellation surfaces right after.
+        let cancelled_mid_batch = executed_outcomes.len() < executable_calls.len();
+
+        // Record the completed outcomes (the full set when the batch
+        // finished; the executed prefix when cancelled mid-batch — the
+        // sequential executor returns completed outcomes in call order).
+        let completed = executed_outcomes.len();
+        record_executed_outcomes(
+            &ctx,
+            &executable_indices[..completed],
+            &executable_calls[..completed],
+            executed_outcomes,
+            &mut ordered_results,
+            iteration,
+        )
+        .await;
+        if cancelled_mid_batch {
             for (idx, call) in tool_calls.iter().enumerate() {
                 if ordered_results[idx].is_none() {
                     ordered_results[idx] = Some((
@@ -663,46 +674,7 @@ pub async fn run_tool_call_loop(
                     ));
                 }
             }
-            let CollectedResults {
-                individual_results,
-                tool_results,
-                ..
-            } = collect_tool_results(
-                ordered_results,
-                &tool_calls,
-                history,
-                &mut loop_detector,
-                &loop_ignore_tools,
-                max_tool_result_chars,
-                collected_receipts,
-                model,
-                iteration,
-                &turn_id,
-            )?;
-            let appended_from = history.len();
-            append_tool_round_to_history(
-                history,
-                assistant_history_content,
-                &native_tool_calls,
-                &individual_results,
-                &tool_results,
-                use_native_tools,
-            );
-            if let Some(out) = new_messages_out.as_deref_mut() {
-                out.extend_from_slice(&history[appended_from..]);
-            }
-            return Err(ToolLoopCancelled.into());
         }
-
-        record_executed_outcomes(
-            &ctx,
-            &executable_indices,
-            &executable_calls,
-            executed_outcomes,
-            &mut ordered_results,
-            iteration,
-        )
-        .await;
 
         let CollectedResults {
             individual_results,
@@ -721,16 +693,18 @@ pub async fn run_tool_call_loop(
             &turn_id,
         )?;
 
-        check_identical_output_abort(
-            &detection_relevant_output,
-            loop_started_at,
-            pacing,
-            &mut consecutive_identical_outputs,
-            &mut last_tool_output_hash,
-            model,
-            iteration,
-            &turn_id,
-        )?;
+        if !cancelled_mid_batch {
+            check_identical_output_abort(
+                &detection_relevant_output,
+                loop_started_at,
+                pacing,
+                &mut consecutive_identical_outputs,
+                &mut last_tool_output_hash,
+                model,
+                iteration,
+                &turn_id,
+            )?;
+        }
 
         let appended_from = history.len();
         append_tool_round_to_history(
@@ -743,6 +717,10 @@ pub async fn run_tool_call_loop(
         );
         if let Some(out) = new_messages_out.as_deref_mut() {
             out.extend_from_slice(&history[appended_from..]);
+        }
+
+        if cancelled_mid_batch {
+            return Err(ToolLoopCancelled.into());
         }
     }
 

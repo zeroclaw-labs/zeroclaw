@@ -1300,3 +1300,88 @@ async fn safety_net_agent_turn_error_path_keeps_executed_rounds() {
         "executed tool round (results side) must survive the turn error"
     );
 }
+
+// ── seam 12: completed tools still emit events/hooks on mid-batch cancel ─
+// A tool that RAN before the user cancelled must emit its TurnEvent
+// ToolCall/ToolResult pair (and fire after_tool_call) even though the
+// cancellation surfaces right after — otherwise the live event stream and
+// the persisted transcript permanently disagree about what executed. The
+// old streamed engine emitted these live, per tool, before the cancel hit.
+
+#[tokio::test]
+async fn safety_net_midbatch_cancel_emits_events_for_completed_tools() {
+    struct CancelAfterRunTool {
+        token: tokio_util::sync::CancellationToken,
+    }
+    zeroclaw_api::tool_attribution!(
+        CancelAfterRunTool,
+        ::zeroclaw_api::attribution::ToolKind::Plugin
+    );
+    #[async_trait]
+    impl Tool for CancelAfterRunTool {
+        fn name(&self) -> &str {
+            "gamma"
+        }
+        fn description(&self) -> &str {
+            "gamma"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+            self.token.cancel();
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "gamma-out".into(),
+                error: None,
+            })
+        }
+    }
+
+    let token = tokio_util::sync::CancellationToken::new();
+    let later_calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = build_agent(
+        Box::new(ScriptedProvider::new(vec![tool_response(vec![
+            tool_call("ev1", "gamma"),
+            tool_call("ev2", "alpha"),
+        ])])),
+        vec![
+            Box::new(CancelAfterRunTool {
+                token: token.clone(),
+            }),
+            Box::new(CountingTool {
+                name: "alpha",
+                calls: Arc::clone(&later_calls),
+            }),
+        ],
+    );
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = zeroclaw_spawn::spawn!(async move {
+        agent
+            .turn_streamed_with_steering_state("cancel-events", tx, Some(token), None)
+            .await
+    });
+    let mut events = Vec::new();
+    while let Some(ev) = rx.recv().await {
+        events.push(ev);
+    }
+    handle
+        .await
+        .expect("task join")
+        .expect_err("cancel mid-batch must surface as StreamedTurnError");
+
+    assert_eq!(later_calls.load(Ordering::SeqCst), 0, "alpha must not run");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, TurnEvent::ToolCall { id, .. } if id == "ev1")),
+        "the completed tool must emit its ToolCall event despite the cancel"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            TurnEvent::ToolResult { id, output, .. } if id == "ev1" && output.contains("gamma-out")
+        )),
+        "the completed tool must emit its ToolResult event despite the cancel"
+    );
+}
