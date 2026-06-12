@@ -9,14 +9,8 @@ pub fn drain_steering_messages(
         return Vec::new();
     };
     let mut messages = Vec::new();
-    loop {
-        match rx.try_recv() {
-            Ok(message) => messages.push(message),
-            Err(
-                tokio::sync::mpsc::error::TryRecvError::Empty
-                | tokio::sync::mpsc::error::TryRecvError::Disconnected,
-            ) => break,
-        }
+    while let Ok(message) = rx.try_recv() {
+        messages.push(message);
     }
     messages
 }

@@ -2,6 +2,7 @@
 //! LLM for a tools-free final summary (with step timeout + cancel select)
 //! and return it appended to the accumulated display text, or bail.
 
+use super::knobs::{LoopKnobs, MaxIterationBehavior};
 use super::outcome::ToolLoopCancelled;
 use anyhow::Result;
 use std::time::Duration;
@@ -27,7 +28,8 @@ pub(crate) async fn finish_after_max_iterations(
     max_iterations: usize,
     mut accumulated_display_text: String,
     turn_id: &str,
-    mut new_messages_out: Option<&mut Vec<ChatMessage>>,
+    knobs: &LoopKnobs,
+    new_messages_out: Option<&mut Vec<ChatMessage>>,
     initial_history_len: usize,
 ) -> Result<String> {
     ::zeroclaw_log::record!(
@@ -41,6 +43,12 @@ pub(crate) async fn finish_after_max_iterations(
             })),
         "tool_loop_exhausted"
     );
+
+    // ErrorAtCap callers (embedders driving Agent::turn) treat the cap as a
+    // control signal: bail instead of spending another LLM call on a summary.
+    if knobs.max_iteration_behavior == MaxIterationBehavior::ErrorAtCap {
+        anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+    }
 
     // Graceful shutdown: ask the LLM for a final summary without tools
     ::zeroclaw_log::record!(
@@ -106,7 +114,7 @@ pub(crate) async fn finish_after_max_iterations(
                 anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
             }
             accumulated_display_text.push_str(&text);
-            if let Some(out) = new_messages_out.as_deref_mut() {
+            if let Some(out) = new_messages_out {
                 *out = history[initial_history_len..].to_vec();
             }
             Ok(accumulated_display_text)

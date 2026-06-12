@@ -33,6 +33,7 @@ pub(crate) async fn prepare_tool_calls(
     tool_calls: &[ParsedToolCall],
     seen_tool_signatures: &mut HashSet<(String, String)>,
     iteration: usize,
+    dedup_enabled: bool,
 ) -> PreparedToolCalls {
     let mut ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>> =
         (0..tool_calls.len()).map(|_| None).collect();
@@ -122,7 +123,7 @@ pub(crate) async fn prepare_tool_calls(
         };
         let dedup_exempt = ctx.dedup_exempt_tools.iter().any(|e| e == &tool_name)
             || crate::tools::REENTRANT_AGENT_TOOLS.contains(&tool_name.as_str());
-        if !dedup_exempt && !seen_tool_signatures.insert(signature) {
+        if dedup_enabled && !dedup_exempt && !seen_tool_signatures.insert(signature) {
             let duplicate = format!(
                 "Skipped duplicate tool call '{tool_name}' with identical arguments in this turn."
             );

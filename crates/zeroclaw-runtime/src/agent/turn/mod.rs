@@ -177,8 +177,7 @@ pub async fn run_tool_call_loop(
     event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
     mut steering: Option<&mut tokio::sync::mpsc::Receiver<String>>,
     mut new_messages_out: Option<&mut Vec<ChatMessage>>,
-    // knobs take effect in the C3 commit; underscore-named until then.
-    _knobs: &LoopKnobs,
+    knobs: &LoopKnobs,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -567,7 +566,14 @@ pub async fn run_tool_call_loop(
             mut ordered_results,
             executable_indices,
             executable_calls,
-        } = prepare_tool_calls(&ctx, &tool_calls, &mut seen_tool_signatures, iteration).await;
+        } = prepare_tool_calls(
+            &ctx,
+            &tool_calls,
+            &mut seen_tool_signatures,
+            iteration,
+            knobs.dedup_enabled,
+        )
+        .await;
 
         let executed_outcomes = if allow_parallel_execution && executable_calls.len() > 1 {
             execute_tools_parallel(
@@ -650,6 +656,7 @@ pub async fn run_tool_call_loop(
         max_iterations,
         accumulated_display_text,
         &turn_id,
+        knobs,
         new_messages_out,
         initial_history_len,
     )
