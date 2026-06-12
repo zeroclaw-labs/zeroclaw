@@ -14,6 +14,7 @@ pub(crate) mod protocol_detect;
 pub(crate) mod redact;
 pub(crate) mod stream_consume;
 pub(crate) mod stream_guard;
+pub(crate) mod tool_specs;
 
 pub(crate) use context::TurnCtx;
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
@@ -31,3 +32,4 @@ pub use redact::scrub_credentials;
 #[cfg(test)]
 pub(crate) use stream_consume::StreamedChatOutcome;
 pub(crate) use stream_consume::consume_provider_streaming_response;
+pub(crate) use tool_specs::{IterationToolSpecs, build_iteration_tool_specs};

@@ -858,24 +858,16 @@ pub async fn run_tool_call_loop(
             .into());
         }
 
-        // Rebuild tool_specs each iteration so newly activated deferred tools appear.
-        let mut tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
-            .iter()
-            .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
-            .map(|tool| tool.spec())
-            .collect();
-        if let Some(at) = activated_tools {
-            for spec in at.lock().unwrap().tool_specs() {
-                if !excluded_tools.iter().any(|ex| ex == &spec.name) {
-                    tool_specs.push(spec);
-                }
-            }
-        }
-        let known_tool_names: HashSet<String> = tool_specs
-            .iter()
-            .map(|tool| tool.name.to_ascii_lowercase())
-            .collect();
-        let use_native_tools = model_provider.supports_native_tools() && !tool_specs.is_empty();
+        let super::turn::IterationToolSpecs {
+            tool_specs,
+            known_tool_names,
+            use_native_tools,
+        } = super::turn::build_iteration_tool_specs(
+            model_provider,
+            tools_registry,
+            excluded_tools,
+            activated_tools,
+        );
 
         let image_marker_count = multimodal::count_image_markers(history);
         // Image markers that came from the user (inbound attachments), as
