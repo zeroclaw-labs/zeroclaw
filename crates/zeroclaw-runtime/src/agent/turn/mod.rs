@@ -14,6 +14,7 @@ pub(crate) mod events;
 pub(crate) mod history_window;
 pub(crate) mod outcome;
 pub(crate) mod parse_response;
+pub(crate) mod post_exec;
 pub(crate) mod protocol_detect;
 pub(crate) mod provider_call;
 pub(crate) mod redact;
@@ -37,6 +38,7 @@ pub use outcome::{
 #[cfg(test)]
 pub(crate) use parse_response::build_native_assistant_history;
 pub(crate) use parse_response::{interpret_chat_response, resolve_display_text};
+pub(crate) use post_exec::record_executed_outcomes;
 pub(crate) use provider_call::{
     ProviderCallOutcome, announce_llm_request, call_provider, enforce_tool_loop_budget,
 };
