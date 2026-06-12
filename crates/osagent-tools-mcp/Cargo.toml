@@ -1,0 +1,32 @@
+# crates/osagent-tools-mcp/Cargo.toml — MCP server registry (engineer-only)
+#
+# This crate exists to lock the MCP code into a dependency edge that the wizard
+# binary's Cargo.toml does NOT list. The structural exclusion is the only sound
+# way to enforce the wizard-no-MCP property: Cargo resolver=2 unifies *features*
+# across workspace members during `cargo build --workspace`, but it cannot link a
+# crate that is not a dependency of any binary in the build target.
+#
+# Phase 1.3 ships this crate as a stub. The physical MCP file migration from
+# `crates/zeroclaw-tools/src/mcp_*.rs` and `src/tools/mcp_*.rs` happens in
+# Phase 1.4/1.5 alongside the broader strip work. Until then, this crate's
+# lib.rs is a documentation placeholder.
+#
+# Permitted dependents:
+#   - bins/engineer/Cargo.toml (eventually, via crates/zeroclaw-runtime once split)
+#   - crates/zeroclaw-runtime, but ONLY through an mcp-glue submodule (M3 prerequisite)
+#
+# Forbidden dependents:
+#   - bins/wizard/Cargo.toml — ever, period.
+#   - any crate that is a transitive dep of the wizard binary.
+
+[package]
+name = "osagent-tools-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+description = "osAgent MCP server registry and tool wrappers (engineer-only; structurally excluded from wizard binary)"
+
+[dependencies]

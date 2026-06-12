@@ -67,5 +67,11 @@ INV_HITS=$(grep -rnE "^[^/]*\b(inventory::submit!|linkme::distributed_slice|#\[c
 # bins/ added to workspace.members
 grep -qE '"bins/(engineer|wizard)"' Cargo.toml && report 0 "bins/ in workspace.members" || report 1 "bins/ NOT in workspace.members"
 
+# PLAN-1.3 FILL — MCP boundary + 4-layer CI gate
+test -d crates/osagent-tools-mcp -a -f crates/osagent-tools-mcp/Cargo.toml && report 0 "osagent-tools-mcp crate exists" || report 1 "osagent-tools-mcp crate missing"
+grep -q '"crates/osagent-tools-mcp"' Cargo.toml && report 0 "osagent-tools-mcp in workspace.members" || report 1 "osagent-tools-mcp NOT in workspace.members"
+test -x scripts/wizard-no-mcp-gate.sh && report 0 "wizard-no-mcp-gate.sh present + executable" || report 1 "wizard-no-mcp-gate.sh missing or not executable"
+grep -qE "wizard-no-mcp-gate:" .github/workflows/osagent-policy.yml && report 0 "CI job wizard-no-mcp-gate wired" || report 1 "CI job wizard-no-mcp-gate missing"
+
 echo "=== $PASS passed, $FAIL failed ==="
 [ $FAIL -eq 0 ]

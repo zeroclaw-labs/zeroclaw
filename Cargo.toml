@@ -7,6 +7,11 @@ members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw
     # (load-bearing safety property; see bins/wizard/Cargo.toml header).
     "bins/engineer",
     "bins/wizard",
+    # crates/osagent-tools-mcp is the structural MCP boundary (Phase 1.3).
+    # bins/wizard MUST NOT depend on it; CI's `wizard-no-mcp-gate` enforces
+    # this property at 4 layers (source-grep, nm --defined-only, cargo-bloat
+    # --crates, strings) on every PR.
+    "crates/osagent-tools-mcp",
 ]
 resolver = "2"
 exclude = ["plugins/image-gen-fal"]

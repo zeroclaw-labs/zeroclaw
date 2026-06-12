@@ -131,10 +131,40 @@ jobs:
       - name: cargo build osagent-wizard
         run: cargo build -p osagent-wizard --release
 
+  # ════════════════════════════════════════════════════════════════════════
+  # MILESTONE-DEFINING SAFETY GATE — Phase 1.3
+  # wizard-no-mcp-gate: 4-layer verification that osagent-wizard contains
+  # zero MCP code. Required for every PR + every push to osagent-main.
+  # ════════════════════════════════════════════════════════════════════════
+  wizard-no-mcp-gate:
+    name: wizard-no-mcp-gate (4-layer)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    needs: [workspace-build]    # we need a release build of the wizard binary
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.2.0
+        with:
+          fetch-depth: 1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.7.5
+        with:
+          shared-key: workspace-build
+      - name: Build osagent-wizard --release
+        run: cargo build -p osagent-wizard --release
+      - name: Install cargo-bloat (Layer 3)
+        run: cargo install cargo-bloat --locked --version ^0.13
+      - name: Run 4-layer wizard-no-mcp-gate
+        run: |
+          chmod +x scripts/wizard-no-mcp-gate.sh
+          bash scripts/wizard-no-mcp-gate.sh
+
   # ────────────────────────────────────────────────────────────────────────
-  # Placeholder slots for Phase 1.3+ additions.
-  # Phase 1.3 will add `wizard-no-mcp-gate` here (the 4-layer MCP exclusion
-  # CI gate — source-grep + nm --defined-only + cargo-bloat + strings).
+  # Placeholder slots for Phase 1.5+ additions.
   # Phase 1.5 will add `manifest-divergence` (verify [declared] == [detected]
   # sections of MANIFEST.toml).
   # Phase 1.6 will add `gateway-ws-only-check`.
