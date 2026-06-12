@@ -130,14 +130,8 @@ fn translate_weekday_value(val: u8) -> Result<u8> {
     }
 }
 
-/// Expand a standard-crontab weekday range whose endpoints involve a Sunday
-/// alias (0 or 7) into an ascending, comma-separated list of cron-crate
-/// values. Translating each endpoint independently would produce a
-/// non-ascending range (e.g. `6-7` → `7-1`) that the cron crate rejects, or
-/// silently drop days (e.g. `0-7` → `1-1`). Enumerating each standard day in
-/// the range, translating it, then sorting and de-duplicating yields a valid
-/// fragment that fires on exactly the intended days.
-fn expand_weekday_range(start: u8, end: u8) -> Result<String> {
+/// Enumerate the standard-crontab weekday values covered by `start-end`.
+fn standard_weekday_range_values(start: u8, end: u8) -> Vec<u8> {
     // Enumerate the standard weekday values covered by the range, wrapping
     // around the week (Sun=0..=6=Sat) when `end < start` (e.g. `5-0`).
     let mut standard_days: Vec<u8> = Vec::new();
@@ -152,8 +146,12 @@ fn expand_weekday_range(start: u8, end: u8) -> Result<String> {
         day = if day >= 7 { 0 } else { day + 1 };
     }
 
+    standard_days
+}
+
+fn translated_weekday_list(mut standard_days: Vec<u8>) -> Result<String> {
     let mut translated: Vec<u8> = standard_days
-        .into_iter()
+        .drain(..)
         .map(translate_weekday_value)
         .collect::<Result<Vec<u8>>>()?;
     translated.sort_unstable();
@@ -164,6 +162,30 @@ fn expand_weekday_range(start: u8, end: u8) -> Result<String> {
         .map(|v| v.to_string())
         .collect::<Vec<_>>()
         .join(","))
+}
+
+/// Expand a standard-crontab weekday range whose endpoints involve a Sunday
+/// alias (0 or 7) into an ascending, comma-separated list of cron-crate
+/// values. Translating each endpoint independently would produce a
+/// non-ascending range (e.g. `6-7` → `7-1`) that the cron crate rejects, or
+/// silently drop days (e.g. `0-7` → `1-1`). Enumerating each standard day in
+/// the range, translating it, then sorting and de-duplicating yields a valid
+/// fragment that fires on exactly the intended days.
+fn expand_weekday_range(start: u8, end: u8) -> Result<String> {
+    translated_weekday_list(standard_weekday_range_values(start, end))
+}
+
+fn expand_stepped_weekday_range(start: u8, end: u8, step: u8) -> Result<String> {
+    if step == 0 {
+        anyhow::bail!("Invalid weekday step: 0");
+    }
+
+    let standard_days = standard_weekday_range_values(start, end)
+        .into_iter()
+        .step_by(step as usize)
+        .collect();
+
+    translated_weekday_list(standard_days)
 }
 
 /// Normalize the weekday field of a 5-field cron expression from standard
@@ -195,37 +217,45 @@ fn normalize_weekday_field(field: &str) -> Result<String> {
             (part, None)
         };
 
-        let translated = if let Some((start_s, end_s)) = range_part.split_once('-') {
-            let start: u8 = start_s
-                .parse()
-                .with_context(|| format!("Invalid weekday in range: {start_s}"))?;
-            let end: u8 = end_s
-                .parse()
-                .with_context(|| format!("Invalid weekday in range: {end_s}"))?;
-            let new_start = translate_weekday_value(start)?;
-            let new_end = translate_weekday_value(end)?;
-            if new_start < new_end || (new_start == new_end && start == end) {
-                format!("{new_start}-{new_end}")
+        let (translated, expanded_step_applied) =
+            if let Some((start_s, end_s)) = range_part.split_once('-') {
+                let start: u8 = start_s
+                    .parse()
+                    .with_context(|| format!("Invalid weekday in range: {start_s}"))?;
+                let end: u8 = end_s
+                    .parse()
+                    .with_context(|| format!("Invalid weekday in range: {end_s}"))?;
+                let new_start = translate_weekday_value(start)?;
+                let new_end = translate_weekday_value(end)?;
+                if new_start < new_end || (new_start == new_end && start == end) {
+                    (format!("{new_start}-{new_end}"), false)
+                } else {
+                    // The endpoints involve a Sunday alias (0 or 7), so translating
+                    // each endpoint independently either yields a non-ascending range
+                    // the cron crate rejects (e.g. `6-7` → `7-1`) or collapses a
+                    // multi-day range to a single day (e.g. `0-7` → `1-1`). Expand the
+                    // standard range into an explicit, ascending list of translated
+                    // single values instead. (A genuine single-day range such as
+                    // `3-3` keeps `new_start == new_end` because `start == end`.)
+                    if let Some(s) = step {
+                        let step: u8 = s
+                            .parse()
+                            .with_context(|| format!("Invalid weekday step: {s}"))?;
+                        (expand_stepped_weekday_range(start, end, step)?, true)
+                    } else {
+                        (expand_weekday_range(start, end)?, false)
+                    }
+                }
+            } else if range_part == "*" {
+                ("*".to_string(), false)
             } else {
-                // The endpoints involve a Sunday alias (0 or 7), so translating
-                // each endpoint independently either yields a non-ascending range
-                // the cron crate rejects (e.g. `6-7` → `7-1`) or collapses a
-                // multi-day range to a single day (e.g. `0-7` → `1-1`). Expand the
-                // standard range into an explicit, ascending list of translated
-                // single values instead. (A genuine single-day range such as
-                // `3-3` keeps `new_start == new_end` because `start == end`.)
-                expand_weekday_range(start, end)?
-            }
-        } else if range_part == "*" {
-            "*".to_string()
-        } else {
-            let val: u8 = range_part
-                .parse()
-                .with_context(|| format!("Invalid weekday value: {range_part}"))?;
-            translate_weekday_value(val)?.to_string()
-        };
+                let val: u8 = range_part
+                    .parse()
+                    .with_context(|| format!("Invalid weekday value: {range_part}"))?;
+                (translate_weekday_value(val)?.to_string(), false)
+            };
 
-        if let Some(s) = step {
+        if let Some(s) = step.filter(|_| !expanded_step_applied) {
             result_parts.push(format!("{translated}/{s}"));
         } else {
             result_parts.push(translated);
@@ -304,6 +334,23 @@ mod tests {
         // range form (regression guard for the unchanged path).
         assert_eq!(normalize_weekday_field("1-5").unwrap(), "2-6");
         assert_eq!(normalize_weekday_field("0-6").unwrap(), "1-7");
+    }
+
+    #[test]
+    fn normalize_weekday_field_applies_steps_to_expanded_sunday_alias_ranges() {
+        // The step belongs to the original standard-crontab range. Once we
+        // expand Sunday-alias ranges into comma-separated values, the step must
+        // be consumed before joining; otherwise `0-7/2` becomes the invalid
+        // `1,2,3,4,5,6,7/2` shape where `/2` applies only to the final item.
+        assert_eq!(normalize_weekday_field("0-7/2").unwrap(), "1,3,5,7");
+        assert_eq!(normalize_weekday_field("6-7/2").unwrap(), "7");
+        assert_eq!(normalize_weekday_field("5-7/2").unwrap(), "1,6");
+
+        // Compact translated ranges still keep cron-crate's native step form.
+        assert_eq!(normalize_weekday_field("1-5/2").unwrap(), "2-6/2");
+        assert_eq!(normalize_weekday_field("0-6/2").unwrap(), "1-7/2");
+
+        assert!(normalize_weekday_field("6-7/0").is_err());
     }
 
     #[test]
@@ -424,6 +471,19 @@ mod tests {
         let sunday = next_run_for_schedule(&schedule, saturday).unwrap();
         assert_eq!(sunday, Utc.with_ymd_and_hms(2026, 2, 22, 10, 0, 0).unwrap());
         assert_eq!(sunday.weekday(), chrono::Weekday::Sun);
+    }
+
+    #[test]
+    fn stepped_full_week_sunday_alias_range_fires_every_other_day() {
+        let monday = Utc.with_ymd_and_hms(2026, 2, 16, 0, 0, 0).unwrap();
+        let schedule = Schedule::Cron {
+            expr: "0 10 * * 0-7/2".into(),
+            tz: Some("UTC".into()),
+        };
+
+        let next = next_run_for_schedule(&schedule, monday).unwrap();
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 2, 17, 10, 0, 0).unwrap());
+        assert_eq!(next.weekday(), chrono::Weekday::Tue);
     }
 
     #[test]
