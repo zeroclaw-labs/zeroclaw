@@ -36,6 +36,8 @@ use std::sync::Arc;
 use tokio::select;
 use waproto::whatsapp::device_props::PlatformType;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+#[cfg(feature = "whatsapp-web")]
+use zeroclaw_api::media::MediaAttachment;
 #[cfg(not(feature = "whatsapp-web"))]
 use zeroclaw_runtime::i18n;
 
@@ -620,6 +622,228 @@ impl WhatsAppWebChannel {
         }
     }
 
+    #[cfg(feature = "whatsapp-web")]
+    fn extract_context_info(
+        msg: &waproto::whatsapp::Message,
+    ) -> Option<&waproto::whatsapp::ContextInfo> {
+        use wacore::proto_helpers::MessageExt;
+        let base = msg.get_base_message();
+
+        if let Some(ref ext) = base.extended_text_message
+            && let Some(ref ctx) = ext.context_info
+        {
+            return Some(ctx);
+        }
+        if let Some(ref img) = base.image_message
+            && let Some(ref ctx) = img.context_info
+        {
+            return Some(ctx);
+        }
+        if let Some(ref vid) = base.video_message
+            && let Some(ref ctx) = vid.context_info
+        {
+            return Some(ctx);
+        }
+        if let Some(ref doc) = base.document_message
+            && let Some(ref ctx) = doc.context_info
+        {
+            return Some(ctx);
+        }
+        if let Some(ref aud) = base.audio_message
+            && let Some(ref ctx) = aud.context_info
+        {
+            return Some(ctx);
+        }
+        if let Some(ref stk) = base.sticker_message
+            && let Some(ref ctx) = stk.context_info
+        {
+            return Some(ctx);
+        }
+
+        None
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn extract_quoted_message(
+        msg: &waproto::whatsapp::Message,
+    ) -> Option<&waproto::whatsapp::Message> {
+        Self::extract_context_info(msg).and_then(|ctx| ctx.quoted_message.as_deref())
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn mime_extension(mime: &str, fallback: &str) -> String {
+        let subtype = mime
+            .split(';')
+            .next()
+            .and_then(|clean| clean.split_once('/').map(|(_, subtype)| subtype))
+            .and_then(|subtype| subtype.split('+').next())
+            .filter(|subtype| {
+                !subtype.is_empty()
+                    && subtype
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '.')
+            })
+            .unwrap_or(fallback);
+
+        match subtype {
+            "jpeg" => "jpg".to_string(),
+            "svg+xml" => "svg".to_string(),
+            other => other.to_string(),
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn push_downloaded_attachment(
+        client: &whatsapp_rust::Client,
+        downloadable: &dyn whatsapp_rust::download::Downloadable,
+        file_name: String,
+        mime_type: Option<String>,
+        attachments: &mut Vec<MediaAttachment>,
+    ) {
+        let data = match client.download(downloadable).await {
+            Ok(data) => data,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "file": file_name,
+                            "error": format!("{}", e),
+                        })),
+                    "failed to download WhatsApp media attachment"
+                );
+                return;
+            }
+        };
+
+        attachments.push(MediaAttachment {
+            file_name,
+            data,
+            mime_type,
+        });
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn collect_media_attachments(
+        client: &whatsapp_rust::Client,
+        msg: &waproto::whatsapp::Message,
+        file_prefix: &str,
+        attachments: &mut Vec<MediaAttachment>,
+    ) {
+        use wacore::proto_helpers::MessageExt;
+        use whatsapp_rust::download::Downloadable;
+
+        let base = msg.get_base_message();
+
+        if let Some(ref image) = base.image_message {
+            let mime = image
+                .mimetype
+                .clone()
+                .unwrap_or_else(|| "image/jpeg".to_string());
+            let file_name = format!(
+                "{file_prefix}whatsapp-image.{}",
+                Self::mime_extension(&mime, "jpg")
+            );
+            Self::push_downloaded_attachment(
+                client,
+                image.as_ref() as &dyn Downloadable,
+                file_name,
+                Some(mime),
+                attachments,
+            )
+            .await;
+        }
+
+        if let Some(ref video) = base.video_message {
+            let mime = video
+                .mimetype
+                .clone()
+                .unwrap_or_else(|| "video/mp4".to_string());
+            let file_name = format!(
+                "{file_prefix}whatsapp-video.{}",
+                Self::mime_extension(&mime, "mp4")
+            );
+            Self::push_downloaded_attachment(
+                client,
+                video.as_ref() as &dyn Downloadable,
+                file_name,
+                Some(mime),
+                attachments,
+            )
+            .await;
+        }
+
+        if let Some(ref document) = base.document_message {
+            let mime = document
+                .mimetype
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            let file_name = document
+                .file_name
+                .as_deref()
+                .map(|name| format!("{file_prefix}{name}"))
+                .unwrap_or_else(|| {
+                    format!(
+                        "{file_prefix}whatsapp-document.{}",
+                        Self::mime_extension(&mime, "bin")
+                    )
+                });
+            Self::push_downloaded_attachment(
+                client,
+                document.as_ref() as &dyn Downloadable,
+                file_name,
+                Some(mime),
+                attachments,
+            )
+            .await;
+        }
+
+        if let Some(ref sticker) = base.sticker_message {
+            let mime = sticker
+                .mimetype
+                .clone()
+                .unwrap_or_else(|| "image/webp".to_string());
+            let file_name = format!(
+                "{file_prefix}whatsapp-sticker.{}",
+                Self::mime_extension(&mime, "webp")
+            );
+            Self::push_downloaded_attachment(
+                client,
+                sticker.as_ref() as &dyn Downloadable,
+                file_name,
+                Some(mime),
+                attachments,
+            )
+            .await;
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn media_fallback_content(content: String, msg: &waproto::whatsapp::Message) -> String {
+        if !content.is_empty() {
+            return content;
+        }
+
+        use wacore::proto_helpers::MessageExt;
+        let base = msg.get_base_message();
+
+        if base.sticker_message.is_some() {
+            return "[Sticker]".to_string();
+        }
+        if base.image_message.is_some() {
+            return "[Image]".to_string();
+        }
+        if base.video_message.is_some() {
+            return "[Video]".to_string();
+        }
+        if base.document_message.is_some() {
+            return "[Document]".to_string();
+        }
+
+        String::new()
+    }
+
     /// Synthesize text to speech and send as a WhatsApp voice note (static version for spawned tasks).
     #[cfg(feature = "whatsapp-web")]
     async fn synthesize_voice_static(
@@ -749,26 +973,11 @@ impl WhatsAppWebChannel {
     }
 
     /// Extract mentioned JIDs from the base (unwrapped) message's context_info.
-    ///
-    /// Uses `get_base_message()` to see through ephemeral/view-once/edited/document wrappers,
-    /// matching the same unwrapping that `text_content()` performs.
-    ///
-    /// NOTE: Only checks `extended_text_message.context_info`. Media messages (image, video,
-    /// document) carry mentions in their own `context_info`, but `text_content()` already
-    /// ignores captions so those messages are filtered out upstream as empty text.
     #[cfg(feature = "whatsapp-web")]
     fn extract_mentioned_jids(msg: &waproto::whatsapp::Message) -> Vec<String> {
-        use wacore::proto_helpers::MessageExt;
-        let base = msg.get_base_message();
-
-        if let Some(ref ext) = base.extended_text_message
-            && let Some(ref ctx) = ext.context_info
-            && !ctx.mentioned_jid.is_empty()
-        {
-            return ctx.mentioned_jid.clone();
-        }
-
-        Vec::new()
+        Self::extract_context_info(msg)
+            .map(|ctx| ctx.mentioned_jid.clone())
+            .unwrap_or_default()
     }
 
     /// Check whether the bot is mentioned -- either structurally or via text fallback.
@@ -818,16 +1027,10 @@ impl WhatsAppWebChannel {
         has_text_mention(text, bot_phone) || bot_lid.is_some_and(|lid| has_text_mention(text, lid))
     }
 
-    /// Extract the author JID of the message quoted by an extended-text reply.
+    /// Extract the author JID of the message quoted by a reply.
     #[cfg(feature = "whatsapp-web")]
     fn extract_reply_participant(msg: &waproto::whatsapp::Message) -> Option<&str> {
-        use wacore::proto_helpers::MessageExt;
-        let base = msg.get_base_message();
-
-        base.extended_text_message
-            .as_ref()
-            .and_then(|ext| ext.context_info.as_ref())
-            .and_then(|ctx| ctx.participant.as_deref())
+        Self::extract_context_info(msg).and_then(|ctx| ctx.participant.as_deref())
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -1348,6 +1551,7 @@ impl Channel for WhatsAppWebChannel {
                                     let text = msg.text_content().unwrap_or("");
                                     text.trim().to_string()
                                 };
+                                let content = Self::media_fallback_content(content, msg);
 
                                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WhatsApp Web message received (sender_len={}, chat_len={}, content_len={})", sender.len(), chat.len(), content.len()));
                                 ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WhatsApp Web message content: {}", content));
@@ -1394,6 +1598,24 @@ impl Channel for WhatsAppWebChannel {
                                         }
                                     };
 
+                                let mut attachments = Vec::new();
+                                Self::collect_media_attachments(
+                                    &client,
+                                    msg,
+                                    "",
+                                    &mut attachments,
+                                )
+                                .await;
+                                if let Some(quoted) = Self::extract_quoted_message(msg) {
+                                    Self::collect_media_attachments(
+                                        &client,
+                                        quoted,
+                                        "quoted-",
+                                        &mut attachments,
+                                    )
+                                    .await;
+                                }
+
                                 if let Err(e) = tx_inner
                                     .send(ChannelMessage {
                                         id: uuid::Uuid::new_v4().to_string(),
@@ -1408,7 +1630,7 @@ impl Channel for WhatsAppWebChannel {
                                         timestamp: chrono::Utc::now().timestamp() as u64,
                                         thread_ts: None,
                                         interruption_scope_id: None,
-                    attachments: vec![],
+                                        attachments,
                                         subject: None,
                                     })
                                     .await
@@ -2238,6 +2460,43 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "whatsapp-web")]
+    fn sticker_reply(
+        participant: &str,
+        quoted_message: Option<waproto::whatsapp::Message>,
+    ) -> waproto::whatsapp::Message {
+        waproto::whatsapp::Message {
+            sticker_message: Some(Box::new(waproto::whatsapp::message::StickerMessage {
+                mimetype: Some("image/webp".to_string()),
+                context_info: Some(Box::new(waproto::whatsapp::ContextInfo {
+                    participant: Some(participant.to_string()),
+                    quoted_message: quoted_message.map(Box::new),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn image_mention(mentioned_jids: &[&str]) -> waproto::whatsapp::Message {
+        waproto::whatsapp::Message {
+            image_message: Some(Box::new(waproto::whatsapp::message::ImageMessage {
+                mimetype: Some("image/jpeg".to_string()),
+                context_info: Some(Box::new(waproto::whatsapp::ContextInfo {
+                    mentioned_jid: mentioned_jids
+                        .iter()
+                        .map(|jid| (*jid).to_string())
+                        .collect(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn jid_digits_extracts_phone_from_jid() {
@@ -2387,6 +2646,16 @@ mod tests {
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
+    fn extract_mentioned_jids_reads_media_context_info() {
+        let msg = image_mention(&["100@s.whatsapp.net"]);
+        assert_eq!(
+            WhatsAppWebChannel::extract_mentioned_jids(&msg),
+            vec!["100@s.whatsapp.net".to_string()]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
     fn message_addressed_to_bot_accepts_reply_to_phone_jid() {
         let msg = extended_text_reply("100@s.whatsapp.net", &[]);
         assert!(WhatsAppWebChannel::is_message_addressed_to_bot(
@@ -2407,6 +2676,75 @@ mod tests {
             "100",
             Some("200"),
         ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn message_addressed_to_bot_accepts_media_reply_to_lid_jid() {
+        let msg = sticker_reply("200@lid", None);
+        assert!(WhatsAppWebChannel::is_message_addressed_to_bot(
+            &msg,
+            "[Sticker]",
+            "100",
+            Some("200"),
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn extract_quoted_message_reads_media_context_info() {
+        let quoted = waproto::whatsapp::Message {
+            image_message: Some(Box::new(waproto::whatsapp::message::ImageMessage {
+                mimetype: Some("image/png".to_string()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let msg = sticker_reply("200@lid", Some(quoted));
+        let quoted = WhatsAppWebChannel::extract_quoted_message(&msg)
+            .expect("sticker reply should expose the quoted message");
+        assert!(quoted.image_message.is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_fallback_content_keeps_sticker_messages_addressable() {
+        let msg = sticker_reply("200@lid", None);
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
+            "[Sticker]"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content("hello".to_string(), &msg),
+            "hello"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_fallback_content_leaves_non_media_messages_empty() {
+        let msg = waproto::whatsapp::Message::default();
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
+            ""
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn mime_extension_uses_safe_subtype() {
+        assert_eq!(
+            WhatsAppWebChannel::mime_extension("image/jpeg; name=photo", "jpg"),
+            "jpg"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::mime_extension("application/vnd.ms-excel", "bin"),
+            "vnd.ms-excel"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::mime_extension("image/../../png", "bin"),
+            "bin"
+        );
     }
 
     #[test]
