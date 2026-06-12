@@ -11,6 +11,7 @@ pub(crate) mod context;
 pub(crate) mod context_recovery;
 pub(crate) mod delivery_defaults;
 pub(crate) mod events;
+pub(crate) mod history_append;
 pub(crate) mod history_window;
 pub(crate) mod outcome;
 pub(crate) mod parse_response;
@@ -31,6 +32,7 @@ pub(crate) use context_recovery::{record_llm_failure, try_recover_context_overfl
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
 pub(crate) use events::STREAM_CHUNK_MIN_CHARS;
 pub use events::{DraftEvent, PROGRESS_MIN_INTERVAL_MS, StreamDelta};
+pub(crate) use history_append::append_tool_round_to_history;
 pub(crate) use history_window::preflight_history_maintenance;
 pub use outcome::{
     ModelSwitchCallback, ModelSwitchRequested, ToolLoopCancelled, is_model_switch_requested,
