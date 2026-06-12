@@ -13,6 +13,7 @@ pub(crate) mod delivery_defaults;
 pub(crate) mod events;
 pub(crate) mod history_append;
 pub(crate) mod history_window;
+pub(crate) mod max_iter;
 pub(crate) mod outcome;
 pub(crate) mod parse_response;
 pub(crate) mod post_exec;
@@ -34,6 +35,7 @@ pub(crate) use events::STREAM_CHUNK_MIN_CHARS;
 pub use events::{DraftEvent, PROGRESS_MIN_INTERVAL_MS, StreamDelta};
 pub(crate) use history_append::append_tool_round_to_history;
 pub(crate) use history_window::preflight_history_maintenance;
+pub(crate) use max_iter::finish_after_max_iterations;
 pub use outcome::{
     ModelSwitchCallback, ModelSwitchRequested, ToolLoopCancelled, is_model_switch_requested,
     is_tool_loop_cancelled,
