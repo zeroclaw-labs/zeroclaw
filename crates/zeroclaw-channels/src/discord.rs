@@ -1403,19 +1403,30 @@ fn command_projection(cmd: &serde_json::Value) -> serde_json::Value {
     })
 }
 
+/// Discord REST base; injectable in `reconcile_slash_commands` for tests.
+const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
+
 /// Reconcile the application's global commands with the desired set:
 /// upsert each desired command (POST upserts by name) and delete stale
 /// skill-shaped commands left over from uninstalled skills. Commands
 /// registered by other tooling are never touched — this deliberately
 /// avoids the bulk-overwrite PUT. Global commands can take up to an hour
 /// to propagate the first time.
+///
+/// Returns `Err` when any owned stale command could not be deleted (other
+/// than a 404, which means it is already gone): the caller's fingerprint
+/// must not record such a pass as successful, or the stale command would
+/// never be retried while the desired set stays unchanged. Upserts for the
+/// desired set are still attempted first so a delete failure cannot block
+/// new registrations.
 async fn reconcile_slash_commands(
     client: &reqwest::Client,
     bot_token: &str,
     app_id: &str,
     desired: &serde_json::Value,
+    api_base: &str,
 ) -> anyhow::Result<()> {
-    let base = format!("https://discord.com/api/v10/applications/{app_id}/commands");
+    let base = format!("{api_base}/applications/{app_id}/commands");
     let auth = format!("Bot {bot_token}");
     let Some(desired) = desired.as_array() else {
         anyhow::bail!("desired command set is not an array");
@@ -1426,7 +1437,10 @@ async fn reconcile_slash_commands(
         .collect();
 
     // Reap stale skill commands first so the 100-command cap never blocks
-    // the upserts that follow.
+    // the upserts that follow. Delete failures are counted, not fatal
+    // mid-pass: the upserts still run, but the pass reports Err at the end
+    // so the fingerprint is not recorded and the next READY retries.
+    let mut failed_deletes = 0usize;
     let resp = client
         .get(&base)
         .header("Authorization", &auth)
@@ -1451,7 +1465,9 @@ async fn reconcile_slash_commands(
             .send()
             .await
             .map_err(reqwest::Error::without_url)?;
-        if del.status().is_success() {
+        if del.status().is_success() || del.status() == reqwest::StatusCode::NOT_FOUND {
+            // 404 = already gone (raced another reconcile or manual
+            // cleanup) — the desired end state holds either way.
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1459,6 +1475,7 @@ async fn reconcile_slash_commands(
                 "deregistered stale skill slash command"
             );
         } else {
+            failed_deletes += 1;
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1507,6 +1524,12 @@ async fn reconcile_slash_commands(
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_attrs(::serde_json::json!({"upserted": upserted})),
             "discord slash commands upserted"
+        );
+    }
+    if failed_deletes > 0 {
+        anyhow::bail!(
+            "{failed_deletes} stale skill command delete(s) failed; \
+             reconcile not recorded, next READY retries"
         );
     }
     Ok(())
@@ -2499,7 +2522,7 @@ impl Channel for DiscordChannel {
                                             ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"commands": specs.len() + 1})), "discord slash command set unchanged; skipping re-registration");
                                             return;
                                         }
-                                        match reconcile_slash_commands(&client, &bot_token, &app_id, &body).await {
+                                        match reconcile_slash_commands(&client, &bot_token, &app_id, &body, DISCORD_API_BASE).await {
                                             Ok(()) => {
                                                 *hash_store.lock() = Some(fingerprint);
                                                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"commands": specs.len() + 1})), "discord slash commands registered");
@@ -3852,6 +3875,128 @@ mod tests {
                 "description": SKILL_COMMAND_OPTION_DESCRIPTION
             }]
         })));
+    }
+
+    fn stale_skill_command(id: &str, name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "name": name, "description": "d", "type": 1,
+            "options": [{
+                "name": "input", "type": 3, "required": true,
+                "description": SKILL_COMMAND_OPTION_DESCRIPTION
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn reconcile_fails_when_a_stale_delete_fails() {
+        // A transiently failing DELETE of an owned stale command must make
+        // the whole reconcile report Err — otherwise the caller records the
+        // fingerprint as successful and the stale command is never retried
+        // while the desired set stays unchanged.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                stale_skill_command("c1", "ghost-skill")
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/applications/app1/commands/c1"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&server)
+            .await;
+        // Desired set: /ask only (the upsert must still be attempted and
+        // succeed even though the delete fails).
+        Mock::given(method("POST"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[]);
+        let err = reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("stale skill command delete"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_treats_delete_404_as_already_gone() {
+        // 404 means the command is already gone (raced cleanup) — the
+        // desired end state holds, so the pass records as successful.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                stale_skill_command("c1", "ghost-skill")
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/applications/app1/commands/c1"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[]);
+        reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconcile_skips_unchanged_and_spares_foreign_commands() {
+        // Steady state: existing /ask matches the desired projection (no
+        // POST), and a foreign command with a generic input option is left
+        // alone. Zero writes.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let existing_ask = serde_json::json!({
+            "id": "a1", "name": "ask",
+            "description": "Ask the agent a question", "type": 1,
+            "options": [{
+                "name": "prompt", "description": "What to ask",
+                "type": 3, "required": true
+            }]
+        });
+        let foreign = serde_json::json!({
+            "id": "f1", "name": "run",
+            "description": "external tool", "type": 1,
+            "options": [{
+                "name": "input", "type": 3, "required": true,
+                "description": "what to run"
+            }]
+        });
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([existing_ask, foreign])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        // No DELETE and no POST expectations mounted: any write request
+        // would 404 the mock server and fail the reconcile.
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[]);
+        reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri())
+            .await
+            .unwrap();
     }
 
     #[test]
