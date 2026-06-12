@@ -1,79 +1,38 @@
-//! Channel implementations and orchestration for messaging platform integrations.
+//! Channel implementations for messaging platform integrations.
+//!
+//! v1 channel set (post Phase 1.5 strip):
+//!   - telegram (decision #2)
+//!   - slack    (decision #2)
+//!   - matrix   (decision #2)
+//!   - mattermost (in-house wrapper; planner decision #2)
+//!   - whatsapp (Cloud API only; whatsapp-web Selenium scraper REMOVED)
+//!   - signal   (M4 — wraps `signal-cli` subprocess; in-process Rust Signal
+//!              SDKs are AGPL-3.0 and banned in deny.toml)
+//!   - cli      (always-on; for engineer interactive mode)
+//!
+//! Phase 1.5 stripped 26 channels at the source level: discord, irc, email,
+//! gmail-push, voice-call, voice-wake, whatsapp-web (Selenium), twitter, reddit,
+//! bluesky, nostr, line, wechat, wecom, qq, dingtalk, lark, feishu, clawdtalk,
+//! nextcloud, linq, wati, imessage, mochat, notion, acp-server.
+//! Phase 1.4 stripped: webhook (user-rejected on security grounds).
+//!
+//! Phase 1.5 also stripped voice-adjacent support modules: transcription, tts.
 
 pub mod orchestrator;
 pub mod util;
-
-// Always-compiled channels and utilities (no feature gate)
-#[cfg(feature = "channel-acp-server")]
-pub mod acp_channel;
 pub mod cli;
 pub mod link_enricher;
-pub mod transcription;
-pub mod tts;
 
-// Feature-gated channels
-#[cfg(feature = "channel-bluesky")]
-pub mod bluesky;
-#[cfg(feature = "channel-clawdtalk")]
-pub mod clawdtalk;
-#[cfg(feature = "channel-dingtalk")]
-pub mod dingtalk;
-#[cfg(feature = "channel-discord")]
-pub mod discord;
-#[cfg(feature = "channel-discord")]
-pub mod discord_history;
-#[cfg(feature = "channel-email")]
-pub mod email_channel;
-#[cfg(feature = "channel-email")]
-pub mod gmail_push;
-#[cfg(feature = "channel-imessage")]
-pub mod imessage;
-#[cfg(feature = "channel-irc")]
-pub mod irc;
-#[cfg(feature = "channel-lark")]
-pub mod lark;
-#[cfg(feature = "channel-line")]
-pub mod line;
-#[cfg(feature = "channel-linq")]
-pub mod linq;
+// v1 channel set — explicit registration only (WS-04). No distributed-slice.
 #[cfg(feature = "channel-matrix")]
 pub mod matrix;
 #[cfg(feature = "channel-mattermost")]
 pub mod mattermost;
-#[cfg(feature = "channel-mochat")]
-pub mod mochat;
-#[cfg(feature = "channel-nextcloud")]
-pub mod nextcloud_talk;
-#[cfg(feature = "channel-nostr")]
-pub mod nostr;
-#[cfg(feature = "channel-notion")]
-pub mod notion;
-#[cfg(feature = "channel-qq")]
-pub mod qq;
-#[cfg(feature = "channel-reddit")]
-pub mod reddit;
 #[cfg(feature = "channel-signal")]
 pub mod signal;
 #[cfg(feature = "channel-slack")]
 pub mod slack;
 #[cfg(feature = "channel-telegram")]
 pub mod telegram;
-#[cfg(feature = "channel-twitter")]
-pub mod twitter;
-#[cfg(feature = "channel-voice-call")]
-pub mod voice_call;
-#[cfg(feature = "voice-wake")]
-pub mod voice_wake;
-#[cfg(feature = "channel-wati")]
-pub mod wati;
-// channel-webhook removed in Phase 1.4 (user-rejected on security grounds — STRIP-06)
-#[cfg(feature = "channel-wechat")]
-pub mod wechat;
-#[cfg(feature = "channel-wecom")]
-pub mod wecom;
 #[cfg(feature = "channel-whatsapp-cloud")]
 pub mod whatsapp;
-#[cfg(feature = "whatsapp-web")]
-pub mod whatsapp_storage;
-#[cfg(feature = "whatsapp-web")]
-pub mod whatsapp_web;

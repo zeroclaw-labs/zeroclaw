@@ -28,6 +28,9 @@ members = [".",
     # this property at 4 layers (source-grep, nm --defined-only, cargo-bloat
     # --crates, strings) on every PR.
     "crates/osagent-tools-mcp",
+    # osagent-manifest (Phase 1.5): MANIFEST.toml emission + `--diff` CLI handler.
+    # Safe for wizard structural exclusion (no MCP code).
+    "crates/osagent-manifest",
 ]
 resolver = "2"
 exclude = ["plugins/image-gen-fal"]

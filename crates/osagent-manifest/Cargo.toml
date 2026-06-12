@@ -1,0 +1,20 @@
+# crates/osagent-manifest/Cargo.toml — MANIFEST.toml emission, parsing, and
+# the `osagent manifest --diff <config.toml>` CLI subcommand.
+#
+# Used by both binaries (engineer + wizard). Crate is in the shared dep tree
+# and contains NO MCP code — safe for wizard's structural exclusion.
+
+[package]
+name = "osagent-manifest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+description = "osAgent build-time MANIFEST.toml emission + runtime --diff CLI"
+
+[dependencies]
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+toml = { version = "1.0", default-features = false, features = ["parse", "display"] }
+thiserror = { version = "2.0", default-features = false }

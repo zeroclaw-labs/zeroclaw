@@ -1,0 +1,35 @@
+# MANIFEST.toml.template — scaffold for build-emitted manifests.
+#
+# At build time, each binary's build.rs emits MANIFEST.toml listing every
+# compiled-in channel, provider, and tool, in TWO sections:
+#
+#   [declared] — derived from CARGO_FEATURE_* env vars + Cargo.toml dep tree
+#                at build time.
+#   [detected] — derived from post-link symbol analysis (cargo bloat --crates
+#                or equivalent inspection of the ELF).
+#
+# CI fails the build if `[declared] != [detected]`. This catches the two
+# silent-leak patterns called out in research/PITFALLS.md:
+#   - feature was declared but code was orphaned (declared > detected)
+#   - code was linked but not declared (detected > declared)
+#
+# `osagent manifest --diff <config.toml>` validates that every channel/provider/
+# tool referenced in the config exists in MANIFEST.toml. Wizard binary refusing
+# to start when config references MCP (which the wizard binary's MANIFEST does
+# not list) is the operational consequence of the structural exclusion.
+
+schema_version = 1
+generated_by = "build.rs"
+binary_name = "{{ binary_name }}"           # engineer | wizard
+binary_version = "{{ binary_version }}"     # workspace.package.version
+fork_provenance = "{{ fork_provenance }}"   # forked_at_sha from workspace.metadata.osagent
+
+[declared]
+channels = []   # populated from CARGO_FEATURE_CHANNEL_*
+providers = []  # populated from CARGO_FEATURE_PROVIDER_*
+tools = []      # populated from CARGO_FEATURE_TOOL_*
+
+[detected]
+channels = []   # populated from post-link symbol analysis
+providers = []
+tools = []
