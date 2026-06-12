@@ -64,12 +64,21 @@ pub(crate) async fn stream_text_posthoc_chunks(
 
 /// Emit the `TurnEvent::ToolCall`/`ToolResult` pair for one executed tool
 /// call (upstream E2 parity: per-outcome emission after execution).
+///
+/// Text-protocol parsed calls carry `tool_call_id: None`; the TurnEvent
+/// contract documents `id` as a stable correlation id shared by the pair
+/// (ACP/WS clients key on it), so a fresh UUID is synthesized per pair —
+/// the old streaming engine pre-assigned UUIDs to id-less calls for the
+/// same reason. Distinct calls in one batch must never collapse to `""`.
 pub(crate) async fn emit_tool_call_pair(
     event_tx: &Sender<TurnEvent>,
     call: &ParsedToolCall,
     outcome: &ToolExecutionOutcome,
 ) {
-    let call_id = call.tool_call_id.clone().unwrap_or_default();
+    let call_id = call
+        .tool_call_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let _ = event_tx
         .send(TurnEvent::ToolCall {
             id: call_id.clone(),
@@ -95,5 +104,74 @@ pub(crate) async fn emit_posthoc_turn_chunk(event_tx: Option<&Sender<TurnEvent>>
                 delta: text.to_string(),
             })
             .await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn parsed_call(id: Option<&str>) -> ParsedToolCall {
+        ParsedToolCall {
+            name: "echo".into(),
+            arguments: serde_json::json!({}),
+            tool_call_id: id.map(str::to_string),
+        }
+    }
+
+    fn ok_outcome() -> ToolExecutionOutcome {
+        ToolExecutionOutcome {
+            output: "out".into(),
+            success: true,
+            error_reason: None,
+            duration: Duration::ZERO,
+            receipt: None,
+        }
+    }
+
+    /// Text-protocol calls have no id; the pair must still correlate via a
+    /// fresh non-empty id, and two id-less calls must never share one.
+    #[tokio::test]
+    async fn idless_calls_get_distinct_synthesized_pair_ids() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        emit_tool_call_pair(&tx, &parsed_call(None), &ok_outcome()).await;
+        emit_tool_call_pair(&tx, &parsed_call(None), &ok_outcome()).await;
+        drop(tx);
+
+        let mut ids = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                TurnEvent::ToolCall { id, .. } | TurnEvent::ToolResult { id, .. } => ids.push(id),
+                _ => {}
+            }
+        }
+        assert_eq!(ids.len(), 4, "two pairs = four events");
+        assert!(
+            ids.iter().all(|id| !id.is_empty()),
+            "synthesized ids must be non-empty: {ids:?}"
+        );
+        assert_eq!(
+            ids[0], ids[1],
+            "ToolCall/ToolResult of one pair must share the id"
+        );
+        assert_eq!(ids[2], ids[3], "second pair must share its id");
+        assert_ne!(ids[0], ids[2], "distinct calls must get distinct ids");
+    }
+
+    /// Parser-assigned ids pass through untouched.
+    #[tokio::test]
+    async fn existing_ids_pass_through() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        emit_tool_call_pair(&tx, &parsed_call(Some("native-7")), &ok_outcome()).await;
+        drop(tx);
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                TurnEvent::ToolCall { id, .. } | TurnEvent::ToolResult { id, .. } => {
+                    assert_eq!(id, "native-7");
+                }
+                _ => {}
+            }
+        }
     }
 }
