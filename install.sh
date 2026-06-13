@@ -1036,6 +1036,7 @@ See all available features:
   fi
   echo
 
+  # >>> generated:source-cargo-install by `cargo generate installers` — do not edit <<<
   if [ "$DRY_RUN" = true ]; then
     # shellcheck disable=SC2086
     info "[dry-run] Would run: cargo install --path . --locked --force $CARGO_FLAGS"
@@ -1043,6 +1044,7 @@ See all available features:
     # shellcheck disable=SC2086
     cargo install --path . --locked --force $CARGO_FLAGS
   fi
+  # >>> end generated:source-cargo-install <<<
 
   # ── Web dashboard (gateway feature only) ──────────────────────────
   # When the install includes the `gateway` feature, build `web/dist` so

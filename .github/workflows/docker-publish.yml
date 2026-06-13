@@ -1,0 +1,75 @@
+name: Docker Publish
+
+# Builds and pushes the canonical image tag matrix to GHCR. The matrix is
+# generated from the install spec (`cargo generate installers`) into
+# dev/ci/docker-tags.toml; this workflow consumes it so published tags can never
+# drift from the spec. Each entry produces an immutable version-pinned tag
+# (Alpine-style `<stem>-v<version>`) and a floating tag (`<stem>`).
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ${{ github.repository }}
+
+jobs:
+  matrix:
+    name: Resolve tag matrix
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.read.outputs.include }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Read generated docker-tags.toml into a build matrix
+        id: read
+        run: |
+          # Convert the canonical TOML matrix to the JSON the Actions matrix
+          # consumes. yq ships on ubuntu-latest runners.
+          include="$(yq -o=json -I=0 '.tags' dev/ci/docker-tags.toml)"
+          echo "include=${include}" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Build & push ${{ matrix.stem }}
+    needs: [matrix]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.matrix.outputs.include) }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Build and push pinned + floating tags
+        uses: docker/build-push-action@1dc73863535b631f98b2378be8619f83b136f4a0 # v6.18.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          build-args: |
+            ZEROCLAW_CARGO_FEATURES=${{ matrix.features }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ matrix.pinned_tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ matrix.floating_tag }}

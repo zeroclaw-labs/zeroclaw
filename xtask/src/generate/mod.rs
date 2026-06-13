@@ -7,9 +7,11 @@
 pub mod container;
 pub mod docker_tags;
 pub mod flake;
+pub mod install_sh;
 pub mod packaging;
 pub mod setup_bat;
 pub mod spec;
+pub mod steps;
 
 use container::ContainerSurface;
 use spec::Selection as Sel;
@@ -30,6 +32,11 @@ struct Surface {
 /// The surface registry. Adding a generated surface = one row here.
 fn registry() -> Vec<Surface> {
     vec![
+        Surface {
+            name: "install-sh",
+            file: "install.sh",
+            render: |root, cur| install_sh::render_file(root, cur),
+        },
         Surface {
             name: "setup-bat",
             file: "setup.bat",
@@ -67,7 +74,7 @@ fn registry() -> Vec<Surface> {
         },
         Surface {
             name: "docker-tags",
-            file: "dev/ci/docker-tags.json",
+            file: "dev/ci/docker-tags.toml",
             render: |root, cur| docker_tags::render_file(root, cur),
         },
     ]
