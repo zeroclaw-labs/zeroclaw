@@ -138,6 +138,10 @@ impl HasPropKind
     const PROP_KIND: PropKind = PropKind::Object;
 }
 
+impl HasPropKind for crate::scattered_types::EmailOAuth2Config {
+    const PROP_KIND: PropKind = PropKind::Object;
+}
+
 // Vec<struct> fields are surfaced as PropKind::ObjectArray — each
 // element renders as a per-row sub-form on the dashboard rather than a
 // chip. The Configurable derive routes `<Vec<T> as HasPropKind>::PROP_KIND`
