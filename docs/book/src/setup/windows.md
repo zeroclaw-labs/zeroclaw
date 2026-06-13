@@ -131,7 +131,7 @@ curl -X POST http://localhost:42617/pair -H 'X-Pairing-Code: <code-from-logs>'
 - **`EXPOSE 42617`** — both the daemon and gateway listen on this port
 - **Data dir:** `/zeroclaw-data` (config: `/zeroclaw-data/.zeroclaw/config.toml`, workspace: `/zeroclaw-data/workspace`). Mount a named volume or bind here for persistence — note this is **not** `/root/.zeroclaw`.
 - **Pairing:** the published image defaults to `require_pairing = false`, so `/api/*` accepts requests without authentication out-of-the-box. When pairing is enabled (set `require_pairing = true` in `/zeroclaw-data/.zeroclaw/config.toml` and restart), the daemon prints a one-time code to stdout on first start, and clients then POST it to `/pair` with the `X-Pairing-Code` header before any authenticated endpoint will respond.
-- **Web dashboard:** bundled and served by default in the published image. The image sets `gateway.web_dist_dir = "/zeroclaw-data/web/dist"` and includes the built frontend there, so the gateway serves the SPA fallback out-of-the-box.
+- **Web dashboard:** bundled and served by default in the published image. The image sets `gateway.web_dist_dir = "/usr/share/zeroclawlabs/web/dist"` and includes the built frontend there, so the gateway serves the SPA fallback out-of-the-box. The assets live **outside** the `/zeroclaw-data` mount point so a `-v …:/zeroclaw-data` volume mount cannot shadow them (ref #6400).
 
 Build from source against the bundled Dockerfile:
 
