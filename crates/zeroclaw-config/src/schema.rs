@@ -18350,11 +18350,15 @@ mod tests {
     /// Build a `Config` whose data dir, install root, and configured plugins dir
     /// live under `root`, and create a plugin at `<parent>/<name>/manifest.toml`.
     fn config_with_dirs(root: &Path) -> Config {
-        let mut config = Config::default();
-        config.data_dir = root.join("data");
-        config.config_path = root.join("install").join("config.toml");
-        config.plugins.plugins_dir = root.join("plugins").to_string_lossy().into_owned();
-        config
+        Config {
+            data_dir: root.join("data"),
+            config_path: root.join("install").join("config.toml"),
+            plugins: PluginsConfig {
+                plugins_dir: root.join("plugins").to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 
     fn write_plugin(parent: &Path, name: &str) {
