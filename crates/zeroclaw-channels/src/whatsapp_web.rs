@@ -729,6 +729,7 @@ impl WhatsAppWebChannel {
         client: &whatsapp_rust::Client,
         msg: &waproto::whatsapp::Message,
         file_prefix: &str,
+        include_audio: bool,
         attachments: &mut Vec<MediaAttachment>,
     ) {
         use wacore::proto_helpers::MessageExt;
@@ -774,24 +775,18 @@ impl WhatsAppWebChannel {
             .await;
         }
 
-        if let Some(ref document) = base.document_message {
-            let mime = document
+        if include_audio && let Some(ref audio) = base.audio_message {
+            let mime = audio
                 .mimetype
                 .clone()
-                .unwrap_or_else(|| "application/octet-stream".to_string());
-            let file_name = document
-                .file_name
-                .as_deref()
-                .map(|name| format!("{file_prefix}{name}"))
-                .unwrap_or_else(|| {
-                    format!(
-                        "{file_prefix}whatsapp-document.{}",
-                        Self::mime_extension(&mime, "bin")
-                    )
-                });
+                .unwrap_or_else(|| "audio/ogg".to_string());
+            let file_name = format!(
+                "{file_prefix}whatsapp-audio.{}",
+                Self::mime_extension(&mime, "ogg")
+            );
             Self::push_downloaded_attachment(
                 client,
-                document.as_ref() as &dyn Downloadable,
+                audio.as_ref() as &dyn Downloadable,
                 file_name,
                 Some(mime),
                 attachments,
@@ -1603,6 +1598,7 @@ impl Channel for WhatsAppWebChannel {
                                     &client,
                                     msg,
                                     "",
+                                    false,
                                     &mut attachments,
                                 )
                                 .await;
@@ -1611,6 +1607,7 @@ impl Channel for WhatsAppWebChannel {
                                         &client,
                                         quoted,
                                         "quoted-",
+                                        true,
                                         &mut attachments,
                                     )
                                     .await;
