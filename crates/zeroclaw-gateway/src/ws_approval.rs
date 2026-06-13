@@ -91,6 +91,16 @@ impl Channel for WsApprovalChannel {
         Ok(())
     }
 
+    fn supports_free_form_ask(&self) -> bool {
+        // The gateway WS path only implements structured approval
+        // (request_approval). It cannot transport free-form ask_user
+        // questions through the generic send+listen flow — send() is
+        // a no-op and listen() returns immediately. Returning false
+        // here lets callers fail fast with a clear error instead of
+        // the misleading "Channel closed before receiving a response".
+        false
+    }
+
     async fn request_approval(
         &self,
         _recipient: &str,
