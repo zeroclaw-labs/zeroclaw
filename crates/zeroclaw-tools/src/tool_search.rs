@@ -62,10 +62,10 @@ impl ToolAccessPolicy {
         // unless explicitly blocked via excluded_tools/denied.
         // An empty allow-list (`Some(vec![])`) still means "deny everything".
         if name.contains("__") {
-            if let Some(list) = &self.allowed {
-                if list.is_empty() {
-                    return false; // explicit empty list = deny all
-                }
+            if let Some(list) = &self.allowed
+                && list.is_empty()
+            {
+                return false; // explicit empty list = deny all
             }
             let in_deny = self
                 .denied
