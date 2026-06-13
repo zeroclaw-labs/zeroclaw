@@ -2939,13 +2939,36 @@ impl RpcDispatcher {
             roots.insert(s.as_str().to_string());
         }
 
-        // Drop bare parents when a dotted child exists
-        // (`providers` vanishes once `providers.models` is present).
+        // Drop bare parents when a dotted child exists AND the parent
+        // carries no direct scalar fields of its own. `providers`
+        // vanishes once `providers.models` is present because
+        // `ProvidersConfig` is a pure wrapper — every scalar lives
+        // under a sub-section. But `mcp` keeps `enabled` and
+        // `deferred_loading` directly, so the parent stays visible
+        // alongside `mcp.servers` and `mcp.bundles`.
+        let direct_scalar_parents: std::collections::HashSet<String> = config
+            .prop_fields()
+            .iter()
+            .filter_map(|f| {
+                let mut segs = f.name.split('.');
+                let root = segs.next()?;
+                // exactly one more segment past root = direct child scalar
+                segs.next()?;
+                if segs.next().is_some() {
+                    return None;
+                }
+                Some(root.to_string())
+            })
+            .collect();
         let parents_with_children: std::collections::HashSet<String> = roots
             .iter()
             .filter_map(|k| k.split_once('.').map(|(p, _)| p.to_string()))
             .collect();
-        roots.retain(|k| k.contains('.') || !parents_with_children.contains(k));
+        roots.retain(|k| {
+            k.contains('.')
+                || !parents_with_children.contains(k)
+                || direct_scalar_parents.contains(k)
+        });
 
         // Hide cost.rates subtree.
         roots.retain(|k| !k.starts_with("cost.rates"));
@@ -4312,6 +4335,123 @@ mod tests {
             .get("default")
             .and_then(|e| e.base.model.clone());
         assert_eq!(stored.as_deref(), Some("claude-sonnet-4-5"));
+    }
+
+    /// End-to-end disk-roundtrip regression for the
+    /// `[[mcp.servers]]` per-field editor (see commit `d06ed25` and the
+    /// in-config-crate regression test
+    /// `save_dirty_persists_mcp_server_field_via_natural_key`).
+    ///
+    /// The shipped natural-key arm successfully mutates the in-memory
+    /// `Config` — so the dashboard / TUI showed the new value — but
+    /// the incremental `save_dirty` writer walked array-of-tables
+    /// nodes as if they were plain tables and silently dropped every
+    /// dirty path that targeted a `mcp.servers.<alias>.<field>` shape.
+    /// Net effect: `handle_config_set` returned `Ok({set: true})`, the
+    /// UI updated, and the on-disk `config.toml` kept its stale value
+    /// until the next process restart wiped the in-memory change.
+    ///
+    /// This test reproduces the full RPC surface — `handle_config_set`
+    /// → `set_prop_persistent` → `flush_config` → `save_dirty` — and
+    /// asserts that the on-disk file actually contains the new value
+    /// once the await returns. The original test surface
+    /// (`config_set_non_secret_field_still_uses_set_prop` above) only
+    /// asserts on in-memory state, which is exactly what let this bug
+    /// ship.
+    #[tokio::test]
+    async fn config_set_persists_mcp_server_field_to_disk() {
+        use zeroclaw_config::schema::{McpServerConfig, McpTransport};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Seed an on-disk file with an existing `[[mcp.servers]]`
+        // entry so `save_dirty` exercises its incremental path
+        // (the new-file fallback to full `save` would mask the
+        // dirty-path bug because it serializes the whole struct).
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [[mcp.servers]]\n\
+             name = \"fs\"\n\
+             transport = \"stdio\"\n\
+             command = \"/usr/bin/mcp-fs\"\n",
+            zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut cfg = zeroclaw_config::schema::Config {
+            config_path: config_path.clone(),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        cfg.mcp.servers.push(McpServerConfig {
+            name: "fs".into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            ..Default::default()
+        });
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+
+        // The exact wire shape the dashboard / TUI send for a
+        // per-field edit on an `[[mcp.servers]]` entry.
+        let params = json!({
+            "prop": "mcp.servers.fs.command",
+            "value": "/usr/local/bin/mcp-fs"
+        });
+        let res = dispatcher.handle_config_set(&params).await;
+        assert!(
+            res.is_ok(),
+            "config/set on a per-field mcp.servers path must succeed: {res:?}"
+        );
+
+        // In-memory landed (this is what the UI sees — and what was
+        // working before; the bug was strictly on the save side).
+        let in_memory = dispatcher
+            .ctx
+            .config
+            .read()
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.name == "fs")
+            .map(|s| s.command.clone());
+        assert_eq!(
+            in_memory.as_deref(),
+            Some("/usr/local/bin/mcp-fs"),
+            "in-memory mutation must land — this part already worked"
+        );
+
+        // The regression: the same value must reach disk.
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            written.contains("/usr/local/bin/mcp-fs"),
+            "config/set on `mcp.servers.fs.command` must persist to disk; \
+             on-disk file still reads:\n{written}"
+        );
+        assert!(
+            !written.contains("/usr/bin/mcp-fs"),
+            "stale command must be overwritten on disk; got:\n{written}"
+        );
+        // The natural-key field itself must stay on disk so the entry
+        // remains addressable on the next load.
+        assert!(
+            written.contains("name = \"fs\""),
+            "natural-key `name` must survive the incremental save; got:\n{written}"
+        );
+
+        // Final paranoia: reparse the on-disk file from scratch and
+        // confirm `Config` loads with the new command. If the writer
+        // produces a syntactically-valid but semantically-wrong shape
+        // (e.g. an inline `mcp.servers.fs = { ... }` instead of a
+        // `[[mcp.servers]]` table), this catches it.
+        let reparsed: zeroclaw_config::schema::Config = toml::from_str(&written).unwrap();
+        let entry = reparsed
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.name == "fs")
+            .expect("reparse must surface the entry by natural key");
+        assert_eq!(entry.command, "/usr/local/bin/mcp-fs");
     }
 
     fn make_model_refresh_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {

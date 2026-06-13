@@ -259,6 +259,16 @@ sections! {
         help:  "Model Context Protocol settings. Toggle `enabled` and pick deferred \
                 or eager loading. Individual MCP servers live under `mcp.servers[]`.",
     },
+    McpServers => {
+        key:   "mcp.servers",
+        shape: OneTierAliasMap,
+        help:  "Individual Model Context Protocol servers. Each entry binds a \
+                transport (stdio, http, sse), the command or URL to reach it, \
+                optional headers, and a `tool_timeout_secs` cap (≤ 600). Each \
+                server's `name` is its addressable key — rename via the section \
+                page rather than editing the field directly. Group servers \
+                into bundles under `mcp_bundles` below.",
+    },
     McpBundles => {
         key:   "mcp_bundles",
         shape: OneTierAliasMap,
@@ -440,6 +450,13 @@ pub fn section_has_signal(cfg: &crate::schema::Config, section: Section) -> bool
                 .is_some_and(|rest| rest.contains('.'))
         }),
         Section::Hardware => cfg.hardware.enabled,
+        // Servers' existence in the Vec is the signal — a fresh install
+        // has an empty `mcp.servers`, so any element at all (even one
+        // with no command set) counts as user intent to use MCP. The
+        // parent `Mcp` section stays marker-only because its top-level
+        // booleans (`enabled`, `deferred_loading`) have meaningful
+        // defaults that are indistinguishable from user choice.
+        Section::McpServers => !cfg.mcp.servers.is_empty(),
         // Memory's default backend is "sqlite" and Tunnel's is "none" —
         // both are valid user choices indistinguishable from untouched
         // defaults. TTS / transcription providers and agents start
@@ -541,6 +558,7 @@ mod tests {
         let alias_map_sections = [
             Section::PeerGroups,
             Section::Cron,
+            Section::McpServers,
             Section::McpBundles,
             Section::KnowledgeBundles,
             Section::SkillBundles,
@@ -555,6 +573,34 @@ mod tests {
                 section.as_str(),
             );
         }
+    }
+
+    /// `Section::McpServers` is the per-server editor page. It must
+    /// be the `OneTierAliasMap` shape so the dashboard / TUI dispatch
+    /// it to the alias-list renderer (matching `risk_profiles` etc.).
+    /// `Section::Mcp` keeps its `DirectForm` shape so the parent's
+    /// `enabled` / `deferred_loading` toggles render as a normal
+    /// field list. Both must coexist; the parent must not collapse
+    /// into the child when both appear in the curated section list.
+    #[test]
+    fn mcp_servers_section_has_alias_map_shape_and_parent_keeps_direct_form() {
+        assert_eq!(Section::Mcp.shape(), SectionShape::DirectForm);
+        assert_eq!(Section::McpServers.shape(), SectionShape::OneTierAliasMap);
+        assert!(QUICKSTART_SECTIONS.contains(&Section::Mcp));
+        assert!(QUICKSTART_SECTIONS.contains(&Section::McpServers));
+        assert!(QUICKSTART_SECTIONS.contains(&Section::McpBundles));
+
+        // Canonical order: parent settings come first, then the
+        // servers editor, then the bundles map. Operators walking the
+        // Quickstart hit the toggle before the per-server form.
+        let idx = |s: Section| {
+            QUICKSTART_SECTIONS
+                .iter()
+                .position(|x| *x == s)
+                .unwrap_or_else(|| panic!("{s:?} missing from QUICKSTART_SECTIONS"))
+        };
+        assert!(idx(Section::Mcp) < idx(Section::McpServers));
+        assert!(idx(Section::McpServers) < idx(Section::McpBundles));
     }
 
     /// Canonical order is dependency-correct: every Section that
