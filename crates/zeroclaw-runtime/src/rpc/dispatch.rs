@@ -263,6 +263,45 @@ fn not_yet_implemented(method: Method) -> RpcResult {
     ))
 }
 
+fn personality_template_context(
+    config: &zeroclaw_config::schema::Config,
+    req: &PersonalityTemplatesParams,
+) -> crate::agent::personality_templates::TemplateContext {
+    let agent_requested = req.agent.is_some();
+    let requested_agent = req
+        .agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let agent_alias = requested_agent.unwrap_or("default");
+    let configured_agent_exists = config.agent(agent_alias).is_some();
+
+    crate::agent::personality_templates::TemplateContext {
+        agent: requested_agent
+            .map(str::to_string)
+            .or_else(|| configured_agent_exists.then(|| agent_alias.to_string()))
+            .unwrap_or_else(|| "ZeroClaw".to_string()),
+        // Existing config editors pass an agent alias, but Quickstart
+        // also asks for templates before the new agent exists. Treat an
+        // explicit agent request as a full per-agent template render so
+        // MEMORY.md is available during first-run setup; keep the no-agent
+        // fallback memoryless for generic/default callers.
+        include_memory: configured_agent_exists || agent_requested,
+        ..Default::default()
+    }
+}
+
+fn model_provider_ref_from_provider_profile_prop(prop: &str) -> Option<String> {
+    let rest = prop.strip_prefix("providers.models.")?;
+    let (provider_type, rest) = rest.split_once('.')?;
+    let (provider_alias, field) = rest.split_once('.')?;
+    if provider_type.is_empty() || provider_alias.is_empty() || field.is_empty() {
+        None
+    } else {
+        Some(format!("{provider_type}.{provider_alias}"))
+    }
+}
+
 /// Per-connection dispatcher. Shared state lives in [`RpcContext`].
 pub struct RpcDispatcher {
     ctx: Arc<RpcContext>,
@@ -2173,6 +2212,7 @@ impl RpcDispatcher {
 
     async fn handle_config_set(&self, params: &Value) -> RpcResult {
         let req: ConfigSetParams = parse_params(params)?;
+        let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
         {
             let mut config = self.ctx.config.write();
             config.ensure_map_key_for_path(&req.prop);
@@ -2215,10 +2255,100 @@ impl RpcDispatcher {
                 .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))?;
         }
         self.flush_config().await?;
+        if let Some(model_provider_ref) = refresh_model_provider_ref {
+            self.schedule_live_sessions_refresh_for_model_provider(model_provider_ref);
+        }
         to_result(ConfigSetResult {
             prop: req.prop,
             set: true,
         })
+    }
+
+    fn schedule_live_sessions_refresh_for_model_provider(&self, model_provider_ref: String) {
+        let ctx = Arc::clone(&self.ctx);
+        zeroclaw_spawn::spawn!(async move {
+            Self::refresh_live_sessions_for_model_provider(ctx, &model_provider_ref).await;
+        });
+    }
+
+    async fn refresh_live_sessions_for_model_provider(
+        ctx: Arc<RpcContext>,
+        model_provider_ref: &str,
+    ) {
+        let session_ids = ctx.sessions.list_ids().await;
+        for session_id in session_ids {
+            let Some(agent_alias) = ctx.sessions.get_agent_alias(&session_id).await else {
+                continue;
+            };
+            let Some(overrides) = ctx.sessions.get_overrides(&session_id).await else {
+                continue;
+            };
+            let uses_provider = {
+                let config = ctx.config.read();
+                let effective_ref = overrides.model_provider.as_deref().or_else(|| {
+                    config
+                        .agent(&agent_alias)
+                        .map(|agent| agent.model_provider.as_str())
+                });
+                effective_ref == Some(model_provider_ref)
+            };
+            if !uses_provider {
+                continue;
+            }
+
+            let (model_provider, model_provider_name, model_name, temperature) = {
+                let config = ctx.config.read();
+                let provider_temperature = model_provider_ref.split_once('.').and_then(
+                    |(provider_type, provider_alias)| {
+                        config
+                            .providers
+                            .models
+                            .find(provider_type, provider_alias)
+                            .and_then(|entry| entry.temperature)
+                    },
+                );
+                match crate::agent::agent::build_session_model_provider(
+                    &config,
+                    model_provider_ref,
+                    overrides.model.as_deref(),
+                ) {
+                    Ok((model_provider, model_provider_name, model_name)) => (
+                        model_provider,
+                        model_provider_name,
+                        model_name,
+                        overrides.temperature.or(provider_temperature),
+                    ),
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "session_id": session_id,
+                                "agent_alias": agent_alias,
+                                "model_provider": model_provider_ref,
+                                "error": e.to_string(),
+                            })),
+                            "config/set saved provider profile but live session refresh failed"
+                        );
+                        continue;
+                    }
+                }
+            };
+            if ctx
+                .sessions
+                .apply_model_provider(&session_id, model_provider, model_provider_name)
+                .await
+                && let Some(agent) = ctx.sessions.get_agent(&session_id).await
+            {
+                let mut agent = agent.lock().await;
+                agent.set_model_name(model_name);
+                agent.set_temperature(temperature);
+            }
+        }
     }
 
     fn handle_config_validate(&self) -> RpcResult {
@@ -2258,7 +2388,7 @@ impl RpcDispatcher {
             .prop_fields()
             .into_iter()
             .filter(|info| match prefix {
-                Some(p) => info.name.starts_with(p),
+                Some(p) => field_visibility::path_matches_prefix(&info.name, p),
                 None => true,
             })
             .filter(|info| !field_visibility::is_excluded(&info.name, &excluded))
@@ -2272,6 +2402,7 @@ impl RpcDispatcher {
 
     async fn handle_config_delete(&self, params: &Value) -> RpcResult {
         let req: ConfigDeleteParams = parse_params(params)?;
+        let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
         {
             let mut config = self.ctx.config.write();
             config
@@ -2279,6 +2410,9 @@ impl RpcDispatcher {
                 .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config delete failed: {e}")))?;
         }
         self.flush_config().await?;
+        if let Some(model_provider_ref) = refresh_model_provider_ref {
+            self.schedule_live_sessions_refresh_for_model_provider(model_provider_ref);
+        }
         to_result(ConfigDeleteResult {
             prop: req.prop,
             deleted: true,
@@ -2666,16 +2800,8 @@ impl RpcDispatcher {
 
     fn handle_personality_templates(&self, params: &Value) -> RpcResult {
         let req: PersonalityTemplatesParams = parse_params(params)?;
-        let agent_alias = req.agent.as_deref().unwrap_or("default");
         let config = self.ctx.config.read().clone();
-        let ctx = crate::agent::personality_templates::TemplateContext {
-            agent: config
-                .agent(agent_alias)
-                .map(|_| agent_alias.to_string())
-                .unwrap_or_else(|| "ZeroClaw".to_string()),
-            include_memory: config.agent(agent_alias).is_some(),
-            ..Default::default()
-        };
+        let ctx = personality_template_context(&config, &req);
         let templates = crate::agent::personality_templates::render_preset_default(&ctx);
         let files: Vec<TemplateFileEntry> = templates
             .into_iter()
@@ -2738,13 +2864,36 @@ impl RpcDispatcher {
             roots.insert(s.as_str().to_string());
         }
 
-        // Drop bare parents when a dotted child exists
-        // (`providers` vanishes once `providers.models` is present).
+        // Drop bare parents when a dotted child exists AND the parent
+        // carries no direct scalar fields of its own. `providers`
+        // vanishes once `providers.models` is present because
+        // `ProvidersConfig` is a pure wrapper — every scalar lives
+        // under a sub-section. But `mcp` keeps `enabled` and
+        // `deferred_loading` directly, so the parent stays visible
+        // alongside `mcp.servers` and `mcp.bundles`.
+        let direct_scalar_parents: std::collections::HashSet<String> = config
+            .prop_fields()
+            .iter()
+            .filter_map(|f| {
+                let mut segs = f.name.split('.');
+                let root = segs.next()?;
+                // exactly one more segment past root = direct child scalar
+                segs.next()?;
+                if segs.next().is_some() {
+                    return None;
+                }
+                Some(root.to_string())
+            })
+            .collect();
         let parents_with_children: std::collections::HashSet<String> = roots
             .iter()
             .filter_map(|k| k.split_once('.').map(|(p, _)| p.to_string()))
             .collect();
-        roots.retain(|k| k.contains('.') || !parents_with_children.contains(k));
+        roots.retain(|k| {
+            k.contains('.')
+                || !parents_with_children.contains(k)
+                || direct_scalar_parents.contains(k)
+        });
 
         // Hide cost.rates subtree.
         roots.retain(|k| !k.starts_with("cost.rates"));
@@ -3268,6 +3417,26 @@ mod tests {
         for (_, wire) in Method::ALL {
             assert!(seen.insert(*wire), "duplicate wire name: {wire}");
         }
+    }
+
+    #[test]
+    fn personality_templates_use_requested_agent_name_before_config_exists() {
+        let req = PersonalityTemplatesParams {
+            agent: Some(" bob ".to_string()),
+        };
+        let ctx = personality_template_context(&zeroclaw_config::schema::Config::default(), &req);
+
+        assert_eq!(ctx.agent, "bob");
+        assert!(ctx.include_memory);
+    }
+
+    #[test]
+    fn personality_templates_without_agent_stay_generic_and_memoryless() {
+        let req = PersonalityTemplatesParams { agent: None };
+        let ctx = personality_template_context(&zeroclaw_config::schema::Config::default(), &req);
+
+        assert_eq!(ctx.agent, "ZeroClaw");
+        assert!(!ctx.include_memory);
     }
 
     #[test]
@@ -4091,6 +4260,366 @@ mod tests {
             .get("default")
             .and_then(|e| e.base.model.clone());
         assert_eq!(stored.as_deref(), Some("claude-sonnet-4-5"));
+    }
+
+    /// End-to-end disk-roundtrip regression for the
+    /// `[[mcp.servers]]` per-field editor (see commit `d06ed25` and the
+    /// in-config-crate regression test
+    /// `save_dirty_persists_mcp_server_field_via_natural_key`).
+    ///
+    /// The shipped natural-key arm successfully mutates the in-memory
+    /// `Config` — so the dashboard / TUI showed the new value — but
+    /// the incremental `save_dirty` writer walked array-of-tables
+    /// nodes as if they were plain tables and silently dropped every
+    /// dirty path that targeted a `mcp.servers.<alias>.<field>` shape.
+    /// Net effect: `handle_config_set` returned `Ok({set: true})`, the
+    /// UI updated, and the on-disk `config.toml` kept its stale value
+    /// until the next process restart wiped the in-memory change.
+    ///
+    /// This test reproduces the full RPC surface — `handle_config_set`
+    /// → `set_prop_persistent` → `flush_config` → `save_dirty` — and
+    /// asserts that the on-disk file actually contains the new value
+    /// once the await returns. The original test surface
+    /// (`config_set_non_secret_field_still_uses_set_prop` above) only
+    /// asserts on in-memory state, which is exactly what let this bug
+    /// ship.
+    #[tokio::test]
+    async fn config_set_persists_mcp_server_field_to_disk() {
+        use zeroclaw_config::schema::{McpServerConfig, McpTransport};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Seed an on-disk file with an existing `[[mcp.servers]]`
+        // entry so `save_dirty` exercises its incremental path
+        // (the new-file fallback to full `save` would mask the
+        // dirty-path bug because it serializes the whole struct).
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [[mcp.servers]]\n\
+             name = \"fs\"\n\
+             transport = \"stdio\"\n\
+             command = \"/usr/bin/mcp-fs\"\n",
+            zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut cfg = zeroclaw_config::schema::Config {
+            config_path: config_path.clone(),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        cfg.mcp.servers.push(McpServerConfig {
+            name: "fs".into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            ..Default::default()
+        });
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+
+        // The exact wire shape the dashboard / TUI send for a
+        // per-field edit on an `[[mcp.servers]]` entry.
+        let params = json!({
+            "prop": "mcp.servers.fs.command",
+            "value": "/usr/local/bin/mcp-fs"
+        });
+        let res = dispatcher.handle_config_set(&params).await;
+        assert!(
+            res.is_ok(),
+            "config/set on a per-field mcp.servers path must succeed: {res:?}"
+        );
+
+        // In-memory landed (this is what the UI sees — and what was
+        // working before; the bug was strictly on the save side).
+        let in_memory = dispatcher
+            .ctx
+            .config
+            .read()
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.name == "fs")
+            .map(|s| s.command.clone());
+        assert_eq!(
+            in_memory.as_deref(),
+            Some("/usr/local/bin/mcp-fs"),
+            "in-memory mutation must land — this part already worked"
+        );
+
+        // The regression: the same value must reach disk.
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            written.contains("/usr/local/bin/mcp-fs"),
+            "config/set on `mcp.servers.fs.command` must persist to disk; \
+             on-disk file still reads:\n{written}"
+        );
+        assert!(
+            !written.contains("/usr/bin/mcp-fs"),
+            "stale command must be overwritten on disk; got:\n{written}"
+        );
+        // The natural-key field itself must stay on disk so the entry
+        // remains addressable on the next load.
+        assert!(
+            written.contains("name = \"fs\""),
+            "natural-key `name` must survive the incremental save; got:\n{written}"
+        );
+
+        // Final paranoia: reparse the on-disk file from scratch and
+        // confirm `Config` loads with the new command. If the writer
+        // produces a syntactically-valid but semantically-wrong shape
+        // (e.g. an inline `mcp.servers.fs = { ... }` instead of a
+        // `[[mcp.servers]]` table), this catches it.
+        let reparsed: zeroclaw_config::schema::Config = toml::from_str(&written).unwrap();
+        let entry = reparsed
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.name == "fs")
+            .expect("reparse must surface the entry by natural key");
+        assert_eq!(entry.command, "/usr/local/bin/mcp-fs");
+    }
+
+    fn make_model_refresh_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let mut config = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        let provider = config
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .expect("openai provider slot exists");
+        provider.api_key = Some("test-key".into());
+        provider.uri = Some("http://127.0.0.1:1".into());
+        provider.model = Some("old-model".into());
+        provider.temperature = Some(0.2);
+
+        config.agents = HashMap::from([(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.test-provider".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        )]);
+        config
+            .risk_profiles
+            .insert("test-profile".into(), RiskProfileConfig::default());
+        config
+            .runtime_profiles
+            .insert("default".into(), Default::default());
+        config
+    }
+
+    async fn create_model_refresh_test_session(
+        dispatcher: &RpcDispatcher,
+        tmp: &tempfile::TempDir,
+    ) -> String {
+        let session_res = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "cwd": tmp.path().join("workspace"),
+            }))
+            .await
+            .expect("session/new should create the agent");
+        session_res
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .expect("session/new result includes session_id")
+            .to_string()
+    }
+
+    async fn model_name_for_session(dispatcher: &RpcDispatcher, session_id: &str) -> String {
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(session_id)
+            .await
+            .expect("session agent exists");
+        agent.lock().await.attribution_fields().2
+    }
+
+    async fn temperature_for_session(dispatcher: &RpcDispatcher, session_id: &str) -> Option<f64> {
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(session_id)
+            .await
+            .expect("session agent exists");
+        agent.lock().await.temperature_for_test()
+    }
+
+    async fn wait_for_model_name(dispatcher: &RpcDispatcher, session_id: &str, expected: &str) {
+        for _ in 0..50 {
+            if model_name_for_session(dispatcher, session_id).await == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            model_name_for_session(dispatcher, session_id).await,
+            expected
+        );
+    }
+
+    async fn wait_for_temperature(
+        dispatcher: &RpcDispatcher,
+        session_id: &str,
+        expected: Option<f64>,
+    ) {
+        for _ in 0..50 {
+            if temperature_for_session(dispatcher, session_id).await == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            temperature_for_session(dispatcher, session_id).await,
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_provider_model_refreshes_matching_live_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.model",
+                "value": "new-model"
+            }))
+            .await;
+        assert!(res.is_ok(), "config/set must succeed: {res:?}");
+
+        wait_for_model_name(&dispatcher, &session_id, "new-model").await;
+    }
+
+    #[tokio::test]
+    async fn config_set_provider_refresh_failure_does_not_fail_saved_write() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.model",
+                "value": ""
+            }))
+            .await;
+        assert!(
+            res.is_ok(),
+            "config/set must report the saved write even if live refresh cannot rebuild: {res:?}"
+        );
+        let cfg = dispatcher.ctx.config.read().clone();
+        let stored = cfg
+            .providers
+            .models
+            .openai
+            .get("test-provider")
+            .and_then(|e| e.base.model.clone());
+        assert_eq!(
+            stored, None,
+            "config/set must still persist the requested provider-profile clear"
+        );
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model",
+            "failed live refresh must leave the existing session provider intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_provider_temperature_refreshes_matching_live_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            temperature_for_session(&dispatcher, &session_id).await,
+            Some(0.2)
+        );
+
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.temperature",
+                "value": 0.4
+            }))
+            .await;
+        assert!(res.is_ok(), "config/set must succeed: {res:?}");
+
+        wait_for_temperature(&dispatcher, &session_id, Some(0.4)).await;
+    }
+
+    #[tokio::test]
+    async fn config_set_provider_refresh_preserves_session_temperature_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let merged = dispatcher
+            .ctx
+            .sessions
+            .set_overrides(
+                &session_id,
+                crate::rpc::session::SessionOverrides {
+                    temperature: Some(0.6),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("session override applies");
+        assert_eq!(merged.temperature, Some(0.6));
+
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.model",
+                "value": "new-model"
+            }))
+            .await;
+        assert!(res.is_ok(), "config/set must succeed: {res:?}");
+
+        wait_for_model_name(&dispatcher, &session_id, "new-model").await;
+        assert_eq!(
+            temperature_for_session(&dispatcher, &session_id).await,
+            Some(0.6),
+            "session temperature override must win over provider profile temperature"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_delete_provider_temperature_refreshes_matching_live_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            temperature_for_session(&dispatcher, &session_id).await,
+            Some(0.2)
+        );
+
+        let res = dispatcher
+            .handle_config_delete(&json!({
+                "prop": "providers.models.openai.test-provider.temperature",
+            }))
+            .await;
+        assert!(res.is_ok(), "config/delete must succeed: {res:?}");
+
+        wait_for_temperature(&dispatcher, &session_id, None).await;
     }
 
     // -----------------------------------------------------------------------

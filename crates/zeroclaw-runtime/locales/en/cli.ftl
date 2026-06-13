@@ -628,3 +628,13 @@ cli-channels-notion = {"  "}{$status} Notion
 cli-channels-start-hint = To start channels: zeroclaw channel start
 cli-channels-doctor-hint = To check health:    zeroclaw channel doctor
 cli-channels-configure-hint = To configure:      zeroclaw config set channels.<name>.<field>=<value>
+
+# ── Agent turn-engine user-visible markers (#7415) ────────────────────
+# Appended to (or persisted as) assistant output when a turn is cut short;
+# shown to end users across every transport (channels, WS, RPC, ACP, CLI).
+turn-interrupted-by-user = [interrupted by user]
+turn-stream-interrupted = [stream interrupted]
+turn-tool-interrupted-before-result = [interrupted by user before this tool produced a result]
+# Safe reply delivered when the model repeatedly emits malformed internal
+# tool-call protocol and the turn gives up retrying.
+channel-runtime-malformed-tool-output = I generated an internal tool-call format error and could not complete this request. Please try again.

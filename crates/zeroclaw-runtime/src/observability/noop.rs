@@ -37,13 +37,19 @@ mod tests {
         obs.record_event(&ObserverEvent::AgentStart {
             model_provider: "test".into(),
             model: "test".into(),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "test".into(),
             model: "test".into(),
             duration: Duration::from_millis(100),
-            tokens_used: Some(42),
+            tokens_used: None,
             cost_usd: Some(0.001),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "test".into(),
@@ -51,6 +57,9 @@ mod tests {
             duration: Duration::ZERO,
             tokens_used: None,
             cost_usd: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
@@ -59,6 +68,9 @@ mod tests {
             success: true,
             arguments: None,
             result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::ChannelMessage {
             channel: "cli".into(),
