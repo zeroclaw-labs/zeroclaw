@@ -3712,9 +3712,11 @@ async fn main() -> Result<()> {
                                 )
                                 .await
                             } else {
-                                zeroclaw_log::record!(
-                                    zeroclaw_log::Level::Error,
-                                    "sop_engine_not_registered",
+                                ::zeroclaw_log::record!(
+                                    ERROR,
+                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(::serde_json::json!({"error_key": "sop_engine_not_registered"})),
                                     "MQTT SOP listener started but SOP engine was not registered"
                                 );
                                 Err(anyhow::Error::msg("SOP engine not registered"))
