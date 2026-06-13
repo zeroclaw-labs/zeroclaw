@@ -2358,6 +2358,11 @@ impl Agent {
         /// here at session start; hard-coding one name would break the other).
         struct AskUserApprovalBridge {
             handles: tools::PerToolChannelHandle,
+            // The back-channel that answered the most recent request, so the
+            // approval audit records the deciding surface (WS, ACP, …) rather
+            // than the loop's static "cli" channel name. See
+            // `last_decision_channel` below and `gate_tool_approval`.
+            last_decision: parking_lot::Mutex<Option<String>>,
         }
 
         impl ::zeroclaw_api::attribution::Attributable for AskUserApprovalBridge {
@@ -2375,6 +2380,10 @@ impl Agent {
         impl zeroclaw_api::channel::Channel for AskUserApprovalBridge {
             fn name(&self) -> &str {
                 "agent-approval-bridge"
+            }
+
+            fn last_decision_channel(&self) -> Option<String> {
+                self.last_decision.lock().clone()
             }
 
             async fn send(
@@ -2403,9 +2412,16 @@ impl Agent {
                     .iter()
                     .map(|(name, channel)| (name.clone(), Arc::clone(channel)))
                     .collect();
+                // Clear the previous decision's attribution; only a decisive
+                // answer below sets it, so an all-`None` fan-out leaves it unset
+                // and the gate falls back to the loop's channel name.
+                *self.last_decision.lock() = None;
                 for (channel_name, channel) in &channels {
                     match channel.request_approval(recipient, request).await {
-                        Ok(Some(response)) => return Ok(Some(response)),
+                        Ok(Some(response)) => {
+                            *self.last_decision.lock() = Some(channel_name.clone());
+                            return Ok(Some(response));
+                        }
                         Ok(None) => continue,
                         Err(e) => {
                             ::zeroclaw_log::record!(
@@ -2532,6 +2548,7 @@ impl Agent {
             self.channel_handles.ask_user.as_ref().map(|handles| {
                 Box::new(AskUserApprovalBridge {
                     handles: Arc::clone(handles),
+                    last_decision: parking_lot::Mutex::new(None),
                 }) as Box<dyn zeroclaw_api::channel::Channel>
             });
 

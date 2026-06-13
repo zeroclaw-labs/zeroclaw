@@ -91,7 +91,17 @@ pub(crate) async fn gate_tool_approval(
             mgr.prompt_cli(&request)
         };
 
-        mgr.record_decision(tool_name, tool_args, &decision, ctx.channel_name);
+        // The approval audit records which surface decided. On the streaming
+        // path `ctx.channel` is the approval bridge fanning out to several
+        // registered back-channels, and `ctx.channel_name` is the loop's
+        // static "cli"; prefer the back-channel that actually answered so a
+        // WS/ACP approval is attributed to WS/ACP, not "cli". Single channels
+        // and the CLI prompt path report `None` and keep `channel_name`.
+        let decision_channel = ctx
+            .channel
+            .and_then(|ch| ch.last_decision_channel())
+            .unwrap_or_else(|| ctx.channel_name.to_string());
+        mgr.record_decision(tool_name, tool_args, &decision, &decision_channel);
 
         if decision == ApprovalResponse::No {
             let denied = "Denied by user.".to_string();

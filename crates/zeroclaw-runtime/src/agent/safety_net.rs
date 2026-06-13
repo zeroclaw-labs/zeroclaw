@@ -604,6 +604,7 @@ async fn safety_net_streaming_approval_deny_with_edit_round_trip() {
         always_ask: vec!["echo".into()],
         ..zeroclaw_config::schema::RiskProfileConfig::default()
     };
+    let approval_mgr = Arc::new(ApprovalManager::for_non_interactive(&risk));
     let mut agent = Agent::builder()
         .model_provider(Box::new(ScriptedProvider::new(vec![tool_response(vec![
             ToolCall {
@@ -621,7 +622,7 @@ async fn safety_net_streaming_approval_deny_with_edit_round_trip() {
         .observer(Arc::from(observability::NoopObserver {}))
         .tool_dispatcher(Box::new(NativeToolDispatcher))
         .workspace_dir(std::path::PathBuf::from("/tmp"))
-        .approval_manager(Some(Arc::new(ApprovalManager::for_non_interactive(&risk))))
+        .approval_manager(Some(Arc::clone(&approval_mgr)))
         .build()
         .expect("agent builder should succeed");
 
@@ -672,6 +673,18 @@ async fn safety_net_streaming_approval_deny_with_edit_round_trip() {
                 if results.iter().any(|r| r.content.contains("EDITED-RESULT"))
         )),
         "persisted tool result must carry the replacement output"
+    );
+
+    // Channel attribution (PR #7540 blocker 1): the approval audit log is a
+    // security record of *which* surface decided. The deciding back-channel
+    // here is "edit-channel"; the consolidated streaming wrapper passes the
+    // loop a static channel name of "cli", so without per-channel attribution
+    // the entry would read "cli" — affirmatively wrong. Pin the real channel.
+    let log = approval_mgr.audit_log();
+    let entry = log.last().expect("a decision must be recorded");
+    assert_eq!(
+        entry.channel, "edit-channel",
+        "approval audit must attribute the deciding back-channel, not the loop's static \"cli\""
     );
 }
 
