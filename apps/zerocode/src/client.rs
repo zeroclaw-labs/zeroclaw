@@ -475,7 +475,7 @@ impl RpcClient {
 
     /// Connect to the daemon via WebSocket Secure (WSS).
     ///
-    /// Same handshake and reconnect semantics as [`connect`] — pass
+    /// Same handshake and reconnect semantics as [`Self::connect`] — pass
     /// previous `tui_id`/`tui_sig` to reclaim identity on reconnect.
     ///
     /// When `tls_skip_verify` is true, certificate verification is
@@ -682,15 +682,27 @@ impl RpcClient {
     }
 
     pub async fn call<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
+        self.call_with_timeout(method, params, std::time::Duration::from_secs(5))
+            .await
+    }
+
+    pub async fn call_with_timeout<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: std::time::Duration,
+    ) -> Result<T> {
         // Timeout prevents indefinite hangs when the daemon dies between
         // the connection-state check and the actual RPC send/recv.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.rpc.request(method, params),
-        )
-        .await
-        .map_err(|_| anyhow::Error::msg(format!("RPC {method}: timed out after 5s")))?
-        .map_err(|e| anyhow::Error::msg(format!("RPC {method}: {} ({})", e.message, e.code)))?;
+        let result = tokio::time::timeout(timeout, self.rpc.request(method, params))
+            .await
+            .map_err(|_| {
+                anyhow::Error::msg(format!(
+                    "RPC {method}: timed out after {}s",
+                    timeout.as_secs()
+                ))
+            })?
+            .map_err(|e| anyhow::Error::msg(format!("RPC {method}: {} ({})", e.message, e.code)))?;
         serde_json::from_value(result).with_context(|| format!("deserializing {method} result"))
     }
 
@@ -824,9 +836,10 @@ impl RpcClient {
     }
 
     pub async fn catalog_models(&self, provider: &str) -> Result<CatalogModelsResult> {
-        self.call(
+        self.call_with_timeout(
             method::CONFIG_CATALOG_MODELS,
             serde_json::json!({ "model_provider": provider }),
+            std::time::Duration::from_secs(20),
         )
         .await
     }
@@ -992,7 +1005,7 @@ impl RpcClient {
         self.session_new_with_id(agent_alias, cwd, None).await
     }
 
-    /// Like [`session_new_with_id`] but sets `exclude_memory: true` so the
+    /// Like [`Self::session_new_with_id`] but sets `exclude_memory: true` so the
     /// daemon strips memory tools and uses a NoneMemory backend. Used by the
     /// ACP pane, which should never have access to persistent memory.
     pub async fn session_new_acp(
@@ -1743,7 +1756,10 @@ pub struct SessionListResult {
 pub struct AgentStatusEntry {
     pub alias: String,
     pub enabled: bool,
-    pub active_sessions: usize,
+    #[serde(default)]
+    pub live_sessions: usize,
+    #[serde(default)]
+    pub persisted_sessions: usize,
     #[serde(default)]
     pub channels: Vec<String>,
 }

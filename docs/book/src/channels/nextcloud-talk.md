@@ -1,6 +1,10 @@
 # Nextcloud Talk
 
-Nextcloud Talk integration via the Talk Bot webhook protocol. Self-hosted, federated, and E2E-capable — another sovereign-communication option alongside [Matrix](./matrix.md) and [Mattermost](./mattermost.md).
+Nextcloud Talk integration via the Talk Bot webhook protocol. Self-hosted, federated, and E2E-capable: another sovereign-communication option alongside [Matrix](./matrix.md) and [Mattermost](./mattermost.md).
+
+## Who can talk to the agent
+
+{{#peer-group nextcloud}}
 
 ## What this integration does
 
@@ -11,33 +15,32 @@ Nextcloud Talk integration via the Talk Bot webhook protocol. Self-hosted, feder
 ## Prerequisites
 
 - **Nextcloud server** with the Talk app enabled (v17 or later recommended)
-- **Bot account** in Talk settings — give it a display name (e.g. `zeroclaw-bot`)
+- **Bot account** in Talk settings, give it a display name (e.g. `zeroclaw-bot`)
 - **Bot app token** from the Talk admin UI for OCS API bearer auth (used for outbound replies)
 - **Webhook secret** from the Talk admin UI if you want signature verification (strongly recommended)
-- **Publicly-reachable gateway** — see [Setup → Container](../setup/container.md) for tunnel options if self-hosted
+- **Publicly-reachable gateway**: see [Setup → Container](../setup/container.md) for tunnel options if self-hosted
 
 ## Configuration
 
-```toml
-[channels.nextcloud_talk]
-enabled = true
-base_url = "https://cloud.example.com"
-app_token = "..."                              # OCS API bearer token (bot app token)
-webhook_secret = "..."                         # shared secret for HMAC-SHA256 webhook verification
-bot_name = "zeroclaw-bot"                      # display name; filters out the bot's own posts
-allowed_users = ["*"]                          # actor IDs; "*" = allow all (use for first-time test only)
-proxy_url = ""                                 # optional per-channel proxy override
-```
+{{#config-fields channels.nextcloud_talk}}
 
-Environment override: `ZEROCLAW_NEXTCLOUD_TALK_WEBHOOK_SECRET` takes precedence over the config value. Useful for rotating secrets without editing the config.
+The channel is read from the `default` alias. Set it through any config surface:
 
-Full field reference: [Config](../reference/config.md).
+{{#config-where channels nextcloud_talk}}
+
+`webhook_secret` can also be supplied at runtime via the generic env override {{#env-var-name channels.nextcloud_talk.default.webhook_secret}}, useful for rotating it without editing the config.
 
 ## Gateway endpoint
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw daemon
 ```
+
+</div>
 
 Configure your Talk bot's webhook URL to point at:
 
@@ -45,7 +48,7 @@ Configure your Talk bot's webhook URL to point at:
 https://<your-public-url>/nextcloud-talk
 ```
 
-Local development? Configure `[tunnel]` in your config (ngrok, Cloudflare, or Tailscale) and the gateway exposes itself on startup — see [Operations → Network deployment](../ops/network-deployment.md).
+Local development? Configure `[tunnel]` in your config (ngrok, Cloudflare, or Tailscale) and the gateway exposes itself on startup: see [Operations → Network deployment](../ops/network-deployment.md).
 
 ## Signature verification
 
@@ -62,11 +65,11 @@ if X-Nextcloud-Talk-Signature != expected_sig:
     return 401
 ```
 
-Without a secret, no verification — don't expose this endpoint publicly in that mode.
+Without a secret, no verification: don't expose this endpoint publicly in that mode.
 
 ## Message routing
 
-- **Bot-originated events** (`actorType = "bots"`) are ignored — prevents feedback loops
+- **Bot-originated events** (`actorType = "bots"`) are ignored: prevents feedback loops
 - **System events** (joins, leaves, membership changes) are ignored
 - **Non-message events** are ignored
 - **User messages** are dispatched to the agent loop
@@ -74,17 +77,17 @@ Without a secret, no verification — don't expose this endpoint publicly in tha
 
 ## Quick validation
 
-1. Set `allowed_users = ["*"]` for first-time testing
+1. Set `external_peers = ["*"]` in the peer group for first-time testing
 2. Send a test message in the configured Talk room
 3. Confirm ZeroClaw receives and replies in the same room
-4. Tighten `allowed_users` to explicit actor IDs (e.g. `["alice", "bob"]`)
+4. Tighten the peer group to explicit actor IDs (e.g. `["alice", "bob"]`)
 
 ## Troubleshooting
 
-- **`404 Nextcloud Talk not configured`** — `[channels.nextcloud_talk]` section missing or `enabled = false`
-- **`401 Invalid signature`** — secret mismatch, wrong random header, or body-signing bug. Check the raw body is being signed (not the parsed JSON)
-- **No reply, webhook `200`** — event was filtered. Check logs for "actorType = bots" or "user not in allowed_users"
-- **Replies delivered but look wrong** — check thread context; Talk replies are currently root-level only
+- **`404 Nextcloud Talk not configured`**: `[channels.nextcloud_talk.default]` section missing or `enabled = false`
+- **`401 Invalid signature`**: secret mismatch, wrong random header, or body-signing bug. Check the raw body is being signed (not the parsed JSON)
+- **No reply, webhook `200`**: event was filtered. Check logs for "actorType = bots" or a sender not in the peer set
+- **Replies delivered but look wrong**: check thread context; Talk replies are currently root-level only
 
 ## Streaming
 
@@ -93,12 +96,12 @@ Nextcloud Talk does not support message edits via the Bot API, so streaming draf
 ## Self-hosting notes
 
 - TLS: terminate at your reverse proxy; webhook signature verification works over HTTP-to-container loopback
-- The OCS API is authenticated via Bearer token — use the bot app token from the Talk admin UI
+- The OCS API is authenticated via Bearer token: use the bot app token from the Talk admin UI
 - Rate limits are Nextcloud-server dependent; the default bot doesn't run into them in normal conversation cadences
 - Per-channel proxy: set `proxy_url` to override the global `[proxy]` setting for Nextcloud Talk only (`http://`, `https://`, `socks5://`, `socks5h://`)
 
 ## See also
 
-- [Matrix](./matrix.md) — richer E2EE but more operational complexity
-- [Mattermost](./mattermost.md) — similar self-hosted posture, different protocol
+- [Matrix](./matrix.md): richer E2EE but more operational complexity
+- [Mattermost](./mattermost.md): similar self-hosted posture, different protocol
 - [Channels → Overview](./overview.md)

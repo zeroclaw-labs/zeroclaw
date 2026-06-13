@@ -358,6 +358,13 @@ onboard-openai-auth-codex = Abonnement Codex
 onboard-openai-codex-followup =
     L'authentification par abonnement Codex utilise votre compte ChatGPT.
     Exécutez `zeroclaw auth login --provider openai-codex` pour vous authentifier avant de démarrer votre agent.
+cli-web-dist-dir-reason-tilde = commence par `~` qui n'est pas développé
+cli-web-dist-dir-reason-dollar = contient `$` qui n'est pas développé
+cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" — {$reason} ; gateway.web_dist_dir est lu tel quel, vous devez donc développer la valeur vous-même (p. ex. un chemin absolu)
+cli-self-test-web-dist-dir-name = web_dist_dir
+cli-self-test-web-dist-dir-pass-unset = non défini (détection automatique utilisée)
+cli-self-test-web-dist-dir-pass-literal = {$path} (chemin littéral)
+cli-self-test-web-dist-dir-fail-expansion = AVERTISSEMENT : {$path} — {$reason} ; gateway.web_dist_dir est lu tel quel, vous devez donc développer la valeur vous-même (p. ex. un chemin absolu)
 cli-peripherals-none = Aucun périphérique configuré.
 cli-peripherals-add-hint = Ajoutez-en un avec : zeroclaw peripheral add <board> <path>
 cli-peripherals-add-example = {"  "}Exemple : zeroclaw peripheral add nucleo-f401re <serial-path>

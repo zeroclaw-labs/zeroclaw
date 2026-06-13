@@ -9,7 +9,7 @@
 //!
 //! Each model_provider call goes through the [`ReliableModelProvider`] wrapper, which adds
 //! automatic retry with exponential backoff and API-key rotation on rate limits.
-//! Model routing across multiple model_providers is available via [`create_routed_model_provider`].
+//! Model routing across multiple model_providers is available via [`create_routed_model_provider_with_options`].
 //!
 //! # Extension
 //!
@@ -56,7 +56,7 @@ const MAX_API_ERROR_CHARS: usize = 500;
 const MINIMAX_INTL_BASE_URL: &str = "https://api.minimax.io/v1";
 /// MiniMax-published OAuth client_id (same one their portal uses).
 /// Operators with a custom OAuth app override via
-/// `[model_providers.minimax.<alias>] oauth_client_id = "..."`.
+/// `[providers.models.minimax.<alias>] oauth_client_id = "..."`.
 const MINIMAX_OAUTH_DEFAULT_CLIENT_ID: &str = "78257093-7e40-4613-99e0-527b14b39113";
 const GLM_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
 const MOONSHOT_INTL_BASE_URL: &str = "https://api.moonshot.ai/v1";
@@ -961,8 +961,8 @@ fn check_api_key_prefix(model_provider_name: &str, key: &str) -> Option<&'static
 // `parse_custom_provider_url` was deleted in #6273. The legacy colon-URL form
 // (`custom:https://...` and `anthropic-custom:https://...`) is collapsed
 // at TOML load time by `normalize_model_provider_type` in `schema/v2.rs` into
-// `[model_providers.custom.<alias>] uri = "..."` (or
-// `[model_providers.anthropic.custom] uri = "..."`). The factory's
+// `[providers.models.custom.<alias>] uri = "..."` (or
+// `[providers.models.anthropic.custom] uri = "..."`). The factory's
 // `"custom"` arm reads `uri` from the alias entry via
 // `options.provider_api_url`; URL parsing/validation now happens at
 // schema validation time, not at runtime construction.
@@ -1083,8 +1083,9 @@ pub fn canonicalize_v2_model_provider_name(name: &str) -> &str {
         "ai21-labs" => "ai21",
         "friendliai" => "friendli",
         "lepton-ai" => "lepton",
+        "lambda-ai" => "lambda_ai",
+        "github-models" => "github_models",
         "step" => "stepfun",
-        "kilo" => "kilocli",
         // Moonshot / Kimi (regional + code variants fold to one family).
         "kimi" | "kimi-cn" | "kimi-intl" | "kimi-global" | "kimi-code" | "kimi_coding"
         | "kimi_for_coding" | "moonshot-cn" | "moonshot-intl" | "moonshot-global" => "moonshot",
@@ -1138,7 +1139,7 @@ pub fn canonicalize_v2_model_provider_name(name: &str) -> &str {
 
 /// Split a V2 colon-URL family name (`custom:https://...`,
 /// `anthropic-custom:https://...`) into a `(name, url)` pair. The V3 typed
-/// schema stores custom endpoints as `[model_providers.<family>.<alias>]
+/// schema stores custom endpoints as `[providers.models.<family>.<alias>]
 /// uri = "..."`; this helper preserves runtime-factory compatibility for
 /// callers that still pass the legacy single-token form.
 fn split_v2_colon_url(name: &str) -> (&str, Option<&str>) {
@@ -1185,7 +1186,7 @@ fn create_model_provider_inner(
         {
             anyhow::bail!(
                 "Custom model_provider `{prefix}:<url>` requires a URL beginning with http:// or https://. \
-                 Set `[model_providers.custom.<alias>] uri = \"https://your-api.com\"` or pass a valid URL."
+                 Set `[providers.models.custom.<alias>] uri = \"https://your-api.com\"` or pass a valid URL."
             );
         }
     }
@@ -1484,7 +1485,7 @@ fn append_fallback_chain(
 /// Build a resilient model provider from a name that may be either a bare
 /// family (`"openai"`) or a dotted alias (`"openai.work"`). Dotted names
 /// dispatch through the typed alias factory so endpoint URI, family
-/// extras, and per-alias credentials from `[model_providers.<family>.<alias>]`
+/// extras, and per-alias credentials from `[providers.models.<family>.<alias>]`
 /// are honored; bare names route through the family factory directly.
 pub fn create_resilient_model_provider_from_ref(
     config: &zeroclaw_config::schema::Config,
@@ -1516,7 +1517,7 @@ pub fn create_resilient_model_provider_from_ref(
 
 /// Build a router fronted by `primary_name` plus one provider per unique
 /// `model_routes` entry. Each dotted `<family>.<alias>` name resolves
-/// through the typed `[model_providers.<family>.<alias>]` config (endpoint
+/// through the typed `[providers.models.<family>.<alias>]` config (endpoint
 /// URI, Azure resource, Gemini OAuth, etc.); bare family names use family
 /// defaults.
 pub fn create_routed_model_provider_with_options(
@@ -1642,6 +1643,59 @@ pub struct ModelProviderInfo {
     pub display_name: &'static str,
     /// Whether the model model_provider runs locally (no API key required)
     pub local: bool,
+    /// Registry category, the grouping the CLI list and docs render by.
+    pub category: ModelProviderCategory,
+}
+
+/// Grouping for a model-provider family. Replaces the section comments in the
+/// registry list with data so surfaces (CLI list, docs capability table) can
+/// group families without re-typing the membership. Mirrors the registry's
+/// own sections exactly; locality is the separate `local` flag, not a category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelProviderCategory {
+    /// First-party / flagship vendor APIs.
+    Primary,
+    /// OpenAI-compatible HTTP endpoints, each with its own canonical slot.
+    OpenAiCompatible,
+    /// Low-latency inference endpoints.
+    FastInference,
+    /// Model-hosting / aggregation platforms.
+    ModelHosting,
+    /// Chinese AI model providers.
+    ChineseAi,
+    /// Cloud-vendor AI endpoints.
+    CloudEndpoint,
+}
+
+impl ModelProviderCategory {
+    /// Stable identifier for this category, matching the Rust variant name.
+    /// Surfaces address a category by this token (CLI filters, docs directives)
+    /// without re-typing the variant set.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "Primary",
+            Self::OpenAiCompatible => "OpenAiCompatible",
+            Self::FastInference => "FastInference",
+            Self::ModelHosting => "ModelHosting",
+            Self::ChineseAi => "ChineseAi",
+            Self::CloudEndpoint => "CloudEndpoint",
+        }
+    }
+
+    /// Every category, in registry display order. Lets surfaces walk the set
+    /// instead of hardcoding it.
+    #[must_use]
+    pub fn all() -> &'static [ModelProviderCategory] {
+        &[
+            Self::Primary,
+            Self::OpenAiCompatible,
+            Self::FastInference,
+            Self::ModelHosting,
+            Self::ChineseAi,
+            Self::CloudEndpoint,
+        ]
+    }
 }
 
 /// Canonical base URL for `name`, mirroring what `create_model_provider`
@@ -1652,15 +1706,18 @@ pub fn default_model_provider_url(name: &str) -> Option<&'static str> {
     use factory::CompatFamilySpec;
     use zeroclaw_config::schema::{
         Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnyscaleModelProviderConfig,
-        AstraiModelProviderConfig, BaichuanModelProviderConfig, BasetenModelProviderConfig,
-        CerebrasModelProviderConfig, CloudflareModelProviderConfig, CohereModelProviderConfig,
-        DeepinfraModelProviderConfig, DeepseekModelProviderConfig, DoubaoModelProviderConfig,
-        FireworksModelProviderConfig, FriendliModelProviderConfig, HuggingfaceModelProviderConfig,
-        HyperbolicModelProviderConfig, LeptonModelProviderConfig, LitellmModelProviderConfig,
-        MistralModelProviderConfig, NebiusModelProviderConfig, NovitaModelProviderConfig,
-        NscaleModelProviderConfig, OpencodeModelProviderConfig, PerplexityModelProviderConfig,
-        RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
-        SiliconflowModelProviderConfig, SyntheticModelProviderConfig, TogetherModelProviderConfig,
+        ArceeModelProviderConfig, AstraiModelProviderConfig, BaichuanModelProviderConfig,
+        BasetenModelProviderConfig, CerebrasModelProviderConfig, CloudflareModelProviderConfig,
+        CohereModelProviderConfig, DeepinfraModelProviderConfig, DeepseekModelProviderConfig,
+        DoubaoModelProviderConfig, FeatherlessModelProviderConfig, FireworksModelProviderConfig,
+        FriendliModelProviderConfig, GithubModelsModelProviderConfig,
+        HuggingfaceModelProviderConfig, HyperbolicModelProviderConfig,
+        InceptionModelProviderConfig, LambdaAiModelProviderConfig, LeptonModelProviderConfig,
+        LitellmModelProviderConfig, MistralModelProviderConfig, MorphModelProviderConfig,
+        NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
+        OpencodeModelProviderConfig, PerplexityModelProviderConfig, RekaModelProviderConfig,
+        SambanovaModelProviderConfig, SglangModelProviderConfig, SiliconflowModelProviderConfig,
+        SyntheticModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
         VercelModelProviderConfig, VllmModelProviderConfig, YiModelProviderConfig,
     };
 
@@ -1702,330 +1759,186 @@ pub fn default_model_provider_url(name: &str) -> Option<&'static str> {
         "nebius" => Some(<NebiusModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "friendli" => Some(<FriendliModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "lepton" => Some(<LeptonModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
+        "morph" => Some(<MorphModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
+        "github_models" => Some(<GithubModelsModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
+        "upstage" => Some(<UpstageModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
+        "featherless" => Some(<FeatherlessModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
+        "arcee" => Some(<ArceeModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
+        "lambda_ai" => Some(<LambdaAiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
+        "inception" => Some(<InceptionModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "baichuan" => Some(<BaichuanModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "yi" => Some(<YiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         _ => None,
     }
 }
 
+/// Append a section of provider families under one category. DRY builder so the
+/// registry lists `(name, display_name, local)` once per family and the category
+/// is stamped from the section, not repeated on every entry.
+fn push_family(
+    out: &mut Vec<ModelProviderInfo>,
+    category: ModelProviderCategory,
+    families: &[(&'static str, &'static str, bool)],
+) {
+    out.extend(
+        families
+            .iter()
+            .map(|&(name, display_name, local)| ModelProviderInfo {
+                name,
+                display_name,
+                local,
+                category,
+            }),
+    );
+}
+
 /// Return the list of all known model_providers for display in `zeroclaw model_providers list`.
 ///
 /// This is intentionally separate from the factory match in `create_model_provider`
 /// (display concern vs. construction concern).
+///
+/// This handwritten list and the `for_each_model_provider_slot!` macro in
+/// `zeroclaw-config` are a dual-maintenance surface: the macro carries the
+/// canonical slot set, this list adds display-only fields (`display_name`,
+/// `local`). The `listed_model_providers_match_canonical_slots` test enforces
+/// that the two cover exactly the same slots, so a provider added to the macro
+/// without a display entry here (or vice versa) fails `cargo test`.
 pub fn list_model_providers() -> Vec<ModelProviderInfo> {
-    vec![
-        // ── Primary model_providers ────────────────────────────────
-        ModelProviderInfo {
-            name: "openrouter",
-            display_name: "OpenRouter",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "anthropic",
-            display_name: "Anthropic",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "openai",
-            display_name: "OpenAI",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "telnyx",
-            display_name: "Telnyx",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "azure",
-            display_name: "Azure OpenAI",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "ollama",
-            display_name: "Ollama",
-            local: true,
-        },
-        ModelProviderInfo {
-            name: "gemini",
-            display_name: "Google Gemini",
-            local: false,
-        },
-        // ── OpenAI-compatible model_providers ──────────────────────
-        ModelProviderInfo {
-            name: "venice",
-            display_name: "Venice",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "vercel",
-            display_name: "Vercel AI Gateway",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "cloudflare",
-            display_name: "Cloudflare AI",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "moonshot",
-            display_name: "Moonshot",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "synthetic",
-            display_name: "Synthetic",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "opencode",
-            display_name: "OpenCode",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "zai",
-            display_name: "Z.AI",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "glm",
-            display_name: "GLM (Zhipu)",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "minimax",
-            display_name: "MiniMax",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "bedrock",
-            display_name: "Amazon Bedrock",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "qianfan",
-            display_name: "Qianfan (Baidu)",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "doubao",
-            display_name: "Doubao (Volcengine)",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "qwen",
-            display_name: "Qwen (DashScope / Qwen Code OAuth)",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "groq",
-            display_name: "Groq",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "mistral",
-            display_name: "Mistral",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "xai",
-            display_name: "xAI (Grok)",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "deepseek",
-            display_name: "DeepSeek",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "together",
-            display_name: "Together AI",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "fireworks",
-            display_name: "Fireworks AI",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "novita",
-            display_name: "Novita AI",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "perplexity",
-            display_name: "Perplexity",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "cohere",
-            display_name: "Cohere",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "copilot",
-            display_name: "GitHub Copilot",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "gemini_cli",
-            display_name: "Gemini CLI",
-            local: true,
-        },
-        ModelProviderInfo {
-            name: "kilocli",
-            display_name: "KiloCLI",
-            local: true,
-        },
-        ModelProviderInfo {
-            name: "lmstudio",
-            display_name: "LM Studio",
-            local: true,
-        },
-        ModelProviderInfo {
-            name: "llamacpp",
-            display_name: "llama.cpp server",
-            local: true,
-        },
-        ModelProviderInfo {
-            name: "sglang",
-            display_name: "SGLang",
-            local: true,
-        },
-        ModelProviderInfo {
-            name: "vllm",
-            display_name: "vLLM",
-            local: true,
-        },
-        ModelProviderInfo {
-            name: "osaurus",
-            display_name: "Osaurus",
-            local: true,
-        },
-        ModelProviderInfo {
-            name: "nvidia",
-            display_name: "NVIDIA NIM",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "siliconflow",
-            display_name: "SiliconFlow",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "aihubmix",
-            display_name: "AiHubMix",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "litellm",
-            display_name: "LiteLLM",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "atomic_chat",
-            display_name: "Atomic Chat",
-            local: true,
-        },
-        // ── Fast inference ────────────────────────────────────
-        ModelProviderInfo {
-            name: "cerebras",
-            display_name: "Cerebras",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "sambanova",
-            display_name: "SambaNova",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "hyperbolic",
-            display_name: "Hyperbolic",
-            local: false,
-        },
-        // ── Model hosting platforms ──────────────────────────
-        ModelProviderInfo {
-            name: "deepinfra",
-            display_name: "DeepInfra",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "huggingface",
-            display_name: "Hugging Face",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "ai21",
-            display_name: "AI21 Labs",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "reka",
-            display_name: "Reka",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "baseten",
-            display_name: "Baseten",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "nscale",
-            display_name: "Nscale",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "anyscale",
-            display_name: "Anyscale",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "nebius",
-            display_name: "Nebius AI Studio",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "friendli",
-            display_name: "Friendli AI",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "lepton",
-            display_name: "Lepton AI",
-            local: false,
-        },
-        // ── Chinese AI model_providers ─────────────────────────────
-        ModelProviderInfo {
-            name: "stepfun",
-            display_name: "Stepfun",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "baichuan",
-            display_name: "Baichuan",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "yi",
-            display_name: "01.AI (Yi)",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "hunyuan",
-            display_name: "Tencent Hunyuan",
-            local: false,
-        },
-        // ── Cloud AI endpoints ───────────────────────────────
-        ModelProviderInfo {
-            name: "ovh",
-            display_name: "OVHcloud AI Endpoints",
-            local: false,
-        },
-        ModelProviderInfo {
-            name: "avian",
-            display_name: "Avian",
-            local: false,
-        },
-    ]
+    let mut out: Vec<ModelProviderInfo> = Vec::new();
+    push_family(
+        &mut out,
+        ModelProviderCategory::Primary,
+        &[
+            ("openrouter", "OpenRouter", false),
+            ("anthropic", "Anthropic", false),
+            ("openai", "OpenAI", false),
+            ("telnyx", "Telnyx", false),
+            ("azure", "Azure OpenAI", false),
+            ("ollama", "Ollama", true),
+            ("gemini", "Google Gemini", false),
+        ],
+    );
+    push_family(
+        &mut out,
+        ModelProviderCategory::OpenAiCompatible,
+        &[
+            ("venice", "Venice", false),
+            ("vercel", "Vercel AI Gateway", false),
+            ("cloudflare", "Cloudflare AI", false),
+            ("moonshot", "Moonshot", false),
+            ("synthetic", "Synthetic", false),
+            ("opencode", "OpenCode", false),
+            ("zai", "Z.AI", false),
+            ("glm", "GLM (Zhipu)", false),
+            ("minimax", "MiniMax", false),
+            ("bedrock", "Amazon Bedrock", false),
+            ("qianfan", "Qianfan (Baidu)", false),
+            ("doubao", "Doubao (Volcengine)", false),
+            ("qwen", "Qwen (DashScope / Qwen Code OAuth)", false),
+            ("groq", "Groq", false),
+            ("mistral", "Mistral", false),
+            ("xai", "xAI (Grok)", false),
+            ("deepseek", "DeepSeek", false),
+            ("together", "Together AI", false),
+            ("fireworks", "Fireworks AI", false),
+            ("novita", "Novita AI", false),
+            ("perplexity", "Perplexity", false),
+            ("cohere", "Cohere", false),
+            ("copilot", "GitHub Copilot", false),
+            ("gemini_cli", "Gemini CLI", true),
+            ("kilocli", "KiloCLI", true),
+            ("kilo", "Kilo", false),
+            ("lmstudio", "LM Studio", true),
+            ("llamacpp", "llama.cpp server", true),
+            ("sglang", "SGLang", true),
+            ("vllm", "vLLM", true),
+            ("osaurus", "Osaurus", true),
+            ("nvidia", "NVIDIA NIM", false),
+            ("siliconflow", "SiliconFlow", false),
+            ("aihubmix", "AiHubMix", false),
+            ("litellm", "LiteLLM", false),
+            ("atomic_chat", "Atomic Chat", true),
+            ("astrai", "Astrai", false),
+            ("deepmyst", "DeepMyst", false),
+            ("morph", "Morph (Fast Apply)", false),
+            ("github_models", "GitHub Models", false),
+            ("upstage", "Upstage Solar", false),
+            ("featherless", "Featherless AI", false),
+            ("arcee", "Arcee AI", false),
+            ("lambda_ai", "Lambda AI", false),
+            ("inception", "Inception Labs (Mercury)", false),
+            ("custom", "Custom (OpenAI-compatible)", false),
+        ],
+    );
+    push_family(
+        &mut out,
+        ModelProviderCategory::FastInference,
+        &[
+            ("cerebras", "Cerebras", false),
+            ("sambanova", "SambaNova", false),
+            ("hyperbolic", "Hyperbolic", false),
+        ],
+    );
+    push_family(
+        &mut out,
+        ModelProviderCategory::ModelHosting,
+        &[
+            ("deepinfra", "DeepInfra", false),
+            ("huggingface", "Hugging Face", false),
+            ("ai21", "AI21 Labs", false),
+            ("reka", "Reka", false),
+            ("baseten", "Baseten", false),
+            ("nscale", "Nscale", false),
+            ("anyscale", "Anyscale", false),
+            ("nebius", "Nebius AI Studio", false),
+            ("friendli", "Friendli AI", false),
+            ("lepton", "Lepton AI", false),
+        ],
+    );
+    push_family(
+        &mut out,
+        ModelProviderCategory::ChineseAi,
+        &[
+            ("stepfun", "Stepfun", false),
+            ("baichuan", "Baichuan", false),
+            ("yi", "01.AI (Yi)", false),
+            ("hunyuan", "Tencent Hunyuan", false),
+        ],
+    );
+    push_family(
+        &mut out,
+        ModelProviderCategory::CloudEndpoint,
+        &[
+            ("ovh", "OVHcloud AI Endpoints", false),
+            ("avian", "Avian", false),
+        ],
+    );
+    debug_assert_eq!(
+        out.iter()
+            .map(|p| p.name)
+            .collect::<std::collections::BTreeSet<_>>(),
+        canonical_model_provider_slots()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "list_model_providers() drifted from for_each_model_provider_slot!: \
+         every canonical slot needs exactly one display entry and vice versa"
+    );
+    out
+}
+
+/// Canonical model-provider slot names, generated directly from the
+/// `for_each_model_provider_slot!` macro in `zeroclaw-config`. This is the
+/// single source of truth for *which* provider families exist; the display
+/// metadata in [`list_model_providers`] is keyed against this set and a drift
+/// guard fails loudly if the two diverge.
+#[must_use]
+pub fn canonical_model_provider_slots() -> Vec<&'static str> {
+    macro_rules! collect_slot_names {
+        ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
+            vec![$($type_str),+]
+        };
+    }
+    zeroclaw_config::for_each_model_provider_slot!(collect_slot_names)
 }
 
 /// Shared test utilities for model_provider modules.
@@ -2216,7 +2129,7 @@ mod tests {
     #[test]
     fn factory_openai_codex() {
         // Codex is now selected by the typed `base.requires_openai_auth`
-        // flag on an `[model_providers.openai.codex]` alias entry — the
+        // flag on an `[providers.models.openai.codex]` alias entry — the
         // factory's legacy escape hatch for the bare "openai-codex" /
         // "openai_codex" / "codex" family names still routes through
         // `OpenAiCodexModelProvider::new` when a real Config + alias is
@@ -2552,7 +2465,7 @@ mod tests {
 
     #[test]
     fn factory_groq_honors_native_tools_override_true() {
-        // Operator opt-in via `[model_providers.groq.<alias>] native_tools = true`
+        // Operator opt-in via `[providers.models.groq.<alias>] native_tools = true`
         // skips the default disable so non-llama Groq models can use native
         // tool calling.
         let options = ModelProviderRuntimeOptions {
@@ -2788,6 +2701,11 @@ mod tests {
     }
 
     #[test]
+    fn factory_kilo() {
+        assert!(create_model_provider("kilo", Some("kilo-test-key")).is_ok());
+    }
+
+    #[test]
     fn factory_nvidia() {
         assert!(create_model_provider("nvidia", Some("nvapi-test")).is_ok());
     }
@@ -2812,12 +2730,86 @@ mod tests {
     #[test]
     fn resolve_provider_credential_deepmyst_env_deleted() {}
 
+    // ── OpenAI-compatible aggregators & inference hosts ──────
+
+    #[test]
+    fn factory_morph() {
+        assert!(create_model_provider("morph", Some("sk-morph-test")).is_ok());
+    }
+
+    #[test]
+    fn factory_github_models() {
+        assert!(create_model_provider("github_models", Some("ghp_test_token")).is_ok());
+        // Hyphenated form canonicalizes to the underscore slot.
+        assert!(create_model_provider("github-models", Some("ghp_test_token")).is_ok());
+    }
+
+    #[test]
+    fn factory_upstage() {
+        assert!(create_model_provider("upstage", Some("up-test-key")).is_ok());
+    }
+
+    #[test]
+    fn factory_featherless() {
+        assert!(create_model_provider("featherless", Some("featherless-test")).is_ok());
+    }
+
+    #[test]
+    fn factory_arcee() {
+        assert!(create_model_provider("arcee", Some("arcee-test")).is_ok());
+    }
+
+    #[test]
+    fn factory_lambda_ai() {
+        assert!(create_model_provider("lambda_ai", Some("lambda-test")).is_ok());
+        // Hyphenated form canonicalizes to the underscore slot.
+        assert!(create_model_provider("lambda-ai", Some("lambda-test")).is_ok());
+    }
+
+    #[test]
+    fn factory_inception() {
+        assert!(create_model_provider("inception", Some("inception-test")).is_ok());
+    }
+
+    #[test]
+    fn default_url_matches_compat_spec_for_new_providers() {
+        assert_eq!(
+            default_model_provider_url("morph"),
+            Some("https://api.morphllm.com/v1")
+        );
+        assert_eq!(
+            default_model_provider_url("github_models"),
+            Some("https://models.github.ai/inference")
+        );
+        assert_eq!(
+            default_model_provider_url("upstage"),
+            Some("https://api.upstage.ai/v1")
+        );
+        assert_eq!(
+            default_model_provider_url("featherless"),
+            Some("https://api.featherless.ai/v1")
+        );
+        // Arcee publishes at the non-standard `/api/v1` path.
+        assert_eq!(
+            default_model_provider_url("arcee"),
+            Some("https://api.arcee.ai/api/v1")
+        );
+        assert_eq!(
+            default_model_provider_url("lambda_ai"),
+            Some("https://api.lambda.ai/v1")
+        );
+        assert_eq!(
+            default_model_provider_url("inception"),
+            Some("https://api.inceptionlabs.ai/v1")
+        );
+    }
+
     // ── Custom / BYOP model model_provider ─────────────────────────
     //
     // The legacy colon-URL form ("custom:https://..." / "anthropic-custom:...")
     // and its in-process URL parser were deleted in #6273. The surface is
-    // `[model_providers.custom.<alias>] uri = "https://..."` for OpenAI-
-    // compatible endpoints (or `[model_providers.anthropic.<alias>] uri = ...`
+    // `[providers.models.custom.<alias>] uri = "https://..."` for OpenAI-
+    // compatible endpoints (or `[providers.models.anthropic.<alias>] uri = ...`
     // for Anthropic-compatible). URL validation now happens at schema-load
     // time in `crates/zeroclaw-config/src/schema.rs::validate`, not at runtime
     // construction; tests for that validation belong with the schema, not here.
@@ -3071,6 +3063,26 @@ mod tests {
                 model_provider.name
             );
         }
+    }
+
+    /// `list_model_providers()` must cover exactly the canonical slot set the
+    /// `for_each_model_provider_slot!` macro emits — no missing display entries
+    /// (a constructible provider invisible in the list / docs / dashboard) and
+    /// no phantom entries (a display row for a slot the factory can't build).
+    /// Adding a slot to the macro without a matching display entry fails here.
+    #[test]
+    fn listed_model_providers_match_canonical_slots() {
+        let listed: std::collections::BTreeSet<&str> =
+            list_model_providers().iter().map(|p| p.name).collect();
+        let canonical: std::collections::BTreeSet<&str> =
+            canonical_model_provider_slots().into_iter().collect();
+        let missing: Vec<&&str> = canonical.difference(&listed).collect();
+        let phantom: Vec<&&str> = listed.difference(&canonical).collect();
+        assert!(
+            missing.is_empty() && phantom.is_empty(),
+            "list_model_providers() drift — missing display entries: {missing:?}; \
+             phantom entries (no factory slot): {phantom:?}"
+        );
     }
 
     #[test]

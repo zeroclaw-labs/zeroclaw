@@ -49,6 +49,11 @@ fn short_hash(s: &str) -> String {
 /// (shell, script, builtin, HTTP) and the skills prompt must call this so the
 /// advertised tool spec and the name the model is told to invoke stay
 /// identical. Do not re-derive the `{skill}__{tool}` string anywhere else.
+///
+/// This guarantees provider-*validity*, not global *uniqueness*: the hash
+/// suffix only reduces accidental collisions, so registration must still treat
+/// two skills' composed names as potentially equal and resolve duplicates
+/// itself rather than assuming this function makes them distinct.
 pub(crate) fn composed_tool_name(skill_name: &str, tool_name: &str) -> String {
     sanitize_tool_name(&format!("{skill_name}__{tool_name}"))
 }
@@ -64,8 +69,8 @@ pub(crate) fn composed_tool_name(skill_name: &str, tool_name: &str) -> String {
 /// disallowed character mapped to `_` and a short stable hash of the original
 /// composed name appended within the 64-char budget. The hash disambiguates
 /// common collisions: distinct inputs that would otherwise collapse to the same
-/// string, such as `a.b__run` vs `a:b__run`, or different tools under a
-/// >64-char skill name whose suffix would be truncated away, stay distinct. It
+/// string, such as `a.b__run` vs `a:b__run`, or two tools under one skill name
+/// longer than 64 chars whose suffix would be truncated away, stay distinct. It
 /// is a strong reducer of accidental collisions, not a guarantee of injectivity.
 fn sanitize_tool_name(raw: &str) -> String {
     let already_valid =

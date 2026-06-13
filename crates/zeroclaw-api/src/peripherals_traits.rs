@@ -51,7 +51,7 @@ pub trait Peripheral: Send + Sync {
     ///
     /// Closes serial ports, unexports GPIO pins, and performs any cleanup
     /// required for a safe shutdown. After this call, [`health_check`](Peripheral::health_check)
-    /// should return `false` until [`connect`](Peripheral::connect) is called again.
+    /// should return `false` until `connect` is called again.
     ///
     /// # Errors
     ///
@@ -70,6 +70,6 @@ pub trait Peripheral: Send + Sync {
     /// Each returned [`Tool`] delegates execution to the underlying hardware
     /// (e.g., `gpio_read`, `gpio_write`, `sensor_read`). The agent merges
     /// these into its tool registry after a successful
-    /// [`connect`](Peripheral::connect).
+    /// `connect`.
     fn tools(&self) -> Vec<Box<dyn Tool>>;
 }
