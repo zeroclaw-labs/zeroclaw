@@ -46,11 +46,11 @@ pub fn splice(current: &str, zone: &str, body: &str) -> anyhow::Result<String> {
     let e = end(zone);
     let begin_at = current
         .find(&b)
-        .ok_or_else(|| anyhow::anyhow!("missing generated:{zone} BEGIN sentinel"))?;
+        .ok_or_else(|| anyhow::Error::msg(format!("missing generated:{zone} BEGIN sentinel")))?;
     let after_begin = begin_at + b.len();
     let end_rel = current[after_begin..]
         .find(&e)
-        .ok_or_else(|| anyhow::anyhow!("missing generated:{zone} END sentinel"))?;
+        .ok_or_else(|| anyhow::Error::msg(format!("missing generated:{zone} END sentinel")))?;
     let end_at = after_begin + end_rel;
     let mut out = String::new();
     out.push_str(&current[..after_begin]);

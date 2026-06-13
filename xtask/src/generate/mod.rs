@@ -110,10 +110,10 @@ pub fn run(targets: &[String], check: bool) -> anyhow::Result<()> {
                 .iter()
                 .find(|s| s.name == t || s.file == t)
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
+                    anyhow::Error::msg(format!(
                         "unknown target `{t}` (known: {})",
                         all.iter().map(|s| s.name).collect::<Vec<_>>().join(", ")
-                    )
+                    ))
                 })?;
             out.push(s);
         }
@@ -126,7 +126,7 @@ pub fn run(targets: &[String], check: bool) -> anyhow::Result<()> {
     for s in selected {
         let path = root.join(s.file);
         let current = std::fs::read_to_string(&path)
-            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+            .map_err(|e| anyhow::Error::msg(format!("{}: {e}", path.display())))?;
         let rendered = (s.render)(&root, &current)?;
         if check {
             if current != rendered {

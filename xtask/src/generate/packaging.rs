@@ -17,11 +17,11 @@ fn splice(current: &str, zone: &str, body: &str) -> anyhow::Result<String> {
     let e = end(zone);
     let begin_at = current
         .find(&b)
-        .ok_or_else(|| anyhow::anyhow!("missing generated:{zone} BEGIN sentinel"))?;
+        .ok_or_else(|| anyhow::Error::msg(format!("missing generated:{zone} BEGIN sentinel")))?;
     let after_begin = begin_at + b.len();
     let end_rel = current[after_begin..]
         .find(&e)
-        .ok_or_else(|| anyhow::anyhow!("missing generated:{zone} END sentinel"))?;
+        .ok_or_else(|| anyhow::Error::msg(format!("missing generated:{zone} END sentinel")))?;
     let end_at = after_begin + end_rel;
     let mut out = String::new();
     out.push_str(&current[..after_begin]);
@@ -60,15 +60,15 @@ fn rewrite_json_version(current: &str, version: &str) -> anyhow::Result<String> 
     let key = "\"version\":";
     let key_at = current
         .find(key)
-        .ok_or_else(|| anyhow::anyhow!("scoop manifest has no \"version\" key"))?;
+        .ok_or_else(|| anyhow::Error::msg("scoop manifest has no \"version\" key"))?;
     let after_key = key_at + key.len();
     let rest = &current[after_key..];
     let q1 = rest
         .find('"')
-        .ok_or_else(|| anyhow::anyhow!("malformed version value"))?;
+        .ok_or_else(|| anyhow::Error::msg("malformed version value"))?;
     let q2 = rest[q1 + 1..]
         .find('"')
-        .ok_or_else(|| anyhow::anyhow!("unterminated version value"))?;
+        .ok_or_else(|| anyhow::Error::msg("unterminated version value"))?;
     let val_start = after_key + q1 + 1;
     let val_end = after_key + q1 + 1 + q2;
     let mut out = String::new();

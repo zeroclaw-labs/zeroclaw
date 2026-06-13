@@ -105,13 +105,13 @@ pub fn render_file(manifest_dir: &Path, current: &str) -> anyhow::Result<String>
 fn splice(current: &str, zone: &str, body: &str) -> anyhow::Result<String> {
     let b = begin(zone);
     let e = end(zone);
-    let begin_at = current
-        .find(&b)
-        .ok_or_else(|| anyhow::anyhow!("setup.bat missing generated:{zone} BEGIN sentinel"))?;
+    let begin_at = current.find(&b).ok_or_else(|| {
+        anyhow::Error::msg(format!("setup.bat missing generated:{zone} BEGIN sentinel"))
+    })?;
     let after_begin = begin_at + b.len();
-    let end_rel = current[after_begin..]
-        .find(&e)
-        .ok_or_else(|| anyhow::anyhow!("setup.bat missing generated:{zone} END sentinel"))?;
+    let end_rel = current[after_begin..].find(&e).ok_or_else(|| {
+        anyhow::Error::msg(format!("setup.bat missing generated:{zone} END sentinel"))
+    })?;
     let end_at = after_begin + end_rel;
 
     let mut out = String::new();

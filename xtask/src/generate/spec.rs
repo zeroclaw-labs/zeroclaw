@@ -340,7 +340,7 @@ pub fn resolve_version(manifest_dir: &Path) -> anyhow::Result<String> {
         .root_package()
         .cloned()
         .or_else(|| meta.workspace_packages().into_iter().next().cloned())
-        .ok_or_else(|| anyhow::anyhow!("no root/workspace package"))?;
+        .ok_or_else(|| anyhow::Error::msg("no root/workspace package"))?;
     Ok(root.version.to_string())
 }
 
@@ -360,7 +360,7 @@ pub fn resolve_feature_list(
         .root_package()
         .cloned()
         .or_else(|| meta.workspace_packages().into_iter().next().cloned())
-        .ok_or_else(|| anyhow::anyhow!("no root/workspace package"))?;
+        .ok_or_else(|| anyhow::Error::msg("no root/workspace package"))?;
     let all_features: Vec<String> = root.features.keys().cloned().collect();
     let non_row = non_row_features(&meta, &root);
     let heavyweight = heavyweight_features(&root);
@@ -385,7 +385,7 @@ pub fn resolve(manifest_dir: &Path, selection: &Selection) -> anyhow::Result<Res
         .root_package()
         .cloned()
         .or_else(|| meta.workspace_packages().into_iter().next().cloned())
-        .ok_or_else(|| anyhow::anyhow!("no root/workspace package"))?;
+        .ok_or_else(|| anyhow::Error::msg("no root/workspace package"))?;
     let root = &root;
 
     let version = root.version.to_string();
