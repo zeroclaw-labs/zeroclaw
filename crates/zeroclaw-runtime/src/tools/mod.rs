@@ -1465,6 +1465,75 @@ mod tests {
         assert!(Arc::ptr_eq(&audit2, &err.1));
     }
 
+    /// Regression: SOP tools must NOT appear in the tool registry when the
+    /// shared engine is not registered (i.e. no `sops_dir` configured).
+    /// Proves the production gating path at `all_tools_with_runtime` — not
+    /// just the `resolve_sop_engine()` helper.
+    #[test]
+    fn sop_tools_absent_when_engine_not_registered() {
+        // Ensure clean state — this test must run before any test that
+        // registers the engine. If another test already registered it, this
+        // test cannot prove the gating behavior and should fail loudly.
+        assert!(
+            resolve_sop_engine().is_none(),
+            "SOP engine already registered — sop_tools_absent_when_engine_not_registered must run first"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig {
+            enabled: false,
+            allowed_domains: vec![],
+            session_name: None,
+            ..BrowserConfig::default()
+        };
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
+
+        let tools = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+        )
+        .tools;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+
+        let sop_tool_names = [
+            "sop_list",
+            "sop_execute",
+            "sop_advance",
+            "sop_approve",
+            "sop_status",
+        ];
+        for name in &sop_tool_names {
+            assert!(
+                !names.contains(name),
+                "SOP tool '{name}' must not be registered when engine is absent"
+            );
+        }
+    }
+
     /// A runtime that reports an ephemeral workspace (no host persistence) while
     /// delegating real shell execution to `NativeRuntime`. Used to exercise the
     /// registration wiring of `has_filesystem_access()` -> `persistent_writes`.

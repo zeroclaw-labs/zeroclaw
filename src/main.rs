@@ -3716,6 +3716,9 @@ async fn main() -> Result<()> {
                                 )
                                 .await
                             } else {
+                                // No SOPs directory configured — this is a valid
+                                // user state, not a misconfiguration. Skip the
+                                // listener gracefully.
                                 ::zeroclaw_log::record!(
                                     INFO,
                                     ::zeroclaw_log::Event::new(
