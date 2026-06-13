@@ -46,6 +46,14 @@ pub enum PropKind {
 /// else as `PropKind::Enum`.
 pub trait HasPropKind {
     const PROP_KIND: PropKind;
+
+    /// Terminal field names whose values must be redacted when this type is
+    /// displayed as an object/object-array prop. Most prop kinds have no
+    /// nested secret surface; Configurable object-array element types can
+    /// override this by delegating to their generated `secret_field_terminals`.
+    fn display_secret_terminals() -> Vec<&'static str> {
+        Vec::new()
+    }
 }
 
 macro_rules! impl_prop_kind {
@@ -79,6 +87,9 @@ impl HasPropKind for Vec<String> {
 // strings too.
 impl HasPropKind for crate::providers::ModelProviderRef {
     const PROP_KIND: PropKind = PropKind::String;
+}
+impl HasPropKind for Vec<crate::providers::ModelProviderRef> {
+    const PROP_KIND: PropKind = PropKind::StringArray;
 }
 impl HasPropKind for crate::providers::TtsProviderRef {
     const PROP_KIND: PropKind = PropKind::String;
@@ -127,6 +138,10 @@ impl HasPropKind
     const PROP_KIND: PropKind = PropKind::Object;
 }
 
+impl HasPropKind for crate::scattered_types::EmailOAuth2Config {
+    const PROP_KIND: PropKind = PropKind::Object;
+}
+
 // Vec<struct> fields are surfaced as PropKind::ObjectArray — each
 // element renders as a per-row sub-form on the dashboard rather than a
 // chip. The Configurable derive routes `<Vec<T> as HasPropKind>::PROP_KIND`
@@ -145,6 +160,10 @@ impl HasPropKind for Vec<crate::schema::GoogleWorkspaceAllowedOperation> {
 }
 impl HasPropKind for Vec<crate::schema::McpServerConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
+
+    fn display_secret_terminals() -> Vec<&'static str> {
+        crate::schema::McpServerConfig::secret_field_terminals()
+    }
 }
 impl HasPropKind for Vec<crate::schema::ModelRouteConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
@@ -439,6 +458,8 @@ impl SecretField for String {
         field: &str,
     ) -> anyhow::Result<()> {
         use anyhow::Context;
+        // `is_encrypted` also includes external secret references (`op://`):
+        // encryption must preserve them, while decryption resolves them for use.
         if !self.is_empty() && !crate::security::SecretStore::is_encrypted(self) {
             *self = store
                 .encrypt(self)
@@ -656,6 +677,21 @@ pub struct MapKeySection {
     /// Doc comment on the field (flattened to one line). What the user sees
     /// when picking which kind of thing to add.
     pub description: &'static str,
+    /// For `Kind::List` Vec sections that declared `#[natural_key = "<f>"]`
+    /// (the per-element editor opt-in shipped with the `mcp.servers`
+    /// per-field editor), this is the snake_case field name on the inner
+    /// type that holds the alias used to address each element — e.g.
+    /// `"name"` for `[[mcp.servers]]`. The incremental TOML writer
+    /// (`apply_dirty_path` in `schema.rs`) reads this to walk a
+    /// `<section>.<alias>.<inner>` dirty path through an array of tables.
+    /// Without it, the writer flat-faceplants on `as_table()` at the
+    /// alias segment and silently drops the edit on the floor.
+    ///
+    /// `None` for HashMap sections (alias *is* the TOML key, no further
+    /// hint needed) and for plain `Vec<T>` sections without
+    /// `#[natural_key]` (legacy whole-array `ObjectArray` round-trip,
+    /// no per-element addressing).
+    pub natural_key: Option<&'static str>,
 }
 
 /// Serializable wire representation of a config field for API consumers
@@ -757,7 +793,7 @@ pub struct IntegrationDescriptor {
     pub active: bool,
 }
 
-/// Metadata for one channel type, as returned by [`ChannelsConfig::channels`].
+/// Metadata for one channel type, as returned by [`crate::schema::ChannelsConfig::channels`].
 #[derive(Debug, Clone)]
 pub struct ChannelInfo {
     /// Canonical kebab-case identifier used in config TOML
@@ -803,6 +839,16 @@ mod secret_field_tests {
         assert_eq!(s, enc1);
         s.decrypt_in_place(&store, "test.s").unwrap();
         assert_eq!(s, "sk-abc");
+    }
+
+    #[test]
+    fn string_op_reference_is_preserved_by_encrypt_in_place() {
+        let (_tmp, store) = store();
+        let mut s = String::from("op://vault/item/field");
+
+        s.encrypt_in_place(&store, "test.s").unwrap();
+
+        assert_eq!(s, "op://vault/item/field");
     }
 
     #[test]

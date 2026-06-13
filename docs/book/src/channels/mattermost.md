@@ -2,18 +2,17 @@
 
 REST v4 polling client. Self-hosted, on-prem, or sovereign-cloud Mattermost servers all work the same way: the bot polls the channels it can read every 3 seconds for new posts, and reply posts go out via `POST /api/v4/posts`.
 
+## Who can talk to the agent
+
+{{#peer-group mattermost}}
+
+To allowlist a specific human, copy their user ID from **System Console → User
+Management**. Mattermost matches the user **UUID**, not a username, and does
+not resolve usernames at message-receive time.
+
 ## Quickstart
 
-Minimum config for a multi-channel, DM-aware bot:
-
-```toml
-[channels.mattermost.work]
-enabled = true
-url = "https://mattermost.example.com"
-bot_token = "..."
-```
-
-That alone gives you:
+Configure a Mattermost channel (`url` plus a `bot_token` secret, see [Authentication](#authentication)) through one of the surfaces below. That alone gives you:
 
 1. Auto-discovery of every channel the bot can read across every team it belongs to.
 2. DM and group-DM channels auto-discovered and polled alongside team channels.
@@ -24,42 +23,13 @@ To restrict the bot, narrow with `channel_ids`, `team_ids`, or `discover_dms`.
 
 ## Configuration
 
-```toml
-[channels.mattermost.<alias>]
-enabled            = true                            # gate; required
-url                = "https://mattermost.example.com" # required
-bot_token          = "..."                            # secret; OR login_id+password
-# login_id         = ""                               # alternative auth path; only when bot_token is unset
-# password         = ""                               # secret; pairs with login_id
+`bot_token` and `password` are secrets:
 
-channel_ids        = []                               # [] or ["*"] = auto-discover
-team_ids           = []                               # [] = all teams
-discover_dms       = true                             # include type=D and type=G
-thread_replies     = true                             # thread on the user's post
-mention_only       = false                            # filter ambient-channel chatter
-interrupt_on_new_message = false                      # cancel in-flight on new sender post
+{{#secret-config channels.mattermost.<alias>.bot_token}}
 
-proxy_url          = ""                               # optional per-channel proxy
-excluded_tools     = []                               # tools hidden from this channel
-```
+### Field reference
 
-Field reference:
-
-| field | type | default | meaning |
-|---|---|---|---|
-| `enabled` | bool | `false` | Loaded only when true. |
-| `url` | string | (required) | Base URL of the Mattermost server, no trailing slash. |
-| `bot_token` | secret | none | Bot Account access token. Preferred. |
-| `login_id` | string | none | Email or username for password login. Used only when `bot_token` is unset. |
-| `password` | secret | none | Account password. Must pair with `login_id`. |
-| `channel_ids` | list | `[]` | Empty or `["*"]` triggers auto-discovery. Explicit IDs pin the bot to that exact set. |
-| `team_ids` | list | `[]` | Auto-discovery allowlist for team channels. Empty = every team the bot belongs to. DM and group-DM channels are unaffected (they carry no `team_id`). |
-| `discover_dms` | bool | `true` | When auto-discovering, include `type=D` and `type=G` channels. Set `false` to scope the bot to public/private team channels only. No effect when `channel_ids` is explicit. |
-| `thread_replies` | bool | `true` | New top-level reply opens a thread rooted on the user's post. Replies inside an existing thread always stay in that thread regardless. |
-| `mention_only` | bool | `false` | Public/private team channels: ignore posts that do not `@mention` the bot. DMs and group DMs always bypass this filter. |
-| `interrupt_on_new_message` | bool | `false` | A newer post from the same sender in the same channel cancels the in-flight turn. |
-| `proxy_url` | string | none | Per-channel proxy override (`http`, `https`, `socks5`, `socks5h`). |
-| `excluded_tools` | list | `[]` | Tool names hidden from the model on this channel. |
+{{#config-fields channels.mattermost}}
 
 ## Channel discovery
 
@@ -91,6 +61,10 @@ Authorization for DM senders still goes through the channel's peer-group resolve
 2. Inbound post is top-level and `thread_replies = true` (default) → the reply opens a thread rooted on the inbound post.
 3. Inbound post is top-level and `thread_replies = false` → the reply is posted at channel root.
 
+### Context management
+
+{{#thread-context channel="Mattermost" prop="thread_replies" path="channels.mattermost.<alias>.thread_replies"}}
+
 ## Authentication
 
 Two paths:
@@ -109,12 +83,8 @@ When `[transcription]` is configured and an inbound post has an audio attachment
 1. In Mattermost: **System Console → Integrations → Bot Accounts → Add Bot Account**. Set a username (e.g. `zeroclaw`), enable the scopes you want.
 2. Copy the access token. Store it in your ZeroClaw secrets backend.
 3. Invite the bot to whichever teams you want it active in. For DM auto-discovery, no extra invites needed: any user can DM the bot.
-4. Add `[channels.mattermost.<alias>]` to your config.toml referencing the token.
+4. Create the `mattermost.<alias>` channel referencing the token through the gateway, zerocode, or `zeroclaw config set`.
 5. Bind the channel to an agent in `[agents.<alias>]` via `channels = ["mattermost.<alias>"]`.
-
-## Identity and peer groups
-
-Inbound `ChannelMessage.sender` is the Mattermost user UUID (`user_id` from the post payload). Peer-group authorization matches against that UUID. If you want to allowlist a specific human, copy their user ID from **System Console → User Management** and add it to `[peer_groups.<group>].external_peers`. The bot does not currently resolve usernames at message-receive time; that's an orthogonal concern shared with Discord and other UUID-based channels.
 
 ## Operational notes
 
@@ -125,5 +95,5 @@ Inbound `ChannelMessage.sender` is the Mattermost user UUID (`user_id` from the 
 ## See also
 
 - [Channels overview](./overview.md)
-- [Security: peer groups](../security/overview.md)
+- [Peer Groups](./peer-groups.md)
 - [Reference: config schema](../reference/config.md)

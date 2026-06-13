@@ -358,6 +358,13 @@ onboard-openai-auth-codex = Abonnement Codex
 onboard-openai-codex-followup =
     L'authentification par abonnement Codex utilise votre compte ChatGPT.
     Exécutez `zeroclaw auth login --provider openai-codex` pour vous authentifier avant de démarrer votre agent.
+cli-web-dist-dir-reason-tilde = commence par `~` qui n'est pas développé
+cli-web-dist-dir-reason-dollar = contient `$` qui n'est pas développé
+cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" — {$reason} ; gateway.web_dist_dir est lu tel quel, vous devez donc développer la valeur vous-même (p. ex. un chemin absolu)
+cli-self-test-web-dist-dir-name = web_dist_dir
+cli-self-test-web-dist-dir-pass-unset = non défini (détection automatique utilisée)
+cli-self-test-web-dist-dir-pass-literal = {$path} (chemin littéral)
+cli-self-test-web-dist-dir-fail-expansion = AVERTISSEMENT : {$path} — {$reason} ; gateway.web_dist_dir est lu tel quel, vous devez donc développer la valeur vous-même (p. ex. un chemin absolu)
 cli-peripherals-none = Aucun périphérique configuré.
 cli-peripherals-add-hint = Ajoutez-en un avec : zeroclaw peripheral add <board> <path>
 cli-peripherals-add-example = {"  "}Exemple : zeroclaw peripheral add nucleo-f401re <serial-path>
@@ -545,7 +552,7 @@ cli-channels-cli-always = {"  "}✅ CLI (toujours disponible)
 cli-channels-notion = {"  "}{ $status } Notion
 cli-channels-start-hint = Pour démarrer les canaux : zeroclaw channel start
 cli-channels-doctor-hint = Pour vérifier l'état :    zeroclaw channel doctor
-cli-channels-configure-hint = Pour configurer :      zeroclaw onboard
+cli-channels-configure-hint = Pour configurer :      zeroclaw config set channels.<name>.<field>=<value>
 cli-onboard-about = Initialiser votre espace de travail et votre configuration
 cli-memory-persist-about = Persister les données de l'état de l'agent dans des fichiers locaux ou un stockage distant
 cli-memory-remove-about = Supprimer une entrée de mémoire par clé
