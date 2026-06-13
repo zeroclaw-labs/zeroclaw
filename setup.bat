@@ -116,32 +116,32 @@ echo   %YELLOW%NOTE: You may need to restart your terminal for PATH changes.%RES
 goto :choose_mode
 
 :: ---- Choose build mode ----
+:: >>> generated:menu by `cargo generate installers` — do not edit <<<
 :choose_mode
-echo.
-
 if "%MODE%"=="prebuilt" goto :install_prebuilt
-if "%MODE%"=="minimal"  goto :build_minimal
-if "%MODE%"=="standard" goto :build_standard
-if "%MODE%"=="full"     goto :build_full
+if "%MODE%"=="minimal" goto :build_minimal
+if "%MODE%"=="dist" goto :build_dist
+if "%MODE%"=="default" goto :build_default
+if "%MODE%"=="all" goto :build_all
 
-:: Interactive mode
 echo %BOLD%[2/5] Choose installation method:%RESET%
 echo.
-echo   1) Prebuilt binary   - Download pre-compiled release (fastest, ~2 min)
-echo   2) Minimal build     - Core only (^--no-default-features, ~15 min)
-echo   3) Standard build    - Default + Lark/Feishu + Matrix (~20 min)
-echo   4) Full build        - All features including hardware + browser (~30 min)
+echo   1) Prebuilt binary - Download pre-compiled release (fastest)
+echo   2) minimal build - core only, no default features
+echo   3) dist build - all channels, no heavyweight extras (recommended)
+echo   4) default build - default feature set
+echo   5) all build - every feature including hardware and browser
 echo.
-set /p "CHOICE=  Select [1-4] (default: 1): "
-
+set /p "CHOICE=  Select [1-5] (default: 1): "
 if "%CHOICE%"=="" set "CHOICE=1"
 if "%CHOICE%"=="1" goto :install_prebuilt
 if "%CHOICE%"=="2" goto :build_minimal
-if "%CHOICE%"=="3" goto :build_standard
-if "%CHOICE%"=="4" goto :build_full
-
-echo   %RED%Invalid choice. Please enter 1-4.%RESET%
+if "%CHOICE%"=="3" goto :build_dist
+if "%CHOICE%"=="4" goto :build_default
+if "%CHOICE%"=="5" goto :build_all
+echo   %RED%Invalid choice. Please enter 1-5.%RESET%
 goto :choose_mode
+:: >>> end generated:menu <<<
 
 :: ---- Prebuilt binary ----
 :install_prebuilt
@@ -164,8 +164,8 @@ if not defined DOWNLOAD_URL (
 echo   Downloading from release...
 curl -sSfL -o "%TEMP%\zeroclaw-windows.zip" "!DOWNLOAD_URL!"
 if %ERRORLEVEL% NEQ 0 (
-    echo   %YELLOW%Prebuilt binary not available. Falling back to source build - standard%RESET%
-    goto :build_standard
+    echo   %YELLOW%Prebuilt binary not available. Falling back to source build - dist%RESET%
+    goto :build_dist
 )
 
 :: Extract
@@ -190,23 +190,28 @@ if exist "%USERPROFILE%\.zeroclaw\bin\zerocode.exe" (
 )
 goto verify
 
-:: ---- Minimal build ----
+:: ---- Source build presets ----
+:: >>> generated:presets by `cargo generate installers` — do not edit <<<
 :build_minimal
 set "FEATURES=--no-default-features"
 set "BUILD_DESC=minimal (core only, no default features)"
 goto :do_build
 
-:: ---- Standard build ----
-:build_standard
-set "FEATURES=--features channel-matrix,channel-lark"
-set "BUILD_DESC=standard (Matrix + Lark/Feishu)"
+:build_dist
+set "FEATURES=--no-default-features --features acp-bridge,agent-runtime,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-imessage,channel-irc,channel-lark,channel-linq,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-wati,channel-webhook,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,gateway,observability-prometheus,schema-export"
+set "BUILD_DESC=dist (all channels, no heavyweight extras (recommended))"
 goto :do_build
 
-:: ---- Full build ----
-:build_full
-set "FEATURES=--features channel-matrix,channel-lark,browser-native,hardware,rag-pdf,observability-otel"
-set "BUILD_DESC=full (all features)"
+:build_default
+set "FEATURES="
+set "BUILD_DESC=default (default feature set)"
 goto :do_build
+
+:build_all
+set "FEATURES=--no-default-features --features acp-bridge,agent-runtime,browser-native,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-feishu,channel-imessage,channel-irc,channel-lark,channel-line,channel-linq,channel-matrix,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-nostr,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-wati,channel-webhook,channel-wechat,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,dev-sim,gateway,hardware,memory-postgres,observability-otel,observability-prometheus,peripheral-rpi,plugins-wasm,probe,rag-pdf,sandbox-bubblewrap,sandbox-landlock,schema-export,voice-wake,webauthn,whatsapp-web"
+set "BUILD_DESC=all (every feature including hardware and browser)"
+goto :do_build
+:: >>> end generated:presets <<<
 
 :: ---- Build from source ----
 :do_build

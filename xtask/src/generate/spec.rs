@@ -324,6 +324,12 @@ pub fn converge_tail() -> Vec<Step> {
     }]
 }
 
+/// Resolve just the cargo flag string for a selection (public entry for
+/// renderers that need per-selection flags without a full Plan).
+pub fn resolve_flags(manifest_dir: &Path, selection: &Selection) -> anyhow::Result<String> {
+    Ok(resolve(manifest_dir, selection)?.cargo_flags)
+}
+
 /// Read canonical data via `cargo_metadata` — Cargo's own resolver, so the
 /// feature graph matches what builds actually see. No awk, no hand-parsing.
 pub fn resolve(manifest_dir: &Path, selection: &Selection) -> anyhow::Result<Resolved> {
@@ -414,6 +420,42 @@ pub enum Selection {
 }
 
 impl Selection {
+    /// Canonical short id for this selection (menu key, docker tag stem, etc.).
+    /// Surfaces render from this — they never type the name literally.
+    pub fn id(&self) -> &'static str {
+        match self {
+            Selection::Full => "default",
+            Selection::Minimal => "minimal",
+            Selection::Dist => "dist",
+            Selection::All => "all",
+            Selection::Features(_) => "custom",
+        }
+    }
+
+    /// One-line human description, rendered into menus/help. Derived here so no
+    /// surface hardcodes it.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Selection::Full => "default feature set",
+            Selection::Minimal => "core only, no default features",
+            Selection::Dist => "all channels, no heavyweight extras (recommended)",
+            Selection::All => "every feature including hardware and browser",
+            Selection::Features(_) => "custom feature selection",
+        }
+    }
+
+    /// The selections a packaged/menu surface offers, in menu order. Single
+    /// source for "which build modes exist"; surfaces walk this, they do not
+    /// enumerate modes themselves.
+    pub fn menu() -> Vec<Selection> {
+        vec![
+            Selection::Minimal,
+            Selection::Dist,
+            Selection::Full,
+            Selection::All,
+        ]
+    }
+
     /// Cargo flag string for this selection, validating named features and
     /// deriving Dist/All from the feature graph + registry sets — no hardcoded
     /// channel or feature lists.

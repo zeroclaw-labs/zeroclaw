@@ -3,6 +3,7 @@
 //! reference. The spec is the single source of truth; surfaces are derived and
 //! drift-checked.
 
+pub mod setup_bat;
 pub mod spec;
 
 use std::path::PathBuf;
@@ -83,8 +84,10 @@ pub fn run(targets: &[String], check: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Placeholder until the renderer + template land. Returns the rendered
-/// setup.bat string from the canonical spec.
-fn render_setup_bat(_root: &std::path::Path) -> anyhow::Result<String> {
-    anyhow::bail!("render_setup_bat not yet implemented")
+/// Render setup.bat by splicing the spec-generated region into the on-disk
+/// file, preserving all hand-written glue outside the sentinels.
+fn render_setup_bat(root: &std::path::Path) -> anyhow::Result<String> {
+    let path = root.join("setup.bat");
+    let current = std::fs::read_to_string(&path)?;
+    setup_bat::render_file(root, &current)
 }
