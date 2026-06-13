@@ -2618,6 +2618,28 @@ X-Tenant = "tenant-42"
 }
 
 #[test]
+fn encryption_preserves_onepassword_secret_references() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = SecretStore::new(tmp.path(), true);
+
+    let raw_toml = r#"
+schema_version = 3
+
+[providers.models.openai.default]
+model = "gpt-5"
+api_key = "op://zeroclaw/provider/openai-api-key"
+"#;
+
+    let mut value: toml::Value = toml::from_str(raw_toml).expect("toml parses");
+    encrypt_secret_strings(&mut value, &store).expect("encrypt walker succeeds");
+
+    let api_key = lookup_dotted(&value, "providers.models.openai.default.api_key")
+        .and_then(toml::Value::as_str);
+
+    assert_eq!(api_key, Some("op://zeroclaw/provider/openai-api-key"));
+}
+
+#[test]
 fn identity_lifts_into_agents_default_during_v2_to_v3() {
     // V2 had a top-level [identity] block. V3 demoted identity to
     // per-agent (`[agents.<alias>.identity]`); the V2->V3 typed

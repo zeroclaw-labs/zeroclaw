@@ -10,7 +10,7 @@ use zeroclaw_api::tool::ToolSpec;
 const DEFAULT_API_VERSION: &str = "2024-08-01-preview";
 
 pub struct AzureOpenAiModelProvider {
-    /// `[model_providers.azure.<alias>]` config-key alias.
+    /// `[providers.models.azure.<alias>]` config-key alias.
     alias: String,
     credential: Option<String>,
     #[allow(dead_code)]

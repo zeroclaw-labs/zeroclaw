@@ -9,6 +9,18 @@ pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Largest byte index `<= max_bytes` that is still a valid UTF-8 boundary.
+pub fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
+    if max_bytes >= s.len() {
+        return s.len();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 pub const BLOCK_KIT_PREFIX: &str = "__ZEROCLAW_BLOCK_KIT__";
 
 pub fn strip_tool_call_tags(message: &str) -> String {
@@ -310,6 +322,14 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn floor_char_boundary_handles_mid_codepoint_offset() {
+        let text = "abc😀def";
+
+        assert_eq!(super::floor_char_boundary(text, 5), 3);
+        assert_eq!(super::floor_char_boundary(text, usize::MAX), text.len());
+    }
 
     #[test]
     fn strip_drops_truncated_function_calls_envelope_keeps_prose() {

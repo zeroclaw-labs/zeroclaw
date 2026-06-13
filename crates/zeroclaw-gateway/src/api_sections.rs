@@ -630,6 +630,7 @@ fn picker_items_for(
         // `<section>.<alias>` (operator-named keys, no closed kind set).
         Section::PeerGroups
         | Section::Cron
+        | Section::McpServers
         | Section::McpBundles
         | Section::KnowledgeBundles
         | Section::SkillBundles
@@ -1093,6 +1094,7 @@ pub async fn handle_section_select(
         Section::Agents
         | Section::PeerGroups
         | Section::Cron
+        | Section::McpServers
         | Section::McpBundles
         | Section::KnowledgeBundles
         | Section::SkillBundles

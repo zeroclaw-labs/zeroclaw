@@ -106,17 +106,59 @@ impl SubAgentSpawn {
     /// configured agent — the spawn site surfaces a structured
     /// failure instead of invoking the agent loop on a nonexistent
     /// identity.
+    ///
+    /// The parent policy is rebuilt from config via
+    /// [`SecurityPolicy::for_agent`]. This is the right entry point
+    /// for spawn sites with **no live parent context** — most
+    /// importantly the cron scheduler's `JobType::Agent` dispatch,
+    /// which has no session and must use the per-agent install
+    /// workspace as the sandbox boundary.
+    ///
+    /// Interactive spawn sites that hold the parent's live
+    /// `Arc<SecurityPolicy>` (the agent-loop `spawn_subagent` tool and
+    /// the `delegate` tool when called from an ACP/gateway session)
+    /// must use [`Self::for_agent_with_policy`] instead, so that
+    /// session-scoped policy fields — most importantly
+    /// `workspace_dir`, which IDE/ACP clients pin to the session cwd
+    /// — survive the spawn. See issue #7263.
     pub fn for_agent(config: &Config, agent_alias: &str) -> Result<Self> {
-        let agent = config
-            .agents
-            .get(agent_alias)
-            .with_context(|| format!("no agent configured under alias {agent_alias:?}"))?;
-
+        // Upfront alias check so a missing-agent failure surfaces with
+        // the "no agent configured under alias …" message rather than
+        // the policy resolver's less specific "no resolvable
+        // risk_profile" wrapping.
+        if !config.agents.contains_key(agent_alias) {
+            anyhow::bail!("no agent configured under alias {agent_alias:?}");
+        }
         let parent_policy = SecurityPolicy::for_agent(config, agent_alias)
             .map(Arc::new)
             .with_context(|| {
                 format!("could not resolve security policy for agent {agent_alias:?}")
             })?;
+        Self::for_agent_with_policy(config, agent_alias, parent_policy)
+    }
+
+    /// Resolve a parent's identity using a **pre-built** security
+    /// policy — the live `Arc<SecurityPolicy>` that the parent's tool
+    /// registry is using. This is the spawn path interactive sites
+    /// (ACP `spawn_subagent`, ACP `delegate`) must take so that
+    /// session-scoped policy fields — most importantly
+    /// `workspace_dir`, which IDE/ACP clients pin to the session cwd
+    /// — survive the spawn. Without this hook the policy is rebuilt
+    /// from config and the session override is silently dropped
+    /// (issue #7263).
+    ///
+    /// The memory allowlist is still resolved from config because it
+    /// is declared statically per agent and the policy carries no
+    /// equivalent field.
+    pub fn for_agent_with_policy(
+        config: &Config,
+        agent_alias: &str,
+        parent_policy: Arc<SecurityPolicy>,
+    ) -> Result<Self> {
+        let agent = config
+            .agents
+            .get(agent_alias)
+            .with_context(|| format!("no agent configured under alias {agent_alias:?}"))?;
 
         let mut parent_allowed_agent_aliases: HashSet<String> = agent
             .workspace
@@ -349,6 +391,68 @@ mod tests {
             "child must inherit parent's exhausted action budget; \
              a fresh bucket here means the budget is bypass-able by \
              spawning a SubAgent"
+        );
+    }
+
+    /// Regression for issue #7263: when an interactive spawn site
+    /// (ACP `spawn_subagent` / `delegate`) supplies a pre-built parent
+    /// policy whose `workspace_dir` was pinned to the session cwd,
+    /// `for_agent_with_policy` must propagate that policy verbatim
+    /// instead of regenerating one from config. Without this the
+    /// child's file/shell tools jail to `~/.zeroclaw/agents/<alias>/
+    /// workspace` rather than the IDE's session cwd, breaking
+    /// subagent-driven workflows in repos outside the install root.
+    #[test]
+    fn for_agent_with_policy_preserves_session_workspace_dir() {
+        let config = config_with_agent("alpha");
+
+        // The session cwd is some directory that is NOT
+        // `config.agent_workspace_dir("alpha")`. Pick an absolute path
+        // that's stable across hosts.
+        let session_cwd = PathBuf::from("/tmp/zeroclaw-test-session-cwd-7263");
+        let config_workspace = config.agent_workspace_dir("alpha");
+        assert_ne!(
+            session_cwd, config_workspace,
+            "test precondition: session cwd must differ from config workspace"
+        );
+
+        // Build the "live" parent policy the way the interactive
+        // builders do (config-derived, then session_cwd override).
+        let mut live_policy = SecurityPolicy::for_agent(&config, "alpha").unwrap();
+        live_policy.workspace_dir = session_cwd.clone();
+        let live_policy = Arc::new(live_policy);
+
+        let ctx = SubAgentSpawn::for_agent_with_policy(&config, "alpha", live_policy.clone())
+            .expect("for_agent_with_policy must accept a live parent policy")
+            .build(SubAgentOverrides::default())
+            .expect("inherits-verbatim build must succeed");
+
+        // The child policy must be the same Arc (no clone, no rebuild)
+        // and must carry the session cwd through to the loop.
+        assert!(
+            Arc::ptr_eq(&ctx.policy, &live_policy),
+            "default overrides must reuse the parent's Arc, not regenerate"
+        );
+        assert_eq!(
+            ctx.policy.workspace_dir, session_cwd,
+            "session cwd must survive the spawn; regression for issue #7263"
+        );
+    }
+
+    /// `for_agent` (the cron-style entry point) must continue to
+    /// resolve the workspace from config so scheduled jobs — which
+    /// have no session — jail to the per-agent install dir.
+    #[test]
+    fn for_agent_uses_config_workspace_dir() {
+        let config = config_with_agent("alpha");
+        let ctx = SubAgentSpawn::for_agent(&config, "alpha")
+            .unwrap()
+            .build(SubAgentOverrides::default())
+            .unwrap();
+        assert_eq!(
+            ctx.policy.workspace_dir,
+            config.agent_workspace_dir("alpha"),
+            "for_agent (cron path) must use the per-agent install workspace"
         );
     }
 }
