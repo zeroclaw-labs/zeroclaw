@@ -3921,7 +3921,7 @@ async fn main() -> Result<()> {
                     "Runtime"
                 )
             );
-            if service::is_running() {
+            if service::is_running(&config) {
                 println!(
                     "{}",
                     t("cli-status-service-running", "🟢 Service:       running")
