@@ -552,7 +552,7 @@ impl WeComWsChannel {
 
         let retention = Duration::from_secs(u64::from(self.cfg.file_retention_days) * 86_400);
         let root = self.cfg.workspace_dir.join("wecom_ws_files");
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             cleanup_inbox_files(root, retention).await;
         });
     }
@@ -571,7 +571,7 @@ impl WeComWsChannel {
             "aibot_msg_callback" => {
                 let channel = self.clone();
                 let tx = tx.clone();
-                tokio::spawn(async move {
+                zeroclaw_spawn::spawn!(async move {
                     channel.handle_msg_callback(frame, &tx).await;
                 });
                 false
@@ -678,16 +678,16 @@ impl WeComWsChannel {
             );
             let _ = tx
                 .send(ChannelMessage {
-                    id: parsed.msg_id.clone(),
-                    sender: parsed.sender_userid.clone(),
-                    reply_target: scopes.conversation_scope.clone(),
-                    content: "/new".to_string(),
-                    channel: "wecom_ws".to_string(),
                     channel_alias: Some(self.alias.clone()),
-                    timestamp: bytes_timestamp_now(),
                     thread_ts: Some(req_id),
-                    interruption_scope_id: None,
-                    attachments: Vec::new(),
+                    ..ChannelMessage::new(
+                        parsed.msg_id.clone(),
+                        parsed.sender_userid.clone(),
+                        scopes.conversation_scope.clone(),
+                        "/new",
+                        "wecom_ws",
+                        bytes_timestamp_now(),
+                    )
                 })
                 .await;
             return;
@@ -702,16 +702,15 @@ impl WeComWsChannel {
                 .await;
             let _ = tx
                 .send(ChannelMessage {
-                    id: parsed.msg_id.clone(),
-                    sender: parsed.sender_userid.clone(),
-                    reply_target: scopes.conversation_scope.clone(),
-                    content: "/stop".to_string(),
-                    channel: "wecom_ws".to_string(),
                     channel_alias: Some(self.alias.clone()),
-                    timestamp: bytes_timestamp_now(),
-                    thread_ts: None,
-                    interruption_scope_id: None,
-                    attachments: Vec::new(),
+                    ..ChannelMessage::new(
+                        parsed.msg_id.clone(),
+                        parsed.sender_userid.clone(),
+                        scopes.conversation_scope.clone(),
+                        "/stop",
+                        "wecom_ws",
+                        bytes_timestamp_now(),
+                    )
                 })
                 .await;
             return;
@@ -726,16 +725,16 @@ impl WeComWsChannel {
             );
             let _ = tx
                 .send(ChannelMessage {
-                    id: parsed.msg_id.clone(),
-                    sender: parsed.sender_userid.clone(),
-                    reply_target: scopes.conversation_scope.clone(),
-                    content: runtime_command,
-                    channel: "wecom_ws".to_string(),
                     channel_alias: Some(self.alias.clone()),
-                    timestamp: bytes_timestamp_now(),
                     thread_ts: Some(req_id),
-                    interruption_scope_id: None,
-                    attachments: Vec::new(),
+                    ..ChannelMessage::new(
+                        parsed.msg_id.clone(),
+                        parsed.sender_userid.clone(),
+                        scopes.conversation_scope.clone(),
+                        runtime_command,
+                        "wecom_ws",
+                        bytes_timestamp_now(),
+                    )
                 })
                 .await;
             return;
@@ -768,7 +767,7 @@ impl WeComWsChannel {
 
         let channel_self = self.clone();
         let tx = tx.clone();
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             let mut inbound = parsed;
             channel_self
                 .materialize_quote_attachments(&mut inbound)
@@ -810,16 +809,16 @@ impl WeComWsChannel {
 
             let _ = tx
                 .send(ChannelMessage {
-                    id: inbound.msg_id.clone(),
-                    sender: inbound.sender_userid.clone(),
-                    reply_target: scopes.conversation_scope.clone(),
-                    content: composed,
-                    channel: "wecom_ws".to_string(),
                     channel_alias: Some(channel_self.alias.clone()),
-                    timestamp: bytes_timestamp_now(),
                     thread_ts: Some(req_id),
-                    interruption_scope_id: None,
-                    attachments: Vec::new(),
+                    ..ChannelMessage::new(
+                        inbound.msg_id.clone(),
+                        inbound.sender_userid.clone(),
+                        scopes.conversation_scope.clone(),
+                        composed,
+                        "wecom_ws",
+                        bytes_timestamp_now(),
+                    )
                 })
                 .await;
         });
@@ -2349,14 +2348,10 @@ fn split_stream_content_and_overflow(input: &str) -> (String, Option<String>) {
 fn strip_trailing_provider_sentinels(input: &str) -> String {
     let mut trimmed = input.trim_end();
 
-    loop {
-        let Some(sentinel) = WECOM_PROVIDER_TRAILING_SENTINELS
-            .iter()
-            .find(|sentinel| trimmed.ends_with(**sentinel))
-        else {
-            break;
-        };
-
+    while let Some(sentinel) = WECOM_PROVIDER_TRAILING_SENTINELS
+        .iter()
+        .find(|sentinel| trimmed.ends_with(**sentinel))
+    {
         trimmed = trimmed[..trimmed.len() - sentinel.len()].trim_end();
     }
 
@@ -3124,7 +3119,7 @@ mod tests {
         *channel.ws_tx.lock().await = Some(ws_tx);
 
         let responder_channel = channel.clone();
-        let responder = tokio::spawn(async move {
+        let responder = zeroclaw_spawn::spawn!(async move {
             let Some(WsOutbound::Frame(frame)) = ws_rx.recv().await else {
                 panic!("expected respond_msg frame");
             };
@@ -3186,7 +3181,7 @@ mod tests {
         *channel.ws_tx.lock().await = Some(ws_tx);
 
         let responder_channel = channel.clone();
-        let responder = tokio::spawn(async move {
+        let responder = zeroclaw_spawn::spawn!(async move {
             let Some(WsOutbound::Frame(frame)) = ws_rx.recv().await else {
                 panic!("expected send_msg frame");
             };
@@ -3357,18 +3352,14 @@ mod tests {
         let channel = WeComWsChannel::new(&config, Path::new("/tmp")).unwrap();
 
         let (tx, mut rx) = mpsc::channel::<ChannelMessage>(1);
-        tx.send(ChannelMessage {
-            id: "prefill-clear".to_string(),
-            sender: "tester".to_string(),
-            reply_target: "user--zeroclaw_user".to_string(),
-            content: "prefill".to_string(),
-            channel: "wecom_ws".to_string(),
-            channel_alias: None,
-            timestamp: bytes_timestamp_now(),
-            thread_ts: None,
-            interruption_scope_id: None,
-            attachments: Vec::new(),
-        })
+        tx.send(ChannelMessage::new(
+            "prefill-clear",
+            "tester",
+            "user--zeroclaw_user",
+            "prefill",
+            "wecom_ws",
+            bytes_timestamp_now(),
+        ))
         .await
         .unwrap();
 
@@ -3417,7 +3408,7 @@ mod tests {
         *channel.ws_tx.lock().await = Some(ws_tx);
 
         let responder_channel = channel.clone();
-        let responder = tokio::spawn(async move {
+        let responder = zeroclaw_spawn::spawn!(async move {
             let Some(WsOutbound::Frame(frame)) = ws_rx.recv().await else {
                 panic!("expected access-denied response frame");
             };
@@ -3550,7 +3541,7 @@ mod tests {
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let responder_channel = channel.clone();
         let responder_attempts = Arc::clone(&attempts);
-        let responder = tokio::spawn(async move {
+        let responder = zeroclaw_spawn::spawn!(async move {
             while let Some(WsOutbound::Frame(frame)) = rx.recv().await {
                 let attempt = responder_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let req_id = frame
@@ -3598,14 +3589,14 @@ mod tests {
         *channel.ws_tx.lock().await = Some(tx);
 
         let first_channel = channel.clone();
-        let first = tokio::spawn(async move {
+        let first = zeroclaw_spawn::spawn!(async move {
             first_channel
                 .ws_send_respond_msg("req-serial", "stream-1", "first", false)
                 .await
         });
 
         let second_channel = channel.clone();
-        let second = tokio::spawn(async move {
+        let second = zeroclaw_spawn::spawn!(async move {
             second_channel
                 .ws_send_respond_msg("req-serial", "stream-1", "second", false)
                 .await

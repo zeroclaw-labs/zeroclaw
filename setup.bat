@@ -7,7 +7,7 @@ setlocal enabledelayedexpansion
 :: Usage: setup.bat [--prebuilt | --minimal | --standard | --full | --help]
 :: ============================================================================
 
-set "VERSION=0.6.2"
+set "VERSION=0.8.0"
 set "RUST_MIN_VERSION=1.87"
 set "TARGET=x86_64-pc-windows-msvc"
 set "REPO=https://github.com/zeroclaw-labs/zeroclaw"
@@ -128,7 +128,7 @@ if "%MODE%"=="full"     goto :build_full
 echo %BOLD%[2/5] Choose installation method:%RESET%
 echo.
 echo   1) Prebuilt binary   - Download pre-compiled release (fastest, ~2 min)
-echo   2) Minimal build     - Default features only (~15 min)
+echo   2) Minimal build     - Core only (^--no-default-features, ~15 min)
 echo   3) Standard build    - Default + Lark/Feishu + Matrix (~20 min)
 echo   4) Full build        - All features including hardware + browser (~30 min)
 echo.
@@ -185,12 +185,15 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo   %GREEN%OK%RESET% Binary installed to %USERPROFILE%\.zeroclaw\bin\zeroclaw.exe
+if exist "%USERPROFILE%\.zeroclaw\bin\zerocode.exe" (
+    echo   %GREEN%OK%RESET% TUI installed to %USERPROFILE%\.zeroclaw\bin\zerocode.exe
+)
 goto verify
 
 :: ---- Minimal build ----
 :build_minimal
-set "FEATURES="
-set "BUILD_DESC=minimal (default features)"
+set "FEATURES=--no-default-features"
+set "BUILD_DESC=minimal (core only, no default features)"
 goto :do_build
 
 :: ---- Standard build ----
@@ -227,6 +230,7 @@ rustup target add %TARGET% >nul 2>&1
 echo   This may take 15-30 minutes on first build...
 echo.
 
+echo   Command: cargo build --release --locked %FEATURES% --target %TARGET%
 cargo build --release --locked %FEATURES% --target %TARGET%
 if %ERRORLEVEL% NEQ 0 (
     echo.
@@ -240,12 +244,30 @@ if %ERRORLEVEL% NEQ 0 (
 
 echo   %GREEN%OK%RESET% Build succeeded.
 
+echo   Command: cargo build --release --locked -p zerocode --target %TARGET%
+cargo build --release --locked -p zerocode --target %TARGET%
+if %ERRORLEVEL% NEQ 0 (
+    echo   %YELLOW%WARNING: zerocode TUI build failed; continuing with zeroclaw only.%RESET%
+)
+
 :: Copy binary to a convenient location
 echo.
 echo %BOLD%[4/5] Installing binary...%RESET%
 mkdir "%USERPROFILE%\.zeroclaw\bin" 2>nul
 copy /Y "target\%TARGET%\release\zeroclaw.exe" "%USERPROFILE%\.zeroclaw\bin\zeroclaw.exe" >nul
-echo   %GREEN%OK%RESET% Installed to %USERPROFILE%\.zeroclaw\bin\zeroclaw.exe
+if exist "target\%TARGET%\release\zerocode.exe" (
+    copy /Y "target\%TARGET%\release\zerocode.exe" "%USERPROFILE%\.zeroclaw\bin\zerocode.exe" >nul
+    echo   %GREEN%OK%RESET% TUI installed to %USERPROFILE%\.zeroclaw\bin\zerocode.exe
+)
+set "BIN_PATH=%USERPROFILE%\.zeroclaw\bin\zeroclaw.exe"
+for /f %%S in ('powershell -NoProfile -Command "[math]::Round(((Get-Item -LiteralPath ''%BIN_PATH%'').Length / 1MB), 2)"') do (
+    set "BINARY_MB=%%S"
+)
+if defined BINARY_MB (
+    echo   %GREEN%OK%RESET% Installed to %USERPROFILE%\.zeroclaw\bin\zeroclaw.exe ^(%BINARY_MB% MB^)
+) else (
+    echo   %GREEN%OK%RESET% Installed to %USERPROFILE%\.zeroclaw\bin\zeroclaw.exe ^(size unavailable^)
+)
 
 :: Add to PATH if not already there
 echo %PATH% | findstr /I /C:".zeroclaw\bin" >nul 2>&1
@@ -253,6 +275,30 @@ if %ERRORLEVEL% NEQ 0 (
     setx PATH "%PATH%;%USERPROFILE%\.zeroclaw\bin" >nul 2>&1
     set "PATH=%PATH%;%USERPROFILE%\.zeroclaw\bin"
     echo   %GREEN%OK%RESET% Added to PATH
+)
+
+:: Build and install the web dashboard so the gateway serves it. Mirrors
+:: install.sh: assets must land where the gateway auto-detects them
+:: (%LOCALAPPDATA%\zeroclaw\web\dist) so a service-launched daemon finds
+:: them regardless of working directory.
+where npm >nul 2>&1
+if %ERRORLEVEL% EQU 0 (
+    echo   Building web dashboard ^(cargo web build^)...
+    cargo web build
+    if %ERRORLEVEL% EQU 0 (
+        if exist "web\dist\index.html" (
+            mkdir "%LOCALAPPDATA%\zeroclaw\web\dist" 2>nul
+            xcopy /E /I /Y "web\dist" "%LOCALAPPDATA%\zeroclaw\web\dist" >nul
+            echo   %GREEN%OK%RESET% Web dashboard installed to %LOCALAPPDATA%\zeroclaw\web\dist
+        )
+    ) else (
+        echo   %YELLOW%WARNING: dashboard build failed; gateway runs in API-only mode.%RESET%
+        echo   %YELLOW%Re-run setup.bat once the build issue is resolved.%RESET%
+    )
+) else (
+    echo   %YELLOW%npm not found - skipping dashboard build. The gateway will run%RESET%
+    echo   %YELLOW%in API-only mode. Install Node.js and re-run setup.bat to build%RESET%
+    echo   %YELLOW%and install the dashboard.%RESET%
 )
 
 goto verify
@@ -285,8 +331,15 @@ echo %BOLD%%GREEN%=========================================%RESET%
 echo.
 echo   Next steps:
 echo     1. Restart your terminal (for PATH changes)
-echo     2. Run: zeroclaw onboard
+if /I "%MODE%"=="minimal" (
+echo     2. Minimal build excludes quickstart ^(zeroclaw quickstart is unavailable^)
+echo     3. Configure model providers manually in %%USERPROFILE%%\.zeroclaw\config.toml
+echo     4. Use reduced CLI path: zeroclaw agent --message "Hello"
+) else (
+echo     2. Run: zeroclaw quickstart
 echo     3. Configure your API key in %%USERPROFILE%%\.zeroclaw\config.toml
+echo     4. Launch the TUI: zerocode
+)
 echo.
 echo   Alternative install via Scoop:
 echo     scoop bucket add zeroclaw https://github.com/zeroclaw-labs/scoop-zeroclaw
@@ -305,7 +358,7 @@ echo Usage: setup.bat [OPTIONS]
 echo.
 echo Options:
 echo   --prebuilt    Download pre-compiled binary (fastest)
-echo   --minimal     Build with default features only
+echo   --minimal     Build core only ^(--no-default-features^)
 echo   --standard    Build with Matrix + Lark/Feishu
 echo   --full        Build with all features
 echo   --help, -h    Show this help message

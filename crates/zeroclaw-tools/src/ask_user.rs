@@ -29,24 +29,9 @@ pub struct AskUserTool {
 }
 
 impl AskUserTool {
-    /// Create a new ask_user tool with an empty channel map.
-    /// Call `channel_map_handle` and write to the returned handle once channels
-    /// are available.
-    pub fn new(security: Arc<SecurityPolicy>) -> Self {
-        Self {
-            security,
-            channels: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
-
-    /// Return the shared handle so callers can populate it after channel init.
-    pub fn channel_map_handle(&self) -> ChannelMapHandle {
-        Arc::clone(&self.channels)
-    }
-
-    /// Convenience: populate the channel map from a pre-built map.
-    pub fn populate(&self, map: HashMap<String, Arc<dyn Channel>>) {
-        *self.channels.write() = map;
+    /// Create a new ask_user tool using the given channel map.
+    pub fn new(security: Arc<SecurityPolicy>, channels: ChannelMapHandle) -> Self {
+        Self { security, channels }
     }
 }
 
@@ -264,7 +249,7 @@ impl Tool for AskUserTool {
 
         // Spawn a listener task on the channel
         let listen_channel = Arc::clone(&channel);
-        let listen_handle = tokio::spawn(async move { listen_channel.listen(tx).await });
+        let listen_handle = zeroclaw_spawn::spawn!(async move { listen_channel.listen(tx).await });
 
         let response = tokio::time::timeout(timeout, rx.recv()).await;
 
@@ -398,6 +383,7 @@ mod tests {
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             };
             let _ = tx.send(msg).await;
             Ok(())
@@ -405,20 +391,24 @@ mod tests {
     }
 
     fn make_tool_with_channels(channels: Vec<(&str, Arc<dyn Channel>)>) -> AskUserTool {
-        let tool = AskUserTool::new(Arc::new(SecurityPolicy::default()));
-        let map: HashMap<String, Arc<dyn Channel>> = channels
-            .into_iter()
-            .map(|(name, ch)| (name.to_string(), ch))
-            .collect();
-        tool.populate(map);
-        tool
+        let handle = Arc::new(RwLock::new(HashMap::new()));
+        {
+            let mut map = handle.write();
+            for (name, ch) in channels {
+                map.insert(name.to_string(), ch);
+            }
+        }
+        AskUserTool::new(Arc::new(SecurityPolicy::default()), handle)
     }
 
     // ── Metadata tests ──
 
     #[test]
     fn tool_name_and_description() {
-        let tool = AskUserTool::new(Arc::new(SecurityPolicy::default()));
+        let tool = AskUserTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(RwLock::new(HashMap::new())),
+        );
         assert_eq!(tool.name(), "ask_user");
         assert!(!tool.description().is_empty());
         assert!(tool.description().contains("question"));
@@ -426,7 +416,10 @@ mod tests {
 
     #[test]
     fn parameter_schema_validation() {
-        let tool = AskUserTool::new(Arc::new(SecurityPolicy::default()));
+        let tool = AskUserTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(RwLock::new(HashMap::new())),
+        );
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["question"].is_object());
@@ -443,7 +436,10 @@ mod tests {
 
     #[test]
     fn spec_matches_metadata() {
-        let tool = AskUserTool::new(Arc::new(SecurityPolicy::default()));
+        let tool = AskUserTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(RwLock::new(HashMap::new())),
+        );
         let spec = tool.spec();
         assert_eq!(spec.name, "ask_user");
         assert_eq!(spec.description, tool.description());
@@ -494,7 +490,10 @@ mod tests {
 
     #[tokio::test]
     async fn empty_channels_returns_not_initialized() {
-        let tool = AskUserTool::new(Arc::new(SecurityPolicy::default()));
+        let tool = AskUserTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(RwLock::new(HashMap::new())),
+        );
         let result = tool.execute(json!({ "question": "Hello?" })).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap().contains("not initialized"));
@@ -569,14 +568,14 @@ mod tests {
 
     #[tokio::test]
     async fn channel_map_handle_allows_late_binding() {
-        let tool = AskUserTool::new(Arc::new(SecurityPolicy::default()));
-        let handle = tool.channel_map_handle();
+        let handle = Arc::new(RwLock::new(HashMap::new()));
+        let tool = AskUserTool::new(Arc::new(SecurityPolicy::default()), handle.clone());
 
         // Initially empty — tool reports not initialized
         let result = tool.execute(json!({ "question": "Hello?" })).await.unwrap();
         assert!(!result.success);
 
-        // Populate via the handle
+        // Populate via the shared handle
         {
             let mut map = handle.write();
             map.insert(

@@ -261,6 +261,7 @@ impl BlueskyChannel {
             thread_ts: Some(notif.uri.clone()),
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         })
     }
 
@@ -337,8 +338,9 @@ impl Channel for BlueskyChannel {
 
         // Bluesky posts have a 300-character limit (grapheme clusters).
         // For longer content, truncate with an indicator.
-        let text = if message.content.len() > 300 {
-            format!("{}...", &message.content[..297])
+        let text = if message.content.chars().count() > 300 {
+            let truncated: String = message.content.chars().take(297).collect();
+            format!("{truncated}...")
         } else {
             message.content.clone()
         };

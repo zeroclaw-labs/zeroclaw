@@ -317,6 +317,7 @@ impl Channel for NostrChannel {
                             thread_ts: None,
                             interruption_scope_id: None,
                             attachments: vec![],
+                            subject: None,
                         };
                         if tx.send(msg).await.is_err() {
                             ::zeroclaw_log::record!(

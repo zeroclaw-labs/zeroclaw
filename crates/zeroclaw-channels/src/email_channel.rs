@@ -19,6 +19,7 @@ use lettre::message::{Attachment, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use mail_parser::{MessageParser, MimeHeaders};
+use pulldown_cmark::{Options, Parser, html};
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pki_types::DnsName;
 use std::collections::HashSet;
@@ -82,15 +83,15 @@ impl EmailChannel {
 
     /// Pure, testable predicate that applies the email-allowlist match
     /// semantics against an already-resolved peer list.
+    ///
+    /// Domain-class email matching (`@host` / bare `host` admit a whole
+    /// domain; `user@host` is a full case-insensitive address) can't be
+    /// expressed by the `crate::allowlist::Match` modes, so the per-entry
+    /// comparison runs through `crate::allowlist::is_user_allowed_by`. `peers`
+    /// is the caller's freshly-resolved list; no allowlist state is cached.
     fn is_email_sender_allowed(peers: &[String], email: &str) -> bool {
-        if peers.is_empty() {
-            return false; // Empty = deny all
-        }
-        if peers.iter().any(|a| a == "*") {
-            return true; // Wildcard = allow all
-        }
-        let email_lower = email.to_lowercase();
-        peers.iter().any(|allowed| {
+        crate::allowlist::is_user_allowed_by(peers, email, |allowed, email| {
+            let email_lower = email.to_lowercase();
             if allowed.starts_with('@') {
                 // Domain match with @ prefix: "@example.com"
                 email_lower.ends_with(&allowed.to_lowercase())
@@ -345,6 +346,7 @@ impl EmailChannel {
                         _uid: uid,
                         msg_id,
                         sender,
+                        subject,
                         content,
                         timestamp: ts,
                         attachments,
@@ -594,16 +596,17 @@ impl EmailChannel {
             }
 
             let msg = ChannelMessage {
-                id: email.msg_id,
-                reply_target: email.sender.clone(),
-                sender: email.sender,
-                content: email.content,
-                channel: "email".to_string(),
                 channel_alias: Some(self.alias.clone()),
-                timestamp: email.timestamp,
-                thread_ts: None,
-                interruption_scope_id: None,
                 attachments: email.attachments,
+                subject: Some(email.subject),
+                ..ChannelMessage::new(
+                    email.msg_id,
+                    email.sender.clone(),
+                    email.sender,
+                    email.content,
+                    "email",
+                    email.timestamp,
+                )
             };
 
             if tx.send(msg).await.is_err() {
@@ -616,16 +619,10 @@ impl EmailChannel {
     }
 
     fn smtp_credentials(&self) -> Credentials {
-        let user = self
-            .config
-            .smtp_username
-            .as_deref()
+        let user = smtp_credential_override(self.config.smtp_username.as_deref())
             .unwrap_or(&self.config.username)
             .to_owned();
-        let pass = self
-            .config
-            .smtp_password
-            .as_deref()
+        let pass = smtp_credential_override(self.config.smtp_password.as_deref())
             .unwrap_or(&self.config.password)
             .to_owned();
         Credentials::new(user, pass)
@@ -653,6 +650,7 @@ struct ParsedEmail {
     _uid: u32,
     msg_id: String,
     sender: String,
+    subject: String,
     content: String,
     timestamp: u64,
     attachments: Vec<zeroclaw_api::media::MediaAttachment>,
@@ -674,7 +672,22 @@ impl ::zeroclaw_api::attribution::Attributable for EmailChannel {
     }
 }
 
+fn markdown_to_html(md: &str) -> String {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    let parser = Parser::new_ext(md, options);
+    let mut html_output = String::new();
+    html::push_html(&mut html_output, parser);
+    html_output
+}
+
+fn smtp_credential_override(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
 #[async_trait]
+
 impl Channel for EmailChannel {
     fn name(&self) -> &str {
         "email"
@@ -695,37 +708,55 @@ impl Channel for EmailChannel {
             (default_subject, message.content.as_str())
         };
 
-        let email = if message.attachments.is_empty() {
-            // Existing plain-text path
-            Message::builder()
-                .from(self.config.from_address.parse()?)
-                .to(message.recipient.parse()?)
-                .subject(subject)
-                .singlepart(SinglePart::plain(body.to_string()))?
-        } else {
-            // Multipart with attachments
-            let mut multipart = MultiPart::mixed().singlepart(SinglePart::plain(body.to_string()));
+        let mut builder = Message::builder()
+            .from(self.config.from_address.parse()?)
+            .to(message.recipient.parse()?)
+            .subject(subject);
+        if let Some(ref reply_id) = message.in_reply_to {
+            builder = builder.in_reply_to(reply_id.clone());
+        }
+        let mut att_parts: Vec<(String, Vec<u8>, ContentType)> = Vec::new();
+        for att in &message.attachments {
+            let content_type = att
+                .mime_type
+                .as_deref()
+                .and_then(|m| ContentType::parse(m).ok())
+                .unwrap_or_else(|| {
+                    ContentType::parse("application/octet-stream").expect("hardcoded MIME type")
+                });
+            let att_data = resolve_attachment_data(&att.file_name, &att.data)?;
+            let att_name = std::path::Path::new(&att.file_name)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&att.file_name)
+                .to_string();
+            att_parts.push((att_name, att_data, content_type));
+        }
 
-            for att in &message.attachments {
-                let content_type = att
-                    .mime_type
-                    .as_deref()
-                    .and_then(|m| ContentType::parse(m).ok())
-                    .unwrap_or_else(|| {
-                        ContentType::parse("application/octet-stream").expect("hardcoded MIME type")
-                    });
-
-                let attachment =
-                    Attachment::new(att.file_name.clone()).body(att.data.clone(), content_type);
-
-                multipart = multipart.singlepart(attachment);
+        let email = if self.config.html_body {
+            let alt = MultiPart::alternative()
+                .singlepart(SinglePart::plain(body.to_string()))
+                .singlepart(SinglePart::html(markdown_to_html(body)));
+            if att_parts.is_empty() {
+                builder.multipart(alt)?
+            } else {
+                let mut mixed = MultiPart::mixed().multipart(alt);
+                for (name, data, ct) in att_parts {
+                    mixed = mixed.singlepart(Attachment::new(name).body(data, ct));
+                }
+                builder.multipart(mixed)?
             }
-
-            Message::builder()
-                .from(self.config.from_address.parse()?)
-                .to(message.recipient.parse()?)
-                .subject(subject)
-                .multipart(multipart)?
+        } else {
+            let plain = SinglePart::plain(body.to_string());
+            if att_parts.is_empty() {
+                builder.singlepart(plain)?
+            } else {
+                let mut mixed = MultiPart::mixed().singlepart(plain);
+                for (name, data, ct) in att_parts {
+                    mixed = mixed.singlepart(Attachment::new(name).body(data, ct));
+                }
+                builder.multipart(mixed)?
+            }
         };
 
         let transport = self.create_smtp_transport()?;
@@ -782,6 +813,31 @@ impl Channel for EmailChannel {
     }
 }
 
+/// Resolve the byte content of an attachment for sending.
+///
+/// # Trust boundary
+///
+/// `file_name` is treated as a file-system path **only** when `data` is empty.
+/// This fallback exists exclusively for internally constructed
+/// [`MediaAttachment`](zeroclaw_api::media::MediaAttachment) values whose
+/// bytes were intentionally omitted (e.g. created via
+/// [`MediaAttachment::from_file`](zeroclaw_api::media::MediaAttachment::from_file)
+/// after a round-trip through serialization).  Callers that build attachments
+/// from untrusted input — user messages, HTTP request bodies, or any external
+/// data source — **must** validate or constrain `file_name` before reaching
+/// this function; no additional path sanitization is applied here.
+///
+/// Read errors are propagated rather than silently suppressed.
+fn resolve_attachment_data(file_name: &str, data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    if data.is_empty() && std::path::Path::new(file_name).exists() {
+        std::fs::read(file_name).map_err(|e| {
+            anyhow::Error::msg(format!("failed to read attachment '{}': {}", file_name, e))
+        })
+    } else {
+        Ok(data.to_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     fn default_imap_port() -> u16 {
@@ -803,6 +859,71 @@ mod tests {
         25 * 1024 * 1024
     }
     use super::*;
+
+    // -- resolve_attachment_data tests --
+
+    #[test]
+    fn resolve_attachment_data_returns_provided_bytes_when_non_empty() {
+        let data = b"hello attachment".to_vec();
+        let result = resolve_attachment_data("ignored.bin", &data).unwrap();
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn resolve_attachment_data_falls_back_to_file_when_data_empty_and_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("att.txt");
+        std::fs::write(&path, b"file contents").unwrap();
+        let result = resolve_attachment_data(path.to_str().unwrap(), &[]).unwrap();
+        assert_eq!(result, b"file contents");
+    }
+
+    #[test]
+    fn resolve_attachment_data_returns_empty_when_data_empty_and_file_absent() {
+        // file_name does not exist on disk — should return empty vec, not error.
+        // Use a temp dir to guarantee the path does not exist, rather than a
+        // hard-coded /tmp path, for portability.
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("does-not-exist.bin");
+        let result = resolve_attachment_data(absent.to_str().unwrap(), &[]).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn resolve_attachment_data_propagates_read_error_on_unreadable_file() {
+        // Create a file, then make it unreadable (Unix only).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("locked.bin");
+            std::fs::write(&path, b"secret").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Permission enforcement is not guaranteed when running as root;
+            // skip rather than produce a false failure.  Reading from
+            // /proc/self/status is Linux-specific but that is where this test
+            // is most likely to run.  On other Unix systems the check falls
+            // back to the USER env var, which is a best-effort heuristic only.
+            #[cfg(target_os = "linux")]
+            let is_root = std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("Uid:"))
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .and_then(|uid| uid.parse::<u32>().ok())
+                })
+                .map(|uid| uid == 0)
+                .unwrap_or(false);
+            #[cfg(not(target_os = "linux"))]
+            let is_root = std::env::var("USER").map(|u| u == "root").unwrap_or(false);
+            if is_root {
+                return;
+            }
+            let result = resolve_attachment_data(path.to_str().unwrap(), &[]);
+            assert!(result.is_err());
+        }
+    }
 
     #[test]
     fn default_smtp_port_uses_tls_port() {
@@ -916,6 +1037,7 @@ mod tests {
             poll_interval_secs: 60,
             default_subject: "Custom Subject".to_string(),
             max_attachment_bytes: default_max_attachment_bytes(),
+            html_body: true,
             excluded_tools: vec![],
         };
         assert_eq!(config.imap_host, "imap.example.com");
@@ -943,6 +1065,7 @@ mod tests {
             poll_interval_secs: 60,
             default_subject: "Test Subject".to_string(),
             max_attachment_bytes: default_max_attachment_bytes(),
+            html_body: true,
             excluded_tools: vec![],
         };
         let cloned = config.clone();
@@ -1191,6 +1314,7 @@ mod tests {
             default_subject: "Serialization Test".to_string(),
             max_attachment_bytes: default_max_attachment_bytes(),
             excluded_tools: vec![],
+            html_body: true,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -1216,7 +1340,7 @@ mod tests {
         assert_eq!(config.smtp_port, 465); // default
         assert!(config.smtp_tls); // default
         assert_eq!(config.idle_timeout_secs, 1740); // default
-        assert_eq!(config.default_subject, "ZeroClaw Message"); // default
+        assert_eq!(config.default_subject, "Re: Message"); // default
     }
 
     #[test]
@@ -1324,6 +1448,40 @@ mod tests {
         let channel = EmailChannel::new(config, "email_test_alias", empty_resolver());
         let creds = channel.smtp_credentials();
         let expected = Credentials::new("smtp@example.com".to_string(), "smtp_pass".to_string());
+        assert_eq!(creds, expected);
+    }
+
+    #[test]
+    fn smtp_credentials_ignore_blank_dedicated_fields() {
+        let config = EmailConfig {
+            username: "shared@example.com".to_string(),
+            password: "shared_pass".to_string(),
+            smtp_username: Some("   ".to_string()),
+            smtp_password: Some("".to_string()),
+            ..Default::default()
+        };
+        let channel = EmailChannel::new(config, "email_test_alias", empty_resolver());
+        let creds = channel.smtp_credentials();
+        let expected =
+            Credentials::new("shared@example.com".to_string(), "shared_pass".to_string());
+        assert_eq!(creds, expected);
+    }
+
+    #[test]
+    fn smtp_credentials_preserve_nonblank_dedicated_fields() {
+        let config = EmailConfig {
+            username: "shared@example.com".to_string(),
+            password: "shared_pass".to_string(),
+            smtp_username: Some("  smtp@example.com  ".to_string()),
+            smtp_password: Some("  smtp_pass  ".to_string()),
+            ..Default::default()
+        };
+        let channel = EmailChannel::new(config, "email_test_alias", empty_resolver());
+        let creds = channel.smtp_credentials();
+        let expected = Credentials::new(
+            "  smtp@example.com  ".to_string(),
+            "  smtp_pass  ".to_string(),
+        );
         assert_eq!(creds, expected);
     }
 }

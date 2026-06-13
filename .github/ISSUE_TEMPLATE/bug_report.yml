@@ -20,6 +20,13 @@ body:
         - provider
         - channel
         - memory
+        - config/onboarding
+        - gateway/api
+        - web dashboard
+        - zerocode/tui
+        - tools
+        - plugins
+        - hardware/peripherals
         - security/sandbox
         - tooling/ci
         - docs
@@ -63,7 +70,7 @@ body:
       label: Steps to reproduce
       description: Please provide exact commands/config.
       placeholder: |
-        1. zeroclaw onboard
+        1. zeroclaw quickstart
         2. zeroclaw daemon
         3. Observe crash in logs
       render: bash

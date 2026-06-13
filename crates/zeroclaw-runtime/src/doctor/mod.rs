@@ -267,12 +267,13 @@ pub async fn run_models(
     config: &Config,
     provider_override: Option<&str>,
     _use_cache: bool,
+    show_model_names: bool,
 ) -> Result<()> {
     let targets = doctor_model_targets(config, provider_override);
 
     if targets.is_empty() {
         anyhow::bail!(
-            "No configured model_providers to probe — run `zeroclaw onboard model_providers` first"
+            "No configured model_providers to probe — run `zeroclaw quickstart` to set one up first"
         );
     }
 
@@ -298,6 +299,11 @@ pub async fn run_models(
             Ok(models) => {
                 ok_count += 1;
                 println!("    ✅ {} models", models.len());
+                if show_model_names && !models.is_empty() {
+                    for m in &models {
+                        println!("      • {}", m);
+                    }
+                }
                 matrix_rows.push((
                     provider_name.clone(),
                     ModelProbeOutcome::Ok,
@@ -494,74 +500,72 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         ));
     }
 
-    // ModelProvider validity (first configured model model_provider)
-    let primary_model_provider_doc = config.first_model_provider();
-    let primary_model_provider = config.first_model_provider_type();
-    if let Some(model_provider) = primary_model_provider {
-        if let Some(reason) = provider_validation_error(model_provider) {
-            items.push(DiagItem::error(
-                cat,
-                format!("model_provider \"{model_provider}\" is invalid: {reason}"),
-            ));
-        } else {
-            items.push(DiagItem::ok(
-                cat,
-                format!("model_provider \"{model_provider}\" is valid"),
-            ));
+    // ModelProvider validity — check each configured provider entry
+    {
+        let mut found_any = false;
+        for (family, alias, entry) in config.providers.models.iter_entries() {
+            found_any = true;
+            let label = format!("{family}.{alias}");
+            if let Some(reason) = provider_validation_error(family) {
+                items.push(DiagItem::error(
+                    cat,
+                    format!("model_provider \"{label}\" is invalid: {reason}"),
+                ));
+            } else {
+                items.push(DiagItem::ok(
+                    cat,
+                    format!("model_provider \"{label}\" is valid"),
+                ));
+            }
+
+            // API key presence
+            if family != "ollama" {
+                if entry.api_key.as_deref().is_some() {
+                    items.push(DiagItem::ok(cat, format!("{label}: API key configured")));
+                } else {
+                    items.push(DiagItem::warn(
+                        cat,
+                        format!("{label}: no api_key set (may rely on env vars or model_provider defaults)"),
+                    ));
+                }
+            }
+
+            // Model configured
+            if let Some(model) = entry.model.as_deref() {
+                items.push(DiagItem::ok(cat, format!("{label}: model: {model}")));
+            } else {
+                items.push(DiagItem::warn(cat, format!("{label}: no model configured")));
+            }
+
+            // Temperature range
+            match entry.temperature {
+                Some(temperature) if (0.0..=2.0).contains(&temperature) => {
+                    items.push(DiagItem::ok(
+                        cat,
+                        format!(
+                            "{label}: temperature {temperature:.1} (valid range 0.0\u{2013}2.0)"
+                        ),
+                    ));
+                }
+                Some(temperature) => {
+                    items.push(DiagItem::error(
+                        cat,
+                        format!(
+                            "{label}: temperature {temperature:.1} is out of range (expected 0.0\u{2013}2.0)"
+                        ),
+                    ));
+                }
+                None => {
+                    items.push(DiagItem::ok(
+                        cat,
+                        format!("{label}: temperature unset (provider default)"),
+                    ));
+                }
+            }
         }
-    } else {
-        items.push(DiagItem::error(cat, "no model model_provider configured"));
-    }
-
-    // API key presence
-    if primary_model_provider != Some("ollama") {
-        if primary_model_provider_doc
-            .and_then(|e| e.api_key.as_deref())
-            .is_some()
-        {
-            items.push(DiagItem::ok(cat, "API key configured"));
-        } else {
-            items.push(DiagItem::warn(
-                cat,
-                "no api_key set (may rely on env vars or model_provider defaults)",
-            ));
+        if !found_any {
+            items.push(DiagItem::error(cat, "no model providers configured"));
         }
-    }
-
-    // Model configured
-    let primary_model = primary_model_provider_doc.and_then(|e| e.model.as_deref());
-    if primary_model.is_some() {
-        items.push(DiagItem::ok(
-            cat,
-            format!("model: {}", primary_model.unwrap_or("?")),
-        ));
-    } else {
-        items.push(DiagItem::warn(
-            cat,
-            "no model configured on primary model_provider",
-        ));
-    }
-
-    // Temperature range
-    let primary_temperature = primary_model_provider_doc
-        .and_then(|e| e.temperature)
-        .unwrap_or(0.7);
-    if (0.0..=2.0).contains(&primary_temperature) {
-        items.push(DiagItem::ok(
-            cat,
-            format!(
-                "temperature {:.1} (valid range 0.0–2.0)",
-                primary_temperature
-            ),
-        ));
-    } else {
-        items.push(DiagItem::error(
-            cat,
-            format!(
-                "temperature {:.1} is out of range (expected 0.0–2.0)",
-                primary_temperature
-            ),
-        ));
     }
 
     // Gateway port range
@@ -644,6 +648,12 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
             ));
     }
 
+    // gateway.web_dist_dir: flag values that rely on shell expansion the
+    // gateway does not perform. Parallel check lives in
+    // `src/commands/self_test.rs::check_web_dist_dir`; keep the wording
+    // and predicate in sync.
+    check_web_dist_dir(config, items);
+
     // Channel: at least one configured
     let cc = &config.channels;
     let has_channel = cc.channels().iter().any(|info| info.configured);
@@ -653,7 +663,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     } else {
         items.push(DiagItem::warn(
             cat,
-            "no channels configured — run `zeroclaw onboard` to set one up",
+            "no channels configured — run `zeroclaw quickstart` to set one up",
         ));
     }
 
@@ -677,6 +687,49 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
                 ),
             ));
         }
+    }
+}
+
+/// Flag `gateway.web_dist_dir` values that rely on shell-style expansion
+/// (a leading `~` or any `$VAR` / `${VAR}`). The gateway reads this field
+/// verbatim and never invokes a shell, so values like `~/web-dist` or
+/// `$HOME/web-dist` resolve to literal on-disk paths and silently fail to
+/// find the bundled assets — surface that here at `zeroclaw doctor` time
+/// instead of at runtime. Parallel check lives in
+/// `src/commands/self_test.rs::check_web_dist_dir`.
+///
+/// User-facing message goes through Fluent
+/// (`cli-doctor-web-dist-dir-expansion-warning`) per AGENTS.md §
+/// Localization — no bare Rust literals for CLI output. Reason phrases
+/// are Fluent keys too (`cli-web-dist-dir-reason-{tilde,dollar}`).
+fn check_web_dist_dir(config: &Config, items: &mut Vec<DiagItem>) {
+    let cat = "config";
+    match config.gateway.web_dist_dir.as_deref() {
+        None => {}
+        Some(value) => match web_dist_dir_expansion_reason_key(value) {
+            None => {}
+            Some(reason_key) => {
+                let reason = crate::i18n::get_required_cli_string(reason_key);
+                let message = crate::i18n::get_required_cli_string_with_args(
+                    "cli-doctor-web-dist-dir-expansion-warning",
+                    &[("path", value), ("reason", reason.as_str())],
+                );
+                items.push(DiagItem::warn(cat, message));
+            }
+        },
+    }
+}
+
+/// Return the Fluent reason key when `value` looks like it expects
+/// shell expansion the gateway will not perform. `None` means the value
+/// is a literal path that the gateway can resolve as-is.
+fn web_dist_dir_expansion_reason_key(value: &str) -> Option<&'static str> {
+    if value.starts_with('~') {
+        Some("cli-web-dist-dir-reason-tilde")
+    } else if value.contains('$') {
+        Some("cli-web-dist-dir-reason-dollar")
+    } else {
+        None
     }
 }
 
@@ -779,25 +832,43 @@ fn check_workspace(config: &Config, items: &mut Vec<DiagItem>) {
         }
     }
 
-    // Key workspace files
-    check_file_exists(ws, "SOUL.md", false, cat, items);
-    check_file_exists(ws, "AGENTS.md", false, cat, items);
+    // Per-agent personality files. These are resolved per agent from
+    // `<install>/agents/<alias>/workspace/` (or an explicit
+    // `[agents.<alias>.workspace.path]` override) — never from `data_dir`.
+    // Iterate every enabled agent so multi-agent installs each get checked,
+    // and name the alias in the result so the report is unambiguous. Sorted
+    // for deterministic output (HashMap iteration order is unspecified).
+    let mut agent_aliases: Vec<&String> = config.agents.keys().collect();
+    agent_aliases.sort();
+    for alias in agent_aliases {
+        let agent = config.agents.get(alias).expect("alias from keys()");
+        if !agent.enabled {
+            continue;
+        }
+        let agent_ws = config.agent_workspace_dir(alias);
+        check_agent_file(&agent_ws, "SOUL.md", alias, cat, items);
+        check_agent_file(&agent_ws, "AGENTS.md", alias, cat, items);
+    }
 }
 
-fn check_file_exists(
-    base: &Path,
+/// Existence check for an optional per-agent workspace file. Prefixes the
+/// owning agent alias as `[alias]` so a multi-agent report stays legible and
+/// `(optional)` keeps its single, consistent meaning as the severity hint
+/// (e.g. `[default] SOUL.md present`, `[default] AGENTS.md not found (optional)`).
+fn check_agent_file(
+    workspace_dir: &Path,
     name: &str,
-    required: bool,
+    alias: &str,
     cat: &'static str,
     items: &mut Vec<DiagItem>,
 ) {
-    let path = base.join(name);
-    if path.is_file() {
-        items.push(DiagItem::ok(cat, format!("{name} present")));
-    } else if required {
-        items.push(DiagItem::error(cat, format!("{name} missing")));
+    if workspace_dir.join(name).is_file() {
+        items.push(DiagItem::ok(cat, format!("[{alias}] {name} present")));
     } else {
-        items.push(DiagItem::warn(cat, format!("{name} not found (optional)")));
+        items.push(DiagItem::warn(
+            cat,
+            format!("[{alias}] {name} not found (optional)"),
+        ));
     }
 }
 
@@ -1110,9 +1181,9 @@ mod tests {
     #[test]
     fn config_validation_catches_bad_temperature() {
         // Single model_provider entry with an out-of-range temperature so the
-        // doctor's `first_model_provider()` lookup deterministically picks it
+        // doctor's `iter_entries()` walk deterministically finds it
         // (HashMap iteration order is unspecified — multiple entries
-        // produce a coin-flip first pick).
+        // produce a coin-flip iteration order).
         let mut config = Config::default();
         config
             .providers
@@ -1189,7 +1260,7 @@ mod tests {
     #[test]
     fn config_validation_catches_unknown_provider() {
         // Typed slots can only hold canonical family names, so an unknown
-        // family can no longer reach `first_model_provider_type()`. The
+        // family can no longer reach `iter_entries()`. The
         // remaining reachable path is `agent.model_provider`, which is a
         // free-form `String` an operator can set to any dotted ref.
         let mut config = Config::default();
@@ -1336,6 +1407,201 @@ mod tests {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with(".zeroclaw_doctor_probe_"))
         );
+    }
+
+    /// Build a Config whose install root is `root`, with an existing
+    /// `data_dir` (so `check_workspace` doesn't early-return) and no agents.
+    /// `config_path` anchors `install_root_dir()` → `agent_workspace_dir()`.
+    fn workspace_test_config(root: &Path) -> Config {
+        let mut config = Config {
+            config_path: root.join("config.toml"),
+            data_dir: root.join("data"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.agents.clear();
+        config
+    }
+
+    fn add_enabled_agent(config: &mut Config, alias: &str) {
+        config.agents.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn check_workspace_finds_soul_in_agent_workspace_not_data_dir() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = workspace_test_config(tmp.path());
+        add_enabled_agent(&mut config, "default");
+
+        // SOUL.md lives in the agent workspace — the real load location.
+        let ws = config.agent_workspace_dir("default");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("SOUL.md"), b"# soul").unwrap();
+        // A decoy in data_dir must NOT satisfy the check (proves we don't
+        // probe data_dir for personality files).
+        std::fs::write(config.data_dir.join("SOUL.md"), b"# decoy").unwrap();
+
+        let mut items = Vec::new();
+        check_workspace(&config, &mut items);
+
+        let soul = items
+            .iter()
+            .find(|i| i.message.contains("SOUL.md"))
+            .expect("SOUL.md diagnostic present");
+        assert_eq!(soul.severity, Severity::Ok);
+        assert_eq!(soul.message, "[default] SOUL.md present");
+        // No bare data_dir-style message ever surfaces.
+        assert!(
+            !items.iter().any(|i| i.message == "SOUL.md present"),
+            "doctor must not report SOUL.md from data_dir"
+        );
+    }
+
+    #[test]
+    fn check_workspace_warns_when_agent_soul_missing() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = workspace_test_config(tmp.path());
+        add_enabled_agent(&mut config, "default");
+        // Workspace dir need not exist; the file simply isn't there.
+
+        let mut items = Vec::new();
+        check_workspace(&config, &mut items);
+
+        let soul = items
+            .iter()
+            .find(|i| i.message.contains("SOUL.md"))
+            .expect("SOUL.md diagnostic present");
+        assert_eq!(soul.severity, Severity::Warn);
+        assert_eq!(soul.message, "[default] SOUL.md not found (optional)");
+    }
+
+    #[test]
+    fn check_workspace_skips_disabled_agents() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = workspace_test_config(tmp.path());
+        config.agents.insert(
+            "dormant".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+
+        let mut items = Vec::new();
+        check_workspace(&config, &mut items);
+
+        assert!(
+            !items.iter().any(|i| i.message.contains("dormant")),
+            "disabled agents must not produce workspace-file diagnostics"
+        );
+    }
+
+    #[test]
+    fn check_workspace_checks_each_enabled_agent() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = workspace_test_config(tmp.path());
+        add_enabled_agent(&mut config, "alpha");
+        add_enabled_agent(&mut config, "zeta");
+
+        let mut items = Vec::new();
+        check_workspace(&config, &mut items);
+
+        // Each enabled agent gets its own SOUL.md + AGENTS.md probe, named.
+        let messages: Vec<&str> = items.iter().map(|i| i.message.as_str()).collect();
+        for alias in ["alpha", "zeta"] {
+            let expected = format!("[{alias}] SOUL.md not found (optional)");
+            assert!(
+                messages.contains(&expected.as_str()),
+                "expected per-agent SOUL.md diagnostic for {alias}; got {messages:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn diagnose_flags_web_dist_dir_with_tilde() {
+        // Asserts the localized Fluent message resolves and inlines the path +
+        // the tilde reason — the diagnostic now goes through Fluent per
+        // AGENTS.md (#6961 Round 3).
+        let mut config = Config::default();
+        config.gateway.web_dist_dir = Some("~/web-dist".to_string());
+
+        let expected_reason = crate::i18n::get_required_cli_string("cli-web-dist-dir-reason-tilde");
+        let expected_message = crate::i18n::get_required_cli_string_with_args(
+            "cli-doctor-web-dist-dir-expansion-warning",
+            &[("path", "~/web-dist"), ("reason", expected_reason.as_str())],
+        );
+
+        let results = diagnose(&config);
+        let hit = results
+            .iter()
+            .find(|item| item.category == "config" && item.message == expected_message);
+        assert!(
+            hit.is_some(),
+            "doctor should flag web_dist_dir = \"~/web-dist\" with the localized warning; \
+             expected message: {expected_message:?}; got: {results:?}"
+        );
+        assert_eq!(hit.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn diagnose_flags_web_dist_dir_with_env_var() {
+        let mut config = Config::default();
+        config.gateway.web_dist_dir = Some("$HOME/web-dist".to_string());
+
+        let expected_reason =
+            crate::i18n::get_required_cli_string("cli-web-dist-dir-reason-dollar");
+        let expected_message = crate::i18n::get_required_cli_string_with_args(
+            "cli-doctor-web-dist-dir-expansion-warning",
+            &[
+                ("path", "$HOME/web-dist"),
+                ("reason", expected_reason.as_str()),
+            ],
+        );
+
+        let results = diagnose(&config);
+        let hit = results
+            .iter()
+            .find(|item| item.category == "config" && item.message == expected_message);
+        assert!(hit.is_some());
+        assert_eq!(hit.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn diagnose_accepts_literal_web_dist_dir() {
+        let mut config = Config::default();
+        config.gateway.web_dist_dir = Some("/srv/zeroclaw/web-dist".to_string());
+
+        let results = diagnose(&config);
+        assert!(
+            !results
+                .iter()
+                .any(|item| item.message.contains("gateway.web_dist_dir")),
+            "literal web_dist_dir paths should produce no doctor diagnostic"
+        );
+    }
+
+    #[test]
+    fn web_dist_dir_expansion_reason_key_detects_tilde_and_env() {
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("~/web-dist"),
+            Some("cli-web-dist-dir-reason-tilde")
+        );
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("$HOME/web-dist"),
+            Some("cli-web-dist-dir-reason-dollar")
+        );
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("${HOME}/web-dist"),
+            Some("cli-web-dist-dir-reason-dollar")
+        );
+        assert!(web_dist_dir_expansion_reason_key("/srv/zeroclaw/web-dist").is_none());
+        assert!(web_dist_dir_expansion_reason_key("./dist").is_none());
     }
 
     #[test]

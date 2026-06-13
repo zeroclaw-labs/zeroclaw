@@ -37,7 +37,7 @@ pub(crate) const BASE_URL: &str = "https://api.telnyx.com/v2/ai";
 /// let response = model_provider.chat("Hello!", "openai/gpt-4o", 0.7).await?;
 /// ```
 pub struct TelnyxModelProvider {
-    /// `[model_providers.telnyx.<alias>]` config-key alias.
+    /// `[providers.models.telnyx.<alias>]` config-key alias.
     alias: String,
     /// Telnyx API key
     api_key: Option<String>,
@@ -125,7 +125,8 @@ struct ModelInfo {
 struct ChatRequest {
     model: String,
     messages: Vec<Message>,
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -164,7 +165,6 @@ impl ModelProvider for TelnyxModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let api_key = self.api_key.as_ref().ok_or_else(|| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -174,7 +174,7 @@ impl ModelProvider for TelnyxModelProvider {
                 "telnyx: API key not configured"
             );
             anyhow::Error::msg(
-                "Telnyx API key not set. Set TELNYX_API_KEY environment variable or run `zeroclaw onboard`.",
+                "Telnyx API key not set. Set TELNYX_API_KEY environment variable or run `zeroclaw quickstart --model-provider telnyx --api-key <key>`.",
             )
         })?;
 
@@ -238,7 +238,6 @@ impl ModelProvider for TelnyxModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let api_key = self.api_key.as_ref().ok_or_else(|| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -248,7 +247,7 @@ impl ModelProvider for TelnyxModelProvider {
                 "telnyx: API key not configured"
             );
             anyhow::Error::msg(
-                "Telnyx API key not set. Set TELNYX_API_KEY environment variable or run `zeroclaw onboard`.",
+                "Telnyx API key not set. Set TELNYX_API_KEY environment variable or run `zeroclaw quickstart --model-provider telnyx --api-key <key>`.",
             )
         })?;
 
@@ -404,7 +403,7 @@ mod tests {
                     content: "Hello".to_string(),
                 },
             ],
-            temperature: 0.7,
+            temperature: Some(0.7),
         };
 
         let json = serde_json::to_string(&req).unwrap();

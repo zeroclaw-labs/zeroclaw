@@ -16,13 +16,18 @@ export interface AgentSummary {
   /** Cron alias list from `[agents.<alias>].cron_jobs`. */
   cronJobs: string[];
   /** Peer-group aliases this agent appears in (reverse-resolved by
-   * walking `[peer-groups.<alias>].agents`). */
+   * walking `[peer_groups.<alias>].agents`). */
   peerGroups: string[];
   sessionCount: number;
   lastActivity: string | null;
   monthCostUsd: number | null;
   /** Persisted memory rows attributed to this agent via `agent_alias`. */
   memoryCount: number;
+}
+
+export interface AgentPickerSummary {
+  alias: string;
+  enabled: boolean;
 }
 
 function entryValue(entry: { populated?: boolean; value?: unknown }): unknown {
@@ -66,16 +71,16 @@ export async function loadAgentSummaries(): Promise<AgentSummary[]> {
   const costPromise = getCost().catch(() => null);
   const memoriesPromise = getMemory().catch(() => []);
 
-  // Reverse-build agent → peer-groups in parallel with the per-agent walks.
-  // listProps('peer-groups.<alias>.agents') is the field that names members.
-  const peerGroupsPromise = getMapKeys('peer-groups')
+  // Reverse-build agent → peer_groups in parallel with the per-agent walks.
+  // listProps('peer_groups.<alias>.agents') is the field that names members.
+  const peerGroupsPromise = getMapKeys('peer_groups')
     .then(async ({ keys: pgKeys }) => {
       const memberships: Record<string, string[]> = {};
       await Promise.all(
         pgKeys.map(async (pg) => {
-          const { entries } = await listProps(`peer-groups.${pg}`);
+          const { entries } = await listProps(`peer_groups.${pg}`);
           const agentsEntry = entries.find(
-            (e) => e.path === `peer-groups.${pg}.agents`,
+            (e) => e.path === `peer_groups.${pg}.agents`,
           );
           for (const a of entryAsStringArray(agentsEntry)) {
             (memberships[a] ||= []).push(pg);
@@ -100,15 +105,15 @@ export async function loadAgentSummaries(): Promise<AgentSummary[]> {
       return {
         alias,
         enabled: entryValue(lookup('enabled') ?? { populated: false }) === 'true',
-        modelProvider: stringField('model-provider'),
+        modelProvider: stringField('model_provider'),
         channels: entryAsStringArray(lookup('channels')),
-        riskProfile: stringField('risk-profile'),
-        runtimeProfile: stringField('runtime-profile'),
+        riskProfile: stringField('risk_profile'),
+        runtimeProfile: stringField('runtime_profile'),
         memoryBackend: stringField('memory.backend'),
-        skillBundles: entryAsStringArray(lookup('skill-bundles')),
-        knowledgeBundles: entryAsStringArray(lookup('knowledge-bundles')),
-        mcpBundles: entryAsStringArray(lookup('mcp-bundles')),
-        cronJobs: entryAsStringArray(lookup('cron-jobs')),
+        skillBundles: entryAsStringArray(lookup('skill_bundles')),
+        knowledgeBundles: entryAsStringArray(lookup('knowledge_bundles')),
+        mcpBundles: entryAsStringArray(lookup('mcp_bundles')),
+        cronJobs: entryAsStringArray(lookup('cron_jobs')),
         peerGroups: [],
         sessionCount: 0,
         lastActivity: null,
@@ -145,6 +150,27 @@ export async function loadAgentSummaries(): Promise<AgentSummary[]> {
   }
 
   return summaries;
+}
+
+/**
+ * Load the minimum agent data needed for route-level agent pickers. Keep this
+ * separate from loadAgentSummaries(), which intentionally gathers dashboard
+ * sessions, cost, memory, and peer-group data.
+ */
+export async function loadAgentPickerSummaries(): Promise<AgentPickerSummary[]> {
+  const { keys } = await getMapKeys('agents');
+  if (keys.length === 0) return [];
+
+  return Promise.all(
+    keys.map(async (alias): Promise<AgentPickerSummary> => {
+      const { entries } = await listProps(`agents.${alias}`);
+      const enabled = entries.find((entry) => entry.path === `agents.${alias}.enabled`);
+      return {
+        alias,
+        enabled: entryValue(enabled ?? { populated: false }) === 'true',
+      };
+    }),
+  );
 }
 
 /** Flip the `enabled` flag for one agent via a JSON-Patch replace. */

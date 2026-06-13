@@ -288,7 +288,7 @@ impl NextcloudTalkChannel {
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({"actor_id": actor_id})),
-                "Talk: ignoring message from unauthorized actor: . Add to channels.nextcloud_talk.allowed_users in config.toml, or run `zeroclaw onboard --channels-only` to configure interactively."
+                "Talk: ignoring message from unauthorized actor: . Add to channels.nextcloud_talk.allowed_users in config.toml, or run `zeroclaw config set channels.nextcloud_talk.allowed-users='[\"<user-id>\"]'`."
             );
             return messages;
         }
@@ -330,6 +330,7 @@ impl NextcloudTalkChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         });
 
         messages
@@ -414,7 +415,7 @@ impl NextcloudTalkChannel {
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({"actor_id": actor_id})),
-                "Talk: ignoring message from unauthorized actor: . Add to channels.nextcloud_talk.allowed_users in config.toml, or run `zeroclaw onboard --channels-only` to configure interactively."
+                "Talk: ignoring message from unauthorized actor: . Add to channels.nextcloud_talk.allowed_users in config.toml, or run `zeroclaw config set channels.nextcloud_talk.allowed-users='[\"<user-id>\"]'`."
             );
             return messages;
         }
@@ -473,6 +474,7 @@ impl NextcloudTalkChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         });
 
         messages

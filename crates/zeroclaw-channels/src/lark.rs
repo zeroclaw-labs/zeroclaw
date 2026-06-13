@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
@@ -9,53 +10,36 @@ use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_config::schema::StreamMode;
 
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";
 const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
 const LARK_BASE_URL: &str = "https://open.larksuite.com/open-apis";
 const LARK_WS_BASE_URL: &str = "https://open.larksuite.com";
 
-const LARK_ACK_REACTIONS_ZH_CN: &[&str] = &[
-    "OK", "JIAYI", "APPLAUSE", "THUMBSUP", "MUSCLE", "SMILE", "DONE",
-];
-const LARK_ACK_REACTIONS_ZH_TW: &[&str] = &[
-    "OK",
-    "JIAYI",
-    "APPLAUSE",
-    "THUMBSUP",
-    "FINGERHEART",
-    "SMILE",
-    "DONE",
-];
-const LARK_ACK_REACTIONS_EN: &[&str] = &[
-    "OK",
-    "THUMBSUP",
-    "THANKS",
-    "MUSCLE",
-    "FINGERHEART",
-    "APPLAUSE",
-    "SMILE",
-    "DONE",
-];
-const LARK_ACK_REACTIONS_JA: &[&str] = &[
-    "OK",
-    "THUMBSUP",
-    "THANKS",
-    "MUSCLE",
-    "FINGERHEART",
-    "APPLAUSE",
-    "SMILE",
-    "DONE",
-];
-
 const MAX_LARK_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LarkAckLocale {
-    ZhCn,
-    ZhTw,
-    En,
-    Ja,
+/// Map a unicode emoji used by generic callers of [`Channel::add_reaction`]
+/// (e.g. Reply-Intent Precheck, no-reply ack heuristics) to a Lark/Feishu
+/// `emoji_type` name recognised by the
+/// `POST /im/v1/messages/{id}/reactions` API.
+///
+/// Returns `None` when no mapping exists; callers should treat that as a
+/// best-effort skip rather than an error. The whitelist intentionally
+/// covers only the unicode emojis emitted by the inbound-ack policy and
+/// related no-reply heuristics today; extend as new callers appear.
+fn unicode_to_lark_emoji_type(emoji: &str) -> Option<&'static str> {
+    match emoji {
+        "👍" => Some("THUMBSUP"),
+        "🚫" => Some("No"),
+        "⚠️" => Some("Alarm"),
+        "👀" => Some("GLANCE"),
+        "✅" => Some("DONE"),
+        "✔️" => Some("DONE"),
+        "❤️" => Some("HEART"),
+        "🎉" => Some("PARTY"),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,8 +214,8 @@ const LARK_DRAFT_RATE_LIMIT_CODE: i64 = 230_020;
 /// Lark card payloads have a ~30 KB limit; leave margin for JSON envelope.
 const LARK_CARD_MARKDOWN_MAX_BYTES: usize = 28_000;
 
-/// Maximum image size we will download and inline (5 MiB).
-const LARK_IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
+/// Maximum image size we will download and inline (10 MiB).
+const LARK_IMAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
 
 /// Maximum file size we will download and present as text (512 KiB).
 const LARK_FILE_MAX_BYTES: usize = 512 * 1024;
@@ -351,6 +335,9 @@ fn build_resolved_approval_card(
         ChannelApprovalResponse::Approve => ("✅", "Approved", "green"),
         ChannelApprovalResponse::AlwaysApprove => ("✅✅", "Approved (always)", "green"),
         ChannelApprovalResponse::Deny => ("❌", "Denied", "red"),
+        ChannelApprovalResponse::DenyWithEdit { .. } => {
+            unreachable!("DenyWithEdit is only valid for ACP channels")
+        }
     };
 
     serde_json::json!({
@@ -451,6 +438,32 @@ fn build_interactive_card_body(recipient: &str, markdown: &str) -> serde_json::V
         "msg_type": "interactive",
         "content": build_card_content(markdown),
     })
+}
+
+/// Truncate streaming-draft markdown to fit `LARK_CARD_MARKDOWN_MAX_BYTES`.
+///
+/// When the accumulated content is small, returns it unchanged. When it
+/// exceeds the budget we cut at the last UTF-8 boundary that still leaves
+/// room for an `…_(updating)_` suffix, so the user sees a visible signal
+/// that the card was clipped while updates continue.
+fn truncate_card_markdown(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let suffix = "\n\n…_(updating)_";
+    let budget = max_bytes.saturating_sub(suffix.len());
+    let mut end = 0;
+    for (idx, ch) in text.char_indices() {
+        let next = idx + ch.len_utf8();
+        if next > budget {
+            break;
+        }
+        end = next;
+    }
+    let mut out = String::with_capacity(end + suffix.len());
+    out.push_str(&text[..end]);
+    out.push_str(suffix);
+    out
 }
 
 /// Split markdown content into chunks that fit within the card size limit.
@@ -609,9 +622,48 @@ pub struct LarkChannel {
     /// Populated by `request_approval`, drained by `handle_card_action_event`.
     pending_approvals: Arc<tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>>,
     /// Seconds to wait for the user's button click before auto-denying.
-    /// Currently hard-coded to 120; lift to `LarkConfig` when a use case
-    /// for per-channel overrides arises.
+    /// Set by the orchestrator from
+    /// `[channels.lark.<alias>].approval_timeout_secs` via
+    /// [`Self::with_approval_timeout_secs`]. Schema default is 300s
+    /// (matches the channel-wide standard used by Telegram, Discord, etc.);
+    /// `LarkChannel::new()` seeds 120 as a conservative fallback for the
+    /// rare construction path that bypasses the builder.
     approval_timeout_secs: u64,
+    /// When `true`, [`Self::resolve_sender`] keys group-chat sessions on the
+    /// sending user's `open_id` instead of the group's `chat_id`. Default
+    /// `false` preserves the existing shared-session behavior. Set via
+    /// [`Self::with_per_user_session`] from
+    /// `[channels.lark.<alias>].per_user_session`.
+    per_user_session: bool,
+    /// Cache of `(message_id, unicode_emoji) -> reaction_id` populated by
+    /// `add_reaction` so a subsequent `remove_reaction` call can issue
+    /// `DELETE /im/v1/messages/{message_id}/reactions/{reaction_id}`
+    /// without first re-listing reactions on the message.
+    ///
+    /// Lifetime: process-local, lost on restart. Reactions added before a
+    /// restart are unreachable (acceptable degradation — by then the user
+    /// has scrolled past those messages). The cached value is a Feishu
+    /// API-returned token (runtime state), not a duplicate of any config
+    /// field; SSOT does not apply.
+    reaction_ids: Arc<tokio::sync::Mutex<std::collections::HashMap<(String, String), String>>>,
+    /// Controls progressive draft-card streaming. `Off` (default) routes
+    /// every response through `send()`; `Partial` opens a draft card and
+    /// edits it incrementally via `update_draft` / `finalize_draft`.
+    /// Set by the orchestrator from `[channels.lark.<alias>].stream_mode`
+    /// via [`Self::with_streaming`].
+    stream_mode: StreamMode,
+    /// Minimum interval between consecutive PATCH edits of the same draft
+    /// card. Tunes to Feishu's 5 QPS per-message cap. Set by the
+    /// orchestrator from `[channels.lark.<alias>].draft_update_interval_ms`
+    /// via [`Self::with_streaming`].
+    draft_update_interval_ms: u64,
+    /// Per-`message_id` timestamp of the last successful PATCH. Reads /
+    /// writes are guarded by an async mutex so concurrent token streams
+    /// cooperate on the same draft without racing the rate-limit window.
+    /// Runtime state (not a config duplicate per SSOT) — bounded by the
+    /// number of in-flight drafts; entries are removed by `finalize_draft`
+    /// and `cancel_draft`.
+    last_draft_edit: Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
     #[cfg(test)]
     api_base_override: Option<String>,
 }
@@ -672,6 +724,11 @@ impl LarkChannel {
             transcription_manager: None,
             pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             approval_timeout_secs: 120,
+            per_user_session: false,
+            reaction_ids: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            stream_mode: StreamMode::Off,
+            draft_update_interval_ms: 1000,
+            last_draft_edit: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             #[cfg(test)]
             api_base_override: None,
         }
@@ -702,6 +759,69 @@ impl LarkChannel {
         ch.receive_mode = config.receive_mode.clone();
         ch.proxy_url = config.proxy_url.clone();
         ch
+    }
+
+    /// Override the default approval timeout (300s) — set by the
+    /// orchestrator from `[channels.lark.<alias>].approval_timeout_secs`.
+    pub fn with_approval_timeout_secs(mut self, secs: u64) -> Self {
+        self.approval_timeout_secs = secs;
+        self
+    }
+
+    /// Configure whether group-chat sessions key on the sender's `open_id`
+    /// (per-user isolation) or on `chat_id` (shared session). No effect on
+    /// 1-on-1 chats (where `chat_id` is already unique per user-bot pair).
+    /// Set by the orchestrator from `[channels.lark.<alias>].per_user_session`.
+    pub fn with_per_user_session(mut self, enabled: bool) -> Self {
+        self.per_user_session = enabled;
+        self
+    }
+
+    /// Configure progressive draft-card streaming. `stream_mode = Off`
+    /// (default) keeps the existing behavior; `Partial` opens a Feishu
+    /// interactive card via `send_draft`, edits it via `update_draft`
+    /// (rate-limited to `draft_update_interval_ms`), and commits via
+    /// `finalize_draft`. Mirrors the `TelegramChannel::with_streaming`
+    /// builder pattern; set by the orchestrator from
+    /// `[channels.lark.<alias>].{stream_mode, draft_update_interval_ms}`.
+    pub fn with_streaming(
+        mut self,
+        stream_mode: StreamMode,
+        draft_update_interval_ms: u64,
+    ) -> Self {
+        let effective_stream_mode = match stream_mode {
+            StreamMode::MultiMessage => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,),
+                    "lark: stream_mode=multi_message is not supported by Feishu's editable-card surface; falling back to off (no draft streaming). Use stream_mode=partial for incremental card edits."
+                );
+                StreamMode::Off
+            }
+            other => other,
+        };
+        self.stream_mode = effective_stream_mode;
+        self.draft_update_interval_ms = draft_update_interval_ms;
+        self
+    }
+
+    /// Decide which key to use as the [`ChannelMessage::sender`] field for
+    /// an inbound message. When `per_user_session = true`, returns the
+    /// sender's `open_id`, falling back to `chat_id` whenever the platform
+    /// omits the `open_id` (e.g. composer / edit events) or passes an empty
+    /// string. When `per_user_session = false` (default), always returns
+    /// `chat_id`, so every message in a chat shares the same agent session.
+    /// Pure function: no I/O, lifetime-bound to the inputs so callers can
+    /// avoid an extra `to_string()` until the final assembly.
+    fn resolve_sender<'a>(&self, chat_id: &'a str, sender_open_id: Option<&'a str>) -> &'a str {
+        if self.per_user_session {
+            match sender_open_id {
+                Some(oid) if !oid.is_empty() => oid,
+                _ => chat_id,
+            }
+        } else {
+            chat_id
+        }
     }
 
     pub fn with_transcription(
@@ -787,8 +907,18 @@ impl LarkChannel {
         format!("{}/im/v1/messages/{message_id}/reactions", self.api_base())
     }
 
-    fn image_download_url(&self, image_key: &str) -> String {
-        format!("{}/im/v1/images/{image_key}", self.api_base())
+    fn delete_message_reaction_url(&self, message_id: &str, reaction_id: &str) -> String {
+        format!(
+            "{}/im/v1/messages/{message_id}/reactions/{reaction_id}",
+            self.api_base()
+        )
+    }
+
+    fn image_resource_url(&self, message_id: &str, image_key: &str) -> String {
+        format!(
+            "{}/im/v1/messages/{message_id}/resources/{image_key}?type=image",
+            self.api_base()
+        )
     }
 
     fn file_download_url(&self, message_id: &str, file_key: &str) -> String {
@@ -834,80 +964,6 @@ impl LarkChannel {
             .await?;
 
         Ok(response)
-    }
-
-    /// Best-effort "received" signal for incoming messages.
-    /// Failures are logged and never block normal message handling.
-    async fn try_add_ack_reaction(&self, message_id: &str, emoji_type: &str) {
-        if message_id.is_empty() {
-            return;
-        }
-
-        let mut token = match self.get_tenant_access_token().await {
-            Ok(token) => token,
-            Err(err) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
-                    "failed to fetch token for reaction"
-                );
-                return;
-            }
-        };
-
-        let mut retried = false;
-        loop {
-            let response = match self
-                .post_message_reaction_with_token(message_id, &token, emoji_type)
-                .await
-            {
-                Ok(resp) => resp,
-                Err(err) => {
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", err), "message_id": message_id})), "failed to add reaction for");
-                    return;
-                }
-            };
-
-            if response.status().as_u16() == 401 && !retried {
-                self.invalidate_token().await;
-                token = match self.get_tenant_access_token().await {
-                    Ok(new_token) => new_token,
-                    Err(err) => {
-                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"message_id": message_id, "err": err.to_string()})), "failed to refresh token for reaction on");
-                        return;
-                    }
-                };
-                retried = true;
-                continue;
-            }
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let err_body = response.text().await.unwrap_or_default();
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"message_id": message_id, "status": status.to_string(), "err_body": err_body})), "add reaction failed for : status=, body=");
-                return;
-            }
-
-            let payload: serde_json::Value = match response.json().await {
-                Ok(v) => v,
-                Err(err) => {
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", err), "message_id": message_id})), "add reaction decode failed for");
-                    return;
-                }
-            };
-
-            let code = payload.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-            if code != 0 {
-                let msg = payload
-                    .get("msg")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown error");
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"code": code.to_string(), "message_id": message_id, "msg": msg.to_string()})), "add reaction returned code= for");
-            }
-            return;
-        }
     }
 
     /// POST /callback/ws/endpoint → (wss_url, client_config)
@@ -1191,7 +1247,7 @@ impl LarkChannel {
                                 Some(k) => k.to_string(),
                                 None => { ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "WS: image message missing image_key"); continue; }
                             };
-                            match self.download_image_as_marker(&image_key).await {
+                            match self.download_image_as_marker(&lark_msg.message_id, &image_key).await {
                                 Some(marker) => (marker, Vec::new()),
                                 None => {
                                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"image_key": image_key})), "WS: failed to download image");
@@ -1256,19 +1312,58 @@ impl LarkChannel {
                         continue;
                     }
 
-                    let ack_emoji =
-                        random_lark_ack_reaction(Some(&event_payload), &text).to_string();
+                    // Inbound fast-ack: spawn the 👀 reaction immediately so the
+                    // user sees a "received" signal within ~100ms instead of
+                    // waiting for the orchestrator's classifier/memory/streaming
+                    // pipeline (which can take several seconds before the generic
+                    // Channel::add_reaction call would otherwise fire).
+                    //
+                    // CRITICAL: this spawn MUST go through the trait
+                    // `Channel::add_reaction` so that Feishu's returned
+                    // reaction_id is written into the shared `reaction_ids`
+                    // cache. The trait impl also has a cache-hit dedupe
+                    // fast-path, so the later generic orchestrator call to
+                    // add_reaction("👀") becomes a no-op instead of a duplicate
+                    // POST. This is the "same cached reaction-id contract"
+                    // requested by the PR review: fast-ack and generic path
+                    // share a single cache, so `remove_reaction("👀")` always
+                    // finds the right reaction_id and no orphan 👀 is left
+                    // beside the completion marker. See lifecycle regression
+                    // tests `lark_inbound_ack_lifecycle_*` and
+                    // `lark_fast_ack_and_generic_path_dedupe_on_cache_hit`.
                     let reaction_channel = self.clone();
                     let reaction_message_id = lark_msg.message_id.clone();
-                    tokio::spawn(async move {
-                        reaction_channel
-                            .try_add_ack_reaction(&reaction_message_id, &ack_emoji)
-                            .await;
+                    let reaction_reply_target = lark_msg.chat_id.clone();
+                    zeroclaw_spawn::spawn!(async move {
+                        if let Err(e) = <LarkChannel as Channel>::add_reaction(
+                            &reaction_channel,
+                            &reaction_reply_target,
+                            &reaction_message_id,
+                            "\u{1F440}",
+                        )
+                        .await
+                        {
+                            ::zeroclaw_log::record!(
+                                DEBUG,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note,
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "message_id": reaction_message_id,
+                                    "error": format!("{e}"),
+                                    "error_key": "lark.inbound_fast_ack.failed",
+                                })),
+                                "Lark inbound fast-ack failed (soft)"
+                            );
+                        }
                     });
 
                     let channel_msg = ChannelMessage {
-                        id: Uuid::new_v4().to_string(),
-                        sender: lark_msg.chat_id.clone(),
+                        id: lark_msg.message_id.clone(),
+                        sender: self
+                            .resolve_sender(&lark_msg.chat_id, Some(sender_open_id))
+                            .to_string(),
                         reply_target: lark_msg.chat_id.clone(),
                         content: text,
                         channel: self.channel_name().to_string(),
@@ -1280,6 +1375,7 @@ impl LarkChannel {
                         thread_ts: None,
                         interruption_scope_id: None,
                     attachments: vec![],
+                        subject: None,
                     };
 
                     ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WS: message in {}", lark_msg.chat_id));
@@ -1367,119 +1463,137 @@ impl LarkChannel {
     }
 
     /// Download an image from the Lark API and return an `[IMAGE:data:...]` marker string.
-    async fn download_image_as_marker(&self, image_key: &str) -> Option<String> {
-        let token = match self.get_tenant_access_token().await {
-            Ok(t) => t,
-            Err(e) => {
+    async fn download_image_as_marker(&self, message_id: &str, image_key: &str) -> Option<String> {
+        let url = self.image_resource_url(message_id, image_key);
+        let mut retried_token = false;
+
+        loop {
+            let token = match self.get_tenant_access_token().await {
+                Ok(t) => t,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "failed to get token for image download"
+                    );
+                    return None;
+                }
+            };
+
+            let resp = match self
+                .http_client()
+                .get(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"error": format!("{}", e), "image_key": image_key})
+                            ),
+                        "image download request failed for"
+                    );
+                    return None;
+                }
+            };
+
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED && !retried_token {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "failed to get token for image download"
+                        .with_attrs(::serde_json::json!({"image_key": image_key})),
+                    "image download 401, refreshing token and retrying once"
+                );
+                drop(resp);
+                self.invalidate_token().await;
+                retried_token = true;
+                continue;
+            }
+
+            if !resp.status().is_success() {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "image download failed for {image_key}: status={}",
+                        resp.status()
+                    )
                 );
                 return None;
             }
-        };
 
-        let url = self.image_download_url(image_key);
-        let resp = match self
-            .http_client()
-            .get(&url)
-            .header("Authorization", format!("Bearer {token}"))
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
+            if let Some(cl) = resp.content_length()
+                && cl > LARK_IMAGE_MAX_BYTES as u64
+            {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"error": format!("{}", e), "image_key": image_key})
-                        ),
-                    "image download request failed for"
+                        .with_attrs(::serde_json::json!({"image_key": image_key, "cl": cl})),
+                    "image too large for : bytes exceeds limit"
                 );
                 return None;
             }
-        };
 
-        if !resp.status().is_success() {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                &format!(
-                    "image download failed for {image_key}: status={}",
-                    resp.status()
-                )
-            );
-            return None;
-        }
+            let content_type = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
 
-        if let Some(cl) = resp.content_length()
-            && cl > LARK_IMAGE_MAX_BYTES as u64
-        {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"image_key": image_key, "cl": cl})),
-                "image too large for : bytes exceeds limit"
-            );
-            return None;
-        }
+            let bytes = match resp.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"error": format!("{}", e), "image_key": image_key})
+                            ),
+                        "image body read failed for"
+                    );
+                    return None;
+                }
+            };
 
-        let content_type = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
+            if bytes.is_empty() || bytes.len() > LARK_IMAGE_MAX_BYTES {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "image body empty or too large for {image_key}: {} bytes",
+                        bytes.len()
+                    )
+                );
+                return None;
+            }
 
-        let bytes = match resp.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
+            let mime = lark_detect_image_mime(content_type.as_deref(), &bytes)?;
+            if !LARK_SUPPORTED_IMAGE_MIMES.contains(&mime.as_str()) {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"error": format!("{}", e), "image_key": image_key})
-                        ),
-                    "image body read failed for"
+                        .with_attrs(::serde_json::json!({"image_key": image_key, "mime": mime})),
+                    "unsupported image MIME for"
                 );
                 return None;
             }
-        };
 
-        if bytes.is_empty() || bytes.len() > LARK_IMAGE_MAX_BYTES {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                &format!(
-                    "image body empty or too large for {image_key}: {} bytes",
-                    bytes.len()
-                )
-            );
-            return None;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            return Some(format!("[IMAGE:data:{mime};base64,{encoded}]"));
         }
-
-        let mime = lark_detect_image_mime(content_type.as_deref(), &bytes)?;
-        if !LARK_SUPPORTED_IMAGE_MIMES.contains(&mime.as_str()) {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"image_key": image_key, "mime": mime})),
-                "unsupported image MIME for"
-            );
-            return None;
-        }
-
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        Some(format!("[IMAGE:data:{mime};base64,{encoded}]"))
     }
 
     /// Download a file from the Lark API and return a text content marker.
@@ -1611,11 +1725,7 @@ impl LarkChannel {
                 || lark_is_text_filename(file_name))
         {
             let text = String::from_utf8_lossy(&bytes);
-            let truncated = if text.len() > 50_000 {
-                format!("{}...\n[truncated]", &text[..50_000])
-            } else {
-                text.into_owned()
-            };
+            let truncated = lark_inline_text_file_preview(text);
             let ext = file_name.rsplit('.').next().unwrap_or("text");
             return Some(format!("[FILE:{file_name}]\n```{ext}\n{truncated}\n```"));
         }
@@ -1930,8 +2040,8 @@ impl LarkChannel {
             });
 
         vec![ChannelMessage {
-            id: Uuid::new_v4().to_string(),
-            sender: chat_id.to_string(),
+            id: message_id.to_string(),
+            sender: self.resolve_sender(chat_id, Some(open_id)).to_string(),
             reply_target: chat_id.to_string(),
             content: text,
             channel: self.channel_name().to_string(),
@@ -1940,6 +2050,7 @@ impl LarkChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         }]
     }
 
@@ -2063,7 +2174,8 @@ impl LarkChannel {
                     });
                 match image_key {
                     Some(key) => {
-                        let marker = match self.download_image_as_marker(&key).await {
+                        let marker = match self.download_image_as_marker(evt_message_id, &key).await
+                        {
                             Some(m) => m,
                             None => {
                                 ::zeroclaw_log::record!(
@@ -2194,8 +2306,8 @@ impl LarkChannel {
             .unwrap_or(open_id);
 
         messages.push(ChannelMessage {
-            id: Uuid::new_v4().to_string(),
-            sender: chat_id.to_string(),
+            id: evt_message_id.to_string(),
+            sender: self.resolve_sender(chat_id, Some(open_id)).to_string(),
             reply_target: chat_id.to_string(),
             content: text,
             channel: self.channel_name().to_string(),
@@ -2204,6 +2316,7 @@ impl LarkChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         });
 
         messages
@@ -2267,6 +2380,235 @@ impl Channel for LarkChannel {
 
     async fn health_check(&self) -> bool {
         self.get_tenant_access_token().await.is_ok()
+    }
+
+    async fn add_reaction(
+        &self,
+        _channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        if message_id.is_empty() {
+            return Ok(());
+        }
+
+        // Cache-hit dedupe: if this (message_id, emoji) pair already has a
+        // cached reaction_id, the reaction is already on the message and a
+        // second POST would either be silently de-duped by Feishu (no
+        // reaction_id returned, leaving a cache hole) or returned as a
+        // non-zero business code. Either way it is a no-op the orchestrator
+        // does not need. This fast-path is what lets the Lark-local
+        // inbound-ack spawn and the generic orchestrator add_reaction call
+        // share the same reaction_ids cache without racing each other.
+        {
+            let cache = self.reaction_ids.lock().await;
+            if cache.contains_key(&(message_id.to_string(), emoji.to_string())) {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "message_id": message_id,
+                            "emoji": emoji,
+                            "error_key": "lark.add_reaction.cache_hit_dedupe",
+                        })),
+                    "Lark add_reaction: cache hit, skipping duplicate POST"
+                );
+                return Ok(());
+            }
+        }
+
+        let emoji_type = match unicode_to_lark_emoji_type(emoji) {
+            Some(t) => t,
+            None => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "message_id": message_id,
+                            "emoji": emoji,
+                            "error_key": "lark.add_reaction.no_emoji_mapping",
+                        })),
+                    "Lark add_reaction: no emoji_type mapping for unicode, skipping"
+                );
+                return Ok(());
+            }
+        };
+
+        let mut token = self.get_tenant_access_token().await?;
+
+        let mut retried = false;
+        loop {
+            let response = self
+                .post_message_reaction_with_token(message_id, &token, emoji_type)
+                .await?;
+
+            if response.status().as_u16() == 401 && !retried {
+                self.invalidate_token().await;
+                token = self.get_tenant_access_token().await?;
+                retried = true;
+                continue;
+            }
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let err_body = response.text().await.unwrap_or_default();
+                anyhow::bail!(
+                    "Lark add_reaction failed for {message_id}: status={status}, body={err_body}"
+                );
+            }
+
+            let payload: serde_json::Value = response.json().await?;
+            let code = payload.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+            if code != 0 {
+                let msg = payload
+                    .get("msg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "code": code,
+                            "message_id": message_id,
+                            "msg": msg,
+                            "error_key": "lark.add_reaction.non_zero_code",
+                        })),
+                    "Lark add_reaction returned non-zero code"
+                );
+            } else if let Some(reaction_id) = payload
+                .pointer("/data/reaction_id")
+                .and_then(|v| v.as_str())
+            {
+                self.reaction_ids.lock().await.insert(
+                    (message_id.to_string(), emoji.to_string()),
+                    reaction_id.to_string(),
+                );
+            }
+            return Ok(());
+        }
+    }
+
+    /// Remove a reaction this bot previously added via `add_reaction`.
+    ///
+    /// Looks up the cached `reaction_id` written by `add_reaction` (Feishu's
+    /// POST response already contains it) and calls
+    /// `DELETE /im/v1/messages/{message_id}/reactions/{reaction_id}`. On
+    /// cache miss this is a silent no-op so the orchestrator's
+    /// `let _ = channel.remove_reaction(...)` pattern keeps working after a
+    /// restart loses the cache.
+    ///
+    /// All failure paths (transport / 401 / Feishu non-zero codes) soft-fail
+    /// via [`zeroclaw_log::record!`] at WARN (or DEBUG for expected
+    /// stale-state codes). Errors never propagate because the orchestrator
+    /// caller discards the `Result` anyway.
+    async fn remove_reaction(
+        &self,
+        _channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        if message_id.is_empty() {
+            return Ok(());
+        }
+
+        let reaction_id = {
+            let mut cache = self.reaction_ids.lock().await;
+            cache.remove(&(message_id.to_string(), emoji.to_string()))
+        };
+        let Some(reaction_id) = reaction_id else {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "message_id": message_id,
+                        "emoji": emoji,
+                    })),
+                "Lark remove_reaction: cache miss, skipping"
+            );
+            return Ok(());
+        };
+
+        let mut token = self.get_tenant_access_token().await?;
+        let url = self.delete_message_reaction_url(message_id, &reaction_id);
+
+        let mut retried = false;
+        loop {
+            let response = self
+                .http_client()
+                .delete(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await?;
+
+            if response.status().as_u16() == 401 && !retried {
+                self.invalidate_token().await;
+                token = self.get_tenant_access_token().await?;
+                retried = true;
+                continue;
+            }
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let err_body = response.text().await.unwrap_or_default();
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "message_id": message_id,
+                            "reaction_id": reaction_id,
+                            "status": status.as_u16(),
+                            "body": err_body,
+                            "error_key": "lark.remove_reaction.http_failure",
+                        })),
+                    "Lark remove_reaction failed"
+                );
+                return Ok(());
+            }
+
+            let payload: serde_json::Value = response.json().await?;
+            let code = payload.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+            match code {
+                0 => {}
+                231_003 | 231_007 | 231_010 | 231_011 => {
+                    let msg = payload
+                        .get("msg")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown error");
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "code": code,
+                                "msg": msg,
+                                "message_id": message_id,
+                            })),
+                        "Lark remove_reaction: server-side stale state"
+                    );
+                }
+                _ => {
+                    let msg = payload
+                        .get("msg")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown error");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "code": code,
+                                "message_id": message_id,
+                                "msg": msg,
+                                "error_key": "lark.remove_reaction.non_zero_code",
+                            })),
+                        "Lark remove_reaction returned non-zero code"
+                    );
+                }
+            }
+            return Ok(());
+        }
     }
 
     async fn request_approval(
@@ -2333,6 +2675,285 @@ impl Channel for LarkChannel {
 
         Ok(Some(self.wait_for_decision(rx, &approval_id).await))
     }
+
+    fn supports_draft_updates(&self) -> bool {
+        !matches!(self.stream_mode, StreamMode::Off)
+    }
+
+    /// Open a streaming draft card. Returns `Ok(None)` (caller must
+    /// degrade to `send()`) when streaming is disabled, the initial POST
+    /// fails, or Feishu replies with non-zero `code`. The returned
+    /// `String` is the Feishu `message_id` used by subsequent
+    /// `update_draft` / `finalize_draft` PATCH calls.
+    async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        if matches!(self.stream_mode, StreamMode::Off) {
+            return Ok(None);
+        }
+
+        let placeholder = truncate_card_markdown(
+            if message.content.is_empty() {
+                "_processing…_"
+            } else {
+                message.content.as_str()
+            },
+            LARK_CARD_MARKDOWN_MAX_BYTES,
+        );
+        let body = build_interactive_card_body(&message.recipient, &placeholder);
+        let url = self.send_message_url();
+
+        let (status, response) = match self.patch_or_send_once(&url, &body, false).await {
+            Ok(r) => r,
+            Err(err) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"err": format!("{err}")})),
+                    "Lark: send_draft failed, falling back to send()"
+                );
+                return Ok(None);
+            }
+        };
+
+        if !status.is_success() || extract_lark_response_code(&response).unwrap_or(0) != 0 {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "status": status.as_u16(),
+                        "body": response,
+                    })),
+                "Lark: send_draft non-success, falling back to send()"
+            );
+            return Ok(None);
+        }
+
+        let message_id = response
+            .pointer("/data/message_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        Ok(message_id)
+    }
+
+    /// Edit a previously-opened draft card with the latest accumulated
+    /// content. Per-`message_id` rate-limited via `last_draft_edit` so we
+    /// stay under Feishu's 5 QPS PATCH cap; calls inside the cooldown window
+    /// are silently dropped (the next caller will catch up). Soft-fails on
+    /// transport / token-refresh / 230020 rate-limit code so streaming token
+    /// loops never abort because of a single edit hiccup.
+    async fn update_draft(
+        &self,
+        _recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        if message_id.is_empty() {
+            return Ok(());
+        }
+
+        {
+            let mut guard = self.last_draft_edit.lock().await;
+            if let Some(last) = guard.get(message_id) {
+                let elapsed_ms = u64::try_from(last.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if elapsed_ms < self.draft_update_interval_ms {
+                    return Ok(());
+                }
+            }
+            guard.insert(message_id.to_string(), Instant::now());
+        }
+
+        let rendered = truncate_card_markdown(text, LARK_CARD_MARKDOWN_MAX_BYTES);
+        self.patch_card_content(message_id, &rendered).await
+    }
+
+    /// Same wire shape as `update_draft`; kept as a separate trait method so
+    /// callers can later distinguish progress chrome from response content
+    /// without changing the calling sites.
+    async fn update_draft_progress(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        self.update_draft(recipient, message_id, text).await
+    }
+
+    /// Commit the final response into the draft card. The first chunk is
+    /// PATCH-applied to the existing message_id; any overflow chunks are
+    /// posted as fresh interactive cards (with a single token-refresh retry
+    /// each) so long responses still land in full.
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        if message_id.is_empty() {
+            return self.send(&SendMessage::new(text, recipient)).await;
+        }
+
+        self.last_draft_edit.lock().await.remove(message_id);
+
+        let chunks = split_markdown_chunks(text, LARK_CARD_MARKDOWN_MAX_BYTES);
+        let first = chunks.first().copied().unwrap_or("");
+        self.patch_card_content(message_id, first).await?;
+
+        if chunks.len() > 1 {
+            let token = self.get_tenant_access_token().await?;
+            let url = self.send_message_url();
+            for chunk in &chunks[1..] {
+                let body = build_interactive_card_body(recipient, chunk);
+                let (status, response) = self.send_text_once(&url, &token, &body).await?;
+                if should_refresh_lark_tenant_token(status, &response) {
+                    self.invalidate_token().await;
+                    let new_token = self.get_tenant_access_token().await?;
+                    let (retry_status, retry_response) =
+                        self.send_text_once(&url, &new_token, &body).await?;
+                    ensure_lark_send_success(
+                        retry_status,
+                        &retry_response,
+                        "after token refresh (finalize_draft)",
+                    )?;
+                } else {
+                    ensure_lark_send_success(status, &response, "finalize_draft chunk")?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Replace the draft body with a "cancelled" marker. Feishu does not
+    /// expose an official "delete-draft" endpoint, so the closest faithful
+    /// signal is a one-line PATCH that overwrites the card content. We
+    /// best-effort emit the marker, then unconditionally evict the
+    /// `last_draft_edit` rate-limit entry so the per-message_id slot is
+    /// reclaimed even when the PATCH itself fails (matching the
+    /// `finalize_draft` cleanup contract — see the field doc on
+    /// `last_draft_edit`).
+    async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
+        let result = self
+            .update_draft(recipient, message_id, "_(cancelled)_")
+            .await;
+        self.last_draft_edit.lock().await.remove(message_id);
+        result
+    }
+}
+
+impl LarkChannel {
+    /// PATCH the draft card body with new markdown content.
+    ///
+    /// Used by both `update_draft` (per-token streaming) and
+    /// `finalize_draft` (last-chunk commit). Soft-fails on every error
+    /// path — transport (reqwest), token-refresh-still-401, the explicit
+    /// 230020 frequency-limit code, and any other non-zero Feishu business
+    /// code — because the streaming caller cannot meaningfully recover
+    /// from a single missed edit and dropping the error keeps the token
+    /// loop alive. The signature still returns `anyhow::Result<()>` for
+    /// caller-shape compatibility, but it never returns `Err`; every
+    /// failure path is logged at WARN/DEBUG with a stable `error_key`
+    /// and the function returns `Ok(())`.
+    async fn patch_card_content(&self, message_id: &str, markdown: &str) -> anyhow::Result<()> {
+        let url = self.patch_message_url(message_id);
+        let body = serde_json::json!({
+            "content": build_card_content(markdown),
+        });
+
+        // First PATCH attempt — soft-fail transport errors instead of
+        // propagating them. The streaming caller invokes this per token,
+        // so a single transport hiccup must not break the token loop.
+        let (status, response) = match self.patch_or_send_once(&url, &body, true).await {
+            Ok(pair) => pair,
+            Err(err) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "message_id": message_id,
+                            "error": format!("{err}"),
+                            "error_key": "lark.draft_patch.transport_failure",
+                        })),
+                    "Lark: draft PATCH transport-failed (soft)"
+                );
+                return Ok(());
+            }
+        };
+
+        let body_for_inspect = if should_refresh_lark_tenant_token(status, &response) {
+            self.invalidate_token().await;
+            // Retry PATCH after token refresh — same soft-fail discipline:
+            // a transport error on the retry must not propagate.
+            let (retry_status, retry_response) = match self
+                .patch_or_send_once(&url, &body, true)
+                .await
+            {
+                Ok(pair) => pair,
+                Err(err) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "message_id": message_id,
+                                "error": format!("{err}"),
+                                "error_key": "lark.draft_patch.transport_failure_on_retry",
+                            })),
+                        "Lark: draft PATCH retry transport-failed (soft)"
+                    );
+                    return Ok(());
+                }
+            };
+            if should_refresh_lark_tenant_token(retry_status, &retry_response) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "message_id": message_id,
+                            "body": retry_response,
+                            "error_key": "lark.draft_patch.unauthorized_after_refresh",
+                        })),
+                    "Lark: draft PATCH still unauthorized after token refresh"
+                );
+                return Ok(());
+            }
+            retry_response
+        } else {
+            response
+        };
+
+        let code = extract_lark_response_code(&body_for_inspect).unwrap_or(0);
+        if code == LARK_DRAFT_RATE_LIMIT_CODE {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "message_id": message_id,
+                        "error_key": "lark.draft_patch.rate_limited",
+                    })),
+                "Lark: draft PATCH rate-limited (code=230020)"
+            );
+            return Ok(());
+        }
+        if code != 0 {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "message_id": message_id,
+                        "code": code,
+                        "body": body_for_inspect,
+                        "error_key": "lark.draft_patch.non_zero_code",
+                    })),
+                "Lark: draft PATCH soft-failed"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl LarkChannel {
@@ -2364,7 +2985,7 @@ impl LarkChannel {
         arguments_summary: &str,
         decision: zeroclaw_api::channel::ChannelApprovalResponse,
     ) {
-        let card = build_resolved_approval_card(tool_name, arguments_summary, decision);
+        let card = build_resolved_approval_card(tool_name, arguments_summary, decision.clone());
         let url = self.patch_message_url(message_id);
         let body = serde_json::json!({
             "content": card.to_string(),
@@ -2637,7 +3258,7 @@ impl LarkChannel {
             "Lark: card action received"
         );
 
-        let _ = pending.sender.send(decision);
+        let _ = pending.sender.send(decision.clone());
 
         if !pending.message_id.is_empty() {
             self.patch_approval_card_resolved(
@@ -2718,22 +3339,50 @@ impl LarkChannel {
                 return (StatusCode::OK, "ok").into_response();
             }
 
-            // Parse event messages
+            // Parse event messages first; then issue an inbound fast-ack via
+            // the same trait-level Channel::add_reaction path that the generic
+            // orchestrator uses. The trait impl writes Feishu's returned
+            // reaction_id into the shared reaction_ids cache and dedupes
+            // subsequent duplicate POSTs via a cache-hit fast-path, so the
+            // later generic orchestrator add_reaction("👀") call becomes a
+            // no-op and remove_reaction("👀") always finds the right id (no
+            // orphan reaction). See lark.rs `add_reaction` impl and the
+            // `lark_fast_ack_and_generic_path_dedupe_on_cache_hit` test.
             let messages = state.channel.parse_event_payload_async(&payload).await;
             if !messages.is_empty()
                 && let Some(message_id) = payload
                     .pointer("/event/message/message_id")
                     .and_then(|m| m.as_str())
             {
-                let ack_text = messages.first().map_or("", |msg| msg.content.as_str());
-                let ack_emoji =
-                    random_lark_ack_reaction(payload.get("event"), ack_text).to_string();
                 let reaction_channel = Arc::clone(&state.channel);
                 let reaction_message_id = message_id.to_string();
-                tokio::spawn(async move {
-                    reaction_channel
-                        .try_add_ack_reaction(&reaction_message_id, &ack_emoji)
-                        .await;
+                // Prefer the first parsed message's reply_target as the
+                // ack target; parse_event_payload_async already filtered
+                // out unauthorized senders and non-text payloads.
+                let reaction_reply_target = messages[0].reply_target.clone();
+                zeroclaw_spawn::spawn!(async move {
+                    if let Err(e) = <LarkChannel as Channel>::add_reaction(
+                        &reaction_channel,
+                        &reaction_reply_target,
+                        &reaction_message_id,
+                        "\u{1F440}",
+                    )
+                    .await
+                    {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note,
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "message_id": reaction_message_id,
+                                "error": format!("{e}"),
+                                "error_key": "lark.inbound_fast_ack.failed",
+                            })),
+                            "Lark inbound fast-ack failed (soft, webhook path)"
+                        );
+                    }
                 });
             }
 
@@ -2805,201 +3454,6 @@ fn inferred_audio_filename(file_key: &str) -> String {
     }
 }
 
-fn pick_uniform_index(len: usize) -> usize {
-    debug_assert!(len > 0);
-    let upper = len as u64;
-    let reject_threshold = (u64::MAX / upper) * upper;
-
-    loop {
-        let value = rand::random::<u64>();
-        if value < reject_threshold {
-            #[allow(clippy::cast_possible_truncation)]
-            return (value % upper) as usize;
-        }
-    }
-}
-
-fn random_from_pool(pool: &'static [&'static str]) -> &'static str {
-    pool[pick_uniform_index(pool.len())]
-}
-
-fn lark_ack_pool(locale: LarkAckLocale) -> &'static [&'static str] {
-    match locale {
-        LarkAckLocale::ZhCn => LARK_ACK_REACTIONS_ZH_CN,
-        LarkAckLocale::ZhTw => LARK_ACK_REACTIONS_ZH_TW,
-        LarkAckLocale::En => LARK_ACK_REACTIONS_EN,
-        LarkAckLocale::Ja => LARK_ACK_REACTIONS_JA,
-    }
-}
-
-fn map_locale_tag(tag: &str) -> Option<LarkAckLocale> {
-    let normalized = tag.trim().to_ascii_lowercase().replace('-', "_");
-    if normalized.is_empty() {
-        return None;
-    }
-
-    if normalized.starts_with("ja") {
-        return Some(LarkAckLocale::Ja);
-    }
-    if normalized.starts_with("en") {
-        return Some(LarkAckLocale::En);
-    }
-    if normalized.contains("hant")
-        || normalized.starts_with("zh_tw")
-        || normalized.starts_with("zh_hk")
-        || normalized.starts_with("zh_mo")
-    {
-        return Some(LarkAckLocale::ZhTw);
-    }
-    if normalized.starts_with("zh") {
-        return Some(LarkAckLocale::ZhCn);
-    }
-    None
-}
-
-fn find_locale_hint(value: &serde_json::Value) -> Option<String> {
-    match value {
-        serde_json::Value::Object(map) => {
-            for key in [
-                "locale",
-                "language",
-                "lang",
-                "i18n_locale",
-                "user_locale",
-                "locale_id",
-            ] {
-                if let Some(locale) = map.get(key).and_then(serde_json::Value::as_str) {
-                    return Some(locale.to_string());
-                }
-            }
-
-            for child in map.values() {
-                if let Some(locale) = find_locale_hint(child) {
-                    return Some(locale);
-                }
-            }
-            None
-        }
-        serde_json::Value::Array(items) => {
-            for child in items {
-                if let Some(locale) = find_locale_hint(child) {
-                    return Some(locale);
-                }
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-fn detect_locale_from_post_content(content: &str) -> Option<LarkAckLocale> {
-    let parsed = serde_json::from_str::<serde_json::Value>(content).ok()?;
-    let obj = parsed.as_object()?;
-    for key in obj.keys() {
-        if let Some(locale) = map_locale_tag(key) {
-            return Some(locale);
-        }
-    }
-    None
-}
-
-fn is_japanese_kana(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x3040..=0x309F | // Hiragana
-        0x30A0..=0x30FF | // Katakana
-        0x31F0..=0x31FF // Katakana Phonetic Extensions
-    )
-}
-
-fn is_cjk_han(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x3400..=0x4DBF | // CJK Extension A
-        0x4E00..=0x9FFF // CJK Unified Ideographs
-    )
-}
-
-fn is_traditional_only_han(ch: char) -> bool {
-    matches!(
-        ch,
-        '奮' | '鬥'
-            | '強'
-            | '體'
-            | '國'
-            | '臺'
-            | '萬'
-            | '與'
-            | '為'
-            | '這'
-            | '學'
-            | '機'
-            | '開'
-            | '裡'
-    )
-}
-
-fn is_simplified_only_han(ch: char) -> bool {
-    matches!(
-        ch,
-        '奋' | '斗'
-            | '强'
-            | '体'
-            | '国'
-            | '台'
-            | '万'
-            | '与'
-            | '为'
-            | '这'
-            | '学'
-            | '机'
-            | '开'
-            | '里'
-    )
-}
-
-fn detect_locale_from_text(text: &str) -> Option<LarkAckLocale> {
-    if text.chars().any(is_japanese_kana) {
-        return Some(LarkAckLocale::Ja);
-    }
-    if text.chars().any(is_traditional_only_han) {
-        return Some(LarkAckLocale::ZhTw);
-    }
-    if text.chars().any(is_simplified_only_han) {
-        return Some(LarkAckLocale::ZhCn);
-    }
-    if text.chars().any(is_cjk_han) {
-        return Some(LarkAckLocale::ZhCn);
-    }
-    None
-}
-
-fn detect_lark_ack_locale(
-    payload: Option<&serde_json::Value>,
-    fallback_text: &str,
-) -> LarkAckLocale {
-    if let Some(payload) = payload {
-        if let Some(locale) = find_locale_hint(payload).and_then(|hint| map_locale_tag(&hint)) {
-            return locale;
-        }
-
-        let message_content = payload
-            .pointer("/message/content")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| {
-                payload
-                    .pointer("/event/message/content")
-                    .and_then(serde_json::Value::as_str)
-            });
-
-        if let Some(locale) = message_content.and_then(detect_locale_from_post_content) {
-            return locale;
-        }
-    }
-
-    detect_locale_from_text(fallback_text).unwrap_or(LarkAckLocale::En)
-}
-
 /// Detect image MIME type from magic bytes, falling back to Content-Type header.
 fn lark_detect_image_mime(content_type: Option<&str>, bytes: &[u8]) -> Option<String> {
     if bytes.len() >= 8 && bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']) {
@@ -3066,12 +3520,13 @@ fn lark_is_text_filename(name: &str) -> bool {
     )
 }
 
-fn random_lark_ack_reaction(
-    payload: Option<&serde_json::Value>,
-    fallback_text: &str,
-) -> &'static str {
-    let locale = detect_lark_ack_locale(payload, fallback_text);
-    random_from_pool(lark_ack_pool(locale))
+fn lark_inline_text_file_preview(text: Cow<'_, str>) -> String {
+    if text.len() > 50_000 {
+        let end = crate::util::floor_char_boundary(text.as_ref(), 50_000);
+        format!("{}...\n[truncated]", &text[..end])
+    } else {
+        text.into_owned()
+    }
 }
 
 /// Flatten a Feishu `post` rich-text message to plain text.
@@ -3843,6 +4298,10 @@ mod tests {
             port: None,
             proxy_url: None,
             excluded_tools: vec![],
+            approval_timeout_secs: 300,
+            per_user_session: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -3866,6 +4325,10 @@ mod tests {
             port: Some(9898),
             proxy_url: None,
             excluded_tools: vec![],
+            approval_timeout_secs: 300,
+            per_user_session: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -3900,6 +4363,10 @@ mod tests {
             port: Some(9898),
             proxy_url: None,
             excluded_tools: vec![],
+            approval_timeout_secs: 300,
+            per_user_session: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
         };
 
         let ch = LarkChannel::from_config(&cfg, "lark_test_alias", resolver_from(vec!["*".into()]));
@@ -3926,6 +4393,10 @@ mod tests {
             port: Some(9898),
             proxy_url: None,
             excluded_tools: vec![],
+            approval_timeout_secs: 300,
+            per_user_session: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
         };
 
         let ch =
@@ -3934,6 +4405,144 @@ mod tests {
         assert_eq!(ch.api_base(), FEISHU_BASE_URL);
         assert_eq!(ch.ws_base(), FEISHU_WS_BASE_URL);
         assert_eq!(ch.name(), "feishu");
+    }
+
+    #[test]
+    fn lark_with_approval_timeout_secs_propagates_value() {
+        use zeroclaw_config::schema::{LarkConfig, LarkReceiveMode};
+
+        let cfg = LarkConfig {
+            enabled: true,
+            app_id: "cli_app123".into(),
+            app_secret: "secret456".into(),
+            encrypt_key: None,
+            verification_token: Some("vtoken789".into()),
+            mention_only: false,
+            use_feishu: false,
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+            proxy_url: None,
+            excluded_tools: vec![],
+            approval_timeout_secs: 456,
+            per_user_session: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
+        };
+
+        let ch = LarkChannel::from_config(&cfg, "lark_test_alias", resolver_from(vec!["*".into()]))
+            .with_approval_timeout_secs(cfg.approval_timeout_secs);
+
+        assert_eq!(ch.approval_timeout_secs, 456);
+    }
+
+    #[test]
+    fn lark_with_per_user_session_propagates_value() {
+        let ch_on = make_channel().with_per_user_session(true);
+        assert!(ch_on.per_user_session);
+        let ch_off = make_channel().with_per_user_session(false);
+        assert!(!ch_off.per_user_session);
+    }
+
+    #[test]
+    fn supports_draft_updates_reflects_stream_mode() {
+        let off = make_channel();
+        assert!(!off.supports_draft_updates());
+
+        let partial = make_channel().with_streaming(StreamMode::Partial, 500);
+        assert!(partial.supports_draft_updates());
+    }
+
+    #[tokio::test]
+    async fn update_draft_rate_limits_within_interval() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "t-rate",
+                "expire": 7200
+            })))
+            .mount(&server)
+            .await;
+
+        let patch_mock = Mock::given(method("PATCH"))
+            .and(path_regex("/im/v1/messages/om_draft_rl"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "code": 0 })),
+            )
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let mut ch = make_channel().with_streaming(StreamMode::Partial, 5_000);
+        ch.api_base_override = Some(server.uri());
+
+        ch.update_draft("oc_chat1", "om_draft_rl", "first")
+            .await
+            .expect("first update_draft ok");
+        ch.update_draft("oc_chat1", "om_draft_rl", "second")
+            .await
+            .expect("second update_draft ok");
+
+        drop(patch_mock);
+    }
+
+    #[tokio::test]
+    async fn update_draft_proceeds_after_interval() {
+        use std::time::Duration as StdDuration;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "t-proceed",
+                "expire": 7200
+            })))
+            .mount(&server)
+            .await;
+
+        let patch_mock = Mock::given(method("PATCH"))
+            .and(path_regex("/im/v1/messages/om_draft_go"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "code": 0 })),
+            )
+            .expect(2)
+            .mount_as_scoped(&server)
+            .await;
+
+        let mut ch = make_channel().with_streaming(StreamMode::Partial, 50);
+        ch.api_base_override = Some(server.uri());
+
+        ch.update_draft("oc_chat1", "om_draft_go", "first")
+            .await
+            .expect("first update_draft ok");
+        tokio::time::sleep(StdDuration::from_millis(80)).await;
+        ch.update_draft("oc_chat1", "om_draft_go", "second")
+            .await
+            .expect("second update_draft ok");
+
+        drop(patch_mock);
+    }
+
+    #[test]
+    fn lark_resolve_sender_respects_per_user_session_flag() {
+        let mut ch = make_channel();
+
+        assert!(!ch.per_user_session);
+        assert_eq!(ch.resolve_sender("oc_chat", Some("ou_user")), "oc_chat");
+        assert_eq!(ch.resolve_sender("oc_chat", None), "oc_chat");
+        assert_eq!(ch.resolve_sender("oc_chat", Some("")), "oc_chat");
+
+        ch.per_user_session = true;
+        assert_eq!(ch.resolve_sender("oc_chat", Some("ou_user")), "ou_user");
+        assert_eq!(ch.resolve_sender("oc_chat", None), "oc_chat");
+        assert_eq!(ch.resolve_sender("oc_chat", Some("")), "oc_chat");
     }
 
     #[tokio::test]
@@ -4133,6 +4742,10 @@ mod tests {
             port: Some(9898),
             proxy_url: None,
             excluded_tools: vec![],
+            approval_timeout_secs: 300,
+            per_user_session: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
         };
         let ch_feishu = LarkChannel::from_config(
             &feishu_cfg,
@@ -4146,12 +4759,8 @@ mod tests {
     }
 
     #[test]
-    fn lark_image_download_url_matches_region() {
-        let ch = make_channel();
-        assert_eq!(
-            ch.image_download_url("img_abc123"),
-            "https://open.larksuite.com/open-apis/im/v1/images/img_abc123"
-        );
+    fn lark_image_max_bytes_is_10_mib() {
+        assert_eq!(LARK_IMAGE_MAX_BYTES, 10 * 1024 * 1024);
     }
 
     #[test]
@@ -4209,100 +4818,12 @@ mod tests {
     }
 
     #[test]
-    fn lark_reaction_locale_explicit_language_tags() {
-        assert_eq!(map_locale_tag("zh-CN"), Some(LarkAckLocale::ZhCn));
-        assert_eq!(map_locale_tag("zh_TW"), Some(LarkAckLocale::ZhTw));
-        assert_eq!(map_locale_tag("zh-Hant"), Some(LarkAckLocale::ZhTw));
-        assert_eq!(map_locale_tag("en-US"), Some(LarkAckLocale::En));
-        assert_eq!(map_locale_tag("ja-JP"), Some(LarkAckLocale::Ja));
-        assert_eq!(map_locale_tag("fr-FR"), None);
-    }
+    fn lark_inline_text_file_preview_truncates_on_utf8_boundary() {
+        let prefix = "a".repeat(49_999);
+        let text = format!("{prefix}{}tail", "😀");
+        let preview = lark_inline_text_file_preview(Cow::Borrowed(&text));
 
-    #[test]
-    fn lark_reaction_locale_prefers_explicit_payload_locale() {
-        let payload = serde_json::json!({
-            "sender": {
-                "locale": "ja-JP"
-            },
-            "message": {
-                "content": "{\"text\":\"hello\"}"
-            }
-        });
-        assert_eq!(
-            detect_lark_ack_locale(Some(&payload), "你好，世界"),
-            LarkAckLocale::Ja
-        );
-    }
-
-    #[test]
-    fn lark_reaction_locale_unsupported_payload_falls_back_to_text_script() {
-        let payload = serde_json::json!({
-            "sender": {
-                "locale": "fr-FR"
-            },
-            "message": {
-                "content": "{\"text\":\"頑張れ\"}"
-            }
-        });
-        assert_eq!(
-            detect_lark_ack_locale(Some(&payload), "頑張ってください"),
-            LarkAckLocale::Ja
-        );
-    }
-
-    #[test]
-    fn lark_reaction_locale_detects_simplified_and_traditional_text() {
-        assert_eq!(
-            detect_lark_ack_locale(None, "继续奋斗，今天很强"),
-            LarkAckLocale::ZhCn
-        );
-        assert_eq!(
-            detect_lark_ack_locale(None, "繼續奮鬥，今天很強"),
-            LarkAckLocale::ZhTw
-        );
-    }
-
-    #[test]
-    fn lark_reaction_locale_defaults_to_english_for_unsupported_text() {
-        assert_eq!(
-            detect_lark_ack_locale(None, "Bonjour tout le monde"),
-            LarkAckLocale::En
-        );
-    }
-
-    #[test]
-    fn random_lark_ack_reaction_respects_detected_locale_pool() {
-        let payload = serde_json::json!({
-            "sender": {
-                "locale": "zh-CN"
-            }
-        });
-        let selected = random_lark_ack_reaction(Some(&payload), "hello");
-        assert!(LARK_ACK_REACTIONS_ZH_CN.contains(&selected));
-
-        let payload = serde_json::json!({
-            "sender": {
-                "locale": "zh-TW"
-            }
-        });
-        let selected = random_lark_ack_reaction(Some(&payload), "hello");
-        assert!(LARK_ACK_REACTIONS_ZH_TW.contains(&selected));
-
-        let payload = serde_json::json!({
-            "sender": {
-                "locale": "en-US"
-            }
-        });
-        let selected = random_lark_ack_reaction(Some(&payload), "hello");
-        assert!(LARK_ACK_REACTIONS_EN.contains(&selected));
-
-        let payload = serde_json::json!({
-            "sender": {
-                "locale": "ja-JP"
-            }
-        });
-        let selected = random_lark_ack_reaction(Some(&payload), "hello");
-        assert!(LARK_ACK_REACTIONS_JA.contains(&selected));
+        assert_eq!(preview, format!("{prefix}...\n[truncated]"));
     }
 
     #[test]
@@ -4767,7 +5288,7 @@ mod tests {
             ),
             (ChannelApprovalResponse::Deny, "red", "Denied"),
         ] {
-            let card = build_resolved_approval_card("shell", "args", decision);
+            let card = build_resolved_approval_card("shell", "args", decision.clone());
             assert_eq!(
                 card.pointer("/header/template").and_then(|v| v.as_str()),
                 Some(expected_template),
@@ -5067,6 +5588,7 @@ mod tests {
             use_feishu: false,
             app_id: "cli_test_app_id".to_string(),
             app_secret: "test_app_secret".to_string(),
+            approval_timeout_secs: 300,
             ..Default::default()
         };
         let mut ch = LarkChannel::from_config(&config, "test_alias", resolver_from(vec![]));
@@ -5101,6 +5623,7 @@ mod tests {
             use_feishu: true,
             app_id: "cli_test_app_id".to_string(),
             app_secret: "test_app_secret".to_string(),
+            approval_timeout_secs: 300,
             ..Default::default()
         };
         let mut ch = LarkChannel::from_config(&config, "test_alias", resolver_from(vec![]));
@@ -5124,5 +5647,577 @@ mod tests {
             "hi from cron",
         )
         .await;
+    }
+
+    #[test]
+    fn unicode_to_lark_emoji_type_covers_known_noreply_emojis() {
+        assert_eq!(unicode_to_lark_emoji_type("👍"), Some("THUMBSUP"));
+        assert_eq!(unicode_to_lark_emoji_type("🚫"), Some("No"));
+        assert_eq!(unicode_to_lark_emoji_type("⚠️"), Some("Alarm"));
+        assert_eq!(unicode_to_lark_emoji_type("👀"), Some("GLANCE"));
+        assert_eq!(unicode_to_lark_emoji_type("✅"), Some("DONE"));
+        assert_eq!(unicode_to_lark_emoji_type("🎉"), Some("PARTY"));
+        assert_eq!(unicode_to_lark_emoji_type("🙉"), None);
+        assert_ne!(unicode_to_lark_emoji_type("🚫"), Some("NO"));
+    }
+
+    /// Regression guard: ChannelMessage.id MUST equal the Feishu om_xxx
+    /// message_id so that the orchestrator's add_reaction calls (which
+    /// pass msg.id straight to `/im/v1/messages/{message_id}/reactions`)
+    /// succeed instead of returning HTTP 400 / code 99992354
+    /// "Invalid ids: [<uuid>]". Replacing the inbound id with
+    /// `Uuid::new_v4()` silently breaks the 👀/✅ ack/done reaction flow.
+    #[tokio::test]
+    async fn lark_inbound_channel_message_id_is_om_xxx_not_uuid() {
+        let ch = make_channel();
+        let om_id = "om_ack_reaction_compat_xyz";
+        let payload = serde_json::json!({
+            "header": {
+                "event_type": "im.message.receive_v1"
+            },
+            "event": {
+                "sender": {
+                    "sender_id": {
+                        "open_id": "ou_testuser123"
+                    }
+                },
+                "message": {
+                    "message_id": om_id,
+                    "message_type": "text",
+                    "content": "{\"text\":\"ack test\"}",
+                    "chat_id": "oc_chat123",
+                    "chat_type": "p2p",
+                    "create_time": "1699999999000"
+                }
+            }
+        });
+
+        let msgs = ch.parse_event_payload_async(&payload).await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(
+            msgs[0].id, om_id,
+            "ChannelMessage.id must equal the Feishu om_xxx message_id; \
+             otherwise add_reaction returns 99992354 (id not exist). \
+             Got: {:?}",
+            msgs[0].id
+        );
+
+        // Belt-and-suspenders: explicitly assert msg.id is NOT a
+        // UUID-v4 shape (8-4-4-4-12 hex with hyphens). Future "let's
+        // just use UUID" PRs will fail this and prompt a re-read.
+        fn looks_like_uuid_v4(s: &str) -> bool {
+            let bytes = s.as_bytes();
+            if bytes.len() != 36 {
+                return false;
+            }
+            for (i, &b) in bytes.iter().enumerate() {
+                let is_hyphen_pos = i == 8 || i == 13 || i == 18 || i == 23;
+                if is_hyphen_pos {
+                    if b != b'-' {
+                        return false;
+                    }
+                } else if !b.is_ascii_hexdigit() {
+                    return false;
+                }
+            }
+            true
+        }
+        assert!(
+            !looks_like_uuid_v4(&msgs[0].id),
+            "ChannelMessage.id must NOT be a UUID-v4 shape — Feishu \
+             add_reaction requires the native om_xxx open_message_id. \
+             Got: {:?}",
+            msgs[0].id
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_caches_id_from_add_and_deletes() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::channel::Channel;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "t-rm-ok",
+                "expire": 7200
+            })))
+            .mount(&server)
+            .await;
+
+        let post_mock = Mock::given(method("POST"))
+            .and(path_regex("/im/v1/messages/om_test/reactions$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": {
+                    "reaction_id": "r_xyz",
+                    "operator": { "operator_id": "cli_test", "operator_type": "app" },
+                    "action_time": "1700000000000",
+                    "reaction_type": { "emoji_type": "GLANCE" }
+                }
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let delete_mock = Mock::given(method("DELETE"))
+            .and(path_regex("/im/v1/messages/om_test/reactions/r_xyz$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "code": 0 })),
+            )
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let mut ch = make_channel();
+        ch.api_base_override = Some(server.uri());
+
+        ch.add_reaction("oc_chat", "om_test", "\u{1F440}")
+            .await
+            .expect("add_reaction should succeed");
+        ch.remove_reaction("oc_chat", "om_test", "\u{1F440}")
+            .await
+            .expect("remove_reaction should succeed");
+
+        let cache = ch.reaction_ids.lock().await;
+        assert!(
+            cache.is_empty(),
+            "reaction_ids cache should be empty after remove, got {} entries",
+            cache.len()
+        );
+
+        drop(post_mock);
+        drop(delete_mock);
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_silent_on_cache_miss() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::channel::Channel;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "t-rm-miss",
+                "expire": 7200
+            })))
+            .mount(&server)
+            .await;
+
+        let delete_mock = Mock::given(method("DELETE"))
+            .and(path_regex("/im/v1/messages/.*/reactions/.*"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount_as_scoped(&server)
+            .await;
+
+        let mut ch = make_channel();
+        ch.api_base_override = Some(server.uri());
+
+        ch.remove_reaction("oc_chat", "om_never_added", "\u{1F440}")
+            .await
+            .expect("cache miss must not error");
+
+        drop(delete_mock);
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_tolerates_server_stale_codes() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::channel::Channel;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "t-rm-stale",
+                "expire": 7200
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex("/im/v1/messages/om_stale/reactions$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": {
+                    "reaction_id": "r_stale",
+                    "operator": { "operator_id": "cli_test", "operator_type": "app" },
+                    "action_time": "1700000000000",
+                    "reaction_type": { "emoji_type": "GLANCE" }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let delete_mock = Mock::given(method("DELETE"))
+            .and(path_regex("/im/v1/messages/om_stale/reactions/r_stale$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 231_007,
+                "msg": "operator has no permission to delete this reaction"
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let mut ch = make_channel();
+        ch.api_base_override = Some(server.uri());
+
+        ch.add_reaction("oc_chat", "om_stale", "\u{1F440}")
+            .await
+            .expect("add_reaction should succeed");
+        ch.remove_reaction("oc_chat", "om_stale", "\u{1F440}")
+            .await
+            .expect("stale-state code must not propagate as error");
+
+        let cache = ch.reaction_ids.lock().await;
+        assert!(
+            cache.is_empty(),
+            "reaction_ids cache should be empty after stale-state DELETE"
+        );
+
+        drop(delete_mock);
+    }
+
+    #[tokio::test]
+    async fn add_reaction_caches_glance_under_unicode_key() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::channel::Channel;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "t-glance",
+                "expire": 7200
+            })))
+            .mount(&server)
+            .await;
+
+        let post_mock = Mock::given(method("POST"))
+            .and(path_regex("/im/v1/messages/om_glance/reactions$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": {
+                    "reaction_id": "r_glance_xyz",
+                    "operator": { "operator_id": "cli_test", "operator_type": "app" },
+                    "action_time": "1700000000000",
+                    "reaction_type": { "emoji_type": "GLANCE" }
+                }
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let mut ch = make_channel();
+        ch.api_base_override = Some(server.uri());
+
+        ch.add_reaction("oc_chat", "om_glance", "\u{1F440}")
+            .await
+            .expect("add_reaction should succeed");
+
+        let cache = ch.reaction_ids.lock().await;
+        let stored = cache
+            .get(&("om_glance".to_string(), "\u{1F440}".to_string()))
+            .cloned();
+        assert_eq!(
+            stored.as_deref(),
+            Some("r_glance_xyz"),
+            "reaction_id must be cached under unicode 👀 key, got {stored:?}"
+        );
+        assert!(
+            cache
+                .get(&("om_glance".to_string(), "GLANCE".to_string()))
+                .is_none(),
+            "reaction_id must NOT be cached under Feishu emoji_type 'GLANCE'"
+        );
+
+        drop(post_mock);
+    }
+
+    /// End-to-end regression for the inbound-ack lifecycle:
+    ///   add 👀 → remove 👀 → add ✅
+    ///
+    /// Asserts the "shared cached reaction-id contract" that the PR review
+    /// requested. The Lark-local inbound fast-ack spawn (in `listen_ws` /
+    /// `listen_http`) and the generic orchestrator `Channel::add_reaction`
+    /// call BOTH go through the same trait impl, which writes Feishu's
+    /// returned `reaction_id` into `reaction_ids` and dedupes duplicate
+    /// POSTs via a cache-hit fast-path. As a result `remove_reaction("👀")`
+    /// always finds the right id and no orphan 👀 is left beside the
+    /// completion marker.
+    ///
+    /// The two strong assertions:
+    ///   1. The mock counts EXACTLY one POST per emoji and EXACTLY one
+    ///      DELETE on the cached `reaction_id`. This is the
+    ///      shared-cache invariant — even though both the inbound fast-ack
+    ///      and the orchestrator may call `add_reaction("👀")` for the
+    ///      same message, the second call is a cache hit and does NOT
+    ///      issue a second POST (see
+    ///      `lark_fast_ack_and_generic_path_dedupe_on_cache_hit` for the
+    ///      explicit dedupe test).
+    ///   2. The final `reaction_ids` cache shape contains ONLY ✅ —
+    ///      i.e. the 👀 entry was removed and no orphan was left behind.
+    #[tokio::test]
+    async fn lark_inbound_ack_lifecycle_swaps_glance_to_done_with_no_orphan() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::channel::Channel;
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "t-lifecycle",
+                "expire": 7200
+            })))
+            .mount(&server)
+            .await;
+
+        // POST 👀 (GLANCE) — must be invoked EXACTLY once.
+        // If a regression re-adds a Lark-local fast-ack spawn alongside
+        // the generic orchestrator add_reaction call, this mock would see
+        // a second POST and the assertion below would fail.
+        let post_glance_mock = Mock::given(method("POST"))
+            .and(path_regex("/im/v1/messages/om_lifecycle/reactions$"))
+            .and(wiremock::matchers::body_string_contains("GLANCE"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": {
+                    "reaction_id": "r_glance_lifecycle",
+                    "operator": { "operator_id": "cli_test", "operator_type": "app" },
+                    "action_time": "1700000000000",
+                    "reaction_type": { "emoji_type": "GLANCE" }
+                }
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        // DELETE on the cached GLANCE reaction_id — must be invoked
+        // EXACTLY once. Cache-miss path would silently skip the DELETE
+        // (see `remove_reaction` doc) and this expect(1) would fail.
+        let delete_glance_mock = Mock::given(method("DELETE"))
+            .and(path_regex(
+                "/im/v1/messages/om_lifecycle/reactions/r_glance_lifecycle$",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "code": 0 })),
+            )
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        // POST ✅ (DONE) — must be invoked EXACTLY once.
+        let post_done_mock = Mock::given(method("POST"))
+            .and(path_regex("/im/v1/messages/om_lifecycle/reactions$"))
+            .and(wiremock::matchers::body_string_contains("DONE"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": {
+                    "reaction_id": "r_done_lifecycle",
+                    "operator": { "operator_id": "cli_test", "operator_type": "app" },
+                    "action_time": "1700000000001",
+                    "reaction_type": { "emoji_type": "DONE" }
+                }
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let mut ch = make_channel();
+        ch.api_base_override = Some(server.uri());
+
+        // Drive the lifecycle through the public Channel trait — the
+        // same surface the generic orchestrator uses in production.
+        ch.add_reaction("oc_chat", "om_lifecycle", "\u{1F440}")
+            .await
+            .expect("add 👀 should succeed");
+        ch.remove_reaction("oc_chat", "om_lifecycle", "\u{1F440}")
+            .await
+            .expect("remove 👀 should succeed");
+        ch.add_reaction("oc_chat", "om_lifecycle", "\u{2705}")
+            .await
+            .expect("add ✅ should succeed");
+
+        // Cache shape: ✅ present, 👀 gone, no orphans.
+        let cache = ch.reaction_ids.lock().await;
+        assert_eq!(
+            cache.len(),
+            1,
+            "after lifecycle the cache must contain exactly 1 entry (✅), got {}: {:?}",
+            cache.len(),
+            cache.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            cache
+                .get(&("om_lifecycle".to_string(), "\u{1F440}".to_string()))
+                .is_none(),
+            "the 👀 entry must be gone after remove_reaction; \
+             orphan presence indicates a parallel ack path bypassed the cache"
+        );
+        assert_eq!(
+            cache
+                .get(&("om_lifecycle".to_string(), "\u{2705}".to_string()))
+                .map(String::as_str),
+            Some("r_done_lifecycle"),
+            "✅ reaction_id must be cached under its unicode key"
+        );
+
+        // Mock-scope drop verifies the .expect(N) counts. A regression
+        // that POSTs 👀 twice (fast-ack + generic) makes post_glance_mock
+        // fail with 'received 2 requests, expected 1'.
+        drop(post_glance_mock);
+        drop(delete_glance_mock);
+        drop(post_done_mock);
+    }
+
+    /// Shared-cache dedupe contract: when the Lark-local inbound fast-ack
+    /// has already POSTed `add_reaction(om_xxx, "👀")` and written
+    /// `(om_xxx, "👀") → R1` into `reaction_ids`, a subsequent
+    /// `add_reaction(om_xxx, "👀")` call from the generic orchestrator
+    /// path MUST be a cache-hit no-op — NO second POST is issued, and
+    /// the cached reaction_id is preserved so `remove_reaction("👀")` can
+    /// still DELETE it correctly.
+    ///
+    /// This is the precise invariant the PR review asked for ("make the
+    /// Lark-local ack use the same cached reaction-id contract as the
+    /// generic path"). Without the cache-hit fast-path in `add_reaction`
+    /// the generic call would issue a second POST: Feishu would either
+    /// silently dedupe and return no reaction_id (leaving R1 cached but
+    /// an unverifiable duplicate POST on the wire) OR return a non-zero
+    /// business code; in either case `remove_reaction` would still find
+    /// R1 in cache, but the wire-level duplicate POST violates the
+    /// contract. This test asserts the wire stays clean: ONE POST 👀,
+    /// then ONE DELETE on R1.
+    #[tokio::test]
+    async fn lark_fast_ack_and_generic_path_dedupe_on_cache_hit() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::channel::Channel;
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "t-dedupe",
+                "expire": 7200
+            })))
+            .mount(&server)
+            .await;
+
+        // POST 👀 — MUST be invoked EXACTLY once across BOTH calls.
+        // The first call is the fast-ack; the second call (simulating
+        // the generic orchestrator path) MUST hit the cache and skip
+        // the POST entirely. expect(1) catches a regression where the
+        // dedupe fast-path is missing or broken.
+        let post_glance_mock = Mock::given(method("POST"))
+            .and(path_regex("/im/v1/messages/om_dedupe/reactions$"))
+            .and(wiremock::matchers::body_string_contains("GLANCE"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": {
+                    "reaction_id": "r_dedupe_fast_ack",
+                    "operator": { "operator_id": "cli_test", "operator_type": "app" },
+                    "action_time": "1700000000000",
+                    "reaction_type": { "emoji_type": "GLANCE" }
+                }
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        // DELETE on the cached reaction_id from the FAST-ACK POST — proves
+        // that fast-ack's reaction_id survived through the dedupe path
+        // and is still usable for cleanup.
+        let delete_glance_mock = Mock::given(method("DELETE"))
+            .and(path_regex(
+                "/im/v1/messages/om_dedupe/reactions/r_dedupe_fast_ack$",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "code": 0 })),
+            )
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let mut ch = make_channel();
+        ch.api_base_override = Some(server.uri());
+
+        // Step 1: fast-ack POSTs 👀 and writes (om_dedupe, "👀") → R1.
+        ch.add_reaction("oc_chat", "om_dedupe", "\u{1F440}")
+            .await
+            .expect("fast-ack add 👀 should succeed");
+
+        // Sanity: cache populated.
+        {
+            let cache = ch.reaction_ids.lock().await;
+            assert_eq!(
+                cache
+                    .get(&("om_dedupe".to_string(), "\u{1F440}".to_string()))
+                    .map(String::as_str),
+                Some("r_dedupe_fast_ack"),
+                "fast-ack must populate cache under unicode 👀 key"
+            );
+        }
+
+        // Step 2: generic orchestrator path tries to add 👀 again.
+        // The cache-hit fast-path in add_reaction MUST return Ok(())
+        // without issuing a second POST. If a regression removes the
+        // dedupe check, post_glance_mock will receive 2 requests and
+        // its expect(1) will fail.
+        ch.add_reaction("oc_chat", "om_dedupe", "\u{1F440}")
+            .await
+            .expect("generic-path add 👀 must be cache-hit no-op, not error");
+
+        // Cache must still hold the SAME reaction_id from the fast-ack —
+        // the dedupe path must not overwrite it.
+        {
+            let cache = ch.reaction_ids.lock().await;
+            assert_eq!(
+                cache
+                    .get(&("om_dedupe".to_string(), "\u{1F440}".to_string()))
+                    .map(String::as_str),
+                Some("r_dedupe_fast_ack"),
+                "cache value must remain the fast-ack reaction_id after dedupe \
+                 (no overwrite)"
+            );
+        }
+
+        // Step 3: cleanup. DELETE must hit the cached fast-ack reaction_id.
+        // If the dedupe path had wrongly issued a second POST and Feishu
+        // had returned a different reaction_id that overwrote the cache,
+        // delete_glance_mock's path-match on r_dedupe_fast_ack would
+        // miss and the assertion would fail.
+        ch.remove_reaction("oc_chat", "om_dedupe", "\u{1F440}")
+            .await
+            .expect("remove 👀 should DELETE the fast-ack reaction_id");
+
+        // Cache must be empty after remove.
+        {
+            let cache = ch.reaction_ids.lock().await;
+            assert!(
+                cache.is_empty(),
+                "cache must be empty after remove_reaction, got {} entries",
+                cache.len()
+            );
+        }
+
+        drop(post_glance_mock);
+        drop(delete_glance_mock);
     }
 }

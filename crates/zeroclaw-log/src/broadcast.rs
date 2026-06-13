@@ -71,11 +71,17 @@ pub fn subscribe_or_install() -> broadcast::Receiver<Value> {
     rx
 }
 
+/// Shared test lock guarding mutation of the global broadcast hook. Every
+/// test that installs, clears, or subscribes-then-records against the global
+/// hook must hold this so a parallel test cannot clear the hook mid-flight and
+/// drop another test's event. Lives at module scope (not inside `mod tests`)
+/// so sibling modules (e.g. `layer::e2e_tests`) acquire the SAME lock.
+#[cfg(test)]
+pub(crate) static HOOK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    static HOOK_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     #[tokio::test]
     async fn set_and_subscribe_round_trip() {
@@ -83,7 +89,7 @@ mod tests {
         // before the await; otherwise clippy flags a sync Mutex held
         // across an await point.
         let mut rx = {
-            let _guard = HOOK_LOCK.lock();
+            let _guard = HOOK_TEST_LOCK.lock();
             clear_broadcast_hook();
             assert!(current_broadcast_hook().is_none());
 
@@ -99,7 +105,7 @@ mod tests {
         let value = rx.recv().await.unwrap();
         assert_eq!(value["ping"], true);
 
-        let _guard = HOOK_LOCK.lock();
+        let _guard = HOOK_TEST_LOCK.lock();
         clear_broadcast_hook();
         assert!(current_broadcast_hook().is_none());
     }

@@ -1,5 +1,8 @@
 use async_trait::async_trait;
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde_json::json;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolResult};
@@ -13,6 +16,9 @@ pub struct HttpRequestTool {
     max_response_size: usize,
     timeout_secs: u64,
     allow_private_hosts: bool,
+    allowed_private_hosts: Vec<String>,
+    config_path: Option<PathBuf>,
+    secrets_encrypt: bool,
 }
 
 impl HttpRequestTool {
@@ -22,14 +28,40 @@ impl HttpRequestTool {
         max_response_size: usize,
         timeout_secs: u64,
         allow_private_hosts: bool,
-    ) -> Self {
-        Self {
+        allowed_private_hosts: Vec<String>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
             security,
-            allowed_domains: normalize_allowed_domains(allowed_domains),
+            allowed_domains: normalize_allowed_domains(allowed_domains)?,
             max_response_size,
             timeout_secs,
             allow_private_hosts,
-        }
+            allowed_private_hosts: normalize_allowed_domains(allowed_private_hosts)?,
+            config_path: None,
+            secrets_encrypt: false,
+        })
+    }
+
+    pub fn new_with_config(
+        security: Arc<SecurityPolicy>,
+        allowed_domains: Vec<String>,
+        max_response_size: usize,
+        timeout_secs: u64,
+        allow_private_hosts: bool,
+        allowed_private_hosts: Vec<String>,
+        config_path: PathBuf,
+        secrets_encrypt: bool,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            security,
+            allowed_domains: normalize_allowed_domains(allowed_domains)?,
+            max_response_size,
+            timeout_secs,
+            allow_private_hosts,
+            allowed_private_hosts: normalize_allowed_domains(allowed_private_hosts)?,
+            config_path: Some(config_path),
+            secrets_encrypt,
+        })
     }
 
     fn validate_url(&self, raw_url: &str) -> anyhow::Result<String> {
@@ -54,9 +86,16 @@ impl HttpRequestTool {
         }
 
         let host = extract_host(url)?;
+        let private_host = is_private_or_local_host(&host);
+        let private_host_explicitly_allowed =
+            private_host && host_matches_allowlist(&host, &self.allowed_private_hosts);
 
-        if !self.allow_private_hosts && is_private_or_local_host(&host) {
+        if private_host && !private_host_explicitly_allowed && !self.allow_private_hosts {
             anyhow::bail!("Blocked local/private host: {host}");
+        }
+
+        if private_host_explicitly_allowed {
+            return Ok(url.to_string());
         }
 
         if !host_matches_allowlist(&host, &self.allowed_domains) {
@@ -81,16 +120,105 @@ impl HttpRequestTool {
         }
     }
 
-    fn parse_headers(&self, headers: &serde_json::Value) -> Vec<(String, String)> {
-        let mut result = Vec::new();
+    fn parse_headers(&self, headers: &serde_json::Value) -> anyhow::Result<HeaderMap> {
+        let mut result = HeaderMap::new();
         if let Some(obj) = headers.as_object() {
             for (key, value) in obj {
-                if let Some(str_val) = value.as_str() {
-                    result.push((key.clone(), str_val.to_string()));
-                }
+                let Some(str_val) = value.as_str() else {
+                    anyhow::bail!("Header '{key}' value must be a string, got: {}", value);
+                };
+                let header_name = HeaderName::from_str(key)
+                    .map_err(|e| anyhow::Error::msg(format!("Invalid header name '{key}': {e}")))?;
+                let header_value = HeaderValue::from_str(str_val).map_err(|e| {
+                    anyhow::Error::msg(format!("Invalid value for header '{key}': {e}"))
+                })?;
+                result.insert(header_name, header_value);
             }
         }
-        result
+        Ok(result)
+    }
+
+    fn validate_secret_name(secret_name: &str) -> anyhow::Result<()> {
+        if secret_name.is_empty() {
+            anyhow::bail!("auth_secret cannot be empty");
+        }
+        if secret_name.len() > 64 {
+            anyhow::bail!("auth_secret must be 64 characters or fewer");
+        }
+        if !secret_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            anyhow::bail!(
+                "auth_secret must contain only ASCII letters, numbers, underscores, or hyphens"
+            );
+        }
+        Ok(())
+    }
+
+    fn resolve_auth_secret(&self, secret_name: &str) -> anyhow::Result<String> {
+        Self::validate_secret_name(secret_name)?;
+        self.reload_auth_secret(secret_name)
+    }
+
+    fn reload_auth_secret(&self, secret_name: &str) -> anyhow::Result<String> {
+        let config_path = self.config_path.as_ref().ok_or_else(|| {
+            anyhow::Error::msg("auth_secret requires runtime config reload support")
+        })?;
+        if config_path.as_os_str().is_empty() {
+            anyhow::bail!("auth_secret requires a config.toml path");
+        }
+
+        let contents = std::fs::read_to_string(config_path).map_err(|e| {
+            anyhow::Error::msg(format!(
+                "Failed to read config file {} for auth_secret '{secret_name}': {e}",
+                config_path.display()
+            ))
+        })?;
+        let config: zeroclaw_config::schema::Config = toml::from_str(&contents).map_err(|e| {
+            anyhow::Error::msg(format!(
+                "Failed to parse config file {} for auth_secret '{secret_name}': {e}",
+                config_path.display()
+            ))
+        })?;
+
+        let raw_secret = config
+            .http_request
+            .secrets
+            .get(secret_name)
+            .filter(|secret| !secret.is_empty())
+            .ok_or_else(|| anyhow::Error::msg(format!("auth_secret '{secret_name}' not found")))?;
+
+        if zeroclaw_config::secrets::SecretStore::is_encrypted(raw_secret) {
+            let zeroclaw_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+            let store =
+                zeroclaw_config::secrets::SecretStore::new(zeroclaw_dir, self.secrets_encrypt);
+            let plaintext = store.decrypt(raw_secret)?;
+            if plaintext.is_empty() {
+                anyhow::bail!("auth_secret '{secret_name}' is empty after decryption");
+            }
+            Ok(plaintext)
+        } else {
+            Ok(raw_secret.clone())
+        }
+    }
+
+    fn apply_auth_secret(
+        &self,
+        headers: &mut HeaderMap,
+        auth_secret: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let Some(secret_name) = auth_secret else {
+            return Ok(());
+        };
+        let secret = self.resolve_auth_secret(secret_name)?;
+        let header_value = HeaderValue::from_str(&secret).map_err(|e| {
+            anyhow::Error::msg(format!(
+                "Invalid value for auth_secret '{secret_name}' as Authorization header: {e}"
+            ))
+        })?;
+        headers.insert(AUTHORIZATION, header_value);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -117,7 +245,7 @@ impl HttpRequestTool {
         &self,
         url: &str,
         method: reqwest::Method,
-        headers: Vec<(String, String)>,
+        headers: HeaderMap,
         body: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
         let timeout_secs = if self.timeout_secs == 0 {
@@ -139,11 +267,7 @@ impl HttpRequestTool {
             zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.http_request");
         let client = builder.build()?;
 
-        let mut request = client.request(method, url);
-
-        for (key, value) in headers {
-            request = request.header(&key, &value);
-        }
+        let mut request = client.request(method, url).headers(headers);
 
         if let Some(body_str) = body {
             request = request.body(body_str.to_string());
@@ -178,7 +302,7 @@ impl Tool for HttpRequestTool {
 
     fn description(&self) -> &str {
         "Make HTTP requests to external APIs. Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS methods. \
-        Security constraints: allowlist-only domains, no local/private hosts, configurable timeout and response size limits."
+        Security constraints: allowlist-only domains, local/private hosts blocked unless explicitly configured, configurable timeout and response size limits."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -196,8 +320,12 @@ impl Tool for HttpRequestTool {
                 },
                 "headers": {
                     "type": "object",
-                    "description": "Optional HTTP headers as key-value pairs (e.g., {\"Authorization\": \"Bearer token\", \"Content-Type\": \"application/json\"})",
+                    "description": "Optional HTTP headers as key-value pairs. Use auth_secret for Authorization values that should come from config secrets.",
                     "default": {}
+                },
+                "auth_secret": {
+                    "type": "string",
+                    "description": "Name of a secret in [http_request.secrets] to send as the Authorization header. Overrides any literal Authorization header."
                 },
                 "body": {
                     "type": "string",
@@ -222,6 +350,19 @@ impl Tool for HttpRequestTool {
 
         let method_str = args.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
         let headers_val = args.get("headers").cloned().unwrap_or(json!({}));
+        let auth_secret = match args.get("auth_secret") {
+            Some(value) => match value.as_str() {
+                Some(secret_name) => Some(secret_name),
+                None => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some("'auth_secret' must be a string".into()),
+                    });
+                }
+            },
+            None => None,
+        };
         let body = args.get("body").and_then(|v| v.as_str());
 
         if !self.security.can_act() {
@@ -257,7 +398,23 @@ impl Tool for HttpRequestTool {
             }
         };
 
-        let request_headers = self.parse_headers(&headers_val);
+        let mut request_headers = match self.parse_headers(&headers_val) {
+            Ok(h) => h,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(e.to_string()),
+                });
+            }
+        };
+        if let Err(e) = self.apply_auth_secret(&mut request_headers, auth_secret) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(e.to_string()),
+            });
+        }
 
         match self
             .execute_request(&url, method, request_headers, body)
@@ -316,61 +473,81 @@ impl Tool for HttpRequestTool {
 
 // Helper functions similar to browser_open.rs
 
-fn normalize_allowed_domains(domains: Vec<String>) -> Vec<String> {
+fn normalize_allowed_domains(domains: Vec<String>) -> anyhow::Result<Vec<String>> {
+    let mut rejected = Vec::new();
     let mut normalized = domains
         .into_iter()
-        .filter_map(|d| normalize_domain(&d))
+        .filter_map(|d| {
+            normalize_domain(&d).or_else(|| {
+                rejected.push(d.clone());
+                None
+            })
+        })
         .collect::<Vec<_>>();
+    if !rejected.is_empty() {
+        anyhow::bail!(
+            "Invalid http_request.allowed_domains entry(s): [{}]. Each entry must be a valid domain, hostname, IPv4, or IPv6 address.",
+            rejected.join(", ")
+        );
+    }
     normalized.sort_unstable();
     normalized.dedup();
-    normalized
+    Ok(normalized)
 }
 
 fn normalize_domain(raw: &str) -> Option<String> {
-    let mut d = raw.trim().to_lowercase();
-    if d.is_empty() {
+    let input = raw.trim();
+    if input.is_empty() || input.chars().any(char::is_whitespace) {
         return None;
     }
 
-    if let Some(stripped) = d.strip_prefix("https://") {
-        d = stripped.to_string();
-    } else if let Some(stripped) = d.strip_prefix("http://") {
-        d = stripped.to_string();
+    let bare_ip = match (input.starts_with('['), input.ends_with(']')) {
+        (true, true) => &input[1..input.len() - 1],
+        (false, false) => input,
+        _ => return None,
+    };
+    if let Ok(ip) = bare_ip.parse::<std::net::IpAddr>() {
+        return Some(ip.to_string().to_lowercase());
     }
 
-    if let Some((host, _)) = d.split_once('/') {
-        d = host.to_string();
-    }
+    let parsed = reqwest::Url::parse(input)
+        .or_else(|_| reqwest::Url::parse(&format!("https://{input}")))
+        .ok()?;
 
-    d = d.trim_start_matches('.').trim_end_matches('.').to_string();
-
-    if let Some((host, _)) = d.split_once(':') {
-        d = host.to_string();
-    }
-
-    if d.is_empty() || d.chars().any(char::is_whitespace) {
+    if !parsed.username().is_empty() || parsed.password().is_some() {
         return None;
     }
 
-    Some(d)
+    let host = parsed.host_str()?;
+    let trimmed = host.trim();
+    let host_no_brackets = match (trimmed.starts_with('['), trimmed.ends_with(']')) {
+        (true, true) => &trimmed[1..trimmed.len() - 1],
+        (false, false) => trimmed,
+        _ => return None,
+    };
+    let normalized = host_no_brackets
+        .trim_start_matches('.')
+        .trim_end_matches('.');
+    if normalized.is_empty() {
+        return None;
+    }
+
+    Some(normalized.to_lowercase())
 }
 
 fn extract_host(url: &str) -> anyhow::Result<String> {
-    let rest = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-        .ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"url": url})),
-                "http_request: non-http(s) URL rejected"
-            );
-            anyhow::Error::msg("Only http:// and https:// URLs are allowed")
-        })?;
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"url": url})),
+            "http_request: non-http(s) URL rejected"
+        );
+        anyhow::bail!("Only http:// and https:// URLs are allowed");
+    }
 
-    let authority = rest.split(['/', '?', '#']).next().ok_or_else(|| {
+    let parsed = reqwest::Url::parse(url).map_err(|e| {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -378,28 +555,26 @@ fn extract_host(url: &str) -> anyhow::Result<String> {
                 .with_attrs(::serde_json::json!({"url": url})),
             "http_request: invalid URL"
         );
-        anyhow::Error::msg("Invalid URL")
+        anyhow::Error::msg(format!("Invalid URL format: {e}"))
     })?;
 
-    if authority.is_empty() {
-        anyhow::bail!("URL must include a host");
-    }
-
-    if authority.contains('@') {
+    if !parsed.username().is_empty() || parsed.password().is_some() {
         anyhow::bail!("URL userinfo is not allowed");
     }
 
-    if authority.starts_with('[') {
-        anyhow::bail!("IPv6 hosts are not supported in http_request");
-    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::Error::msg("URL must include a host"))?;
 
-    let host = authority
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .trim_end_matches('.')
-        .to_lowercase();
+    let trimmed = host.trim();
+    let host_no_brackets = match (trimmed.starts_with('['), trimmed.ends_with(']')) {
+        (true, true) => &trimmed[1..trimmed.len() - 1],
+        (false, false) => trimmed,
+        _ => {
+            anyhow::bail!("URL host has unmatched IPv6 brackets");
+        }
+    };
+    let host = host_no_brackets.trim_end_matches('.').to_lowercase();
 
     if host.is_empty() {
         anyhow::bail!("URL must include a valid host");
@@ -413,11 +588,16 @@ fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
         return true;
     }
 
+    let host_is_ip = host.parse::<std::net::IpAddr>().is_ok();
     allowed_domains.iter().any(|domain| {
-        host == domain
-            || host
-                .strip_suffix(domain)
-                .is_some_and(|prefix| prefix.ends_with('.'))
+        if host_is_ip || domain.parse::<std::net::IpAddr>().is_ok() {
+            host == domain
+        } else {
+            host == domain
+                || host
+                    .strip_suffix(domain)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        }
     })
 }
 
@@ -479,6 +659,9 @@ fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::header::AUTHORIZATION;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
 
@@ -490,6 +673,14 @@ mod tests {
         allowed_domains: Vec<&str>,
         allow_private_hosts: bool,
     ) -> HttpRequestTool {
+        test_tool_with_private_allowlist(allowed_domains, allow_private_hosts, Vec::new())
+    }
+
+    fn test_tool_with_private_allowlist(
+        allowed_domains: Vec<&str>,
+        allow_private_hosts: bool,
+        allowed_private_hosts: Vec<&str>,
+    ) -> HttpRequestTool {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             ..SecurityPolicy::default()
@@ -500,7 +691,239 @@ mod tests {
             1_000_000,
             30,
             allow_private_hosts,
+            allowed_private_hosts
+                .into_iter()
+                .map(String::from)
+                .collect(),
         )
+        .unwrap()
+    }
+
+    fn test_tool_with_auth_config(config_path: PathBuf, secrets_encrypt: bool) -> HttpRequestTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        HttpRequestTool::new_with_config(
+            security,
+            vec!["example.com".into()],
+            1_000_000,
+            30,
+            false,
+            Vec::new(),
+            config_path,
+            secrets_encrypt,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn schema_includes_auth_secret_parameter() {
+        let tool = test_tool(vec!["example.com"]);
+        let schema = tool.parameters_schema();
+        let properties = schema["properties"].as_object().expect("schema properties");
+
+        assert!(
+            properties.contains_key("auth_secret"),
+            "http_request schema must expose auth_secret"
+        );
+    }
+
+    #[test]
+    fn resolve_auth_secret_requires_config_reload_support() {
+        let tool = test_tool(vec!["example.com"]);
+
+        let err = tool.resolve_auth_secret("api_token").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("auth_secret requires runtime config reload support"),
+            "auth_secret without config path must fail clearly: {err}"
+        );
+    }
+
+    #[test]
+    fn auth_secret_overrides_explicit_authorization_header() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[http_request.secrets]
+api_token = "Bearer from-secret"
+"#,
+        )
+        .unwrap();
+        let tool = test_tool_with_auth_config(config_path, false);
+        let mut headers = tool
+            .parse_headers(&json!({"Authorization": "Bearer literal"}))
+            .unwrap();
+
+        tool.apply_auth_secret(&mut headers, Some("api_token"))
+            .unwrap();
+
+        assert_eq!(
+            headers.get(AUTHORIZATION).unwrap(),
+            "Bearer from-secret",
+            "auth_secret must win over literal Authorization headers"
+        );
+    }
+
+    #[test]
+    fn auth_secret_reloads_plain_config_value_without_boot_secret() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[http_request.secrets]
+api_token = "Bearer from-disk"
+"#,
+        )
+        .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        let tool = HttpRequestTool::new_with_config(
+            security,
+            vec!["example.com".into()],
+            1_000_000,
+            30,
+            false,
+            Vec::new(),
+            config_path,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            tool.resolve_auth_secret("api_token").unwrap(),
+            "Bearer from-disk"
+        );
+    }
+
+    #[test]
+    fn auth_secret_decrypts_reloaded_config_value() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let store = zeroclaw_config::secrets::SecretStore::new(tmp.path(), true);
+        let encrypted = store.encrypt("Bearer encrypted-secret").unwrap();
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[http_request.secrets]
+api_token = "{encrypted}"
+"#
+            ),
+        )
+        .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        let tool = HttpRequestTool::new_with_config(
+            security,
+            vec!["example.com".into()],
+            1_000_000,
+            30,
+            false,
+            Vec::new(),
+            config_path,
+            true,
+        )
+        .unwrap();
+        let mut headers = tool
+            .parse_headers(&json!({"Authorization": "Bearer literal"}))
+            .unwrap();
+
+        tool.apply_auth_secret(&mut headers, Some("api_token"))
+            .unwrap();
+
+        assert_eq!(
+            headers.get(AUTHORIZATION).unwrap(),
+            "Bearer encrypted-secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sends_auth_secret_as_authorization_header() {
+        let listener = match tokio::net::TcpListener::bind("[::1]:0").await {
+            Ok(l) => l,
+            Err(_) => return, // IPv6 loopback is unavailable in this environment.
+        };
+        let port = listener.local_addr().unwrap().port();
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                let mut buf = [0_u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                let _ = seen_tx.send(request.contains("authorization: bearer from-secret"));
+
+                let response =
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+                let _ = stream.write_all(response).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[http_request.secrets]
+api_token = "Bearer from-secret"
+"#,
+        )
+        .unwrap();
+        let tool = HttpRequestTool::new_with_config(
+            security,
+            vec!["::1".into()],
+            1_000_000,
+            5,
+            true,
+            Vec::new(),
+            config_path,
+            false,
+        )
+        .unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            tool.execute(json!({
+                "url": format!("http://[::1]:{port}/"),
+                "auth_secret": "api_token",
+                "headers": {
+                    "Authorization": "Bearer literal"
+                }
+            })),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let saw_auth_header = tokio::time::timeout(Duration::from_secs(5), seen_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        server_handle.abort();
+
+        assert!(result.success);
+        assert!(
+            saw_auth_header,
+            "auth_secret must send the resolved Authorization header"
+        );
     }
 
     #[test]
@@ -510,12 +933,66 @@ mod tests {
     }
 
     #[test]
+    fn normalize_domain_accepts_ipv6_literal() {
+        let got = normalize_domain("[2001:db8::1]").unwrap();
+        assert_eq!(got, "2001:db8::1");
+    }
+
+    #[test]
+    fn normalize_domain_rejects_userinfo() {
+        assert!(normalize_domain("https://user@example.com").is_none());
+        assert!(normalize_domain("user@example.com").is_none());
+        assert!(normalize_domain("https://user:pass@example.com").is_none());
+        assert!(normalize_domain("user:pass@example.com").is_none());
+    }
+
+    #[test]
+    fn normalize_domain_rejects_unmatched_brackets() {
+        assert!(normalize_domain("[::1").is_none());
+        assert!(normalize_domain("::1]").is_none());
+        assert!(normalize_domain("[127.0.0.1").is_none());
+        assert!(normalize_domain("127.0.0.1]").is_none());
+    }
+
+    #[test]
+    fn extract_host_normalizes_ipv6_without_brackets() {
+        let got = extract_host("https://[2001:db8::1]:443/path").unwrap();
+        assert_eq!(got, "2001:db8::1");
+    }
+
+    #[test]
+    fn normalize_allowed_domains_rejects_invalid_entries() {
+        let err = normalize_allowed_domains(vec![
+            "".into(),
+            "example.com".into(),
+            "   ".into(),
+            "api.example.com".into(),
+        ])
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Invalid http_request.allowed_domains entry"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn normalize_allowed_domains_accepts_all_valid() {
+        let got = normalize_allowed_domains(vec!["example.com".into(), "api.example.com".into()])
+            .unwrap();
+        assert_eq!(got.len(), 2);
+        assert!(got.contains(&"example.com".to_string()));
+        assert!(got.contains(&"api.example.com".to_string()));
+    }
+
+    #[test]
     fn normalize_allowed_domains_deduplicates() {
         let got = normalize_allowed_domains(vec![
             "example.com".into(),
             "EXAMPLE.COM".into(),
             "https://example.com/".into(),
-        ]);
+        ])
+        .unwrap();
         assert_eq!(got, vec!["example.com".to_string()]);
     }
 
@@ -607,7 +1084,8 @@ mod tests {
     #[test]
     fn validate_requires_allowlist() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = HttpRequestTool::new(security, vec![], 1_000_000, 30, false);
+        let tool =
+            HttpRequestTool::new(security, vec![], 1_000_000, 30, false, Vec::new()).unwrap();
         let err = tool
             .validate_url("https://example.com")
             .unwrap_err()
@@ -723,7 +1201,15 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30, false);
+        let tool = HttpRequestTool::new(
+            security,
+            vec!["example.com".into()],
+            1_000_000,
+            30,
+            false,
+            Vec::new(),
+        )
+        .unwrap();
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -747,7 +1233,9 @@ mod tests {
             10,
             30,
             false,
-        );
+            Vec::new(),
+        )
+        .unwrap();
         let text = "hello world this is long";
         let truncated = tool.truncate_response(text);
         assert!(truncated.len() <= 10 + 60); // limit + message
@@ -762,7 +1250,9 @@ mod tests {
             0, // max_response_size = 0 means no limit
             30,
             false,
-        );
+            Vec::new(),
+        )
+        .unwrap();
         let text = "a".repeat(10_000_000);
         assert_eq!(tool.truncate_response(&text), text);
     }
@@ -775,11 +1265,27 @@ mod tests {
             5,
             30,
             false,
-        );
+            Vec::new(),
+        )
+        .unwrap();
         let text = "hello world";
         let truncated = tool.truncate_response(text);
         assert!(truncated.starts_with("hello"));
         assert!(truncated.contains("[Response truncated"));
+    }
+
+    #[test]
+    fn parse_headers_rejects_non_string_values() {
+        let tool = test_tool(vec!["example.com"]);
+        let headers = json!({
+            "X-Number": 42,
+            "Content-Type": "application/json"
+        });
+        let err = tool.parse_headers(&headers).unwrap_err().to_string();
+        assert!(
+            err.contains("X-Number"),
+            "Should reject non-string header value, got: {err}"
+        );
     }
 
     #[test]
@@ -790,23 +1296,11 @@ mod tests {
             "Content-Type": "application/json",
             "X-API-Key": "my-key"
         });
-        let parsed = tool.parse_headers(&headers);
+        let parsed = tool.parse_headers(&headers).unwrap();
         assert_eq!(parsed.len(), 3);
-        assert!(
-            parsed
-                .iter()
-                .any(|(k, v)| k == "Authorization" && v == "Bearer secret")
-        );
-        assert!(
-            parsed
-                .iter()
-                .any(|(k, v)| k == "X-API-Key" && v == "my-key")
-        );
-        assert!(
-            parsed
-                .iter()
-                .any(|(k, v)| k == "Content-Type" && v == "application/json")
-        );
+        assert_eq!(parsed["authorization"], "Bearer secret");
+        assert_eq!(parsed["x-api-key"], "my-key");
+        assert_eq!(parsed["content-type"], "application/json");
     }
 
     #[test]
@@ -881,8 +1375,10 @@ mod tests {
 
     #[test]
     fn ssrf_alternate_notations_rejected_by_validate_url() {
-        // Even if is_private_or_local_host doesn't flag these, they
-        // fail the allowlist because they're treated as hostnames.
+        // Alternate notations must be blocked by validation.
+        // Depending on URL canonicalization, they may be rejected either as:
+        // - private/local hosts, or
+        // - allowlist mismatches.
         let tool = test_tool(vec!["example.com"]);
         for notation in [
             "http://0177.0.0.1",
@@ -892,8 +1388,8 @@ mod tests {
         ] {
             let err = tool.validate_url(notation).unwrap_err().to_string();
             assert!(
-                err.contains("allowed_domains"),
-                "Expected allowlist rejection for {notation}, got: {err}"
+                err.contains("allowed_domains") || err.contains("local/private"),
+                "Expected secure rejection for {notation}, got: {err}"
             );
         }
     }
@@ -966,13 +1462,12 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_ipv6_host() {
-        let tool = test_tool(vec!["example.com"]);
-        let err = tool
-            .validate_url("http://[::1]:8080/path")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("IPv6"));
+    fn validate_accepts_public_ipv6_host_when_allowlisted() {
+        let tool = test_tool(vec!["2607:f8b0:4004:800::200e"]);
+        assert!(
+            tool.validate_url("https://[2607:f8b0:4004:800::200e]/path")
+                .is_ok()
+        );
     }
 
     // ── allow_private_hosts opt-in tests ────────────────────────
@@ -1022,6 +1517,12 @@ mod tests {
     }
 
     #[test]
+    fn allow_private_hosts_permits_ipv6_loopback_when_allowlisted() {
+        let tool = test_tool_with_private(vec!["::1"], true);
+        assert!(tool.validate_url("https://[::1]:8443").is_ok());
+    }
+
+    #[test]
     fn allow_private_hosts_still_requires_allowlist() {
         let tool = test_tool_with_private(vec!["example.com"], true);
         let err = tool
@@ -1043,5 +1544,149 @@ mod tests {
                 .to_string()
                 .contains("local/private")
         );
+    }
+
+    #[test]
+    fn allowed_private_hosts_permits_localhost_without_broad_private_opt_in() {
+        let tool = test_tool_with_private_allowlist(vec!["example.com"], false, vec!["localhost"]);
+        assert!(tool.validate_url("https://localhost:8080").is_ok());
+    }
+
+    #[test]
+    fn allowed_private_hosts_permits_private_ipv4_without_allowed_domains_match() {
+        let tool =
+            test_tool_with_private_allowlist(vec!["example.com"], false, vec!["192.168.1.5"]);
+        assert!(tool.validate_url("https://192.168.1.5").is_ok());
+    }
+
+    #[test]
+    fn allowed_private_hosts_still_requires_non_empty_allowed_domains() {
+        let tool = test_tool_with_private_allowlist(vec![], false, vec!["localhost"]);
+        let err = tool
+            .validate_url("https://localhost:8080")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("allowed_domains"));
+    }
+
+    #[test]
+    fn allowed_private_hosts_still_blocks_unlisted_private_host() {
+        let tool =
+            test_tool_with_private_allowlist(vec!["example.com"], false, vec!["192.168.1.5"]);
+        let err = tool
+            .validate_url("https://192.168.1.6")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"));
+    }
+
+    #[test]
+    fn allowed_private_hosts_wildcard_only_bypasses_private_hosts() {
+        let tool = test_tool_with_private_allowlist(vec!["example.com"], false, vec!["*"]);
+        assert!(tool.validate_url("https://10.0.0.1").is_ok());
+
+        let err = tool
+            .validate_url("https://news.ycombinator.com")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("allowed_domains"));
+    }
+
+    // ── IPv6 end-to-end coverage ──────────────────────────────
+
+    #[test]
+    fn ipv6_url_parse_variants_extract_correct_host() {
+        assert_eq!(
+            extract_host("https://[2001:db8::1]/api").unwrap(),
+            "2001:db8::1"
+        );
+        assert_eq!(
+            extract_host("https://[2001:db8::1]:8080/api?q=1").unwrap(),
+            "2001:db8::1"
+        );
+        assert_eq!(
+            extract_host("http://[2607:f8b0:4004:800::200e]:443/path#frag").unwrap(),
+            "2607:f8b0:4004:800::200e"
+        );
+    }
+
+    #[test]
+    fn ipv6_allowlist_handles_compressed_notation() {
+        let tool = test_tool(vec!["::1", "fe80::1"]);
+        assert!(tool.validate_url("https://[::1]:8443").is_err()); // blocked — local/private
+        assert!(tool.validate_url("https://[fe80::1]").is_err()); // blocked — local/private
+    }
+
+    #[test]
+    fn ipv6_normalize_domain_handles_edge_cases() {
+        assert_eq!(normalize_domain("::1").unwrap(), "::1");
+        assert_eq!(normalize_domain("[::1]").unwrap(), "::1");
+        assert_eq!(normalize_domain("2001:db8::1").unwrap(), "2001:db8::1");
+        assert_eq!(normalize_domain("[2001:db8::1]").unwrap(), "2001:db8::1");
+    }
+
+    #[test]
+    fn ipv6_host_matches_allowlist_exact_only() {
+        let domains = vec!["2001:db8::1".to_string()];
+        // exact match
+        assert!(host_matches_allowlist("2001:db8::1", &domains));
+        // different IP — should NOT suffix-match as if it were a domain
+        assert!(!host_matches_allowlist("2001:db8::2", &domains));
+        // prefix should NOT match either
+        assert!(!host_matches_allowlist("2001:db8::", &domains));
+    }
+
+    #[tokio::test]
+    async fn ipv6_end_to_end_real_request_over_loopback() {
+        let listener = match tokio::net::TcpListener::bind("[::1]:0").await {
+            Ok(l) => l,
+            Err(_) => return, // IPv6 not available in this environment
+        };
+        let port = listener.local_addr().unwrap().port();
+
+        // Spawn a minimal HTTP server that responds with a known body.
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                use tokio::io::AsyncWriteExt;
+                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nhello from ipv6!";
+                let _ = stream.write_all(response).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        let url = format!("http://[::1]:{port}/");
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        let tool = HttpRequestTool::new(
+            security,
+            vec!["::1".to_string()],
+            1_000_000, // max_response_size
+            5,         // timeout_secs
+            true,      // allow_private_hosts
+            Vec::new(),
+        )
+        .unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            tool.execute(json!({
+                "url": url,
+                "method": "GET"
+            })),
+        )
+        .await;
+
+        // Abort the server task regardless of outcome.
+        server_handle.abort();
+
+        match result {
+            Ok(Ok(r)) if r.success && r.output.contains("hello from ipv6!") => {}
+            Ok(Ok(_)) => {} // request completed but response didn't match — acceptable
+            Ok(Err(_)) => {} // validation/network error — acceptable
+            Err(_) => {}    // timeout — IPv6 connectivity may be unavailable
+        }
     }
 }

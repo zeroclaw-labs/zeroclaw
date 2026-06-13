@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
+zeroclaw-spawn.workspace = true
 zeroclaw-config = { workspace = true, default-features = false }
 zeroclaw-providers.workspace = true
 zeroclaw-memory.workspace = true
@@ -21,6 +22,7 @@ directories = "6.0"
 futures-util = { version = "0.3", default-features = false }
 glob = "0.3"
 hex = "0.4"
+infer = { version = "0.19", default-features = false }
 fantoccini = { version = "0.22.1", optional = true, default-features = false, features = ["rustls-tls"] }
 nanohtml2text = "0.2"
 parking_lot = "0.12"

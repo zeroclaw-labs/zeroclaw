@@ -12,6 +12,9 @@ pub mod session_sqlite {
 
 use crate::config::Config;
 use anyhow::Result;
+use zeroclaw_runtime::i18n::get_required_cli_string;
+#[cfg(feature = "channel-notion")]
+use zeroclaw_runtime::i18n::get_required_cli_string_with_args;
 
 pub async fn handle_command(command: crate::ChannelCommands, config: &Config) -> Result<()> {
     match command {
@@ -22,8 +25,8 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
             anyhow::bail!("Doctor must be handled in main.rs (requires async runtime)")
         }
         crate::ChannelCommands::List => {
-            println!("Channels:");
-            println!("  ✅ CLI (always available)");
+            println!("{}", get_required_cli_string("cli-channels-header"));
+            println!("{}", get_required_cli_string("cli-channels-cli-always"));
             for entry in zeroclaw_channels::listing::compiled_channels(&config.channels) {
                 println!(
                     "  {} {}",
@@ -36,11 +39,18 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
             {
                 let notion_configured =
                     config.notion.enabled && !config.notion.database_id.trim().is_empty();
-                println!("  {} Notion", if notion_configured { "✅" } else { "❌" });
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-channels-notion",
+                        &[("status", if notion_configured { "✅" } else { "❌" })],
+                    )
+                );
             }
-            println!("\nTo start channels: zeroclaw channel start");
-            println!("To check health:    zeroclaw channel doctor");
-            println!("To configure:      zeroclaw onboard");
+            println!();
+            println!("{}", get_required_cli_string("cli-channels-start-hint"));
+            println!("{}", get_required_cli_string("cli-channels-doctor-hint"));
+            println!("{}", get_required_cli_string("cli-channels-configure-hint"));
             Ok(())
         }
         crate::ChannelCommands::Add {
@@ -48,7 +58,7 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
             config: _,
         } => {
             anyhow::bail!(
-                "Channel type '{channel_type}' — use `zeroclaw onboard` to configure channels"
+                "Channel type '{channel_type}' — use `zeroclaw config set channels.{channel_type}.<alias>.<field>=<value>` to configure"
             );
         }
         crate::ChannelCommands::Remove { name } => {

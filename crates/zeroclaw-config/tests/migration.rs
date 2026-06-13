@@ -11,7 +11,7 @@
 
 use zeroclaw_config::autonomy::AutonomyLevel;
 use zeroclaw_config::migration::{
-    CURRENT_SCHEMA_VERSION, GenerateOptions, MigrateReport, detect_version,
+    CURRENT_SCHEMA_VERSION, GenerateOptions, MigrateReport, detect_version, encrypt_secret_strings,
     ensure_disk_at_current_version, generate, migrate_file, migrate_file_in_place,
     migrate_to_current,
 };
@@ -809,13 +809,13 @@ memory_monitoring = true
 #[test]
 fn t14a_max_iterations_renamed_to_max_tool_iterations() {
     let cfg = v3_config();
-    let agent = cfg
-        .agents
-        .get("complex_agent")
-        .expect("agents.complex_agent present");
+    let runtime = cfg
+        .runtime_profiles
+        .get("agent_complex_agent")
+        .expect("synthesized runtime_profiles.agent_complex_agent");
     assert_eq!(
-        agent.max_tool_iterations, 25,
-        "V2 max_iterations=25 must land at V3 max_tool_iterations on the agent"
+        runtime.max_tool_iterations, 25,
+        "V2 max_iterations=25 must land on the synthesized runtime profile's max_tool_iterations"
     );
 }
 
@@ -1890,7 +1890,7 @@ allowed_rooms = ["!ops:matrix.org"]
 
 #[test]
 fn v2_channels_voice_duplex_block_alias_wraps() {
-    // Reproduces the user-reported migration error in v0.8.0:
+    // Reproduces a user-reported migration error:
     //   invalid type: boolean `false`, expected struct VoiceDuplexConfig
     //   in `channels.voice_duplex.enabled`
     // Cause: voice_duplex was missing from V3_CHANNEL_TYPES and went
@@ -2534,6 +2534,109 @@ fn encryption_covers_every_schema_secret_field() {
          string leaf survived as plaintext:\n\n{}",
         missed.join("\n")
     );
+}
+
+#[test]
+fn encryption_covers_compound_map_secret_field() {
+    // Map-shaped `#[secret]` fields (e.g. `mcp.servers[*].headers:
+    // HashMap<String, String>`) don't surface through `prop_fields()`
+    // — the derive intentionally skips non-Vec compound types. The
+    // raw-TOML encrypt walker must therefore source its allowlist
+    // from `secret_field_terminals()` (compile-time enumeration of
+    // every `#[secret]` field at every depth), so map-shaped values
+    // get the same encrypt-on-save coverage as scalar ones.
+    //
+    // This regression encodes that: a TOML config containing an MCP
+    // headers table with bearer credentials must have every value
+    // encrypted by the raw walker, while keys stay plaintext and
+    // sibling non-secret strings (`url`, `name`) stay plaintext too.
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = SecretStore::new(tmp.path(), true);
+
+    let raw_toml = r#"
+schema_version = 3
+
+[[mcp.servers]]
+name = "primary"
+transport = "sse"
+url = "https://mcp.example.invalid/sse"
+command = ""
+
+[mcp.servers.headers]
+Authorization = "Bearer mcp-cred"
+X-Tenant = "tenant-42"
+"#;
+
+    let mut value: toml::Value = toml::from_str(raw_toml).expect("toml parses");
+    encrypt_secret_strings(&mut value, &store).expect("encrypt walker succeeds");
+
+    let server = value
+        .get("mcp")
+        .and_then(|v| v.get("servers"))
+        .and_then(toml::Value::as_array)
+        .and_then(|arr| arr.first())
+        .expect("mcp.servers[0] table");
+    let headers = server
+        .get("headers")
+        .and_then(toml::Value::as_table)
+        .expect("mcp.servers[0].headers table");
+
+    for (key, val) in headers {
+        let s = val
+            .as_str()
+            .unwrap_or_else(|| panic!("headers.{key} is not a string"));
+        assert!(
+            s.starts_with("enc2:"),
+            "mcp.servers[0].headers.{key} must be enc2-prefixed; got: {s}"
+        );
+    }
+    let auth = headers
+        .get("Authorization")
+        .and_then(toml::Value::as_str)
+        .expect("Authorization value");
+    let tenant = headers
+        .get("X-Tenant")
+        .and_then(toml::Value::as_str)
+        .expect("X-Tenant value");
+    assert_eq!(
+        store.decrypt(auth).expect("decrypt auth"),
+        "Bearer mcp-cred",
+    );
+    assert_eq!(store.decrypt(tenant).expect("decrypt tenant"), "tenant-42",);
+
+    // Sibling non-secret strings remain plaintext — the walker only
+    // descends through allowlisted keys, not every string in the tree.
+    assert_eq!(
+        server.get("url").and_then(toml::Value::as_str),
+        Some("https://mcp.example.invalid/sse"),
+    );
+    assert_eq!(
+        server.get("name").and_then(toml::Value::as_str),
+        Some("primary"),
+    );
+}
+
+#[test]
+fn encryption_preserves_onepassword_secret_references() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = SecretStore::new(tmp.path(), true);
+
+    let raw_toml = r#"
+schema_version = 3
+
+[providers.models.openai.default]
+model = "gpt-5"
+api_key = "op://zeroclaw/provider/openai-api-key"
+"#;
+
+    let mut value: toml::Value = toml::from_str(raw_toml).expect("toml parses");
+    encrypt_secret_strings(&mut value, &store).expect("encrypt walker succeeds");
+
+    let api_key = lookup_dotted(&value, "providers.models.openai.default.api_key")
+        .and_then(toml::Value::as_str);
+
+    assert_eq!(api_key, Some("op://zeroclaw/provider/openai-api-key"));
 }
 
 #[test]

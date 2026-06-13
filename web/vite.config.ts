@@ -16,10 +16,12 @@ export default defineConfig(({ command }) => ({
   },
   build: {
     outDir: "dist",
+    target: ["chrome111", "edge111", "firefox113", "safari16.2"],
   },
   server: {
     proxy: {
       "/api":            { target: gatewayTarget, changeOrigin: true },
+      "^/acp(?:\\?.*)?$": { target: gatewayTarget, changeOrigin: true, ws: true },
       "/ws":             { target: gatewayTarget, changeOrigin: true, ws: true },
       "/admin":          { target: gatewayTarget, changeOrigin: true },
       "/health":         { target: gatewayTarget, changeOrigin: true },

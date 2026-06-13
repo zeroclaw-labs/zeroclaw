@@ -2847,6 +2847,7 @@ impl SlackChannel {
                 .map(str::to_string),
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         })
     }
 
@@ -3172,6 +3173,7 @@ impl SlackChannel {
                                         thread_ts,
                                         interruption_scope_id: scope_id,
                                         attachments: vec![],
+                                        subject: None,
                                     };
                                     ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"cancel_emoji": cancel_emoji, "user": user, "item_channel": item_channel, "item_ts": item_ts})), ":: reaction from on / — sending /stop");
                                     if tx.send(cancel_msg).await.is_err() {
@@ -3282,6 +3284,7 @@ impl SlackChannel {
                     },
                     interruption_scope_id: Self::inbound_interruption_scope_id(event, ts),
                     attachments: vec![],
+                    subject: None,
                 };
 
                 // Track thread context so start_typing can set assistant status.
@@ -3683,7 +3686,7 @@ impl SlackChannel {
 
 const SLACK_TRUNCATION_INDICATOR: &str = "\n\n...[message truncated]";
 
-/// Split `text` into chunks of at most `max_chars`, breaking at newline or
+/// Split `text` into chunks of at most `max_chars` bytes, breaking at newline or
 /// space boundaries when possible. Returns at most `max_chunks` pieces; if the
 /// text would require more, the last chunk includes a truncation indicator.
 fn split_text_into_chunks(text: &str, max_chars: usize, max_chunks: usize) -> Vec<String> {
@@ -3708,7 +3711,10 @@ fn split_text_into_chunks(text: &str, max_chars: usize, max_chunks: usize) -> Ve
                 chunks.push(remaining.to_string());
             } else {
                 // Truncate with indicator.
-                let avail = max_chars - SLACK_TRUNCATION_INDICATOR.len();
+                let avail = crate::util::floor_char_boundary(
+                    remaining,
+                    max_chars.saturating_sub(SLACK_TRUNCATION_INDICATOR.len()),
+                );
                 let break_at = remaining[..avail]
                     .rfind('\n')
                     .map(|i| i + 1)
@@ -3722,7 +3728,7 @@ fn split_text_into_chunks(text: &str, max_chars: usize, max_chunks: usize) -> Ve
         }
 
         // Normal chunk: find a good break point.
-        let limit = max_chars.min(remaining.len());
+        let limit = crate::util::floor_char_boundary(remaining, max_chars);
         let break_at = remaining[..limit]
             .rfind('\n')
             .map(|i| i + 1)
@@ -3946,7 +3952,7 @@ impl Channel for SlackChannel {
         let client = self.http_client();
         let token = self.bot_token.clone();
         let channel = recipient.to_string();
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             let mut body = serde_json::json!({
                 "channel": channel,
                 "ts": real_ts,
@@ -4420,6 +4426,7 @@ impl Channel for SlackChannel {
                             },
                             interruption_scope_id: Self::inbound_interruption_scope_id(msg, ts),
                             attachments: vec![],
+                            subject: None,
                         };
 
                         if tx.send(channel_msg).await.is_err() {
@@ -4515,6 +4522,7 @@ impl Channel for SlackChannel {
                         thread_ts: Some(thread_ts.clone()),
                         interruption_scope_id: Some(thread_ts.clone()),
                         attachments: vec![],
+                        subject: None,
                     };
 
                     if tx.send(channel_msg).await.is_err() {
@@ -4679,6 +4687,25 @@ impl Channel for SlackChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_text_into_chunks_safe_on_multibyte_utf8() {
+        let text = format!(
+            "{}{}{}",
+            "a".repeat(SLACK_BLOCK_TEXT_MAX_CHARS - 1),
+            "😀",
+            "tail"
+        );
+        let chunks = split_text_into_chunks(&text, SLACK_BLOCK_TEXT_MAX_CHARS, 3);
+
+        assert_eq!(chunks.concat(), text);
+        assert_eq!(chunks[0].len(), SLACK_BLOCK_TEXT_MAX_CHARS - 1);
+        assert_eq!(chunks[1], "😀tail");
+        for chunk in &chunks {
+            assert!(chunk.len() <= SLACK_BLOCK_TEXT_MAX_CHARS);
+            assert!(chunk.is_char_boundary(chunk.len()));
+        }
+    }
 
     #[test]
     fn slack_channel_name() {
@@ -5722,6 +5749,7 @@ mod tests {
             thread_ts: None, // thread_replies=false → no fallback to ts
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         };
 
         let msg1 = make_msg("100.000");
@@ -5749,6 +5777,7 @@ mod tests {
             thread_ts: Some(ts.to_string()), // thread_replies=true → ts as thread_ts
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         };
 
         let msg1 = make_msg("100.000");

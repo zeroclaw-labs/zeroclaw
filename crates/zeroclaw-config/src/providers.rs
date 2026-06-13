@@ -4,27 +4,29 @@ use zeroclaw_macros::Configurable;
 
 use super::schema::{
     Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnthropicModelProviderConfig,
-    AnyscaleModelProviderConfig, AstraiModelProviderConfig, AtomicChatModelProviderConfig,
-    AvianModelProviderConfig, AzureModelProviderConfig, BaichuanModelProviderConfig,
-    BasetenModelProviderConfig, BedrockModelProviderConfig, CerebrasModelProviderConfig,
-    CloudflareModelProviderConfig, CohereModelProviderConfig, CopilotModelProviderConfig,
-    CustomModelProviderConfig, DeepinfraModelProviderConfig, DeepmystModelProviderConfig,
-    DeepseekModelProviderConfig, DoubaoModelProviderConfig, FireworksModelProviderConfig,
-    FriendliModelProviderConfig, GeminiCliModelProviderConfig, GeminiModelProviderConfig,
+    AnyscaleModelProviderConfig, ArceeModelProviderConfig, AstraiModelProviderConfig,
+    AtomicChatModelProviderConfig, AvianModelProviderConfig, AzureModelProviderConfig,
+    BaichuanModelProviderConfig, BasetenModelProviderConfig, BedrockModelProviderConfig,
+    CerebrasModelProviderConfig, CloudflareModelProviderConfig, CohereModelProviderConfig,
+    CopilotModelProviderConfig, CustomModelProviderConfig, DeepinfraModelProviderConfig,
+    DeepmystModelProviderConfig, DeepseekModelProviderConfig, DoubaoModelProviderConfig,
+    FeatherlessModelProviderConfig, FireworksModelProviderConfig, FriendliModelProviderConfig,
+    GeminiCliModelProviderConfig, GeminiModelProviderConfig, GithubModelsModelProviderConfig,
     GlmModelProviderConfig, GroqModelProviderConfig, HuggingfaceModelProviderConfig,
-    HunyuanModelProviderConfig, HyperbolicModelProviderConfig, KiloCliModelProviderConfig,
+    HunyuanModelProviderConfig, HyperbolicModelProviderConfig, InceptionModelProviderConfig,
+    KiloCliModelProviderConfig, KiloModelProviderConfig, LambdaAiModelProviderConfig,
     LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
     LmstudioModelProviderConfig, MinimaxModelProviderConfig, MistralModelProviderConfig,
-    ModelProviderConfig, MoonshotModelProviderConfig, NebiusModelProviderConfig,
-    NovitaModelProviderConfig, NscaleModelProviderConfig, NvidiaModelProviderConfig,
-    OllamaModelProviderConfig, OpenAIModelProviderConfig, OpenRouterModelProviderConfig,
-    OpencodeModelProviderConfig, OsaurusModelProviderConfig, OvhModelProviderConfig,
-    PerplexityModelProviderConfig, QianfanModelProviderConfig, QwenModelProviderConfig,
-    RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
-    SiliconflowModelProviderConfig, StepfunModelProviderConfig, SyntheticModelProviderConfig,
-    TelnyxModelProviderConfig, TogetherModelProviderConfig, VeniceModelProviderConfig,
-    VercelModelProviderConfig, VllmModelProviderConfig, XaiModelProviderConfig,
-    YiModelProviderConfig, ZaiModelProviderConfig,
+    ModelProviderConfig, MoonshotModelProviderConfig, MorphModelProviderConfig,
+    NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
+    NvidiaModelProviderConfig, OllamaModelProviderConfig, OpenAIModelProviderConfig,
+    OpenRouterModelProviderConfig, OpencodeModelProviderConfig, OsaurusModelProviderConfig,
+    OvhModelProviderConfig, PerplexityModelProviderConfig, QianfanModelProviderConfig,
+    QwenModelProviderConfig, RekaModelProviderConfig, SambanovaModelProviderConfig,
+    SglangModelProviderConfig, SiliconflowModelProviderConfig, StepfunModelProviderConfig,
+    SyntheticModelProviderConfig, TelnyxModelProviderConfig, TogetherModelProviderConfig,
+    UpstageModelProviderConfig, VeniceModelProviderConfig, VercelModelProviderConfig,
+    VllmModelProviderConfig, XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
 };
 use super::schema::{
     AssemblyAiTranscriptionProviderConfig, DeepgramTranscriptionProviderConfig,
@@ -153,9 +155,17 @@ define_provider_ref!(TtsProviderRef, "providers.tts");
 define_provider_ref!(TranscriptionProviderRef, "providers.transcription");
 define_provider_ref!(ChannelRef, "channels");
 
+/// Hard ceiling on `providers.models.<alias>.fallback` chain depth. The cycle
+/// guard only bounds chains that loop; a long acyclic chain would otherwise
+/// recurse one stack frame per alias at config-load and build time, turning a
+/// pathological config into a startup stack overflow. Both the validation walk
+/// and the runtime build walk stop descending past this depth and prune the
+/// rest of the branch.
+pub const MAX_FALLBACK_DEPTH: usize = 3;
+
 /// Macro that expands to a single source of truth for the per-provider-type
 /// slot list on `ModelProviders`. Every helper that needs to walk every slot
-/// (`first_model_provider`, `iter_entries`, `is_empty`, etc.) goes through this
+/// (`find`, `iter_entries`, `is_empty`, etc.) goes through this
 /// macro so adding a new model_provider type is a one-line addition here, not a
 /// shotgun edit across multiple helpers.
 ///
@@ -229,8 +239,17 @@ macro_rules! for_each_model_provider_slot {
             (osaurus, "osaurus", OsaurusModelProviderConfig),
             (litellm, "litellm", LitellmModelProviderConfig),
             (lepton, "lepton", LeptonModelProviderConfig),
+            (morph, "morph", MorphModelProviderConfig),
+            (github_models, "github_models", GithubModelsModelProviderConfig),
+            (upstage, "upstage", UpstageModelProviderConfig),
+            (featherless, "featherless", FeatherlessModelProviderConfig),
+            (arcee, "arcee", ArceeModelProviderConfig),
+            (lambda_ai, "lambda_ai", LambdaAiModelProviderConfig),
+            (inception, "inception", InceptionModelProviderConfig),
             (synthetic, "synthetic", SyntheticModelProviderConfig),
-            (opencode, "opencode", OpencodeModelProviderConfig),            (kilocli, "kilocli", KiloCliModelProviderConfig),
+            (opencode, "opencode", OpencodeModelProviderConfig),
+            (kilocli, "kilocli", KiloCliModelProviderConfig),
+            (kilo, "kilo", KiloModelProviderConfig),
             (custom, "custom", CustomModelProviderConfig),
         }
     };
@@ -246,11 +265,11 @@ macro_rules! emit_model_providers_struct {
         /// extras visible at the type level).
         ///
         /// TOML shape is preserved byte-identical: each named field deserializes
-        /// from the same `[model_providers.<type>.<alias>]` block as before.
+        /// from the same `[providers.models.<type>.<alias>]` block as before.
         ///
         /// Adding a new model_provider family means: define the typed config in
-        /// `schema.rs`, then add one row to `for_each_model_provider_slot!` —
-        /// every helper picks up the new slot automatically.
+        /// `schema.rs`, then add one row to `for_each_model_provider_slot!`,
+        /// and every helper picks up the new slot automatically.
         #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
         #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
         #[prefix = "providers.models"]
@@ -341,6 +360,40 @@ impl ModelProviders {
         for_each_model_provider_slot!(emit_get)
     }
 
+    /// Resolve a name that is either a bare `<alias>` or a `<kind>.<alias>` pair
+    /// to its `(kind, alias, &config)`. A bare alias is matched across every
+    /// family; ambiguity (same alias under multiple kinds) returns `None` so the
+    /// caller can ask the user to qualify it. Registry-driven via
+    /// `for_each_model_provider_slot!`.
+    pub fn find_by_name(&self, name: &str) -> Option<(&'static str, String, &ModelProviderConfig)> {
+        if let Some((kind, alias)) = name.split_once('.') {
+            macro_rules! emit_dotted {
+                ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
+                    match kind {
+                        $( $type_str => self.$field.get(alias).map(|c| ($type_str, alias.to_string(), &c.base)), )+
+                        _ => None,
+                    }
+                };
+            }
+            return for_each_model_provider_slot!(emit_dotted);
+        }
+        let mut hit: Option<(&'static str, String, &ModelProviderConfig)> = None;
+        macro_rules! emit_bare {
+            ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
+                $(
+                    if let Some(c) = self.$field.get(name) {
+                        if hit.is_some() {
+                            return None; // ambiguous across kinds
+                        }
+                        hit = Some(($type_str, name.to_string(), &c.base));
+                    }
+                )+
+            };
+        }
+        for_each_model_provider_slot!(emit_bare);
+        hit
+    }
+
     /// Get-or-create the shared base config for a `<provider_type>.<alias>`
     /// pair, returning a mutable reference. Used by tools that mutate
     /// generic baseline fields (model, temperature, api_key) without caring
@@ -392,6 +445,21 @@ impl ModelProviders {
             };
         }
         for_each_model_provider_slot!(emit_aliases)
+    }
+
+    /// Canonical family slot names, straight from
+    /// `for_each_model_provider_slot!`. Use this to distinguish "unknown
+    /// family" from "known family, missing alias" in validation messages,
+    /// and to detect raw-TOML sections that deserialization silently drops.
+    #[must_use]
+    pub fn slot_names() -> &'static [&'static str] {
+        macro_rules! emit_slot_names {
+            ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
+                &[$($type_str),+]
+            };
+        }
+        const NAMES: &[&str] = for_each_model_provider_slot!(emit_slot_names);
+        NAMES
     }
 
     /// Remove the entry for `<provider_type>.<alias>`, returning whether it
@@ -736,6 +804,36 @@ macro_rules! for_each_transcription_provider_slot {
             (local_whisper, "local_whisper"),
         }
     };
+}
+
+/// Collect the `$type_str` names out of a rate-typed slot macro
+/// (`for_each_tts_provider_slot!` / `for_each_transcription_provider_slot!`).
+/// The `$rate_ty` head is consumed and ignored; the macro exists so
+/// `slot_names()` derives from the same source the structs are built from.
+macro_rules! collect_rate_slot_names {
+    ($rate_ty:ty, $(($field:ident, $type_str:literal)),+ $(,)?) => {
+        &[$($type_str),+]
+    };
+}
+
+impl TtsProviders {
+    /// Canonical TTS family slot names, derived from
+    /// `for_each_tts_provider_slot!`.
+    #[must_use]
+    pub fn slot_names() -> &'static [&'static str] {
+        const NAMES: &[&str] = for_each_tts_provider_slot!(collect_rate_slot_names, ());
+        NAMES
+    }
+}
+
+impl TranscriptionProviders {
+    /// Canonical transcription family slot names, derived from
+    /// `for_each_transcription_provider_slot!`.
+    #[must_use]
+    pub fn slot_names() -> &'static [&'static str] {
+        const NAMES: &[&str] = for_each_transcription_provider_slot!(collect_rate_slot_names, ());
+        NAMES
+    }
 }
 
 /// Emit a `<Family>CostRatesByProvider` struct from a slot list. Used

@@ -18,6 +18,9 @@ const QQ_AUTH_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
 /// Maximum upload size for QQ media files (10 MB).
 const QQ_MAX_UPLOAD_BYTES: u64 = 10 * 1024 * 1024;
 
+/// Maximum QQ audio size sent to transcription providers (25 MB).
+const QQ_MAX_AUDIO_TRANSCRIPTION_BYTES: u64 = 25 * 1024 * 1024;
+
 /// Maximum entries in the upload cache before eviction.
 const UPLOAD_CACHE_CAPACITY: usize = 500;
 
@@ -70,6 +73,33 @@ fn ensure_https(url: &str) -> anyhow::Result<()> {
 /// Check whether a file extension is a natively supported QQ voice format.
 fn is_native_voice_ext(ext: &str) -> bool {
     matches!(ext.to_ascii_lowercase().as_str(), "wav" | "mp3" | "silk")
+}
+
+fn has_supported_transcription_extension(filename: &str) -> bool {
+    let ext = Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    matches!(
+        ext.as_str(),
+        "flac" | "mp3" | "mpeg" | "mpga" | "mp4" | "m4a" | "ogg" | "oga" | "opus" | "wav" | "webm"
+    )
+}
+
+fn voice_wav_filename(url: &str) -> String {
+    let filename = Path::new(url.split('?').next().unwrap_or(url))
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .unwrap_or("voice");
+
+    if has_supported_transcription_extension(filename) {
+        filename.to_string()
+    } else {
+        format!("{filename}.wav")
+    }
 }
 
 /// Map a `[TYPE:target]` marker kind string to `QQMediaFileType`.
@@ -275,6 +305,9 @@ pub struct QQChannel {
     upload_cache: Arc<RwLock<HashMap<String, UploadCacheEntry>>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
+    /// Optional voice transcription manager for QQ audio attachments that do
+    /// not already carry QQ platform ASR text.
+    transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
     /// Session ID from the last READY event, used for gateway resume (opcode 6).
     session_id: Arc<RwLock<Option<String>>>,
     /// Last sequence number received, used for gateway resume (opcode 6).
@@ -298,6 +331,7 @@ impl QQChannel {
             workspace_dir: None,
             upload_cache: Arc::new(RwLock::new(HashMap::new())),
             proxy_url: None,
+            transcription_manager: None,
             session_id: Arc::new(RwLock::new(None)),
             last_sequence: Arc::new(RwLock::new(None)),
         }
@@ -318,6 +352,46 @@ impl QQChannel {
     /// Set a per-channel proxy URL that overrides the global proxy config.
     pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
         self.proxy_url = proxy_url;
+        self
+    }
+
+    /// Configure voice transcription for QQ audio attachments.
+    pub fn with_transcription(
+        mut self,
+        config: zeroclaw_config::schema::TranscriptionConfig,
+    ) -> Self {
+        if !config.enabled {
+            return self;
+        }
+
+        match super::transcription::TranscriptionManager::new(&config) {
+            Ok(manager) => {
+                let sole_provider = {
+                    let providers = manager.available_providers();
+                    if providers.len() == 1 {
+                        Some(providers[0].to_string())
+                    } else {
+                        None
+                    }
+                };
+                let manager = if let Some(provider) = sole_provider {
+                    manager.with_agent_transcription_provider(provider)
+                } else {
+                    manager
+                };
+                self.transcription_manager = Some(Arc::new(manager));
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "transcription manager init failed, QQ voice transcription disabled"
+                );
+            }
+        }
+
         self
     }
 
@@ -806,12 +880,7 @@ impl QQChannel {
                         .filter(|u| !u.trim().is_empty())
                     {
                         let fixed = fix_qq_url(wav_url);
-                        // Extract filename from WAV URL path
-                        let wav_name = Path::new(fixed.split('?').next().unwrap_or(&fixed))
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("voice.wav")
-                            .to_string();
+                        let wav_name = voice_wav_filename(&fixed);
                         (fixed, wav_name)
                     } else {
                         (url.clone(), filename.to_string())
@@ -821,13 +890,16 @@ impl QQChannel {
                 };
 
                 // Try to download to workspace
-                let location = if let Some(ref ws) = self.workspace_dir {
+                let (location, local_audio_data) = if let Some(ref ws) = self.workspace_dir {
                     let dir = ws.join("qq_files");
                     match self
                         .download_attachment(&download_url, &dir, &save_filename)
                         .await
                     {
-                        Ok(local_path) => local_path.display().to_string(),
+                        Ok((local_path, bytes)) => (
+                            local_path.display().to_string(),
+                            if is_voice { Some(bytes) } else { None },
+                        ),
                         Err(e) => {
                             ::zeroclaw_log::record!(
                                 WARN,
@@ -839,11 +911,11 @@ impl QQChannel {
                                 .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                                 "failed to download attachment"
                             );
-                            url.clone()
+                            (url.clone(), None)
                         }
                     }
                 } else {
-                    url.clone()
+                    (url.clone(), None)
                 };
 
                 if is_voice {
@@ -858,6 +930,12 @@ impl QQChannel {
                         .filter(|t| !t.is_empty())
                     {
                         voice_transcripts.push(asr_text.to_string());
+                    } else if let Some(audio_data) = local_audio_data.as_deref()
+                        && let Some(transcript) = self
+                            .try_transcribe_audio_data(audio_data, &save_filename)
+                            .await
+                    {
+                        voice_transcripts.push(transcript);
                     }
                 } else {
                     markers.push(format!("[{marker_type}:{location}]"));
@@ -906,7 +984,7 @@ impl QQChannel {
         url: &str,
         dir: &Path,
         filename: &str,
-    ) -> anyhow::Result<PathBuf> {
+    ) -> anyhow::Result<(PathBuf, Vec<u8>)> {
         tokio::fs::create_dir_all(dir).await?;
 
         // Generate a unique filename to avoid collisions
@@ -934,10 +1012,49 @@ impl QQChannel {
             anyhow::bail!("Download failed ({}): {url}", resp.status());
         }
 
-        let bytes = resp.bytes().await?;
+        let bytes = resp.bytes().await?.to_vec();
         tokio::fs::write(&dest, &bytes).await?;
 
-        Ok(dest)
+        Ok((dest, bytes))
+    }
+
+    async fn try_transcribe_audio_data(&self, audio_data: &[u8], filename: &str) -> Option<String> {
+        let manager = self.transcription_manager.as_deref()?;
+
+        if audio_data.len() as u64 > QQ_MAX_AUDIO_TRANSCRIPTION_BYTES {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "bytes": audio_data.len(),
+                        "max_bytes": QQ_MAX_AUDIO_TRANSCRIPTION_BYTES,
+                    })),
+                "QQ audio attachment exceeds transcription size limit"
+            );
+            return None;
+        }
+
+        match manager.transcribe(audio_data, filename).await {
+            Ok(text) => {
+                let text = text.trim();
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(text.to_string())
+                }
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "QQ audio transcription failed"
+                );
+                None
+            }
+        }
     }
 
     /// Send a markdown text message (msg_type=2).
@@ -1143,7 +1260,7 @@ impl Channel for QQChannel {
         let effective_interval = hb_interval.saturating_add(grace_ms);
 
         let (hb_tx, mut hb_rx) = tokio::sync::mpsc::channel::<()>(1);
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             let mut interval =
                 tokio::time::interval(std::time::Duration::from_millis(effective_interval));
             loop {
@@ -1320,6 +1437,7 @@ impl Channel for QQChannel {
                                 thread_ts: None,
                                 interruption_scope_id: None,
                     attachments: vec![],
+                                subject: None,
                             };
 
                             if tx.send(channel_msg).await.is_err() {
@@ -1362,6 +1480,7 @@ impl Channel for QQChannel {
                                 thread_ts: None,
                                 interruption_scope_id: None,
                     attachments: vec![],
+                                subject: None,
                             };
 
                             if tx.send(channel_msg).await.is_err() {
@@ -1718,6 +1837,32 @@ allowed_users = ["user1"]
 
     // --- compose_message_content tests (now async) ---
 
+    fn local_whisper_transcription_config(
+        url: String,
+    ) -> zeroclaw_config::schema::TranscriptionConfig {
+        zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: None,
+            api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
+            model: "whisper-large-v3".to_string(),
+            language: None,
+            initial_prompt: None,
+            max_audio_bytes: None,
+            max_duration_secs: 600,
+            openai: None,
+            deepgram: None,
+            assemblyai: None,
+            google: None,
+            local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                url,
+                bearer_token: Some("test_token".to_string()),
+                max_audio_bytes: 25_000_000,
+                timeout_secs: 300,
+            }),
+            transcribe_non_ptt_audio: false,
+        }
+    }
+
     #[tokio::test]
     async fn test_compose_message_content_text_only() {
         let ch = QQChannel::new(
@@ -1800,6 +1945,109 @@ allowed_users = ["user1"]
         assert!(result.contains("[VOICE:"));
         assert!(result.contains("[VIDEO:"));
         assert!(result.contains("[DOCUMENT:"));
+    }
+
+    #[tokio::test]
+    async fn test_compose_voice_attachment_transcribes_when_asr_missing() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"audio bytes"))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"text": " configured transcript "})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let ch = QQChannel::new(
+            "id".into(),
+            "secret".into(),
+            "qq_test_alias",
+            Arc::new(Vec::new),
+        )
+        .with_workspace_dir(workspace.path().to_path_buf())
+        .with_transcription(local_whisper_transcription_config(format!(
+            "{}/v1/audio/transcriptions",
+            mock_server.uri()
+        )));
+
+        let payload = json!({
+            "content": "",
+            "attachments": [{
+                "content_type": "voice",
+                "filename": "voice.amr",
+                "url": "https://cdn.example.com/voice.amr",
+                "voice_wav_url": format!("{}/download?sig=abc", mock_server.uri())
+            }]
+        });
+
+        let result = ch.compose_message_content(&payload).await.unwrap();
+        assert!(
+            result.contains("<VOICE_TRANSCRIPTION>configured transcript</VOICE_TRANSCRIPTION>")
+        );
+        assert!(result.contains("[VOICE:"));
+        assert!(result.contains("qq_files/download_"));
+        assert!(result.contains(".wav]"));
+    }
+
+    #[tokio::test]
+    async fn test_compose_voice_attachment_preserves_platform_asr() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/voice.wav"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"audio bytes"))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"text": "fallback"})))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let ch = QQChannel::new(
+            "id".into(),
+            "secret".into(),
+            "qq_test_alias",
+            Arc::new(Vec::new),
+        )
+        .with_workspace_dir(workspace.path().to_path_buf())
+        .with_transcription(local_whisper_transcription_config(format!(
+            "{}/v1/audio/transcriptions",
+            mock_server.uri()
+        )));
+
+        let payload = json!({
+            "content": "",
+            "attachments": [{
+                "content_type": "voice",
+                "filename": "voice.amr",
+                "url": "https://cdn.example.com/voice.amr",
+                "voice_wav_url": format!("{}/voice.wav", mock_server.uri()),
+                "asr_refer_text": "platform transcript"
+            }]
+        });
+
+        let result = ch.compose_message_content(&payload).await.unwrap();
+        assert!(result.contains("<VOICE_TRANSCRIPTION>platform transcript</VOICE_TRANSCRIPTION>"));
+        assert!(!result.contains("fallback"));
     }
 
     #[tokio::test]
