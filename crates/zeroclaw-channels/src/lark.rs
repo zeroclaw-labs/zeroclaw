@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
@@ -1724,11 +1725,7 @@ impl LarkChannel {
                 || lark_is_text_filename(file_name))
         {
             let text = String::from_utf8_lossy(&bytes);
-            let truncated = if text.len() > 50_000 {
-                format!("{}...\n[truncated]", &text[..50_000])
-            } else {
-                text.into_owned()
-            };
+            let truncated = lark_inline_text_file_preview(text);
             let ext = file_name.rsplit('.').next().unwrap_or("text");
             return Some(format!("[FILE:{file_name}]\n```{ext}\n{truncated}\n```"));
         }
@@ -3523,6 +3520,15 @@ fn lark_is_text_filename(name: &str) -> bool {
     )
 }
 
+fn lark_inline_text_file_preview(text: Cow<'_, str>) -> String {
+    if text.len() > 50_000 {
+        let end = crate::util::floor_char_boundary(text.as_ref(), 50_000);
+        format!("{}...\n[truncated]", &text[..end])
+    } else {
+        text.into_owned()
+    }
+}
+
 /// Flatten a Feishu `post` rich-text message to plain text.
 ///
 /// Returns `None` when the content cannot be parsed or yields no usable text,
@@ -4809,6 +4815,15 @@ mod tests {
         assert!(!lark_is_text_filename("image.png"));
         assert!(!lark_is_text_filename("archive.zip"));
         assert!(!lark_is_text_filename("binary.exe"));
+    }
+
+    #[test]
+    fn lark_inline_text_file_preview_truncates_on_utf8_boundary() {
+        let prefix = "a".repeat(49_999);
+        let text = format!("{prefix}{}tail", "😀");
+        let preview = lark_inline_text_file_preview(Cow::Borrowed(&text));
+
+        assert_eq!(preview, format!("{prefix}...\n[truncated]"));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-# ZeroClaw on Nucleo-F401RE — Step-by-Step Guide
+# ZeroClaw on Nucleo-F401RE: Step-by-Step Guide
 
 Run ZeroClaw on your Mac or Linux host. Connect a Nucleo-F401RE via USB. Control GPIO (LED, pins) via Telegram or CLI.
 
@@ -19,11 +19,17 @@ The agent uses the `hardware_board_info` tool to return chip name, architecture,
 
 **CLI alternative:**
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 cargo build --features hardware,probe
 zeroclaw hardware info
 zeroclaw hardware discover
 ```
+
+</div>
 
 ---
 
@@ -33,7 +39,7 @@ ZeroClaw includes everything for Nucleo-F401RE:
 
 | Component | Location | Purpose |
 |-----------|----------|---------|
-| Firmware | `firmware/nucleo/` | Embassy Rust — USART2 (115200), gpio_read, gpio_write |
+| Firmware | `firmware/nucleo/` | Embassy Rust: USART2 (115200), gpio_read, gpio_write |
 | Serial peripheral | `crates/zeroclaw-hardware/src/peripherals/serial.rs` | JSON-over-serial protocol (same as Arduino/ESP32) |
 | Flash command | `zeroclaw peripheral flash-nucleo` | Builds firmware, flashes via probe-rs |
 
@@ -60,19 +66,31 @@ Protocol: newline-delimited JSON. Request: `{"id":"1","cmd":"gpio_write","args":
 
 From the zeroclaw repo root:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw peripheral flash-nucleo
 ```
+
+</div>
 
 This builds `firmware/nucleo` and runs `probe-rs run --chip STM32F401RETx`. The firmware runs immediately after flashing.
 
 ### 1.3 Manual Flash (Alternative)
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 cd firmware/nucleo
 cargo build --release --target thumbv7em-none-eabihf
 probe-rs run --chip STM32F401RETx target/thumbv7em-none-eabihf/release/nucleo
 ```
+
+</div>
 
 ---
 
@@ -87,21 +105,33 @@ USART2 (PA2/PA3) is bridged to the ST-Link's virtual COM port, so the host sees 
 
 ## Phase 3: Configure ZeroClaw
 
-Enable `[peripherals]` and add a `[[peripherals.boards]]` entry for the Nucleo (`board = "nucleo-f401re"`, `transport = "serial"`, `path = "/dev/cu.usbmodem101"` — adjust to your serial port). See the [Config reference](../reference/config.md) for all fields.
+Enable `[peripherals]` and add a `[[peripherals.boards]]` entry for the Nucleo (`board = "nucleo-f401re"`, `transport = "serial"`, `path = "/dev/cu.usbmodem101"`, adjust to your serial port). See the [Config reference](../reference/config.md) for all fields.
 
 ---
 
 ## Phase 4: Run and Test
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw daemon --host 127.0.0.1 --port 42617
 ```
 
+</div>
+
 Or use the agent directly:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw agent -a assistant --message "Turn on the LED on pin 13"
 ```
+
+</div>
 
 Pin 13 = PA5 = User LED (LD2) on Nucleo-F401RE.
 
@@ -121,8 +151,8 @@ Pin 13 = PA5 = User LED (LD2) on Nucleo-F401RE.
 
 ## Troubleshooting
 
-- **flash-nucleo unrecognized** — Build from repo: `cargo run --features hardware -- peripheral flash-nucleo`. The subcommand is only in the repo build, not in crates.io installs.
-- **probe-rs not found** — `cargo install probe-rs-tools --locked` (the `probe-rs` crate is a library; the CLI is in `probe-rs-tools`)
-- **No probe detected** — Ensure Nucleo is connected. Try another USB cable/port.
-- **Serial port not found** — On Linux, add user to `dialout`: `sudo usermod -a -G dialout $USER`, then log out/in.
-- **GPIO commands ignored** — Check `path` in config matches your serial port. Run `zeroclaw peripheral list` to verify.
+- **flash-nucleo unrecognized**: Build from repo: `cargo run --features hardware -- peripheral flash-nucleo`. The subcommand is only in the repo build, not in crates.io installs.
+- **probe-rs not found**: `cargo install probe-rs-tools --locked` (the `probe-rs` crate is a library; the CLI is in `probe-rs-tools`)
+- **No probe detected**: Ensure Nucleo is connected. Try another USB cable/port.
+- **Serial port not found**: On Linux, add user to `dialout`: `sudo usermod -a -G dialout $USER`, then log out/in.
+- **GPIO commands ignored**: Check `path` in config matches your serial port. Run `zeroclaw peripheral list` to verify.

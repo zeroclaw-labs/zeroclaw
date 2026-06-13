@@ -458,6 +458,8 @@ impl SecretField for String {
         field: &str,
     ) -> anyhow::Result<()> {
         use anyhow::Context;
+        // `is_encrypted` also includes external secret references (`op://`):
+        // encryption must preserve them, while decryption resolves them for use.
         if !self.is_empty() && !crate::security::SecretStore::is_encrypted(self) {
             *self = store
                 .encrypt(self)
@@ -675,6 +677,21 @@ pub struct MapKeySection {
     /// Doc comment on the field (flattened to one line). What the user sees
     /// when picking which kind of thing to add.
     pub description: &'static str,
+    /// For `Kind::List` Vec sections that declared `#[natural_key = "<f>"]`
+    /// (the per-element editor opt-in shipped with the `mcp.servers`
+    /// per-field editor), this is the snake_case field name on the inner
+    /// type that holds the alias used to address each element — e.g.
+    /// `"name"` for `[[mcp.servers]]`. The incremental TOML writer
+    /// (`apply_dirty_path` in `schema.rs`) reads this to walk a
+    /// `<section>.<alias>.<inner>` dirty path through an array of tables.
+    /// Without it, the writer flat-faceplants on `as_table()` at the
+    /// alias segment and silently drops the edit on the floor.
+    ///
+    /// `None` for HashMap sections (alias *is* the TOML key, no further
+    /// hint needed) and for plain `Vec<T>` sections without
+    /// `#[natural_key]` (legacy whole-array `ObjectArray` round-trip,
+    /// no per-element addressing).
+    pub natural_key: Option<&'static str>,
 }
 
 /// Serializable wire representation of a config field for API consumers
@@ -822,6 +839,16 @@ mod secret_field_tests {
         assert_eq!(s, enc1);
         s.decrypt_in_place(&store, "test.s").unwrap();
         assert_eq!(s, "sk-abc");
+    }
+
+    #[test]
+    fn string_op_reference_is_preserved_by_encrypt_in_place() {
+        let (_tmp, store) = store();
+        let mut s = String::from("op://vault/item/field");
+
+        s.encrypt_in_place(&store, "test.s").unwrap();
+
+        assert_eq!(s, "op://vault/item/field");
     }
 
     #[test]

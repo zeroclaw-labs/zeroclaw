@@ -4,6 +4,7 @@
 //! The directory path is configured via `gateway.web_dist_dir`.
 
 use axum::{
+    Json,
     extract::State,
     http::{StatusCode, Uri, header},
     response::{IntoResponse, Response},
@@ -36,15 +37,24 @@ pub async fn handle_static(State(state): State<AppState>, uri: Uri) -> Response 
 
 /// SPA fallback: serve index.html for any non-API, non-static GET request.
 /// Injects `window.__ZEROCLAW_BASE__` so the frontend knows the path prefix.
-pub async fn handle_spa_fallback(State(state): State<AppState>) -> Response {
+pub async fn handle_spa_fallback(State(state): State<AppState>, uri: Uri) -> Response {
+    if let Some(path) = api_fallback_path(uri.path(), &state.path_prefix) {
+        let body = serde_json::json!({
+            "error": "not_found",
+            "message": "No backend route matched this path.",
+            "path": path,
+        });
+        return (StatusCode::NOT_FOUND, Json(body)).into_response();
+    }
+
     let Some(bytes) = load_index_html_bytes(state.web_dist_dir.as_ref()).await else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            "Web dashboard not available. Build the frontend with `cargo web build` \
-             (the supported entry point — it generates the TS API client and runs \
-             the Vite production build) and point gateway.web_dist_dir at the \
-             resulting web/dist. The daemon's API endpoints remain reachable \
-             independently of the dashboard.",
+            "Web dashboard not available. Reinstall with the supported installer \
+             so the dashboard is built and placed where the gateway looks for it: \
+             `./install.sh --source` on Linux/macOS, or `setup.bat` on Windows. \
+             The daemon's API endpoints remain reachable independently of the \
+             dashboard.",
         )
             .into_response();
     };
@@ -73,6 +83,25 @@ pub async fn handle_spa_fallback(State(state): State<AppState>) -> Response {
         html,
     )
         .into_response()
+}
+
+fn api_fallback_path<'a>(path: &'a str, path_prefix: &str) -> Option<&'a str> {
+    let path = strip_path_prefix(path, path_prefix);
+    (path == "/api" || path.strip_prefix("/api/").is_some()).then_some(path)
+}
+
+fn strip_path_prefix<'a>(path: &'a str, path_prefix: &str) -> &'a str {
+    if path_prefix.is_empty() || path_prefix == "/" {
+        return path;
+    }
+
+    if path == path_prefix {
+        return "/";
+    }
+
+    path.strip_prefix(path_prefix)
+        .filter(|rest| rest.starts_with('/'))
+        .unwrap_or(path)
 }
 
 async fn load_index_html_bytes(dist_dir: Option<&PathBuf>) -> Option<Vec<u8>> {

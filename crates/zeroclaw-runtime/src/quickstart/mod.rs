@@ -740,6 +740,10 @@ const MODEL_PROVIDER_ESSENTIALS: &[&str] = &[
 const CHANNEL_ESSENTIALS: &[&str] = &["bot_token", "token", "webhook_url", "allowed_users"];
 const PEER_GROUP_ESSENTIALS: &[&str] = &["channel", "external_peers", "agents", "ignore"];
 
+/// Runtime profile the Quickstart silently installs. The Runtime Profile
+/// picker was removed from every surface; apply always writes this preset.
+const FORCED_RUNTIME_PRESET: &str = "unbounded";
+
 fn apply_into(
     config: &mut Config,
     submission: &BuilderSubmission,
@@ -770,14 +774,17 @@ fn apply_into(
         &risk_alias,
     );
 
-    let runtime_alias = apply_named_preset(
-        config,
-        &submission.runtime_profile,
-        QuickstartStep::RuntimeProfile,
-        runtime_preset_keys,
-        write_runtime_preset,
-        errors,
-    )?;
+    let runtime_alias = match write_runtime_preset(config, FORCED_RUNTIME_PRESET) {
+        Ok(alias) => alias,
+        Err(msg) => {
+            errors.push(QuickstartError::new(
+                QuickstartStep::RuntimeProfile,
+                "",
+                msg,
+            ));
+            return None;
+        }
+    };
     emit_selector_pick(
         ctx,
         "runtime_profile",
@@ -1049,10 +1056,6 @@ where
 
 fn risk_preset_keys(config: &Config) -> Vec<String> {
     config.risk_profiles.keys().cloned().collect()
-}
-
-fn runtime_preset_keys(config: &Config) -> Vec<String> {
-    config.runtime_profiles.keys().cloned().collect()
 }
 
 fn write_risk_preset(config: &mut Config, preset_name: &str) -> Result<String, String> {
@@ -1963,21 +1966,23 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_preset_profiles_persist_to_disk() {
+        // The runtime profile picker was removed; apply silently forces the
+        // `unbounded` preset regardless of the submitted runtime value.
         let (dir, applied) = apply_to_temp(fresh_submission("bot")).await;
         assert!(applied.risk_profiles.contains_key("balanced"));
-        assert!(applied.runtime_profiles.contains_key("balanced"));
+        assert!(applied.runtime_profiles.contains_key("unbounded"));
         let reloaded = reload(&dir);
         assert!(
             reloaded.risk_profiles.contains_key("balanced"),
             "risk_profiles.balanced must survive save_dirty + reload, not dangle"
         );
         assert!(
-            reloaded.runtime_profiles.contains_key("balanced"),
-            "runtime_profiles.balanced must survive save_dirty + reload, not dangle"
+            reloaded.runtime_profiles.contains_key("unbounded"),
+            "runtime_profiles.unbounded must survive save_dirty + reload, not dangle"
         );
         let agent = reloaded.agents.get("bot").expect("agent persisted");
         assert_eq!(agent.risk_profile, "balanced");
-        assert_eq!(agent.runtime_profile, "balanced");
+        assert_eq!(agent.runtime_profile, "unbounded");
     }
 
     #[tokio::test]

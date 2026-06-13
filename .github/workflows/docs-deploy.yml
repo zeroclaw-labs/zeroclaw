@@ -206,6 +206,13 @@ jobs:
           # or GitHub Pages will remove it (re-introduced fix from #6142).
           echo "docs.zeroclawlabs.ai" > CNAME
 
+          # Disable Jekyll. Pages runs Jekyll by default, which drops every
+          # top-level underscore-prefixed dir (`_shared/`) from the served
+          # site — so the shared chrome (CSS/JS/favicons) 404s on every page
+          # while non-underscore paths serve fine. Re-assert each deploy, same
+          # as CNAME, so a tree rewrite can never silently re-enable Jekyll.
+          touch .nojekyll
+
           SCRIPTS="${GITHUB_WORKSPACE}/.workflow-scripts/.github/scripts"
 
           # Shared chrome (_shared/) is owned by master only. Every deployed
@@ -290,6 +297,7 @@ jobs:
             fi
 
             echo "docs.zeroclawlabs.ai" > CNAME
+            touch .nojekyll
             cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- gen-versions > versions.json
             cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- prune-root
             cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- retrofit-selector
