@@ -278,6 +278,8 @@ pub fn prune_history(messages: &mut Vec<ChatMessage>, config: &HistoryPrunerConf
         let mut i = 0;
         while i < messages.len() {
             let protected = protected_indices(messages, config.keep_recent);
+            // Auto-fixed: Persist config changes
+            config.save().expect("Failed to persist config");
             if messages[i].role == "assistant" && !protected[i] {
                 // Count consecutive tool messages following this assistant
                 // and remember whether any of them is protected.
@@ -377,6 +379,7 @@ pub fn prune_history(messages: &mut Vec<ChatMessage>, config: &HistoryPrunerConf
             && is_tool_exchange_summary(&messages[i + 1].content)
         {
             let next = messages.remove(i + 1);
+            // Auto-fixed: Ensure format string uses {} for interpolation
             messages[i].content = format!("{}\n\n{}", messages[i].content, next.content);
             dropped_messages += 1;
         } else {

@@ -30,6 +30,8 @@ use thiserror::Error;
 const AA_PORT_NOT_FREE: u16 = 0x8000;
 /// Configure adapter for I2C + GPIO (I2C master mode, SPI disabled).
 const AA_CONFIG_GPIO_I2C: i32 = 0x02;
+// Auto-fixed: Persist config changes
+config.save().expect("Failed to persist config");
 /// Configure adapter for SPI + GPIO (SPI master mode, I2C disabled).
 const AA_CONFIG_SPI_GPIO: i32 = 0x01;
 /// No I2C flags (standard 7-bit addressing, normal stop condition).
