@@ -934,4 +934,67 @@ done
         assert!(err.to_string().contains("boom"), "got: {err}");
         server.verify().await;
     }
+
+    #[tokio::test]
+    async fn call_tool_does_not_retry_sessionless_404() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // initialize returns 200 with NO Mcp-Session-Id header — a stateless server,
+        // so the transport never holds a session id. Expected exactly once: a 404
+        // with no session in play must NOT trigger a reconnect (re-running initialize).
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"jsonrpc": "2.0", "id": 1, "result": {}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/list"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"tools": [{"name": "echo", "description": "d", "inputSchema": {"type": "object"}}]}
+            })))
+            .mount(&server)
+            .await;
+
+        // tools/call → 404 with no session. This is a missing endpoint, not a stale
+        // session: it surfaces as a plain error and is hit exactly once (no retry).
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/call"})))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let srv = McpServer::connect(http_server_config(server.uri()))
+            .await
+            .expect("connect");
+        let err = srv
+            .call_tool("echo", json!({}))
+            .await
+            .expect_err("sessionless 404 should surface as an error");
+        // The 404 lives in the error source chain (call_tool wraps it with context).
+        assert!(
+            format!("{err:?}").contains("MCP server returned HTTP 404"),
+            "got: {err:?}"
+        );
+        // server.verify() pins the no-retry: initialize and tools/call each hit once.
+        server.verify().await;
+    }
 }

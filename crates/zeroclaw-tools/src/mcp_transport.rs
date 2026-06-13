@@ -336,7 +336,14 @@ impl McpTransportConn for HttpTransport {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE {
+            // A 404/410 only means "stale session" when this request carried an
+            // `Mcp-Session-Id` the server no longer recognizes (MCP spec 2025-06-18,
+            // Session Management). Without a session id, a 404 is just a missing
+            // endpoint (typo'd `url`, wrong path, proxy misroute) — surface it as a
+            // plain error so `call_tool` doesn't burn a reconnect on it.
+            if self.session_id.is_some()
+                && (status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::GONE)
+            {
                 return Err(McpTransportError::StaleSession {
                     status: status.as_u16(),
                 }
@@ -1570,6 +1577,8 @@ mod tests {
             ..Default::default()
         };
         let mut transport = HttpTransport::new(&config).expect("build transport");
+        // A 404 only signals a stale session when the request carried a session id.
+        transport.session_id = Some("sess-1".into());
         let req = JsonRpcRequest::new(1, "tools/call", serde_json::json!({}));
         let err = transport
             .send_and_recv(&req)
@@ -1579,6 +1588,46 @@ mod tests {
             Some(McpTransportError::StaleSession { status }) => assert_eq!(*status, 404),
             other => panic!("expected StaleSession, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn http_transport_404_without_session_is_plain_error() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let config = McpServerConfig {
+            name: "test-http".into(),
+            transport: McpTransport::Http,
+            url: Some(server.uri()),
+            ..Default::default()
+        };
+        // No session id was ever issued (stateless server, or a misconfigured url):
+        // a 404 here is a missing endpoint, not a stale session — it must NOT map to
+        // StaleSession (which would make `call_tool` burn a wasted reconnect).
+        let mut transport = HttpTransport::new(&config).expect("build transport");
+        assert!(transport.session_id.is_none());
+        let req = JsonRpcRequest::new(1, "tools/call", serde_json::json!({}));
+        let err = transport
+            .send_and_recv(&req)
+            .await
+            .expect_err("404 should error");
+        assert!(
+            !matches!(
+                err.downcast_ref::<McpTransportError>(),
+                Some(McpTransportError::StaleSession { .. })
+            ),
+            "sessionless 404 must not be classified as StaleSession, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("MCP server returned HTTP 404"),
+            "got: {err}"
+        );
     }
 
     #[tokio::test]
