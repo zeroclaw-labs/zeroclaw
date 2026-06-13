@@ -816,6 +816,8 @@ pub async fn run_gateway(
                 Some(canvas_store.clone()),
                 false,
                 None,
+                None,
+                None,
             );
             // Wire channel-driven tool handles so the dashboard agent can
             // deliver messages to configured channels (same pattern as

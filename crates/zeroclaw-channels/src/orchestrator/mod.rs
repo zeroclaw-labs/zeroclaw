@@ -8318,6 +8318,8 @@ pub async fn start_channels(
             canvas_store.clone(),
             false,
             None,
+            None,
+            None,
         );
         let mut built_tools = all_tools_result_ch.tools;
         let delegate_handle_ch = all_tools_result_ch.delegate_handle;

@@ -923,6 +923,8 @@ pub async fn run(
             None,
             is_subagent_caller,
             None,
+            None,
+            None,
         );
         let mut tools_registry = all_tools_result.tools;
         let delegate_handle = all_tools_result.delegate_handle;
@@ -2365,6 +2367,8 @@ pub async fn process_message(
             &config,
             None,
             false,
+            None,
+            None,
             None,
         );
         let mut tools_registry = all_tools_result_pm.tools;

@@ -3617,21 +3617,6 @@ async fn main() -> Result<()> {
             let canvas_store_for_gateway = canvas_store.clone();
             let canvas_store_for_channels = canvas_store.clone();
 
-            // Construct the single shared SopEngine + SopAuditLogger for the
-            // daemon. All SOP tool construction sites and fan-in listeners
-            // (MQTT, HTTP, cron) resolve from this singleton. Only registered
-            // when a SOPs directory is configured — users without SOPs don't
-            // pay the memory cost.
-            let sop_config = config.sop.clone();
-            let workspace_dir = config.data_dir.clone();
-            if sop_config.sops_dir.is_some() {
-                let mem: Arc<dyn zeroclaw_memory::Memory> =
-                    zeroclaw_memory::create_memory_for_agent(&config, "default", None).await?;
-                let (sop_engine, sop_audit) =
-                    zeroclaw_runtime::sop::build_sop_engine(sop_config, &workspace_dir, mem);
-                let _ = zeroclaw_runtime::tools::register_sop_engine(sop_engine, sop_audit);
-            }
-
             // Reload loop. `daemon::run` returns DaemonExit::Shutdown on
             // SIGINT/SIGTERM (loop ends) or DaemonExit::Reload on SIGUSR1
             // (loop re-reads config from disk and re-runs). The PID stays
@@ -3650,6 +3635,23 @@ async fn main() -> Result<()> {
                 let canvas_store_for_gateway = canvas_store_for_gateway.clone();
                 let canvas_store_for_channels = canvas_store_for_channels.clone();
                 let mut registry = daemon::DaemonRegistry::new();
+
+                // Build SOP engine + audit per iteration from current_config.
+                // This ensures reload picks up config changes (new sops_dir,
+                // changed path, or removed sops_dir).
+                let (sop_engine, sop_audit) = if current_config.sop.sops_dir.is_some() {
+                    let mem: Arc<dyn zeroclaw_memory::Memory> =
+                        zeroclaw_memory::create_memory_for_agent(&current_config, "default", None)
+                            .await?;
+                    let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
+                        current_config.sop.clone(),
+                        &current_config.data_dir,
+                        mem,
+                    );
+                    (Some(engine), Some(audit))
+                } else {
+                    (None, None)
+                };
 
                 #[cfg(feature = "gateway")]
                 registry.register_gateway(Box::new(
@@ -3684,8 +3686,8 @@ async fn main() -> Result<()> {
 
                 #[cfg(feature = "channel-mqtt")]
                 registry.register_mqtt(Box::new({
-                    let engine = zeroclaw_runtime::tools::resolve_sop_engine();
-                    let audit = zeroclaw_runtime::tools::resolve_sop_audit();
+                    let engine = sop_engine.clone();
+                    let audit = sop_audit.clone();
                     move |mqtt_config| {
                         let engine = engine.clone();
                         let audit = audit.clone();

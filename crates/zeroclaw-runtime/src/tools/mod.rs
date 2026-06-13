@@ -175,35 +175,6 @@ pub type PerToolChannelHandle =
 /// Callers can push additional tools (e.g. MCP wrappers) after construction.
 pub type DelegateParentToolsHandle = Arc<RwLock<Vec<Arc<dyn Tool>>>>;
 
-/// Shared SopEngine + SopAuditLogger for the daemon.
-///
-/// Registered once at daemon startup via `register_sop_engine`.
-/// All tool construction sites and fan-in listeners (MQTT, HTTP, cron)
-/// resolve from this singleton — never call `SopEngine::new` directly.
-type SopEngineHandle = Arc<Mutex<SopEngine>>;
-type SopAuditHandle = Arc<SopAuditLogger>;
-static SOP_ENGINE: std::sync::OnceLock<(SopEngineHandle, SopAuditHandle)> =
-    std::sync::OnceLock::new();
-
-/// Register the shared SopEngine and SopAuditLogger for the daemon.
-/// Called once at daemon startup. Returns Err if already registered.
-pub fn register_sop_engine(
-    engine: SopEngineHandle,
-    audit: SopAuditHandle,
-) -> Result<(), (SopEngineHandle, SopAuditHandle)> {
-    SOP_ENGINE.set((engine, audit))
-}
-
-/// Resolve the shared SopEngine if registered.
-pub fn resolve_sop_engine() -> Option<SopEngineHandle> {
-    SOP_ENGINE.get().map(|(e, _)| Arc::clone(e))
-}
-
-/// Resolve the shared SopAuditLogger if registered.
-pub fn resolve_sop_audit() -> Option<SopAuditHandle> {
-    SOP_ENGINE.get().map(|(_, a)| Arc::clone(a))
-}
-
 /// Thin wrapper that makes an `Arc<dyn Tool>` usable as `Box<dyn Tool>`.
 pub struct ArcToolRef(pub Arc<dyn Tool>);
 // ArcToolRef is the public constructor name for ArcToolWrapper
@@ -493,6 +464,8 @@ pub fn all_tools(
         canvas_store,
         is_subagent_caller,
         tui_env,
+        None,
+        None,
     )
 }
 
@@ -521,6 +494,8 @@ pub fn all_tools_with_runtime(
     canvas_store: Option<CanvasStore>,
     is_subagent_caller: bool,
     tui_env: Option<HashMap<String, String>>,
+    sop_engine: Option<Arc<Mutex<SopEngine>>>,
+    _sop_audit: Option<Arc<SopAuditLogger>>,
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
@@ -1115,13 +1090,13 @@ pub fn all_tools_with_runtime(
         Arc::clone(&poll_handle),
     )));
 
-    // SOP tools (registered when shared engine is available)
-    if let Some(sop_engine) = resolve_sop_engine() {
-        tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(&sop_engine))));
-        tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(&sop_engine))));
-        tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(&sop_engine))));
-        tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(&sop_engine))));
-        tool_arcs.push(Arc::new(SopStatusTool::new(Arc::clone(&sop_engine))));
+    // SOP tools (registered when engine handle is provided)
+    if let Some(ref sop_engine) = sop_engine {
+        tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(sop_engine))));
+        tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(sop_engine))));
+        tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(sop_engine))));
+        tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(sop_engine))));
+        tool_arcs.push(Arc::new(SopStatusTool::new(Arc::clone(sop_engine))));
     }
 
     if let Some(key) = composio_key
@@ -1413,72 +1388,11 @@ mod tests {
         assert_eq!(tools.len(), 6);
     }
 
-    #[test]
-    fn shared_sop_engine_resolve_returns_singleton() {
-        use zeroclaw_config::schema::{MemoryConfig, SopConfig};
-
-        // Before registration, resolve returns None.
-        assert!(resolve_sop_engine().is_none());
-        assert!(resolve_sop_audit().is_none());
-
-        // Build engine + audit the same way the daemon does.
-        let sop_cfg = SopConfig::default();
-        let mem_cfg = MemoryConfig {
-            backend: "sqlite".into(),
-            ..MemoryConfig::default()
-        };
-        let tmp = tempfile::tempdir().unwrap();
-        let memory: Arc<dyn zeroclaw_memory::Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
-        std::mem::forget(tmp);
-
-        let mut engine = SopEngine::new(sop_cfg);
-        engine.reload(std::path::Path::new("/tmp"));
-        let engine = Arc::new(Mutex::new(engine));
-        let audit = Arc::new(SopAuditLogger::new(memory));
-
-        // First registration succeeds.
-        assert!(register_sop_engine(engine.clone(), audit.clone()).is_ok());
-
-        // After registration, resolve returns Some.
-        let resolved_engine = resolve_sop_engine().expect("engine should be registered");
-        let resolved_audit = resolve_sop_audit().expect("audit should be registered");
-
-        // Resolved handles point to the same underlying instances.
-        assert!(Arc::ptr_eq(&engine, &resolved_engine));
-        assert!(Arc::ptr_eq(&audit, &resolved_audit));
-
-        // Second registration returns Err with the original values back.
-        let mem_cfg2 = MemoryConfig {
-            backend: "sqlite".into(),
-            ..MemoryConfig::default()
-        };
-        let tmp2 = tempfile::tempdir().unwrap();
-        let memory2: Arc<dyn zeroclaw_memory::Memory> =
-            Arc::from(zeroclaw_memory::create_memory(&mem_cfg2, tmp2.path(), None).unwrap());
-        std::mem::forget(tmp2);
-        let engine2 = Arc::new(Mutex::new(SopEngine::new(SopConfig::default())));
-        let audit2 = Arc::new(SopAuditLogger::new(memory2));
-        let err = register_sop_engine(engine2.clone(), audit2.clone())
-            .expect_err("second registration should fail");
-        assert!(Arc::ptr_eq(&engine2, &err.0));
-        assert!(Arc::ptr_eq(&audit2, &err.1));
-    }
-
     /// Regression: SOP tools must NOT appear in the tool registry when the
-    /// shared engine is not registered (i.e. no `sops_dir` configured).
-    /// Proves the production gating path at `all_tools_with_runtime` — not
-    /// just the `resolve_sop_engine()` helper.
+    /// engine handle is not provided (i.e. no `sops_dir` configured).
+    /// Proves the production gating path at `all_tools_with_runtime`.
     #[test]
-    fn sop_tools_absent_when_engine_not_registered() {
-        // Ensure clean state — this test must run before any test that
-        // registers the engine. If another test already registered it, this
-        // test cannot prove the gating behavior and should fail loudly.
-        assert!(
-            resolve_sop_engine().is_none(),
-            "SOP engine already registered — sop_tools_absent_when_engine_not_registered must run first"
-        );
-
+    fn sop_tools_absent_when_engine_not_provided() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
@@ -1530,6 +1444,74 @@ mod tests {
             assert!(
                 !names.contains(name),
                 "SOP tool '{name}' must not be registered when engine is absent"
+            );
+        }
+    }
+
+    /// SOP tools MUST appear in the tool registry when an engine handle is
+    /// provided, regardless of config. Proves the parameter-passing path
+    /// works end-to-end.
+    #[test]
+    fn sop_tools_present_when_engine_provided() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig {
+            enabled: false,
+            allowed_domains: vec![],
+            session_name: None,
+            ..BrowserConfig::default()
+        };
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
+
+        // Build a minimal SOP engine — no sops_dir needed for this test.
+        let engine = Arc::new(Mutex::new(SopEngine::new(
+            zeroclaw_config::schema::SopConfig::default(),
+        )));
+
+        let tools = all_tools_with_runtime(
+            Arc::new(Config::default()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            Some(engine),
+            None,
+        )
+        .tools;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+
+        let sop_tool_names = [
+            "sop_list",
+            "sop_execute",
+            "sop_advance",
+            "sop_approve",
+            "sop_status",
+        ];
+        for name in &sop_tool_names {
+            assert!(
+                names.contains(name),
+                "SOP tool '{name}' must be registered when engine is provided"
             );
         }
     }

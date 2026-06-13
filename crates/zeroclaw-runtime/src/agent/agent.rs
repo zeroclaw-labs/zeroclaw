@@ -1119,6 +1119,8 @@ impl Agent {
             None,
             false,
             tui_env,
+            None,
+            None,
         );
         let mut tools = all_tools_result.tools;
         let delegate_handle = all_tools_result.delegate_handle;
