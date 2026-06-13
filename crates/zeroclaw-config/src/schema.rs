@@ -12300,14 +12300,16 @@ impl ChannelConfig for NextcloudTalkConfig {
 
 impl WhatsAppConfig {
     /// Detect which backend to use based on config fields.
-    /// Returns "cloud" if phone_number_id is set, "web" if session_path is set.
+    /// Cloud API when `phone_number_id` is set; otherwise Web when any
+    /// Web-only selector (`session_path`, `pair_phone`, `pair_code`,
+    /// `ws_url`, or `mode = personal`) is present. Falls back to Cloud
+    /// for an otherwise-empty config (env-injected Cloud credentials).
     pub fn backend_type(&self) -> &'static str {
         if self.phone_number_id.is_some() {
             "cloud"
-        } else if self.session_path.is_some() {
+        } else if self.has_web_selector() {
             "web"
         } else {
-            // Default to Cloud API for backward compatibility
             "cloud"
         }
     }
@@ -12317,9 +12319,22 @@ impl WhatsAppConfig {
         self.phone_number_id.is_some() && self.access_token.is_some() && self.verify_token.is_some()
     }
 
-    /// Check if this is a valid Web config
-    pub fn is_web_config(&self) -> bool {
+    /// Any Web-only selector that signals WhatsApp Web intent. `mode`
+    /// defaults to `Business` on every config, so only a non-default
+    /// `Personal` mode counts; the rest are `Option` fields absent by
+    /// default.
+    pub fn has_web_selector(&self) -> bool {
         self.session_path.is_some()
+            || self.pair_phone.is_some()
+            || self.pair_code.is_some()
+            || self.ws_url.is_some()
+            || self.mode == WhatsAppWebMode::Personal
+    }
+
+    /// Check if this is a valid Web config. The Web client defaults a
+    /// missing `session_path`, so any Web selector is sufficient.
+    pub fn is_web_config(&self) -> bool {
+        self.has_web_selector()
     }
 
     /// Returns true when both Cloud and Web selectors are present.
@@ -21019,6 +21034,32 @@ allowed_numbers = ["+1", "+2"]
         };
         assert!(!wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "web");
+    }
+
+    #[test]
+    async fn whatsapp_config_backend_type_web_from_personal_pairing() {
+        let wc = WhatsAppConfig {
+            enabled: true,
+            mode: WhatsAppWebMode::Personal,
+            pair_phone: Some("+10000000000".into()),
+            ..Default::default()
+        };
+        assert_eq!(wc.backend_type(), "web");
+        assert!(wc.is_web_config());
+        assert!(!wc.is_cloud_config());
+
+        let pair_only = WhatsAppConfig {
+            enabled: true,
+            pair_phone: Some("+10000000000".into()),
+            ..Default::default()
+        };
+        assert_eq!(pair_only.backend_type(), "web");
+
+        let empty = WhatsAppConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert_eq!(empty.backend_type(), "cloud");
     }
 
     #[test]
