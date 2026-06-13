@@ -1688,6 +1688,22 @@ impl Channel for WhatsAppWebChannel {
         Ok(())
     }
 
+    /// Add an emoji reaction to a message.
+    ///
+    /// ## Current scope (honest documentation)
+    ///
+    /// The `Channel::add_reaction` trait does not provide the target
+    /// message's `is_from_me` flag or the sender's participant JID,
+    /// both of which are needed to construct a fully correct
+    /// [`waproto::whatsapp::MessageKey`] for group chats and for
+    /// reacting to the bot's own messages.  The implementation below
+    /// therefore targets **1:1 chats reacting to inbound messages**
+    /// (`from_me: false`, no `participant`).  Group chats and
+    /// own-message reactions are not yet supported; the protocol
+    /// library's `BotMessage::message_key()` builder (which derives
+    /// `from_me` and `participant` from the stored message `Info`) is
+    /// the intended resolution path when those fields are plumbed
+    /// through the trait.
     async fn add_reaction(
         &self,
         channel_id: &str,
@@ -1707,8 +1723,17 @@ impl Channel for WhatsAppWebChannel {
             reaction_message: Some(waproto::whatsapp::message::ReactionMessage {
                 key: Some(waproto::whatsapp::MessageKey {
                     remote_jid: Some(to.to_string()),
+                    // `from_me: false` is correct for inbound 1:1
+                    // messages.  Own-message reactions and group
+                    // chats need `BotMessage::message_key()` — see
+                    // method doc above.
                     from_me: Some(false),
                     id: Some(message_id.to_string()),
+                    // `participant` is not needed for 1:1 chats.
+                    // For group chats the sender JID must be set;
+                    // that requires plumbing message metadata
+                    // through the trait.
+                    participant: None,
                     ..Default::default()
                 }),
                 text: Some(emoji.to_string()),
@@ -1725,6 +1750,12 @@ impl Channel for WhatsAppWebChannel {
         Ok(())
     }
 
+    /// Remove an emoji reaction from a message.
+    ///
+    /// Scope is the same as [`Self::add_reaction`]: 1:1 chats,
+    /// inbound messages.  See that method's doc comment for the
+    /// group / own-message limitation and the intended resolution
+    /// path via `BotMessage::message_key()`.
     async fn remove_reaction(
         &self,
         channel_id: &str,
@@ -1744,10 +1775,18 @@ impl Channel for WhatsAppWebChannel {
             reaction_message: Some(waproto::whatsapp::message::ReactionMessage {
                 key: Some(waproto::whatsapp::MessageKey {
                     remote_jid: Some(to.to_string()),
+                    // `from_me: false` is correct for inbound 1:1
+                    // messages.  Own-message reactions and group
+                    // chats need `BotMessage::message_key()` — see
+                    // `add_reaction` doc above.
                     from_me: Some(false),
                     id: Some(message_id.to_string()),
+                    // `participant` is not needed for 1:1 chats.
+                    participant: None,
                     ..Default::default()
                 }),
+                // Empty text removes the reaction per WhatsApp
+                // protocol.
                 text: Some(String::new()),
                 ..Default::default()
             }),
