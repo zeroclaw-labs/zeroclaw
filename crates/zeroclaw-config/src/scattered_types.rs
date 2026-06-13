@@ -525,7 +525,7 @@ pub struct EmailConfig {
     /// Outlook/Hotmail that have deprecated password auth.
     #[serde(default)]
     pub oauth2: Option<EmailOAuth2Config>,
-    /// When `true`, the daemon never modifies any IMAP flag — not on startup,
+    /// When `true`, the daemon never modifies any IMAP flag: not on startup,
     /// not on message receipt, not ever. It only processes emails that arrive
     /// after startup (UID >= uid_next at connect time). Existing unread mail
     /// stays unread; no `\Seen` is set implicitly via RFC822 or explicitly via
