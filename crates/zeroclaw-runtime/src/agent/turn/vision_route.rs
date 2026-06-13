@@ -110,10 +110,16 @@ pub(crate) fn resolve_vision_provider(
 }
 
 /// Prepare the iteration's outbound messages for the active provider.
+///
+/// When `image_cache` is `Some`, resolved local image data URIs are reused
+/// across iterations and turns (embedded `Agent` paths pass the per-session
+/// cache) so each file is read + base64-encoded at most once; channel/CLI
+/// paths pass `None` and resolve fresh.
 pub(crate) async fn prepare_messages_for_iteration(
     history: &[ChatMessage],
     multimodal_config: &MultimodalConfig,
     degrade_strip_images: bool,
+    image_cache: Option<&mut multimodal::LocalImageCache>,
 ) -> Result<multimodal::PreparedMessages> {
     if degrade_strip_images {
         // Text-only fallback: replace every media marker with a
@@ -127,8 +133,67 @@ pub(crate) async fn prepare_messages_for_iteration(
                 content: multimodal::strip_media_markers(&m.content),
             })
             .collect();
-        multimodal::prepare_messages_for_provider(&stripped, multimodal_config).await
+        match image_cache {
+            Some(cache) => {
+                multimodal::prepare_messages_for_provider_cached(
+                    &stripped,
+                    multimodal_config,
+                    cache,
+                )
+                .await
+            }
+            None => multimodal::prepare_messages_for_provider(&stripped, multimodal_config).await,
+        }
     } else {
-        multimodal::prepare_messages_for_provider(history, multimodal_config).await
+        match image_cache {
+            Some(cache) => {
+                multimodal::prepare_messages_for_provider_cached(history, multimodal_config, cache)
+                    .await
+            }
+            None => multimodal::prepare_messages_for_provider(history, multimodal_config).await,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Wiring check (#7415): the per-session `image_cache` threaded from the
+    /// embedded `Agent` wrappers is populated on the first prep and reused on
+    /// later iterations/turns, so a local image file is read + base64-encoded
+    /// once instead of on every loop iteration. The `None` path (channels/CLI)
+    /// still resolves correctly.
+    #[tokio::test]
+    async fn prepare_messages_for_iteration_populates_and_reuses_image_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("shot.png");
+        // Minimal PNG signature — enough for MIME detection.
+        std::fs::write(&path, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+        let history = vec![ChatMessage::user(format!(
+            "look [IMAGE:{}]",
+            path.display()
+        ))];
+        let cfg = MultimodalConfig::default();
+
+        let mut cache = multimodal::LocalImageCache::new();
+        let first = prepare_messages_for_iteration(&history, &cfg, false, Some(&mut cache))
+            .await
+            .unwrap();
+        assert!(first.contains_images);
+        assert_eq!(cache.len(), 1, "image cached after the first prep");
+
+        // A later iteration/turn re-walks the same history; the cache serves it
+        // without growing (no second disk read + encode).
+        let _second = prepare_messages_for_iteration(&history, &cfg, false, Some(&mut cache))
+            .await
+            .unwrap();
+        assert_eq!(cache.len(), 1, "subsequent preps reuse the cached entry");
+
+        // The cache-less path (channels/CLI pass None) still resolves images.
+        let uncached = prepare_messages_for_iteration(&history, &cfg, false, None)
+            .await
+            .unwrap();
+        assert!(uncached.contains_images);
     }
 }

@@ -477,6 +477,7 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
         None, // steering
         None, // new_messages_out
         &crate::agent::loop_::LoopKnobs::default(),
+        None,
     )
     .await
     .expect("loop should succeed");
@@ -866,6 +867,7 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                 None, // steering
                 None, // new_messages_out
                 &crate::agent::loop_::LoopKnobs::default(),
+                None,
             )
             .await
         }),

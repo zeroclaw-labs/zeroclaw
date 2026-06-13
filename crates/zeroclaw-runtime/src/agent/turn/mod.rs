@@ -185,6 +185,7 @@ pub async fn run_tool_call_loop(
     mut steering: Option<&mut tokio::sync::mpsc::Receiver<String>>,
     mut new_messages_out: Option<&mut Vec<ChatMessage>>,
     knobs: &LoopKnobs,
+    mut image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -325,9 +326,13 @@ pub async fn run_tool_call_loop(
             (model_provider, provider_name, model)
         };
 
-        let prepared_messages =
-            prepare_messages_for_iteration(history, multimodal_config, degrade_strip_images)
-                .await?;
+        let prepared_messages = prepare_messages_for_iteration(
+            history,
+            multimodal_config,
+            degrade_strip_images,
+            image_cache.as_deref_mut(),
+        )
+        .await?;
 
         let llm_started_at = announce_llm_request(
             &ctx,

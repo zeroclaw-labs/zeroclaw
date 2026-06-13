@@ -181,6 +181,11 @@ pub struct Agent {
     /// `start_channels`; this is the alternate path for environments that
     /// build an Agent directly without `start_channels`.
     channel_handles: AgentChannelHandles,
+    /// Per-session cache for resolved local image data URIs, threaded into
+    /// the turn loop so each unique local image file is read + base64-encoded
+    /// at most once per session even though the multimodal pipeline re-walks
+    /// the full conversation history on every turn and tool iteration.
+    image_cache: zeroclaw_providers::multimodal::LocalImageCache,
 }
 
 impl Drop for Agent {
@@ -663,6 +668,7 @@ impl AgentBuilder {
             approval_manager: self.approval_manager,
             agent_alias: self.agent_alias.unwrap_or_default(),
             channel_handles: AgentChannelHandles::default(),
+            image_cache: zeroclaw_providers::multimodal::LocalImageCache::new(),
         })
     }
 }
@@ -1898,6 +1904,7 @@ impl Agent {
                     None,
                     Some(&mut loop_new_messages),
                     &knobs,
+                    Some(&mut self.image_cache),
                 ),
             )
             .await;
@@ -2285,6 +2292,7 @@ impl Agent {
                         None,
                         Some(&mut round_added),
                         &knobs,
+                        Some(&mut self.image_cache),
                     ),
                 )
                 .await;

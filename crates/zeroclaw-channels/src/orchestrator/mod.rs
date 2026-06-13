@@ -4540,7 +4540,8 @@ async fn process_channel_message_body(
                         None, // steering
                         None, // new_messages_out
                         &loop_knobs,
-                    ),
+                    None,
+),
                     ),
                     ),
                     ),

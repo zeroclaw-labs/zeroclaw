@@ -608,6 +608,7 @@ pub async fn agent_turn(
         None, // steering
         None, // new_messages_out
         &LoopKnobs::default(),
+        None,
     )
     .await
 }
@@ -1605,6 +1606,7 @@ pub async fn run(
                                 None, // steering
                                 None, // new_messages_out
                                 &LoopKnobs::default(),
+                                None,
                             ),
                         ),
                     )
@@ -2017,6 +2019,7 @@ pub async fn run(
                                     None, // steering
                                     None, // new_messages_out
                                     &LoopKnobs::default(),
+                                    None,
                                 ),
                             ),
                         )
@@ -4323,6 +4326,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect_err("user image on a non-vision provider should error");
@@ -4385,6 +4389,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("oversized payload should be skipped and continue as text-only");
@@ -4451,6 +4456,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -4516,6 +4522,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("text-only fallback should succeed, not abort the turn");
@@ -4581,6 +4588,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect_err("should fail when vision model_provider cannot be created");
@@ -4646,6 +4654,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("text-only messages should succeed with default model_provider");
@@ -4711,6 +4720,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect_err("should fail due to nonexistent vision model_provider");
@@ -4775,6 +4785,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("empty image markers should not trigger vision routing");
@@ -4838,6 +4849,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect_err("should attempt vision model_provider creation for multiple images");
@@ -4985,6 +4997,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("parallel execution should complete");
@@ -5099,6 +5112,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("native parallel execution should complete");
@@ -5181,6 +5195,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("cron_add delivery defaults should be injected");
@@ -5259,6 +5274,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("explicit delivery mode should be preserved");
@@ -5332,6 +5348,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -5418,6 +5435,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("non-interactive shell should succeed for low-risk command");
@@ -5494,6 +5512,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -5579,6 +5598,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("loop should finish running both identical subagent calls");
@@ -5663,6 +5683,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("loop should complete");
@@ -5733,6 +5754,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("native fallback id flow should complete");
@@ -5807,6 +5829,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("malformed tool protocol should retry and recover");
@@ -5876,6 +5899,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("business JSON should be returned as normal text");
@@ -5943,6 +5967,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("unknown business JSON should be returned as normal text");
@@ -6013,6 +6038,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("malformed tool protocol should return a safe fallback");
@@ -6080,6 +6106,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("toolcalls reference JSON should remain visible without tools");
@@ -6146,6 +6173,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("toolcalls reference JSON should remain visible without tools");
@@ -6204,6 +6232,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("schema JSON should remain visible without tools");
@@ -6263,6 +6292,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("audit JSON should remain visible without tools");
@@ -6322,6 +6352,7 @@ mod tests {
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("reference JSON should remain visible without tools");
@@ -6383,6 +6414,7 @@ This is an example, not an invocation."#;
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("tool_call tag examples should remain visible without tools");
@@ -6449,6 +6481,7 @@ This is an example, not an invocation."#;
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("registered tool_call fenced examples should remain visible");
@@ -6527,6 +6560,7 @@ This is an example, not an invocation."#;
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("registered tool_call tag examples should remain visible");
@@ -6588,6 +6622,7 @@ Done."#;
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("tagged tool protocol with trailing text should retry and recover");
@@ -6652,6 +6687,7 @@ Done."#;
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("embedded fenced tool protocol should retry and recover");
@@ -6714,6 +6750,7 @@ Done."#;
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("standalone tool_call fence should retry and recover without tools");
@@ -6777,6 +6814,7 @@ This is an example, not an invocation."#;
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("tool_call fenced examples should remain visible without tools");
@@ -6897,6 +6935,7 @@ This is an example, not an invocation."#;
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("split tool_call fenced examples should remain visible without tools");
@@ -6968,6 +7007,7 @@ This is an example, not an invocation."#;
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("JSON-fenced tool protocol examples should remain visible without tools");
@@ -7043,6 +7083,7 @@ This is an example, not an invocation."#;
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("streamed fenced tool call should execute and continue");
@@ -7141,6 +7182,7 @@ This is an example, not an invocation."#;
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("native tool-call text should be relayed through on_delta");
@@ -7244,6 +7286,7 @@ This is an example, not an invocation."#;
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("streaming model_provider should complete");
@@ -7321,6 +7364,7 @@ This is an example, not an invocation."#;
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("streaming tool loop should execute tool and finish");
@@ -8204,6 +8248,7 @@ This is an example, not an invocation."#;
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("native streaming events should preserve tool loop semantics");
@@ -8349,6 +8394,7 @@ This is an example, not an invocation."#;
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("routed streaming model_provider should complete");
@@ -9803,6 +9849,7 @@ Let me check the result."#;
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("tool loop should complete");
@@ -9965,6 +10012,7 @@ Let me check the result."#;
                     None, // steering
                     None, // new_messages_out
                     &LoopKnobs::default(),
+                    None,
                 ),
             )
             .await
@@ -10027,6 +10075,7 @@ Let me check the result."#;
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("tool loop should complete");
@@ -10127,6 +10176,7 @@ Let me check the result."#;
                     None, // steering
                     None, // new_messages_out
                     &LoopKnobs::default(),
+                    None,
                 ),
             )
             .await
@@ -10194,6 +10244,7 @@ Let me check the result."#;
             None, // steering
             None, // new_messages_out
             &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("should succeed without cost scope");

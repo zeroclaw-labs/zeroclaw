@@ -1771,6 +1771,7 @@ impl DelegateTool {
                 None, // steering
                 None, // new_messages_out
                 &LoopKnobs::default(),
+                None,
             )
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(agent_name)
