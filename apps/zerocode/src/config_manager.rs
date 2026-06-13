@@ -27,6 +27,11 @@ use crate::theme;
 
 pub(crate) type Term = Terminal<CrosstermBackend<Stdout>>;
 
+fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        | KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+}
+
 pub(crate) fn init_terminal() -> Result<Term> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -44,7 +49,7 @@ pub(crate) fn init_terminal() -> Result<Term> {
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
         let _ = execute!(
             stdout,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+            PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
         );
     }
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
@@ -3990,7 +3995,7 @@ fn edit_in_external_editor(
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
         let _ = execute!(
             term.backend_mut(),
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+            PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
         );
     }
     // Force a full redraw so ratatui repaints everything.
@@ -4011,5 +4016,19 @@ fn edit_in_external_editor(
             let _ = std::fs::remove_file(&tmp_path);
             Err(format!("failed to launch {editor}: {e}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyboard_enhancement_flags_disambiguate_modified_enter() {
+        assert!(
+            keyboard_enhancement_flags()
+                .contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+            "Shift+Enter reaches crossterm as plain Enter on common terminals unless keyboard enhancement asks for modified-key disambiguation"
+        );
     }
 }
