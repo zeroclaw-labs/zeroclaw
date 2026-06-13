@@ -300,11 +300,16 @@ zc-quickstart-block-peers = 对等组
 zc-quickstart-block-agent = 代理
 zc-quickstart-personality-help = 个性文件（e=编辑，t=使用模板，c=清除）
 zc-quickstart-save-and-close = 保存并关闭
+zc-quickstart-no-template = `{ $filename }` 没有可用模板
+zc-quickstart-agent-name-field = 名称
+zc-quickstart-file-bytes = { $bytes } 字节
 zc-chat-pane-chat = 聊天
 zc-chat-pane-acp = ACP
 zc-chat-no-agents = 没有已启用的代理。请在配置选项卡中配置代理。
 zc-chat-error-fetch-agents = 获取代理失败：{ $error }
 zc-chat-error-create-session = 创建会话失败：{ $error }
+zc-chat-session-restarted = 已启动新会话。
+zc-chat-session-restart-error = 无法启动新会话：{ $error }
 zc-chat-thinking-visible = 思考输出：可见
 zc-chat-thinking-hidden = 思考输出：已隐藏
 zc-model-picker-hint = 在 /model 后输入模型名称，或按 Tab 自动补全。

@@ -29,7 +29,10 @@ pub struct TurnUsage {
 /// Scoped via `tokio::task_local!` at call sites (channels, gateway).
 #[derive(Clone)]
 pub struct ToolLoopCostTrackingContext {
-    pub tracker: Arc<CostTracker>,
+    /// Shared cost tracker. `None` for usage-only contexts that accumulate
+    /// per-turn token totals without persisting cost records or enforcing
+    /// budgets (see [`Self::usage_only`]).
+    pub tracker: Option<Arc<CostTracker>>,
     pub model_provider_pricing: Arc<ModelProviderPricing>,
     pub turn_usage: Arc<Mutex<TurnUsage>>,
     /// Alias of the agent driving this turn. Stamped onto persisted
@@ -43,8 +46,23 @@ impl ToolLoopCostTrackingContext {
         model_provider_pricing: Arc<ModelProviderPricing>,
     ) -> Self {
         Self {
-            tracker,
+            tracker: Some(tracker),
             model_provider_pricing,
+            turn_usage: Arc::new(Mutex::new(TurnUsage::default())),
+            agent_alias: None,
+        }
+    }
+
+    /// Accumulation-only context: snapshots per-turn token usage without a
+    /// backing tracker. `record_tool_loop_cost_usage` skips persistence and
+    /// the missing-pricing warning (there is no cost enforcement to be
+    /// silently inert); `check_tool_loop_budget` reports no budget. Lets
+    /// wrappers that never tracked costs (e.g. `Agent::turn`) read summed
+    /// token totals out of the loop for observer events.
+    pub fn usage_only() -> Self {
+        Self {
+            tracker: None,
+            model_provider_pricing: Arc::new(ModelProviderPricing::new()),
             turn_usage: Arc::new(Mutex::new(TurnUsage::default())),
             agent_alias: None,
         }
@@ -176,13 +194,13 @@ pub fn record_tool_loop_cost_usage(
     // stream doesn't get spammy. Missing pricing means either the
     // model_provider has no pricing map at all, or the map exists but
     // produced zero rates for this model.
-    if pricing.is_none() || (input_rate == 0.0 && output_rate == 0.0) {
+    if ctx.tracker.is_some() && (pricing.is_none() || (input_rate == 0.0 && output_rate == 0.0)) {
         warn_once_missing_pricing(model_provider_name, model);
     }
 
-    if let Err(error) = ctx
-        .tracker
-        .record_usage_with_agent(cost_usage.clone(), ctx.agent_alias.as_deref())
+    if let Some(tracker) = &ctx.tracker
+        && let Err(error) =
+            tracker.record_usage_with_agent(cost_usage.clone(), ctx.agent_alias.as_deref())
     {
         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": model_provider_name, "model": model, "error": format!("{}", error)})), "Failed to record cost tracking usage: ");
     }
@@ -255,10 +273,9 @@ pub fn check_tool_loop_budget() -> Option<BudgetCheck> {
         .try_with(Clone::clone)
         .ok()
         .flatten()
-        .map(|ctx| {
+        .and_then(|ctx| {
             ctx.tracker
-                .check_budget(0.0)
-                .unwrap_or(BudgetCheck::Allowed)
+                .map(|tracker| tracker.check_budget(0.0).unwrap_or(BudgetCheck::Allowed))
         })
 }
 
