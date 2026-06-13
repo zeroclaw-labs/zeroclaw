@@ -3718,7 +3718,10 @@ async fn main() -> Result<()> {
                             } else {
                                 ::zeroclaw_log::record!(
                                     INFO,
-                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip),
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Skip
+                                    ),
                                     "MQTT SOP listener skipped — no SOPs directory configured"
                                 );
                                 Ok(())
