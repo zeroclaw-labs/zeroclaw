@@ -15,18 +15,19 @@ fn end(zone: &str) -> String {
     format!("# >>> end generated:{zone} <<<")
 }
 
-/// Render the feature-arg body for a zone: a `--features "X,Y" \` continued
-/// line a `cargo build` consumes (the surrounding `--no-default-features \`
-/// stays in the hand-written template). For the default selection, emits the
-/// `--features` line resolved from Cargo's default leaves so the image is
-/// explicit and drift-checkable rather than relying on implicit defaults.
+/// Render the feature-arg body for a zone: a `ZEROCLAW_FEATURES="X,Y"`
+/// assignment the surrounding `cargo build` references as
+/// `--features "${ZEROCLAW_FEATURES}"`. Using a variable (rather than injecting
+/// a `--features` line mid backslash-continuation) keeps the generated zone a
+/// standalone statement, so sentinel comments never sit inside a continued
+/// command — which would break the shell parse and the StageX `--frozen` build.
 pub fn render_features(
     manifest_dir: &Path,
     selection: &Selection,
     indent: &str,
 ) -> anyhow::Result<String> {
     let list = spec::resolve_feature_list(manifest_dir, selection)?;
-    Ok(format!("{indent}--features \"{}\" \\", list.join(",")))
+    Ok(format!("{indent}ZEROCLAW_FEATURES=\"{}\"", list.join(",")))
 }
 
 /// Render an `ARG ZEROCLAW_CARGO_FEATURES="X,Y"` default line from a selection.
@@ -94,10 +95,10 @@ mod tests {
 
     #[test]
     fn full_renders_explicit_default_leaves() {
-        let b = render_features(&root(), &Selection::Full, "        ").unwrap();
-        // Full now emits the explicit resolved default leaves (drift-checkable),
-        // not a bare comment.
-        assert!(b.contains("--features"));
+        let b = render_features(&root(), &Selection::Full, "    ").unwrap();
+        // Full emits the explicit resolved default leaves as a ZEROCLAW_FEATURES
+        // assignment (drift-checkable), not a bare comment.
+        assert!(b.contains("ZEROCLAW_FEATURES="));
         assert!(b.contains("gateway"), "default includes gateway");
     }
 

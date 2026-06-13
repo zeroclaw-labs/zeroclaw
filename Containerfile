@@ -30,15 +30,16 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     (mkdir -p /tmp/libwrap && cd /tmp/libwrap && ar x /lib/libc++.a && ar x /lib/libc++abi.a && ar rcs /usr/lib/libstdc++.a *.o && rm -rf /tmp/libwrap)
 
     # Release build — zeroclawlabs (daemon)
+    # >>> generated:container-standard by `cargo generate installers` — do not edit <<<
+    ZEROCLAW_FEATURES="acp-bridge,agent-runtime,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-imessage,channel-irc,channel-lark,channel-linq,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-wati,channel-webhook,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,gateway,observability-prometheus,schema-export"
+# >>> end generated:container-standard <<<
     CARGO_TARGET_DIR=/target \
     cargo build \
         --frozen \
         --release \
         --target "${ARCH}-unknown-linux-musl" \
         --no-default-features \
-        # >>> generated:container-standard by `cargo generate installers` — do not edit <<<
-        --features "acp-bridge,agent-runtime,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-imessage,channel-irc,channel-lark,channel-linq,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-wati,channel-webhook,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,gateway,observability-prometheus,schema-export" \
-# >>> end generated:container-standard <<<
+        --features "${ZEROCLAW_FEATURES}" \
         -p zeroclawlabs
 
     # Release build — zerocode (TUI config manager)
@@ -71,15 +72,16 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     set -e
     ARCH="$(uname -m)"
     export RUSTFLAGS="-C target-feature=+crt-static -C linker=rust-lld -C link-arg=-L/usr/lib"
+    # >>> generated:container-fat by `cargo generate installers` — do not edit <<<
+    ZEROCLAW_FEATURES="acp-bridge,agent-runtime,browser-native,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-feishu,channel-imessage,channel-irc,channel-lark,channel-line,channel-linq,channel-matrix,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-nostr,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-wati,channel-webhook,channel-wechat,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,dev-sim,gateway,hardware,memory-postgres,observability-otel,observability-prometheus,peripheral-rpi,plugins-wasm,probe,rag-pdf,sandbox-bubblewrap,sandbox-landlock,schema-export,voice-wake,webauthn,whatsapp-web"
+# >>> end generated:container-fat <<<
     CARGO_TARGET_DIR=/target \
     cargo build \
         --frozen \
         --release \
         --target "${ARCH}-unknown-linux-musl" \
         --no-default-features \
-        # >>> generated:container-fat by `cargo generate installers` — do not edit <<<
-        --features "acp-bridge,agent-runtime,browser-native,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-feishu,channel-imessage,channel-irc,channel-lark,channel-line,channel-linq,channel-matrix,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-nostr,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-wati,channel-webhook,channel-wechat,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,dev-sim,gateway,hardware,memory-postgres,observability-otel,observability-prometheus,peripheral-rpi,plugins-wasm,probe,rag-pdf,sandbox-bubblewrap,sandbox-landlock,schema-export,voice-wake,webauthn,whatsapp-web" \
-# >>> end generated:container-fat <<<
+        --features "${ZEROCLAW_FEATURES}" \
         -p zeroclawlabs
     mkdir -p /rootfs/usr/bin
     cp /target/${ARCH}-unknown-linux-musl/release/zeroclaw /rootfs/usr/bin/zeroclaw

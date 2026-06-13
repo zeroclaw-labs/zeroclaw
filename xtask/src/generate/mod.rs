@@ -93,8 +93,8 @@ fn containerfile_surface() -> ContainerSurface {
     ContainerSurface {
         file: "Containerfile",
         zones: vec![
-            ("container-standard", Sel::Dist, "        "),
-            ("container-fat", Sel::All, "        "),
+            ("container-standard", Sel::Dist, "    "),
+            ("container-fat", Sel::All, "    "),
         ],
     }
 }
