@@ -484,16 +484,11 @@ fn extract_zip(archive_bytes: &[u8], dest: &Path) -> Result<()> {
     use std::io::Read;
 
     let cursor = std::io::Cursor::new(archive_bytes);
-    let mut archive =
-        zip::ZipArchive::new(cursor).context("failed to open zip archive")?;
+    let mut archive = zip::ZipArchive::new(cursor).context("failed to open zip archive")?;
 
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).context("failed to read zip entry")?;
-        let file_name = entry
-            .name()
-            .rsplit(&['/', '\\'])
-            .next()
-            .unwrap_or("");
+        let file_name = entry.name().rsplit(&['/', '\\']).next().unwrap_or("");
         if file_name == "zeroclaw.exe" {
             let mut buf = Vec::new();
             entry
