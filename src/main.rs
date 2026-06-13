@@ -3637,14 +3637,18 @@ async fn main() -> Result<()> {
 
             // Construct the single shared SopEngine + SopAuditLogger for the
             // daemon. All SOP tool construction sites and fan-in listeners
-            // (MQTT, HTTP, cron) resolve from this singleton.
+            // (MQTT, HTTP, cron) resolve from this singleton. Only registered
+            // when a SOPs directory is configured — users without SOPs don't
+            // pay the memory cost.
             let sop_config = config.sop.clone();
             let workspace_dir = config.data_dir.clone();
-            let mem: Arc<dyn zeroclaw_memory::Memory> =
-                zeroclaw_memory::create_memory_for_agent(&config, "default", None).await?;
-            let (sop_engine, sop_audit) =
-                zeroclaw_runtime::sop::build_sop_engine(sop_config, &workspace_dir, mem);
-            let _ = zeroclaw_runtime::tools::register_sop_engine(sop_engine, sop_audit);
+            if sop_config.sops_dir.is_some() {
+                let mem: Arc<dyn zeroclaw_memory::Memory> =
+                    zeroclaw_memory::create_memory_for_agent(&config, "default", None).await?;
+                let (sop_engine, sop_audit) =
+                    zeroclaw_runtime::sop::build_sop_engine(sop_config, &workspace_dir, mem);
+                let _ = zeroclaw_runtime::tools::register_sop_engine(sop_engine, sop_audit);
+            }
 
             // Reload loop. `daemon::run` returns DaemonExit::Shutdown on
             // SIGINT/SIGTERM (loop ends) or DaemonExit::Reload on SIGUSR1
@@ -3713,13 +3717,11 @@ async fn main() -> Result<()> {
                                 .await
                             } else {
                                 ::zeroclaw_log::record!(
-                                    ERROR,
-                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                        .with_attrs(::serde_json::json!({"error_key": "sop_engine_not_registered"})),
-                                    "MQTT SOP listener started but SOP engine was not registered"
+                                    INFO,
+                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip),
+                                    "MQTT SOP listener skipped — no SOPs directory configured"
                                 );
-                                Err(anyhow::Error::msg("SOP engine not registered"))
+                                Ok(())
                             }
                         })
                     }
