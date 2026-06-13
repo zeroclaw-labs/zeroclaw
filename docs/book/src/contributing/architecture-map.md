@@ -49,9 +49,7 @@ Coding agents should use the same public docs as humans, plus the repository-loc
 
 ## RFC And PR Checkpoints
 
-This map does not replace the [RFC process](./rfcs.md) or the PR template.
-It exists to make architecture and contribution scope easier to find. After RFC #6808 policy slices are promoted, follow [FND-003](../foundations/fnd-003-governance.md), [Labels](../maintainers/labels.md), [PR workflow](../maintainers/pr-workflow.md), and [Reviewer playbook](../maintainers/reviewer-playbook.md).
+This map does not replace the [RFC process](./rfcs.md) or the PR template; it only helps you find the right doc. The [RFC process](./rfcs.md) carries the canonical "is this RFC-shaped?" table, so check it rather than guessing from a restated list here. After RFC #6808 policy slices are promoted, follow [FND-003](../foundations/fnd-003-governance.md), [Labels](../maintainers/labels.md), [PR workflow](../maintainers/pr-workflow.md), and [Reviewer playbook](../maintainers/reviewer-playbook.md).
 
-- Check or open an RFC first when the RFC page says the change is RFC-shaped: established default changes, breaking config or schema migration, new subsystem or protocol, cross-cutting refactor, governance, release, or contribution-model changes.
 - If a change is ambiguous but not clearly RFC-shaped, ask a maintainer or narrow the PR before implementation.
-- Before opening a PR, answer the template's summary, validation, compatibility, and rollback prompts. If those answers are not clear, write the design note or RFC first.
+- Before opening a PR, answer the prompts in the PR template (`.github/pull_request_template.md`). If those answers are not clear, write the design note or RFC first.

@@ -1,0 +1,35 @@
+name: Docker Image PR Check
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - Dockerfile.ci
+      - Dockerfile.debian.ci
+      - .github/workflows/docker-image-pr.yml
+      - .github/workflows/release-stable-manual.yml
+      - scripts/ci/prepare_docker_context.sh
+
+concurrency:
+  group: docker-image-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  images:
+    name: Docker Images Build (no push)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Prepare Docker smoke context
+        run: bash scripts/ci/prepare_docker_context.sh smoke docker-ctx
+
+      - name: Build default image
+        run: docker build -f docker-ctx/Dockerfile -t zeroclaw-pr-default:smoke docker-ctx
+
+      - name: Build Debian compatibility image
+        run: docker build -f docker-ctx/Dockerfile.debian -t zeroclaw-pr-debian:smoke docker-ctx

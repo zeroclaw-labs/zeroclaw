@@ -6,6 +6,9 @@ use xtask::cmd;
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
+    /// Optional tag for versioned docs output (e.g. v0.7.5). Falls back to TAG env var.
+    #[arg(long)]
+    tag: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -20,6 +23,16 @@ enum Cmd {
     Build,
     /// Regenerate cli.md, config.md, and rustdoc API reference
     Refs,
+    /// mdBook preprocessor: expand `{{#peer-group <channel>}}` directives.
+    /// Invoked by mdBook via book.toml; not run directly.
+    Preprocess {
+        /// `supports <renderer>` probe from mdBook (exit 0 = supported).
+        #[arg(value_name = "ARG")]
+        arg: Option<String>,
+        /// The renderer name mdBook passes after `supports`.
+        #[arg(value_name = "RENDERER")]
+        renderer: Option<String>,
+    },
     /// Sync .po files and AI-fill translation delta
     Sync {
         #[arg(long)]
@@ -27,7 +40,7 @@ enum Cmd {
         /// Re-translate all entries (quality pass, costs more)
         #[arg(long)]
         force: bool,
-        /// Provider alias from [providers.models.<kind>.<alias>] in config.toml
+        /// Provider alias from `[providers.models.<kind>.<alias>]` in config.toml
         #[arg(long)]
         model_provider: Option<String>,
         /// Config directory holding config.toml and .secret-key (default:
@@ -44,16 +57,39 @@ enum Cmd {
     Check,
     /// Print space-separated locale codes from locales.toml (for CI use)
     Locales,
+    /// Extract shared chrome layer into _shared directory
+    ExtractChrome {
+        version_dir: String,
+        shared_dir: String,
+    },
+    /// Generate versions.json list of deployed documentation versions
+    GenVersions,
+    /// Remove orphaned root entries from the gh-pages clone (run in its root)
+    PruneRoot,
+    /// Inject the version-selector script into deployed pages that lack it
+    RetrofitSelector,
     /// Regenerate pc-themes.css + switcher list from the dashboard theme registry
     Themes,
+    /// Regenerate hardware reference snippets from the board registry + catalog
+    Hardware,
+    /// Check internal links in the already-built book HTML
+    Linkcheck,
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let tag_owned = cli.tag.or_else(|| std::env::var("TAG").ok());
+    let tag = tag_owned.as_deref();
     match cli.command {
-        Cmd::Serve { locale } => cmd::mdbook::serve::run(locale.as_deref()),
-        Cmd::Build => cmd::mdbook::build::run(),
-        Cmd::Refs => cmd::mdbook::refs::run(),
+        Cmd::Serve { locale } => cmd::mdbook::serve::run(locale.as_deref(), tag),
+        Cmd::Build => cmd::mdbook::build::run(tag),
+        Cmd::Refs => cmd::mdbook::refs::run(tag),
+        Cmd::Preprocess { arg, .. } => {
+            if arg.as_deref() == Some("supports") {
+                cmd::mdbook::peer_groups::supports();
+            }
+            cmd::mdbook::peer_groups::run()
+        }
         Cmd::Sync {
             locale,
             force,
@@ -73,6 +109,21 @@ fn main() -> anyhow::Result<()> {
             cmd::mdbook::build::print_locales();
             Ok(())
         }
+        Cmd::ExtractChrome {
+            version_dir,
+            shared_dir,
+        } => cmd::mdbook::build::extract_shared_chrome(
+            std::path::Path::new(&version_dir),
+            std::path::Path::new(&shared_dir),
+        ),
+        Cmd::GenVersions => cmd::mdbook::versions::run(),
+        Cmd::PruneRoot => cmd::mdbook::versions::prune_root(),
+        Cmd::RetrofitSelector => cmd::mdbook::versions::retrofit_selector(),
         Cmd::Themes => cmd::mdbook::themes::run(&xtask::util::repo_root()),
+        Cmd::Hardware => cmd::mdbook::hardware::run(&xtask::util::repo_root()),
+        Cmd::Linkcheck => cmd::mdbook::linkcheck::check_internal_links(
+            &xtask::util::repo_root(),
+            tag.unwrap_or("master"),
+        ),
     }
 }

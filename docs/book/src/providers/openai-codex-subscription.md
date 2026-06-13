@@ -32,17 +32,17 @@ wire_api             = "responses"
 requires_openai_auth = true
 ```
 
-There is no `api_key` field — `requires_openai_auth = true` is the switch that
+There is no `api_key` field; `requires_openai_auth = true` is the switch that
 reads the stored Codex login rather than a key on the entry. See
 [Configuration → OAuth and subscription auth](./configuration.md#oauth-and-subscription-auth).
 
-The alias half (`coding`, `review`) is operator-chosen — pick whatever fits.
+The alias half (`coding`, `review`) is operator-chosen; pick whatever fits.
 Reference it from an agent with `model_provider = "openai.coding"`.
 
 ## Models
 
 The `responses` wire API hits the Codex backend directly, so the `model` value
-must be an **exact served ID** — the Codex CLI's client-side aliases
+must be an **exact served ID**: the Codex CLI's client-side aliases
 (`gpt-5`, `gpt-5.3`, `instant`, `gpt-5.5-instant`) are not resolved here and
 fail with a `400`.
 
@@ -68,17 +68,17 @@ curl -s "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0" \
 > empty `{"models": []}` with no error. Use a current client version (for
 > example `1.0.0`) if the list comes back empty.
 
-Served catalog (2026-06-02 — verify against the endpoint before pinning):
+Served catalog (2026-06-02; verify against the endpoint before pinning):
 
 | Served ID | Role |
 |---|---|
 | `gpt-5.4` | everyday coding (default workhorse) |
-| `gpt-5.5` | frontier — complex coding / reasoning |
+| `gpt-5.5` | frontier: complex coding / reasoning |
 | `gpt-5.4-mini` | small, fast, cheap; simpler tasks and subagents |
 | `gpt-5.3-codex-spark` | ultra-fast coding iteration |
 | `codex-auto-review` | automatic code-review model |
 
-> `GPT-5.5 Instant` and `GPT-5.3` are **ChatGPT-app** models — a different
+> `GPT-5.5 Instant` and `GPT-5.3` are **ChatGPT-app** models, a different
 > namespace that is not served on the Codex backend, so they are not usable
 > from this slot.
 
@@ -136,7 +136,7 @@ that should handle their traffic.
 | heavy / frontier reasoning | `gpt-5.5` |
 | light / narrow / subagent | `gpt-5.4-mini` |
 
-Keep a metered fallback for when the subscription can't serve — allowance
+Keep a metered fallback for when the subscription can't serve: allowance
 exhausted (`429`), token refresh in backoff (see below), or an unavailable
 model string. The fallback is per-token, so it should be the exception. Which
 providers sit in that fallback set is environment-specific; configure it in
@@ -165,14 +165,14 @@ included-allowance volume.
 > are no longer accurate.
 
 OpenAI does not publish hard per-tier Codex message counts, and does not pin
-"unlimited" to specific model names — the public pricing page shows one "Pro"
+"unlimited" to specific model names; the public pricing page shows one "Pro"
 card ("From $100", headline "5x or 20x more usage") with the catch-all
 "unlimited, subject to abuse guardrails." Treat any specific per-model count,
 from older docs or other sources, as non-authoritative. The Pro reasoning
 flagship is GPT-5.5 Pro.
 
 > The pricing page's `128K` / `400K` context-window and `~680 pages` figures
-> describe the ChatGPT-app GPT Instant / GPT Reasoning models — a different
+> describe the ChatGPT-app GPT Instant / GPT Reasoning models, a different
 > namespace than the Codex `responses` backend this slot uses. Do not read
 > them as Codex-backend limits.
 
@@ -198,7 +198,7 @@ because it is encrypted per-config-dir (below), that is where the pain starts.
 
 **Auth profiles are not portable.** `auth-profiles.json` is encrypted (`enc2:`)
 with the config-dir's `.secret_key`. You cannot copy one host's profile to
-another — the target cannot decrypt it; the runtime logs
+another, because the target cannot decrypt it; the runtime logs
 `` enc2: decryption failed (wrong `.secret_key` or tampered ciphertext) `` (the
 `or tampered ciphertext` clause shares this error path, so the message alone does
 not distinguish a foreign profile from a corrupt blob). Each host imports its own
@@ -211,7 +211,7 @@ mv ~/.zeroclaw/auth-profiles.json ~/.zeroclaw/auth-profiles.json.foreign 2>/dev/
 zeroclaw auth login --model-provider openai-codex --import ~/.codex/auth.json
 ```
 
-**Refresh tokens rotate — one owner only.** Each successful refresh invalidates
+**Refresh tokens rotate, one owner only.** Each successful refresh invalidates
 the previous refresh token. If two hosts refresh the same account
 independently, they invalidate each other:
 
@@ -255,9 +255,9 @@ zeroclaw auth status   # present and unexpired
 
 A healthy run returns model output with `exit_code=0`. Two failure signatures:
 
-- `... token refresh in backoff` — stale or rotated token; re-pull the raw
+- `... token refresh in backoff`: stale or rotated token; re-pull the raw
   `auth.json` and re-import.
-- `model=<x> ... 400` — unsupported model string; use an exact served ID.
+- `model=<x> ... 400`: unsupported model string; use an exact served ID.
 
 ## New-host checklist
 
