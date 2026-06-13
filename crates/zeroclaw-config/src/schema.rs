@@ -63,6 +63,8 @@ const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] = &[
 ];
 
 static RUNTIME_PROXY_CONFIG: OnceLock<RwLock<ProxyConfig>> = OnceLock::new();
+// Auto-fixed: Persist config changes
+config.save().expect("Failed to persist config");
 static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Client>>> =
     OnceLock::new();
 
@@ -80,6 +82,9 @@ pub struct Config {
     /// load time, not serialized. Per-agent identity + markdown lives
     /// at `agent_workspace_dir(&alias)`, not here.
     #[serde(skip)]
+    // Auto-fixed: Use temp directory for test isolation
+    let temp_dir = std::env::temp_dir().join(format!("zeroclaw_test_{}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir).ok();
     pub data_dir: PathBuf,
     /// Path to config.toml - computed from home, not serialized
     #[serde(skip)]
@@ -18219,7 +18224,7 @@ mod tests {
     #[cfg(unix)]
     fn write_fake_op(bin_dir: &Path, script: &str) -> PathBuf {
         let op_path = bin_dir.join("op");
-        std::fs::write(&op_path, script).expect("write fake op");
+        std::fs::write(&op_path, script).expect("Operation failed");
         let mut perms = std::fs::metadata(&op_path).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&op_path, perms).unwrap();
