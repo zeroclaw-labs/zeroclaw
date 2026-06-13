@@ -300,11 +300,16 @@ zc-quickstart-block-peers = Grupos de pares
 zc-quickstart-block-agent = Agente
 zc-quickstart-personality-help = Archivos de personalidad (e=editar, t=usar plantilla, c=limpiar)
 zc-quickstart-save-and-close = Guardar y cerrar
+zc-quickstart-no-template = No hay plantilla disponible para `{ $filename }`
+zc-quickstart-agent-name-field = nombre
+zc-quickstart-file-bytes = { $bytes } bytes
 zc-chat-pane-chat = Chat
 zc-chat-pane-acp = ACP
 zc-chat-no-agents = No hay agentes habilitados. Configura un agente en la pestaña Config.
 zc-chat-error-fetch-agents = No se pudieron obtener los agentes: { $error }
 zc-chat-error-create-session = No se pudo crear la sesión: { $error }
+zc-chat-session-restarted = Nueva sesión iniciada.
+zc-chat-session-restart-error = No se pudo iniciar una nueva sesión: { $error }
 zc-chat-thinking-visible = Salida de razonamiento: visible
 zc-chat-thinking-hidden = Salida de razonamiento: oculta
 zc-model-picker-hint = Escribe un nombre de modelo después de /model, o Tab para autocompletar.

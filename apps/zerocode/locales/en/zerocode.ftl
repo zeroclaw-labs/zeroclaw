@@ -334,6 +334,9 @@ zc-quickstart-block-peers = Peer groups
 zc-quickstart-block-agent = Agent
 zc-quickstart-personality-help = Personality files (e=edit, t=use template, c=clear)
 zc-quickstart-save-and-close = Save & close
+zc-quickstart-no-template = No template is available for `{ $filename }`
+zc-quickstart-agent-name-field = name
+zc-quickstart-file-bytes = { $bytes } bytes
 
 zc-chat-pane-chat = Chat
 zc-chat-pane-acp = ACP
@@ -341,6 +344,8 @@ zc-chat-pane-acp = ACP
 zc-chat-no-agents = No enabled agents yet. Open Quickstart to create one, or use Config to add and enable an agent.
 zc-chat-error-fetch-agents = Failed to fetch agents: { $error }
 zc-chat-error-create-session = Failed to create session: { $error }
+zc-chat-session-restarted = New session started.
+zc-chat-session-restart-error = Failed to start a new session: { $error }
 
 zc-chat-thinking-visible = Thinking output: visible
 zc-chat-thinking-hidden = Thinking output: hidden
