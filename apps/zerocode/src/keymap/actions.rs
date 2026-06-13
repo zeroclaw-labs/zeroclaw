@@ -337,9 +337,10 @@ keyactions! {
         PrevField      [Chord::key(KeyCode::BackTab)] => "prev field",
         Backspace      [Chord::key(KeyCode::Backspace)] => "backspace",
         DeleteRow      [Chord::char('d'), Chord::char('D')] => "delete row",
-        EditWithEditor [Chord::char('e'), Chord::char('E')] => "edit in $EDITOR",
+        Save           [Chord::ctrl('s')] => "save",
+        EditWithEditor [Chord::char('e'), Chord::char('E')] => "edit file",
         EditTemplate   [Chord::char('t'), Chord::char('T')] => "from template",
-        EditCopy       [Chord::char('c'), Chord::char('C')] => "copy contents",
+        ClearFile      [Chord::char('c'), Chord::char('C')] => "clear file",
         Create         [] => "create",
     }
 }

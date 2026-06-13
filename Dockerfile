@@ -167,6 +167,7 @@ FROM debian:trixie-slim@sha256:f6e2cfac5cf956ea044b4bd75e6397b4372ad88fe00908045
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     curl \
+    vim-tiny \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /zeroclaw-data /zeroclaw-data

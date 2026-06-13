@@ -1,10 +1,40 @@
 /* ZeroClaw docs enhancement layer (Tier B PoC).
-   - Right-hand "On this page" TOC built from content headings, with scroll-spy.
+   - Right-hand page TOC built from content headings, with scroll-spy.
    - Hero banner injected on the landing page (introduction).
    - Reading-progress bar under the menu bar.
    No build-time coupling: everything is derived from the rendered DOM. */
 (function () {
   'use strict';
+
+  const LOCALE_TEXT = {
+    en: {
+      onThisPage: 'On this page',
+      quickStart: 'Quickstart',
+    },
+    es: {
+      onThisPage: 'En esta página',
+      quickStart: 'Inicio rápido',
+    },
+    fr: {
+      onThisPage: 'Sur cette page',
+      quickStart: 'Démarrage rapide',
+    },
+    ja: {
+      onThisPage: 'このページ',
+      quickStart: 'クイックスタート',
+    },
+    'zh-CN': {
+      onThisPage: '本页目录',
+      quickStart: '快速入门',
+    },
+  };
+
+  function localeText(key, fallback) {
+    const lang = document.documentElement.lang || 'en';
+    const exact = LOCALE_TEXT[lang];
+    const base = LOCALE_TEXT[lang.split('-')[0]];
+    return (exact && exact[key]) || (base && base[key]) || fallback;
+  }
 
   function ready(fn) {
     if (document.readyState !== 'loading') fn();
@@ -46,7 +76,8 @@
 
     const title = document.createElement('div');
     title.className = 'pc-toc-title';
-    title.textContent = 'On this page';
+    title.textContent = localeText('onThisPage', 'On this page');
+    toc.setAttribute('aria-label', title.textContent);
     toc.appendChild(title);
 
     const list = document.createElement('ul');
@@ -104,26 +135,41 @@
     const t = firstH1.textContent.toLowerCase();
     if (!/introduction|zeroclaw|welcome|overview/.test(t)) return;
 
+    const intro = firstH1.nextElementSibling?.matches('p')
+      ? firstH1.nextElementSibling
+      : null;
+    const subtitle =
+      intro?.textContent.trim() || 'Personal AI assistant you own, written in Rust.';
+    const quickstart = Array.from(main.querySelectorAll('a[href]')).find((a) => {
+      const href = a.getAttribute('href') || '';
+      return /(^|\/)getting-started\/quick-?start\.html$/.test(href);
+    });
+    const quickstartHref =
+      quickstart?.getAttribute('href') || 'getting-started/quickstart.html';
+    const quickstartText =
+      localeText('quickStart', quickstart?.textContent.trim() || 'Quickstart');
+
     const hero = document.createElement('section');
     hero.className = 'pc-hero';
-    // Static scaffold only — no interpolation of page-derived text here.
     hero.innerHTML =
       '<div class="pc-hero-glow"></div>' +
       '<div class="pc-hero-inner">' +
       '<div class="pc-hero-badge">ZeroClaw</div>' +
       '<h1 class="pc-hero-title"></h1>' +
-      // Subtitle is intentionally hardcoded here: it is product positioning,
-      // not page content, and changes rarely. If it needs to vary per build,
-      // promote it to a data-hero-sub attribute read from the landing Markdown.
-      '<p class="pc-hero-sub">Your personal AI assistant: one static binary, runs anywhere, no vendor lock-in.</p>' +
+      '<p class="pc-hero-sub"></p>' +
       '<div class="pc-hero-actions">' +
-      '<a class="pc-btn pc-btn-primary" href="getting-started/quickstart.html">Quick start →</a>' +
+      '<a class="pc-btn pc-btn-primary"></a>' +
       '<a class="pc-btn pc-btn-secondary" href="https://github.com/zeroclaw-labs/zeroclaw">GitHub</a>' +
       '</div></div>';
     // Insert the page-derived heading as text, never as HTML, so a crafted
-    // heading cannot inject markup (textContent -> innerHTML re-encoding sink).
+    // heading or translation cannot inject markup.
     hero.querySelector('.pc-hero-title').textContent = firstH1.textContent;
+    hero.querySelector('.pc-hero-sub').textContent = subtitle;
+    const primary = hero.querySelector('.pc-btn-primary');
+    primary.href = quickstartHref;
+    primary.textContent = quickstartText.replace(/\s*→\s*$/, '') + ' →';
     firstH1.replaceWith(hero);
+    if (intro) intro.remove();
   }
 
   // ── Wrap tables for horizontal scroll on narrow screens ────────────────
