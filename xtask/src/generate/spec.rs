@@ -330,6 +330,20 @@ pub fn resolve_flags(manifest_dir: &Path, selection: &Selection) -> anyhow::Resu
     Ok(resolve(manifest_dir, selection)?.cargo_flags)
 }
 
+/// Resolve the canonical workspace version from Cargo.toml.
+pub fn resolve_version(manifest_dir: &Path) -> anyhow::Result<String> {
+    let meta = cargo_metadata::MetadataCommand::new()
+        .manifest_path(manifest_dir.join("Cargo.toml"))
+        .no_deps()
+        .exec()?;
+    let root = meta
+        .root_package()
+        .cloned()
+        .or_else(|| meta.workspace_packages().into_iter().next().cloned())
+        .ok_or_else(|| anyhow::anyhow!("no root/workspace package"))?;
+    Ok(root.version.to_string())
+}
+
 /// Resolve the explicit feature list for a selection — the names a `--features`
 /// arg would carry. For `Full` (Cargo default) this returns the resolved
 /// default leaves so container/packaging surfaces are explicit and

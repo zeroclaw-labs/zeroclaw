@@ -5,6 +5,7 @@
 //! one table so adding one is data, not control flow.
 
 pub mod container;
+pub mod packaging;
 pub mod setup_bat;
 pub mod spec;
 
@@ -46,6 +47,16 @@ fn registry() -> Vec<Surface> {
             name: "dockerfile-debian",
             file: "Dockerfile.debian",
             render: |root, cur| render_docker_arg(root, cur),
+        },
+        Surface {
+            name: "pkgbuild",
+            file: "dist/aur/PKGBUILD",
+            render: |root, cur| packaging::render_pkgbuild(root, cur),
+        },
+        Surface {
+            name: "scoop",
+            file: "dist/scoop/zeroclaw.json",
+            render: |root, cur| packaging::render_scoop(root, cur),
         },
     ]
 }
