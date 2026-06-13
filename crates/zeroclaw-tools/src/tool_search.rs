@@ -585,9 +585,13 @@ mod tests {
             make_stub("srv__ok", "OK tool"),
             make_stub("srv__nope", "Blocked tool"),
         ];
+        // Runtime-discovered MCP tools (names containing "__") are auto-admitted
+        // when an allow-list is present, so the operator-visible way to block a
+        // specific MCP tool is the deny-list (the `excluded_tools` equivalent).
+        // See `ToolAccessPolicy::is_tool_allowed` and PR #7547.
         let policy = ToolAccessPolicy {
             allowed: Some(vec!["srv__ok".into()]),
-            denied: None,
+            denied: Some(vec!["srv__nope".into()]),
         };
         let tool = ToolSearchTool::new(make_deferred_set(stubs).await, Arc::clone(&activated))
             .with_access_policy(policy);
