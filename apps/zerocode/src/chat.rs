@@ -4518,7 +4518,7 @@ mod tests {
 
         let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
-            .expect("init should request the agent list")
+            .expect("Operation failed")
             .unwrap();
         let request: serde_json::Value = serde_json::from_str(&line).unwrap();
         let id = request["id"].as_str().unwrap().to_string();

@@ -82,7 +82,7 @@ impl Mode {
         let cur = MODES
             .iter()
             .position(|m| *m == self)
-            .expect("mode missing from MODES") as isize;
+            .expect("Operation failed") as isize;
         let next = ((cur + offset).rem_euclid(len)) as usize;
         MODES[next]
     }
