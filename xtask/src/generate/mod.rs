@@ -1,40 +1,57 @@
-//! `cargo generate installers` — render install surfaces (install.sh,
-//! setup.bat, ...) from the canonical spec. install.sh@HEAD is the behavioral
-//! reference. The spec is the single source of truth; surfaces are derived and
-//! drift-checked.
+//! `cargo generate installers` — render install surfaces (setup.bat,
+//! Containerfile, Dockerfiles, packaging, ...) from the canonical spec.
+//! install.sh@HEAD is the behavioral reference. The spec is the single source
+//! of truth; surfaces are derived and drift-checked. Surfaces are registered in
+//! one table so adding one is data, not control flow.
 
+pub mod container;
 pub mod setup_bat;
 pub mod spec;
 
-use std::path::PathBuf;
+use container::ContainerSurface;
+use spec::Selection as Sel;
+use std::path::{Path, PathBuf};
 
-/// Surfaces this command can render. Each maps to a renderer that rewrites only
-/// the sentinel-delimited generated region of its file.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Target {
-    SetupBat,
+/// A render: given the workspace root and the file's current content, produce
+/// the regenerated content (splicing only sentinel zones).
+type Render = fn(&Path, &str) -> anyhow::Result<String>;
+
+/// One registered surface: a canonical name and the file it owns + how to
+/// render it. The registry is the single list of "what we generate".
+struct Surface {
+    name: &'static str,
+    file: &'static str,
+    render: Render,
 }
 
-impl Target {
-    fn parse(s: &str) -> anyhow::Result<Target> {
-        match s {
-            "setup-bat" | "setup.bat" => Ok(Target::SetupBat),
-            other => anyhow::bail!("unknown convert target `{other}` (known: setup-bat)"),
-        }
-    }
+/// The surface registry. Adding a generated surface = one row here.
+fn registry() -> Vec<Surface> {
+    vec![
+        Surface {
+            name: "setup-bat",
+            file: "setup.bat",
+            render: |root, cur| setup_bat::render_file(root, cur),
+        },
+        Surface {
+            name: "containerfile",
+            file: "Containerfile",
+            render: |root, cur| containerfile_surface().render(root, cur),
+        },
+    ]
+}
 
-    fn all() -> Vec<Target> {
-        vec![Target::SetupBat]
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Target::SetupBat => "setup-bat",
-        }
+/// Containerfile surface: standard image ships Dist (all channels, no
+/// heavyweight); fat image ships All (kitchen sink). Selections, not literals.
+fn containerfile_surface() -> ContainerSurface {
+    ContainerSurface {
+        file: "Containerfile",
+        zones: vec![
+            ("container-standard", Sel::Dist, "        "),
+            ("container-fat", Sel::All, "        "),
+        ],
     }
 }
 
-/// Workspace root (where the canonical Cargo.toml lives).
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -43,38 +60,46 @@ fn workspace_root() -> PathBuf {
 }
 
 pub fn run(targets: &[String], check: bool) -> anyhow::Result<()> {
-    // `cargo generate installers` with no targets renders every surface; the
-    // plural subcommand means "all installers" by default.
-    let selected: Vec<Target> = if targets.is_empty() {
-        Target::all()
+    let all = registry();
+    let selected: Vec<&Surface> = if targets.is_empty() {
+        all.iter().collect()
     } else {
-        targets
-            .iter()
-            .map(|t| Target::parse(t))
-            .collect::<anyhow::Result<_>>()?
+        let mut out = Vec::new();
+        for t in targets {
+            let s = all
+                .iter()
+                .find(|s| s.name == t || s.file == t)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unknown target `{t}` (known: {})",
+                        all.iter().map(|s| s.name).collect::<Vec<_>>().join(", ")
+                    )
+                })?;
+            out.push(s);
+        }
+        out
     };
 
     let root = workspace_root();
     let mut drift = false;
 
-    for t in selected {
-        match t {
-            Target::SetupBat => {
-                let rendered = render_setup_bat(&root)?;
-                let path = root.join("setup.bat");
-                if check {
-                    let current = std::fs::read_to_string(&path).unwrap_or_default();
-                    if current != rendered {
-                        eprintln!("DRIFT: {} is out of sync with the spec", t.name());
-                        drift = true;
-                    } else {
-                        println!("ok: {} in sync", t.name());
-                    }
-                } else {
-                    std::fs::write(&path, rendered)?;
-                    println!("wrote {}", path.display());
-                }
+    for s in selected {
+        let path = root.join(s.file);
+        let current = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        let rendered = (s.render)(&root, &current)?;
+        if check {
+            if current != rendered {
+                eprintln!("DRIFT: {} is out of sync with the spec", s.name);
+                drift = true;
+            } else {
+                println!("ok: {} in sync", s.name);
             }
+        } else if current != rendered {
+            std::fs::write(&path, rendered)?;
+            println!("wrote {}", path.display());
+        } else {
+            println!("unchanged {}", path.display());
         }
     }
 
@@ -82,12 +107,4 @@ pub fn run(targets: &[String], check: bool) -> anyhow::Result<()> {
         anyhow::bail!("one or more installers drifted; run `cargo generate installers`");
     }
     Ok(())
-}
-
-/// Render setup.bat by splicing the spec-generated region into the on-disk
-/// file, preserving all hand-written glue outside the sentinels.
-fn render_setup_bat(root: &std::path::Path) -> anyhow::Result<String> {
-    let path = root.join("setup.bat");
-    let current = std::fs::read_to_string(&path)?;
-    setup_bat::render_file(root, &current)
 }

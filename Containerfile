@@ -36,7 +36,9 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
         --release \
         --target "${ARCH}-unknown-linux-musl" \
         --no-default-features \
-        --features "agent-runtime,default-channels,acp-bridge,gateway,schema-export,observability-prometheus" \
+        # >>> generated:container-standard by `cargo generate installers` — do not edit <<<
+        --features "acp-bridge,agent-runtime,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-imessage,channel-irc,channel-lark,channel-linq,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-wati,channel-webhook,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,gateway,observability-prometheus,schema-export" \
+# >>> end generated:container-standard <<<
         -p zeroclawlabs
 
     # Release build — zerocode (TUI config manager)
@@ -75,7 +77,9 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
         --release \
         --target "${ARCH}-unknown-linux-musl" \
         --no-default-features \
-        --features "agent-runtime,channels-full,acp-bridge,gateway,schema-export,observability-prometheus" \
+        # >>> generated:container-fat by `cargo generate installers` — do not edit <<<
+        --features "acp-bridge,agent-runtime,browser-native,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-feishu,channel-imessage,channel-irc,channel-lark,channel-line,channel-linq,channel-matrix,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-nostr,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-wati,channel-webhook,channel-wechat,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,dev-sim,gateway,hardware,memory-postgres,observability-otel,observability-prometheus,peripheral-rpi,plugins-wasm,probe,rag-pdf,sandbox-bubblewrap,sandbox-landlock,schema-export,voice-wake,webauthn,whatsapp-web" \
+# >>> end generated:container-fat <<<
         -p zeroclawlabs
     mkdir -p /rootfs/usr/bin
     cp /target/${ARCH}-unknown-linux-musl/release/zeroclaw /rootfs/usr/bin/zeroclaw

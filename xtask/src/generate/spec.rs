@@ -330,6 +330,35 @@ pub fn resolve_flags(manifest_dir: &Path, selection: &Selection) -> anyhow::Resu
     Ok(resolve(manifest_dir, selection)?.cargo_flags)
 }
 
+/// Resolve the explicit feature list for a selection — the names a `--features`
+/// arg would carry. For `Full` (Cargo default) this returns the resolved
+/// default leaves so container/packaging surfaces are explicit and
+/// drift-checkable rather than relying on implicit cargo defaults.
+pub fn resolve_feature_list(
+    manifest_dir: &Path,
+    selection: &Selection,
+) -> anyhow::Result<Vec<String>> {
+    let meta = cargo_metadata::MetadataCommand::new()
+        .manifest_path(manifest_dir.join("Cargo.toml"))
+        .no_deps()
+        .exec()?;
+    let root = meta
+        .root_package()
+        .cloned()
+        .or_else(|| meta.workspace_packages().into_iter().next().cloned())
+        .ok_or_else(|| anyhow::anyhow!("no root/workspace package"))?;
+    let all_features: Vec<String> = root.features.keys().cloned().collect();
+    let non_row = non_row_features(&meta, &root);
+    let heavyweight = heavyweight_features(&root);
+    let ctx = FeatureCtx {
+        graph: &root.features,
+        all: &all_features,
+        non_row: &non_row,
+        heavyweight: &heavyweight,
+    };
+    selection.to_feature_list(&ctx)
+}
+
 /// Read canonical data via `cargo_metadata` — Cargo's own resolver, so the
 /// feature graph matches what builds actually see. No awk, no hand-parsing.
 pub fn resolve(manifest_dir: &Path, selection: &Selection) -> anyhow::Result<Resolved> {
@@ -456,50 +485,53 @@ impl Selection {
         ]
     }
 
-    /// Cargo flag string for this selection, validating named features and
-    /// deriving Dist/All from the feature graph + registry sets — no hardcoded
-    /// channel or feature lists.
+    /// Cargo flag string for this selection (wraps `to_feature_list`).
     fn to_cargo_flags(&self, ctx: &FeatureCtx) -> anyhow::Result<String> {
         match self {
             Selection::Full => Ok(String::new()),
-            Selection::Minimal => Ok("--no-default-features".into()),
+            _ => Ok(ctx.flags_from(self.to_feature_list(ctx)?)),
+        }
+    }
+
+    /// The explicit feature name list this selection resolves to. `Full`
+    /// returns the resolved default leaves (so callers can be explicit);
+    /// `Minimal` returns empty.
+    fn to_feature_list(&self, ctx: &FeatureCtx) -> anyhow::Result<Vec<String>> {
+        let mut set = match self {
+            Selection::Minimal => Vec::new(),
+            Selection::Full => ctx.expand("default"),
             Selection::Dist => {
-                // All channels (channels-full leaves) + default runtime leaves,
-                // minus heavyweight. Derived from the graph + registry.
-                let mut set = ctx.expand("channels-full");
-                set.extend(ctx.expand("default"));
-                set.retain(|f| !ctx.heavyweight.contains(f));
-                Ok(ctx.flags_from(set))
+                let mut s = ctx.expand("channels-full");
+                s.extend(ctx.expand("default"));
+                s.retain(|f| !ctx.heavyweight.contains(f));
+                s
             }
-            Selection::All => {
-                // Every selectable feature: all − non_row − pure-alias.
-                let set: Vec<String> = ctx
-                    .all
-                    .iter()
-                    .filter(|f| !ctx.non_row.contains(f) && !ctx.is_alias(f))
-                    .cloned()
-                    .collect();
-                Ok(ctx.flags_from(set))
-            }
+            Selection::All => ctx
+                .all
+                .iter()
+                .filter(|f| !ctx.non_row.contains(f) && !ctx.is_alias(f))
+                .cloned()
+                .collect(),
             Selection::Features(feats) => {
-                let mut picked: Vec<String> = feats
+                let picked: Vec<String> = feats
                     .iter()
                     .flat_map(|f| f.split([',', ' ']))
                     .map(str::trim)
                     .filter(|f| !f.is_empty())
                     .map(str::to_owned)
                     .collect();
-                picked.sort();
-                picked.dedup();
                 for f in &picked {
                     anyhow::ensure!(
                         ctx.all.contains(f),
                         "unknown feature `{f}` (not in [features])"
                     );
                 }
-                Ok(ctx.flags_from(picked))
+                picked
             }
-        }
+        };
+        set.sort();
+        set.dedup();
+        Ok(set)
     }
 }
 
