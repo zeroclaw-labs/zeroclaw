@@ -14954,6 +14954,13 @@ pub async fn ensure_bootstrap_files(workspace_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ExtraNestedModelProviderTable {
+    family: String,
+    alias: String,
+    nested: String,
+}
+
 impl Config {
     /// External-peer usernames authorized on `<channel_type>.<alias>`.
     ///
@@ -15083,6 +15090,76 @@ impl Config {
             );
         }
         out
+    }
+
+    /// Return extra-nested model-provider alias tables that look like a
+    /// misplaced provider config, e.g.
+    /// `[providers.models.zai.default.default]`.
+    ///
+    /// Serde treats the first `default` as the alias and silently ignores the
+    /// second `default` child table. When that child table carries provider
+    /// fields such as `model`, `api_key`, or family-specific fields, the
+    /// operator's settings are dropped while the empty alias still validates as
+    /// an in-progress provider. This raw-TOML detector runs before that shape
+    /// is erased by typed deserialization.
+    fn extra_nested_model_provider_tables(raw_toml: &str) -> Vec<ExtraNestedModelProviderTable> {
+        let raw: toml::Table = match raw_toml.parse() {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+        let Some(models) = raw
+            .get("providers")
+            .and_then(toml::Value::as_table)
+            .and_then(|providers| providers.get("models"))
+            .and_then(toml::Value::as_table)
+        else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::new();
+        for (family, aliases_value) in models {
+            if !crate::providers::ModelProviders::slot_names().contains(&family.as_str()) {
+                continue;
+            }
+            let Some(aliases) = aliases_value.as_table() else {
+                continue;
+            };
+            for (alias, alias_value) in aliases {
+                let Some(alias_table) = alias_value.as_table() else {
+                    continue;
+                };
+                for (nested_key, nested_value) in alias_table {
+                    let Some(nested_table) = nested_value.as_table() else {
+                        continue;
+                    };
+                    if nested_table.is_empty()
+                        || Self::is_model_provider_table_valued_field(nested_key)
+                    {
+                        continue;
+                    }
+                    out.push(ExtraNestedModelProviderTable {
+                        family: family.clone(),
+                        alias: alias.clone(),
+                        nested: nested_key.clone(),
+                    });
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    fn is_model_provider_table_valued_field(key: &str) -> bool {
+        // These shared model-provider fields legitimately deserialize from
+        // nested TOML tables under an alias. Every other table-valued child of
+        // `[providers.models.<family>.<alias>]` is an ignored extra section,
+        // regardless of whether its contents are shared or family-specific
+        // provider fields.
+        matches!(
+            key,
+            "chat_template_kwargs" | "extra_headers" | "pricing" | "provider_extra"
+        )
     }
 
     /// Returns `true` if `path` was populated by a `ZEROCLAW_*` env-var
@@ -15331,7 +15408,32 @@ impl Config {
                         .with_attrs(::serde_json::json!({"kind": kind, "family": family})),
                     &format!(
                         "[providers.{kind}.{family}] section dropped: not a known {kind} \
-                         provider family. Its aliases will not load and {reference}."
+                        provider family. Its aliases will not load and {reference}."
+                    )
+                );
+            }
+            // Extra child tables under a known model-provider alias are also
+            // erased by serde. If the child carries provider-shaped fields,
+            // call out the likely mistaken nesting instead of letting the
+            // parent alias look like an ordinary unfinished provider.
+            for entry in Self::extra_nested_model_provider_tables(&contents) {
+                let family = entry.family.as_str();
+                let alias = entry.alias.as_str();
+                let nested = entry.nested.as_str();
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "family": family,
+                            "alias": alias,
+                            "nested": nested,
+                        })),
+                    &format!(
+                        "[providers.models.{}.{}.{}] section ignored: \
+                         model-provider fields must live directly under \
+                         [providers.models.{}.{}]. Move the nested keys up one level.",
+                        family, alias, nested, family, alias
                     )
                 );
             }
@@ -26066,6 +26168,147 @@ model = "gpt-4o"
             vec!["models.weird".to_string()],
             "array-of-tables under an unknown family is still an unknown family"
         );
+    }
+
+    #[test]
+    async fn extra_nested_model_provider_tables_flags_dropped_provider_fields() {
+        let finding = |family: &str, alias: &str, nested: &str| ExtraNestedModelProviderTable {
+            family: family.to_string(),
+            alias: alias.to_string(),
+            nested: nested.to_string(),
+        };
+
+        // serde accepts `[providers.models.zai.default.default]` by treating
+        // the first `default` as the provider alias and erasing the second
+        // child table. The typed Config therefore looks like an empty
+        // `zai.default` provider and `validate()` accepts it as an
+        // in-progress quickstart entry. The raw-TOML detector must preserve
+        // that diagnostic signal before deserialization erases the shape.
+        let raw = r#"
+schema_version = 3
+
+[providers.models.zai.default.default]
+model = "glm-5.1"
+api_key = "sk-test"
+endpoint = "global"
+
+[risk_profiles.default]
+level = "supervised"
+
+[agents.default]
+enabled = true
+model_provider = "zai.default"
+risk_profile = "default"
+"#;
+        let parsed: Config = toml::from_str(raw).expect("extra nesting must not fail parse");
+        let provider = parsed
+            .providers
+            .models
+            .find("zai", "default")
+            .expect("outer alias is still present");
+        assert!(
+            provider.model.is_none() && provider.api_key.is_none(),
+            "precondition: serde silently drops the nested model/api_key"
+        );
+        parsed
+            .validate()
+            .expect("typed validation cannot see the raw extra nesting");
+        assert_eq!(
+            Config::extra_nested_model_provider_tables(raw),
+            vec![finding("zai", "default", "default")]
+        );
+
+        let valid = r#"
+schema_version = 3
+
+[providers.models.zai.default]
+model = "glm-5.1"
+api_key = "sk-test"
+endpoint = "global"
+"#;
+        assert!(
+            Config::extra_nested_model_provider_tables(valid).is_empty(),
+            "valid V3 alias tables must not be flagged"
+        );
+
+        let valid_table_fields = r#"
+schema_version = 3
+
+[providers.models.openai.default]
+model = "gpt-4o"
+
+[providers.models.openai.default.extra_headers]
+model = "header-value"
+api_key = "header-value"
+
+[providers.models.openai.default.provider_extra]
+model = "router-model"
+api_key = "provider-extra-value"
+
+[providers.models.openai.default.chat_template_kwargs]
+model = "template-model"
+api_key = "template-value"
+
+[providers.models.openai.default.pricing]
+model = 1.0
+api_key = 2.0
+"#;
+        assert!(
+            Config::extra_nested_model_provider_tables(valid_table_fields).is_empty(),
+            "valid table-valued provider fields must not be flagged even when child keys collide"
+        );
+
+        let valid_pricing = r#"
+schema_version = 3
+
+[providers.models.openai.default]
+model = "gpt-4o"
+pricing = { "gpt-4o.input" = 5.0, "gpt-4o.output" = 15.0 }
+"#;
+        assert!(
+            Config::extra_nested_model_provider_tables(valid_pricing).is_empty(),
+            "valid nested provider fields such as pricing must not be flagged"
+        );
+
+        let family_specific = r#"
+schema_version = 3
+
+[providers.models.azure.default.default]
+api_version = "2024-10-21"
+
+[providers.models.ollama.local.default]
+num_ctx = 16384
+"#;
+        assert_eq!(
+            Config::extra_nested_model_provider_tables(family_specific),
+            vec![
+                finding("azure", "default", "default"),
+                finding("ollama", "local", "default")
+            ],
+            "family-specific fields must still be flagged when extra-nested"
+        );
+
+        let dotted_alias = r#"
+schema_version = 3
+
+[providers.models.openai."prod.v2".default]
+model = "gpt-4o"
+"#;
+        assert_eq!(
+            Config::extra_nested_model_provider_tables(dotted_alias),
+            vec![finding("openai", "prod.v2", "default")],
+            "aliases containing dots must stay intact in diagnostics"
+        );
+
+        assert!(
+            Config::extra_nested_model_provider_tables(
+                "schema_version = 3\n[providers.models.zia.default.default]\nmodel = \"x\"\n",
+            )
+            .is_empty(),
+            "unknown families are handled by unknown_provider_families"
+        );
+        assert!(Config::extra_nested_model_provider_tables("not toml {{{").is_empty());
+        assert!(Config::extra_nested_model_provider_tables("providers = 3\n").is_empty());
     }
 
     #[test]
