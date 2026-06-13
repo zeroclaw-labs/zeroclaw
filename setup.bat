@@ -252,7 +252,11 @@ echo   %GREEN%OK%RESET% Build succeeded.
 echo   Command: cargo build --release --locked -p zerocode --target %TARGET%
 cargo build --release --locked -p zerocode --target %TARGET%
 if %ERRORLEVEL% NEQ 0 (
-    echo   %YELLOW%WARNING: zerocode TUI build failed; continuing with zeroclaw only.%RESET%
+    echo.
+    echo   %RED%ERROR: zerocode TUI build failed.%RESET%
+    echo   zerocode ships with every install; a partial install is not produced.
+    echo   Fix the build error above and re-run setup.bat.
+    goto :error_exit
 )
 
 :: Copy binary to a convenient location
