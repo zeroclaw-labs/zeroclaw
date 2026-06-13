@@ -4,7 +4,7 @@ setlocal enabledelayedexpansion
 :: ============================================================================
 :: ZeroClaw Windows Setup Script
 :: Simplifies building and installing ZeroClaw on Windows.
-:: Usage: setup.bat [--prebuilt | --minimal | --standard | --full | --help]
+:: Usage: setup.bat [--prebuilt | --minimal | --dist | --default | --all | --dry-run | --help]
 :: ============================================================================
 
 set "VERSION=0.8.0"
@@ -22,12 +22,19 @@ set "RESET=[0m"
 
 :: Parse arguments
 set "MODE=interactive"
+set "DRY_RUN=false"
+:parse_args
+if "%~1"==""           goto :start
 if "%~1"=="--help"     goto :show_help
 if "%~1"=="-h"         goto :show_help
-if "%~1"=="--prebuilt" set "MODE=prebuilt" & goto :start
-if "%~1"=="--minimal"  set "MODE=minimal"  & goto :start
-if "%~1"=="--standard" set "MODE=standard" & goto :start
-if "%~1"=="--full"     set "MODE=full"     & goto :start
+if "%~1"=="--dry-run"  set "DRY_RUN=true" & shift & goto :parse_args
+if "%~1"=="--prebuilt" set "MODE=prebuilt" & shift & goto :parse_args
+if "%~1"=="--minimal"  set "MODE=minimal"  & shift & goto :parse_args
+if "%~1"=="--dist"     set "MODE=dist"     & shift & goto :parse_args
+if "%~1"=="--default"  set "MODE=default"  & shift & goto :parse_args
+if "%~1"=="--all"      set "MODE=all"      & shift & goto :parse_args
+echo Unknown option: %~1
+goto :show_help
 
 :start
 echo.
@@ -61,7 +68,11 @@ for /f %%a in ('powershell -Command "[math]::Round((Get-PSDrive $env:SystemDrive
 where cargo >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
     echo   %YELLOW%Rust not found.%RESET%
-    goto :install_rust
+    if "%DRY_RUN%"=="true" (
+        echo   [dry-run] Would install Rust via rustup
+    ) else (
+        goto :install_rust
+    )
 ) else (
     for /f "tokens=2" %%v in ('rustc --version 2^>nul') do set "RUST_VER=%%v"
     echo   %GREEN%OK%RESET% Rust !RUST_VER! found
@@ -148,6 +159,13 @@ goto :choose_mode
 echo.
 echo %BOLD%[3/5] Downloading prebuilt binary...%RESET%
 
+if "%DRY_RUN%"=="true" (
+    echo   [dry-run] Would download the prebuilt Windows release archive
+    echo   [dry-run] Would install to %USERPROFILE%\.zeroclaw\bin
+    echo   [dry-run] Would add %USERPROFILE%\.zeroclaw\bin to PATH
+    goto :dry_run_done
+)
+
 :: Try to get latest release URL via gh or curl
 where gh >nul 2>&1
 if %ERRORLEVEL% EQU 0 (
@@ -218,6 +236,15 @@ goto :do_build
 echo.
 echo %BOLD%[3/5] Building ZeroClaw (%BUILD_DESC%)...%RESET%
 echo   Target: %TARGET%
+
+if "%DRY_RUN%"=="true" (
+    echo   [dry-run] Would run: cargo build --release --locked %FEATURES% --target %TARGET%
+    echo   [dry-run] Would run: cargo build --release --locked -p zerocode --target %TARGET%
+    echo   [dry-run] Would install to %USERPROFILE%\.zeroclaw\bin
+    echo   [dry-run] Would build web dashboard ^(cargo web build^) and install to %LOCALAPPDATA%\zeroclaw\web\dist
+    echo   [dry-run] Would add %USERPROFILE%\.zeroclaw\bin to PATH
+    goto :dry_run_done
+)
 
 :: Ensure we're in the repo root (check for Cargo.toml)
 if not exist "Cargo.toml" (
@@ -368,8 +395,10 @@ echo.
 echo Options:
 echo   --prebuilt    Download pre-compiled binary (fastest)
 echo   --minimal     Build core only ^(--no-default-features^)
-echo   --standard    Build with Matrix + Lark/Feishu
-echo   --full        Build with all features
+echo   --dist        Build all channels, no heavyweight extras (recommended)
+echo   --default     Build the default feature set
+echo   --all         Build every feature including hardware and browser
+echo   --dry-run     Show what would happen without building or installing
 echo   --help, -h    Show this help message
 echo.
 echo Without arguments, runs in interactive mode.
@@ -390,6 +419,12 @@ echo Need help? Open an issue at %REPO%/issues
 echo.
 endlocal
 exit /b 1
+
+:: ---- Dry-run summary ----
+:dry_run_done
+echo.
+echo   %GREEN%Dry run complete.%RESET% No changes were made.
+goto :end
 
 :: ---- Clean exit ----
 :end

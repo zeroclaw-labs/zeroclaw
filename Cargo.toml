@@ -260,7 +260,7 @@ non_row_features = [
 # bloat the single artifact for users who never use them. Still opt-in via
 # source `--features`, the docker `:all-features` tag, or a nix override. This
 # "too big for the default download" bit is not derivable from the feature
-# graph, so it lives here in the canonical registry — never shadowed.
+# graph, so it lives here in the canonical registry; never shadowed.
 heavyweight_features = [
     "hardware",
     "browser-native",

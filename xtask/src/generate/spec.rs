@@ -1,8 +1,9 @@
 //! Canonical install spec. install.sh@HEAD is the behavioral reference; this
 //! spec reproduces it and every surface (install.sh, setup.bat, ...) renders
-//! from it. Dry-run is intrinsic: a step renders its `narration` in
-//! `Mode::DryRun` and performs its `action` in `Mode::Execute`. Nothing is
-//! hardcoded in a surface; values flow from `Cargo.toml` and the resolver.
+//! from it. Dry-run is intrinsic: each step pairs a `narration` (the dry-run
+//! line) with its `action` (the real op), and the rendered script chooses
+//! between them at runtime via its dry-run flag. Nothing is hardcoded in a
+//! surface; values flow from `Cargo.toml` and the resolver.
 
 use std::path::Path;
 
@@ -78,20 +79,6 @@ impl Step {
     }
 }
 
-/// Execution mode for a plan. This is the structured home of the dry-run
-/// concept: a plan is rendered (or executed) in exactly one mode, and the mode
-/// (not a per-step flag or a vec convention) decides whether each step emits
-/// its narration or performs its action.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    /// Perform each step's `action`.
-    Execute,
-    /// Emit each step's narration as a `[dry-run] Would ...` line; perform
-    /// nothing. Every step that has an action MUST have a narration, so dry-run
-    /// coverage is total by construction (enforced by `Plan::validate`).
-    DryRun,
-}
-
 /// The install flow as it actually is: a divergence (prebuilt vs source) that
 /// reconverges at a shared tail. The tree makes branch + convergence a property
 /// of the type, not something a reader reconstructs from per-step `when` flags.
@@ -147,7 +134,7 @@ impl Plan {
     }
 
     /// Invariant that makes dry-run trustworthy: every step has a non-empty
-    /// narration, so `Mode::DryRun` describes the entire plan with no silent
+    /// narration, so the dry-run pass describes the entire plan with no silent
     /// gaps. A mutating step without a dry-run line is a bug, caught here.
     pub fn validate(&self) -> anyhow::Result<()> {
         for s in self.all_steps() {
@@ -161,7 +148,7 @@ impl Plan {
     }
 }
 
-/// What a step emits in `Mode::DryRun`: the narration prefixed so users see it
+/// What a step emits in dry-run: the narration prefixed so users see it
 /// is a no-op preview. Renderers turn this into their dialect (`info`/`echo`).
 pub fn dry_run_line(narration_text: &str) -> String {
     format!("[dry-run] Would {narration_text}")
@@ -607,9 +594,10 @@ impl FeatureCtx<'_> {
 }
 
 /// The web/dist path EXPRESSION each surface emits - resolved on the END
-/// USER's machine at install time, never baked to the generator host. A test
-/// asserts these expressions agree with `directories::BaseDirs::data_local_dir`
-/// so the rendered path matches the gateway's runtime auto-detect.
+/// USER's machine at install time, never baked to the generator host. The
+/// expression mirrors `BaseDirs::data_local_dir` semantics (LOCALAPPDATA on
+/// Windows, XDG_DATA_HOME/.local/share on Linux) so the rendered path matches
+/// the gateway's runtime auto-detect.
 pub fn web_data_dir_expr(platform: Platform) -> &'static str {
     match platform {
         // Unix renderer's else-arm (Linux). The macOS arm is emitted by the
@@ -758,7 +746,7 @@ mod tests {
     #[test]
     fn dry_run_coverage_is_total() {
         // validate() already ran in build(); assert every step narrates so
-        // Mode::DryRun can describe the whole plan with no silent mutations.
+        // the dry-run pass can describe the whole plan with no silent mutations.
         let p = Plan::build(&root(), Platform::Windows, &Selection::Full).unwrap();
         for s in p.all_steps() {
             let empty = matches!(s.narration, Value::Lit(ref l) if l.is_empty());
@@ -775,7 +763,7 @@ mod tests {
     }
 
     #[test]
-    fn web_data_dir_expr_matches_directories_runtime() {
+    fn web_data_dir_expr_matches_data_local_dir_semantics() {
         let win = web_data_dir_expr(Platform::Windows);
         assert!(win.contains("LOCALAPPDATA") && win.ends_with("zeroclaw\\web\\dist"));
         let unix = web_data_dir_expr(Platform::Unix);

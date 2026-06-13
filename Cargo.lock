@@ -2689,20 +2689,11 @@ dependencies = [
 
 [[package]]
 name = "directories"
-version = "5.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a49173b84e034382284f27f1af4dcbbd231ffa358c0fe316541a7337f376a35"
-dependencies = [
- "dirs-sys 0.4.1",
-]
-
-[[package]]
-name = "directories"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "16f5094c54661b38d03bd7e50df373292118db60b585c08a411c6d840017fe7d"
 dependencies = [
- "dirs-sys 0.5.0",
+ "dirs-sys",
 ]
 
 [[package]]
@@ -2721,19 +2712,7 @@ version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
 dependencies = [
- "dirs-sys 0.5.0",
-]
-
-[[package]]
-name = "dirs-sys"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "520f05a5cbd335fae5a99ff7a6ab8627577660ee5cfd6a94a6a929b52ff0321c"
-dependencies = [
- "libc",
- "option-ext",
- "redox_users 0.4.6",
- "windows-sys 0.48.0",
+ "dirs-sys",
 ]
 
 [[package]]
@@ -13484,7 +13463,6 @@ dependencies = [
  "axum",
  "cargo_metadata 0.18.1",
  "clap",
- "directories 5.0.1",
  "fluent-syntax",
  "reqwest 0.12.28",
  "schemars 1.2.1",
@@ -13492,7 +13470,6 @@ dependencies = [
  "serde_json",
  "shlex",
  "tempfile",
- "tinytemplate",
  "tokio",
  "toml 0.8.23",
  "tower-http",
@@ -13660,7 +13637,7 @@ dependencies = [
  "cbc 0.1.2",
  "chrono",
  "cpal",
- "directories 6.0.0",
+ "directories",
  "ecb",
  "futures-util",
  "hex",
@@ -13734,7 +13711,7 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "clap",
- "directories 6.0.0",
+ "directories",
  "hex",
  "hostname",
  "parking_lot",
@@ -13796,7 +13773,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
- "directories 6.0.0",
+ "directories",
  "futures-util",
  "hex",
  "hmac 0.12.1",
@@ -13849,7 +13826,7 @@ dependencies = [
  "axum",
  "console",
  "dialoguer",
- "directories 6.0.0",
+ "directories",
  "glob",
  "nusb",
  "portable-atomic",
@@ -13973,7 +13950,7 @@ dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
  "chrono",
- "directories 6.0.0",
+ "directories",
  "futures-util",
  "hex",
  "hmac 0.12.1",
@@ -14008,7 +13985,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chrono",
- "directories 6.0.0",
+ "directories",
  "portable-atomic",
  "reqwest 0.12.28",
  "rppal",
@@ -14037,7 +14014,7 @@ dependencies = [
  "console",
  "cron",
  "dialoguer",
- "directories 6.0.0",
+ "directories",
  "encoding_rs",
  "flate2",
  "fluent",
@@ -14135,7 +14112,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chrono",
- "directories 6.0.0",
+ "directories",
  "fantoccini",
  "futures-util",
  "glob",
@@ -14193,7 +14170,7 @@ dependencies = [
  "cron",
  "crossterm",
  "dialoguer",
- "directories 6.0.0",
+ "directories",
  "flate2",
  "futures-util",
  "glob",
@@ -14274,7 +14251,7 @@ dependencies = [
  "async-trait",
  "clap",
  "crossterm",
- "directories 6.0.0",
+ "directories",
  "fluent",
  "futures-util",
  "inkjet",

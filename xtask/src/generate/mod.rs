@@ -11,7 +11,6 @@ pub mod install_sh;
 pub mod packaging;
 pub mod setup_bat;
 pub mod spec;
-pub mod steps;
 
 use container::ContainerSurface;
 use spec::Selection as Sel;

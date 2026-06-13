@@ -1,7 +1,9 @@
-//! install.sh renderer. install.sh@HEAD is the behavioral reference; we
-//! generate the step-dispatcher zones from the canonical `Plan` so the dry-run
-//! narration and the real action come from one source. The hand-written glue
-//! (arg parsing, toolchain bootstrap, summary) stays outside the sentinels.
+//! install.sh renderer. install.sh@HEAD is the behavioral reference and stays
+//! hand-authored; we generate one sentinel zone for the source-build
+//! cargo-install step so its dry-run narration and real command come from the
+//! canonical spec and cannot drift. All other install.sh logic (arg parsing,
+//! toolchain bootstrap, web-dist copy, apps, summary) stays outside the
+//! sentinels, unchanged.
 
 use super::spec::{self, Selection};
 use std::path::Path;
