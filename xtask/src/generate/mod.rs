@@ -5,6 +5,7 @@
 //! one table so adding one is data, not control flow.
 
 pub mod container;
+pub mod flake;
 pub mod packaging;
 pub mod setup_bat;
 pub mod spec;
@@ -57,6 +58,11 @@ fn registry() -> Vec<Surface> {
             name: "scoop",
             file: "dist/scoop/zeroclaw.json",
             render: |root, cur| packaging::render_scoop(root, cur),
+        },
+        Surface {
+            name: "flake",
+            file: "flake.nix",
+            render: |root, cur| flake::render_file(root, cur),
         },
     ]
 }
