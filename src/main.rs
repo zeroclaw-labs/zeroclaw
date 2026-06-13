@@ -41,6 +41,7 @@ use dialoguer::{Password, Select};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 
 /// Resolve a `cli-*` Fluent key for CLI output. Routes through the runtime
@@ -3634,6 +3635,17 @@ async fn main() -> Result<()> {
             let canvas_store_for_gateway = canvas_store.clone();
             let canvas_store_for_channels = canvas_store.clone();
 
+            // Construct the single shared SopEngine + SopAuditLogger for the
+            // daemon. All SOP tool construction sites and fan-in listeners
+            // (MQTT, HTTP, cron) resolve from this singleton.
+            let sop_config = config.sop.clone();
+            let workspace_dir = config.data_dir.clone();
+            let mem: Arc<dyn zeroclaw_memory::Memory> =
+                zeroclaw_memory::create_memory_for_agent(&config, "default", None).await?;
+            let (sop_engine, sop_audit) =
+                zeroclaw_runtime::sop::build_sop_engine(sop_config, &workspace_dir, mem);
+            let _ = zeroclaw_runtime::tools::register_sop_engine(sop_engine, sop_audit);
+
             // Reload loop. `daemon::run` returns DaemonExit::Shutdown on
             // SIGINT/SIGTERM (loop ends) or DaemonExit::Reload on SIGUSR1
             // (loop re-reads config from disk and re-runs). The PID stays
@@ -3686,30 +3698,22 @@ async fn main() -> Result<()> {
 
                 #[cfg(feature = "channel-mqtt")]
                 registry.register_mqtt(Box::new({
-                    use std::sync::{Arc, Mutex};
-                    use zeroclaw_config::schema::SopConfig;
-                    use zeroclaw_memory::NoneMemory;
-                    use zeroclaw_runtime::sop::{SopAuditLogger, SopEngine};
-                    let sop_config = current_config.sop.clone();
-                    let workspace_dir = current_config.data_dir.clone();
+                    let engine = zeroclaw_runtime::tools::resolve_sop_engine();
+                    let audit = zeroclaw_runtime::tools::resolve_sop_audit();
                     move |mqtt_config| {
-                        let engine = if sop_config.sops_dir.is_some() {
-                            let mut e = SopEngine::new(sop_config.clone());
-                            e.reload(&workspace_dir);
-                            e
-                        } else {
-                            SopEngine::new(SopConfig::default())
-                        };
-                        let engine = Arc::new(Mutex::new(engine));
-                        let audit =
-                            Arc::new(SopAuditLogger::new(Arc::new(NoneMemory::new("none"))));
+                        let engine = engine.clone();
+                        let audit = audit.clone();
                         Box::pin(async move {
-                            zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
-                                &mqtt_config,
-                                engine,
-                                audit,
-                            )
-                            .await
+                            if let (Some(engine), Some(audit)) = (engine, audit) {
+                                zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
+                                    &mqtt_config,
+                                    engine,
+                                    audit,
+                                )
+                                .await
+                            } else {
+                                Err(anyhow::anyhow!("SOP engine not registered"))
+                            }
                         })
                     }
                 }));

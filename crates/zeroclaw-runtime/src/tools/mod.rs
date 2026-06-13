@@ -154,10 +154,12 @@ pub const REENTRANT_AGENT_TOOLS: &[&str] = &[SpawnSubagentTool::NAME, DelegateTo
 
 use crate::platform::{NativeRuntime, RuntimeAdapter};
 use crate::security::{SecurityPolicy, create_sandbox};
+use crate::sop::audit::SopAuditLogger;
+use crate::sop::engine::SopEngine;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 use zeroclaw_memory::Memory;
 
@@ -172,6 +174,35 @@ pub type PerToolChannelHandle =
 /// Shared handle to the delegate tool's parent-tools list.
 /// Callers can push additional tools (e.g. MCP wrappers) after construction.
 pub type DelegateParentToolsHandle = Arc<RwLock<Vec<Arc<dyn Tool>>>>;
+
+/// Shared SopEngine + SopAuditLogger for the daemon.
+///
+/// Registered once at daemon startup via `register_sop_engine`.
+/// All tool construction sites and fan-in listeners (MQTT, HTTP, cron)
+/// resolve from this singleton — never call `SopEngine::new` directly.
+type SopEngineHandle = Arc<Mutex<SopEngine>>;
+type SopAuditHandle = Arc<SopAuditLogger>;
+static SOP_ENGINE: std::sync::OnceLock<(SopEngineHandle, SopAuditHandle)> =
+    std::sync::OnceLock::new();
+
+/// Register the shared SopEngine and SopAuditLogger for the daemon.
+/// Called once at daemon startup. Returns Err if already registered.
+pub fn register_sop_engine(
+    engine: SopEngineHandle,
+    audit: SopAuditHandle,
+) -> Result<(), (SopEngineHandle, SopAuditHandle)> {
+    SOP_ENGINE.set((engine, audit))
+}
+
+/// Resolve the shared SopEngine if registered.
+pub fn resolve_sop_engine() -> Option<SopEngineHandle> {
+    SOP_ENGINE.get().map(|(e, _)| Arc::clone(e))
+}
+
+/// Resolve the shared SopAuditLogger if registered.
+pub fn resolve_sop_audit() -> Option<SopAuditHandle> {
+    SOP_ENGINE.get().map(|(_, a)| Arc::clone(a))
+}
 
 /// Thin wrapper that makes an `Arc<dyn Tool>` usable as `Box<dyn Tool>`.
 pub struct ArcToolRef(pub Arc<dyn Tool>);
@@ -1084,11 +1115,8 @@ pub fn all_tools_with_runtime(
         Arc::clone(&poll_handle),
     )));
 
-    // SOP tools (registered when sops_dir is configured)
-    if root_config.sop.sops_dir.is_some() {
-        let mut engine = crate::sop::SopEngine::new(root_config.sop.clone());
-        engine.reload(workspace_dir);
-        let sop_engine = Arc::new(std::sync::Mutex::new(engine));
+    // SOP tools (registered when shared engine is available)
+    if let Some(sop_engine) = resolve_sop_engine() {
         tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(&sop_engine))));
         tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(&sop_engine))));
         tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(&sop_engine))));
@@ -1383,6 +1411,58 @@ mod tests {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
         assert_eq!(tools.len(), 6);
+    }
+
+    #[test]
+    fn shared_sop_engine_resolve_returns_singleton() {
+        use zeroclaw_config::schema::{MemoryConfig, SopConfig};
+
+        // Before registration, resolve returns None.
+        assert!(resolve_sop_engine().is_none());
+        assert!(resolve_sop_audit().is_none());
+
+        // Build engine + audit the same way the daemon does.
+        let sop_cfg = SopConfig::default();
+        let mem_cfg = MemoryConfig {
+            backend: "sqlite".into(),
+            ..MemoryConfig::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn zeroclaw_memory::Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        std::mem::forget(tmp);
+
+        let mut engine = SopEngine::new(sop_cfg);
+        engine.reload(std::path::Path::new("/tmp"));
+        let engine = Arc::new(Mutex::new(engine));
+        let audit = Arc::new(SopAuditLogger::new(memory));
+
+        // First registration succeeds.
+        assert!(register_sop_engine(engine.clone(), audit.clone()).is_ok());
+
+        // After registration, resolve returns Some.
+        let resolved_engine = resolve_sop_engine().expect("engine should be registered");
+        let resolved_audit = resolve_sop_audit().expect("audit should be registered");
+
+        // Resolved handles point to the same underlying instances.
+        assert!(Arc::ptr_eq(&engine, &resolved_engine));
+        assert!(Arc::ptr_eq(&audit, &resolved_audit));
+
+        // Second registration returns Err with the original values back.
+        let mem_cfg2 = MemoryConfig {
+            backend: "sqlite".into(),
+            ..MemoryConfig::default()
+        };
+        let tmp2 = tempfile::tempdir().unwrap();
+        let memory2: Arc<dyn zeroclaw_memory::Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg2, tmp2.path(), None).unwrap());
+        std::mem::forget(tmp2);
+        let engine2 = Arc::new(Mutex::new(SopEngine::new(SopConfig::default())));
+        let audit2 = Arc::new(SopAuditLogger::new(memory2));
+        let err = register_sop_engine(engine2.clone(), audit2.clone())
+            .expect_err("second registration should fail");
+        assert!(Arc::ptr_eq(&engine2, &err.0));
+        assert!(Arc::ptr_eq(&audit2, &err.1));
     }
 
     /// A runtime that reports an ephemeral workspace (no host persistence) while
