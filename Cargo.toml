@@ -363,21 +363,23 @@ metrics = ["observability-prometheus"]
 # support at all — no plugin runtime, no WASM dependencies, and the plugin ABI
 # surface will be unavailable in the agent runtime.
 #
-# Choose ONE (and only one) of the following features to select a WASM execution
-# strategy:
+# Each feature adds a WASM execution strategy; enable the smallest set your targets
+# need. `plugins-wasm-runtime` is implied by the other two.
 #
-# - `plugins-wasm-runtime-only`: Fastest startup for plugins and smallest binary
-#   size, but requires plugin authors to compile a specific version for each
-#   target architecture (`.cwasm` files instead of `.wasm`). 
-# - `plugins-wasm-cranelift`: More flexible than runtime-only, supports JIT
-#   compilation of plugins on the host machine, but results in larger binary size
-#   due to the Cranelift dependency. Not supported on all platforms (e.g., ARM32).
+# - `plugins-wasm-runtime`: Fastest startup for plugins and smallest binary size,
+#   but requires plugin authors to compile a specific version for each target
+#   architecture (`.cwasm` files instead of `.wasm`) unless one of the two JIT
+#   compilation feature flags is also used. 
+# - `plugins-wasm-cranelift`: Add the Cranelift JIT compilation engine on top of
+#   the runtime which enables compiling WASM plugins on the host machine, but
+#   results in larger binary size due to the Cranelift dependency. NOTE: Not
+#   supported on all platforms (e.g., ARM32).
 # - `plugins-wasm-pulley`: Most flexible, supports JIT compilation on targets
 #   where Cranelift isn't available (e.g., ARM32), but has the slowest runtime
 #   performance.
-plugins-wasm-runtime-only = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasmtime"]
-plugins-wasm-cranelift    = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasm-cranelift"]
-plugins-wasm-pulley       = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasm-pulley"]
+plugins-wasm-runtime   = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasmtime"]
+plugins-wasm-cranelift = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasm-cranelift"]
+plugins-wasm-pulley    = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasm-pulley"]
 
 # CI meta-feature
 ci-all = [
