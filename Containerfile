@@ -3,6 +3,40 @@
 # by SONAME, so we create a symlink in web-build. Pure StageX — no
 # Alpine, no core-llvm-libgcc, no external deps for the GCC runtime.
 
+# ── Stage: config-gen (generate default config template) ────
+FROM docker.io/stagex/pallet-rust@sha256:2d90b9552412ee2c4fa2a13b489c2f28c044be7fb5d6a942bfd5a480a5c288fd AS config-gen
+
+# Default config template consumed by build/build-fat. Single source of truth
+# so operators get a working config on first run without migration overhead.
+RUN <<-EOF
+    set -e
+    mkdir -p /rootfs/zeroclaw-data/.zeroclaw /rootfs/zeroclaw-data/data
+    # allow_public_bind: bind to [::] (all interfaces). Inside a container this
+    # is safe — the runtime sandboxes network access. The port is only reachable
+    # when the operator explicitly publishes it via -p/--publish.
+    printf '%s\n' \
+        'schema_version = 3' \
+        'default_provider = "custom"' \
+        'default_model = "opencode/big-pickle"' \
+        'default_temperature = 0.7' \
+        '' \
+        '[gateway]' \
+        'port = 42617' \
+        'host = "[::]"' \
+        'allow_public_bind = true' \
+        'web_dist_dir = "/usr/share/zeroclawlabs/web/dist"' \
+        '' \
+        '[providers.models.custom.opencode]' \
+        'uri = "https://api.opencode.ai/v1"' \
+        'api_key = ""' \
+        'model = "opencode/big-pickle"' \
+        '' \
+        '[risk_profiles.default]' \
+        'level = "supervised"' \
+        'auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory_store", "web_search_tool", "web_fetch", "calculator", "glob_search", "content_search", "image_info", "weather", "git_operations"]' \
+        > /rootfs/zeroclaw-data/.zeroclaw/config.toml
+EOF
+
 # ── Stage: nodejs (reference for Node.js toolchain) ──────────
 FROM docker.io/stagex/pallet-nodejs@sha256:81bc04b9490a4f4401a8b6fd277736d75f1f0ad4bd98e8f6b4b3616e18b75f7b AS nodejs
 
@@ -34,12 +68,12 @@ RUN ln -s /usr/lib/node_modules/npm/bin/npm-cli.js /usr/bin/npm && \
 # SONAME for exception unwinding. pallet-rust has libunwind with all the
 # needed _Unwind_* symbols, so a symlink is sufficient (no GCC runtime
 # or core-llvm-libgcc COPY needed).
-RUN ln -s libunwind.so /usr/lib/libgcc_s.so.1
+RUN test -f /usr/lib/libunwind.so && ln -s libunwind.so /usr/lib/libgcc_s.so.1 || ln -s libunwind.so.1 /usr/lib/libgcc_s.so.1
 
 # Install npm dependencies (cached layer: only invalidated when package files change)
 # Also explicitly install the musl platform variant of lightningcss — npm's
 # optional-dependency resolver misdetects musl as glibc in StageX and skips it.
-RUN npm ci --prefix web && npm install --prefix web lightningcss-linux-x64-musl
+RUN npm ci --prefix web && npm install --prefix web lightningcss-linux-$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/')-musl
 
 # Fetch cargo dependencies (network allowed)
 RUN --mount=type=cache,target=/root/.cargo/registry \
@@ -60,8 +94,8 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     # Remove .so files that have corresponding .a — forces linker to use static archives
     # Note: do NOT cd to /usr/lib (breaks cargo's config resolution from /src/.cargo/)
     for a_file in /usr/lib/*.a; do
-      base="\${a_file%.a}"
-      so_file="\${base}.so"
+      base="${a_file%.a}"
+      so_file="${base}.so"
       [ -f "$so_file" ] || [ -L "$so_file" ] && rm -f "$so_file"
     done
     # Override .cargo/config.toml's -C link-arg=-static for musl, which conflicts with
@@ -92,9 +126,13 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     --network=none \
     <<-EOF
     set -e
-    mkdir -p web/dist && touch web/dist/.gitkeep
-    cargo fmt --all -- --check && \
-    cargo clippy --all-targets -- -D warnings
+    mkdir -p web/dist
+    touch web/dist/.gitkeep
+    cargo fmt --all -- --check
+    # --features ci-all matches CI's Lint job — validates all feature-gated code.
+    # --exclude zeroclaw-desktop: needs GTK/WebKit (not in StageX).
+    # --exclude zerocode: inkjet/tree-sitter needs C++ compiler (not in StageX).
+    cargo clippy --workspace --exclude zeroclaw-desktop --exclude zerocode --all-targets --features ci-all --locked -- -D warnings
 EOF
 
 # Test (needs loopback for wiremock — no --network=none)
@@ -108,7 +146,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     <<-EOF
     set -e
-    cargo test --workspace --exclude zeroclaw-desktop --exclude zerocode --offline
+    cargo test --workspace --exclude zeroclaw-desktop --exclude zerocode --offline --locked
 EOF
 
 # ── Stage: build (zeroclaw + zerocode, default channels) ────
@@ -138,7 +176,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     export RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-static"
 
     # Build combined libstdc++.a from libc++.a + libc++abi.a (stagex ships LLVM libc++, not GCC libstdc++)
-    (mkdir -p /tmp/libwrap && cd /tmp/libwrap && ar x /usr/lib/libc++.a && ar x /usr/lib/libc++abi.a && ar rcs /usr/lib/libstdc++.a *.o && rm -rf /tmp/libwrap)
+    (mkdir -p /tmp/libwrap/cxx /tmp/libwrap/cxxabi && cd /tmp/libwrap/cxx && ar x /usr/lib/libc++.a && cd /tmp/libwrap/cxxabi && ar x /usr/lib/libc++abi.a && ar rcs /usr/lib/libstdc++.a /tmp/libwrap/cxx/*.o /tmp/libwrap/cxxabi/*.o && rm -rf /tmp/libwrap)
 
     # Release build — zeroclawlabs (daemon)
     CARGO_TARGET_DIR=/target \
@@ -161,30 +199,10 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     mkdir -p /rootfs/usr/bin /rootfs/usr/share/zeroclawlabs/web/dist
     cp /target/${TARGET}/release/zeroclaw /rootfs/usr/bin/zeroclaw
     cp /target/${TARGET}/release/zerocode /rootfs/usr/bin/zerocode
-
-    # Generate default config (written into rootfs; no shell in final image)
-    mkdir -p /rootfs/zeroclaw-data/.zeroclaw /rootfs/zeroclaw-data/data
-    printf '%s\n' \
-        'default_provider = "custom"' \
-        'default_model = "opencode/big-pickle"' \
-        'default_temperature = 0.7' \
-        '' \
-        '[gateway]' \
-        'port = 42617' \
-        'host = "[::]"' \
-        'allow_public_bind = true' \
-        'web_dist_dir = "/usr/share/zeroclawlabs/web/dist"' \
-        '' \
-        '[providers.models.custom.opencode]' \
-        'uri = "https://api.opencode.ai/v1"' \
-        'api_key = ""' \
-        'model = "opencode/big-pickle"' \
-        '' \
-        '[risk_profiles.default]' \
-        'level = "supervised"' \
-        'auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory_store", "web_search_tool", "web_fetch", "calculator", "glob_search", "content_search", "image_info", "weather", "git_operations"]' \
-        > /rootfs/zeroclaw-data/.zeroclaw/config.toml
 EOF
+
+# Copy default config template into rootfs (consumed by package stage)
+COPY --from=config-gen /rootfs/ /rootfs/
 
 # Copy web dashboard dist
 COPY --from=web-build /src/web/dist /rootfs/usr/share/zeroclawlabs/web/dist
@@ -239,7 +257,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     export RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-static"
 
     # Build combined libstdc++.a from libc++.a + libc++abi.a (stagex ships LLVM libc++, not GCC libstdc++)
-    (mkdir -p /tmp/libwrap && cd /tmp/libwrap && ar x /usr/lib/libc++.a && ar x /usr/lib/libc++abi.a && ar rcs /usr/lib/libstdc++.a *.o && rm -rf /tmp/libwrap)
+    (mkdir -p /tmp/libwrap/cxx /tmp/libwrap/cxxabi && cd /tmp/libwrap/cxx && ar x /usr/lib/libc++.a && cd /tmp/libwrap/cxxabi && ar x /usr/lib/libc++abi.a && ar rcs /usr/lib/libstdc++.a /tmp/libwrap/cxx/*.o /tmp/libwrap/cxxabi/*.o && rm -rf /tmp/libwrap)
 
     # Release build — zeroclawlabs (all channels)
     CARGO_TARGET_DIR=/target \
@@ -262,30 +280,10 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     mkdir -p /rootfs/usr/bin /rootfs/usr/share/zeroclawlabs/web/dist
     cp /target/${TARGET}/release/zeroclaw /rootfs/usr/bin/zeroclaw
     cp /target/${TARGET}/release/zerocode /rootfs/usr/bin/zerocode
-
-    # Generate default config (written into rootfs; no shell in final image)
-    mkdir -p /rootfs/zeroclaw-data/.zeroclaw /rootfs/zeroclaw-data/data
-    printf '%s\n' \
-        'default_provider = "custom"' \
-        'default_model = "opencode/big-pickle"' \
-        'default_temperature = 0.7' \
-        '' \
-        '[gateway]' \
-        'port = 42617' \
-        'host = "[::]"' \
-        'allow_public_bind = true' \
-        'web_dist_dir = "/usr/share/zeroclawlabs/web/dist"' \
-        '' \
-        '[providers.models.custom.opencode]' \
-        'uri = "https://api.opencode.ai/v1"' \
-        'api_key = ""' \
-        'model = "opencode/big-pickle"' \
-        '' \
-        '[risk_profiles.default]' \
-        'level = "supervised"' \
-        'auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory_store", "web_search_tool", "web_fetch", "calculator", "glob_search", "content_search", "image_info", "weather", "git_operations"]' \
-        > /rootfs/zeroclaw-data/.zeroclaw/config.toml
 EOF
+
+# Copy default config template into rootfs (consumed by package-fat stage)
+COPY --from=config-gen /rootfs/ /rootfs/
 
 # Copy web dashboard dist
 COPY --from=web-build /src/web/dist /rootfs/usr/share/zeroclawlabs/web/dist
