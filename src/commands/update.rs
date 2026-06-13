@@ -341,10 +341,13 @@ async fn download_binary(url: &str, sha256sums_url: Option<&str>, dest: &Path) -
         );
     }
 
-    // Release assets are .tar.gz archives containing a single `zeroclaw` binary.
-    // Extract the binary from the archive instead of writing the raw tarball.
+    // Release assets are .tar.gz archives (universal) or .zip archives
+    // (Windows) containing the `zeroclaw` (or `zeroclaw.exe`) binary.
+    // Extract the binary from the archive instead of writing raw bytes.
     if url.ends_with(".tar.gz") || url.ends_with(".tgz") {
         extract_tar_gz(&bytes, dest).context("failed to extract binary from tar.gz archive")?;
+    } else if url.ends_with(".zip") {
+        extract_zip(&bytes, dest).context("failed to extract binary from zip archive")?;
     } else {
         tokio::fs::write(dest, &bytes)
             .await
@@ -474,6 +477,34 @@ fn extract_tar_gz(archive_bytes: &[u8], dest: &Path) -> Result<()> {
     }
 
     bail!("archive does not contain a 'zeroclaw' binary")
+}
+
+/// Extract the `zeroclaw.exe` binary from a `.zip` archive (Windows).
+fn extract_zip(archive_bytes: &[u8], dest: &Path) -> Result<()> {
+    use std::io::Read;
+
+    let cursor = std::io::Cursor::new(archive_bytes);
+    let mut archive =
+        zip::ZipArchive::new(cursor).context("failed to open zip archive")?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).context("failed to read zip entry")?;
+        let file_name = entry
+            .name()
+            .rsplit(&['/', '\\'])
+            .next()
+            .unwrap_or("");
+        if file_name == "zeroclaw.exe" {
+            let mut buf = Vec::new();
+            entry
+                .read_to_end(&mut buf)
+                .context("failed to read binary from zip archive")?;
+            std::fs::write(dest, &buf).context("failed to write extracted binary")?;
+            return Ok(());
+        }
+    }
+
+    bail!("zip archive does not contain a 'zeroclaw.exe' binary")
 }
 
 async fn validate_binary(path: &Path) -> Result<()> {
