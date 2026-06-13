@@ -103,6 +103,12 @@ pub struct SkillTool {
     /// action). Accepts the legacy key `default_args` for compatibility.
     #[serde(default, alias = "default_args")]
     pub locked_args: HashMap<String, String>,
+    /// For `kind = "shell"` / `kind = "script"`: maximum execution time in
+    /// seconds before the command is killed. Unset falls back to the built-in
+    /// `SKILL_SHELL_TIMEOUT_SECS` (60s) default; long-running skills (e.g. a
+    /// build pipeline) raise it via `timeout_secs` in SKILL.toml.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 /// Skill manifest parsed from SKILL.toml
