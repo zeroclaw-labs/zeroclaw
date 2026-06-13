@@ -44,6 +44,13 @@ urlencoding = "2.1"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 which = "8.0"
 
+async-imap = { version = "0.11", features = ["runtime-tokio"], default-features = false }
+mail-parser = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1.14.0"
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1.0.6"
+
 [features]
 default = []
 browser-native = ["dep:fantoccini"]

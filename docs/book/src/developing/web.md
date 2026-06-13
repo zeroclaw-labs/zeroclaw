@@ -58,8 +58,12 @@ The gateway loads `web/dist/` from the filesystem at runtime via `static_files.r
 
 | Tool   | Install                                |
 | ------ | -------------------------------------- |
-| `npm`  | <https://nodejs.org/> or `nvm install --lts` |
+| `npm`  | <https://nodejs.org/> or `nvm install && nvm use` from the repo root |
 | `cargo`| <https://rustup.rs>                    |
+
+The repo root `.nvmrc` pins the Node major version used by release web builds.
+Use it for local dashboard work so `npm install`, `cargo web check`, and
+manual release builds all run against the same Node line.
 
 `cargo web` fails fast with an install hint if `npm` is missing.
 

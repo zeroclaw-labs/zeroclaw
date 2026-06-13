@@ -14,7 +14,7 @@
   <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="License" /></a>
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-edition%202024-orange?logo=rust" alt="Rust Edition 2024" /></a>
   <a href="https://github.com/zeroclaw-labs/zeroclaw/graphs/contributors"><img src="https://img.shields.io/github/contributors/zeroclaw-labs/zeroclaw?color=green" alt="Contributors" /></a>
-  <a href="https://discord.com/invite/wDshRVqRjx"><img src="https://img.shields.io/badge/Discord-join-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord" /></a>
+  <a href="https://discord.gg/zeroclaw"><img src="https://img.shields.io/badge/Discord-join-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord" /></a>
 </p>
 
 <p align="center">
@@ -22,7 +22,7 @@
   <a href="docs/book/src/philosophy/index.md">Philosophy</a> ·
   <a href="docs/book/src/getting-started/quickstart.md">Quick start</a> ·
   <a href="docs/book/src/architecture/overview.md">Architecture</a> ·
-  <a href="https://discord.com/invite/wDshRVqRjx">Discord</a>
+  <a href="https://discord.gg/zeroclaw">Discord</a>
 </p>
 
 ---
@@ -134,7 +134,7 @@ Full detail with Mermaid diagrams: [Architecture overview](docs/book/src/archite
 
 ## Contributing
 
-Start with [how to contribute](docs/book/src/contributing/how-to.md). Larger changes go through the [RFC process](docs/book/src/contributing/rfcs.md). Real-time chat lives on [Discord](https://discord.com/invite/wDshRVqRjx) (the best way to reach the team); durable work tracking is on [GitHub issues](https://github.com/zeroclaw-labs/zeroclaw/issues).
+Start with [how to contribute](docs/book/src/contributing/how-to.md). Larger changes go through the [RFC process](docs/book/src/contributing/rfcs.md). Real-time chat lives on [Discord](https://discord.gg/zeroclaw) (the best way to reach the team); durable work tracking is on [GitHub issues](https://github.com/zeroclaw-labs/zeroclaw/issues).
 
 Good places to start:
 
