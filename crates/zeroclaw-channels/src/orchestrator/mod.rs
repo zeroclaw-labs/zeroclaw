@@ -4140,7 +4140,11 @@ async fn process_channel_message_body(
     // ── Reply-intent precheck ────────────────────────────────────────
     let explicit_channel_address =
         is_explicitly_addressed_channel_message(&msg.channel, &msg.content);
-    let classifier_intent = if explicit_channel_address {
+    let direct_message = target_channel
+        .as_ref()
+        .map(|c| c.is_direct_message(&msg))
+        .unwrap_or(false);
+    let classifier_intent = if explicit_channel_address || direct_message {
         AssistantChannelOutcome::Reply(String::new())
     } else {
         let (classifier_provider_arc, classifier_model_owned, classifier_temperature): (

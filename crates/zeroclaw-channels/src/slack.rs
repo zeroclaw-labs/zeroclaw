@@ -3779,6 +3779,10 @@ impl Channel for SlackChannel {
         self.self_handle().map(|id| format!("<@{id}>"))
     }
 
+    fn is_direct_message(&self, msg: &zeroclaw_api::channel::ChannelMessage) -> bool {
+        !Self::is_group_channel_id(&msg.reply_target)
+    }
+
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         // Detect Block Kit payloads produced by the `/config` command.
         let body = if let Some(blocks_json) =
@@ -4914,6 +4918,28 @@ mod tests {
         assert!(SlackChannel::is_group_channel_id("G123"));
         assert!(!SlackChannel::is_group_channel_id("D123"));
         assert!(!SlackChannel::is_group_channel_id(""));
+    }
+
+    #[test]
+    fn is_direct_message_true_for_im_reply_target() {
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            vec![],
+            "slack_test_alias",
+            Arc::new(Vec::new),
+        );
+        let dm = zeroclaw_api::channel::ChannelMessage {
+            reply_target: "D0B189MTELX".into(),
+            channel: "slack".into(),
+            ..Default::default()
+        };
+        let group = zeroclaw_api::channel::ChannelMessage {
+            reply_target: "C12345".into(),
+            ..dm.clone()
+        };
+        assert!(Channel::is_direct_message(&ch, &dm));
+        assert!(!Channel::is_direct_message(&ch, &group));
     }
 
     #[test]
