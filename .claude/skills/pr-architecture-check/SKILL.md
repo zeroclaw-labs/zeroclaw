@@ -102,16 +102,36 @@ Write the analysis to `tmp/arch-review-<N>.md` with this structure:
 <list of files from the diff>
 ```
 
-### Step 5 — Post advisory comment
+### Step 5 — Show the artifact and wait for approval
 
-Post as a PR comment. The comment must include the advisory header.
+The artifact is generated advisory output. Do **not** post it automatically.
+Show it to the human first and get explicit approval, exactly as the
+PR-review, PR-submission, and issue-filing skills do before any public-state
+mutation.
+
+1. Show the human the generated artifact — prefer a link to
+   `tmp/arch-review-<N>.md` plus a short summary of the findings; if the full
+   text needs to be inline, paste it as regular text rather than a fenced
+   block.
+2. Ask the reviewer to review it and confirm before anything is posted, for
+   example: "Here's the advisory architecture review for #<N>. Review it and
+   say 'post' to comment it on the PR, or tell me what to change." Iterate on
+   edits until they approve.
+3. **Wait for explicit approval.** Do not run `gh pr comment` until the human
+   has approved posting. If they decline, leave the artifact in `tmp/` and stop
+   — posting is optional and reviewer-owned.
+
+### Step 6 — Post advisory comment (only after approval)
+
+Once, and only once, the human has explicitly approved, post the artifact as a
+PR comment. The comment must include the advisory header.
 
 ```bash
 gh pr comment <N> --repo zeroclaw-labs/zeroclaw \
   --body-file tmp/arch-review-<N>.md
 ```
 
-### Step 6 — Label policy
+### Step 7 — Label policy
 
 This skill does not add, remove, or modify any labels. Label management is
 the responsibility of triage and review skills.
@@ -124,14 +144,19 @@ the responsibility of triage and review skills.
    architecture references. Do not skip them.
 2. **Always write to `tmp/arch-review-<N>.md` before posting.** The artifact
    is consumed by `github-pr-review-session` if it exists.
-3. **Always include the advisory header** in the posted comment and the
+3. **Always show the artifact to the human and wait for explicit approval
+   before posting.** Never run `gh pr comment` automatically. Posting is
+   optional and reviewer-owned — same human-approval checkpoint the PR-review,
+   PR-submission, and issue-filing skills use before any public-state mutation.
+   If the reviewer declines, leave the artifact in `tmp/` and stop.
+4. **Always include the advisory header** in the posted comment and the
    artifact file. Per FND-003 §6.4, this output is advisory only.
-4. **Never approve, request changes, or use `gh pr review`.** This skill
+5. **Never approve, request changes, or use `gh pr review`.** This skill
    posts a comment, not a formal review verdict.
-5. **Never modify labels.** No label additions, removals, or changes.
-6. **Never block a merge.** If the analysis finds issues, they are reported
+6. **Never modify labels.** No label additions, removals, or changes.
+7. **Never block a merge.** If the analysis finds issues, they are reported
    as advisory findings for the human reviewer to evaluate.
-7. **Be specific.** Reference the exact file, line range, crate, and
+8. **Be specific.** Reference the exact file, line range, crate, and
    constraint. Vague findings waste reviewer time.
-8. **Skip irrelevant checks.** If a PR only touches docs, do not flag
+9. **Skip irrelevant checks.** If a PR only touches docs, do not flag
    dependency direction. Only report checks relevant to the diff.

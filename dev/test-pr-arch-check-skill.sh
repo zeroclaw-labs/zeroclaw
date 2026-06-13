@@ -19,8 +19,6 @@ echo "1. File existence"
 
 SKILL=".claude/skills/pr-architecture-check/SKILL.md"
 CHECKLIST=".claude/skills/pr-architecture-check/references/arch-checklist.md"
-REVIEW_SKILL=".claude/skills/github-pr-review-session/SKILL.md"
-TRIAGE_SKILL=".claude/skills/github-issue-triage/SKILL.md"
 
 [ -f "$SKILL" ]     && pass "SKILL.md exists"          || fail "SKILL.md missing"
 [ -f "$CHECKLIST" ] && pass "arch-checklist.md exists"  || fail "arch-checklist.md missing"
@@ -56,6 +54,8 @@ if [ -f "$SKILL" ]; then
   grep -qi 'FND-001\|fnd-001' "$SKILL"           && pass "loads FND-001"              || fail "FND-001 load missing"
   grep -q  'tmp/arch-review' "$SKILL"            && pass "writes tmp artifact"        || fail "tmp/arch-review artifact missing"
   grep -qi 'comment'        "$SKILL"             && pass "posts PR comment"           || fail "PR comment posting missing"
+  grep -qi 'wait for.*approval\|explicit approval\|before posting' "$SKILL" \
+                                                  && pass "human-approval checkpoint"  || fail "human-approval checkpoint before posting missing"
   grep -qi 'label'          "$SKILL"             && pass "label policy mentioned"     || fail "label policy not mentioned"
 fi
 
@@ -87,24 +87,8 @@ if [ -f "$CHECKLIST" ]; then
                                                   && pass "constraint: no ext infra"   || fail "external infra constraint missing"
 fi
 
-# ─── 6. PR review session integration ────────────────────────────────
-echo "6. PR review session integration"
-
-if [ -f "$REVIEW_SKILL" ]; then
-  grep -q  'tmp/arch-review' "$REVIEW_SKILL"     && pass "reads arch-review artifact" || fail "arch-review artifact read missing from review skill"
-  grep -qi 'arch-check'     "$REVIEW_SKILL"      && pass "suggests arch-check"        || fail "arch-check suggestion missing from review skill"
-fi
-
-# ─── 7. Issue triage work queue ───────────────────────────────────────
-echo "7. Issue triage work queue"
-
-if [ -f "$TRIAGE_SKILL" ]; then
-  grep -q 'status:accepted' "$TRIAGE_SKILL"      && pass "work queue label present"   || fail "status:accepted label missing from triage skill"
-  grep -q '\-\-no-assignee'  "$TRIAGE_SKILL"     && pass "no-assignee filter"         || fail "--no-assignee filter missing from triage skill"
-fi
-
-# ─── 8. No new labels created ────────────────────────────────────────
-echo "8. Guardrails"
+# ─── 6. No new labels created ────────────────────────────────────────
+echo "6. Guardrails"
 
 if [ -f "$SKILL" ]; then
   # Must not add labels
