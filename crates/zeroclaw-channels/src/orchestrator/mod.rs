@@ -9305,6 +9305,23 @@ pub async fn deliver_announcement(
                 .ok_or_else(not_configured)?;
             anyhow::bail!("wecom_ws channel is not connected");
         }
+        #[cfg(feature = "channel-email")]
+        "email" => {
+            let em = config
+                .channels
+                .email
+                .get(alias)
+                .ok_or_else(not_configured)?;
+            let peers = config.channel_external_peers("email", alias);
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+                Arc::new(move || peers.clone());
+            let ch = EmailChannel::new(em.clone(), alias.to_string(), peer_resolver);
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+        }
+        #[cfg(not(feature = "channel-email"))]
+        "email" => {
+            anyhow::bail!("Email channel requires the `channel-email` feature");
+        }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
     #[allow(unreachable_code)]
@@ -20135,6 +20152,26 @@ Done."#;
                 "{channel} must report the real config table [channels.lark.default]; got: {msg}"
             );
         }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-email")]
+    async fn deliver_announcement_routes_email_to_email_arm() {
+        let config = zeroclaw_config::schema::Config::default();
+
+        let err = deliver_announcement(&config, "email.default", "user@example.com", None, "hi")
+            .await
+            .err()
+            .expect("expected email.default to bail because channel is not configured");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("unsupported delivery channel"),
+            "email.default must route to the email arm, not fall through; got: {msg}"
+        );
+        assert!(
+            msg.contains("[channels.email.default] not configured"),
+            "email.default must report the real config table; got: {msg}"
+        );
     }
 
     #[tokio::test]
