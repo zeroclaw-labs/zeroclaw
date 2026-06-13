@@ -1299,15 +1299,17 @@ pub async fn run_gateway(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             "Web dashboard: not available — configured gateway.web_dist_dir is missing on \
-             this machine and no fallback location was found. Build with `cargo web build` \
-             and point gateway.web_dist_dir at the resulting web/dist directory."
+             this machine and no fallback location was found. Reinstall with the supported \
+             installer (`./install.sh --source` on Linux/macOS, `setup.bat` on Windows) to \
+             build and place the dashboard where the gateway looks for it."
         );
     } else {
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "Web dashboard: not available — no web/dist found. Build with `cargo web build` \
-             and point gateway.web_dist_dir at the resulting web/dist directory."
+            "Web dashboard: not available — no web/dist found. Reinstall with the supported \
+             installer (`./install.sh --source` on Linux/macOS, `setup.bat` on Windows) to \
+             build and place the dashboard where the gateway looks for it."
         );
     }
 
@@ -2533,6 +2535,9 @@ async fn handle_webhook(
         &zeroclaw_runtime::observability::ObserverEvent::AgentStart {
             model_provider: provider_label.clone(),
             model: model_label.clone(),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         },
     );
     state.observer.record_event(
@@ -2540,6 +2545,9 @@ async fn handle_webhook(
             model_provider: provider_label.clone(),
             model: model_label.clone(),
             messages_count: 1,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         },
     );
 
@@ -2554,13 +2562,17 @@ async fn handle_webhook(
             let duration = started_at.elapsed();
             // Per-turn token / cost annotation captured from the cost-tracking
             // scope inside `run_gateway_chat_with_tools` (None outside of test
-            // / when no LLM call recorded). Cost is also persisted to
-            // /api/cost and costs.jsonl via the same scope.
-            let tokens_used = input_tokens
-                .zip(output_tokens)
-                .map(|(i, o)| i + o)
-                .or(input_tokens)
-                .or(output_tokens);
+            // / when no LLM call recorded). `TurnUsage` always carries the real
+            // input/output split together, so `.zip` either gives both or
+            // neither — never fabricate `output_tokens: 0` from an aggregate.
+            // Cost is also persisted to /api/cost and costs.jsonl via the same
+            // scope.
+            let tokens_used = input_tokens.zip(output_tokens).map(|(i, o)| {
+                zeroclaw_api::observability_traits::TurnTokenUsage {
+                    input_tokens: i,
+                    output_tokens: o,
+                }
+            });
             state.observer.record_event(
                 &zeroclaw_runtime::observability::ObserverEvent::LlmResponse {
                     model_provider: provider_label.clone(),
@@ -2568,8 +2580,11 @@ async fn handle_webhook(
                     duration,
                     success: true,
                     error_message: None,
-                    input_tokens: None,
-                    output_tokens: None,
+                    input_tokens,
+                    output_tokens,
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 },
             );
             state.observer.record_metric(
@@ -2582,6 +2597,9 @@ async fn handle_webhook(
                     duration,
                     tokens_used,
                     cost_usd,
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 },
             );
 
@@ -2601,6 +2619,9 @@ async fn handle_webhook(
                     error_message: Some(sanitized.clone()),
                     input_tokens: None,
                     output_tokens: None,
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 },
             );
             state.observer.record_metric(
@@ -2619,6 +2640,9 @@ async fn handle_webhook(
                     duration,
                     tokens_used: None,
                     cost_usd: None,
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
                 },
             );
 
@@ -5429,6 +5453,7 @@ mod tests {
                 zeroclaw_runtime::observability::ObserverEvent::AgentStart {
                     model_provider,
                     model,
+                    ..
                 } if model_provider == &expected_provider && model == "agent-model"
             )),
             "expected AgentStart to use the explicit agent model; events were: {events:?}"

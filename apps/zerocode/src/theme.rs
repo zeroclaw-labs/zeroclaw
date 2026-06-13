@@ -4,11 +4,11 @@
 //! target). Not every helper is used by both targets.
 #![allow(dead_code)]
 
-use std::sync::RwLock;
+use std::sync::{LazyLock, RwLock};
 
 use ratatui::style::{Color, Modifier, Style};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Theme {
     pub title: Color,
     pub heading: Color,
@@ -20,18 +20,6 @@ pub(crate) struct Theme {
     pub tool: Color,
     pub background: Color,
 }
-
-const ICY_BLUE: Theme = Theme {
-    title: Color::Rgb(100, 200, 255),
-    heading: Color::Rgb(140, 230, 255),
-    body: Color::Rgb(220, 240, 255),
-    dim: Color::Rgb(80, 130, 170),
-    accent: Color::Rgb(255, 100, 80),
-    warn: Color::Rgb(255, 220, 80),
-    selection_bg: Color::Rgb(30, 60, 100),
-    tool: Color::Rgb(180, 140, 255),
-    background: Color::Rgb(8, 14, 24),
-};
 
 /// "Inherit shell" — uses the terminal's own default colours. Every
 /// role is `Color::Reset`, and the app-level backdrop skips painting
@@ -49,22 +37,18 @@ const TERMINAL: Theme = Theme {
     background: Color::Reset,
 };
 
-// The named preset palettes (icy_blue plus the dashboard registry themes) are
-// generated at build time from `web/src/contexts/themes.json`, the single
-// source of truth shared with the React dashboard and mdBook docs. See
-// `build.rs` for the var→role mapping. `TERMINAL` and `ICY_BLUE` are authored
-// here because they have no registry entry: `terminal` is the inherit-shell
-// sentinel, and `icy_blue` is the default.
+// The named preset palettes are generated at build time from
+// `web/src/contexts/themes.json`, the single source of truth shared with the
+// React dashboard and mdBook docs. See `build.rs` for the var→role mapping.
+// `TERMINAL` is authored here because it is the inherit-shell sentinel, not a
+// real palette.
 include!(concat!(env!("OUT_DIR"), "/theme_presets.rs"));
 
 pub(crate) const DEFAULT_THEME_NAME: &str = "icy_blue";
 
-const DEFAULT_THEME: Theme = ICY_BLUE;
-
-/// The two authored presets with no dashboard-registry entry: the
-/// inherit-shell sentinel and the default. All other presets come
-/// from `GENERATED_THEMES`.
-const AUTHORED_THEMES: &[(&str, Theme)] = &[("terminal", TERMINAL), ("icy_blue", ICY_BLUE)];
+/// The authored inherit-shell sentinel. Real palettes come from
+/// `GENERATED_THEMES`.
+const AUTHORED_THEMES: &[(&str, Theme)] = &[("terminal", TERMINAL)];
 
 /// Every named preset: the authored pair followed by the generated registry
 /// themes. The single iteration point both lookup helpers walk.
@@ -80,7 +64,7 @@ pub(crate) fn theme_names() -> impl Iterator<Item = &'static str> {
     all_themes().map(|(n, _)| *n)
 }
 
-static ACTIVE: RwLock<Theme> = RwLock::new(DEFAULT_THEME);
+static ACTIVE: LazyLock<RwLock<Theme>> = LazyLock::new(|| RwLock::new(default_theme()));
 
 /// Per-agent theme overrides, keyed by agent alias. A process-global registry
 /// mirroring `ACTIVE`: the Config pane writes here on assign/clear (live, no
@@ -148,11 +132,14 @@ pub(crate) fn active() -> Theme {
 /// raw RGB, so save/restore must round-trip the raw value, not the downgraded
 /// one `active()` returns.
 pub(crate) fn active_raw() -> Theme {
-    ACTIVE.read().map(|g| *g).unwrap_or(DEFAULT_THEME)
+    ACTIVE
+        .read()
+        .map(|g| *g)
+        .unwrap_or_else(|_| default_theme())
 }
 
 pub(crate) fn default_theme() -> Theme {
-    DEFAULT_THEME
+    theme_by_name(DEFAULT_THEME_NAME).expect("default theme must be present in theme registry")
 }
 
 /// The graceful-fallback palette for an unknown theme name: the inherit-shell
@@ -439,6 +426,9 @@ mod tests {
     #[test]
     fn default_theme_is_icy_blue() {
         assert_eq!(DEFAULT_THEME_NAME, "icy_blue");
-        assert!(theme_by_name(DEFAULT_THEME_NAME).is_some());
+        assert_eq!(
+            default_theme(),
+            theme_by_name(DEFAULT_THEME_NAME).expect("default registered")
+        );
     }
 }

@@ -299,8 +299,8 @@ fn calc_factorial(args: &serde_json::Value) -> Result<String, String> {
     }
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     let n = x.round() as u128;
-    if n > 170 {
-        return Err("Factorial result exceeds f64 range (max input: 170)".to_string());
+    if n > 34 {
+        return Err("Factorial input too large (max input: 34); 34! is the largest factorial that fits in a 128-bit integer".to_string());
     }
     let mut result: u128 = 1;
     for i in 2..=n {
@@ -630,6 +630,30 @@ mod tests {
             .unwrap();
         assert!(result.success);
         assert_eq!(result.output, "120");
+    }
+
+    #[tokio::test]
+    async fn test_factorial_max_input() {
+        let tool = CalculatorTool::new();
+        let result = tool
+            .execute(json!({"function": "factorial", "x": 34.0}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(result.output, "295232799039604140847618609643520000000");
+    }
+
+    #[tokio::test]
+    async fn test_factorial_overflow_is_graceful() {
+        let tool = CalculatorTool::new();
+        // 35! overflows the u128 accumulator (~1.03e40 > u128::MAX ~3.40e38).
+        // This must return a graceful error rather than panicking on overflow.
+        let result = tool
+            .execute(json!({"function": "factorial", "x": 35.0}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_ref().unwrap().contains("too large"));
     }
 
     #[tokio::test]
