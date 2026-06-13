@@ -76,6 +76,14 @@
           ];
         };
       }) // {
+      # The `services.zeroclaw` NixOS module (multi-instance; see nix/module.nix
+      # and nix/README.md). Exposed as the default so `nixosModules.default` can
+      # be imported directly into a system configuration.
+      nixosModules.default = import ./nix/module.nix;
+
+      # Toolchain test systems used to evaluate the dev-shell module on both
+      # supported Linux architectures; not a deployment target. The `checks`
+      # output evaluates these in CI.
       nixosConfigurations = {
         nixos = nixpkgs.lib.nixosSystem {
           system = "x86_64-linux";
