@@ -1,9 +1,12 @@
 # OpenAI Codex over a ChatGPT subscription
 
-Run an agent on the `openai` slot, paid by a ChatGPT subscription instead of
-metered API billing. The agent is a GPT-5.x Codex model driving ZeroClaw's
-tools: no `OPENAI_API_KEY`, no per-token spend — it draws the flat monthly
-subscription you already have.
+Run an agent on the `openai` slot, paid through a ChatGPT subscription instead
+of metered `OPENAI_API_KEY` billing. The agent is a GPT-5.x Codex model driving
+ZeroClaw's tools, authenticated by your Codex login rather than an API key.
+Billing follows your ChatGPT plan: the usage included with your subscription is
+consumed first, and Codex usage beyond that included allowance draws on your
+account's flexible credits at OpenAI's per-model token rates. It is not a flat
+per-call `$0` path once you are past the included allowance.
 
 This page covers the slot config, the served model strings, the cost and
 routing implications, and the OAuth wiring. For the universal provider fields
@@ -50,10 +53,14 @@ hardcoded list, including this one:
 # Field names match the live ~/.codex/auth.json (verify against the file itself;
 # the layout has shifted across Codex versions).
 AT=$(jq -r .tokens.access_token ~/.codex/auth.json)
-ACC=$(jq -r .tokens.account_id ~/.codex/auth.json)
+# account_id is OPTIONAL in auth.json; ZeroClaw falls back to the OAuth JWT when
+# it is absent. `// empty` keeps jq from emitting the literal string "null", and
+# the header is sent only when the field is actually present. After an import you
+# can also read the resolved id from `zeroclaw auth status`.
+ACC=$(jq -r '.tokens.account_id // empty' ~/.codex/auth.json)
 curl -s "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0" \
   -H "Authorization: Bearer ${AT}" \
-  -H "chatgpt-account-id: ${ACC}" \
+  ${ACC:+-H "chatgpt-account-id: ${ACC}"} \
   -H "originator: pi" | jq -r '.models[].slug'
 ```
 
@@ -81,19 +88,42 @@ rather than pinning a version.
 
 ## Cost and routing
 
-In cost tracking the subscription is billed at `$0` per call — it is a
-flat-rate provider, not a metered one. Keep the two classes separate in
-accounting; see [Cost tracking](../ops/cost-tracking.md).
+How OpenAI bills this path (follow OpenAI's current Codex / ChatGPT-plan billing
+docs, which supersede any figure pinned here):
 
-| Class | Billing | Budget |
+1. **Included plan usage first.** Each ChatGPT plan includes a Codex usage
+   allowance that refreshes on a rolling window. While you are inside it, Codex
+   requests do not draw extra charges.
+2. **Flexible credits after the included allowance.** Once the included usage is
+   exhausted, Codex usage draws from your account's credit balance where the plan
+   supports it. Input, cached input, and output are priced as credits per 1M
+   tokens, so what a task consumes depends on its token mix and the model used.
+3. **Over-limit options.** When the included allowance and any credits are gone,
+   OpenAI's paths are add credits, upgrade the plan, or wait for the window to
+   reset.
+
+The plan tiers below are therefore **usage-allowance multipliers**, not a
+guarantee of per-call zero cost.
+
+### ZeroClaw cost tracking
+
+ZeroClaw records this slot at `$0` per call. **That is a local accounting
+limitation, not an OpenAI billing fact:** ZeroClaw cannot see your ChatGPT plan's
+included-usage meter or credit balance, so it cannot attribute per-call token
+cost to a subscription request. Read the `$0` as "not metered by ZeroClaw", and
+watch the real allowance / credit state in your OpenAI account. Keep subscription
+and metered (api-key) classes separate in accounting; see
+[Cost tracking](../ops/cost-tracking.md).
+
+| Class | ZeroClaw budget signal | Real billing |
 |---|---|---|
-| Subscription (`openai` slot, Codex auth) | flat $/mo, not per-token | rolling 5-hour Codex message allowance |
-| Metered (api-key providers) | per-token | running $ balance |
+| Subscription (`openai` slot, Codex auth) | rolling Codex usage allowance | included plan usage, then per-token flexible credits |
+| Metered (api-key providers) | running $ balance | per-token |
 
-The subscription is flat-rate but **finite**: `$0` per call, but a 5-hour
-rolling Codex allowance you can exhaust. So routing is about spending that
-allowance deliberately and keeping a paid path for when it runs out, not about
-saving per-token money.
+So routing is about spending the included allowance deliberately and keeping a
+fallback for when you are past it, both to avoid credit burn at per-model token
+rates and to survive a hard stop. It is not "free per token" once you are
+outside the included usage.
 
 Routing is per-agent (see [Routing](./routing.md)): define one agent alias per
 role, each pointing at an `openai` Codex entry, and point channels at the agent
@@ -114,16 +144,20 @@ your own routing, not here.
 
 ## Subscription tiers and limits
 
-ChatGPT tiers relevant to this slot (as of 2026-06):
+ChatGPT tiers relevant to this slot (as of 2026-06). The "allowance" column is
+the **included-usage multiplier**, not a free-call ceiling: beyond the included
+allowance every tier falls back to per-token flexible credits at OpenAI's
+published Codex rates. A higher tier raises the included multiplier; it does not
+make usage free.
 
-| Tier | Price | Codex allowance |
+| Tier | Price | Codex included-usage allowance |
 |---|---|---|
 | Plus | $20/mo  | baseline |
 | Pro  | $100/mo | 5× Plus limits |
 | Pro  | $200/mo | 20× Plus limits |
 
 Both Pro tiers expose the same model suite and features; they differ only in
-rate-limit volume.
+included-allowance volume.
 
 > **The $100 tier stepped down on 2026-06-01.** Through 2026-05-31 it ran a
 > launch promotion at 10× Plus, then reverted to the standard 5×. Per-model
@@ -185,18 +219,32 @@ independently, they invalidate each other:
 error=OpenAI token refresh is in backoff for 9s due to previous failures
 ```
 
-The pattern that works across more than one host:
+The pattern that works across more than one host, strictly limited to machines
+**you own under the same OpenAI account**:
+
+> ⚠️ **Credential boundary.** `~/.codex/auth.json` holds live bearer and refresh
+> credentials for your OpenAI account. Distribute it **only** to your own hosts,
+> over a **private, encrypted channel**: a secret manager, an encrypted
+> transport, or an SSH-only pull. **Never** commit it to a repo, publish it,
+> paste it into chat or a ticket, or share it with another user or a team.
+> OpenAI's terms prohibit sharing account credentials or making an account
+> available to someone else, and a raw `auth.json` pull point is a high-value
+> secret on its own. This is operator-facing credential-handling guidance; the
+> runtime code does not change it.
 
 1. One host owns the refresh (e.g. the one running the Codex CLI's background
    refresh) and keeps `~/.codex/auth.json` current.
-2. That host publishes the raw `~/.codex/auth.json` to a pull point.
-3. Every other host pulls the raw `auth.json` (portable — it is just the token)
+2. That host publishes the raw `~/.codex/auth.json` to a **private** pull point
+   (secret manager or encrypted/SSH-only channel), reachable only by your own
+   hosts.
+3. Every other host pulls the raw `auth.json` (portable, it is just the token)
    and re-imports it locally, which re-encrypts it under that host's own
    `.secret_key`.
 4. Other hosts do not refresh independently.
 
 The artifact you distribute is the raw `~/.codex/auth.json`, never the encrypted
-`auth-profiles.json`.
+`auth-profiles.json`, and only ever to your own machines through a private,
+encrypted channel.
 
 ## Verifying
 
