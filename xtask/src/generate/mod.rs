@@ -37,7 +37,24 @@ fn registry() -> Vec<Surface> {
             file: "Containerfile",
             render: |root, cur| containerfile_surface().render(root, cur),
         },
+        Surface {
+            name: "dockerfile",
+            file: "Dockerfile",
+            render: |root, cur| render_docker_arg(root, cur),
+        },
+        Surface {
+            name: "dockerfile-debian",
+            file: "Dockerfile.debian",
+            render: |root, cur| render_docker_arg(root, cur),
+        },
     ]
+}
+
+/// Dockerfile-family ARG default: ships Dist by default (all channels, no
+/// heavyweight), build-time overridable via --build-arg.
+fn render_docker_arg(root: &Path, current: &str) -> anyhow::Result<String> {
+    let body = container::render_features_arg(root, &Sel::Dist)?;
+    container::splice(current, "docker-features-arg", &body)
 }
 
 /// Containerfile surface: standard image ships Dist (all channels, no

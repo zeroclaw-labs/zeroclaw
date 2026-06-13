@@ -29,6 +29,17 @@ pub fn render_features(
     Ok(format!("{indent}--features \"{}\" \\", list.join(",")))
 }
 
+/// Render an `ARG ZEROCLAW_CARGO_FEATURES="X,Y"` default line from a selection.
+/// The ARG stays build-time overridable (the docker feature-selection axis);
+/// only its default is canonical. The list is resolved, never typed.
+pub fn render_features_arg(manifest_dir: &Path, selection: &Selection) -> anyhow::Result<String> {
+    let list = spec::resolve_feature_list(manifest_dir, selection)?;
+    Ok(format!(
+        "ARG ZEROCLAW_CARGO_FEATURES=\"{}\"",
+        list.join(",")
+    ))
+}
+
 /// Splice a named zone's body into `current`, preserving everything else.
 pub fn splice(current: &str, zone: &str, body: &str) -> anyhow::Result<String> {
     let b = begin(zone);
