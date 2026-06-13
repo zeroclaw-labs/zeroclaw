@@ -107,10 +107,12 @@ When evaluating won't-fix candidates, check against these constraints from `AGEN
 The accepted-but-unassigned work queue is a single `gh` query — no dedicated skill needed:
 
 ```bash
-gh issue list --repo zeroclaw-labs/zeroclaw --label "status:accepted" --no-assignee --json number,title
+gh issue list --repo zeroclaw-labs/zeroclaw --search 'label:"status:accepted" no:assignee' --json number,title
 ```
 
-Use this to find issues ready for someone to pick up.
+Use the search-qualifier form (`no:assignee`) rather than a `--no-assignee`
+flag — `gh issue list` has no such flag and errors with `unknown flag:
+--no-assignee`. This query lists issues ready for someone to pick up.
 
 ## Session Report
 
