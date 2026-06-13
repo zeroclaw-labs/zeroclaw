@@ -1081,18 +1081,24 @@ async fn run_quickstart_cli(
         snapshot_state,
     };
 
-    // The checklist below is driven by dialoguer prompts, which need an
-    // interactive terminal. With piped/redirected stdin the selector
-    // redraws in a tight loop forever instead of failing (#7507) — fail
-    // fast and point headless callers at the scriptable alternative.
-    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+    // The checklist below is driven by dialoguer prompts, which read keys
+    // from stdin and render on `Term::stderr()`. If *either* end is not an
+    // interactive terminal the selector cannot make progress: with a
+    // non-TTY stdin or stderr `read_key()` yields `Key::Unknown`, which
+    // `FuzzySelect` does not treat as a terminal condition, so it redraws
+    // in a tight loop forever instead of failing (#7507 — e.g. piped stdin
+    // `echo "" | … quickstart`, or redirected stderr `… quickstart > log 2>&1`).
+    // Fail fast and point headless callers at the scriptable alternative.
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin())
+        || !std::io::IsTerminal::is_terminal(&std::io::stderr())
+    {
         anyhow::bail!(
             "{}",
             t(
                 "cli-quickstart-needs-tty",
-                "Quickstart is interactive and needs a terminal. Run it from an \
-                 interactive shell, or use `zeroclaw config set <path> <value>` \
-                 for headless configuration."
+                "Quickstart is interactive and needs a terminal on stdin and stderr. \
+                 Run it from an interactive shell, or use \
+                 `zeroclaw config set <path> <value>` for headless configuration."
             )
         );
     }
