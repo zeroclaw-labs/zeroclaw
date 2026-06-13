@@ -807,30 +807,6 @@ impl Agent {
         self.history.push(user_msg);
     }
 
-    // The turn loop appends a tool round to history only after execution,
-    // so a mid-tool cancel leaves no orphaned tool-call entry needing runtime
-    // synthesis; kept for its direct unit test (lib-dead since the
-    // consolidation).
-    #[allow(dead_code)]
-    fn synthesize_cancelled_tool_results(
-        &mut self,
-        completed: Vec<ToolResultMessage>,
-        remaining: &[zeroclaw_providers::ToolCall],
-        new_msgs: &mut Vec<ConversationMessage>,
-    ) {
-        let mut results = completed;
-        results.extend(remaining.iter().map(|call| ToolResultMessage {
-            tool_call_id: call.id.clone(),
-            content: crate::i18n::get_required_cli_string("turn-tool-interrupted-before-result"),
-        }));
-        if results.is_empty() {
-            return;
-        }
-        let msg = ConversationMessage::ToolResults(results);
-        new_msgs.push(msg.clone());
-        self.history.push(msg);
-    }
-
     pub fn set_memory_session_id(&mut self, session_id: Option<String>) {
         self.memory_session_id = session_id;
     }
@@ -5691,87 +5667,6 @@ mod tests {
             "trim_history left only the system message; convert_messages \
              would produce messages: [] and the provider call would 400"
         );
-    }
-
-    #[test]
-    fn cancel_synthesizes_paired_tool_results_for_orphaned_calls() {
-        use zeroclaw_providers::ToolCall;
-
-        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
-            backend: "none".into(),
-            ..zeroclaw_config::schema::MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
-                .expect("memory creation should succeed with valid config"),
-        );
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = Agent::builder()
-            .model_provider(Box::new(MockModelProvider {
-                responses: Mutex::new(vec![]),
-            }))
-            .tools(vec![Box::new(MockTool)])
-            .memory(mem)
-            .observer(observer)
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
-            .config(zeroclaw_config::schema::AliasedAgentConfig::default())
-            .build()
-            .expect("agent builder should succeed with valid config");
-
-        // Mirror the cancellation path: an AssistantToolCalls is committed,
-        // then the turn is interrupted before results land. The synthesized
-        // results must key off the same tool_calls stored in the
-        // AssistantToolCalls — two calls, to catch any count/order drift.
-        let tool_calls = vec![
-            ToolCall {
-                id: "tc-cancel-1".into(),
-                name: "shell".into(),
-                arguments: "{}".into(),
-                extra_content: None,
-            },
-            ToolCall {
-                id: "tc-cancel-2".into(),
-                name: "shell".into(),
-                arguments: "{}".into(),
-                extra_content: None,
-            },
-        ];
-        agent.history.push(ConversationMessage::AssistantToolCalls {
-            text: None,
-            tool_calls: tool_calls.clone(),
-            reasoning_content: None,
-        });
-
-        let mut new_msgs = Vec::new();
-        agent.synthesize_cancelled_tool_results(vec![], &tool_calls, &mut new_msgs);
-
-        // The synthesized ToolResults must answer every pending call by id, in
-        // both the canonical history and the new_messages persistence vec.
-        let last = agent.history.last().expect("history not empty");
-        match last {
-            ConversationMessage::ToolResults(results) => {
-                assert_eq!(results.len(), 2);
-                assert_eq!(results[0].tool_call_id, "tc-cancel-1");
-                assert_eq!(results[1].tool_call_id, "tc-cancel-2");
-            }
-            other => panic!("expected ToolResults, got {other:?}"),
-        }
-        assert!(matches!(
-            new_msgs.last(),
-            Some(ConversationMessage::ToolResults(r)) if r.len() == 2
-        ));
-
-        // Invariant: every AssistantToolCalls is immediately followed by
-        // ToolResults — no orphan that would 400 on replay.
-        for window in agent.history.windows(2) {
-            if matches!(&window[0], ConversationMessage::AssistantToolCalls { .. }) {
-                assert!(
-                    matches!(&window[1], ConversationMessage::ToolResults(_)),
-                    "orphaned AssistantToolCalls after cancel synthesis"
-                );
-            }
-        }
     }
 
     // ── Duplicate narration guard ────────────────────────────────────

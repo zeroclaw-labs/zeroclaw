@@ -4233,7 +4233,6 @@ mod tests {
     }
 
     impl FailingTool {
-        #[allow(dead_code)]
         fn new(name: &str, error_reason: &str) -> Self {
             Self {
                 tool_name: name.to_string(),
