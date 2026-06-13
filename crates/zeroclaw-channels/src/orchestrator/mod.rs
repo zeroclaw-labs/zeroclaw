@@ -9305,6 +9305,26 @@ pub async fn deliver_announcement(
                 .ok_or_else(not_configured)?;
             anyhow::bail!("wecom_ws channel is not connected");
         }
+        #[cfg(feature = "whatsapp-web")]
+        "whatsapp" | "whatsapp-web" | "whatsapp_web" => {
+            let wa = config
+                .channels
+                .whatsapp
+                .get(alias)
+                .ok_or_else(not_configured)?;
+            if !wa.is_web_config() {
+                anyhow::bail!("WhatsApp channel send requires Web mode (session_path must be set)");
+            }
+            let peers = config.channel_external_peers("whatsapp", alias);
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+                Arc::new(move || peers.clone());
+            let ch = WhatsAppWebChannel::new(wa, alias.to_string(), peer_resolver);
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+        }
+        #[cfg(not(feature = "whatsapp-web"))]
+        "whatsapp" | "whatsapp-web" | "whatsapp_web" => {
+            anyhow::bail!("WhatsApp channel requires the `whatsapp-web` feature");
+        }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
     #[allow(unreachable_code)]
@@ -20135,6 +20155,26 @@ Done."#;
                 "{channel} must report the real config table [channels.lark.default]; got: {msg}"
             );
         }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn deliver_announcement_routes_whatsapp_to_whatsapp_arm() {
+        let config = zeroclaw_config::schema::Config::default();
+
+        let err = deliver_announcement(&config, "whatsapp.default", "+15551234567", None, "hi")
+            .await
+            .err()
+            .expect("expected whatsapp.default to bail because channel is not configured");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("unsupported delivery channel"),
+            "whatsapp.default must route to the whatsapp arm, not fall through; got: {msg}"
+        );
+        assert!(
+            msg.contains("[channels.whatsapp.default] not configured"),
+            "whatsapp.default must report the real config table; got: {msg}"
+        );
     }
 
     #[tokio::test]
