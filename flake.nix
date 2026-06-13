@@ -40,7 +40,7 @@
         nixosModuleEvalTests = import ./nix/eval-tests.nix {
           inherit nixpkgs system;
         };
-        # >>> generated:flake-packages by `cargo generate installers` — do not edit <<<
+        # >>> generated:flake-packages by `cargo generate installers` - do not edit <<<
         # Default feature set: canonical Dist (all channels, no heavyweight).
         # Override with `packages.zeroclaw.override { features = [ ... ]; }`.
         zeroclawDefaultFeatures = [ "acp-bridge" "agent-runtime" "channel-acp-server" "channel-amqp" "channel-bluesky" "channel-clawdtalk" "channel-dingtalk" "channel-discord" "channel-email" "channel-imessage" "channel-irc" "channel-lark" "channel-linq" "channel-mattermost" "channel-mochat" "channel-mqtt" "channel-nextcloud" "channel-notion" "channel-qq" "channel-reddit" "channel-signal" "channel-slack" "channel-telegram" "channel-twitch" "channel-twitter" "channel-voice-call" "channel-wati" "channel-webhook" "channel-wecom" "channel-wecom-ws" "channel-whatsapp-cloud" "gateway" "observability-prometheus" "schema-export" ];

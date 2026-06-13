@@ -1,4 +1,4 @@
-//! `cargo generate installers` — render install surfaces (setup.bat,
+//! `cargo generate installers` - render install surfaces (setup.bat,
 //! Containerfile, Dockerfiles, packaging, ...) from the canonical spec.
 //! install.sh@HEAD is the behavioral reference. The spec is the single source
 //! of truth; surfaces are derived and drift-checked. Surfaces are registered in

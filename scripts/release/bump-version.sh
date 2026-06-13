@@ -182,6 +182,22 @@ for f in "${docs_files[@]}"; do
   esac
 done
 
+# ── Generated install surfaces (single source of truth) ───────────
+# After the workspace version is bumped, regenerate every spec-driven install
+# surface so version and feature sets stay canonical. This OWNS the version and
+# feature content of setup.bat, dist/aur/PKGBUILD, dist/scoop/zeroclaw.json,
+# flake.nix, the Dockerfiles/Containerfile feature sets, and
+# dev/ci/docker-tags.toml. No per-file sed hacks for those. CI's Installer
+# Drift gate fails if this is skipped.
+echo "Generated install surfaces (cargo generate installers)..."
+if command -v cargo >/dev/null 2>&1; then
+  ( cd "$REPO_ROOT" && cargo generate installers ) \
+    && { echo "  regenerated install surfaces"; changed=$((changed + 1)); } \
+    || echo "  warn: cargo generate installers failed; run it manually and commit the result"
+else
+  echo "  skip: cargo not on PATH; run 'cargo generate installers' before committing"
+fi
+
 echo ""
 if [[ $changed -gt 0 ]]; then
   echo "Done — $changed file(s) updated to v$VERSION."

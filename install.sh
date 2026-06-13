@@ -1036,7 +1036,7 @@ See all available features:
   fi
   echo
 
-  # >>> generated:source-cargo-install by `cargo generate installers` — do not edit <<<
+  # >>> generated:source-cargo-install by `cargo generate installers` - do not edit <<<
   if [ "$DRY_RUN" = true ]; then
     # shellcheck disable=SC2086
     info "[dry-run] Would run: cargo install --path . --locked --force $CARGO_FLAGS"

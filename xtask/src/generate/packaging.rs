@@ -1,12 +1,12 @@
 //! Packaging surface renderers: AUR PKGBUILD (shell-comment sentinels) and the
-//! scoop manifest (JSON, no comments — targeted key rewrite). Version and
+//! scoop manifest (JSON, no comments - targeted key rewrite). Version and
 //! feature sets come from the canonical spec; nothing is typed.
 
 use super::spec::{self, Selection};
 use std::path::Path;
 
 fn begin(zone: &str) -> String {
-    format!("# >>> generated:{zone} by `cargo generate installers` — do not edit <<<")
+    format!("# >>> generated:{zone} by `cargo generate installers` - do not edit <<<")
 }
 fn end(zone: &str) -> String {
     format!("# >>> end generated:{zone} <<<")
@@ -33,7 +33,7 @@ fn splice(current: &str, zone: &str, body: &str) -> anyhow::Result<String> {
 }
 
 /// PKGBUILD: regenerate the `pkgver` and the build `--features` from the spec.
-/// Ships `Selection::Dist`. Two zones — version and the cargo build line.
+/// Ships `Selection::Dist`. Two zones - version and the cargo build line.
 pub fn render_pkgbuild(root: &Path, current: &str) -> anyhow::Result<String> {
     let version = spec::resolve_version(root)?;
     let features = spec::resolve_feature_list(root, &Selection::Dist)?.join(",");

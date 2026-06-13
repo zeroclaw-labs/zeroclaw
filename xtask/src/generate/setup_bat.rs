@@ -1,8 +1,8 @@
 //! setup.bat renderer. The hand-written imperative glue (toolchain bootstrap,
 //! PATH, copy, quickstart, prebuilt download) stays in setup.bat; only the
 //! drift-prone data lives in sentinel-delimited regions this renderer owns.
-//! setup.bat has two such zones — the build-mode menu/routing and the per-mode
-//! preset definitions — separated by the hand-written prebuilt block. Every
+//! setup.bat has two such zones - the build-mode menu/routing and the per-mode
+//! preset definitions - separated by the hand-written prebuilt block. Every
 //! label and feature string derives from the canonical `Selection` set.
 
 use super::spec::{self, Selection};
@@ -11,7 +11,7 @@ use std::path::Path;
 /// A named generated zone, delimited by id-tagged sentinels so multiple regions
 /// can coexist in one file and the splicer targets each precisely.
 fn begin(id: &str) -> String {
-    format!(":: >>> generated:{id} by `cargo generate installers` — do not edit <<<")
+    format!(":: >>> generated:{id} by `cargo generate installers` - do not edit <<<")
 }
 fn end(id: &str) -> String {
     format!(":: >>> end generated:{id} <<<")
@@ -89,7 +89,7 @@ fn render_presets(manifest_dir: &Path) -> anyhow::Result<String> {
     Ok(out)
 }
 
-/// The recommended default selection's id — what the prebuilt-fallback path
+/// The recommended default selection's id - what the prebuilt-fallback path
 /// jumps to. Derived, not hardcoded: `Dist` is the recommended build.
 pub fn fallback_build_id() -> &'static str {
     Selection::Dist.id()

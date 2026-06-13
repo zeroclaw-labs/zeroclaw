@@ -9,7 +9,7 @@ use super::spec::{self, Selection};
 use std::path::Path;
 
 fn begin(zone: &str) -> String {
-    format!("# >>> generated:{zone} by `cargo generate installers` — do not edit <<<")
+    format!("# >>> generated:{zone} by `cargo generate installers` - do not edit <<<")
 }
 fn end(zone: &str) -> String {
     format!("# >>> end generated:{zone} <<<")
@@ -20,7 +20,7 @@ fn end(zone: &str) -> String {
 /// `--features "${ZEROCLAW_FEATURES}"`. Using a variable (rather than injecting
 /// a `--features` line mid backslash-continuation) keeps the generated zone a
 /// standalone statement, so sentinel comments never sit inside a continued
-/// command — which would break the shell parse and the StageX `--frozen` build.
+/// command - which would break the shell parse and the StageX `--frozen` build.
 pub fn render_features(
     manifest_dir: &Path,
     selection: &Selection,

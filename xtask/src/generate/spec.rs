@@ -80,8 +80,8 @@ impl Step {
 
 /// Execution mode for a plan. This is the structured home of the dry-run
 /// concept: a plan is rendered (or executed) in exactly one mode, and the mode
-/// — not a per-step flag or a vec convention — decides whether each step
-/// emits its narration or performs its action.
+/// (not a per-step flag or a vec convention) decides whether each step emits
+/// its narration or performs its action.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Perform each step's `action`.
@@ -136,7 +136,7 @@ impl Plan {
         Ok(plan)
     }
 
-    /// Every step the plan can run, in no particular order — for invariants and
+    /// Every step the plan can run, in no particular order - for invariants and
     /// coverage checks that don't care about branch structure.
     pub fn all_steps(&self) -> impl Iterator<Item = &Step> {
         self.diverge
@@ -168,7 +168,7 @@ pub fn dry_run_line(narration_text: &str) -> String {
 }
 
 /// Conditions for an *intra-branch* step. Branch selection (prebuilt vs source)
-/// is structural — it lives in `Plan`, not here — so this only covers the
+/// is structural - it lives in `Plan`, not here - so this only covers the
 /// genuinely conditional steps within a branch, mirroring install.sh's guards.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum When {
@@ -344,7 +344,7 @@ pub fn resolve_version(manifest_dir: &Path) -> anyhow::Result<String> {
     Ok(root.version.to_string())
 }
 
-/// Resolve the explicit feature list for a selection — the names a `--features`
+/// Resolve the explicit feature list for a selection - the names a `--features`
 /// arg would carry. For `Full` (Cargo default) this returns the resolved
 /// default leaves so container/packaging surfaces are explicit and
 /// drift-checkable rather than relying on implicit cargo defaults.
@@ -373,7 +373,7 @@ pub fn resolve_feature_list(
     selection.to_feature_list(&ctx)
 }
 
-/// Read canonical data via `cargo_metadata` — Cargo's own resolver, so the
+/// Read canonical data via `cargo_metadata` - Cargo's own resolver, so the
 /// feature graph matches what builds actually see. No awk, no hand-parsing.
 pub fn resolve(manifest_dir: &Path, selection: &Selection) -> anyhow::Result<Resolved> {
     let meta = cargo_metadata::MetadataCommand::new()
@@ -419,7 +419,7 @@ pub fn resolve(manifest_dir: &Path, selection: &Selection) -> anyhow::Result<Res
     })
 }
 
-/// Expand `default` to leaf features, walking aggregates — the typed twin of
+/// Expand `default` to leaf features, walking aggregates - the typed twin of
 /// install.sh `expand_default_features`. `non_row` is the registry-declared
 /// aggregate/meta set (from Cargo.toml metadata), never a literal here.
 fn expand_default(
@@ -464,7 +464,7 @@ pub enum Selection {
 
 impl Selection {
     /// Canonical short id for this selection (menu key, docker tag stem, etc.).
-    /// Surfaces render from this — they never type the name literally.
+    /// Surfaces render from this - they never type the name literally.
     pub fn id(&self) -> &'static str {
         match self {
             Selection::Full => "default",
@@ -581,7 +581,7 @@ impl FeatureCtx<'_> {
     }
 
     /// A pure alias: a non-meta feature whose only member is another local
-    /// feature (e.g. `channel-feishu = ["channel-lark"]`) — not separately
+    /// feature (e.g. `channel-feishu = ["channel-lark"]`) - not separately
     /// selectable in `All`.
     fn is_alias(&self, feature: &str) -> bool {
         match self.graph.get(feature) {
@@ -606,7 +606,7 @@ impl FeatureCtx<'_> {
     }
 }
 
-/// The web/dist path EXPRESSION each surface emits — resolved on the END
+/// The web/dist path EXPRESSION each surface emits - resolved on the END
 /// USER's machine at install time, never baked to the generator host. A test
 /// asserts these expressions agree with `directories::BaseDirs::data_local_dir`
 /// so the rendered path matches the gateway's runtime auto-detect.

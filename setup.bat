@@ -116,7 +116,7 @@ echo   %YELLOW%NOTE: You may need to restart your terminal for PATH changes.%RES
 goto :choose_mode
 
 :: ---- Choose build mode ----
-:: >>> generated:menu by `cargo generate installers` — do not edit <<<
+:: >>> generated:menu by `cargo generate installers` - do not edit <<<
 :choose_mode
 if "%MODE%"=="prebuilt" goto :install_prebuilt
 if "%MODE%"=="minimal" goto :build_minimal
@@ -191,7 +191,7 @@ if exist "%USERPROFILE%\.zeroclaw\bin\zerocode.exe" (
 goto verify
 
 :: ---- Source build presets ----
-:: >>> generated:presets by `cargo generate installers` — do not edit <<<
+:: >>> generated:presets by `cargo generate installers` - do not edit <<<
 :build_minimal
 set "FEATURES=--no-default-features"
 set "BUILD_DESC=minimal (core only, no default features)"

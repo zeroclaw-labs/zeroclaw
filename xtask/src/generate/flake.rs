@@ -9,7 +9,7 @@ use super::spec::{self, Selection};
 use std::path::Path;
 
 fn begin(zone: &str) -> String {
-    format!("        # >>> generated:{zone} by `cargo generate installers` — do not edit <<<")
+    format!("        # >>> generated:{zone} by `cargo generate installers` - do not edit <<<")
 }
 fn end(zone: &str) -> String {
     format!("        # >>> end generated:{zone} <<<")
