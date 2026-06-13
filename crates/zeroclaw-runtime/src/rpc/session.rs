@@ -1,6 +1,7 @@
 //! RPC session state.
 
 use crate::agent::agent::Agent;
+use crate::agent::dispatcher::ToolDispatcher;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -156,24 +157,10 @@ impl SessionStore {
         id: &str,
         patch: SessionOverrides,
     ) -> Option<SessionOverrides> {
+        let merged = self.preview_overrides(id, &patch).await?;
         let mut sessions = self.sessions.lock().await;
         let session = sessions.get_mut(id)?;
-        if let Some(ref m) = patch.model {
-            session.overrides.model = Some(m.clone());
-        }
-        if let Some(ref p) = patch.model_provider {
-            session.overrides.model_provider = Some(p.clone());
-            // A provider switch without an explicit model must not carry the
-            // previous provider's model forward (e.g. switching to an Ollama
-            // alias while a Claude model override lingers). Clear it so the
-            // dispatcher resolves the new alias's configured model.
-            if patch.model.is_none() {
-                session.overrides.model = None;
-            }
-        }
-        if let Some(t) = patch.temperature {
-            session.overrides.temperature = Some(t);
-        }
+        session.overrides = merged.clone();
         // Apply to agent immediately.
         let overrides = session.overrides.clone();
         let agent = session.agent.clone();
@@ -188,6 +175,33 @@ impl SessionStore {
         Some(overrides)
     }
 
+    pub async fn preview_overrides(
+        &self,
+        id: &str,
+        patch: &SessionOverrides,
+    ) -> Option<SessionOverrides> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(id)?;
+        let mut merged = session.overrides.clone();
+        if let Some(ref m) = patch.model {
+            merged.model = Some(m.clone());
+        }
+        if let Some(ref p) = patch.model_provider {
+            merged.model_provider = Some(p.clone());
+            // A provider switch without an explicit model must not carry the
+            // previous provider's model forward (e.g. switching to an Ollama
+            // alias while a Claude model override lingers). Clear it so the
+            // dispatcher resolves the new alias's configured model.
+            if patch.model.is_none() {
+                merged.model = None;
+            }
+        }
+        if let Some(t) = patch.temperature {
+            merged.temperature = Some(t);
+        }
+        Some(merged)
+    }
+
     /// Swap a freshly built `ModelProvider` box (and its name) onto the
     /// session's agent. Called by the dispatcher after it constructs the
     /// box from config, keeping model_provider-build logic out of the store.
@@ -196,6 +210,8 @@ impl SessionStore {
         id: &str,
         model_provider: Box<dyn ModelProvider>,
         model_provider_name: String,
+        model_name: String,
+        tool_dispatcher: Box<dyn ToolDispatcher>,
     ) -> bool {
         let agent = {
             let sessions = self.sessions.lock().await;
@@ -207,6 +223,8 @@ impl SessionStore {
         let mut guard = agent.lock().await;
         guard.set_model_provider(model_provider);
         guard.set_model_provider_name(model_provider_name);
+        guard.set_model_name(model_name);
+        guard.set_tool_dispatcher(tool_dispatcher);
         true
     }
 

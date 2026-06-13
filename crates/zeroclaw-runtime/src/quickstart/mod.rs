@@ -654,7 +654,7 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
             MODEL_PROVIDER_ESSENTIALS,
         ),
         FieldSection::Channel => (format!("channels.{type_key}"), CHANNEL_ESSENTIALS),
-        FieldSection::PeerGroup => (format!("peer-groups.{type_key}"), PEER_GROUP_ESSENTIALS),
+        FieldSection::PeerGroup => ("peer_groups".to_string(), PEER_GROUP_ESSENTIALS),
     };
 
     // A throwaway Config we can mutate freely. Inject one default
@@ -1338,7 +1338,7 @@ fn apply_peer_groups(
             ));
             continue;
         }
-        if let Err(err) = config.create_map_key("peer-groups", &pg.name) {
+        if let Err(err) = config.create_map_key("peer_groups", &pg.name) {
             errors.push(QuickstartError::new(
                 QuickstartStep::Channels,
                 format!("peer_groups[{idx}]"),
@@ -1346,7 +1346,7 @@ fn apply_peer_groups(
             ));
             continue;
         }
-        let prefix = format!("peer-groups.{}", pg.name);
+        let prefix = format!("peer_groups.{}", pg.name);
         if let Err(err) = config.set_prop_persistent(&format!("{prefix}.channel"), &pg.channel) {
             errors.push(QuickstartError::new(
                 QuickstartStep::Channels,
@@ -1620,12 +1620,23 @@ pub async fn model_catalog(
         && let Ok(models) = handle.list_models_with_pricing().await
         && !models.is_empty()
     {
+        let raw_pricing: std::collections::HashMap<
+            String,
+            zeroclaw_api::model_provider::ModelPricing,
+        > = models
+            .iter()
+            .filter_map(|m| m.pricing.as_ref().map(|p| (m.id.clone(), p.clone())))
+            .collect();
+        let ids = models.into_iter().map(|m| m.id).collect();
+        let Some(ids) =
+            zeroclaw_providers::catalog::sort_model_catalog_for_chat(model_provider, ids)
+        else {
+            return (Vec::new(), None, false);
+        };
         let pricing: std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing> =
-            models
-                .iter()
-                .filter_map(|m| m.pricing.as_ref().map(|p| (m.id.clone(), p.clone())))
+            ids.iter()
+                .filter_map(|id| raw_pricing.get(id).map(|p| (id.clone(), p.clone())))
                 .collect();
-        let ids: Vec<String> = models.into_iter().map(|m| m.id).collect();
         let pricing = if pricing.is_empty() {
             None
         } else {
@@ -1634,7 +1645,12 @@ pub async fn model_catalog(
         return (ids, pricing, true);
     }
     match zeroclaw_providers::catalog::list_models_for_family(model_provider).await {
-        Ok(models) if !models.is_empty() => (models, None, true),
+        Ok(models) if !models.is_empty() => (
+            zeroclaw_providers::catalog::sort_model_catalog_for_chat(model_provider, models)
+                .unwrap_or_default(),
+            None,
+            true,
+        ),
         _ => (Vec::new(), None, false),
     }
 }
@@ -2013,5 +2029,40 @@ mod tests {
             "second channel must also be bound; got {bound:?}"
         );
         assert_eq!(bound.len(), 2, "both channels bound, not just the last");
+    }
+
+    #[tokio::test]
+    async fn peer_groups_persist_to_canonical_section() {
+        let mut submission = fresh_submission("bot");
+        submission.channels = vec![SelectorChoice::Fresh(ChannelQuickStart {
+            channel_type: "telegram".into(),
+            alias: "tg".into(),
+            token: Some("tok-a".into()),
+        })];
+        submission.peer_groups = vec![zeroclaw_config::presets::QuickstartPeerGroup {
+            name: "team".into(),
+            channel: "telegram.tg".into(),
+            external_peers: vec!["*".into()],
+            ignore: vec![],
+        }];
+
+        let (dir, _applied) = apply_to_temp(submission).await;
+        let raw = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(
+            raw.contains("[peer_groups.team]"),
+            "Quickstart must serialize peer groups through canonical snake_case paths:\n{raw}"
+        );
+        assert!(
+            !raw.contains("[peer-groups.team]"),
+            "Quickstart must not write the stale kebab-case peer-groups path:\n{raw}"
+        );
+
+        let reloaded = reload(&dir);
+        let group = reloaded
+            .peer_groups
+            .get("team")
+            .expect("peer group persisted");
+        assert_eq!(group.channel, "telegram.tg");
+        assert_eq!(group.external_peers, vec!["*".to_string()]);
     }
 }

@@ -128,6 +128,21 @@ impl Drop for TurnGuard {
     }
 }
 
+/// Resolve the tool dispatcher with the same provider-capability fallback
+/// used by fresh agent construction.
+#[must_use]
+pub fn tool_dispatcher_for_provider(
+    agent_cfg: &zeroclaw_config::schema::AliasedAgentConfig,
+    model_provider: &dyn ModelProvider,
+) -> Box<dyn ToolDispatcher> {
+    match agent_cfg.resolved.tool_dispatcher.as_str() {
+        "native" => Box::new(NativeToolDispatcher),
+        "xml" => Box::new(XmlToolDispatcher),
+        _ if model_provider.supports_native_tools() => Box::new(NativeToolDispatcher),
+        _ => Box::new(XmlToolDispatcher),
+    }
+}
+
 pub struct Agent {
     model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,
@@ -836,6 +851,10 @@ impl Agent {
         self.model_provider_name = model_provider_name;
     }
 
+    pub fn set_tool_dispatcher(&mut self, tool_dispatcher: Box<dyn ToolDispatcher>) {
+        self.tool_dispatcher = tool_dispatcher;
+    }
+
     /// Return the names of all registered tools.  Test-only — avoids
     /// exposing `Box<dyn Tool>` across the crate boundary.
     #[cfg(test)]
@@ -1282,13 +1301,7 @@ impl Agent {
                 &provider_runtime_options,
             )?;
 
-        let dispatcher_choice = agent_cfg.resolved.tool_dispatcher.as_str();
-        let tool_dispatcher: Box<dyn ToolDispatcher> = match dispatcher_choice {
-            "native" => Box::new(NativeToolDispatcher),
-            "xml" => Box::new(XmlToolDispatcher),
-            _ if model_provider.supports_native_tools() => Box::new(NativeToolDispatcher),
-            _ => Box::new(XmlToolDispatcher),
-        };
+        let tool_dispatcher = tool_dispatcher_for_provider(agent_cfg, model_provider.as_ref());
 
         let route_model_by_hint: HashMap<String, String> = config
             .model_routes
