@@ -88,6 +88,16 @@ impl SectionGroup {
             Self::Other => "Other",
         }
     }
+
+    /// Inverse of [`label`](Self::label): parse a group label string
+    /// back into the enum, or `None` for an unrecognized label. The
+    /// bridge for `#[group = "..."]` attributes resolved through the
+    /// schema — the derive emits the label as a string the macro can't
+    /// type-check, so this validates it on the way back in.
+    #[must_use]
+    pub fn from_label(label: &str) -> Option<Self> {
+        SECTION_GROUPS.iter().copied().find(|g| g.label() == label)
+    }
 }
 
 impl std::fmt::Display for SectionGroup {
@@ -112,60 +122,34 @@ pub const SECTION_GROUPS: &[SectionGroup] = &[
     SectionGroup::Other,
 ];
 
-/// Display group for any section key. Curated [`Section`]s read the
-/// `group:` cell of their `sections!` row; everything else — the
-/// schema-derived top-level `Config` roots the section explorer
-/// surfaces without a curated row — is hand-mapped here. This match
-/// moved from the gateway (`api_sections.rs`) so the dashboard, the
-/// RPC `config/sections` handler, and the TUI all read one table.
-/// Unknown keys fall into [`SectionGroup::Other`] so new schema
-/// additions still surface — they just land in the catch-all bucket
-/// until someone curates them.
+/// Display group for any section key. Two declarative sources, no
+/// hand-maintained table:
+///
+/// 1. Curated [`Section`]s read the `group:` cell of their `sections!`
+///    row.
+/// 2. The long tail of top-level `Config` roots the section explorer
+///    surfaces without a curated row declares its group inline via
+///    `#[group = "..."]`, harvested by the `Configurable` derive into
+///    [`crate::schema::Config::nested_section_group`]. This mirrors how
+///    [`section_help`] falls through to `Config::nested_section_help`.
+///
+/// Unknown keys — and roots whose `#[group]` label fails to parse — fall
+/// into [`SectionGroup::Other`] so new schema additions still surface;
+/// they just land in the catch-all bucket until someone annotates them.
+/// The `every_surfaced_root_has_a_group` test guards against a real root
+/// silently landing there.
 #[must_use]
 pub fn section_group_for_key(key: &str) -> SectionGroup {
     if let Some(s) = Section::from_key(key) {
         return s.group();
     }
-    match key.replace('-', "_").as_str() {
-        // Agent loop, scheduling, and orchestration.
-        "agent"
-        | "heartbeat"
-        | "hooks"
-        | "pacing"
-        | "pipeline"
-        | "query_classification"
-        | "reliability"
-        | "runtime"
-        | "scheduler"
-        | "sop"
-        | "verifiable_intent" => SectionGroup::Agent,
-        // Multi-agent / delegation.
-        "delegate" => SectionGroup::MultiAgent,
-        // Tool integrations.
-        "browser" | "browser_delegate" | "http_request" | "image_gen" | "knowledge"
-        | "link_enricher" | "media_pipeline" | "multimodal" | "plugins" | "project_intel"
-        | "shell_tool" | "text_browser" | "transcription" | "tts" | "web_fetch" | "web_search" => {
-            SectionGroup::Tools
-        }
-        // External services / vendor integrations. ACP is included
-        // because it is always client-paired — you cannot use it
-        // without a client.
-        "acp" | "claude_code" | "claude_code_runner" | "codex_cli" | "composio" | "gemini_cli"
-        | "google_workspace" | "jira" | "linkedin" | "notion" | "opencode_cli" => {
-            SectionGroup::Integrations
-        }
-        // Networking / multi-node infrastructure.
-        "gateway" | "node_transport" | "nodes" | "proxy" => SectionGroup::Network,
-        // Storage, identity, secrets. (`storage` itself is a curated
-        // row and resolves above.)
-        "identity" | "secrets" => SectionGroup::Storage,
-        // Operations / monitoring / safety / cost.
-        "backup" | "cloud_ops" | "conversational_ai" | "cost" | "data_retention"
-        | "observability" | "peripherals" | "security" | "security_ops" | "trust" => {
-            SectionGroup::Operations
-        }
-        _ => SectionGroup::Other,
-    }
+    // `nested_section_group` arms are keyed kebab-case (the derive runs
+    // each field name through `snake_to_kebab`). Section keys reaching
+    // here may be either spelling, so try as-is then kebab-normalized.
+    crate::schema::Config::nested_section_group(key)
+        .or_else(|| crate::schema::Config::nested_section_group(&key.replace('_', "-")))
+        .and_then(SectionGroup::from_label)
+        .unwrap_or(SectionGroup::Other)
 }
 
 /// Humanize a section wire key for display (`risk_profiles` → `Risk profiles`,
@@ -939,6 +923,105 @@ mod tests {
         assert_eq!(section_group_for_key("secrets"), SectionGroup::Storage);
         // Unknown keys land in the catch-all, never disappear.
         assert_eq!(section_group_for_key("not_a_section"), SectionGroup::Other);
+    }
+
+    /// Drift guard for the schema-attribute grouping: every top-level
+    /// config root the section explorer can surface must resolve to a
+    /// real [`SectionGroup`], not the `Other` catch-all — either through
+    /// the `sections!` table (curated rows) or a `#[group = "..."]`
+    /// annotation harvested into `Config::nested_section_group`.
+    ///
+    /// This is what makes grouping declarative-by-construction: add a
+    /// new top-level `#[nested]` section without a group and this test
+    /// fails, naming the root, rather than the section silently landing
+    /// in `Other`. A root that genuinely has no curated group yet goes
+    /// in `UNGROUPED` with intent; `HIDDEN` covers system roots the
+    /// explorer never shows.
+    #[test]
+    fn every_surfaced_root_has_a_group() {
+        use crate::schema::Config;
+        let cfg = Config::default();
+        let roots: std::collections::BTreeSet<String> = cfg
+            .prop_fields()
+            .iter()
+            .filter_map(|f| f.name.split('.').next().map(str::to_string))
+            .collect();
+
+        // System/bookkeeping root the explorer hides; resolved at
+        // runtime, never user-edited, so intentionally ungrouped.
+        const HIDDEN: &[&str] = &["schema_version"];
+
+        // Roots with no curated group yet: they render in the `Other`
+        // bucket. Pre-existing — ungrouped before grouping moved into
+        // the schema. Annotating one with `#[group]` (e.g. `microsoft365`
+        // and the `file_*` tool sections are obvious candidates) means
+        // removing it from this list. The assertions below keep the list
+        // honest: every entry must still be a real, still-ungrouped root.
+        const UNGROUPED: &[&str] = &[
+            "escalation",
+            "locale",
+            "microsoft365",
+            "model_routes",
+            "embedding_routes",
+            "file_upload",
+            "file_upload_bundle",
+            "file_download",
+            "wss",
+        ];
+
+        let violations: Vec<&String> = roots
+            .iter()
+            .filter(|r| !HIDDEN.contains(&r.as_str()) && !UNGROUPED.contains(&r.as_str()))
+            .filter(|r| section_group_for_key(r) == SectionGroup::Other)
+            .collect();
+        assert!(
+            violations.is_empty(),
+            "these surfaced config roots resolve to SectionGroup::Other — add a \
+             `#[group = \"...\"]` to each in schema.rs (or, if intentionally \
+             uncurated, to the UNGROUPED allowlist): {violations:?}",
+        );
+
+        // Keep the allowlist from rotting: each entry must still be a
+        // surfaced root and still ungrouped.
+        for u in UNGROUPED {
+            assert!(
+                roots.contains(*u),
+                "UNGROUPED lists `{u}` but it is no longer a surfaced root — remove it",
+            );
+            assert_eq!(
+                section_group_for_key(u),
+                SectionGroup::Other,
+                "`{u}` now resolves to a real group — remove it from UNGROUPED",
+            );
+        }
+    }
+
+    /// The regression roots that the pre-migration gateway hand-list
+    /// grouped must still resolve the same way through the schema
+    /// attributes — pins that the move from hand-list to `#[group]`
+    /// didn't silently drop any of them back into `Other`.
+    #[test]
+    fn migrated_hand_list_roots_keep_their_groups() {
+        let expected = [
+            ("claude_code", SectionGroup::Integrations),
+            ("codex_cli", SectionGroup::Integrations),
+            ("gemini_cli", SectionGroup::Integrations),
+            ("opencode_cli", SectionGroup::Integrations),
+            ("sop", SectionGroup::Agent),
+            ("verifiable_intent", SectionGroup::Agent),
+            ("shell_tool", SectionGroup::Tools),
+            ("observability", SectionGroup::Operations),
+            ("gateway", SectionGroup::Network),
+            ("delegate", SectionGroup::MultiAgent),
+            ("secrets", SectionGroup::Storage),
+        ];
+        for (key, group) in expected {
+            assert_eq!(
+                section_group_for_key(key),
+                group,
+                "`{key}` should resolve to {group:?} via its #[group] attribute",
+            );
+        }
     }
 
     /// Storage help must steer first-time operators toward SQLite as the
