@@ -7520,6 +7520,8 @@ pub struct FileUploadBundleConfig {
 
     /// Static HTTP headers attached to every upload request.
     #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub headers: HashMap<String, String>,
 }
 
@@ -7603,6 +7605,8 @@ pub struct FileDownloadConfig {
     /// `Authorization: Bearer …` token for the upstream endpoint. Same shape as
     /// `[mcp.servers.*.headers]`.
     #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub headers: HashMap<String, String>,
 }
 
@@ -25459,6 +25463,18 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         assert!(!Config::prop_is_secret(
             "providers.models.openrouter.default.context-window"
         ));
+    }
+
+    #[test]
+    async fn file_transfer_header_maps_are_secret() {
+        assert!(Config::prop_is_secret("file_download.headers.Authorization"));
+        assert!(Config::prop_is_secret("file_upload.headers.Authorization"));
+        assert!(Config::prop_is_secret(
+            "file_upload_bundle.headers.Authorization"
+        ));
+        assert!(Config::prop_is_secret("mcp.servers.acme.headers.Authorization"));
+        assert!(!Config::prop_is_secret("file_download.timeout_secs"));
+        assert!(!Config::prop_is_secret("file_download.headers"));
     }
 
     #[test]
