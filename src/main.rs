@@ -268,8 +268,6 @@ mod platform;
 #[cfg(feature = "plugins-wasm")]
 mod plugins;
 mod providers;
-#[cfg(feature = "schema-export")]
-mod schema_markdown;
 #[cfg(feature = "agent-runtime")]
 mod security;
 #[cfg(feature = "agent-runtime")]
@@ -433,7 +431,7 @@ enum Commands {
         api_key: Option<String>,
 
         /// ModelProvider name. Used as the type key for the synthesized
-        /// `[model_providers.<type>.default]` entry.
+        /// `[providers.models.<type>.default]` entry.
         #[arg(long, hide = true)]
         model_provider: Option<String>,
 
@@ -1076,7 +1074,7 @@ async fn run_quickstart_cli(
     use dialoguer::{Confirm, Editor, FuzzySelect, Input, Password};
     use zeroclaw_config::presets::{
         AgentIdentity, BuilderSubmission, ChannelQuickStart, MemoryChoice, ModelProviderChoice,
-        RISK_PRESETS, RUNTIME_PRESETS, SelectorChoice,
+        RISK_PRESETS, SelectorChoice,
     };
     use zeroclaw_runtime::quickstart::{
         FieldSection, QuickstartTypeOption, Surface, apply_with_surface, field_shape,
@@ -1093,7 +1091,6 @@ async fn run_quickstart_cli(
     struct Form {
         provider: Option<ProviderChoice>,
         risk: Option<PresetChoice>,
-        runtime: Option<PresetChoice>,
         memory: Option<MemoryChoice>,
         channels: Vec<ChannelChoice>,
         // Tracks whether the user explicitly visited Channels and
@@ -1153,9 +1150,6 @@ async fn run_quickstart_cli(
         fn risk_done(&self) -> bool {
             self.risk.is_some()
         }
-        fn runtime_done(&self) -> bool {
-            self.runtime.is_some()
-        }
         fn memory_done(&self) -> bool {
             self.memory.is_some()
         }
@@ -1173,7 +1167,6 @@ async fn run_quickstart_cli(
         fn all_done(&self) -> bool {
             self.provider_done()
                 && self.risk_done()
-                && self.runtime_done()
                 && self.memory_done()
                 && self.channels_done()
                 && self.agent_done()
@@ -1212,7 +1205,10 @@ async fn run_quickstart_cli(
             let mut fields: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
             if let Some(key) = api_key.as_deref().filter(|s| !s.is_empty()) {
-                fields.insert("api-key".to_string(), key.to_string());
+                // Submission field keys are snake_case (`api_key`) — the apply
+                // path round-trips them verbatim into `set_prop_persistent`,
+                // which rejects kebab-case with "Unknown property".
+                fields.insert("api_key".to_string(), key.to_string());
             }
             form.provider = Some(ProviderChoice::Fresh {
                 kind: found.kind.clone(),
@@ -1239,7 +1235,6 @@ async fn run_quickstart_cli(
     enum Action {
         Provider,
         Risk,
-        Runtime,
         Memory,
         Channels,
         PeerGroups,
@@ -1331,11 +1326,6 @@ async fn run_quickstart_cli(
                 preset_summary(&form.risk)
             ),
             format!(
-                "{} Runtime profile    — {}",
-                glyph(form.runtime_done()),
-                preset_summary(&form.runtime)
-            ),
-            format!(
                 "{} Memory             — {memory_summary}",
                 glyph(form.memory_done())
             ),
@@ -1362,7 +1352,6 @@ async fn run_quickstart_cli(
         let actions = [
             Action::Provider,
             Action::Risk,
-            Action::Runtime,
             Action::Memory,
             Action::Channels,
             Action::PeerGroups,
@@ -1485,7 +1474,7 @@ async fn run_quickstart_cli(
                     // leaves the descriptor unchanged → free-text fallback.
                     let upgraded;
                     let d_used = if d.key.eq_ignore_ascii_case("model") {
-                        let (models, live) =
+                        let (models, _pricing, live) =
                             zeroclaw_runtime::quickstart::model_catalog(&chosen.kind).await;
                         if live && !models.is_empty() {
                             upgraded = zeroclaw_runtime::quickstart::FieldDescriptor {
@@ -1558,22 +1547,6 @@ async fn run_quickstart_cli(
                 )?;
                 if let Some(c) = chosen {
                     form.risk = Some(match c {
-                        Ok(name) => PresetChoice::Fresh(name),
-                        Err(alias) => PresetChoice::Existing(alias),
-                    });
-                }
-            }
-            Action::Runtime => {
-                let chosen = pick_preset(
-                    "Runtime profile",
-                    RUNTIME_PRESETS
-                        .iter()
-                        .map(|p| (p.preset_name, p.label, p.help))
-                        .collect(),
-                    &state.runtime_profiles,
-                )?;
-                if let Some(c) = chosen {
-                    form.runtime = Some(match c {
                         Ok(name) => PresetChoice::Fresh(name),
                         Err(alias) => PresetChoice::Existing(alias),
                     });
@@ -2082,10 +2055,9 @@ async fn run_quickstart_cli(
         PresetChoice::Fresh(n) => SelectorChoice::Fresh(n.to_string()),
         PresetChoice::Existing(a) => SelectorChoice::Existing(a),
     };
-    let runtime_profile = match form.runtime.expect("runtime satisfied") {
-        PresetChoice::Fresh(n) => SelectorChoice::Fresh(n.to_string()),
-        PresetChoice::Existing(a) => SelectorChoice::Existing(a),
-    };
+    // Runtime profile picker removed from all surfaces; apply silently
+    // forces the `unbounded` preset. Submit it so the field stays well-formed.
+    let runtime_profile = SelectorChoice::Fresh("unbounded".to_string());
     let memory = SelectorChoice::Fresh(form.memory.expect("memory satisfied"));
     let channels = form
         .channels
@@ -2141,7 +2113,7 @@ async fn run_quickstart_cli(
             println!();
             println!("{}", t("cli-next-steps", "Next steps:"));
             println!(
-                "  zeroclaw agent {}  # chat with this agent in your terminal",
+                "  zeroclaw agent -a {}  # chat with this agent in your terminal",
                 applied.alias
             );
             if which_zerocode_on_path() {
@@ -2452,7 +2424,7 @@ enum ConfigCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Migrate config.toml to the current schema version on disk (preserves comments)
+    /// Migrate the on-disk config to the current schema version (preserves comments)
     Migrate {
         /// Emit a structured JSON envelope ({migrated, backup_path?, schema_version}) instead of plain text.
         #[arg(long)]
@@ -2939,7 +2911,10 @@ async fn main() -> Result<()> {
             #[cfg(feature = "schema-export")]
             {
                 let schema = schemars::schema_for!(config::Config);
-                print!("{}", schema_markdown::generate(&schema.to_value()));
+                print!(
+                    "{}",
+                    zeroclaw_config::schema_markdown::generate(&schema.to_value())
+                );
                 return Ok(());
             }
             #[cfg(not(feature = "schema-export"))]
@@ -3676,109 +3651,105 @@ async fn main() -> Result<()> {
                 // first iteration; reload would otherwise see a moved value.
                 let canvas_store_for_gateway = canvas_store_for_gateway.clone();
                 let canvas_store_for_channels = canvas_store_for_channels.clone();
-                let subsystems = daemon::DaemonSubsystems {
-                    #[cfg(feature = "gateway")]
-                    gateway_start: Some(Box::new(
-                        move |host, port, config, tx, reload_tx, tui_registry| {
-                            let canvas_store = canvas_store_for_gateway.clone();
-                            Box::pin(async move {
-                                Box::pin(zeroclaw_gateway::run_gateway(
-                                    &host,
-                                    port,
-                                    config,
-                                    tx,
-                                    reload_tx,
-                                    tui_registry,
-                                    Some(canvas_store),
-                                ))
-                                .await
-                            })
-                        },
-                    )),
-                    #[cfg(not(feature = "gateway"))]
-                    gateway_start: None,
-                    channels_start: Some(Box::new(move |config, cancel| {
-                        let canvas_store = canvas_store_for_channels.clone();
+                let mut registry = daemon::DaemonRegistry::new();
+
+                #[cfg(feature = "gateway")]
+                registry.register_gateway(Box::new(
+                    move |host, port, config, tx, reload_tx, tui_registry| {
+                        let canvas_store = canvas_store_for_gateway.clone();
                         Box::pin(async move {
-                            Box::pin(zeroclaw_channels::orchestrator::start_channels(
+                            Box::pin(zeroclaw_gateway::run_gateway(
+                                &host,
+                                port,
                                 config,
+                                tx,
+                                reload_tx,
+                                tui_registry,
                                 Some(canvas_store),
-                                cancel,
                             ))
                             .await
                         })
-                    })),
-                    #[cfg(feature = "channel-mqtt")]
-                    mqtt_start: Some(Box::new({
-                        use std::sync::{Arc, Mutex};
-                        use zeroclaw_config::schema::SopConfig;
-                        use zeroclaw_memory::NoneMemory;
-                        use zeroclaw_runtime::sop::{SopAuditLogger, SopEngine};
-                        let sop_config = current_config.sop.clone();
-                        let workspace_dir = current_config.data_dir.clone();
-                        move |mqtt_config| {
-                            let engine = if sop_config.sops_dir.is_some() {
-                                let mut e = SopEngine::new(sop_config.clone());
-                                e.reload(&workspace_dir);
-                                e
-                            } else {
-                                SopEngine::new(SopConfig::default())
-                            };
-                            let engine = Arc::new(Mutex::new(engine));
-                            let audit =
-                                Arc::new(SopAuditLogger::new(Arc::new(NoneMemory::new("none"))));
-                            Box::pin(async move {
-                                zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
-                                    &mqtt_config,
-                                    engine,
-                                    audit,
-                                )
-                                .await
-                            })
-                        }
-                    })),
-                    socket_start: Some(Box::new(|ctx, cancel, client_count| {
+                    },
+                ));
+
+                registry.register_channels(Box::new(move |config, cancel| {
+                    let canvas_store = canvas_store_for_channels.clone();
+                    Box::pin(async move {
+                        Box::pin(zeroclaw_channels::orchestrator::start_channels(
+                            config,
+                            Some(canvas_store),
+                            cancel,
+                        ))
+                        .await
+                    })
+                }));
+
+                #[cfg(feature = "channel-mqtt")]
+                registry.register_mqtt(Box::new({
+                    use std::sync::{Arc, Mutex};
+                    use zeroclaw_config::schema::SopConfig;
+                    use zeroclaw_memory::NoneMemory;
+                    use zeroclaw_runtime::sop::{SopAuditLogger, SopEngine};
+                    let sop_config = current_config.sop.clone();
+                    let workspace_dir = current_config.data_dir.clone();
+                    move |mqtt_config| {
+                        let engine = if sop_config.sops_dir.is_some() {
+                            let mut e = SopEngine::new(sop_config.clone());
+                            e.reload(&workspace_dir);
+                            e
+                        } else {
+                            SopEngine::new(SopConfig::default())
+                        };
+                        let engine = Arc::new(Mutex::new(engine));
+                        let audit =
+                            Arc::new(SopAuditLogger::new(Arc::new(NoneMemory::new("none"))));
                         Box::pin(async move {
-                            Box::pin(zeroclaw_runtime::rpc::local::run_local_listener(
-                                ctx,
-                                cancel,
-                                client_count,
-                            ))
-                            .await
-                        })
-                    })),
-                    wss_start: Some(Box::new(|ctx, cancel, client_count| {
-                        Box::pin(async move {
-                            let wss_cfg = ctx.config.read().wss.clone();
-                            if !wss_cfg.enabled {
-                                // WSS disabled — park until cancelled.
-                                cancel.cancelled().await;
-                                return Ok(());
-                            }
-                            let tls_acceptor = zeroclaw_runtime::rpc::wss::build_tls_acceptor(
-                                &wss_cfg.cert_path,
-                                &wss_cfg.key_path,
-                            )?;
-                            let bind_addr: std::net::SocketAddr =
-                                format!("{}:{}", wss_cfg.bind, wss_cfg.port).parse()?;
-                            zeroclaw_runtime::rpc::wss::run_wss_listener(
-                                ctx,
-                                cancel,
-                                client_count,
-                                tls_acceptor,
-                                bind_addr,
+                            zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
+                                &mqtt_config,
+                                engine,
+                                audit,
                             )
                             .await
                         })
-                    })),
-                    #[cfg(not(feature = "channel-mqtt"))]
-                    mqtt_start: None,
-                };
+                    }
+                }));
+
+                registry.register_socket(Box::new(|ctx, cancel, client_count| {
+                    Box::pin(async move {
+                        zeroclaw_runtime::rpc::local::run_local_listener(ctx, cancel, client_count)
+                            .await
+                    })
+                }));
+
+                registry.register_wss(Box::new(|ctx, cancel, client_count| {
+                    Box::pin(async move {
+                        let wss_cfg = ctx.config.read().wss.clone();
+                        if !wss_cfg.enabled {
+                            // WSS disabled — park until cancelled.
+                            cancel.cancelled().await;
+                            return Ok(());
+                        }
+                        let tls_acceptor = zeroclaw_runtime::rpc::wss::build_tls_acceptor(
+                            &wss_cfg.cert_path,
+                            &wss_cfg.key_path,
+                        )?;
+                        let bind_addr: std::net::SocketAddr =
+                            format!("{}:{}", wss_cfg.bind, wss_cfg.port).parse()?;
+                        zeroclaw_runtime::rpc::wss::run_wss_listener(
+                            ctx,
+                            cancel,
+                            client_count,
+                            tls_acceptor,
+                            bind_addr,
+                        )
+                        .await
+                    })
+                }));
                 let exit = Box::pin(daemon::run(
                     current_config.clone(),
                     host.clone(),
                     port,
-                    subsystems,
+                    registry,
                     ephemeral,
                 ))
                 .await?;
@@ -4170,15 +4141,25 @@ async fn main() -> Result<()> {
             );
             println!("  ID (use in config)  DESCRIPTION"); // i18n-exempt: literal command/identifier example
             println!("  ─────────────────── ───────────");
-            for p in &model_providers {
-                let is_configured = configured_types.contains(p.name);
-                let marker = if is_configured { " (configured)" } else { "" };
-                let local_tag = if p.local { " [local]" } else { "" };
-                println!("  {:<19} {}{}{}", p.name, p.display_name, local_tag, marker);
+            for category in zeroclaw_providers::ModelProviderCategory::all() {
+                let in_category: Vec<_> = model_providers
+                    .iter()
+                    .filter(|p| p.category == *category)
+                    .collect();
+                if in_category.is_empty() {
+                    continue;
+                }
+                println!("\n  {}:", category.as_str());
+                for p in in_category {
+                    let is_configured = configured_types.contains(p.name);
+                    let marker = if is_configured { " (configured)" } else { "" };
+                    let local_tag = if p.local { " [local]" } else { "" };
+                    println!("  {:<19} {}{}{}", p.name, p.display_name, local_tag, marker);
+                }
             }
             println!(
-                "\n  Set [model_providers.custom.<alias>] uri = \"<URL>\" for any \
-                 OpenAI-compatible endpoint, or [model_providers.anthropic.<alias>] \
+                "\n  Set [providers.models.custom.<alias>] uri = \"<URL>\" for any \
+                 OpenAI-compatible endpoint, or [providers.models.anthropic.<alias>] \
                  uri = \"<URL>\" for an Anthropic-compatible endpoint."
             );
             Ok(())
@@ -4214,6 +4195,13 @@ async fn main() -> Result<()> {
 
         Commands::Channel { channel_command } => match channel_command {
             ChannelCommands::Start => {
+                #[cfg(feature = "hardware")]
+                zeroclaw_runtime::agent::loop_::register_peripheral_tools_fn(Box::new(|config| {
+                    Box::pin(async move {
+                        zeroclaw_hardware::peripherals::create_peripheral_tools(&config).await
+                    })
+                }));
+
                 let cancel = tokio_util::sync::CancellationToken::new();
                 Box::pin(channels::start_channels(config, None, cancel)).await
             }
@@ -4685,7 +4673,7 @@ async fn main() -> Result<()> {
                     // hand. Falls back to free text on `live=false`
                     // (unknown provider, fetch failed, catalog empty).
                     use dialoguer::{FuzzySelect, Input};
-                    let (models, live) =
+                    let (models, _pricing, live) =
                         zeroclaw_runtime::quickstart::model_catalog(provider_type).await;
                     if live && !models.is_empty() {
                         let current = config.get_prop(&path).unwrap_or_default();

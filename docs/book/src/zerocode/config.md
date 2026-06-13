@@ -6,9 +6,9 @@ does, and most settings apply live without a daemon restart. Open it from any
 zerocode session and edit settings there rather than hand editing the config
 file.
 
-Settings still persist to `config.toml` in your config directory, and the docs
-quote the relevant TOML so you can see exactly what a given control writes. Read
-those TOML blocks as a description of the persisted result, not as an
+Settings still persist to your config, and the docs
+describe the relevant fields so you can see exactly what a given control writes. Read
+those descriptions as the persisted result, not as an
 instruction to open the file in an editor. Hand editing is a fallback for
 headless hosts and scripted provisioning, where the docs call it out
 explicitly.
@@ -23,14 +23,3 @@ explicitly.
 - **Registry-backed lists.** Provider, channel, model, and theme choices come
   from the backend registry, so the options you see are exactly the ones this
   build supports.
-
-## When to edit the file directly
-
-Hand editing `config.toml` is the right tool only when a Config pane is not
-reachable:
-
-- Bootstrapping a fresh **headless host** before the first zerocode connection.
-- **Scripted provisioning**, where the config is written by automation.
-
-In those cases the docs show the TOML to write. Everywhere else, treat the TOML
-blocks as the result of a Config pane change, not a call to open an editor.

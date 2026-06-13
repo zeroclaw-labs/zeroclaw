@@ -61,7 +61,7 @@ Medium/high-risk PRs must fill:
 
 ---
 
-**Labels** live in the GitHub label UI, not in the body. Maintainers and reviewers with label permissions set `risk:*`, `size:*`, and scope labels via the sidebar. If auto-labels need correction, add `risk: manual` and the intended label. Contributors without label permission can note the mismatch in a comment.
+**Labels** live in the GitHub label UI, not in the body. Maintainers and reviewers with label permissions set `risk:*`, `size:*`, and any missing manual labels via the sidebar. The PR path labeler only owns path/scope labels from `.github/labeler.yml`. Contributors without label permission can note obvious label mismatches in a comment.
 
 **Do not add bot/AI attribution footers** such as `Co-authored-by: Claude ...`
 or `Created with Claude Code` to the PR body or commit-message tail. Human
