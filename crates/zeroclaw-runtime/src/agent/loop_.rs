@@ -825,10 +825,27 @@ fn resolved_agent_for_turn(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
 ) -> Result<zeroclaw_config::schema::AliasedAgentConfig> {
-    config
+    let agent = config
         .resolved_agent_config(agent_alias)
-        .with_context(|| format!("agents.{agent_alias} is not configured"))
+        .with_context(|| format!("agents.{agent_alias} is not configured"))?;
+    #[cfg(test)]
+    if let Some(hook) = RESOLVED_AGENT_FOR_TURN_TEST_HOOK
+        .lock()
+        .expect("resolved-agent test hook lock should not be poisoned")
+        .as_ref()
+        .cloned()
+    {
+        hook(agent_alias, agent.resolved.max_tool_iterations);
+    }
+    Ok(agent)
 }
+
+#[cfg(test)]
+type ResolvedAgentForTurnTestHook = Arc<dyn Fn(&str, usize) + Send + Sync>;
+
+#[cfg(test)]
+static RESOLVED_AGENT_FOR_TURN_TEST_HOOK: LazyLock<Mutex<Option<ResolvedAgentForTurnTestHook>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 /// Resolve (api_key, uri) for `provider_name`, preferring the alias-specific
 /// config when `provider_name` is a dotted `<family>.<alias>` reference.
@@ -11771,6 +11788,81 @@ Let me check the result."#;
             agent.resolved.max_tool_iterations, 25,
             "direct agent turns must honor runtime_profiles.*.max_tool_iterations \
              instead of the skipped AliasedAgentConfig::resolved default"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_entrypoints_resolve_runtime_profile_tunables_before_provider_setup() {
+        use zeroclaw_config::providers::RuntimeProfileRef;
+        use zeroclaw_config::schema::{AliasedAgentConfig, RuntimeProfileConfig};
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.runtime_profiles.insert(
+            "entrypoint-profile".to_string(),
+            RuntimeProfileConfig {
+                max_tool_iterations: 3,
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "entrypoint-profile-agent".to_string(),
+            AliasedAgentConfig {
+                runtime_profile: RuntimeProfileRef::new("entrypoint-profile"),
+                ..Default::default()
+            },
+        );
+
+        let seen = Arc::new(Mutex::new(Vec::<(String, usize)>::new()));
+        let seen_for_hook = Arc::clone(&seen);
+        {
+            let mut hook = RESOLVED_AGENT_FOR_TURN_TEST_HOOK
+                .lock()
+                .expect("resolved-agent test hook lock should not be poisoned");
+            *hook = Some(Arc::new(move |alias, max_tool_iterations| {
+                seen_for_hook
+                    .lock()
+                    .expect("seen lock should not be poisoned")
+                    .push((alias.to_string(), max_tool_iterations));
+            }));
+        }
+
+        let _ = super::run(
+            config.clone(),
+            "entrypoint-profile-agent",
+            Some("hello".to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            None,
+            None,
+            super::AgentRunOverrides::default(),
+        )
+        .await;
+        let _ =
+            super::process_message(config, "entrypoint-profile-agent", "hello", Some("session"))
+                .await;
+
+        {
+            let mut hook = RESOLVED_AGENT_FOR_TURN_TEST_HOOK
+                .lock()
+                .expect("resolved-agent test hook lock should not be poisoned");
+            *hook = None;
+        }
+
+        let seen = seen.lock().expect("seen lock should not be poisoned");
+        let matching = seen
+            .iter()
+            .filter(|(alias, max_tool_iterations)| {
+                alias == "entrypoint-profile-agent" && *max_tool_iterations == 3
+            })
+            .count();
+
+        assert_eq!(
+            matching, 2,
+            "run and process_message must both resolve runtime_profiles.*.max_tool_iterations \
+             before provider setup; observed {seen:?}"
         );
     }
 
