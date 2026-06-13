@@ -5,6 +5,7 @@
 //! one table so adding one is data, not control flow.
 
 pub mod container;
+pub mod docker_tags;
 pub mod flake;
 pub mod packaging;
 pub mod setup_bat;
@@ -63,6 +64,11 @@ fn registry() -> Vec<Surface> {
             name: "flake",
             file: "flake.nix",
             render: |root, cur| flake::render_file(root, cur),
+        },
+        Surface {
+            name: "docker-tags",
+            file: "dev/ci/docker-tags.json",
+            render: |root, cur| docker_tags::render_file(root, cur),
         },
     ]
 }
