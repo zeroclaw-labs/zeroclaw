@@ -320,13 +320,12 @@ struct ProviderErrorDiagnostic {
     endpoint: Option<String>,
 }
 
-fn sanitized_url_endpoint(url: &reqwest::Url) -> String {
-    let mut clean = url.clone();
-    let _ = clean.set_username("");
-    let _ = clean.set_password(None);
-    clean.set_query(None);
-    clean.set_fragment(None);
-    clean.to_string()
+fn sanitized_url_endpoint(mut url: reqwest::Url) -> String {
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
 }
 
 fn endpoint_from_error_text(text: &str) -> Option<String> {
@@ -335,12 +334,10 @@ fn endpoint_from_error_text(text: &str) -> Option<String> {
         .split(|c: char| c.is_whitespace() || matches!(c, ')' | ',' | ';' | '"'))
         .next()
         .unwrap_or("");
-    let endpoint = raw.trim_end_matches([':', '.', ']']);
-    if endpoint.is_empty() {
-        None
-    } else {
-        Some(super::sanitize_api_error(endpoint))
-    }
+    let url = reqwest::Url::parse(raw)
+        .or_else(|_| reqwest::Url::parse(raw.trim_end_matches([':', '.'])))
+        .ok()?;
+    Some(super::sanitize_api_error(&sanitized_url_endpoint(url)))
 }
 
 fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
@@ -348,7 +345,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
     let lower = error_detail.to_lowercase();
     let endpoint = err
         .downcast_ref::<reqwest::Error>()
-        .and_then(|reqwest_err| reqwest_err.url().map(sanitized_url_endpoint))
+        .and_then(|reqwest_err| reqwest_err.url().cloned().map(sanitized_url_endpoint))
         .or_else(|| endpoint_from_error_text(&error_detail));
 
     if is_context_window_exceeded(err) {
@@ -2265,6 +2262,91 @@ mod tests {
             Some("https://api.deepseek.com/chat/completions")
         );
         assert!(diagnostic.hint.contains("VPN"));
+    }
+
+    #[test]
+    fn endpoint_from_error_text_strips_url_userinfo() {
+        let endpoint = endpoint_from_error_text(
+            "error sending request for url \
+             (https://user:hunter2@inference.host/v1?token=hunter2#debug): timed out",
+        );
+
+        assert_eq!(endpoint.as_deref(), Some("https://inference.host/v1"));
+    }
+
+    #[test]
+    fn endpoint_from_error_text_drops_unparseable_urls() {
+        let endpoint = endpoint_from_error_text("error sending request to https://:not-a-url");
+
+        assert_eq!(endpoint, None);
+    }
+
+    #[test]
+    fn endpoint_from_error_text_preserves_ipv6_host_brackets() {
+        let bare = endpoint_from_error_text("error sending request for url (http://[::1]): failed");
+        let with_port = endpoint_from_error_text(
+            "error sending request for url (http://[::1]:8080/v1): failed",
+        );
+
+        assert_eq!(bare.as_deref(), Some("http://[::1]/"));
+        assert_eq!(with_port.as_deref(), Some("http://[::1]:8080/v1"));
+    }
+
+    #[test]
+    fn provider_error_diagnostic_classifies_text_error_branches() {
+        let cases = [
+            (
+                "input exceeds the context window of this model",
+                "context_window",
+                "request_validation",
+                "larger-context model",
+            ),
+            (
+                "401 Unauthorized: invalid api key",
+                "auth",
+                "http_response",
+                "credentials",
+            ),
+            (
+                "429 Too Many Requests",
+                "rate_limited",
+                "http_response",
+                "quota",
+            ),
+            (
+                "client error (Connect): operation timed out",
+                "connect_timeout",
+                "tls_or_connect",
+                "VPN",
+            ),
+            (
+                "request timed out while waiting for provider",
+                "timeout",
+                "request",
+                "timed out",
+            ),
+            ("dns resolve failed for provider host", "dns", "dns", "DNS"),
+            (
+                "model gpt-missing does not exist",
+                "model_not_found",
+                "http_response",
+                "model id",
+            ),
+            (
+                "provider returned an opaque transport error",
+                "provider_error",
+                "unknown",
+                "inspect provider error",
+            ),
+        ];
+
+        for (message, expected_kind, expected_phase, expected_hint) in cases {
+            let diagnostic = provider_error_diagnostic(&anyhow::Error::msg(message));
+
+            assert_eq!(diagnostic.kind, expected_kind, "{message}");
+            assert_eq!(diagnostic.phase, expected_phase, "{message}");
+            assert!(diagnostic.hint.contains(expected_hint), "{message}");
+        }
     }
 
     #[test]

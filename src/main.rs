@@ -3447,6 +3447,8 @@ async fn main() -> Result<()> {
                                 paircode_no_code_message(
                                     &host,
                                     port,
+                                    &config.gateway.host,
+                                    config.gateway.port,
                                     &action,
                                     config.gateway.require_pairing,
                                     message.as_deref(),
@@ -5831,6 +5833,8 @@ fn gateway_admin_url(host: &str, port: u16, path_prefix: Option<&str>, admin_pat
 fn paircode_no_code_message(
     host: &str,
     port: u16,
+    default_host: &str,
+    default_port: u16,
     action: &PaircodeAction,
     require_pairing: bool,
     gateway_message: Option<&str>,
@@ -5860,10 +5864,22 @@ fn paircode_no_code_message(
                     .into(),
             );
             lines.push("To pair another device, run:".into());
-            lines.push(paircode_command(host, port, Some("--new")));
+            lines.push(paircode_command(
+                host,
+                port,
+                default_host,
+                default_port,
+                Some("--new"),
+            ));
             lines.push(String::new());
             lines.push("To revoke existing pairings and mint a replacement code, run:".into());
-            lines.push(paircode_command(host, port, Some("--rotate")));
+            lines.push(paircode_command(
+                host,
+                port,
+                default_host,
+                default_port,
+                Some("--rotate"),
+            ));
         }
         PaircodeAction::AddClient => {
             lines.push(
@@ -5874,12 +5890,24 @@ fn paircode_no_code_message(
                 "Try again shortly, or revoke existing pairings and mint a replacement code:"
                     .into(),
             );
-            lines.push(paircode_command(host, port, Some("--rotate")));
+            lines.push(paircode_command(
+                host,
+                port,
+                default_host,
+                default_port,
+                Some("--rotate"),
+            ));
         }
         PaircodeAction::RotateAll | PaircodeAction::RotateDevice(_) => {
             lines.push("The rotate request completed without returning a replacement code.".into());
             lines.push("Check whether pairing is enabled, then request a new device code:".into());
-            lines.push(paircode_command(host, port, Some("--new")));
+            lines.push(paircode_command(
+                host,
+                port,
+                default_host,
+                default_port,
+                Some("--new"),
+            ));
         }
     }
 
@@ -5890,16 +5918,22 @@ fn paircode_no_code_message(
 }
 
 #[cfg(feature = "agent-runtime")]
-fn paircode_command(host: &str, port: u16, flag: Option<&str>) -> String {
+fn paircode_command(
+    host: &str,
+    port: u16,
+    default_host: &str,
+    default_port: u16,
+    flag: Option<&str>,
+) -> String {
     let mut command = "    zeroclaw gateway get-paircode".to_string();
     if let Some(flag) = flag {
         command.push(' ');
         command.push_str(flag);
     }
-    if port != 42617 {
+    if port != default_port {
         write!(command, " --port {port}").expect("writing to String cannot fail");
     }
-    if host != "127.0.0.1" {
+    if host != default_host {
         write!(command, " --host {host}").expect("writing to String cannot fail");
     }
     command
@@ -6283,6 +6317,8 @@ async fn run_gateway_if_enabled(
     config: zeroclaw::config::Config,
     tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
 ) -> anyhow::Result<()> {
+    let default_host = config.gateway.host.clone();
+    let default_port = config.gateway.port;
     // Standalone gateway (no daemon supervisor): pass None for reload_tx so
     // /admin/reload returns 503 with a clear "no supervisor; restart
     // manually" message, None for tui_registry (no TUI socket), and None
@@ -6293,7 +6329,10 @@ async fn run_gateway_if_enabled(
     .await;
     match result {
         Err(err) if is_addr_in_use_error(&err) => {
-            anyhow::bail!("{}", gateway_addr_in_use_message(host, port));
+            anyhow::bail!(
+                "{}",
+                gateway_addr_in_use_message(host, port, &default_host, default_port)
+            );
         }
         other => other,
     }
@@ -6318,10 +6357,16 @@ fn is_addr_in_use_error(err: &anyhow::Error) -> bool {
     })
 }
 
-fn gateway_addr_in_use_message(host: &str, port: u16) -> String {
-    const DEFAULT_GATEWAY_HOST: &str = "127.0.0.1";
-    const DEFAULT_GATEWAY_PORT: u16 = 42617;
+fn is_default_gateway_addr(host: &str, port: u16, default_host: &str, default_port: u16) -> bool {
+    host == default_host && port == default_port
+}
 
+fn gateway_addr_in_use_message(
+    host: &str,
+    port: u16,
+    default_host: &str,
+    default_port: u16,
+) -> String {
     let mut lines = vec![
         format!("Port {port} is already in use, so the gateway could not start."),
         String::new(),
@@ -6330,13 +6375,16 @@ fn gateway_addr_in_use_message(host: &str, port: u16) -> String {
         String::new(),
     ];
 
-    if host == DEFAULT_GATEWAY_HOST && port == DEFAULT_GATEWAY_PORT {
-        lines.push(format!(
-            "    open http://{DEFAULT_GATEWAY_HOST}:{DEFAULT_GATEWAY_PORT}"
-        ));
+    if is_default_gateway_addr(host, port, default_host, default_port) {
+        lines.push(format!("    open http://{host}:{port}"));
     }
 
-    lines.push(gateway_paircode_recovery_command(host, port));
+    lines.push(gateway_paircode_recovery_command(
+        host,
+        port,
+        default_host,
+        default_port,
+    ));
     lines.push(format!(
         "    zeroclaw gateway start --port {}",
         next_gateway_port(port)
@@ -6349,13 +6397,18 @@ fn gateway_addr_in_use_message(host: &str, port: u16) -> String {
     lines.join("\n")
 }
 
-fn gateway_paircode_recovery_command(host: &str, port: u16) -> String {
-    if host == "127.0.0.1" && port == 42617 {
+fn gateway_paircode_recovery_command(
+    host: &str,
+    port: u16,
+    default_host: &str,
+    default_port: u16,
+) -> String {
+    if host == default_host && port == default_port {
         return "    zeroclaw gateway get-paircode".to_string();
     }
 
     let mut command = format!("    zeroclaw gateway get-paircode --port {port}");
-    if host != "127.0.0.1" {
+    if host != default_host {
         write!(command, " --host {host}").expect("writing to String cannot fail");
     }
     command
@@ -6667,9 +6720,12 @@ mod tests {
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn paircode_no_code_message_explains_bare_command_does_not_mint() {
+        let default = config::GatewayConfig::default();
         let msg = paircode_no_code_message(
             "127.0.0.1",
             42617,
+            &default.host,
+            default.port,
             &PaircodeAction::Show,
             true,
             Some("Pairing is active but no new code available (already paired or code expired)"),
@@ -6684,7 +6740,16 @@ mod tests {
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn paircode_no_code_message_preserves_host_port_on_suggestions() {
-        let msg = paircode_no_code_message("192.168.1.20", 9001, &PaircodeAction::Show, true, None);
+        let default = config::GatewayConfig::default();
+        let msg = paircode_no_code_message(
+            "192.168.1.20",
+            9001,
+            &default.host,
+            default.port,
+            &PaircodeAction::Show,
+            true,
+            None,
+        );
 
         assert!(
             msg.contains("zeroclaw gateway get-paircode --new --port 9001 --host 192.168.1.20")
@@ -6697,10 +6762,32 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
+    fn paircode_no_code_message_omits_configured_default_host_port() {
+        let msg = paircode_no_code_message(
+            "192.168.1.20",
+            9001,
+            "192.168.1.20",
+            9001,
+            &PaircodeAction::Show,
+            true,
+            None,
+        );
+
+        assert!(msg.contains("zeroclaw gateway get-paircode --new\n"));
+        assert!(msg.contains("zeroclaw gateway get-paircode --rotate\n"));
+        assert!(!msg.contains("--port 9001"));
+        assert!(!msg.contains("--host 192.168.1.20"));
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
     fn paircode_no_code_message_for_new_suggests_rotate() {
+        let default = config::GatewayConfig::default();
         let msg = paircode_no_code_message(
             "127.0.0.1",
             42617,
+            &default.host,
+            default.port,
             &PaircodeAction::AddClient,
             true,
             Some("Pairing is active but no new code available (already paired or code expired)"),
@@ -6712,7 +6799,8 @@ mod tests {
 
     #[test]
     fn gateway_addr_in_use_message_guides_default_gateway_recovery() {
-        let msg = gateway_addr_in_use_message("127.0.0.1", 42617);
+        let default = config::GatewayConfig::default();
+        let msg = gateway_addr_in_use_message("127.0.0.1", 42617, &default.host, default.port);
 
         assert!(msg.contains("Port 42617 is already in use"));
         assert!(msg.contains("open http://127.0.0.1:42617"));
@@ -6723,12 +6811,22 @@ mod tests {
 
     #[test]
     fn gateway_addr_in_use_message_keeps_non_default_host_context() {
-        let msg = gateway_addr_in_use_message("192.168.1.20", 9001);
+        let default = config::GatewayConfig::default();
+        let msg = gateway_addr_in_use_message("192.168.1.20", 9001, &default.host, default.port);
 
         assert!(!msg.contains("open http://127.0.0.1:42617"));
         assert!(msg.contains("zeroclaw gateway get-paircode --port 9001 --host 192.168.1.20"));
         assert!(msg.contains("zeroclaw gateway start --port 9002"));
         assert!(msg.contains("lsof -nP -iTCP:9001 -sTCP:LISTEN"));
+    }
+
+    #[test]
+    fn gateway_addr_in_use_message_uses_configured_default_gateway_recovery() {
+        let msg = gateway_addr_in_use_message("192.168.1.20", 9001, "192.168.1.20", 9001);
+
+        assert!(msg.contains("open http://192.168.1.20:9001"));
+        assert!(msg.contains("zeroclaw gateway get-paircode\n"));
+        assert!(!msg.contains("get-paircode --port 9001"));
     }
 
     #[test]
