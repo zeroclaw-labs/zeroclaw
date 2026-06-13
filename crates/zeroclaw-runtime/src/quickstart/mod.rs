@@ -654,7 +654,7 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
             MODEL_PROVIDER_ESSENTIALS,
         ),
         FieldSection::Channel => (format!("channels.{type_key}"), CHANNEL_ESSENTIALS),
-        FieldSection::PeerGroup => (format!("peer-groups.{type_key}"), PEER_GROUP_ESSENTIALS),
+        FieldSection::PeerGroup => ("peer_groups".to_string(), PEER_GROUP_ESSENTIALS),
     };
 
     // A throwaway Config we can mutate freely. Inject one default
@@ -740,6 +740,10 @@ const MODEL_PROVIDER_ESSENTIALS: &[&str] = &[
 const CHANNEL_ESSENTIALS: &[&str] = &["bot_token", "token", "webhook_url", "allowed_users"];
 const PEER_GROUP_ESSENTIALS: &[&str] = &["channel", "external_peers", "agents", "ignore"];
 
+/// Runtime profile the Quickstart silently installs. The Runtime Profile
+/// picker was removed from every surface; apply always writes this preset.
+const FORCED_RUNTIME_PRESET: &str = "unbounded";
+
 fn apply_into(
     config: &mut Config,
     submission: &BuilderSubmission,
@@ -770,14 +774,17 @@ fn apply_into(
         &risk_alias,
     );
 
-    let runtime_alias = apply_named_preset(
-        config,
-        &submission.runtime_profile,
-        QuickstartStep::RuntimeProfile,
-        runtime_preset_keys,
-        write_runtime_preset,
-        errors,
-    )?;
+    let runtime_alias = match write_runtime_preset(config, FORCED_RUNTIME_PRESET) {
+        Ok(alias) => alias,
+        Err(msg) => {
+            errors.push(QuickstartError::new(
+                QuickstartStep::RuntimeProfile,
+                "",
+                msg,
+            ));
+            return None;
+        }
+    };
     emit_selector_pick(
         ctx,
         "runtime_profile",
@@ -1049,10 +1056,6 @@ where
 
 fn risk_preset_keys(config: &Config) -> Vec<String> {
     config.risk_profiles.keys().cloned().collect()
-}
-
-fn runtime_preset_keys(config: &Config) -> Vec<String> {
-    config.runtime_profiles.keys().cloned().collect()
 }
 
 fn write_risk_preset(config: &mut Config, preset_name: &str) -> Result<String, String> {
@@ -1335,7 +1338,7 @@ fn apply_peer_groups(
             ));
             continue;
         }
-        if let Err(err) = config.create_map_key("peer-groups", &pg.name) {
+        if let Err(err) = config.create_map_key("peer_groups", &pg.name) {
             errors.push(QuickstartError::new(
                 QuickstartStep::Channels,
                 format!("peer_groups[{idx}]"),
@@ -1343,7 +1346,7 @@ fn apply_peer_groups(
             ));
             continue;
         }
-        let prefix = format!("peer-groups.{}", pg.name);
+        let prefix = format!("peer_groups.{}", pg.name);
         if let Err(err) = config.set_prop_persistent(&format!("{prefix}.channel"), &pg.channel) {
             errors.push(QuickstartError::new(
                 QuickstartStep::Channels,
@@ -1602,20 +1605,53 @@ fn section_has_alias(config: &Config, prefix: &str, family: &str, alias: &str) -
     false
 }
 
-/// Live model catalog for a provider type. `(models, live)`:
+/// Live model catalog for a provider type. `(models, pricing, live)`:
 /// `live=true` means surfaces should render a picker; `live=false`
-/// means fall back to free text. Tries `ModelProvider::list_models()`
-/// first, then the family catalog table.
-pub async fn model_catalog(model_provider: &str) -> (Vec<String>, bool) {
+/// means fall back to free text. Tries `ModelProvider::list_models_with_pricing()`
+/// first, then the family catalog table (no pricing for fallbacks).
+pub async fn model_catalog(
+    model_provider: &str,
+) -> (
+    Vec<String>,
+    Option<std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing>>,
+    bool,
+) {
     if let Ok(handle) = zeroclaw_providers::create_model_provider(model_provider, None)
-        && let Ok(models) = handle.list_models().await
+        && let Ok(models) = handle.list_models_with_pricing().await
         && !models.is_empty()
     {
-        return (models, true);
+        let raw_pricing: std::collections::HashMap<
+            String,
+            zeroclaw_api::model_provider::ModelPricing,
+        > = models
+            .iter()
+            .filter_map(|m| m.pricing.as_ref().map(|p| (m.id.clone(), p.clone())))
+            .collect();
+        let ids = models.into_iter().map(|m| m.id).collect();
+        let Some(ids) =
+            zeroclaw_providers::catalog::sort_model_catalog_for_chat(model_provider, ids)
+        else {
+            return (Vec::new(), None, false);
+        };
+        let pricing: std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing> =
+            ids.iter()
+                .filter_map(|id| raw_pricing.get(id).map(|p| (id.clone(), p.clone())))
+                .collect();
+        let pricing = if pricing.is_empty() {
+            None
+        } else {
+            Some(pricing)
+        };
+        return (ids, pricing, true);
     }
     match zeroclaw_providers::catalog::list_models_for_family(model_provider).await {
-        Ok(models) if !models.is_empty() => (models, true),
-        _ => (Vec::new(), false),
+        Ok(models) if !models.is_empty() => (
+            zeroclaw_providers::catalog::sort_model_catalog_for_chat(model_provider, models)
+                .unwrap_or_default(),
+            None,
+            true,
+        ),
+        _ => (Vec::new(), None, false),
     }
 }
 
@@ -1946,21 +1982,23 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_preset_profiles_persist_to_disk() {
+        // The runtime profile picker was removed; apply silently forces the
+        // `unbounded` preset regardless of the submitted runtime value.
         let (dir, applied) = apply_to_temp(fresh_submission("bot")).await;
         assert!(applied.risk_profiles.contains_key("balanced"));
-        assert!(applied.runtime_profiles.contains_key("balanced"));
+        assert!(applied.runtime_profiles.contains_key("unbounded"));
         let reloaded = reload(&dir);
         assert!(
             reloaded.risk_profiles.contains_key("balanced"),
             "risk_profiles.balanced must survive save_dirty + reload, not dangle"
         );
         assert!(
-            reloaded.runtime_profiles.contains_key("balanced"),
-            "runtime_profiles.balanced must survive save_dirty + reload, not dangle"
+            reloaded.runtime_profiles.contains_key("unbounded"),
+            "runtime_profiles.unbounded must survive save_dirty + reload, not dangle"
         );
         let agent = reloaded.agents.get("bot").expect("agent persisted");
         assert_eq!(agent.risk_profile, "balanced");
-        assert_eq!(agent.runtime_profile, "balanced");
+        assert_eq!(agent.runtime_profile, "unbounded");
     }
 
     #[tokio::test]
@@ -1991,5 +2029,40 @@ mod tests {
             "second channel must also be bound; got {bound:?}"
         );
         assert_eq!(bound.len(), 2, "both channels bound, not just the last");
+    }
+
+    #[tokio::test]
+    async fn peer_groups_persist_to_canonical_section() {
+        let mut submission = fresh_submission("bot");
+        submission.channels = vec![SelectorChoice::Fresh(ChannelQuickStart {
+            channel_type: "telegram".into(),
+            alias: "tg".into(),
+            token: Some("tok-a".into()),
+        })];
+        submission.peer_groups = vec![zeroclaw_config::presets::QuickstartPeerGroup {
+            name: "team".into(),
+            channel: "telegram.tg".into(),
+            external_peers: vec!["*".into()],
+            ignore: vec![],
+        }];
+
+        let (dir, _applied) = apply_to_temp(submission).await;
+        let raw = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(
+            raw.contains("[peer_groups.team]"),
+            "Quickstart must serialize peer groups through canonical snake_case paths:\n{raw}"
+        );
+        assert!(
+            !raw.contains("[peer-groups.team]"),
+            "Quickstart must not write the stale kebab-case peer-groups path:\n{raw}"
+        );
+
+        let reloaded = reload(&dir);
+        let group = reloaded
+            .peer_groups
+            .get("team")
+            .expect("peer group persisted");
+        assert_eq!(group.channel, "telegram.tg");
+        assert_eq!(group.external_peers, vec!["*".to_string()]);
     }
 }

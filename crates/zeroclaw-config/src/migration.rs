@@ -120,7 +120,7 @@ pub struct GenerateOptions<'a> {
     /// Encrypt secret-bearing string values in the output. Works at every
     /// schema version via [`encrypt_secret_strings`], which walks the TOML
     /// and ChaCha20-Poly1305-encrypts any leaf whose key name appears in
-    /// [`SECRET_KEY_NAMES`].
+    /// `SECRET_KEY_NAMES`.
     pub encrypt_secrets: bool,
     /// Directory containing (or to receive) the `.secret_key` used for
     /// `enc2:` encryption. Required when `encrypt_secrets` is true. The
@@ -141,7 +141,7 @@ pub struct GenerateOptions<'a> {
 ///
 /// When [`GenerateOptions::encrypt_secrets`] is set, secret-bearing
 /// string values (api_key, bot_token, access_token, etc. — see
-/// [`SECRET_KEY_NAMES`]) are ChaCha20-Poly1305-encrypted with the
+/// `SECRET_KEY_NAMES`) are ChaCha20-Poly1305-encrypted with the
 /// `.secret_key` under `secret_store_dir`. Works at every version.
 pub fn generate(target_version: u32, opts: &GenerateOptions<'_>) -> Result<String> {
     if target_version == 0 || target_version > CURRENT_SCHEMA_VERSION {
@@ -193,7 +193,7 @@ fn secret_key_names() -> &'static std::collections::HashSet<&'static str> {
 }
 
 /// Walk a TOML tree and encrypt every string leaf whose terminal key
-/// name appears in [`secret_key_names`]. Strings already in `enc2:` /
+/// name appears in `secret_key_names`. Strings already in `enc2:` /
 /// `enc:` form are left alone (idempotent). Arrays of strings under a
 /// matching key (e.g. `paired_tokens`) are encrypted element-wise.
 ///
@@ -383,6 +383,7 @@ fn deserialize_resilient(value: toml::Value) -> ResilientLoad {
     let mut dropped: Vec<String> = Vec::new();
     prune_bad_channel_aliases(&mut salvaged, &mut dropped);
     prune_bad_channel_types(&mut salvaged, &mut dropped);
+    prune_bad_provider_aliases(&mut salvaged, &mut dropped);
     prune_bad_top_level_sections(&mut salvaged, &mut dropped);
 
     let mut whole_config_lost = false;
@@ -530,6 +531,77 @@ fn prune_bad_channel_aliases(value: &mut toml::Value, dropped: &mut Vec<String>)
             dropped.push(format!("channels.{chan_type}.{alias}"));
         }
     }
+}
+
+/// Drop each `[providers.<kind>.<family>.<alias>]` that fails to deserialize,
+/// checked in isolation so valid siblings survive. Without this, one
+/// malformed provider alias makes `prune_bad_top_level_sections` drop the
+/// whole `providers` section: every model/tts/transcription provider
+/// vanishes on reload while agents.*.model_provider references dangle.
+/// Appends `providers.<kind>.<family>.<alias>`.
+fn prune_bad_provider_aliases(value: &mut toml::Value, dropped: &mut Vec<String>) {
+    let Some(provider_kinds) = value
+        .as_table_mut()
+        .and_then(|root| root.get_mut("providers"))
+        .and_then(toml::Value::as_table_mut)
+    else {
+        return;
+    };
+
+    // Non-table nodes where a kind/family map is required (e.g.
+    // `[providers.models] ollama = "oops"`) would otherwise still sink the
+    // whole section in prune_bad_top_level_sections. Drop just the node.
+    let scalar_kinds: Vec<String> = provider_kinds
+        .iter()
+        .filter(|(_, v)| !v.is_table())
+        .map(|(k, _)| k.clone())
+        .collect();
+    for kind in scalar_kinds {
+        provider_kinds.remove(&kind);
+        dropped.push(format!("providers.{kind}"));
+    }
+
+    for (kind, families) in provider_kinds.iter_mut() {
+        let family_table = families.as_table_mut().expect("scalar kinds pruned above");
+        let scalar_families: Vec<String> = family_table
+            .iter()
+            .filter(|(_, v)| !v.is_table())
+            .map(|(k, _)| k.clone())
+            .collect();
+        for family in scalar_families {
+            family_table.remove(&family);
+            dropped.push(format!("providers.{kind}.{family}"));
+        }
+        for (family, aliases) in family_table.iter_mut() {
+            let alias_table = aliases
+                .as_table_mut()
+                .expect("scalar families pruned above");
+            let invalid: Vec<String> = alias_table
+                .iter()
+                .filter(|(_, v)| provider_alias_is_invalid(kind, family, v))
+                .map(|(k, _)| k.clone())
+                .collect();
+            for alias in invalid {
+                alias_table.remove(&alias);
+                dropped.push(format!("providers.{kind}.{family}.{alias}"));
+            }
+        }
+    }
+}
+
+/// True when `[providers.<kind>.<family>.<alias>]`, wrapped alone, fails to
+/// deserialize. Unknown families pass (serde ignores them); only a
+/// known-family alias with bad field data is invalid.
+fn provider_alias_is_invalid(kind: &str, family: &str, alias_value: &toml::Value) -> bool {
+    let mut inner = toml::value::Table::new();
+    inner.insert("probe".to_string(), alias_value.clone());
+    let mut family_table = toml::value::Table::new();
+    family_table.insert(family.to_string(), toml::Value::Table(inner));
+    let mut kind_table = toml::value::Table::new();
+    kind_table.insert(kind.to_string(), toml::Value::Table(family_table));
+    let mut root = toml::value::Table::new();
+    root.insert("providers".to_string(), toml::Value::Table(kind_table));
+    toml::Value::Table(root).try_into::<Config>().is_err()
 }
 
 /// Drop each `[channels.<type>]` block still blocking the load after alias
@@ -1010,6 +1082,92 @@ from_address = "a@example.com"
         assert!(
             !cfg.channels.email.contains_key("fakeemail"),
             "invalid alias must be pruned"
+        );
+    }
+
+    #[test]
+    fn valid_provider_aliases_survive_broken_sibling() {
+        // Repro for the zerocode "all providers vanish after restart" report:
+        // one malformed provider alias must not take the whole [providers]
+        // section (and every other provider) down with it.
+        let raw = r#"
+schema_version = 3
+
+[providers.models.ollama.ai]
+model = "qwen3:30b"
+
+[providers.models.custom.rag_bot]
+uri = "http://localhost:8000/v1"
+model = "m"
+
+[providers.models.custom.broken]
+uri = "http://localhost:9000/v1"
+model = "m"
+temperature = "hot"
+"#;
+        let load = migrate_to_current_salvaged(raw);
+        assert_eq!(load.dropped, vec!["providers.models.custom.broken"]);
+        assert!(
+            load.config.providers.models.find("ollama", "ai").is_some(),
+            "valid alias in another family must survive"
+        );
+        assert!(
+            load.config
+                .providers
+                .models
+                .find("custom", "rag_bot")
+                .is_some(),
+            "valid sibling alias must survive"
+        );
+        assert!(
+            load.config
+                .providers
+                .models
+                .find("custom", "broken")
+                .is_none(),
+            "only the malformed alias is pruned"
+        );
+    }
+
+    #[test]
+    fn provider_pruner_never_panics_on_non_table_shapes() {
+        // Array-of-tables where a family map is expected, scalar [providers],
+        // array alias value. The salvage path is the daemon's never-fail
+        // loader, and prune_bad_provider_aliases carries expect() calls that
+        // rely on the scalar pre-passes; pin that invariant here.
+        for raw in [
+            "schema_version = 3\nproviders = 3\n",
+            "schema_version = 3\n[[providers.models.ollama]]\nmodel = \"x\"\n",
+            "schema_version = 3\n[providers.models.ollama]\nai = [1, 2]\n",
+            "schema_version = 3\n[providers.models]\nollama = [1]\n",
+        ] {
+            let _ = migrate_to_current_salvaged(raw);
+        }
+    }
+
+    #[test]
+    fn scalar_provider_nodes_pruned_without_sinking_section() {
+        // A scalar where a family/kind table is required must drop only
+        // that node, not the whole [providers] section.
+        let raw = r#"
+schema_version = 3
+
+[providers.models]
+ollama = "oops"
+
+[providers.models.custom.rag_bot]
+uri = "http://localhost:8000/v1"
+model = "m"
+"#;
+        let load = migrate_to_current_salvaged(raw);
+        assert_eq!(load.dropped, vec!["providers.models.ollama"]);
+        assert!(
+            load.config
+                .providers
+                .models
+                .find("custom", "rag_bot")
+                .is_some(),
+            "valid alias must survive a scalar sibling family"
         );
     }
 

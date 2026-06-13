@@ -14,8 +14,8 @@
 //!   [`RuntimeProfileConfig`] field values. The Quickstart writes
 //!   these verbatim into the corresponding config table on apply.
 //!
-//! Adding or removing a preset is one row in the [`risk_presets!`] /
-//! [`runtime_presets!`] table below; every consumer dispatches off
+//! Adding or removing a preset is one row in the `risk_presets!` /
+//! `runtime_presets!` table below; every consumer dispatches off
 //! `&'static [RiskPreset]` / `&'static [RuntimePreset]` so drift is
 //! impossible.
 //!
@@ -221,7 +221,6 @@ fn tight_runtime() -> RuntimeProfileConfig {
         tool_dispatcher: None,
         tool_call_dedup_exempt: vec![],
         max_system_prompt_chars: Some(4_000),
-        context_aware_tools: Some(true),
         max_tool_result_chars: Some(8_000),
         keep_tool_context_turns: Some(2),
         memory_recall_limit: Some(3),
@@ -257,7 +256,6 @@ fn unbounded_runtime() -> RuntimeProfileConfig {
         tool_dispatcher: None,
         tool_call_dedup_exempt: vec![],
         max_system_prompt_chars: Some(64_000),
-        context_aware_tools: Some(true),
         max_tool_result_chars: Some(64_000),
         keep_tool_context_turns: Some(8),
         memory_recall_limit: Some(10),
@@ -408,13 +406,13 @@ pub struct BuilderSubmission {
 }
 
 /// Peer-group entry staged in the Quickstart. Maps 1:1 to a
-/// `[peer-groups.<name>]` table written at apply time. The `channel`
+/// `[peer_groups.<name>]` table written at apply time. The `channel`
 /// field carries a `<type>.<alias>` ref pointing at either a staged
 /// channel from the same submission or a pre-existing one.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct QuickstartPeerGroup {
-    /// Map key written to `peer-groups.<name>`. Synthesized by surfaces
+    /// Map key written to `peer_groups.<name>`. Synthesized by surfaces
     /// from the channel ref so no `match` table is involved.
     pub name: String,
     /// Channel ref (`<type>.<alias>`) the peer group authorizes.

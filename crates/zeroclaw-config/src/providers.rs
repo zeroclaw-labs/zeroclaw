@@ -14,19 +14,19 @@ use super::schema::{
     GeminiCliModelProviderConfig, GeminiModelProviderConfig, GithubModelsModelProviderConfig,
     GlmModelProviderConfig, GroqModelProviderConfig, HuggingfaceModelProviderConfig,
     HunyuanModelProviderConfig, HyperbolicModelProviderConfig, InceptionModelProviderConfig,
-    KiloCliModelProviderConfig, LambdaAiModelProviderConfig, LeptonModelProviderConfig,
-    LitellmModelProviderConfig, LlamacppModelProviderConfig, LmstudioModelProviderConfig,
-    MinimaxModelProviderConfig, MistralModelProviderConfig, ModelProviderConfig,
-    MoonshotModelProviderConfig, MorphModelProviderConfig, NebiusModelProviderConfig,
-    NovitaModelProviderConfig, NscaleModelProviderConfig, NvidiaModelProviderConfig,
-    OllamaModelProviderConfig, OpenAIModelProviderConfig, OpenRouterModelProviderConfig,
-    OpencodeModelProviderConfig, OsaurusModelProviderConfig, OvhModelProviderConfig,
-    PerplexityModelProviderConfig, QianfanModelProviderConfig, QwenModelProviderConfig,
-    RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
-    SiliconflowModelProviderConfig, StepfunModelProviderConfig, SyntheticModelProviderConfig,
-    TelnyxModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
-    VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
-    XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    KiloCliModelProviderConfig, KiloModelProviderConfig, LambdaAiModelProviderConfig,
+    LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
+    LmstudioModelProviderConfig, MinimaxModelProviderConfig, MistralModelProviderConfig,
+    ModelProviderConfig, MoonshotModelProviderConfig, MorphModelProviderConfig,
+    NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
+    NvidiaModelProviderConfig, OllamaModelProviderConfig, OpenAIModelProviderConfig,
+    OpenRouterModelProviderConfig, OpencodeModelProviderConfig, OsaurusModelProviderConfig,
+    OvhModelProviderConfig, PerplexityModelProviderConfig, QianfanModelProviderConfig,
+    QwenModelProviderConfig, RekaModelProviderConfig, SambanovaModelProviderConfig,
+    SglangModelProviderConfig, SiliconflowModelProviderConfig, StepfunModelProviderConfig,
+    SyntheticModelProviderConfig, TelnyxModelProviderConfig, TogetherModelProviderConfig,
+    UpstageModelProviderConfig, VeniceModelProviderConfig, VercelModelProviderConfig,
+    VllmModelProviderConfig, XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
 };
 use super::schema::{
     AssemblyAiTranscriptionProviderConfig, DeepgramTranscriptionProviderConfig,
@@ -247,7 +247,9 @@ macro_rules! for_each_model_provider_slot {
             (lambda_ai, "lambda_ai", LambdaAiModelProviderConfig),
             (inception, "inception", InceptionModelProviderConfig),
             (synthetic, "synthetic", SyntheticModelProviderConfig),
-            (opencode, "opencode", OpencodeModelProviderConfig),            (kilocli, "kilocli", KiloCliModelProviderConfig),
+            (opencode, "opencode", OpencodeModelProviderConfig),
+            (kilocli, "kilocli", KiloCliModelProviderConfig),
+            (kilo, "kilo", KiloModelProviderConfig),
             (custom, "custom", CustomModelProviderConfig),
         }
     };
@@ -263,11 +265,11 @@ macro_rules! emit_model_providers_struct {
         /// extras visible at the type level).
         ///
         /// TOML shape is preserved byte-identical: each named field deserializes
-        /// from the same `[model_providers.<type>.<alias>]` block as before.
+        /// from the same `[providers.models.<type>.<alias>]` block as before.
         ///
         /// Adding a new model_provider family means: define the typed config in
-        /// `schema.rs`, then add one row to `for_each_model_provider_slot!` —
-        /// every helper picks up the new slot automatically.
+        /// `schema.rs`, then add one row to `for_each_model_provider_slot!`,
+        /// and every helper picks up the new slot automatically.
         #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
         #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
         #[prefix = "providers.models"]
@@ -443,6 +445,21 @@ impl ModelProviders {
             };
         }
         for_each_model_provider_slot!(emit_aliases)
+    }
+
+    /// Canonical family slot names, straight from
+    /// `for_each_model_provider_slot!`. Use this to distinguish "unknown
+    /// family" from "known family, missing alias" in validation messages,
+    /// and to detect raw-TOML sections that deserialization silently drops.
+    #[must_use]
+    pub fn slot_names() -> &'static [&'static str] {
+        macro_rules! emit_slot_names {
+            ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
+                &[$($type_str),+]
+            };
+        }
+        const NAMES: &[&str] = for_each_model_provider_slot!(emit_slot_names);
+        NAMES
     }
 
     /// Remove the entry for `<provider_type>.<alias>`, returning whether it
@@ -787,6 +804,36 @@ macro_rules! for_each_transcription_provider_slot {
             (local_whisper, "local_whisper"),
         }
     };
+}
+
+/// Collect the `$type_str` names out of a rate-typed slot macro
+/// (`for_each_tts_provider_slot!` / `for_each_transcription_provider_slot!`).
+/// The `$rate_ty` head is consumed and ignored; the macro exists so
+/// `slot_names()` derives from the same source the structs are built from.
+macro_rules! collect_rate_slot_names {
+    ($rate_ty:ty, $(($field:ident, $type_str:literal)),+ $(,)?) => {
+        &[$($type_str),+]
+    };
+}
+
+impl TtsProviders {
+    /// Canonical TTS family slot names, derived from
+    /// `for_each_tts_provider_slot!`.
+    #[must_use]
+    pub fn slot_names() -> &'static [&'static str] {
+        const NAMES: &[&str] = for_each_tts_provider_slot!(collect_rate_slot_names, ());
+        NAMES
+    }
+}
+
+impl TranscriptionProviders {
+    /// Canonical transcription family slot names, derived from
+    /// `for_each_transcription_provider_slot!`.
+    #[must_use]
+    pub fn slot_names() -> &'static [&'static str] {
+        const NAMES: &[&str] = for_each_transcription_provider_slot!(collect_rate_slot_names, ());
+        NAMES
+    }
 }
 
 /// Emit a `<Family>CostRatesByProvider` struct from a slot list. Used

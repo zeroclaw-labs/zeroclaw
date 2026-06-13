@@ -1,0 +1,76 @@
+# Peer-group snippet parameters. One row per channel that documents peer-group
+# gating. The generator (`cargo mdbook peer-groups`) renders one snippet per
+# entry from a single template; channel pages include their snippet. Keys are
+# validated against the canonical channel inventory in zeroclaw-config, so a
+# typo'd or removed channel fails the build loudly.
+#
+# Fields:
+#   key             channel type (must match a real [channels.<key>] type)
+#   sender_desc     prose describing the native sender identifier
+#   sender_example  neutral, non-personal example of that identifier shape
+#   agents_example  optional example peer-agent aliases for the example block
+#   ignore_example  optional example blocked sender for the example block
+
+[[channel]]
+key = "matrix"
+sender_desc = "the full Matrix user ID, `@user:server.tld`"
+sender_example = "@user:matrix.example.org"
+
+[[channel]]
+key = "signal"
+sender_desc = "an E.164 phone number or a signal-cli source identifier"
+sender_example = "+15550100"
+
+[[channel]]
+key = "whatsapp"
+sender_desc = "a phone identifier (Cloud API) or the JID user part (Web mode)"
+sender_example = "+15550100"
+
+[[channel]]
+key = "mattermost"
+sender_desc = "the Mattermost user UUID (not a username)"
+sender_example = "9c8f...userUUID"
+
+[[channel]]
+key = "line"
+sender_desc = "the LINE user ID"
+sender_example = "Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+[[channel]]
+key = "nextcloud"
+sender_desc = "the Nextcloud actor ID"
+sender_example = "alice"
+
+[[channel]]
+key = "discord"
+sender_desc = "the Discord user ID (snowflake)"
+sender_example = "111111111111111111"
+agents_example = ["researcher", "summariser"]
+ignore_example = "222222222222222222"
+
+[[channel]]
+key = "slack"
+sender_desc = "the Slack user ID"
+sender_example = "U01ABC2DEF3"
+agents_example = ["researcher", "summariser"]
+ignore_example = "U09XYZ8WUV7"
+
+[[channel]]
+key = "telegram"
+sender_desc = "the Telegram user ID or @username"
+sender_example = "111111111"
+
+[[channel]]
+key = "email"
+sender_desc = "the sender's email address"
+sender_example = "sender@example.com"
+
+[[channel]]
+key = "twitter"
+sender_desc = "the Twitter/X @username"
+sender_example = "example_user"
+
+[[channel]]
+key = "nostr"
+sender_desc = "the sender's hex public key"
+sender_example = "npub1exampleexampleexampleexample"

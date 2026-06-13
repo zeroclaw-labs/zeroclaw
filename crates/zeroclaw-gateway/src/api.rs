@@ -10,6 +10,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use zeroclaw_config::schema::{ChannelAliasInfo, Config};
+use zeroclaw_memory::MemoryEntry;
+
+const MEMORY_API_CONTENT_MAX_CHARS: usize = 4096;
 
 // ── Bearer token auth extractor ─────────────────────────────────
 
@@ -952,7 +955,10 @@ pub async fn handle_api_memory_list(
                         .collect(),
                     None => entries,
                 };
-                Json(serde_json::json!({"entries": entries})).into_response()
+                Json(serde_json::json!({
+                    "entries": sanitize_memory_entries_for_api(entries)
+                }))
+                .into_response()
             }
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -970,7 +976,10 @@ pub async fn handle_api_memory_list(
         });
 
         match mem.list(category.as_ref(), None).await {
-            Ok(entries) => Json(serde_json::json!({"entries": entries})).into_response(),
+            Ok(entries) => Json(serde_json::json!({
+                "entries": sanitize_memory_entries_for_api(entries)
+            }))
+            .into_response(),
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Memory list failed: {e}")})),
@@ -978,6 +987,32 @@ pub async fn handle_api_memory_list(
                 .into_response(),
         }
     }
+}
+
+fn sanitize_memory_entries_for_api(entries: Vec<MemoryEntry>) -> Vec<MemoryEntry> {
+    entries
+        .into_iter()
+        .map(|mut entry| {
+            entry.content = truncate_with_ellipsis_total_chars(entry.content);
+            entry
+        })
+        .collect()
+}
+
+fn truncate_with_ellipsis_total_chars(mut s: String) -> String {
+    if s.char_indices().nth(MEMORY_API_CONTENT_MAX_CHARS).is_none() {
+        return s;
+    }
+
+    let keep_chars = MEMORY_API_CONTENT_MAX_CHARS - 3;
+    let cut_idx = s
+        .char_indices()
+        .nth(keep_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(s.len());
+    s.truncate(cut_idx);
+    s.push_str("...");
+    s
 }
 
 /// POST /api/memory — store a memory entry
@@ -1891,7 +1926,10 @@ mod tests {
     use zeroclaw_providers::ModelProvider;
     use zeroclaw_runtime::security::pairing::PairingGuard;
 
-    struct MockMemory;
+    #[derive(Default)]
+    struct MockMemory {
+        entries: Vec<MemoryEntry>,
+    }
 
     #[async_trait]
     impl Memory for MockMemory {
@@ -1917,7 +1955,7 @@ mod tests {
             _since: Option<&str>,
             _until: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
-            Ok(Vec::new())
+            Ok(self.entries.clone())
         }
 
         async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
@@ -1929,7 +1967,7 @@ mod tests {
             _category: Option<&MemoryCategory>,
             _session_id: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
-            Ok(Vec::new())
+            Ok(self.entries.clone())
         }
 
         async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
@@ -1941,7 +1979,7 @@ mod tests {
         }
 
         async fn count(&self) -> anyhow::Result<usize> {
-            Ok(0)
+            Ok(self.entries.len())
         }
 
         async fn health_check(&self) -> bool {
@@ -2041,7 +2079,14 @@ mod tests {
             model_provider: Arc::new(MockModelProvider),
             model: "test-model".into(),
             temperature: None,
-            mem: Arc::new(MockMemory),
+            mem: Arc::new(MockMemory::default()),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(MockMemory::default()),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
             auto_save: false,
             webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
@@ -2088,6 +2133,16 @@ mod tests {
         }
     }
 
+    fn test_state_with_memory(
+        config: zeroclaw_config::schema::Config,
+        entries: Vec<MemoryEntry>,
+    ) -> AppState {
+        AppState {
+            mem: Arc::new(MockMemory { entries }),
+            ..test_state(config)
+        }
+    }
+
     async fn response_json(response: axum::response::Response) -> serde_json::Value {
         let body = response
             .into_body()
@@ -2096,6 +2151,104 @@ mod tests {
             .expect("response body")
             .to_bytes();
         serde_json::from_slice(&body).expect("valid json response")
+    }
+
+    fn memory_entry_with_content(content: String) -> MemoryEntry {
+        MemoryEntry {
+            id: "entry-1".into(),
+            key: "huge-memory".into(),
+            content,
+            category: MemoryCategory::Conversation,
+            timestamp: "2026-04-06T00:00:00Z".into(),
+            session_id: None,
+            score: None,
+            namespace: "default".into(),
+            importance: Some(0.5),
+            superseded_by: None,
+            agent_alias: None,
+            agent_id: None,
+        }
+    }
+
+    fn memory_content_from_response(json: &serde_json::Value) -> &str {
+        json["entries"][0]["content"]
+            .as_str()
+            .expect("string content")
+    }
+
+    #[test]
+    fn truncate_memory_api_content_caps_total_chars_with_ellipsis() {
+        let exact = "x".repeat(MEMORY_API_CONTENT_MAX_CHARS);
+        assert_eq!(truncate_with_ellipsis_total_chars(exact.clone()), exact);
+
+        let short = "short memory".to_string();
+        assert_eq!(truncate_with_ellipsis_total_chars(short.clone()), short);
+
+        let over = "火".repeat(MEMORY_API_CONTENT_MAX_CHARS + 1);
+        let truncated = truncate_with_ellipsis_total_chars(over.clone());
+        assert_eq!(truncated.chars().count(), MEMORY_API_CONTENT_MAX_CHARS);
+        assert!(truncated.ends_with("..."));
+        assert_ne!(truncated, over);
+    }
+
+    #[tokio::test]
+    async fn handle_api_memory_list_truncates_oversized_content() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        let huge = "x".repeat(MEMORY_API_CONTENT_MAX_CHARS + 128);
+        let state = test_state_with_memory(config, vec![memory_entry_with_content(huge.clone())]);
+
+        let response = handle_api_memory_list(
+            State(state),
+            HeaderMap::new(),
+            Query(MemoryQuery {
+                query: None,
+                category: None,
+                since: None,
+                until: None,
+                agent: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        let json = response_json(response).await;
+        let content = memory_content_from_response(&json);
+
+        assert_eq!(content.chars().count(), MEMORY_API_CONTENT_MAX_CHARS);
+        assert!(content.ends_with("..."));
+        assert_eq!(json["entries"][0]["key"], "huge-memory");
+        assert_eq!(json["entries"][0]["category"], "conversation");
+        assert_ne!(content, huge);
+    }
+
+    #[tokio::test]
+    async fn handle_api_memory_search_truncates_oversized_content_after_filtering() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        let huge = "火".repeat(MEMORY_API_CONTENT_MAX_CHARS + 128);
+        let state = test_state_with_memory(config, vec![memory_entry_with_content(huge.clone())]);
+
+        let response = handle_api_memory_list(
+            State(state),
+            HeaderMap::new(),
+            Query(MemoryQuery {
+                query: Some("huge".into()),
+                category: Some("conversation".into()),
+                since: None,
+                until: None,
+                agent: None,
+            }),
+        )
+        .await
+        .into_response();
+
+        let json = response_json(response).await;
+        let content = memory_content_from_response(&json);
+
+        assert_eq!(content.chars().count(), MEMORY_API_CONTENT_MAX_CHARS);
+        assert!(content.ends_with("..."));
+        assert_ne!(content, huge);
     }
 
     #[test]

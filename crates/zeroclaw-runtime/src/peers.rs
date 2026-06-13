@@ -129,9 +129,10 @@ pub fn resolve_peer_set(config: &Config, agent_alias: &str) -> ResolvedPeers {
 
         let ext_set = resolved.external_peers.entry(channel.clone()).or_default();
         for ext in &group.external_peers {
-            // PeerUsername is already case-folded and `@`-stripped at
-            // deserialization (multi_agent.rs).
-            ext_set.insert(ext.as_str().to_ascii_lowercase());
+            // Match the lookup side (`is_known_peer` / `allows_inbound`):
+            // channel-native usernames may be configured with or without a
+            // leading `@`, and callers may pass either form.
+            ext_set.insert(ext.as_str().trim_start_matches('@').to_ascii_lowercase());
         }
 
         for ignored in &group.ignore {
@@ -169,5 +170,29 @@ mod tests {
         // A handle of "@" (empty after stripping the @) must not match
         // every inbound; the guard only fires on a real handle.
         assert!(!should_drop_self_loop("@anyone", Some("@")));
+    }
+
+    #[test]
+    fn resolve_peer_set_normalizes_external_peer_handles_for_lookup() {
+        use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::schema::Config;
+
+        let mut config = Config::default();
+        config.peer_groups.insert(
+            "ops".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".to_string(),
+                agents: vec![AgentAlias::new("aa")],
+                external_peers: vec![PeerUsername::new("@Operator")],
+                ..PeerGroupConfig::default()
+            },
+        );
+
+        let resolved = resolve_peer_set(&config, "aa");
+
+        assert!(resolved.is_known_peer("telegram", "operator"));
+        assert!(resolved.is_known_peer("telegram", "@operator"));
+        assert!(resolved.allows_inbound("telegram", "operator"));
+        assert!(resolved.allows_inbound("telegram", "@operator"));
     }
 }

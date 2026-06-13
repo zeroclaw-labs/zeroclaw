@@ -16,12 +16,27 @@ pub use schedule::{
 pub use store::{
     add_agent_job, all_overdue_jobs, due_jobs, get_job, list_jobs, list_runs, record_last_run,
     record_last_run_with_status, record_run, remove_job, reschedule_after_run,
-    reschedule_after_run_with_status, sync_declarative_jobs, update_job,
+    reschedule_after_run_with_status, skip_missed_run, sync_declarative_jobs, update_job,
 };
 pub use types::{
     CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
     deserialize_maybe_stringified,
 };
+
+/// Channel names exposed by the cron tool schemas. Actual runtime delivery is
+/// provided by the registered channel delivery handler, not this static enum.
+pub(crate) const CRON_DELIVERY_SCHEMA_CHANNELS: &[&str] = &[
+    "telegram",
+    "discord",
+    "slack",
+    "mattermost",
+    "matrix",
+    "qq",
+    "webhook",
+    "lark",
+    "feishu",
+    "dingtalk",
+];
 
 /// Validate a shell command against an agent's security policy
 /// (allowlist + risk gate). `agent_alias` names the agent under whose

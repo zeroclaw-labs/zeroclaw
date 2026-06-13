@@ -1,13 +1,13 @@
 # API Reference
 
-Full rustdoc for every public type in the workspace, auto-generated from the `///` comments on each type, function, and module. Use this when you need to know the exact shape of a struct, the methods on a trait, or what a function returns — anything the generated reference exposes better than prose can.
+Full rustdoc for every public type in the workspace, auto-generated from the `///` comments on each type, function, and module. Use this when you need to know the exact shape of a struct, the methods on a trait, or what a function returns: anything the generated reference exposes better than prose can.
 
 **[Open the rustdoc →](../api/zeroclaw/index.html)**
 
 ## How to navigate it
 
 - The sidebar on the left lists every crate in the workspace
-- Click `zeroclaw-api` first — that's where the public traits (`Provider`, `Channel`, `Tool`) live
+- Click `zeroclaw-api` first; that's where the public traits (`Provider`, `Channel`, `Tool`) live
 - Use `cmd/ctrl+F` in the rustdoc page to search within a crate
 - Click on any trait to see implementors across the workspace
 
@@ -34,9 +34,15 @@ See [Architecture → Crates](./architecture/crates.md) for a plain-English desc
 
 The rustdoc ships with every doc deploy. For local builds:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 cargo mdbook refs     # generates CLI + config reference + rustdoc
 cargo mdbook build    # rebuilds the full book including rustdoc bridge
 ```
+
+</div>
 
 See [Maintainers → Docs & Translations](./maintainers/docs-and-translations.md).
