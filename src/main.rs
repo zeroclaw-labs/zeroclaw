@@ -3712,7 +3712,12 @@ async fn main() -> Result<()> {
                                 )
                                 .await
                             } else {
-                                Err(anyhow::anyhow!("SOP engine not registered"))
+                                zeroclaw_log::record!(
+                                    zeroclaw_log::Level::Error,
+                                    "sop_engine_not_registered",
+                                    "MQTT SOP listener started but SOP engine was not registered"
+                                );
+                                Err(anyhow::Error::msg("SOP engine not registered"))
                             }
                         })
                     }
