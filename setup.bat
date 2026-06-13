@@ -277,6 +277,30 @@ if %ERRORLEVEL% NEQ 0 (
     echo   %GREEN%OK%RESET% Added to PATH
 )
 
+:: Build and install the web dashboard so the gateway serves it. Mirrors
+:: install.sh: assets must land where the gateway auto-detects them
+:: (%LOCALAPPDATA%\zeroclaw\web\dist) so a service-launched daemon finds
+:: them regardless of working directory.
+where npm >nul 2>&1
+if %ERRORLEVEL% EQU 0 (
+    echo   Building web dashboard ^(cargo web build^)...
+    cargo web build
+    if %ERRORLEVEL% EQU 0 (
+        if exist "web\dist\index.html" (
+            mkdir "%LOCALAPPDATA%\zeroclaw\web\dist" 2>nul
+            xcopy /E /I /Y "web\dist" "%LOCALAPPDATA%\zeroclaw\web\dist" >nul
+            echo   %GREEN%OK%RESET% Web dashboard installed to %LOCALAPPDATA%\zeroclaw\web\dist
+        )
+    ) else (
+        echo   %YELLOW%WARNING: dashboard build failed; gateway runs in API-only mode.%RESET%
+        echo   %YELLOW%Re-run setup.bat once the build issue is resolved.%RESET%
+    )
+) else (
+    echo   %YELLOW%npm not found - skipping dashboard build. The gateway will run%RESET%
+    echo   %YELLOW%in API-only mode. Install Node.js and re-run setup.bat to build%RESET%
+    echo   %YELLOW%and install the dashboard.%RESET%
+)
+
 goto verify
 
 :: ---- Post install ----
