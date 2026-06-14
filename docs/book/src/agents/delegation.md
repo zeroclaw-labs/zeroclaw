@@ -131,6 +131,14 @@ This is a thin signal for the agent-loop spawn path. A dedicated "subagent start
 
 Because reachability is gated by the shared risk profile, the advertised roster (the `agent` parameter's enum in the tool schema) lists only the configured agents that share the caller's risk profile, minus the caller itself, and only when `delegation_policy.mode = "allow"`. There is no separate per-agent allow-list: the shared profile *is* the allow-list.
 
+#### Extra precondition when the target is agentic
+
+If the target agent's `[runtime_profiles.<target>].agentic = true`, a third gate fires on the target's side of the call:
+
+3. **Target's `risk_profile.allowed_tools` must be non-empty.** The agentic sub-loop builds its child tool registry by intersecting the parent's available tools with the **target's** `[risk_profiles.<target_profile>].allowed_tools`. An empty (or unset) list yields an empty intersection, which the tool refuses before invoking the model; see refusal string #10 below. The sub-loop additionally drops `delegate` from the intersection unconditionally (no recursive delegation), so a target whose entire allowlist is `["delegate"]` also refuses with #11 below.
+
+This precondition lives on the target, not the caller, but because gate 2 forces caller and target to share a risk profile, in practice it's a constraint on the **shared** profile. If the shared profile's `allowed_tools` is empty, no agentic target on that profile is reachable until the operator adds at least one tool name.
+
 ### `delegate`: output strings the model sees
 
 Exact, sourced from `crates/zeroclaw-runtime/src/tools/delegate.rs`.
@@ -150,6 +158,16 @@ Exact, sourced from `crates/zeroclaw-runtime/src/tools/delegate.rs`.
 7. Unknown target agent: error is `Unknown agent '<target>'. Available agents: <comma-separated list>`.
 8. Depth exceeded (controlled by the parent's `runtime_profile.max_delegation_depth`, default 3): error is `Delegation depth limit reached (<depth>/<max>).`
 9. Unknown action: error is `Unknown action '<value>'. Use delegate/check_result/list_results/cancel_task.`
+10. **Agentic target with empty `allowed_tools`**: when the target agent's `runtime_profile.agentic = true`, the target's `risk_profile.allowed_tools` must be non-empty. If it is empty (or unset), the refusal is:
+    ```text
+    Agent '<target>' is agentic but risk_profile '<target_profile>' has no allowed_tools
+    ```
+    The check fires before any sub-loop work. Fix it by adding at least one tool name to `[risk_profiles.<target_profile>].allowed_tools` (or by switching the target off agentic mode). The `<target_profile>` in the message is the target agent's risk profile, which, because delegation requires a shared profile (gate 2 above), is also the caller's.
+11. **Agentic target with no matching tools**: if `allowed_tools` is non-empty but, after intersecting with the parent's tool registry and excluding `delegate` (the sub-loop is never given another `delegate`), no tools remain, the refusal is:
+    ```text
+    Agent '<target>' has no executable tools after filtering allowlist (<comma-separated names>)
+    ```
+    Typical cause: every entry on `allowed_tools` is a typo, an MCP/skill tool that isn't currently registered, or the literal name `delegate`.
 
 ### `delegate`: how to verify it actually fired
 
