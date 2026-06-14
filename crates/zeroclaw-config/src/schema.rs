@@ -15065,6 +15065,87 @@ impl Config {
     /// time, so a typo'd family (`[providers.models.antropic.x]`) or one
     /// from a newer binary vanishes on reload: the alias "works" in the
     /// session that created it, then disappears after restart.
+    /// Detect provider aliases with extra nesting that causes serde to
+    /// silently drop user-supplied fields. For example:
+    ///
+    /// ```toml
+    /// [providers.models.zai.default.default]  # extra "default" level
+    /// model = "glm-5.1"
+    /// api_key = "sk-test"
+    /// ```
+    ///
+    /// This deserializes into an empty `zai.default` entry because serde
+    /// treats the inner `default` as an unknown field and drops it.
+    ///
+    /// Returns a list of warning strings like
+    /// `"providers.models.zai.default.default"`.
+    pub fn extra_nested_provider_aliases(raw_toml: &str) -> Vec<String> {
+        let raw: toml::Table = match raw_toml.parse() {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+        let Some(kinds) = raw.get("providers").and_then(toml::Value::as_table) else {
+            return Vec::new();
+        };
+        let kind_slots: &[(&str, &[&str])] = &[
+            ("models", crate::providers::ModelProviders::slot_names()),
+            ("tts", crate::providers::TtsProviders::slot_names()),
+            (
+                "transcription",
+                crate::providers::TranscriptionProviders::slot_names(),
+            ),
+        ];
+        // Known provider config field names that should appear at the
+        // alias level, not nested one level deeper.
+        const PROVIDER_FIELD_NAMES: &[&str] = &[
+            "model",
+            "api_key",
+            "uri",
+            "endpoint",
+            "wire_api",
+            "kind",
+            "temperature",
+            "fallback",
+            "enabled",
+            "extra_headers",
+        ];
+        let mut out = Vec::new();
+        for (kind, slots) in kind_slots {
+            let Some(families) = kinds.get(*kind).and_then(toml::Value::as_table) else {
+                continue;
+            };
+            for (family, aliases) in families {
+                if !slots.contains(&family.as_str()) {
+                    continue;
+                }
+                let Some(alias_table) = aliases.as_table() else {
+                    continue;
+                };
+                for (alias, value) in alias_table {
+                    let Some(inner) = value.as_table() else {
+                        continue;
+                    };
+                    // Check if any key in the inner table is itself a
+                    // table containing provider-shaped fields. This
+                    // indicates an extra nesting level.
+                    for (inner_key, inner_value) in inner {
+                        if let Some(deep_table) = inner_value.as_table() {
+                            let has_provider_fields = deep_table
+                                .keys()
+                                .any(|k| PROVIDER_FIELD_NAMES.contains(&k.as_str()));
+                            if has_provider_fields {
+                                out.push(format!(
+                                    "providers.{kind}.{family}.{alias}.{inner_key}"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
     pub fn unknown_provider_families(raw_toml: &str) -> Vec<String> {
         let raw: toml::Table = match raw_toml.parse() {
             Ok(t) => t,
@@ -15343,6 +15424,23 @@ impl Config {
                     &format!(
                         "[providers.{kind}.{family}] section dropped: not a known {kind} \
                          provider family. Its aliases will not load and {reference}."
+                    )
+                );
+            }
+            // Extra-nested provider aliases: the user wrote an extra
+            // table level (e.g. [providers.models.zai.default.default])
+            // causing serde to silently drop all provider fields.
+            for entry in Self::extra_nested_provider_aliases(&contents) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"path": entry})),
+                    &format!(
+                        "[{entry}] looks like an extra-nested provider alias — \
+                         provider fields (model, api_key, etc.) were silently dropped. \
+                         Remove one table level; the correct shape is \
+                         [providers.<kind>.<family>.<alias>]."
                     )
                 );
             }
@@ -26079,6 +26177,59 @@ model = "gpt-4o"
             vec!["models.weird".to_string()],
             "array-of-tables under an unknown family is still an unknown family"
         );
+    }
+
+    #[test]
+    async fn extra_nested_provider_aliases_detects_double_nesting() {
+        // Issue #7577: [providers.models.zai.default.default] silently
+        // drops model/api_key because serde treats the inner "default"
+        // as an unknown field.
+        let raw = r#"
+schema_version = 3
+
+[providers.models.zai.default.default]
+model = "glm-5.1"
+api_key = "sk-test"
+endpoint = "global"
+"#;
+        let flags = Config::extra_nested_provider_aliases(raw);
+        assert_eq!(
+            flags,
+            vec!["providers.models.zai.default.default".to_string()],
+            "must detect the extra-nested alias"
+        );
+
+        // Normal shape: no extra nesting.
+        let normal = r#"
+schema_version = 3
+
+[providers.models.zai.default]
+model = "glm-5.1"
+api_key = "sk-test"
+"#;
+        assert!(
+            Config::extra_nested_provider_aliases(normal).is_empty(),
+            "normal shape must not trigger"
+        );
+
+        // Non-provider sub-table should not trigger.
+        let non_provider = r#"
+schema_version = 3
+
+[providers.models.zai.default]
+model = "glm-5.1"
+
+[providers.models.zai.default.settings]
+timeout = 30
+"#;
+        assert!(
+            Config::extra_nested_provider_aliases(non_provider).is_empty(),
+            "non-provider sub-table must not trigger"
+        );
+
+        // Hostile shapes.
+        assert!(Config::extra_nested_provider_aliases("not toml {{{").is_empty());
+        assert!(Config::extra_nested_provider_aliases("providers = 3\n").is_empty());
     }
 
     #[test]
