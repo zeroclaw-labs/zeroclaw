@@ -25467,12 +25467,16 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
     #[test]
     async fn file_transfer_header_maps_are_secret() {
-        assert!(Config::prop_is_secret("file_download.headers.Authorization"));
+        assert!(Config::prop_is_secret(
+            "file_download.headers.Authorization"
+        ));
         assert!(Config::prop_is_secret("file_upload.headers.Authorization"));
         assert!(Config::prop_is_secret(
             "file_upload_bundle.headers.Authorization"
         ));
-        assert!(Config::prop_is_secret("mcp.servers.acme.headers.Authorization"));
+        assert!(Config::prop_is_secret(
+            "mcp.servers.acme.headers.Authorization"
+        ));
         assert!(!Config::prop_is_secret("file_download.timeout_secs"));
         assert!(!Config::prop_is_secret("file_download.headers"));
     }
