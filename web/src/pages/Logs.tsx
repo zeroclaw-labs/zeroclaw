@@ -212,7 +212,8 @@ export default function Logs() {
   useEffect(() => {
     let cancelled = false;
     const tick = async () => {
-      if (cancelled || pausedRef.current) return;
+      // Skip while paused, cancelled, or the tab is hidden (no background poll).
+      if (cancelled || pausedRef.current || document.hidden) return;
       const newest = eventsRef.current[0];
       const sinceTs = newest
         ? newest['@timestamp']
@@ -232,9 +233,15 @@ export default function Logs() {
     };
     tickRef.current = tick;
     const handle = window.setInterval(() => void tick(), POLL_INTERVAL_MS);
+    // Catch up immediately when the tab becomes visible again.
+    const onVisible = () => {
+      if (!document.hidden) void tick();
+    };
+    document.addEventListener('visibilitychange', onVisible);
     return () => {
       cancelled = true;
       window.clearInterval(handle);
+      document.removeEventListener('visibilitychange', onVisible);
     };
   }, [mergeNewer]);
 

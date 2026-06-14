@@ -1,9 +1,10 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { useLocation } from 'react-router-dom';
 import { AlertTriangle, X } from 'lucide-react';
 import { getDrift, getReloadStatus, type DriftEntry } from '@/lib/api';
 import ReloadDaemonButton from '@/components/sections/ReloadDaemonButton';
 import { useReloadAvailable } from '@/lib/reloadAvailability';
+import { usePolling } from '@/hooks/usePolling';
 
 const POLL_INTERVAL_MS = 5_000;
 
@@ -37,30 +38,24 @@ export default function ReloadBanner() {
   // the notice to point the operator at the CLI / a loopback session.
   const reloadAvailable = useReloadAvailable();
 
-  useEffect(() => {
-    let cancelled = false;
-
-    async function pollOnce() {
+  // Poll only while the tab is visible (no background churn); re-arm on reload.
+  usePolling(
+    async (isStale) => {
       try {
         const [{ pending_reload }, { drifted }] = await Promise.all([
           getReloadStatus(),
           getDrift(),
         ]);
-        if (!cancelled) {
+        if (!isStale()) {
           setState({ pendingReload: pending_reload, drifted });
         }
       } catch {
         // Network blip or auth lapse: keep the prior state.
       }
-    }
-
-    pollOnce();
-    const interval = setInterval(pollOnce, POLL_INTERVAL_MS);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
-  }, [pollKey]);
+    },
+    POLL_INTERVAL_MS,
+    [pollKey],
+  );
 
   if (!state || (!state.pendingReload && state.drifted.length === 0)) {
     return null;

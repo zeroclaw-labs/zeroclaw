@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { usePolling } from '@/hooks/usePolling';
 import { Monitor, Trash2, History, RefreshCw } from 'lucide-react';
 import { apiFetch } from '@/lib/api';
 import { basePath } from '@/lib/basePath';
@@ -105,20 +106,15 @@ export default function Canvas() {
     };
   }, [canvasId, connectWs]);
 
-  // Fetch canvas list periodically
-  useEffect(() => {
-    const fetchList = async () => {
-      try {
-        const data = await apiFetch<{ canvases: string[] }>('/api/canvas');
-        setCanvasList(data.canvases || []);
-      } catch {
-        // ignore
-      }
-    };
-    fetchList();
-    const interval = setInterval(fetchList, 5000);
-    return () => clearInterval(interval);
-  }, []);
+  // Fetch the canvas list every 5s — paused while the tab is hidden.
+  usePolling(async (isStale) => {
+    try {
+      const data = await apiFetch<{ canvases: string[] }>('/api/canvas');
+      if (!isStale()) setCanvasList(data.canvases || []);
+    } catch {
+      // ignore
+    }
+  }, 5000);
 
   // Build srcdoc HTML for the iframe — avoids needing allow-same-origin to
   // access contentDocument.  Content types that don't need scripts get a

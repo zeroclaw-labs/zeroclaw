@@ -94,6 +94,7 @@ import AgentDrawer from "@/components/AgentDrawer";
 import EntityLink from "@/components/EntityLink";
 import EntityEnabledToggle from "@/components/EntityEnabledToggle";
 import { useSSE } from "@/hooks/useSSE";
+import { usePolling } from "@/hooks/usePolling";
 import { t } from "@/lib/i18n";
 import { StatCard, PageHeader } from "@/components/ui";
 
@@ -1619,30 +1620,26 @@ export default function Dashboard() {
     );
   };
 
-  useEffect(() => {
-    let cancelled = false;
-    const refresh = () => {
+  // Uptime ticks every second on the server; poll every 5s so the tile and
+  // health badges stay live — but only while the tab is visible (paused when
+  // backgrounded), and re-armed when the cost window changes.
+  usePolling(
+    (isStale) => {
       const { from, to } = costWindowBounds(costWindow);
       Promise.all([getStatus(), getCost(from, to), getTuis()])
         .then(([s, c, t]) => {
-          if (cancelled) return;
+          if (isStale()) return;
           setStatus(s);
           setCost(c);
           setTuis(t);
         })
         .catch((err) => {
-          if (!cancelled) setError(err.message);
+          if (!isStale()) setError(err.message);
         });
-    };
-    refresh();
-    // Uptime ticks every second on the server; poll every 5s so the tile and
-    // health badges stay live without hammering the gateway.
-    const id = window.setInterval(refresh, 5000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(id);
-    };
-  }, [costWindow]);
+    },
+    5000,
+    [costWindow],
+  );
 
   if (error) {
     return (
