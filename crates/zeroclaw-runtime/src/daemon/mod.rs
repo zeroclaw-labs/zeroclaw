@@ -501,17 +501,38 @@ pub async fn run(
         );
     }
 
-    println!("🧠 ZeroClaw daemon started");
-    println!("   Gateway:  http://{host}:{port}");
-    println!(
-        "   Socket:   {}",
-        crate::rpc::local::socket_path(&config).display()
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        "ZeroClaw daemon started"
     );
-    println!("   Components: gateway, channels, heartbeat, scheduler");
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        format!("Gateway: http://{host}:{port}")
+    );
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        format!("Socket: {}", crate::rpc::local::socket_path(&config).display())
+    );
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        "Components: gateway, channels, heartbeat, scheduler"
+    );
     if config.gateway.require_pairing {
-        println!("   Pairing:    enabled (code appears in gateway output above)");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "Pairing: enabled (code appears in gateway output above)"
+        );
     }
-    println!("   Ctrl+C or SIGTERM to stop");
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        "Ctrl+C or SIGTERM to stop"
+    );
 
     // Wait for shutdown (SIGINT/SIGTERM/Ctrl+C) or reload (in-process channel).
     let exit = wait_for_exit_signal(reload_rx, ephemeral, socket_client_count).await?;
