@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AgentProvider } from '@/contexts/AgentContext';
 import { AgentChatInner, type AgentChatStatus } from '@/pages/AgentChat';
 import { ChatTabBar, type TabIndicator, type WorkspaceLayout } from '@/components/ChatTabBar';
+import { basePath } from '@/lib/basePath';
 
 const STORAGE_KEY = 'zeroclaw-chat-workspace';
 
@@ -169,7 +170,14 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
   // Mirror the active alias to the URL via history.replaceState only — never a
   // React Router navigate, which would remount AgentChat and kill connections.
   useEffect(() => {
-    const target = `/agent/${activeAlias}`;
+    // Include the reverse-proxy prefix so `target` matches the real
+    // `window.location.pathname` under a gateway base path (e.g. "/zeroclaw").
+    // Without it the comparison would never match, firing replaceState every
+    // render and rewriting the bar to a prefix-less path that breaks
+    // reload/deep-link (Router's basename no longer matches). basePath is
+    // already normalized to "" (root) or a no-trailing-slash prefix, so plain
+    // concatenation can't produce a double slash.
+    const target = `${basePath}/agent/${activeAlias}`;
     if (window.location.pathname !== target) {
       try { window.history.replaceState(window.history.state, '', target); } catch { /* noop */ }
     }

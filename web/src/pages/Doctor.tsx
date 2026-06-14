@@ -18,12 +18,6 @@ import { t } from '@/lib/i18n';
 
 type Severity = DiagResult['severity'];
 
-const SEVERITY_TONE: Record<Severity, 'ok' | 'warn' | 'error'> = {
-  ok: 'ok',
-  warn: 'warn',
-  error: 'error',
-};
-
 /**
  * A remediable config entity parsed out of a diagnostic message, paired with
  * its deep-link. The same parse drives both the inline "fix in a modal" flow
@@ -63,7 +57,20 @@ function remediationTarget(result: DiagResult): RemediationTarget | null {
   const rawAlias = m[2];
   const type = encodeURIComponent(rawType);
   const alias = encodeURIComponent(rawAlias);
-  if (/\bmodel\b|api[\s_-]?key|provider/i.test(msg)) {
+  // Check the channel branch FIRST: a channel finding may legitimately mention
+  // "provider"/"model" in its prose (e.g. "discord.gnosis: no provider bound"),
+  // and the broader provider/model match below would otherwise misroute it to
+  // providers.models.*. `\bchannel\b` is the strongest signal, so it wins.
+  if (/\bchannel\b/i.test(msg)) {
+    return {
+      prefix: `channels.${rawType}.${rawAlias}`,
+      href: `/config/channels/${type}/${alias}`,
+      label: 'Open config',
+    };
+  }
+  // `provider` is word-bounded so it doesn't match inside unrelated words; the
+  // alternatives stay loose enough to catch the real model/api-key phrasings.
+  if (/\bmodel\b|api[\s_-]?key|\bprovider\b/i.test(msg)) {
     // A "no model configured" finding belongs on the Model tab; api-key /
     // connection issues default to the Connection tab (no ?tab needed). The
     // dotted entity prefix FieldForm edits uses dots throughout; the href uses
@@ -72,13 +79,6 @@ function remediationTarget(result: DiagResult): RemediationTarget | null {
     return {
       prefix: `providers.models.${rawType}.${rawAlias}`,
       href: `/config/providers.models/${type}/${alias}${tab}`,
-      label: 'Open config',
-    };
-  }
-  if (/\bchannel\b/i.test(msg)) {
-    return {
-      prefix: `channels.${rawType}.${rawAlias}`,
-      href: `/config/channels/${type}/${alias}`,
       label: 'Open config',
     };
   }
@@ -338,7 +338,7 @@ export default function Doctor() {
                             <ArrowRight className="h-3.5 w-3.5" />
                           </Link>
                         )}
-                        <Badge tone={SEVERITY_TONE[result.severity]}>
+                        <Badge tone={result.severity}>
                           {result.severity}
                         </Badge>
                       </Card>

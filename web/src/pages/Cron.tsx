@@ -185,6 +185,11 @@ export default function Cron() {
   const [expandedJob, setExpandedJob] = useState<string | null>(null);
   const [triggering, setTriggering] = useState<string | null>(null);
   const [triggerError, setTriggerError] = useState<string | null>(null);
+  // Localized error for the pause/resume toggle. Kept SEPARATE from the
+  // page-level `error` (which drives a full-page guard) so a single job's
+  // toggle failure — or the "daemon ignored enabled" no-op path — renders
+  // inline and leaves the jobs table / Add-Job button visible.
+  const [toggleError, setToggleError] = useState<string | null>(null);
   const [runHistoryRefresh, setRunHistoryRefresh] = useState<Record<string, number>>({});
   const [settings, setSettings] = useState<CronSettings | null>(null);
   const [togglingCatchUp, setTogglingCatchUp] = useState(false);
@@ -473,14 +478,14 @@ export default function Cron() {
       // (CronPatchBody has no `enabled` field, so the flag is silently
       // ignored). Say so rather than leaving the button looking broken.
       if (updated.enabled !== desired) {
-        setError(
+        setToggleError(
           'This daemon build can’t pause/resume jobs from the web yet — the cron API accepted the request but ignored the enabled change. Update the gateway (add `enabled` to CronPatchBody) and reload to enable it.',
         );
       } else {
-        setError(null);
+        setToggleError(null);
       }
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : t('cron.edit_error'));
+      setToggleError(err instanceof Error ? err.message : t('cron.edit_error'));
     }
   };
 
@@ -960,6 +965,17 @@ export default function Cron() {
         <div className="rounded-[var(--radius-md)] border border-status-error/25 bg-status-error/10 p-3 text-sm text-status-error flex items-start justify-between gap-3">
           <span className="whitespace-pre-wrap break-words">{triggerError}</span>
           <Button variant="ghost" size="sm" className="shrink-0" onClick={() => setTriggerError(null)} aria-label={t('cron.dismiss')}>
+            <X className="h-4 w-4" />
+          </Button>
+        </div>
+      )}
+
+      {/* Inline pause/resume-error banner — keeps the cron table mounted on a failed
+          toggle or when the daemon silently ignores the `enabled` change */}
+      {toggleError && (
+        <div className="rounded-[var(--radius-md)] border border-status-error/25 bg-status-error/10 p-3 text-sm text-status-error flex items-start justify-between gap-3">
+          <span className="whitespace-pre-wrap break-words">{toggleError}</span>
+          <Button variant="ghost" size="sm" className="shrink-0" onClick={() => setToggleError(null)} aria-label={t('cron.dismiss')}>
             <X className="h-4 w-4" />
           </Button>
         </div>

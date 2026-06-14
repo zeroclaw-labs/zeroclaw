@@ -75,9 +75,15 @@ export async function apiFetch<T = unknown>(
   const token = getToken();
   const url = `${apiOrigin}${basePath}${path}`;
   const method = (options.method ?? "GET").toUpperCase();
-  // Only idempotent, body-less GETs are safe to coalesce.
+  // Only idempotent, body-less GETs are safe to coalesce. Skip coalescing when
+  // the request carries custom headers (which could change the response) or an
+  // AbortSignal — the cached entry closes over the FIRST caller's options, so a
+  // later caller would silently get the wrong response and have its signal
+  // ignored. Plain header-less, signal-less GETs still share one request.
   const coalesceKey =
-    method === "GET" && !options.body ? `${token ?? ""} ${url}` : null;
+    method === "GET" && !options.body && !options.headers && !options.signal
+      ? `${token ?? ""} ${url}`
+      : null;
 
   const doFetch = async (): Promise<RawResult> => {
     const headers = new Headers(options.headers);
@@ -147,8 +153,11 @@ export async function apiFetch<T = unknown>(
     throw new Error(`API ${result.status}: ${result.text || result.statusText}`);
   }
 
-  // Some endpoints may return 204 No Content (or an otherwise empty body).
-  if (result.status === 204 || result.text === "") {
+  // Only 204 No Content is a genuinely empty success. A non-204 success with
+  // an empty body is a contract violation (truncated/misbehaving response):
+  // fall through to JSON.parse so it surfaces as a clear parse error here
+  // rather than silently coercing to `undefined` and exploding far away.
+  if (result.status === 204) {
     return undefined as unknown as T;
   }
 
@@ -429,11 +438,16 @@ export function listProps(prefix?: string): Promise<ListResponse> {
   return apiFetch<ListResponse>(`/api/config/list${q}`);
 }
 
-export function patchConfig(ops: PatchOp[]): Promise<PatchResponse> {
-  return apiFetch<PatchResponse>("/api/config", {
+export async function patchConfig(ops: PatchOp[]): Promise<PatchResponse> {
+  const result = await apiFetch<PatchResponse>("/api/config", {
     method: "PATCH",
     body: JSON.stringify(ops),
   });
+  // Config structure changed: notify listeners (e.g. the ⌘K search index)
+  // so they can invalidate caches. Decoupled via a browser event to avoid a
+  // circular import (configSearch.ts imports from this module).
+  window.dispatchEvent(new Event("zeroclaw-config-mutated"));
+  return result;
 }
 
 export function initSection(
@@ -1207,13 +1221,13 @@ export interface SelectItemResponse {
   created: boolean;
 }
 
-export function selectSectionItem(
+export async function selectSectionItem(
   section: string,
   key: string,
   alias?: string,
 ): Promise<SelectItemResponse> {
   const body = alias ? JSON.stringify({ alias }) : undefined;
-  return apiFetch<SelectItemResponse>(
+  const result = await apiFetch<SelectItemResponse>(
     `/api/config/sections/${encodeURIComponent(section)}/items/${encodeURIComponent(key)}`,
     {
       method: "POST",
@@ -1221,6 +1235,12 @@ export function selectSectionItem(
       body,
     },
   );
+  // Selecting an item may instantiate a new alias (config entity): notify
+  // listeners (e.g. the ⌘K search index) to invalidate their caches.
+  // Decoupled via a browser event to avoid a circular import
+  // (configSearch.ts imports from this module).
+  window.dispatchEvent(new Event("zeroclaw-config-mutated"));
+  return result;
 }
 // ── Quickstart ───────────────────────────────────────────────────────
 
@@ -1413,14 +1433,19 @@ export interface MapKeyMutResponse {
   created?: boolean;
 }
 
-export function deleteMapKey(
+export async function deleteMapKey(
   path: string,
   key: string,
 ): Promise<MapKeyMutResponse> {
-  return apiFetch<MapKeyMutResponse>(
+  const result = await apiFetch<MapKeyMutResponse>(
     `/api/config/map-key?path=${encodeURIComponent(path)}&key=${encodeURIComponent(key)}`,
     { method: "DELETE" },
   );
+  // An entity was removed: notify listeners (e.g. the ⌘K search index) to
+  // invalidate their caches. Decoupled via a browser event to avoid a
+  // circular import (configSearch.ts imports from this module).
+  window.dispatchEvent(new Event("zeroclaw-config-mutated"));
+  return result;
 }
 
 export function renameMapKey(

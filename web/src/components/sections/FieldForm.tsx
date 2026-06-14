@@ -304,7 +304,8 @@ function requirementBadgeTone(
   tone: "required" | "choice" | "optional",
 ): BadgeTone {
   if (tone === "required") return "warn";
-  if (tone === "choice") return "neutral";
+  // `choice` and `optional` both render the calm `neutral` tint, so they
+  // share the default below (the `choice` branch was identity with default).
   return "neutral";
 }
 
@@ -410,11 +411,25 @@ function isOptionalArray(typeHint: string): boolean {
   );
 }
 
+// Reference-type fields name an alias of another section: their `type_hint`
+// is a bare `*Ref` (e.g. `TtsProviderRef`, `TranscriptionProviderRef`,
+// `ModelProviderRef`, `ChannelRef`). Even though they aren't wrapped in
+// `Option<…>`, an EMPTY value is usually legitimate — it means "none" / unset.
+// The exception is a ref that `setupRequirement` explicitly marks "Required"
+// (e.g. an agent's `model_provider`), so the optional/required decision for
+// refs is made at the call site against the badge, not here. Detected purely
+// from the schema's own `type_hint` (the `Ref` suffix), nothing hardcoded.
+function isReferenceField(typeHint: string): boolean {
+  return typeHint.replace(/\s+/g, "").endsWith("Ref");
+}
+
 // A field is "required" (in the display-only validation sense) when its Rust
 // type signature is NOT wrapped in `Option<…>`. Read purely from the schema's
 // own `type_hint`, so nothing is hardcoded per field. Used only to surface an
 // inline hint — the authoritative required/optional check still runs in
-// `Config::validate()` on the server at save time.
+// `Config::validate()` on the server at save time. (Empty-able reference types
+// are excused by `treatAsOptional` at the call site, not here, so a genuinely
+// required ref like `model_provider` keeps its hint.)
 function isRequiredField(typeHint: string): boolean {
   return !typeHint.replace(/\s+/g, "").startsWith("Option<");
 }
@@ -1188,7 +1203,13 @@ function FieldRow({
   const validationMessage = validationHint(
     entry,
     value,
-    requirement != null && requirement.tone !== "required",
+    // Suppress the "required when empty" hint when: the badge marks the field
+    // optional/choice (keeps badge + hint from contradicting), OR it's an
+    // empty-able reference type that the badge does NOT mark required (the #8
+    // residual: a *Ref with no badge). A ref that IS badged "required" (e.g.
+    // model_provider) still gets its hint.
+    (requirement != null && requirement.tone !== "required") ||
+      (requirement?.tone !== "required" && isReferenceField(entry.type_hint)),
   );
   // Suppress the local hint while a server-side error is already bound to this
   // field so the two don't stack; the authoritative server message wins.

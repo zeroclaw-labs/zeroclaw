@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Activity, ChevronDown, ChevronUp, Pause, Play, Plus, RefreshCw, X } from 'lucide-react';
 import { apiFetch } from '@/lib/api';
 import type { LogEvent, LogsQueryParams, LogsResponse } from '@/lib/api';
+import { usePolling } from '@/hooks/usePolling';
 import { Badge, Button, PageHeader } from '@/components/ui';
 
 const DEFAULT_SEVERITY_MIN = 9;
@@ -163,6 +164,11 @@ export default function Logs() {
   daemonStartedAtRef.current = daemonStartedAt;
   const pausedRef = useRef(paused);
   pausedRef.current = paused;
+  // Monotonic request-id for initialLoad. Changing the filter quickly can let
+  // an older fetch resolve last; we stamp each call and only apply its results
+  // if it's still the latest, so a superseded request can't clobber the list
+  // (or cursor/atEnd/error) with rows that don't match the current filter.
+  const loadSeqRef = useRef(0);
 
   const mergeNewer = useCallback((incoming: LogEvent[]) => {
     if (incoming.length === 0) return;
@@ -180,6 +186,7 @@ export default function Logs() {
   }, []);
 
   const initialLoad = useCallback(async () => {
+    const seq = ++loadSeqRef.current;
     setLoading(true);
     setError(null);
     try {
@@ -187,15 +194,21 @@ export default function Logs() {
         ? daemonStartedAtRef.current || undefined
         : undefined;
       const response = await fetchLogs(buildQueryParams(filterRef.current, { sinceTs }));
+      // Superseded by a newer load (e.g. filter changed mid-flight): drop the
+      // result entirely so we never overwrite the list with stale rows.
+      if (seq !== loadSeqRef.current) return;
       setEvents(response.events);
       setCursorOlder(response.next_cursor);
       setAtEnd(response.at_end);
       setAttributionKeys(response.attribution_keys ?? []);
       setDaemonStartedAt(response.daemon_started_at);
     } catch (err) {
+      if (seq !== loadSeqRef.current) return;
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
+      // Only the latest request owns the loading flag; a superseded request
+      // clearing it would falsely signal completion while a newer one runs.
+      if (seq === loadSeqRef.current) setLoading(false);
     }
   }, []);
 
@@ -207,13 +220,12 @@ export default function Logs() {
   // One incremental fetch — fetch newer-than-newest, append. Exposed via
   // a ref so the Pause/Resume button can fire it inline on Resume to
   // close the gap immediately instead of waiting up to POLL_INTERVAL_MS
-  // for the next scheduled tick.
+  // for the next scheduled tick. The `isStale` guard (supplied by usePolling
+  // for scheduled ticks, no-op for the manual Resume call) prevents a slow
+  // in-flight request from writing after the effect was torn down/re-armed.
   const tickRef = useRef<() => Promise<void>>(async () => {});
-  useEffect(() => {
-    let cancelled = false;
-    const tick = async () => {
-      // Skip while paused, cancelled, or the tab is hidden (no background poll).
-      if (cancelled || pausedRef.current || document.hidden) return;
+  const tick = useCallback(
+    async (isStale: () => boolean = () => false) => {
       const newest = eventsRef.current[0];
       const sinceTs = newest
         ? newest['@timestamp']
@@ -222,7 +234,7 @@ export default function Logs() {
         const response = await fetchLogs(
           buildQueryParams(filterRef.current, { sinceTs }),
         );
-        if (cancelled) return;
+        if (isStale()) return;
         if (response.events.length > 0) mergeNewer(response.events);
         if (response.daemon_started_at) setDaemonStartedAt(response.daemon_started_at);
         if (response.attribution_keys?.length) setAttributionKeys(response.attribution_keys);
@@ -230,20 +242,23 @@ export default function Logs() {
         // Polling errors are silent — they'd cascade otherwise. Manual
         // Refresh surfaces errors prominently.
       }
-    };
-    tickRef.current = tick;
-    const handle = window.setInterval(() => void tick(), POLL_INTERVAL_MS);
-    // Catch up immediately when the tab becomes visible again.
-    const onVisible = () => {
-      if (!document.hidden) void tick();
-    };
-    document.addEventListener('visibilitychange', onVisible);
-    return () => {
-      cancelled = true;
-      window.clearInterval(handle);
-      document.removeEventListener('visibilitychange', onVisible);
-    };
-  }, [mergeNewer]);
+    },
+    [mergeNewer],
+  );
+  // Keep the manual Resume entry point pointed at the latest tick. Resume
+  // clears pausedRef and calls this directly to close the pause gap inline.
+  tickRef.current = () => tick();
+  // usePolling owns the interval + document.hidden skip + visibilitychange
+  // catch-up; we only layer on the Logs-specific "skip while paused" gate so
+  // scheduled ticks don't fetch while the stream is held.
+  usePolling(
+    (isStale) => {
+      if (pausedRef.current) return;
+      return tick(isStale);
+    },
+    POLL_INTERVAL_MS,
+    [tick],
+  );
 
   const loadOlder = useCallback(async () => {
     if (!cursorOlder || atEnd || loadingOlder) return;

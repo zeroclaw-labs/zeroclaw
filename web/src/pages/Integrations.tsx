@@ -52,6 +52,17 @@ function statusBadge(status: Integration['status']) {
         label: t('integrations.status_available'),
         tone: 'neutral' as BadgeTone,
       };
+    // `status` is the declared union, but the value comes from unvalidated
+    // backend JSON — any drift (a new state, lowercase 'active', whitespace)
+    // would otherwise return undefined and crash the caller's badge.icon /
+    // badge.tone deref inside .map. Fall back to a neutral badge that echoes
+    // the raw status so an unknown state still renders something meaningful.
+    default:
+      return {
+        icon: Puzzle,
+        label: String(status),
+        tone: 'neutral' as BadgeTone,
+      };
   }
 }
 

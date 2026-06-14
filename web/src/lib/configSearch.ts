@@ -159,3 +159,12 @@ export function clearConfigSearchCache(): void {
   cache = null;
   inFlight = null;
 }
+
+// Invalidate the session cache whenever config structure/entities change, so
+// the next ⌘K open rebuilds the index instead of showing stale entities. The
+// event is dispatched by the config-mutating calls in api.ts (patchConfig,
+// deleteMapKey, selectSectionItem); a browser event keeps this decoupled and
+// avoids a circular import (this module imports from api.ts).
+if (typeof window !== "undefined") {
+  window.addEventListener("zeroclaw-config-mutated", clearConfigSearchCache);
+}
