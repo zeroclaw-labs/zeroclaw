@@ -108,7 +108,7 @@ function RailNavItem({ item, onClick }: { item: NavItem; onClick: () => void }) 
             />
           )}
           <Icon
-            className={`h-[18px] w-[18px] shrink-0 transition-colors ${
+            className={`h-[22px] w-[22px] shrink-0 transition-colors ${
               isActive ? 'text-pc-accent' : 'group-hover:text-pc-text-secondary'
             }`}
           />
@@ -163,7 +163,7 @@ function DrawerNavItem({ item, onClick }: { item: NavItem; onClick: () => void }
             />
           )}
           <Icon
-            className={`h-[18px] w-[18px] shrink-0 transition-colors ${
+            className={`h-[22px] w-[22px] shrink-0 transition-colors ${
               isActive ? 'text-pc-accent' : 'group-hover:text-pc-text-secondary'
             }`}
           />
