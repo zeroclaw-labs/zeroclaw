@@ -244,8 +244,9 @@ impl PropKind {
     }
 }
 
-/// Alias namespace for `PropKind::AliasRef` fields. Mirrors
-/// `zeroclaw_config::traits::AliasSource`.
+/// Alias namespace for `PropKind::AliasRef` fields. Wire mirror of
+/// `zeroclaw_config::traits::AliasSource`; zerocode does not depend on
+/// `zeroclaw-config`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AliasSource {
