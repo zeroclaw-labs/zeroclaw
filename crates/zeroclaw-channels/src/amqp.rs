@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use portable_atomic::{AtomicBool, AtomicU64, Ordering};
+use portable_atomic::{AtomicU64, Ordering};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -34,7 +34,6 @@ pub struct AmqpChannel {
     durable_ack: bool,
     alias: String,
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
-    consuming: Arc<AtomicBool>,
 }
 
 /// Construction parameters for [`AmqpChannel`].
@@ -70,7 +69,6 @@ impl AmqpChannel {
             durable_ack: cfg.durable_ack,
             alias: cfg.alias,
             peer_resolver: cfg.peer_resolver,
-            consuming: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -297,7 +295,6 @@ impl Channel for AmqpChannel {
             .await?;
 
         zeroclaw_runtime::health::mark_component_ok("amqp");
-        self.consuming.store(true, Ordering::Release);
         let _peers = (self.peer_resolver)();
 
         while let Some(delivery) = consumer.next().await {
@@ -326,7 +323,6 @@ impl Channel for AmqpChannel {
             };
 
             if tx.send(channel_msg).await.is_err() {
-                self.consuming.store(false, Ordering::Release);
                 return Ok(());
             }
 
@@ -335,12 +331,17 @@ impl Channel for AmqpChannel {
             }
         }
 
-        self.consuming.store(false, Ordering::Release);
         Ok(())
     }
 
     async fn health_check(&self) -> bool {
-        self.consuming.load(Ordering::Acquire)
+        match self.connect().await {
+            Ok(conn) => {
+                let _ = conn.close(0, "health check").await;
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     fn self_handle(&self) -> Option<String> {
@@ -423,7 +424,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_check_false_before_consuming() {
+    async fn health_check_false_when_broker_unreachable() {
         assert!(!channel_with("", "").health_check().await);
     }
 
