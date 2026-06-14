@@ -33,11 +33,25 @@ Search before filing. Duplicates get consolidated; the search box is your friend
 
 ## GitHub Discussions
 
-For community-facing threads that need more permanence than Discord but are not yet tracked work. Discussions work well for Q&A, ideas, show-and-tell, project or integration demos, polls, announcements, and "does anyone else see this?" threads where Discord would scroll away.
+For community-facing threads that need more permanence than Discord but are not yet tracked work. Discussions work well for Q&A, ideas, project show-and-tell, polls, maintainer announcements, and "does anyone else see this?" threads where Discord would scroll away.
 
-Treat Discussions as non-urgent community conversation. They are maintained intake only when a steward or review cadence is documented.
+Treat Discussions as non-urgent community conversation. They are maintained intake only when a steward or review cadence is documented. The maintainer routine and default cadence live in [Reviewer playbook: Discussions stewardship](../maintainers/reviewer-playbook.md#discussions-stewardship).
 
 Discussions are part of the GitHub handoff system, not a replacement for issues, RFCs, PR comments, or maintainer docs. Move a Discussion into the tracked surface once it produces a concrete bug, feature scope, owner, blocker, validation evidence, policy decision, or docs requirement.
+
+Use this split when choosing a surface:
+
+| Surface | Use it for | Move it when |
+|---|---|---|
+| Discord | Fast help, live coordination, early "is this a thing?" conversation | The project needs a durable record, decision, owner, validation note, blocker, or release-impact note |
+| Discussions | Searchable Q&A, ideas, show-and-tell, demos, polls, announcements, broad feedback, and exploratory architecture questions that are not ready for formal tracking | The thread produces a concrete bug, feature scope, architecture proposal, policy decision, docs gap, owner, blocker, or validation evidence |
+| Issues | Bugs, feature requests, support/configuration reports, contributor tasks, roadmap trackers, and other work that needs triage or tracking | The issue turns into an RFC, PR, tracker item, duplicate, support redirect, or closure decision |
+| RFC issues | Architecture, governance, lifecycle, compatibility, or process decisions that need formal review | The RFC is accepted, rejected, superseded, or split into implementation issues |
+| PR comments | Review feedback and implementation details for an active change | The detail becomes durable policy, reusable docs, a follow-up issue, or release note |
+
+Discussion categories should make the expected outcome obvious. Use Q&A for answerable questions, Ideas for proposals that need community shaping, Show and tell for project-related demos or integrations, Polls for community votes, Announcements for maintainer updates, and General for broad searchable conversation or early architecture exploration before an RFC exists.
+
+Close the loop when a Discussion moves. Add a short summary and link to the issue, RFC, PR, or doc that now owns the outcome. If the category supports accepted answers, mark the summary or tracked-work link as the answer when that accurately reflects the result.
 
 [github.com/zeroclaw-labs/zeroclaw/discussions](https://github.com/zeroclaw-labs/zeroclaw/discussions)
 
@@ -88,7 +102,7 @@ None offered. ZeroClaw is maintained by the community. If you're deploying at sc
 
 ## Feedback
 
-Open-ended feedback, "I tried to do X and it felt wrong", UX observations, direction thoughts, lands best as a thread in Discord `#general` or `#dev`. The team is more likely to see and discuss it there. If the thread turns into something concrete, move it to a GitHub Discussion or issue.
+Open-ended feedback, "I tried to do X and it felt wrong", UX observations, direction thoughts, lands best as a thread in Discord `#general` or `#dev` when it needs a fast live conversation. Use GitHub Discussions `General` or `Ideas` when the feedback should stay searchable for asynchronous community input. If the thread turns into something concrete, move it to an issue, RFC, PR comment, or doc.
 
 ## Contributor recognition
 
