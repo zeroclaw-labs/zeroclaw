@@ -42,6 +42,8 @@ pub struct ChannelQuickStart {
     pub channel_type: String,
     pub alias: String,
     pub token: Option<String>,
+    #[serde(default)]
+    pub fields: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

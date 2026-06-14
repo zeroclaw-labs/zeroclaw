@@ -574,6 +574,7 @@ impl FormState {
                         channel_type: c.channel_type.clone(),
                         alias: c.alias.clone(),
                         token: c.token.clone(),
+                        fields: std::collections::HashMap::new(),
                     }),
                     SelectorMode::Existing => {
                         SelectorChoice::Existing(format!("{}.{}", c.channel_type, c.alias))

@@ -737,7 +737,7 @@ const MODEL_PROVIDER_ESSENTIALS: &[&str] = &[
     "requires_openai_auth",
     "wire_api",
 ];
-const CHANNEL_ESSENTIALS: &[&str] = &["bot_token", "token", "webhook_url", "allowed_users"];
+const CHANNEL_ESSENTIALS: &[&str] = &["bot_token", "token", "webhook_url", "allowed_users", "port"];
 const PEER_GROUP_ESSENTIALS: &[&str] = &["channel", "external_peers", "agents", "ignore"];
 
 /// Runtime profile the Quickstart silently installs. The Runtime Profile
@@ -1270,6 +1270,20 @@ fn apply_channels(
                             err.to_string(),
                         ));
                         continue;
+                    }
+                }
+                // Write extra channel-specific fields (e.g. port for webhook).
+                for (key, value) in &entry.fields {
+                    let field_path = format!(
+                        "channels.{}.{}.{}",
+                        entry.channel_type, entry.alias, key
+                    );
+                    if let Err(err) = config.set_prop_persistent(&field_path, value) {
+                        errors.push(QuickstartError::new(
+                            QuickstartStep::Channels,
+                            format!("channels[{idx}].{key}"),
+                            err.to_string(),
+                        ));
                     }
                 }
                 refs.push(format!("{}.{}", entry.channel_type, entry.alias));
@@ -2009,11 +2023,13 @@ mod tests {
                 channel_type: "telegram".into(),
                 alias: "tg".into(),
                 token: Some("tok-a".into()),
+                fields: std::collections::HashMap::new(),
             }),
             SelectorChoice::Fresh(ChannelQuickStart {
                 channel_type: "discord".into(),
                 alias: "dc".into(),
                 token: Some("tok-b".into()),
+                fields: std::collections::HashMap::new(),
             }),
         ];
         let (dir, _applied) = apply_to_temp(submission).await;
@@ -2038,6 +2054,7 @@ mod tests {
             channel_type: "telegram".into(),
             alias: "tg".into(),
             token: Some("tok-a".into()),
+            fields: std::collections::HashMap::new(),
         })];
         submission.peer_groups = vec![zeroclaw_config::presets::QuickstartPeerGroup {
             name: "team".into(),

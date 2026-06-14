@@ -325,6 +325,10 @@ pub struct ChannelQuickStart {
     /// Bot token / shared secret if the channel needs one
     /// (Telegram, Discord). `None` for channels that don't.
     pub token: Option<String>,
+    /// Extra channel-specific fields collected from the user
+    /// (e.g. `port` for webhook channels).
+    #[serde(default)]
+    pub fields: std::collections::HashMap<String, String>,
 }
 
 /// Agent identity payload from the Agent step. Personality file
@@ -624,6 +628,7 @@ mod tests {
                 channel_type: "cli".into(),
                 alias: "cli".into(),
                 token: None,
+                fields: std::collections::HashMap::new(),
             })],
             peer_groups: vec![],
             agent: AgentIdentity {

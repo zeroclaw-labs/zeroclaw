@@ -2091,18 +2091,26 @@ async fn run_quickstart_cli(
                 alias,
                 extras,
                 ..
-            } => SelectorChoice::Fresh(ChannelQuickStart {
-                channel_type: kind,
-                alias,
-                token: extras
-                    .into_iter()
-                    .find(|(k, _)| {
-                        k.eq_ignore_ascii_case("bot-token")
-                            || k.eq_ignore_ascii_case("token")
-                            || k.eq_ignore_ascii_case("access-token")
-                    })
-                    .map(|(_, v)| v),
-            }),
+            } => {
+                let mut remaining = std::collections::HashMap::new();
+                let mut token = None;
+                for (k, v) in extras {
+                    if k.eq_ignore_ascii_case("bot-token")
+                        || k.eq_ignore_ascii_case("token")
+                        || k.eq_ignore_ascii_case("access-token")
+                    {
+                        token = Some(v);
+                    } else {
+                        remaining.insert(k, v);
+                    }
+                }
+                SelectorChoice::Fresh(ChannelQuickStart {
+                    channel_type: kind,
+                    alias,
+                    token,
+                    fields: remaining,
+                })
+            }
             ChannelChoice::Existing { alias_ref } => SelectorChoice::Existing(alias_ref),
         })
         .collect();
