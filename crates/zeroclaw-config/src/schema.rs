@@ -795,6 +795,12 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<serde_json::Value>,
+    /// Path to a PEM-encoded CA certificate for TLS connections to this provider.
+    /// Must be an absolute path; shell expansion (e.g. `~`) is not performed.
+    /// Leave unset to use the system's default trust store.
+    #[tab(Connection)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ca_cert_path: Option<String>,
 }
 
 // ── Per-family model model_provider configs ────────────────────────────
@@ -5034,30 +5040,55 @@ pub struct SkillInstallSuggestionsConfig {
     pub enabled: bool,
 }
 
-/// Skill self-improvement configuration (`[skills.auto_improve]` section).
+/// Skill self-improvement configuration (`[skills.skill-improvement]` section).
+///
+/// Controls the post-turn background review fork that may patch, expand, or
+/// archive skills based on what the conversation revealed. The fork runs in a
+/// restricted toolset (only `skills_list`, `skill_view`, `skill_manage`) and
+/// never touches the user-visible conversation.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "skills.skill_improvement"]
 pub struct SkillImprovementConfig {
-    /// Enable automatic skill improvement after successful skill usage.
-    /// Default: `true`.
-    #[serde(default = "default_true")]
+    /// Enable the background skill-review fork. Default: `false`.
+    /// Opt-in: users must explicitly enable this to allow post-turn skill
+    /// mutations.
+    #[serde(default)]
     pub enabled: bool,
-    /// Minimum interval (in seconds) between improvements for the same skill.
-    /// Default: `3600` (1 hour).
+    /// Minimum interval (in seconds) between reviews for the same skill.
+    /// Acts as a durable rate limit on patches to any one skill. Default: `3600`.
     #[serde(default = "default_skill_improvement_cooldown")]
     pub cooldown_secs: u64,
+    /// Spawn a review fork once at least this many tool-call iterations have
+    /// accumulated in the current run. `0` disables iteration-based triggering.
+    /// Default: `10`.
+    #[serde(default = "default_nudge_interval_iterations")]
+    pub nudge_interval_iterations: u32,
+    /// Maximum tool-call iterations the review fork itself is allowed to make.
+    /// Caps the fork's LLM cost. Default: `8`.
+    #[serde(default = "default_max_review_iterations")]
+    pub max_review_iterations: u32,
 }
 
 fn default_skill_improvement_cooldown() -> u64 {
     3600
 }
 
+fn default_nudge_interval_iterations() -> u32 {
+    10
+}
+
+fn default_max_review_iterations() -> u32 {
+    8
+}
+
 impl Default for SkillImprovementConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             cooldown_secs: 3600,
+            nudge_interval_iterations: 10,
+            max_review_iterations: 8,
         }
     }
 }
@@ -12311,14 +12342,16 @@ impl ChannelConfig for NextcloudTalkConfig {
 
 impl WhatsAppConfig {
     /// Detect which backend to use based on config fields.
-    /// Returns "cloud" if phone_number_id is set, "web" if session_path is set.
+    /// Cloud API when `phone_number_id` is set; otherwise Web when any
+    /// Web-only selector (`session_path`, `pair_phone`, `pair_code`,
+    /// `ws_url`, or `mode = personal`) is present. Falls back to Cloud
+    /// for an otherwise-empty config (env-injected Cloud credentials).
     pub fn backend_type(&self) -> &'static str {
         if self.phone_number_id.is_some() {
             "cloud"
-        } else if self.session_path.is_some() {
+        } else if self.has_web_selector() {
             "web"
         } else {
-            // Default to Cloud API for backward compatibility
             "cloud"
         }
     }
@@ -12328,16 +12361,29 @@ impl WhatsAppConfig {
         self.phone_number_id.is_some() && self.access_token.is_some() && self.verify_token.is_some()
     }
 
-    /// Check if this is a valid Web config
-    pub fn is_web_config(&self) -> bool {
+    /// Any Web-only selector that signals WhatsApp Web intent. `mode`
+    /// defaults to `Business` on every config, so only a non-default
+    /// `Personal` mode counts; the rest are `Option` fields absent by
+    /// default.
+    pub fn has_web_selector(&self) -> bool {
         self.session_path.is_some()
+            || self.pair_phone.is_some()
+            || self.pair_code.is_some()
+            || self.ws_url.is_some()
+            || self.mode == WhatsAppWebMode::Personal
+    }
+
+    /// Check if this is a valid Web config. The Web client defaults a
+    /// missing `session_path`, so any Web selector is sufficient.
+    pub fn is_web_config(&self) -> bool {
+        self.has_web_selector()
     }
 
     /// Returns true when both Cloud and Web selectors are present.
     ///
     /// Runtime currently prefers Cloud mode in this case for backward compatibility.
     pub fn is_ambiguous_config(&self) -> bool {
-        self.phone_number_id.is_some() && self.session_path.is_some()
+        self.phone_number_id.is_some() && self.has_web_selector()
     }
 }
 
@@ -21032,6 +21078,41 @@ allowed_numbers = ["+1", "+2"]
         };
         assert!(!wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "web");
+    }
+
+    #[test]
+    async fn whatsapp_config_backend_type_web_from_personal_pairing() {
+        let wc = WhatsAppConfig {
+            enabled: true,
+            mode: WhatsAppWebMode::Personal,
+            pair_phone: Some("+10000000000".into()),
+            ..Default::default()
+        };
+        assert_eq!(wc.backend_type(), "web");
+        assert!(wc.is_web_config());
+        assert!(!wc.is_cloud_config());
+
+        let pair_only = WhatsAppConfig {
+            enabled: true,
+            pair_phone: Some("+10000000000".into()),
+            ..Default::default()
+        };
+        assert_eq!(pair_only.backend_type(), "web");
+
+        let empty = WhatsAppConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert_eq!(empty.backend_type(), "cloud");
+
+        let cloud_plus_pairing = WhatsAppConfig {
+            enabled: true,
+            phone_number_id: Some("123".into()),
+            pair_phone: Some("+10000000000".into()),
+            ..Default::default()
+        };
+        assert_eq!(cloud_plus_pairing.backend_type(), "cloud");
+        assert!(cloud_plus_pairing.is_ambiguous_config());
     }
 
     #[test]

@@ -4154,7 +4154,11 @@ async fn process_channel_message_body(
     // ── Reply-intent precheck ────────────────────────────────────────
     let explicit_channel_address =
         is_explicitly_addressed_channel_message(&msg.channel, &msg.content);
-    let classifier_intent = if explicit_channel_address {
+    let direct_message = target_channel
+        .as_ref()
+        .map(|c| c.is_direct_message(&msg))
+        .unwrap_or(false);
+    let classifier_intent = if explicit_channel_address || direct_message {
         AssistantChannelOutcome::Reply(String::new())
     } else {
         let (classifier_provider_arc, classifier_model_owned, classifier_temperature): (
@@ -5841,7 +5845,7 @@ fn build_channel_by_id(
                     .context("WhatsApp channel is not configured")?;
                 if !wa.is_web_config() {
                     anyhow::bail!(
-                        "WhatsApp channel send requires Web mode (session_path must be set)"
+                        "WhatsApp channel send requires Web mode (set session_path, pair_phone, or mode = personal)"
                     );
                 }
                 let alias = "default".to_string();
@@ -6986,7 +6990,7 @@ fn collect_configured_channels(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                "WhatsApp config has both phone_number_id and session_path set; preferring Cloud API mode. Remove one selector to avoid ambiguity."
+                "WhatsApp config has both phone_number_id (Cloud) and a Web selector (session_path/pair_phone/pair_code/ws_url/mode=personal) set; preferring Cloud API mode. Remove one selector to avoid ambiguity."
             );
         }
         // Runtime negotiation: detect backend type from config
@@ -9426,6 +9430,26 @@ pub async fn deliver_announcement(
         #[cfg(not(feature = "channel-email"))]
         "email" => {
             anyhow::bail!("Email channel requires the `channel-email` feature");
+        }
+        #[cfg(feature = "whatsapp-web")]
+        "whatsapp" | "whatsapp-web" | "whatsapp_web" => {
+            let wa = config
+                .channels
+                .whatsapp
+                .get(alias)
+                .ok_or_else(not_configured)?;
+            if !wa.is_web_config() {
+                anyhow::bail!("WhatsApp channel send requires Web mode (session_path must be set)");
+            }
+            let peers = config.channel_external_peers("whatsapp", alias);
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+                Arc::new(move || peers.clone());
+            let ch = WhatsAppWebChannel::new(wa, alias.to_string(), peer_resolver);
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+        }
+        #[cfg(not(feature = "whatsapp-web"))]
+        "whatsapp" | "whatsapp-web" | "whatsapp_web" => {
+            anyhow::bail!("WhatsApp channel requires the `whatsapp-web` feature");
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
@@ -20429,6 +20453,25 @@ Done."#;
         assert!(
             msg.contains("[channels.email.default] not configured"),
             "email.default must report the real config table; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn deliver_announcement_routes_whatsapp_to_whatsapp_arm() {
+        let config = zeroclaw_config::schema::Config::default();
+
+        let err = deliver_announcement(&config, "whatsapp.default", "+15551234567", None, "hi")
+            .await
+            .expect_err("expected whatsapp.default to bail because channel is not configured");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("unsupported delivery channel"),
+            "whatsapp.default must route to the whatsapp arm, not fall through; got: {msg}"
+        );
+        assert!(
+            msg.contains("[channels.whatsapp.default] not configured"),
+            "whatsapp.default must report the real config table; got: {msg}"
         );
     }
 
