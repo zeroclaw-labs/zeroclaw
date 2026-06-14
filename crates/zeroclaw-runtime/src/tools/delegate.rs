@@ -540,24 +540,36 @@ impl DelegateTool {
     }
 
     /// Resolve allowed tools list from the named risk profile (authorization).
+    ///
     /// When the profile has an explicit allow-list we also union in any
     /// MCP tools that have been injected into the parent_tools registry so
     /// that the post-#7464 eager-MCP default actually works for agents.
+    ///
+    /// The profile's `excluded_tools` always subtracts from the resolved set,
+    /// matching the contract documented on `RiskProfileConfig`. This means
+    /// runtime-discovered MCP tools auto-admitted via the `<server>__<tool>`
+    /// double-underscore convention can still be blocked individually via
+    /// `excluded_tools`, which is the operator's only remaining escape hatch
+    /// after this PR widened the allow-list semantics. Empty/missing
+    /// `excluded_tools` is a no-op.
     fn resolve_allowed_tools(&self, risk_profile: &str) -> Vec<String> {
         if risk_profile.is_empty() {
             return Vec::new();
         }
-        let base = self
-            .risk_profiles
-            .get(risk_profile)
-            .map(|p| p.allowed_tools.clone())
+        let profile = self.risk_profiles.get(risk_profile);
+        let base = profile.map(|p| p.allowed_tools.clone()).unwrap_or_default();
+        let excluded: Vec<String> = profile
+            .map(|p| p.excluded_tools.clone())
             .unwrap_or_default();
 
         if base.is_empty() {
+            // Empty allow-list = "no authorization granted"; do not expand
+            // with MCP names and do not consult excluded_tools (nothing to
+            // subtract from).
             return base;
         }
 
-        // Collect names of any MCP tools present in parent_tools
+        // Collect names of any MCP tools present in parent_tools.
         let mcp_names: Vec<String> = {
             let parent = self.parent_tools.read();
             parent
@@ -576,15 +588,19 @@ impl DelegateTool {
                 .collect()
         };
 
-        if mcp_names.is_empty() {
-            return base;
-        }
-
         let mut out = base;
         for n in mcp_names {
             if !out.iter().any(|x| x == &n) {
                 out.push(n);
             }
+        }
+        // Subtract excluded_tools. This is the deny-list path operators rely
+        // on to block individual `<server>__<tool>` MCP names that would
+        // otherwise be auto-admitted by the union step above, and it also
+        // honors the deny-list against explicit allow-list entries (which
+        // delegate.rs previously ignored entirely — see PR #7547 review).
+        if !excluded.is_empty() {
+            out.retain(|name| !excluded.iter().any(|d| d == name));
         }
         out
     }
@@ -1910,7 +1926,7 @@ mod tests {
     };
     use zeroclaw_providers::{ChatRequest, ChatResponse, ToolCall};
 
-    zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool);
+    zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool, FilesystemWriteFileMcpTool);
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy::default())
@@ -3200,6 +3216,145 @@ mod tests {
             result.output.contains("mcp done"),
             "Expected output containing 'mcp done', got: {}",
             result.output
+        );
+    }
+
+    /// Fake MCP tool that follows the real `<server>__<tool>` naming
+    /// convention. Used by the regression tests that exercise the
+    /// double-underscore auto-admit and `excluded_tools` deny-list branches
+    /// added in PR #7547. We pick `filesystem__write_file` deliberately
+    /// because it is the exact tool the reviewer called out as the kind of
+    /// destructive MCP capability operators must be able to block.
+    #[derive(Default)]
+    struct FilesystemWriteFileMcpTool;
+
+    #[async_trait]
+    impl Tool for FilesystemWriteFileMcpTool {
+        fn name(&self) -> &str {
+            "filesystem__write_file"
+        }
+
+        fn description(&self) -> &str {
+            "Fake filesystem MCP write_file tool used by allow/deny tests."
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "wrote".into(),
+                error: None,
+            })
+        }
+    }
+
+    /// PR #7547 review (Audacity88): the `<server>__<tool>` MCP-naming
+    /// convention must be auto-admitted into the resolved allow-list even
+    /// when the risk profile's explicit `allowed_tools` list does not
+    /// mention the tool. The pre-existing `mcp_tools_included_in_subagent_tool_list`
+    /// fixture uses `mcp_fake` (no double underscore) so it actually
+    /// exercises the explicit allow-list path, not the new auto-admit
+    /// branch. This test pins the new branch.
+    #[test]
+    fn resolve_allowed_tools_auto_admits_double_underscore_mcp_names() {
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_risk_profiles(agentic_risk_profiles(vec!["shell".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+
+        // No MCP tool registered yet → only the explicit allow-list survives.
+        let resolved = tool.resolve_allowed_tools("agentic_test");
+        assert_eq!(resolved, vec!["shell".to_string()]);
+
+        // Inject the `<server>__<tool>` MCP wrapper, mirroring the
+        // late-binding path that eager-MCP discovery uses in production.
+        tool.parent_tools_handle()
+            .write()
+            .push(Arc::new(FilesystemWriteFileMcpTool));
+
+        let resolved = tool.resolve_allowed_tools("agentic_test");
+        assert!(
+            resolved.iter().any(|n| n == "shell"),
+            "explicit allow-list entry preserved: {resolved:?}"
+        );
+        assert!(
+            resolved.iter().any(|n| n == "filesystem__write_file"),
+            "double-underscore MCP name auto-admitted: {resolved:?}"
+        );
+    }
+
+    /// PR #7547 review (Audacity88) — blocking comment: the PR body
+    /// claims MCP tools can still be blocked via `excluded_tools`, but
+    /// `DelegateTool::resolve_allowed_tools` never subtracted the
+    /// target risk profile's `excluded_tools` before this fix. A target
+    /// profile that allow-lists `shell` and excludes
+    /// `filesystem__write_file` must NOT receive the MCP wrapper in an
+    /// agentic delegate even though it matches the `__` auto-admit
+    /// heuristic.
+    #[test]
+    fn resolve_allowed_tools_honors_excluded_tools_for_auto_admitted_mcp() {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "agentic_test".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["shell".to_string()],
+                excluded_tools: vec!["filesystem__write_file".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_risk_profiles(profiles)
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+
+        // Inject the destructive MCP wrapper so the auto-admit branch
+        // would otherwise pull it into the resolved set.
+        tool.parent_tools_handle()
+            .write()
+            .push(Arc::new(FilesystemWriteFileMcpTool));
+
+        let resolved = tool.resolve_allowed_tools("agentic_test");
+        assert!(
+            resolved.iter().any(|n| n == "shell"),
+            "non-excluded allow-list entry preserved: {resolved:?}"
+        );
+        assert!(
+            !resolved.iter().any(|n| n == "filesystem__write_file"),
+            "excluded_tools must block auto-admitted MCP name, got: {resolved:?}"
+        );
+    }
+
+    /// Companion to the test above: `excluded_tools` must also subtract
+    /// from explicit allow-list entries, not just from the
+    /// double-underscore auto-admit set. delegate.rs previously ignored
+    /// `excluded_tools` entirely on the agentic path; this pins the fix
+    /// so it cannot regress.
+    #[test]
+    fn resolve_allowed_tools_honors_excluded_tools_for_explicit_allow_list_entries() {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "agentic_test".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["shell".to_string(), "memory_recall".to_string()],
+                excluded_tools: vec!["shell".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_risk_profiles(profiles)
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+
+        let resolved = tool.resolve_allowed_tools("agentic_test");
+        assert!(
+            !resolved.iter().any(|n| n == "shell"),
+            "excluded entry must drop out of resolved set: {resolved:?}"
+        );
+        assert!(
+            resolved.iter().any(|n| n == "memory_recall"),
+            "non-excluded entry preserved: {resolved:?}"
         );
     }
 
