@@ -30,15 +30,14 @@ pub fn render_features(
     Ok(format!("{indent}ZEROCLAW_FEATURES=\"{}\"", list.join(",")))
 }
 
-/// Render an `ARG ZEROCLAW_CARGO_FEATURES="X,Y"` default line from a selection.
-/// The ARG stays build-time overridable (the docker feature-selection axis);
-/// only its default is canonical. The list is resolved, never typed.
+/// Render an `ARG ZEROCLAW_CARGO_FLAGS="..."` default line from a selection.
+/// The flag string (`--no-default-features [--features ...]` or empty for the
+/// Cargo default) is the only form that distinguishes `minimal` from the
+/// default-features build. Build-time overridable; only its default is
+/// canonical. Resolved, never typed.
 pub fn render_features_arg(manifest_dir: &Path, selection: &Selection) -> anyhow::Result<String> {
-    let list = spec::resolve_feature_list(manifest_dir, selection)?;
-    Ok(format!(
-        "ARG ZEROCLAW_CARGO_FEATURES=\"{}\"",
-        list.join(",")
-    ))
+    let flags = spec::resolve_flags(manifest_dir, selection)?;
+    Ok(format!("ARG ZEROCLAW_CARGO_FLAGS=\"{flags}\""))
 }
 
 /// Splice a named zone's body into `current`, preserving everything else.

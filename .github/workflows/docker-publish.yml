@@ -69,7 +69,7 @@ jobs:
           file: ${{ matrix.dockerfile }}
           push: true
           build-args: |
-            ZEROCLAW_CARGO_FEATURES=${{ matrix.features }}
+            ZEROCLAW_CARGO_FLAGS=${{ matrix.flags }}
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ matrix.pinned_tag }}
             ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ matrix.floating_tag }}

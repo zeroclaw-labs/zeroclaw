@@ -1,9 +1,7 @@
 //! Docker tag matrix generator. Emits the canonical `[[tags]]` table the
-//! docker-publish workflow consumes - Alpine-style version-pinned tags plus
-//! floating tags. Both the version and the per-tag feature selection come from
-//! the spec; nothing is typed. Output is TOML for repo consistency (everything
-//! canonical here is TOML); the publish workflow converts to JSON for the
-//! Actions matrix. Fully generated (the whole file is owned).
+//! docker-publish workflow consumes. `flags` carries the resolved cargo flag
+//! string and is the authoritative build input; `features` is human-readable
+//! only. Fully generated.
 
 use super::spec::{self, Selection};
 use std::path::Path;
@@ -42,9 +40,8 @@ fn tag_specs() -> Vec<TagSpec> {
     ]
 }
 
-/// Render the docker tag matrix TOML: for each selection, a pinned tag
-/// (`<stem>-v<version>`, immutable, Alpine-style) and a floating tag (`<stem>`,
-/// re-points to latest), with the resolved feature list and dockerfile.
+/// Render the docker tag matrix TOML. `flags` is the authoritative build
+/// input; `features` is human-readable only.
 pub fn render(root: &Path) -> anyhow::Result<String> {
     let version = spec::resolve_version(root)?;
     let mut out = String::new();
@@ -54,11 +51,13 @@ pub fn render(root: &Path) -> anyhow::Result<String> {
     out.push_str(&format!("version = \"{version}\"\n\n"));
     for ts in tag_specs() {
         let features = spec::resolve_feature_list(root, &ts.selection)?.join(",");
+        let flags = spec::resolve_flags(root, &ts.selection)?;
         out.push_str("[[tags]]\n");
         out.push_str(&format!("stem = \"{}\"\n", ts.stem));
         out.push_str(&format!("pinned_tag = \"{}-v{version}\"\n", ts.stem));
         out.push_str(&format!("floating_tag = \"{}\"\n", ts.stem));
         out.push_str(&format!("dockerfile = \"{}\"\n", ts.dockerfile));
+        out.push_str(&format!("flags = \"{flags}\"\n"));
         out.push_str(&format!("features = \"{features}\"\n\n"));
     }
     while out.ends_with('\n') {
@@ -99,6 +98,24 @@ mod tests {
             .unwrap();
         assert_eq!(dist["pinned_tag"].as_str().unwrap(), format!("dist-v{ver}"));
         assert_eq!(dist["floating_tag"].as_str().unwrap(), "dist");
+    }
+
+    #[test]
+    fn minimal_carries_no_default_flag_default_features_does_not() {
+        let s = render(&root()).unwrap();
+        let v: toml::Value = toml::from_str(&s).unwrap();
+        let tags = v["tags"].as_array().unwrap();
+        let flags = |stem: &str| {
+            tags.iter()
+                .find(|t| t["stem"].as_str() == Some(stem))
+                .unwrap()["flags"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(flags("minimal"), "--no-default-features");
+        assert_eq!(flags("default-features"), "");
+        assert!(flags("dist").starts_with("--no-default-features --features"));
     }
 
     #[test]
