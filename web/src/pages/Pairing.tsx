@@ -20,6 +20,9 @@ export default function Pairing() {
   const [error, setError] = useState<string | null>(null);
   // The device queued for revocation; non-null opens the confirm dialog.
   const [pendingRevoke, setPendingRevoke] = useState<Device | null>(null);
+  // True when /api/devices returned 401/403 — this browser isn't paired, so
+  // the list can't be read (distinct from an empty registry).
+  const [unauthorized, setUnauthorized] = useState(false);
 
   const token = localStorage.getItem('zeroclaw_token') || '';
 
@@ -31,6 +34,16 @@ export default function Pairing() {
       if (res.ok) {
         const data = await res.json();
         setDevices(data.devices || []);
+        setUnauthorized(false);
+      } else if (res.status === 401 || res.status === 403) {
+        // require_pairing is on and this browser isn't paired (no/invalid
+        // token), so the gateway rejects the listing. Distinguish this from a
+        // genuinely empty registry — otherwise it reads as "0 paired devices"
+        // when really we just can't see them.
+        setUnauthorized(true);
+        setDevices([]);
+      } else {
+        setError(t('pairing.load_error'));
       }
     } catch (err) {
       setError(t('pairing.load_error'));
@@ -138,10 +151,22 @@ export default function Pairing() {
       <Card padded={false} className="overflow-hidden">
         <div className="px-5 py-4 border-b border-pc-border">
           <h3 className="text-sm font-semibold text-pc-text">
-            {t('pairing.paired_devices')} ({devices.length})
+            {t('pairing.paired_devices')}
+            {unauthorized ? '' : ` (${devices.length})`}
           </h3>
         </div>
-        {devices.length === 0 ? (
+        {unauthorized ? (
+          <div className="p-8 text-center text-sm text-pc-text-muted">
+            <p className="font-medium text-pc-text-secondary">
+              This browser isn’t paired yet
+            </p>
+            <p className="mt-1">
+              Pairing is required, so the device list can’t be read from here.
+              Pair this browser with a code (above) — then your paired devices
+              will appear.
+            </p>
+          </div>
+        ) : devices.length === 0 ? (
           <div className="p-8 text-center text-sm text-pc-text-muted">
             {t('pairing.no_devices')}
           </div>
