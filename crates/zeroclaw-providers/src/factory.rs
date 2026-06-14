@@ -71,6 +71,26 @@ pub trait CompatFamilySpec {
     /// (e.g. Sambanova, Hyperbolic — no public catalog at all without a key).
     const OPENROUTER_VENDOR_PREFIX: Option<&'static str> = None;
 
+    /// Wire protocol selector for this entry, when the family reads it from
+    /// per-alias config. Defaults to `None` so families that only speak
+    /// chat_completions need no override.
+    ///
+    /// A family whose endpoint can serve the responses wire MUST override this
+    /// to return `self.base.wire_api`; otherwise a user's
+    /// `wire_api = "responses"` is silently ignored and routed through
+    /// chat_completions. The blanket `create_provider` consults this before
+    /// building the compat client.
+    fn wire_api(&self) -> Option<zeroclaw_config::schema::WireApi> {
+        None
+    }
+
+    /// Whether this provider's `/models` endpoint is accessible without an
+    /// API key. When `true`, `list_models()` and `list_models_with_pricing()`
+    /// will query the live endpoint even when no credential is configured.
+    /// Defaults to `false`; set to `true` for providers like Kilo Gateway
+    /// whose model catalog is public.
+    const PUBLIC_MODEL_LISTING: bool = false;
+
     /// Build the base compat provider with both catalog consts applied. Use
     /// this from inside `build_compat` overrides so the catalog hooks ride
     /// along with any family-specific modifiers.
@@ -92,6 +112,9 @@ pub trait CompatFamilySpec {
         }
         if let Some(prefix) = Self::OPENROUTER_VENDOR_PREFIX {
             p = p.with_openrouter_vendor_prefix(prefix);
+        }
+        if Self::PUBLIC_MODEL_LISTING {
+            p = p.with_public_model_listing();
         }
         p
     }
@@ -117,6 +140,15 @@ impl<T: CompatFamilySpec> FamilyProviderFactory for T {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
+        if let Some(p) = build_responses_provider_if_requested(
+            self.wire_api(),
+            alias,
+            api_url.or(Some(Self::DEFAULT_URL)),
+            key,
+            opts,
+        ) {
+            return Ok(p);
+        }
         Ok(apply_compat_options(
             self.build_compat(alias, key, api_url),
             opts,
@@ -250,7 +282,7 @@ pub fn dispatch_family_factory(
                     Err(anyhow::Error::msg(format!(
                         "Unknown model_provider family: {family}. After the V2 to typed-family migration, \
                          only canonical family names are valid. Run `zeroclaw quickstart` to reconfigure, \
-                         or set `[model_providers.custom.<alias>] uri = \"https://your-api.com\"` for \
+                         or set `[providers.models.custom.<alias>] uri = \"https://your-api.com\"` for \
                          OpenAI-compatible custom endpoints."
                     )))
                 },
@@ -278,19 +310,19 @@ use zeroclaw_config::schema::{
     GeminiCliModelProviderConfig, GeminiModelProviderConfig, GithubModelsModelProviderConfig,
     GlmModelProviderConfig, GroqModelProviderConfig, HuggingfaceModelProviderConfig,
     HunyuanModelProviderConfig, HyperbolicModelProviderConfig, InceptionModelProviderConfig,
-    KiloCliModelProviderConfig, LambdaAiModelProviderConfig, LeptonModelProviderConfig,
-    LitellmModelProviderConfig, LlamacppModelProviderConfig, LmstudioModelProviderConfig,
-    MinimaxModelProviderConfig, MistralModelProviderConfig, MoonshotEndpoint,
-    MoonshotModelProviderConfig, MorphModelProviderConfig, NebiusModelProviderConfig,
-    NovitaModelProviderConfig, NscaleModelProviderConfig, NvidiaModelProviderConfig,
-    OllamaModelProviderConfig, OpenAIModelProviderConfig, OpenRouterModelProviderConfig,
-    OpencodeModelProviderConfig, OsaurusModelProviderConfig, OvhModelProviderConfig,
-    PerplexityModelProviderConfig, QianfanModelProviderConfig, QwenModelProviderConfig,
-    RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
-    SiliconflowModelProviderConfig, StepfunModelProviderConfig, SyntheticModelProviderConfig,
-    TelnyxModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
-    VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
-    XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    KiloCliModelProviderConfig, KiloModelProviderConfig, LambdaAiModelProviderConfig,
+    LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
+    LmstudioModelProviderConfig, MinimaxModelProviderConfig, MistralModelProviderConfig,
+    MoonshotEndpoint, MoonshotModelProviderConfig, MorphModelProviderConfig,
+    NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
+    NvidiaModelProviderConfig, OllamaModelProviderConfig, OpenAIModelProviderConfig,
+    OpenRouterModelProviderConfig, OpencodeModelProviderConfig, OsaurusModelProviderConfig,
+    OvhModelProviderConfig, PerplexityModelProviderConfig, QianfanModelProviderConfig,
+    QwenModelProviderConfig, RekaModelProviderConfig, SambanovaModelProviderConfig,
+    SglangModelProviderConfig, SiliconflowModelProviderConfig, StepfunModelProviderConfig,
+    SyntheticModelProviderConfig, TelnyxModelProviderConfig, TogetherModelProviderConfig,
+    UpstageModelProviderConfig, VeniceModelProviderConfig, VercelModelProviderConfig,
+    VllmModelProviderConfig, XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
 };
 
 // ── Pure-compat families ───────────────────────────────────────────────
@@ -321,6 +353,10 @@ impl CompatFamilySpec for OpencodeModelProviderConfig {
     const DEFAULT_URL: &'static str = "https://opencode.ai/zen/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("opencode");
+
+    fn wire_api(&self) -> Option<zeroclaw_config::schema::WireApi> {
+        self.base.wire_api
+    }
 }
 impl CompatFamilySpec for DoubaoModelProviderConfig {
     const DISPLAY: &'static str = "Doubao";
@@ -787,6 +823,9 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
         }
         // Default: chat_completions wire with standard API key.
         let mut p = crate::openai::OpenAiModelProvider::with_base_url(alias, api_url, key);
+        if let Some(t) = opts.provider_timeout_secs {
+            p = p.with_timeout_secs(t);
+        }
         if let Some(mt) = opts.provider_max_tokens {
             p = p.with_max_tokens(Some(mt));
         }
@@ -830,7 +869,7 @@ fn build_ollama_compat_provider(
         true,
     )
     .with_local_model_tool_sanitize()
-    .with_unauthenticated_model_listing();
+    .with_public_model_listing();
     if opts.merge_system_into_user {
         p = p.with_merge_system_into_user();
     }
@@ -902,7 +941,7 @@ impl FamilyProviderFactory for AzureModelProviderConfig {
         _opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
         // Reads typed Azure alias fields directly. Operator sets these
-        // under `[model_providers.azure.<alias>]` or via the schema-mirror
+        // under `[providers.models.azure.<alias>]` or via the schema-mirror
         // env grammar — env-var fallback eradicated.
         let resource = self.resource.as_deref().ok_or_else(|| {
             ::zeroclaw_log::record!(
@@ -918,7 +957,7 @@ impl FamilyProviderFactory for AzureModelProviderConfig {
             );
             anyhow::Error::msg(
                 "Azure model_provider requires `resource`: set \
-                 `[model_providers.azure.<alias>] resource = \"...\"` in config.toml.",
+                 `[providers.models.azure.<alias>] resource = \"...\"` in config.toml.",
             )
         })?;
         let deployment = self.deployment.as_deref().ok_or_else(|| {
@@ -935,7 +974,7 @@ impl FamilyProviderFactory for AzureModelProviderConfig {
             );
             anyhow::Error::msg(
                 "Azure model_provider requires `deployment`: set \
-                 `[model_providers.azure.<alias>] deployment = \"...\"` in config.toml.",
+                 `[providers.models.azure.<alias>] deployment = \"...\"` in config.toml.",
             )
         })?;
         let api_version = self.api_version.as_deref();
@@ -1067,7 +1106,7 @@ impl FamilyProviderFactory for GroqModelProviderConfig {
         .with_models_dev_key("groq");
         // Groq's llama-family models reject native tool calls with HTTP
         // 400; default to text-fallback. Operators can override per-alias
-        // via `[model_providers.groq.<alias>] native_tools = true`.
+        // via `[providers.models.groq.<alias>] native_tools = true`.
         if opts.native_tools != Some(true) {
             p = p.without_native_tools();
         }
@@ -1117,6 +1156,19 @@ impl FamilyProviderFactory for KiloCliModelProviderConfig {
             self.binary_path.as_deref(),
         )))
     }
+}
+
+// ── Kilo AI Gateway (OpenAI-compatible) ────────────────────────────────
+
+impl CompatFamilySpec for KiloModelProviderConfig {
+    const DISPLAY: &'static str = "Kilo";
+    // Canonical gateway host per https://kilo.ai/docs/gateway (api.kilo.ai;
+    // app.kilo.ai is the web-app sign-in). Must stay in lockstep with
+    // `KiloEndpoint::Gateway` in zeroclaw-config — see the
+    // `kilo_gateway_default_url_matches_schema_endpoint` regression test.
+    const DEFAULT_URL: &'static str = "https://api.kilo.ai/api/gateway";
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+    const PUBLIC_MODEL_LISTING: bool = true;
 }
 
 impl FamilyProviderFactory for LmstudioModelProviderConfig {
@@ -1241,7 +1293,7 @@ impl FamilyProviderFactory for CustomModelProviderConfig {
             );
             anyhow::Error::msg(
                 "Custom model_provider requires `uri`: set \
-                 `[model_providers.custom.<alias>] uri = \"https://your-api.com\"` in config.toml.",
+                 `[providers.models.custom.<alias>] uri = \"https://your-api.com\"` in config.toml.",
             )
         })?;
         if let Some(p) = build_responses_provider_if_requested(
@@ -1261,6 +1313,9 @@ impl FamilyProviderFactory for CustomModelProviderConfig {
             AuthStyle::Bearer,
             true,
         );
+        if opts.native_tools != Some(true) {
+            p = p.without_native_tools();
+        }
         if opts.merge_system_into_user {
             p = p.with_merge_system_into_user();
         }
@@ -1279,7 +1334,7 @@ impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
         let base_url = api_url.ok_or_else(|| {
             anyhow::Error::msg(
                 "OpenAI-compatible model_provider requires `uri`: set \
-                 `[model_providers.<family>.<alias>] uri = \"https://your-api.com\"` in config.toml.",
+                 `[providers.models.<family>.<alias>] uri = \"https://your-api.com\"` in config.toml.",
             )
         })?;
         if let Some(p) =
@@ -1306,6 +1361,24 @@ impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
 mod tests {
     use super::*;
     use zeroclaw_config::schema::ModelProviderConfig;
+
+    /// Regression for the #7136 review: the Kilo Gateway default exists in two
+    /// places — the typed `KiloEndpoint` in zeroclaw-config and the factory's
+    /// `CompatFamilySpec::DEFAULT_URL` — and they must never drift apart.
+    /// kilo.ai/docs/gateway documents `api.kilo.ai` as the canonical API host.
+    #[test]
+    fn kilo_gateway_default_url_matches_schema_endpoint() {
+        use zeroclaw_config::schema::{KiloEndpoint, ModelEndpoint};
+        assert_eq!(
+            <KiloModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+            KiloEndpoint::default().uri(),
+            "schema KiloEndpoint and factory DEFAULT_URL disagree on the Kilo Gateway URL"
+        );
+        assert_eq!(
+            KiloEndpoint::default().uri(),
+            "https://api.kilo.ai/api/gateway"
+        );
+    }
 
     #[test]
     fn openai_factory_routes_to_codex_when_requires_openai_auth_true() {
@@ -1549,6 +1622,51 @@ mod tests {
     }
 
     #[test]
+    fn custom_factory_disables_native_tools_by_default() {
+        use zeroclaw_config::schema::{CustomModelProviderConfig, ModelProviderConfig};
+        let cfg = CustomModelProviderConfig {
+            base: ModelProviderConfig {
+                uri: Some("http://10.0.0.15:8000/v1".to_string()),
+                ..Default::default()
+            },
+        };
+        let provider = cfg
+            .create_provider(
+                "vllm",
+                None,
+                Some("http://10.0.0.15:8000/v1"),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .unwrap();
+        assert!(
+            !provider.supports_native_tools(),
+            "custom OpenAI-compatible endpoints must default to prompt-guided tools"
+        );
+    }
+
+    #[test]
+    fn custom_factory_honors_native_tools_override_true() {
+        use zeroclaw_config::schema::{CustomModelProviderConfig, ModelProviderConfig};
+        let cfg = CustomModelProviderConfig {
+            base: ModelProviderConfig {
+                uri: Some("http://10.0.0.15:8000/v1".to_string()),
+                ..Default::default()
+            },
+        };
+        let options = ModelProviderRuntimeOptions {
+            native_tools: Some(true),
+            ..Default::default()
+        };
+        let provider = cfg
+            .create_provider("vllm", None, Some("http://10.0.0.15:8000/v1"), &options)
+            .unwrap();
+        assert!(
+            provider.supports_native_tools(),
+            "custom endpoints with `native_tools = true` must keep native tool calling available"
+        );
+    }
+
+    #[test]
     fn openai_compatible_factory_routes_to_responses_when_wire_api_responses() {
         use zeroclaw_config::schema::{ModelProviderConfig, WireApi};
         let cfg = ModelProviderConfig {
@@ -1565,5 +1683,130 @@ mod tests {
             )
             .unwrap();
         assert_eq!(provider.default_wire_api(), "responses");
+    }
+
+    #[test]
+    fn compat_family_factory_routes_to_responses_when_wire_api_responses() {
+        use zeroclaw_config::schema::{ModelProviderConfig, WireApi};
+        let cfg = OpencodeModelProviderConfig {
+            base: ModelProviderConfig {
+                wire_api: Some(WireApi::Responses),
+                ..Default::default()
+            },
+        };
+        let provider = cfg
+            .create_provider(
+                "default",
+                None,
+                None,
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(provider.default_wire_api(), "responses");
+        // Security/privacy fallback pin: with no alias-level `uri`, the blanket
+        // compat route must hand OpenCode's DEFAULT_URL to the responses
+        // provider. If it stopped doing so, the provider would silently default
+        // to OpenAI's /v1/responses and send OpenCode credentials to the wrong
+        // host.
+        assert_eq!(
+            provider.default_base_url(),
+            Some("https://opencode.ai/zen/v1/responses")
+        );
+    }
+
+    #[test]
+    fn compat_family_factory_defaults_to_chat_completions_without_wire_api() {
+        let cfg = OpencodeModelProviderConfig::default();
+        let provider = cfg
+            .create_provider(
+                "default",
+                None,
+                None,
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .unwrap();
+        assert_ne!(provider.default_wire_api(), "responses");
+    }
+
+    #[test]
+    fn compat_family_without_wire_api_override_ignores_responses_setting() {
+        // Scope guard: only families that override `wire_api()` opt into the
+        // responses route. A compat family that does not override it (Doubao
+        // here) must keep chat_completions even if the entry sets
+        // `wire_api = "responses"`, so this fix stays scoped per family.
+        use zeroclaw_config::schema::{ModelProviderConfig, WireApi};
+        let cfg = DoubaoModelProviderConfig {
+            base: ModelProviderConfig {
+                wire_api: Some(WireApi::Responses),
+                ..Default::default()
+            },
+        };
+        let provider = cfg
+            .create_provider(
+                "default",
+                None,
+                None,
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .unwrap();
+        assert_ne!(provider.default_wire_api(), "responses");
+    }
+
+    #[tokio::test]
+    async fn compat_family_responses_posts_to_responses_path_on_configured_base() {
+        use axum::{Json, Router, extract::State, http::Uri, routing::post};
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{ModelProviderConfig, WireApi};
+
+        type Capture = Arc<Mutex<Vec<String>>>;
+
+        async fn capture_path(
+            State(capture): State<Capture>,
+            uri: Uri,
+            Json(_body): Json<Value>,
+        ) -> Json<Value> {
+            capture
+                .lock()
+                .expect("capture lock poisoned")
+                .push(uri.path().to_string());
+            Json(json!({ "output": [], "output_text": "ok" }))
+        }
+
+        let capture: Capture = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new()
+            .route("/zen/v1/responses", post(capture_path))
+            .with_state(capture.clone());
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let base_url = format!("http://{addr}/zen/v1");
+        let cfg = OpencodeModelProviderConfig {
+            base: ModelProviderConfig {
+                wire_api: Some(WireApi::Responses),
+                ..Default::default()
+            },
+        };
+        let provider = cfg
+            .create_provider(
+                "default",
+                Some("opencode-test-credential"),
+                Some(&base_url),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .expect("opencode responses provider should build");
+        let _ = provider
+            .chat_with_system(None, "hello", "big-pickle", Some(0.7))
+            .await;
+
+        server.abort();
+
+        let paths = capture.lock().expect("capture lock poisoned").clone();
+        assert_eq!(paths, vec!["/zen/v1/responses".to_string()]);
     }
 }

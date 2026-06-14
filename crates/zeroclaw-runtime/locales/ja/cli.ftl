@@ -355,6 +355,13 @@ onboard-openai-auth-codex = Codexサブスクリプション
 onboard-openai-codex-followup =
     Codexサブスクリプションの認証はChatGPTアカウントを使用します。
     エージェントを起動する前に `zeroclaw auth login --provider openai-codex` を実行して認証してください。
+cli-web-dist-dir-reason-tilde = 展開されない `~` で始まっています
+cli-web-dist-dir-reason-dollar = 展開されない `$` が含まれています
+cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" — {$reason}。gateway.web_dist_dir はそのまま読み込まれるため、値を自分で展開してください（例: 絶対パス）
+cli-self-test-web-dist-dir-name = web_dist_dir
+cli-self-test-web-dist-dir-pass-unset = 未設定（自動検出を使用）
+cli-self-test-web-dist-dir-pass-literal = {$path}（リテラルパス）
+cli-self-test-web-dist-dir-fail-expansion = 警告: {$path} — {$reason}。gateway.web_dist_dir はそのまま読み込まれるため、値を自分で展開してください（例: 絶対パス）
 cli-peripherals-none = 周辺機器が設定されていません。
 cli-peripherals-add-hint = 次のコマンドで追加します: zeroclaw peripheral add <board> <path>
 cli-peripherals-add-example = {"  "}例: zeroclaw peripheral add nucleo-f401re <serial-path>
@@ -437,6 +444,13 @@ cli-press-enter = 終了するにはEnterキーを押してください...
 cli-quickstart-title = クイックスタート — 1つの動作するエージェントをエンドツーエンドで作成します。
 cli-quickstart-cancelled = クイックスタートをキャンセルしました。設定は書き込まれていません。
 cli-quickstart-incomplete = {"  "}すべてのセレクターがまだ入力されていません。
+cli-quickstart-create-agent = ── エージェントを作成
+cli-quickstart-create-agent-locked = ── エージェントを作成（ロック中 — 先にすべてのセレクターを入力してください）
+cli-quickstart-open-selector-prompt = セレクターを開く（Enter）か、作成を選択します。Escで終了。
+cli-quickstart-use-existing = 既存を使用
+cli-quickstart-create-new = 新規作成
+cli-quickstart-model-provider-prompt = モデルプロバイダー
+cli-quickstart-pick-configured-provider = 設定済みプロバイダーを選択
 cli-no-channels-compiled = {"  "}このバイナリにコンパイルされているチャンネルタイプはありません。
 cli-quickstart-complete = クイックスタートが完了しました。エージェント `{$alias}` を作成しました。
 cli-next-steps = 次のステップ:

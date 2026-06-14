@@ -349,6 +349,25 @@ fn lookup_prop_field(
         .prop_fields()
         .into_iter()
         .find(|info| info.name == path)
+        .or_else(|| {
+            zeroclaw_config::schema::Config::prop_is_secret(path).then(|| {
+                zeroclaw_config::traits::PropFieldInfo {
+                    name: path.to_string(),
+                    category: "Secrets",
+                    display_value: zeroclaw_config::traits::UNSET_DISPLAY.to_string(),
+                    type_hint: "String",
+                    kind: zeroclaw_config::traits::PropKind::String,
+                    is_secret: true,
+                    enum_variants: None,
+                    description: "",
+                    derived_from_secret: false,
+                    credential_class: Some(
+                        zeroclaw_config::traits::CredentialSurfaceClass::EncryptedSecret,
+                    ),
+                    tab: zeroclaw_config::traits::ConfigTab::None,
+                }
+            })
+        })
 }
 
 /// Save the config and refresh in-memory state. Captures a snapshot of the
@@ -775,7 +794,7 @@ pub async fn handle_list(
         .prop_fields()
         .into_iter()
         .filter(|info| match prefix {
-            Some(p) => info.name.starts_with(p),
+            Some(p) => field_visibility::path_matches_prefix(&info.name, p),
             None => true,
         })
         .filter(|info| !field_visibility::is_excluded(&info.name, &excluded))
@@ -2212,6 +2231,20 @@ mod tests {
         assert!(!obj.contains_key("length"));
         assert!(!obj.contains_key("hash"));
         assert!(!obj.contains_key("masked"));
+    }
+
+    #[test]
+    fn lookup_prop_field_synthesizes_dynamic_http_request_secret_metadata() {
+        let cfg = zeroclaw_config::schema::Config::default();
+        let field = lookup_prop_field(&cfg, "http_request.secrets.api_token")
+            .expect("dynamic http_request secret metadata");
+
+        assert_eq!(field.kind, PropKind::String);
+        assert!(field.is_secret);
+        assert_eq!(
+            field.credential_class,
+            Some(zeroclaw_config::traits::CredentialSurfaceClass::EncryptedSecret)
+        );
     }
 
     #[test]

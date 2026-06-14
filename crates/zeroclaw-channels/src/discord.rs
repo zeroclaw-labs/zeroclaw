@@ -38,6 +38,13 @@ pub struct DiscordChannel {
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     listen_to_bots: bool,
     mention_only: bool,
+    /// Raw IDENTIFY mask override (config `intents_mask`). `Some` wins over
+    /// everything `gateway_intents()` would derive — including `Some(0)`,
+    /// a legal IDENTIFY value. Intents are connection-scoped (sent once in
+    /// IDENTIFY), so a construction-time snapshot matches the connection
+    /// lifecycle exactly: config reloads rebuild channels, which re-derives
+    /// the mask.
+    intents_mask_override: Option<u64>,
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
@@ -123,6 +130,7 @@ impl DiscordChannel {
             peer_resolver,
             listen_to_bots,
             mention_only,
+            intents_mask_override: None,
             typing_handles: Mutex::new(HashMap::new()),
             proxy_url: None,
             transcription: None,
@@ -146,6 +154,23 @@ impl DiscordChannel {
     pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
         self.proxy_url = proxy_url;
         self
+    }
+
+    /// Send exactly `mask` in IDENTIFY when `Some`, ignoring the derived
+    /// mask entirely (including `Some(0)`, a legal IDENTIFY value). Operator
+    /// escape hatch (config `intents_mask`).
+    pub fn with_intents_mask(mut self, mask: Option<u64>) -> Self {
+        self.intents_mask_override = mask;
+        self
+    }
+
+    /// Gateway intent mask for IDENTIFY: the raw `intents_mask` override
+    /// when set, otherwise the fixed baseline.
+    fn gateway_intents(&self) -> u64 {
+        if let Some(mask) = self.intents_mask_override {
+            return mask;
+        }
+        BASELINE_INTENTS
     }
 
     pub fn with_approval_timeout_secs(mut self, secs: u64) -> Self {
@@ -1374,6 +1399,18 @@ fn contains_bot_mention(content: &str, bot_user_id: &str) -> bool {
     content.contains(&tags[0]) || content.contains(&tags[1])
 }
 
+/// Whether a Discord message `type` represents a real user turn the bot should
+/// act on, versus a system/auto message it must ignore.
+///
+/// Only `DEFAULT` (0) and `REPLY` (19) are conversational. Everything else is a
+/// system message: notably `THREAD_CREATED` (18) — posted in the parent channel
+/// when a thread is created — and `THREAD_STARTER_MESSAGE` (21), plus joins,
+/// pins, boosts, etc. Acting on `THREAD_CREATED` is what made the bot "respond
+/// to a thread's birth message".
+fn is_conversational_message_type(message_type: u64) -> bool {
+    matches!(message_type, 0 | 19)
+}
+
 /// Decide whether an inbound Discord message passes the listener gate.
 /// Returns the cleaned text body when admitted, or `None` to drop the
 /// message. Attachment-only messages (empty `content` plus at least one
@@ -1435,6 +1472,75 @@ fn base64_decode(input: &str) -> Option<String> {
     }
 
     String::from_utf8(bytes).ok()
+}
+
+// Discord gateway intent bits (API v10) — the ones zeroclaw consumes or
+// exposes as opt-ins. https://discord.com/developers/docs/events/gateway#gateway-intents
+const INTENT_GUILDS: u64 = 1 << 0;
+const INTENT_GUILD_MEMBERS: u64 = 1 << 1; // privileged
+const INTENT_GUILD_PRESENCES: u64 = 1 << 8; // privileged
+const INTENT_GUILD_MESSAGES: u64 = 1 << 9;
+const INTENT_DIRECT_MESSAGES: u64 = 1 << 12;
+const INTENT_MESSAGE_CONTENT: u64 = 1 << 15; // privileged
+
+/// The intents every Discord channel needs: guild topology plus guild/DM
+/// messages with content. MESSAGE_CONTENT is privileged but always requested
+/// — without it the bot only sees text in DMs and @-mentions, which silently
+/// breaks `archive`, `listen_to_bots`, and mention-free channels.
+const BASELINE_INTENTS: u64 =
+    INTENT_GUILDS | INTENT_GUILD_MESSAGES | INTENT_DIRECT_MESSAGES | INTENT_MESSAGE_CONTENT;
+
+/// Human-readable names for a resolved intent mask, for connect logs and
+/// close-code diagnostics. Bits without a known name (possible via the raw
+/// `intents_mask` override) are reported as one hex remainder entry rather
+/// than silently dropped.
+fn intent_names(mask: u64) -> Vec<String> {
+    let known: [(u64, &str); 6] = [
+        (INTENT_GUILDS, "guilds"),
+        (INTENT_GUILD_MEMBERS, "guild_members"),
+        (INTENT_GUILD_PRESENCES, "guild_presences"),
+        (INTENT_GUILD_MESSAGES, "guild_messages"),
+        (INTENT_DIRECT_MESSAGES, "direct_messages"),
+        (INTENT_MESSAGE_CONTENT, "message_content"),
+    ];
+    let mut names = Vec::new();
+    let mut rest = mask;
+    for (bit, name) in known {
+        if mask & bit != 0 {
+            names.push(name.to_string());
+            rest &= !bit;
+        }
+    }
+    if rest != 0 {
+        names.push(format!("unknown({rest:#x})"));
+    }
+    names
+}
+
+/// Close 4014 means the Developer Portal doesn't grant a privileged intent
+/// we requested. Name the portal toggles so the operator knows exactly what
+/// to fix instead of staring at a bare close code.
+fn disallowed_intents_hint(mask: u64) -> String {
+    let mut requested = Vec::new();
+    if mask & INTENT_MESSAGE_CONTENT != 0 {
+        requested.push("Message Content".to_string());
+    }
+    if mask & INTENT_GUILD_MEMBERS != 0 {
+        requested.push("Server Members".to_string());
+    }
+    if mask & INTENT_GUILD_PRESENCES != 0 {
+        requested.push("Presence".to_string());
+    }
+    if requested.is_empty() {
+        // Reachable only via an `intents_mask` override with no privileged
+        // bits — name the raw mask so the operator has something to act on.
+        requested.push(format!("mask {mask:#x}"));
+    }
+    format!(
+        " — a privileged intent is not enabled for this bot in the Discord \
+         Developer Portal (Bot → Privileged Gateway Intents). Requested: {}",
+        requested.join(", ")
+    )
 }
 
 fn is_fatal_gateway_close_code(code: u16) -> bool {
@@ -1661,11 +1767,26 @@ impl Channel for DiscordChannel {
                 "sent Discord Resume"
             );
         } else {
+            let intents = self.gateway_intents();
+            if intents & BASELINE_INTENTS != BASELINE_INTENTS {
+                // Only reachable via the raw `intents_mask` override — the
+                // derived path always starts from the full baseline.
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "intents": intents,
+                            "missing": intent_names(BASELINE_INTENTS & !intents),
+                        })),
+                    "intents_mask drops baseline intents — message handling may go quiet"
+                );
+            }
             let identify = json!({
                 "op": 2,
                 "d": {
                     "token": self.bot_token,
-                    "intents": 37377,
+                    "intents": intents,
                     "properties": {
                         "os": "linux",
                         "browser": "zeroclaw",
@@ -1678,7 +1799,11 @@ impl Channel for DiscordChannel {
                 .await?;
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "intents": intents,
+                        "intent_names": intent_names(intents),
+                    })),
                 "sent Discord Identify"
             );
         }
@@ -1762,9 +1887,15 @@ impl Channel for DiscordChannel {
                                     session.sequence = None;
                                 }
                                 if is_fatal_gateway_close_code(code) {
-                                    return Err(Self::fatal_listener_error(format!(
+                                    let mut message = format!(
                                         "discord gateway closed with fatal code {code}: {reason}"
-                                    )));
+                                    );
+                                    if code == 4014 {
+                                        message.push_str(&disallowed_intents_hint(
+                                            self.gateway_intents(),
+                                        ));
+                                    }
+                                    return Err(Self::fatal_listener_error(message));
                                 }
                                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"code": code, "reason": reason, "had_ready": had_ready, "sequence": sequence})), "discord gateway closed; reconnecting");
                             }
@@ -1881,6 +2012,20 @@ impl Channel for DiscordChannel {
                     let Some(d) = event.get("d") else {
                         continue;
                     };
+
+                    // Skip non-conversational system messages. Discord posts a
+                    // MESSAGE_CREATE of type 18 (THREAD_CREATED) in the parent
+                    // channel when a thread is born — authored by the human who
+                    // created it, with the thread name as content — which would
+                    // otherwise pass the admit gate and make the bot "reply" to
+                    // the thread's birth. Type 21 (THREAD_STARTER_MESSAGE), pins,
+                    // joins, etc. are likewise not user turns. Only DEFAULT (0)
+                    // and REPLY (19) are real messages to act on. Absent `type`
+                    // defaults to 0 for forward-compatibility.
+                    let message_type = d.get("type").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                    if !is_conversational_message_type(message_type) {
+                        continue;
+                    }
 
                     // Skip messages from the bot itself
                     let author_id = d.get("author").and_then(|a| a.get("id")).and_then(|i| i.as_str()).unwrap_or("");
@@ -2655,6 +2800,109 @@ mod tests {
     }
 
     #[test]
+    fn gateway_intents_default_matches_legacy_mask() {
+        // The pre-resolver IDENTIFY hardcoded 37377. A default-config channel
+        // must request exactly the same mask — no silent behavior change.
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        );
+        assert_eq!(ch.gateway_intents(), 37377);
+        assert_eq!(ch.gateway_intents(), BASELINE_INTENTS);
+    }
+
+    #[test]
+    fn intent_names_decode_the_mask() {
+        assert_eq!(
+            intent_names(BASELINE_INTENTS),
+            vec![
+                "guilds",
+                "guild_messages",
+                "direct_messages",
+                "message_content"
+            ]
+        );
+        assert_eq!(
+            intent_names(BASELINE_INTENTS | INTENT_GUILD_MEMBERS | INTENT_GUILD_PRESENCES),
+            vec![
+                "guilds",
+                "guild_members",
+                "guild_presences",
+                "guild_messages",
+                "direct_messages",
+                "message_content"
+            ]
+        );
+        // Bits with no known name (reachable via the raw override) are
+        // reported, not dropped.
+        assert_eq!(
+            intent_names(INTENT_GUILDS | (1 << 21)),
+            vec!["guilds".to_string(), format!("unknown({:#x})", 1u64 << 21)]
+        );
+    }
+
+    #[test]
+    fn disallowed_intents_hint_names_privileged_toggles() {
+        let hint = disallowed_intents_hint(BASELINE_INTENTS | INTENT_GUILD_MEMBERS);
+        assert!(hint.contains("Server Members"));
+        assert!(hint.contains("Message Content"));
+        assert!(!hint.contains("Presence,"));
+
+        let base_hint = disallowed_intents_hint(BASELINE_INTENTS);
+        assert!(base_hint.contains("Message Content"));
+        assert!(!base_hint.contains("Server Members"));
+
+        // An override mask with no privileged bits still produces an
+        // actionable message instead of a dangling empty list.
+        let bare = disallowed_intents_hint(INTENT_GUILDS);
+        assert!(bare.contains("mask 0x1"));
+    }
+
+    #[test]
+    fn intents_mask_override_wins_verbatim() {
+        // Operator escape hatch: a Some(_) intents_mask is sent exactly as
+        // configured, ignoring the derived baseline — including Some(0),
+        // which is a legal IDENTIFY value.
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        )
+        .with_intents_mask(Some(46593));
+        assert_eq!(ch.gateway_intents(), 46593);
+
+        let zero = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        )
+        .with_intents_mask(Some(0));
+        assert_eq!(zero.gateway_intents(), 0);
+
+        // None means "derive".
+        let derived = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        )
+        .with_intents_mask(None);
+        assert_eq!(derived.gateway_intents(), BASELINE_INTENTS);
+    }
+
+    #[test]
     fn base64_decode_bot_id() {
         // "MTIzNDU2" decodes to "123456"
         let decoded = base64_decode("MTIzNDU2");
@@ -2849,6 +3097,19 @@ mod tests {
         assert!(contains_bot_mention("hi <@12345>", "12345"));
         assert!(contains_bot_mention("hi <@!12345>", "12345"));
         assert!(!contains_bot_mention("hi <@99999>", "12345"));
+    }
+
+    #[test]
+    fn thread_created_and_system_messages_are_not_conversational() {
+        // The bug: THREAD_CREATED (18) was treated as a normal message, so the
+        // bot replied to a thread's birth. It and other system types must be
+        // rejected; only DEFAULT (0) and REPLY (19) are real user turns.
+        assert!(is_conversational_message_type(0)); // DEFAULT
+        assert!(is_conversational_message_type(19)); // REPLY
+        assert!(!is_conversational_message_type(18)); // THREAD_CREATED
+        assert!(!is_conversational_message_type(21)); // THREAD_STARTER_MESSAGE
+        assert!(!is_conversational_message_type(6)); // CHANNEL_PINNED_MESSAGE
+        assert!(!is_conversational_message_type(7)); // USER_JOIN
     }
 
     #[test]

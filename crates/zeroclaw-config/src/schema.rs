@@ -98,6 +98,11 @@ pub struct Config {
     /// original on-disk credentials survive any save cycle.
     #[serde(skip)]
     pub pre_override_snapshots: std::collections::HashMap<String, String>,
+    /// Per-path snapshot of `op://` external secret references captured before
+    /// `decrypt_secrets()` resolves them for runtime use. `save()` restores
+    /// these references unless the same path was intentionally edited.
+    #[serde(skip)]
+    pub onepassword_reference_snapshots: std::collections::HashMap<String, String>,
     /// Dotted prop-paths mutated since the last persist; drives the
     /// per-path PATCH applied by `save_dirty()`.
     #[serde(skip)]
@@ -671,7 +676,7 @@ pub enum AuthMode {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models"]
 pub struct ModelProviderConfig {
-    /// Secret API token for this model_provider — grab it from the model_provider's dashboard (OpenAI platform, Anthropic console, OpenRouter keys page, etc.). Stored via the OS keyring when possible; never commit it to config.toml directly.
+    /// Secret API token for this model_provider. Grab it from the model_provider's dashboard (OpenAI platform, Anthropic console, OpenRouter keys page, etc.). Stored via the OS keyring when possible; never commit it to config.toml directly.
     #[secret]
     #[credential_class = "encrypted_secret"]
     #[tab(Connection)]
@@ -684,18 +689,18 @@ pub struct ModelProviderConfig {
     /// "openai-compatible"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
-    /// Endpoint URI the client hits. Override the family's default endpoint when pointing at a self-hosted gateway (LiteLLM, vLLM, Ollama), a custom proxy, or any non-standard URL. Leave unset to use the family's default URI from its `ModelEndpoint` impl. Set this to the FULL endpoint URL — there is no separate path-suffix field.
+    /// Endpoint URI the client hits. Override the family's default endpoint when pointing at a self-hosted gateway (LiteLLM, vLLM, Ollama), a custom proxy, or any non-standard URL. Leave unset to use the family's default URI from its `ModelEndpoint` impl. Set this to the FULL endpoint URL; there is no separate path-suffix field.
     #[tab(Connection)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
-    /// Model identifier to send with each request — the ID string from the model_provider's catalog (e.g. `gpt-4o`, `claude-sonnet-4-5`, `llama-3.3-70b`). Must match a model the model_provider actually serves on this account.
+    /// Model identifier to send with each request: the ID string from the model_provider's catalog (e.g. `gpt-4o`, `claude-sonnet-4-5`, `llama-3.3-70b`). Must match a model the model_provider actually serves on this account.
     #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Ordered list of other provider aliases to try when every model on this
     /// alias has failed. Each entry is a dotted `<type>.<alias>` reference into
     /// `providers.models` and resolves with its own credentials, endpoint, and
-    /// model — a fallback never inherits this alias's key. The walk is
+    /// model. A fallback never inherits this alias's key. The walk is
     /// depth-first: this alias's models are exhausted first, then each fallback
     /// alias is descended in turn (applying its own `fallback_models` and
     /// `fallback`). Empty means no provider-level fallback.
@@ -704,7 +709,7 @@ pub struct ModelProviderConfig {
     pub fallback: Vec<crate::providers::ModelProviderRef>,
     /// Ordered alternate models to try on THIS provider before falling over to
     /// the `fallback` aliases. Same endpoint, key, and headers as the primary
-    /// `model` — only the model identifier changes. Use this when a provider
+    /// `model`. Only the model identifier changes. Use this when a provider
     /// serves a backup model (e.g. a smaller or older variant) that should be
     /// tried before leaving the provider entirely. Empty means only `model` is
     /// tried.
@@ -712,8 +717,8 @@ pub struct ModelProviderConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback_models: Vec<String>,
     /// Sampling temperature passed to the model. Lower values (0.0–0.3) give
-    /// deterministic, near-verbatim output — fits code, routing, summarization.
-    /// Higher values (0.7–1.2) give more varied output — fits open-ended chat.
+    /// deterministic, near-verbatim output, which fits code, routing, summarization.
+    /// Higher values (0.7–1.2) give more varied output, which fits open-ended chat.
     #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
@@ -721,13 +726,13 @@ pub struct ModelProviderConfig {
     #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
-    /// Extra HTTP headers sent with every request. Niche — used for auth bridges, corporate proxies, or custom gateways that demand a tracing header. Most users never touch this; edit `config.toml` directly if you need it.
+    /// Extra HTTP headers sent with every request. Niche: used for auth bridges, corporate proxies, or custom gateways that demand a tracing header. Most users never touch this; edit `config.toml` directly if you need it.
     #[tab(Connection)]
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub extra_headers: HashMap<String, String>,
-    /// Wire protocol flavor: `responses` for OpenAI's Codex/Responses API, `chat_completions` for everything else (OpenAI chat, Anthropic, OpenRouter, Groq, local gateways). Auto-selected per model_provider — only override if you're forcing an unusual combination.
+    /// Wire protocol flavor: `responses` for OpenAI's Codex/Responses API, `chat_completions` for everything else (OpenAI chat, Anthropic, OpenRouter, Groq, local gateways). Auto-selected per model_provider; only override if you're forcing an unusual combination.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_api: Option<WireApi>,
@@ -736,11 +741,11 @@ pub struct ModelProviderConfig {
     #[serde(default, skip_serializing_if = "is_false")]
     #[credential_class = "external_auth_store"]
     pub requires_openai_auth: bool,
-    /// Hard cap on response length in tokens. Most models enforce sensible built-in limits already — leave unset unless you specifically need to clip long outputs for cost or latency reasons.
+    /// Hard cap on response length in tokens. Most models enforce sensible built-in limits already; leave unset unless you specifically need to clip long outputs for cost or latency reasons.
     #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
-    /// ModelProvider-specific quirk: fold the system prompt into the first user message instead of sending a separate system role. Only needed for models that reject (or mishandle) a standalone system role — e.g. certain older Mistral variants.
+    /// ModelProvider-specific quirk: fold the system prompt into the first user message instead of sending a separate system role. Only needed for models that reject (or mishandle) a standalone system role, e.g. certain older Mistral variants.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "is_false")]
     pub merge_system_into_user: bool,
@@ -884,7 +889,7 @@ pub struct AzureModelProviderConfig {
         alias = "azure_openai_resource"
     )]
     pub resource: Option<String>,
-    /// Azure deployment name — the deployment created in Azure AI Studio.
+    /// Azure deployment name: the deployment created in Azure AI Studio.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -1031,7 +1036,7 @@ pub struct QwenModelProviderConfig {
     /// Long-lived Qwen OAuth refresh token. When set, the runtime
     /// exchanges it for a short-lived access token at provider
     /// construction time. Operators relying on the upstream `qwen login`
-    /// tool (which writes `~/.qwen/oauth_creds.json`) leave this unset —
+    /// tool (which writes `~/.qwen/oauth_creds.json`) leave this unset;
     /// the file-cache integration takes over.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[secret(category = "model_provider")]
@@ -1119,7 +1124,7 @@ pub struct OllamaModelProviderConfig {
     /// Force every Ollama `/api/chat` request to use this temperature,
     /// overriding the per-call value passed through
     /// `ModelProvider::chat_with_system(.., temperature)`. When unset
-    /// (`None`, the default), the per-call temperature wins — full
+    /// (`None`, the default), the per-call temperature wins: full
     /// backward compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature_override: Option<f64>,
@@ -2126,7 +2131,7 @@ pub struct MinimaxModelProviderConfig {
     #[secret(category = "model_provider")]
     pub oauth_refresh_token: Option<String>,
     /// Override of MiniMax's published OAuth client_id. Most operators
-    /// should leave this unset — the runtime defaults to the
+    /// should leave this unset; the runtime defaults to the
     /// vendor-published client_id (same one MiniMax's own portal uses).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth_client_id: Option<String>,
@@ -2328,7 +2333,7 @@ pub struct GeminiModelProviderConfig {
     /// Google OAuth app `client_id`, used when this alias drives ZeroClaw's
     /// own browser/device-code login flow (`zeroclaw auth login
     /// --model-provider gemini --profile <alias>`). Operators relying on
-    /// the upstream `gemini login` tool don't need this — that tool writes
+    /// the upstream `gemini login` tool don't need this; that tool writes
     /// its own client_id / client_secret into `~/.gemini/oauth_creds.json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[secret(category = "model_provider")]
@@ -2802,6 +2807,48 @@ pub struct KiloCliModelProviderConfig {
     pub binary_path: Option<String>,
 }
 
+// ── Kilo (AI Gateway — OpenAI-compatible) ──
+
+/// Kilo AI Gateway endpoint. Single canonical endpoint at kilo.ai.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum KiloEndpoint {
+    #[default]
+    Gateway,
+}
+impl ModelEndpoint for KiloEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Gateway => "https://api.kilo.ai/api/gateway",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.kilo"]
+pub struct KiloModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    /// Kilo endpoint variant. Defaults to the canonical Kilo AI Gateway.
+    #[serde(default, skip_serializing_if = "KiloEndpoint::is_default")]
+    pub endpoint: KiloEndpoint,
+}
+
+impl KiloEndpoint {
+    fn is_default(&self) -> bool {
+        matches!(self, Self::Gateway)
+    }
+}
+
+impl FamilyEndpoint for KiloModelProviderConfig {
+    fn endpoint_uri(&self) -> Option<&'static str> {
+        Some(self.endpoint.uri())
+    }
+}
+
 // ── Custom (user-supplied URL, no canonical default) ──
 
 /// Custom catch-all for operator-defined endpoints. The endpoint variant has
@@ -2999,7 +3046,6 @@ pub struct ResolvedRuntime {
     pub max_system_prompt_chars: usize,
     pub thinking: crate::scattered_types::ThinkingConfig,
     pub history_pruning: crate::scattered_types::HistoryPrunerConfig,
-    pub context_aware_tools: bool,
     pub eval: crate::scattered_types::EvalConfig,
     pub auto_classify: Option<crate::scattered_types::AutoClassifyConfig>,
     pub context_compression: crate::scattered_types::ContextCompressionConfig,
@@ -3023,7 +3069,6 @@ impl Default for ResolvedRuntime {
             max_system_prompt_chars: default_max_system_prompt_chars(),
             thinking: crate::scattered_types::ThinkingConfig::default(),
             history_pruning: crate::scattered_types::HistoryPrunerConfig::default(),
-            context_aware_tools: false,
             eval: crate::scattered_types::EvalConfig::default(),
             auto_classify: None,
             context_compression: crate::scattered_types::ContextCompressionConfig::default(),
@@ -3071,7 +3116,7 @@ pub struct AliasedAgentConfig {
     #[tab(Bundles)]
     #[serde(default)]
     pub skill_bundles: Vec<String>,
-    /// Knowledge bundle aliases. Additive — the agent loads every listed
+    /// Knowledge bundle aliases. Additive: the agent loads every listed
     /// bundle.
     #[tab(Bundles)]
     #[serde(default)]
@@ -3082,7 +3127,7 @@ pub struct AliasedAgentConfig {
     #[tab(Bundles)]
     #[serde(default)]
     pub mcp_bundles: Vec<String>,
-    /// Cron job aliases. Each entry references `cron[key]` — a declarative
+    /// Cron job aliases. Each entry references `cron[key]`, a declarative
     /// scheduled job invoked by the scheduler on its configured trigger.
     /// When the cron fires, this agent is the actor that executes the job.
     #[tab(Cron)]
@@ -3114,7 +3159,7 @@ pub struct AliasedAgentConfig {
     ///
     /// Source of truth for api_key / uri / model / temperature etc. is the
     /// referenced `[providers.models.<type>.<alias>]` entry. This field is
-    /// a reference only (NEVER a copy) — per AGENTS.md SINGLE SOURCE OF TRUTH.
+    /// a reference only (NEVER a copy), per AGENTS.md SINGLE SOURCE OF TRUTH.
     ///
     /// Empty (`Default`) = inherit the main agent's resolved provider+model
     /// (preserves pre-PR behavior; backward compatible).
@@ -3129,7 +3174,7 @@ pub struct AliasedAgentConfig {
     /// underlying `model = "kimi-k2.5"` string can still contain dots.
     ///
     /// ACP channels (IDE-direct) always reply and skip the classifier
-    /// entirely — this field has no effect on ACP traffic.
+    /// entirely, so this field has no effect on ACP traffic.
     #[tab(Providers)]
     #[serde(default)]
     pub classifier_provider: crate::providers::ModelProviderRef,
@@ -3276,13 +3321,13 @@ impl Config {
 
     // ── Effective per-agent runtime tunables ──────────────────────────
     //
-    // Precedence: `[runtime_profiles.<profile>].<field>` (when explicitly
-    // set / non-sentinel) wins over `[agents.<alias>].<field>`. This
-    // matches the documented "None inherits" semantics on
-    // `RuntimeProfileConfig` and the precedence that
-    // `crates/zeroclaw-runtime/src/tools/delegate.rs` already applies for
-    // subagent dispatch. The agent inline field remains the fallback so
-    // configs that only set the agent value keep working unchanged.
+    // Runtime tunables live on `[runtime_profiles.<profile>]`, referenced by an
+    // agent via `agents.<alias>.runtime_profile`. A profile value that is
+    // explicitly set (non-sentinel, i.e. `> 0` for `max_tool_iterations`) is
+    // authoritative; otherwise the global default applies. Agent-inline copies
+    // of these tunable keys are inert — superseded by runtime profiles (see the
+    // `agent_level_tunable_keys_are_inert` test) — so they are deliberately not
+    // consulted here as a fallback (#6877).
 
     #[must_use]
     pub fn effective_max_tool_iterations(&self, agent_alias: &str) -> usize {
@@ -3352,13 +3397,6 @@ impl Config {
     }
 
     #[must_use]
-    pub fn effective_context_aware_tools(&self, agent_alias: &str) -> bool {
-        self.runtime_profile_for_agent(agent_alias)
-            .and_then(|p| p.context_aware_tools)
-            .unwrap_or(false)
-    }
-
-    #[must_use]
     pub fn effective_max_tool_result_chars(&self, agent_alias: &str) -> usize {
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.max_tool_result_chars)
@@ -3397,7 +3435,6 @@ impl Config {
             tool_dispatcher: self.effective_tool_dispatcher(agent_alias),
             tool_call_dedup_exempt: self.effective_tool_call_dedup_exempt(agent_alias),
             max_system_prompt_chars: self.effective_max_system_prompt_chars(agent_alias),
-            context_aware_tools: self.effective_context_aware_tools(agent_alias),
             max_tool_result_chars: self.effective_max_tool_result_chars(agent_alias),
             keep_tool_context_turns: self.effective_keep_tool_context_turns(agent_alias),
             ..ResolvedRuntime::default()
@@ -4049,7 +4086,7 @@ pub struct McpServerConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub env: HashMap<String, String>,
-    /// Optional HTTP headers for HTTP/SSE transports. Treated as secret —
+    /// Optional HTTP headers for HTTP/SSE transports. Treated as secret:
     /// the values commonly carry Bearer tokens for the upstream MCP server.
     #[serde(default)]
     #[secret]
@@ -4067,12 +4104,12 @@ pub struct McpServerConfig {
 pub struct McpConfig {
     /// Enable MCP tool loading.
     #[tab(Settings)]
-    #[serde(default)]
+    #[serde(default = "default_mcp_enabled")]
     pub enabled: bool,
     /// Load MCP tool schemas on-demand via `tool_search` instead of eagerly
-    /// including them in the LLM context window. When `true` (the default),
-    /// only tool names are listed in the system prompt; the LLM must call
-    /// `tool_search` to fetch full schemas before invoking a deferred tool.
+    /// including them in the LLM context window. When enabled, only tool names
+    /// are listed in the system prompt; the LLM must call `tool_search` to fetch
+    /// full schemas before invoking a deferred tool.
     #[tab(Settings)]
     #[serde(default = "default_deferred_loading")]
     pub deferred_loading: bool,
@@ -4081,20 +4118,35 @@ pub struct McpConfig {
     /// dashboard's `+ Add MCP server` affordance and the `POST
     /// /api/config/map-key?path=mcp.servers&key=<name>` endpoint pick it
     /// up automatically (no hand-table on the gateway side).
+    ///
+    /// `#[natural_key = "name"]` opts the Vec into per-element property
+    /// routing (see `route_vec_path` and the `Configurable` derive's
+    /// `#[natural_key]` arm). With it, `set_prop("mcp.servers.<name>.url",
+    /// ...)` and `get_prop("mcp.servers.<name>.transport")` resolve to
+    /// the matching element's own `set_prop` / `get_prop`, and the
+    /// `mcp.servers` section behaves like a `HashMap<String,
+    /// McpServerConfig>` from the dashboard / TUI's point of view.
+    /// `name` itself becomes read-only via `set_prop`; rename goes
+    /// through `rename_map_key` which mutates the `name` field in place.
     #[tab(Servers)]
     #[serde(default, alias = "mcpServers")]
     #[nested]
+    #[natural_key = "name"]
     pub servers: Vec<McpServerConfig>,
 }
 
-fn default_deferred_loading() -> bool {
+fn default_mcp_enabled() -> bool {
     true
+}
+
+fn default_deferred_loading() -> bool {
+    false
 }
 
 impl Default for McpConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: default_mcp_enabled(),
             deferred_loading: default_deferred_loading(),
             servers: Vec::new(),
         }
@@ -4982,30 +5034,55 @@ pub struct SkillInstallSuggestionsConfig {
     pub enabled: bool,
 }
 
-/// Skill self-improvement configuration (`[skills.auto_improve]` section).
+/// Skill self-improvement configuration (`[skills.skill-improvement]` section).
+///
+/// Controls the post-turn background review fork that may patch, expand, or
+/// archive skills based on what the conversation revealed. The fork runs in a
+/// restricted toolset (only `skills_list`, `skill_view`, `skill_manage`) and
+/// never touches the user-visible conversation.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "skills.skill_improvement"]
 pub struct SkillImprovementConfig {
-    /// Enable automatic skill improvement after successful skill usage.
-    /// Default: `true`.
-    #[serde(default = "default_true")]
+    /// Enable the background skill-review fork. Default: `false`.
+    /// Opt-in: users must explicitly enable this to allow post-turn skill
+    /// mutations.
+    #[serde(default)]
     pub enabled: bool,
-    /// Minimum interval (in seconds) between improvements for the same skill.
-    /// Default: `3600` (1 hour).
+    /// Minimum interval (in seconds) between reviews for the same skill.
+    /// Acts as a durable rate limit on patches to any one skill. Default: `3600`.
     #[serde(default = "default_skill_improvement_cooldown")]
     pub cooldown_secs: u64,
+    /// Spawn a review fork once at least this many tool-call iterations have
+    /// accumulated in the current run. `0` disables iteration-based triggering.
+    /// Default: `10`.
+    #[serde(default = "default_nudge_interval_iterations")]
+    pub nudge_interval_iterations: u32,
+    /// Maximum tool-call iterations the review fork itself is allowed to make.
+    /// Caps the fork's LLM cost. Default: `8`.
+    #[serde(default = "default_max_review_iterations")]
+    pub max_review_iterations: u32,
 }
 
 fn default_skill_improvement_cooldown() -> u64 {
     3600
 }
 
+fn default_nudge_interval_iterations() -> u32 {
+    10
+}
+
+fn default_max_review_iterations() -> u32 {
+    8
+}
+
 impl Default for SkillImprovementConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             cooldown_secs: 3600,
+            nudge_interval_iterations: 10,
+            max_review_iterations: 8,
         }
     }
 }
@@ -5551,6 +5628,17 @@ pub struct GatewayConfig {
     /// Allow binding to non-localhost without a tunnel (default: false)
     #[serde(default)]
     pub allow_public_bind: bool,
+    /// Allow authenticated remote callers to use admin endpoints that are
+    /// otherwise localhost-only. Currently this gates `POST /admin/reload`.
+    /// When false (default), those endpoints reject any non-loopback peer.
+    /// When true, a non-loopback request is accepted only if it also passes
+    /// pairing authentication — which requires `require_pairing = true`; with
+    /// pairing off a remote caller cannot be authenticated and is rejected, so
+    /// this flag never exposes an anonymous remote reload. `/admin/shutdown`
+    /// and the pairing-code endpoints stay localhost-only regardless.
+    /// (default: false)
+    #[serde(default)]
+    pub allow_remote_admin: bool,
     /// Paired bearer tokens (managed automatically, not user-edited)
     #[serde(default)]
     #[secret]
@@ -5679,6 +5767,7 @@ impl Default for GatewayConfig {
             host: default_gateway_host(),
             require_pairing: true,
             allow_public_bind: false,
+            allow_remote_admin: false,
             paired_tokens: Vec::new(),
             pair_rate_limit_per_minute: default_pair_rate_limit(),
             webhook_rate_limit_per_minute: default_webhook_rate_limit(),
@@ -6030,7 +6119,7 @@ impl Default for Microsoft365Config {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "secrets"]
 pub struct SecretsConfig {
-    /// Enable encryption for API keys and tokens in config.toml
+    /// Enable encryption for API keys and tokens at rest
     #[serde(default = "default_true")]
     #[credential_class = "public_value"]
     pub encrypt: bool,
@@ -6201,6 +6290,12 @@ pub struct HttpRequestConfig {
     /// Exact and subdomain matches are supported; `*` permits all private/local hosts.
     #[serde(default)]
     pub allowed_private_hosts: Vec<String>,
+    /// Named authorization secrets for `auth_secret` requests.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub secrets: HashMap<String, String>,
 }
 
 impl Default for HttpRequestConfig {
@@ -6212,6 +6307,7 @@ impl Default for HttpRequestConfig {
             timeout_secs: default_http_timeout_secs(),
             allow_private_hosts: false,
             allowed_private_hosts: vec![],
+            secrets: HashMap::new(),
         }
     }
 }
@@ -8840,7 +8936,7 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 /// Persistent storage configuration (`[storage]` section).
 ///
 /// Storage is a two-tier alias-keyed map: `[storage.<backend>.<alias>]`,
-/// parallel to `[model_providers.<type>.<alias>]`. Each backend has its own typed
+/// parallel to `[providers.models.<type>.<alias>]`. Each backend has its own typed
 /// config struct. `MemoryConfig.backend` carries a dotted reference (`"sqlite.default"`,
 /// `"postgres.work"`) that resolves to one of these entries via
 /// [`Config::resolve_active_storage`].
@@ -9476,6 +9572,7 @@ fn default_auto_approve() -> Vec<String> {
         "content_search".into(),
         "image_info".into(),
         "weather".into(),
+        "tool_search".into(),
         "browser".into(),
         "browser_open".into(),
     ]
@@ -9678,8 +9775,6 @@ pub struct RuntimeProfileConfig {
     pub tool_call_dedup_exempt: Vec<String>,
     /// Maximum characters for the assembled system prompt. `None` inherits.
     pub max_system_prompt_chars: Option<usize>,
-    /// Enable context-aware tool filtering per iteration. `None` inherits.
-    pub context_aware_tools: Option<bool>,
     /// Maximum characters for a single tool result. `None` inherits.
     pub max_tool_result_chars: Option<usize>,
     /// Number of recent turns whose full tool context is preserved. `None` inherits.
@@ -9721,7 +9816,6 @@ impl Default for RuntimeProfileConfig {
             tool_dispatcher: None,
             tool_call_dedup_exempt: Vec::new(),
             max_system_prompt_chars: None,
-            context_aware_tools: None,
             max_tool_result_chars: None,
             keep_tool_context_turns: None,
             memory_recall_limit: None,
@@ -10041,7 +10135,7 @@ impl Default for SchedulerConfig {
 pub struct ModelRouteConfig {
     /// Task hint name (e.g. "reasoning", "fast", "code", "summarize")
     pub hint: String,
-    /// Dotted provider profile ref to route to (must resolve to providers.models.<type>.<alias>)
+    /// Dotted provider profile ref to route to (must resolve to `providers.models.<type>.<alias>`)
     pub model_provider: String,
     /// Provider-local model identifier to use with that provider profile
     pub model: String,
@@ -10745,6 +10839,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub mqtt: HashMap<String, MqttConfig>,
+    /// AMQP channel instances (`[channels.amqp.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub amqp: HashMap<String, AmqpConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -10752,6 +10850,12 @@ pub struct ChannelsConfig {
     /// Default: 300s for on-device LLMs (Ollama) which are slower than cloud APIs.
     #[serde(default = "default_channel_message_timeout_secs")]
     pub message_timeout_secs: u64,
+    /// Per-channel multiplier for the global channel message in-flight budget.
+    /// Runtime multiplies this value by the configured channel count, then
+    /// applies its global minimum and maximum bounds to one shared dispatcher
+    /// semaphore. Default: `4`.
+    #[serde(default = "default_channel_max_concurrent_per_channel")]
+    pub max_concurrent_per_channel: usize,
     /// Whether to add acknowledgement reactions (👀 on receipt, ✅/⚠️ on
     /// completion) to incoming channel messages. Default: `true`.
     #[serde(default = "default_true")]
@@ -10983,6 +11087,12 @@ impl ChannelsConfig {
                 configured: !self.mqtt.is_empty(),
             },
             ChannelInfo {
+                kind: "amqp",
+                name: "AMQP",
+                desc: "AMQP topic consumer",
+                configured: !self.amqp.is_empty(),
+            },
+            ChannelInfo {
                 kind: "webhook",
                 name: "Webhook",
                 desc: "HTTP endpoint",
@@ -11030,11 +11140,16 @@ impl ChannelsConfig {
             || self.voice_wake.values().any(|c| c.enabled)
             || self.voice_duplex.values().any(|c| c.enabled)
             || self.mqtt.values().any(|c| c.enabled)
+            || self.amqp.values().any(|c| c.enabled)
     }
 }
 
 fn default_channel_message_timeout_secs() -> u64 {
     300
+}
+
+fn default_channel_max_concurrent_per_channel() -> usize {
+    4
 }
 
 fn default_session_backend() -> String {
@@ -11078,7 +11193,9 @@ impl Default for ChannelsConfig {
             voice_wake: HashMap::new(),
             voice_duplex: HashMap::new(),
             mqtt: HashMap::new(),
+            amqp: HashMap::new(),
             message_timeout_secs: default_channel_message_timeout_secs(),
+            max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: false,
             session_persistence: true,
@@ -11281,6 +11398,17 @@ pub struct DiscordConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub stall_timeout_secs: u64,
+    /// Raw gateway intent mask override. When set, this exact value is sent
+    /// in IDENTIFY instead of the derived mask: an operator escape hatch
+    /// for downstream deployments that consume gateway events through
+    /// custom builds or forks. The operator owns the consequences:
+    /// privileged bits still need their Developer Portal toggles, and
+    /// dropping baseline bits silences message handling (a warning is
+    /// logged). Unset (default) = derive the mask from the channel's
+    /// feature config.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub intents_mask: Option<u64>,
     /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
     #[tab(Behavior)]
     #[serde(default = "default_channel_approval_timeout_secs")]
@@ -11693,8 +11821,11 @@ pub struct MatrixConfig {
     #[tab(Connection)]
     #[serde(default)]
     pub device_id: Option<String>,
-    /// Allowed Matrix room IDs or aliases. Empty = allow all rooms.
-    /// Supports canonical room IDs (`!abc:server`) and aliases (`#room:server`).
+    /// Allowed Matrix room IDs. Empty = allow all rooms the bot has joined.
+    /// Entries are matched literally against the canonical room ID
+    /// (`!abc:server`) of each incoming message; `#room:server` aliases are
+    /// not resolved for this allowlist (they are resolved only for outbound
+    /// delivery targets such as cron `delivery.to`).
     #[tab(Behavior)]
     #[serde(default)]
     pub allowed_rooms: Vec<String>,
@@ -11954,6 +12085,10 @@ pub struct WhatsAppConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
+    /// Cancel an in-flight response from this channel sender when a newer
+    /// WhatsApp message arrives. Default: `false`.
+    #[serde(default)]
+    pub interrupt_on_new_message: bool,
     /// Usage mode for WhatsApp Web: "business" (default) or "personal".
     /// In personal mode the bot applies dm_policy, group_policy, and
     /// self_chat_mode to decide which chats to respond in.
@@ -12177,8 +12312,8 @@ pub struct NextcloudTalkConfig {
     pub excluded_tools: Vec<String>,
     /// Controls whether and how streaming draft updates are delivered.
     ///
-    /// - `"off"` (default) — responses are sent as a single final message.
-    /// - `"partial"` — a placeholder is posted first and edited incrementally
+    /// - `"off"` (default): responses are sent as a single final message.
+    /// - `"partial"`: a placeholder is posted first and edited incrementally
     ///   as tokens arrive, making long responses visible in real time.
     #[tab(Behavior)]
     #[serde(default)]
@@ -12358,6 +12493,152 @@ fn default_mqtt_qos() -> u8 {
 
 fn default_mqtt_keep_alive_secs() -> u64 {
     30
+}
+
+/// Generic AMQP 0-9-1 channel configuration (RabbitMQ, Fedora Messaging, etc.).
+///
+/// Subscribes to an exchange via routing keys and lifts each delivery into an
+/// inbound `ChannelMessage`. The mapping from a JSON delivery body to message
+/// fields is config-driven (`content_template`, `thread_id_field`) so a new
+/// source — Anitya, an internal bus, anything publishing JSON — is onboarded by
+/// configuration rather than code.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.amqp"]
+pub struct AmqpConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false` so an operator who pastes a partial
+    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
+    /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub enabled: bool,
+    /// AMQP broker URL. Use `amqp://` for plain or `amqps://` for TLS
+    /// (e.g. `amqps://fedora:@rabbitmq.fedoraproject.org/%2Fpublic_pubsub`).
+    #[tab(Connection)]
+    pub amqp_url: String,
+    /// Exchange to bind the consumer queue to (e.g. `amq.topic`).
+    #[tab(Advanced)]
+    pub exchange: String,
+    /// Routing keys to bind. Scope these to the topics of interest; binding
+    /// `#` consumes the entire exchange and is almost never what you want.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub routing_keys: Vec<String>,
+    /// Queue name. Leave unset for a server-generated, transient,
+    /// auto-deleted, exclusive queue. Set a stable name (UUID recommended)
+    /// only when durable delivery across reconnects is required.
+    #[tab(Advanced)]
+    pub queue: Option<String>,
+    /// Path to the CA certificate bundle for `amqps://` connections.
+    #[tab(Connection)]
+    pub ca_cert: Option<PathBuf>,
+    /// Path to the client certificate for broker mutual-TLS auth
+    /// (Fedora Messaging requires a client cert).
+    #[tab(Connection)]
+    pub client_cert: Option<PathBuf>,
+    /// Path to the client private key matching `client_cert`.
+    #[tab(Connection)]
+    pub client_key: Option<PathBuf>,
+    /// Value placed in `ChannelMessage.sender` for every delivery from this
+    /// source (e.g. `anitya`). Lets the orchestrator's self-loop guard and
+    /// per-channel routing identify the origin.
+    #[tab(Behavior)]
+    #[serde(default = "default_amqp_sender_label")]
+    pub sender_label: String,
+    /// Template for the inbound message content. `{field}` placeholders are
+    /// interpolated from the JSON delivery body's top-level keys. When empty,
+    /// the raw delivery body is used verbatim.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub content_template: String,
+    /// Dotted path into the JSON delivery body whose value becomes the
+    /// message `thread_ts`, correlating replies to the originating event
+    /// (e.g. `message.project.name`). Empty disables threading.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub thread_id_field: String,
+    /// Acknowledgement mode. When `true` (default), deliveries are acked only
+    /// after the message is durably handed to the agent loop, giving
+    /// at-least-once semantics: a crash before hand-off redelivers the event.
+    /// Set `false` for at-most-once (broker acks on dispatch), which silently
+    /// drops in-flight events on crash and is only appropriate for
+    /// non-side-effecting, drop-on-overload consumers.
+    #[tab(Behavior)]
+    #[serde(default = "default_amqp_durable_ack")]
+    pub durable_ack: bool,
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
+}
+
+impl AmqpConfig {
+    /// Validate the AMQP configuration.
+    ///
+    /// Checks:
+    /// - `amqp_url` uses a valid scheme (`amqp://` or `amqps://`)
+    /// - `amqps://` connections carry a CA certificate
+    /// - `client_cert` and `client_key` are supplied together (mutual TLS)
+    /// - the exchange is non-empty
+    /// - at least one routing key is bound
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let is_tls = self.amqp_url.starts_with("amqps://");
+        let is_plain = self.amqp_url.starts_with("amqp://");
+
+        if !is_tls && !is_plain {
+            anyhow::bail!(
+                "amqp_url must start with 'amqp://' or 'amqps://', got: {}",
+                self.amqp_url
+            );
+        }
+
+        if is_tls && self.ca_cert.is_none() {
+            anyhow::bail!("amqps:// requires ca_cert to verify the broker");
+        }
+
+        match (self.client_cert.is_some(), self.client_key.is_some()) {
+            (true, false) => {
+                anyhow::bail!(
+                    "client_cert is set but client_key is missing (both are required for mutual TLS)"
+                )
+            }
+            (false, true) => {
+                anyhow::bail!(
+                    "client_key is set but client_cert is missing (both are required for mutual TLS)"
+                )
+            }
+            _ => {}
+        }
+
+        if self.exchange.is_empty() {
+            validation_bail!(RequiredFieldEmpty, "exchange", "exchange must not be empty");
+        }
+
+        if self.routing_keys.is_empty() {
+            anyhow::bail!("at least one routing key must be configured");
+        }
+
+        Ok(())
+    }
+}
+
+impl ChannelConfig for AmqpConfig {
+    fn name() -> &'static str {
+        "AMQP"
+    }
+    fn desc() -> &'static str {
+        "AMQP topic consumer"
+    }
+}
+
+fn default_amqp_sender_label() -> String {
+    "amqp".to_string()
+}
+
+fn default_amqp_durable_ack() -> bool {
+    true
 }
 
 /// IRC channel configuration.
@@ -12552,6 +12833,36 @@ pub struct LarkConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub excluded_tools: Vec<String>,
+
+    /// Time in seconds an approval card waits for user response before
+    /// the runtime auto-denies. Default: 300 (5 minutes).
+    #[tab(Behavior)]
+    #[serde(default = "default_channel_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
+    /// When `true`, group-chat sessions key on the sender's open_id, so
+    /// distinct members of the same group chat don't share conversation
+    /// context. When `false` (default), all members of a group share one
+    /// session keyed on chat_id (matches the existing behavior). 1-on-1
+    /// chats are unaffected (chat_id is already unique per user-bot pair).
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub per_user_session: bool,
+
+    /// Streaming mode for the LLM response: `off` (default) routes every
+    /// response through `send()`; `partial` opens a Feishu interactive
+    /// card and edits it incrementally via `update_draft` /
+    /// `finalize_draft`; `multi_message` is rejected for Lark (Feishu has
+    /// no equivalent surface — falls back to `off` with a warning).
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub stream_mode: StreamMode,
+
+    /// Minimum interval between consecutive `update_draft` PATCH calls in
+    /// milliseconds. Default 1000 ms tunes to Feishu's 5 QPS-per-message
+    /// edit cap; raise on enterprise plans with higher quotas.
+    #[tab(Behavior)]
+    #[serde(default = "default_draft_update_interval_ms")]
+    pub draft_update_interval_ms: u64,
 }
 
 impl ChannelConfig for LarkConfig {
@@ -12622,17 +12933,17 @@ pub struct LineConfig {
     pub channel_secret: String,
     /// DM (1:1 chat) access policy. Default: `pairing`.
     ///
-    /// - `open`      — respond to everyone
-    /// - `pairing`   — require one-time `/bind <code>` handshake on first contact
-    /// - `allowlist` — respond only to user IDs listed in `allowed_users`
+    /// - `open`: respond to everyone
+    /// - `pairing`: require one-time `/bind <code>` handshake on first contact
+    /// - `allowlist`: respond only to user IDs listed in `allowed_users`
     #[tab(Advanced)]
     #[serde(default)]
     pub dm_policy: LineDmPolicy,
     /// Group / multi-person chat policy. Default: `mention`.
     ///
-    /// - `open`     — respond to every message
-    /// - `mention`  — respond only when @mentioned
-    /// - `disabled` — ignore all group messages
+    /// - `open`: respond to every message
+    /// - `mention`: respond only when @mentioned
+    /// - `disabled`: ignore all group messages
     #[tab(Advanced)]
     #[serde(default)]
     pub group_policy: LineGroupPolicy,
@@ -12784,7 +13095,9 @@ pub struct OtpConfig {
     #[serde(default = "default_otp_cache_valid_secs")]
     pub cache_valid_secs: u64,
 
-    /// Tool/action names gated by OTP.
+    /// Tool/action names gated by OTP. Empty or malformed entries are rejected
+    /// at config load; an entry that does not match a known gated action is
+    /// accepted but logged at WARN, since it cannot be enforced.
     #[serde(default = "default_otp_gated_actions")]
     pub gated_actions: Vec<String>,
 
@@ -13589,7 +13902,7 @@ pub struct VoiceWakeConfig {
     /// Default: `"hey zeroclaw"`.
     #[serde(default = "default_voice_wake_word")]
     pub wake_word: String,
-    /// Silence timeout in milliseconds — how long to wait after the last
+    /// Silence timeout in milliseconds: how long to wait after the last
     /// energy spike before finalizing a capture window. Default: `2000`.
     #[serde(default = "default_voice_wake_silence_timeout_ms")]
     pub silence_timeout_ms: u32,
@@ -14104,6 +14417,7 @@ impl Default for Config {
             config_path: zeroclaw_dir.join("config.toml"),
             env_overridden_paths: std::collections::HashSet::new(),
             pre_override_snapshots: std::collections::HashMap::new(),
+            onepassword_reference_snapshots: std::collections::HashMap::new(),
             dirty_paths: std::collections::HashSet::new(),
             degraded_security: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
@@ -14770,6 +15084,43 @@ impl Config {
             .collect()
     }
 
+    /// Return `<kind>.<family>` entries under `[providers]` in `raw_toml`
+    /// whose family is not a known typed slot (kinds: models, tts,
+    /// transcription). Serde silently drops these sections at deserialize
+    /// time, so a typo'd family (`[providers.models.antropic.x]`) or one
+    /// from a newer binary vanishes on reload: the alias "works" in the
+    /// session that created it, then disappears after restart.
+    pub fn unknown_provider_families(raw_toml: &str) -> Vec<String> {
+        let raw: toml::Table = match raw_toml.parse() {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+        let Some(kinds) = raw.get("providers").and_then(toml::Value::as_table) else {
+            return Vec::new();
+        };
+        let kind_slots: &[(&str, &[&str])] = &[
+            ("models", crate::providers::ModelProviders::slot_names()),
+            ("tts", crate::providers::TtsProviders::slot_names()),
+            (
+                "transcription",
+                crate::providers::TranscriptionProviders::slot_names(),
+            ),
+        ];
+        let mut out = Vec::new();
+        for (kind, slots) in kind_slots {
+            let Some(families) = kinds.get(*kind).and_then(toml::Value::as_table) else {
+                continue;
+            };
+            out.extend(
+                families
+                    .keys()
+                    .filter(|k| !slots.contains(&k.as_str()))
+                    .map(|k| format!("{kind}.{k}")),
+            );
+        }
+        out
+    }
+
     /// Returns `true` if `path` was populated by a `ZEROCLAW_*` env-var
     /// override at load time. O(1) HashSet lookup; safe to call per row in
     /// list-rendering paths (`config list`, dashboard, quickstart).
@@ -14998,6 +15349,28 @@ impl Config {
                     "Unknown config key ignored: \"\". Check config.toml for typos or deprecated options."
                 );
             }
+            // Unknown provider families are dropped by serde, so an alias
+            // created under a typo'd or unsupported family silently vanishes
+            // on reload while agents.*.model_provider still references it.
+            for entry in Self::unknown_provider_families(&contents) {
+                let (kind, family) = entry.split_once('.').unwrap_or(("models", entry.as_str()));
+                let reference = if kind == "models" {
+                    "any agents.*.model_provider referencing them will fail to resolve; \
+                     run `zeroclaw providers` for valid family names"
+                } else {
+                    "references to its aliases will fail to resolve"
+                };
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"kind": kind, "family": family})),
+                    &format!(
+                        "[providers.{kind}.{family}] section dropped: not a known {kind} \
+                         provider family. Its aliases will not load and {reference}."
+                    )
+                );
+            }
             // Set computed paths that are skipped during serialization
             config.config_path = config_path.clone();
             config.data_dir = workspace_dir;
@@ -15024,8 +15397,15 @@ impl Config {
             }
 
             let store = crate::secrets::SecretStore::new(&zeroclaw_dir, config.secrets.encrypt);
+            config.onepassword_reference_snapshots =
+                collect_onepassword_reference_snapshots(&config);
             // Decrypt all #[secret]-annotated fields via Configurable derive
-            config.decrypt_secrets(&store)?;
+            config = tokio::task::spawn_blocking(move || {
+                config.decrypt_secrets(&store)?;
+                Ok::<_, anyhow::Error>(config)
+            })
+            .await
+            .context("Config secret decryption task failed")??;
 
             // Apply ZEROCLAW_<lowercase_path> env-var overrides. Hard-errors
             // on any unresolvable path — no silent ignores. Tracks overridden
@@ -15328,6 +15708,21 @@ impl Config {
             }
         }
 
+        for name in self.http_request.secrets.keys() {
+            if name.is_empty()
+                || name.len() > 64
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                validation_bail!(
+                    InvalidFormat,
+                    format!("http_request.secrets.{name}"),
+                    "http_request.secrets key {name:?} must contain 1..=64 ASCII letters, numbers, underscores, or hyphens"
+                );
+            }
+        }
+
         // Gateway
         if self.gateway.host.trim().is_empty() {
             validation_bail!(
@@ -15341,6 +15736,13 @@ impl Config {
                 InvalidNumericRange,
                 "transcription.max_audio_bytes",
                 "transcription.max_audio_bytes must be greater than zero"
+            );
+        }
+        if self.channels.max_concurrent_per_channel == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "channels.max_concurrent_per_channel",
+                "channels.max_concurrent_per_channel must be greater than 0"
             );
         }
         // Heartbeat agent: when heartbeat is enabled, the agent field
@@ -15501,6 +15903,21 @@ impl Config {
                     "security.otp.gated_actions[{i}] contains invalid characters: {normalized}"
                 );
             }
+            if !default_otp_gated_actions()
+                .iter()
+                .any(|known| known == normalized)
+            {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "action": normalized,
+                            "known_actions": default_otp_gated_actions(),
+                        })),
+                    "security.otp.gated_actions entry does not match a known gated action and will not be enforced: "
+                );
+            }
         }
         DomainMatcher::new(
             &self.security.otp.gated_domains,
@@ -15551,7 +15968,7 @@ impl Config {
                 );
             }
             // Route refs are dotted `<type>.<alias>` and must resolve to a
-            // configured `[model_providers.<type>.<alias>]` entry. Unresolved
+            // configured `[providers.models.<type>.<alias>]` entry. Unresolved
             // routes are dropped at runtime construction; rejecting them here
             // keeps that drift visible at config-load time.
             match mp.split_once('.') {
@@ -16146,6 +16563,13 @@ impl Config {
             }
             match mp.split_once('.') {
                 Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+                    if !crate::providers::ModelProviders::slot_names().contains(&ty) {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("agents.{alias}.model_provider"),
+                            "agents.{alias}.model_provider = {mp:?} but {ty:?} is not a known provider family; check [providers.models.<family>.<alias>] in config.toml (valid families: `zeroclaw providers`)",
+                        );
+                    }
                     let exists = self
                         .get_map_keys(&format!("providers.models.{ty}"))
                         .is_some_and(|keys| keys.iter().any(|k| k == inner));
@@ -16153,7 +16577,7 @@ impl Config {
                         validation_bail!(
                             DanglingReference,
                             format!("agents.{alias}.model_provider"),
-                            "agents.{alias}.model_provider = {mp:?} but providers.models.{ty}.{inner} is not configured",
+                            "agents.{alias}.model_provider = {mp:?} but [providers.models.{ty}.{inner}] is not configured",
                         );
                     }
                 }
@@ -16541,6 +16965,11 @@ impl Config {
                 &self.pre_override_snapshots,
             )?;
         }
+        restore_onepassword_references_for_save(
+            &mut config_to_save,
+            &self.onepassword_reference_snapshots,
+            &self.dirty_paths,
+        )?;
 
         // Encrypt all #[secret]-annotated fields via Configurable derive
         config_to_save.encrypt_secrets(&store)?;
@@ -16619,6 +17048,11 @@ impl Config {
                 &self.pre_override_snapshots,
             )?;
         }
+        restore_onepassword_references_for_save(
+            &mut config_to_save,
+            &self.onepassword_reference_snapshots,
+            &self.dirty_paths,
+        )?;
         config_to_save.encrypt_secrets(&store)?;
 
         let full_table: toml::Table = toml::Value::try_from(&config_to_save)
@@ -16663,6 +17097,42 @@ impl Config {
         self.clear_dirty();
         Ok(())
     }
+}
+
+fn collect_onepassword_reference_snapshots(
+    config: &Config,
+) -> std::collections::HashMap<String, String> {
+    config
+        .prop_fields()
+        .into_iter()
+        .filter(|field| field.is_secret)
+        .filter_map(|field| {
+            let value = crate::env_overrides::raw_value_for_path(config, &field.name)?;
+            crate::secrets::SecretStore::is_onepassword_ref(&value).then_some((field.name, value))
+        })
+        .collect()
+}
+
+fn restore_onepassword_references_for_save(
+    config_to_save: &mut Config,
+    snapshots: &std::collections::HashMap<String, String>,
+    dirty_paths: &std::collections::HashSet<String>,
+) -> Result<()> {
+    for (path, value) in snapshots {
+        if dirty_paths.contains(path) {
+            continue;
+        }
+        if let Err(err) = config_to_save.set_prop(path, value) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"path": path, "error": format!("{}", err)})),
+                "1Password reference save-restore failed; field retains resolved value"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Atomic write shared by `save()` and `save_dirty()`.
@@ -16765,6 +17235,22 @@ fn apply_dirty_path(
     if raw.is_empty() {
         return;
     }
+
+    // Natural-key `Vec<T>` sections (`#[natural_key = "<f>"]`, currently
+    // `mcp.servers`) serialize as `[[mcp.servers]]` — an
+    // `Item::ArrayOfTables`, not a Table. The generic walker below
+    // assumes every intermediate node is a Table (`as_table()` /
+    // `as_table_mut()`), so without this branch a dirty path like
+    // `mcp.servers.fs.command` would resolve to `None` in `full_table`,
+    // get misclassified as `should_delete`, then bail at the
+    // `ArrayOfTables` segment in `delete_path_in_doc` too. Net effect:
+    // the per-field MCP editor's edits go nowhere on disk. See the
+    // regression test `save_dirty_persists_mcp_server_field_via_natural_key`.
+    if let Some(section) = find_natural_key_section_for_path(dotted) {
+        apply_dirty_natural_key_path(root, &section, dotted, full_table, default_table);
+        return;
+    }
+
     // Resolve each segment against the in-memory table: struct fields
     // serialize as snake_case (so `input-per-mtok` → `input_per_mtok`), but
     // HashMap keys are preserved verbatim and may legitimately carry hyphens
@@ -16789,6 +17275,539 @@ fn apply_dirty_path(
         let mut pruned = value.clone();
         prune_empty_leaves(&mut pruned);
         set_path_in_doc(root, &segs, &pruned);
+    }
+}
+
+/// Resolved metadata for a `#[natural_key]` Vec section that matches a
+/// given dirty path. `section_path` is the dotted section (e.g.
+/// `"mcp.servers"`); `natural_key_field` is the snake_case field name
+/// on the inner type that holds each element's alias (e.g. `"name"`).
+struct NaturalKeySection {
+    section_path: &'static str,
+    natural_key_field: &'static str,
+}
+
+/// Return the longest natural-key `Kind::List` section whose path is a
+/// strict prefix of `dotted` (i.e. `dotted` starts with `<path>.`).
+/// Strict-prefix wins so a nested natural-key section would always
+/// outscore its parent; today there's only `mcp.servers`, so the lookup
+/// is effectively a single-entry match, but the longest-match rule
+/// keeps the writer correct when a future `#[natural_key]` Vec lands
+/// inside another section.
+///
+/// Returns the `<section_path>` (e.g. `"mcp.servers"`) and the
+/// `<natural_key_field>` (e.g. `"name"`) the writer needs to locate
+/// the matching `[[<section_path>]]` element on disk.
+///
+/// Section paths are exact-matched against the leading segments of
+/// `dotted`; the function does **not** apply the kebab→snake fallback
+/// that the inner segment resolver (`resolve_dirty_segments`) uses.
+/// That is deliberate and mirrors the in-memory routing macro's
+/// `section_path == expected` check in
+/// `crates/zeroclaw-macros/src/lib.rs` (the `get_map_keys` /
+/// `route_vec_path` arms) — making either side dash-tolerant in
+/// isolation would let the dispatcher and the writer disagree on
+/// which call participates in this branch, which is exactly the
+/// memory-vs-disk divergence this PR exists to eliminate. If a
+/// future natural-key section needs an underscore in its path AND
+/// must be addressable via a kebab wire path, change **both** sides
+/// together (the macro arm and this match).
+///
+/// Plain `Kind::List` Vec sections without `#[natural_key]` (their
+/// `natural_key` is `None`) are intentionally excluded — those use the
+/// legacy whole-array `ObjectArray` save path and don't need the
+/// array-of-tables walker.
+fn find_natural_key_section_for_path(dotted: &str) -> Option<NaturalKeySection> {
+    use crate::traits::MapKeyKind;
+
+    let mut best: Option<NaturalKeySection> = None;
+    for section in Config::map_key_sections().iter() {
+        if section.kind != MapKeyKind::List {
+            continue;
+        }
+        let Some(natural_key_field) = section.natural_key else {
+            continue;
+        };
+        // strip_prefix avoids the allocation `format!("{}.", ...)`
+        // would do per section per dirty path, and makes the "must
+        // have *something* after the dot" guard a natural fallout of
+        // the second `strip_prefix('.')` rather than a length check.
+        let Some(after) = dotted
+            .strip_prefix(section.path)
+            .and_then(|s| s.strip_prefix('.'))
+        else {
+            continue;
+        };
+        // Empty alias segment ("mcp.servers." with nothing after) can't
+        // be addressed by name; skip to avoid matching every otherwise-
+        // unmatched path via the empty prefix. Same guard the in-memory
+        // `route_vec_path` applies to empty natural keys.
+        if after.is_empty() {
+            continue;
+        }
+        let better = best
+            .as_ref()
+            .is_none_or(|b| section.path.len() > b.section_path.len());
+        if better {
+            best = Some(NaturalKeySection {
+                section_path: section.path,
+                natural_key_field,
+            });
+        }
+    }
+    best
+}
+
+/// Apply a dirty path of the form
+/// `<section_path>.<alias>[.<inner_suffix>...]` against an
+/// `[[<section_path>]]` array of tables.
+///
+/// Three shapes show up in practice:
+///
+///   1. `<section>.<alias>.<inner>` — per-field edit (the dashboard /
+///      TUI editor). Locate the in-memory element whose natural-key
+///      field equals `<alias>` and reconcile its `<inner>` sub-path
+///      against the doc's matching `[[<section>]]` table.
+///
+///   2. `<section>.<alias>` with the element still in memory — the
+///      whole-element write the rename path emits for the *new* alias.
+///      Reseed the matching doc entry from the in-memory serialization
+///      so a rename `fs` → `filesystem` updates the entire
+///      `[[mcp.servers]]` table (in particular its `name` field).
+///
+///   3. `<section>.<alias>` with the element gone from memory — the
+///      delete path the rename emits for the *old* alias, and what
+///      `delete_map_key` plus an explicit `mark_dirty` would produce.
+///      Drop the matching doc entry.
+///
+/// All three are handled by walking the doc through the section's
+/// non-array parents, locating the `ArrayOfTables` at the section's
+/// last path segment, then either editing or removing the entry whose
+/// natural-key field matches `<alias>`. The `<inner>` recursion reuses
+/// the existing Table-shaped `set_path_in_doc` / `delete_path_in_doc`
+/// helpers against the located entry's table.
+///
+/// **Order-independence invariant.** `Config::dirty_paths` is a
+/// `HashSet<String>`, so the three shapes above can apply in any
+/// interleaving within a single `save_dirty` batch — in particular,
+/// a rename emits both the old and new aliases dirty without an
+/// ordering guarantee, and a create-then-edit sequence may walk the
+/// per-field path before the whole-element write. Convergence under
+/// every ordering is load-bearing here and works only because every
+/// branch derives its write from the current in-memory state and the
+/// case-1 delete fires only on mem-absence (not on default
+/// equivalence). Future edits — e.g. an early-exit that assumes
+/// whole-element writes run before per-field ones, or a "skip if
+/// already written" optimization keyed on the doc shape — would
+/// break this. Preserve commutativity across the three shapes for
+/// any single (section, alias) tuple.
+fn apply_dirty_natural_key_path(
+    root: &mut toml_edit::Table,
+    section: &NaturalKeySection,
+    dotted: &str,
+    full_table: &toml::Table,
+    _default_table: &toml::Table,
+) {
+    // `dotted` is known to start with `<section_path>.` thanks to
+    // `find_natural_key_section_for_path`; split the alias and inner
+    // suffix off the tail.
+    let rest = match dotted
+        .strip_prefix(section.section_path)
+        .and_then(|s| s.strip_prefix('.'))
+    {
+        Some(r) => r,
+        None => return,
+    };
+    let (alias, inner_suffix) = match rest.split_once('.') {
+        Some((a, i)) => (a, Some(i)),
+        None => (rest, None),
+    };
+    if alias.is_empty() {
+        return;
+    }
+
+    // Walk the in-memory serialized array at `section_path`. Each
+    // element is a `toml::Value::Table`; the alias lives in the
+    // `natural_key_field` column.
+    let section_segs: Vec<&str> = section.section_path.split('.').collect();
+    let mem_array = lookup_path_in_table(full_table, &section_segs).and_then(|v| v.as_array());
+    let mem_entry = mem_array.and_then(|arr| {
+        arr.iter().find_map(|item| {
+            let table = item.as_table()?;
+            let alias_value = table.get(section.natural_key_field)?.as_str()?;
+            (alias_value == alias).then_some(table)
+        })
+    });
+
+    // The doc cursor walks the section's parent Tables (e.g. `mcp`) and
+    // arrives at the array node (`servers`). The natural-key Vec is
+    // always at the deepest segment of `section_path`; the leading
+    // segments are plain struct fields and therefore Tables on disk.
+    let Some((array_key, parent_segs)) = section_segs.split_last() else {
+        return;
+    };
+
+    // Inner-suffix path: per-field edit (case 1). Reconcile the inner
+    // sub-path on the matched doc table the same way the generic
+    // Table-shaped walker does — mem-vs-default comparison decides
+    // delete vs write — and bail out before touching the array spine
+    // if the entry doesn't exist in either memory or the doc.
+    if let Some(inner) = inner_suffix {
+        // Look up the same inner sub-path on the default-shaped element.
+        // `Config::default()` always has an empty `mcp.servers` (and no
+        // default natural-key Vec entry is non-empty), so we synthesize
+        // the default by going through the inner type's own
+        // `Default` impl via the existing `default_table` plus an
+        // alias-keyed lookup. The Vec being empty in defaults means
+        // `default_array_entry` is always `None`, which mirrors the
+        // existing HashMap behaviour: `default_val` for an alias's
+        // child is None too, because the alias key doesn't exist in
+        // `Config::default()`. Keep the comparison shape identical so
+        // the delete-on-default rule degrades the same way the HashMap
+        // path already does (i.e. it doesn't catch "field is set to
+        // its serde default"; that limitation is shared and not a
+        // regression from this fix). The `_default_table` parameter
+        // is intentionally unused for this reason — kept on the
+        // signature so the call site in `save_dirty` stays uniform
+        // with `apply_dirty_path`, which does consume it.
+
+        let inner_raw: Vec<&str> = inner.split('.').collect();
+        // Same dash-aware segment resolution the top-level Table-shaped
+        // walker uses (`apply_dirty_path` → `resolve_dirty_segments`), but
+        // rooted at the natural-key entry's own serialized table so kebab
+        // inner segments like `mcp.servers.fs.tool-timeout-secs` resolve
+        // to the snake `tool_timeout_secs` field on disk. Sharing the
+        // helper instead of forking is load-bearing: this PR exists
+        // because two parallel walks (in-memory vs on-disk) drifted apart;
+        // a forked copy here would recreate exactly that hazard, so any
+        // future fix to dash handling lands in both code paths at once.
+        let inner_segments: Vec<String> = match mem_entry {
+            Some(table) => resolve_dirty_segments(table, &inner_raw),
+            None => inner_raw.iter().map(|s| (*s).to_string()).collect(),
+        };
+        let inner_segs: Vec<&str> = inner_segments.iter().map(String::as_str).collect();
+
+        let mem_inner_val = mem_entry.and_then(|t| lookup_path_in_table(t, &inner_segs));
+
+        // mem missing → delete. mem present → write.
+        match mem_inner_val {
+            Some(value) => {
+                let entry_table = ensure_array_of_tables_entry(
+                    root,
+                    parent_segs,
+                    array_key,
+                    section.natural_key_field,
+                    alias,
+                );
+                let Some(entry_table) = entry_table else {
+                    return;
+                };
+                let mut pruned = value.clone();
+                prune_empty_leaves(&mut pruned);
+                set_path_in_doc(entry_table, &inner_segs, &pruned);
+            }
+            None => {
+                // Only walk the doc if we'd actually find something to
+                // delete; otherwise an "ambient" delete pass on a fresh
+                // alias would scribble an empty `[[mcp.servers]]` entry
+                // via `ensure_array_of_tables_entry`'s create path.
+                let Some(entry_table) = find_array_of_tables_entry_mut(
+                    root,
+                    parent_segs,
+                    array_key,
+                    section.natural_key_field,
+                    alias,
+                ) else {
+                    return;
+                };
+                delete_path_in_doc(entry_table, &inner_segs);
+            }
+        }
+        return;
+    }
+
+    // Bare-alias path (cases 2 and 3). No inner suffix → reconcile the
+    // whole element.
+    match mem_entry {
+        Some(entry) => {
+            // Case 2: rewrite the entire array entry from the in-memory
+            // serialization. Prunes empties so default fields don't
+            // sprawl, matching the per-field path's `prune_empty_leaves`
+            // pass.
+            let mut value = toml::Value::Table(entry.clone());
+            prune_empty_leaves(&mut value);
+            let entry_table = ensure_array_of_tables_entry(
+                root,
+                parent_segs,
+                array_key,
+                section.natural_key_field,
+                alias,
+            );
+            let Some(entry_table) = entry_table else {
+                return;
+            };
+            // Replace the table's contents wholesale so removed inner
+            // fields actually disappear from disk.
+            entry_table.clear();
+            if let toml::Value::Table(t) = value {
+                for (k, v) in t.into_iter() {
+                    entry_table.insert(&k, crate::migration::toml_value_to_edit_item(&v));
+                }
+            }
+        }
+        None => {
+            // Case 3: alias no longer in memory → drop the matching
+            // doc entry. If no doc entry matches, no-op.
+            delete_array_of_tables_entry(
+                root,
+                parent_segs,
+                array_key,
+                section.natural_key_field,
+                alias,
+            );
+        }
+    }
+}
+
+/// Emit a single `WARN` event when a natural-key writer (ensure /
+/// find / delete) bails because the on-disk node has the wrong shape
+/// — for example an operator hand-edited `mcp.servers = "foo"`, or
+/// wrote `servers = [{ name = "fs", ... }]` (an inline array of
+/// tables, which `toml_edit` parses as `Item::Value(Value::Array)`
+/// rather than the `Item::ArrayOfTables` this writer produces).
+///
+/// Without this, `config/set` returns success, the in-memory mutation
+/// and the dashboard/TUI both reflect the new value, and the on-disk
+/// file silently stays stale — the exact symptom the underlying
+/// natural-key persistence bug (#7267 fix) exists to eliminate. The
+/// `WARN` shape mirrors the 0600-permissions fallback below: same
+/// `Action::Note` / `EventOutcome::Unknown` / module path, so log
+/// scrapers that already understand the schema warnings will surface
+/// these the same way.
+///
+/// `op` is `"ensure"`, `"find"`, or `"delete"` — which writer bailed.
+/// `kind` is `"parent_segment"` or `"array_key"` — which node was
+/// wrong-shaped. `which` is the specific seg/key name involved.
+fn warn_natural_key_doc_kind_mismatch(
+    parent_segs: &[&str],
+    array_key: &str,
+    alias: &str,
+    kind: &str,
+    which: &str,
+    op: &str,
+) {
+    let section_path = if parent_segs.is_empty() {
+        array_key.to_string()
+    } else {
+        format!("{}.{array_key}", parent_segs.join("."))
+    };
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({
+                "section_path": section_path,
+                "alias": alias,
+                "node_kind": kind,
+                "node_name": which,
+                "operation": op,
+            })),
+        "natural-key writer: refusing to clobber hand-edited config.toml node; \
+         on-disk file may diverge from in-memory state"
+    );
+}
+
+/// Locate or create the `[[<section_path>]]` entry whose natural-key
+/// field equals `alias`, returning a mutable reference to its inner
+/// `toml_edit::Table`.
+///
+/// Three shapes are reconciled here:
+///
+///   * Parent Tables along `parent_segs` are auto-created if missing
+///     (mirrors `set_path_in_doc`).
+///   * The `array_key` slot may not yet exist; insert an
+///     `ArrayOfTables` if so.
+///   * The array may not yet contain an entry whose natural-key field
+///     matches `alias`; push a new table with `<natural_key_field> =
+///     "<alias>"` seeded.
+///
+/// Returns `None` only when an existing doc node at `parent_segs` or
+/// `array_key` has the wrong kind (e.g. an operator hand-edited
+/// `mcp.servers = "foo"`, or wrote an inline `servers = [{ ... }]`
+/// array-of-tables that parses as `Item::Value(Value::Array)` rather
+/// than the `Item::ArrayOfTables` shape this writer expects); in that
+/// case we refuse to clobber the hand-edit and let the save bail
+/// rather than data-loss the user's file. A `WARN`-level event is
+/// emitted on every wrong-kind bail so the divergence between memory
+/// and disk is observable in logs — silent bails were what let the
+/// underlying #7267 bug ship.
+fn ensure_array_of_tables_entry<'a>(
+    root: &'a mut toml_edit::Table,
+    parent_segs: &[&str],
+    array_key: &str,
+    natural_key_field: &str,
+    alias: &str,
+) -> Option<&'a mut toml_edit::Table> {
+    let mut cursor: &mut toml_edit::Table = root;
+    for seg in parent_segs {
+        if !cursor.contains_key(seg) {
+            cursor.insert(seg, toml_edit::Item::Table(toml_edit::Table::new()));
+        }
+        let next = cursor.get_mut(seg).and_then(|i| i.as_table_mut());
+        if next.is_none() {
+            warn_natural_key_doc_kind_mismatch(
+                parent_segs,
+                array_key,
+                alias,
+                "parent_segment",
+                seg,
+                "ensure",
+            );
+            return None;
+        }
+        cursor = next?;
+    }
+    if !cursor.contains_key(array_key) {
+        cursor.insert(
+            array_key,
+            toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()),
+        );
+    }
+    let aot = cursor
+        .get_mut(array_key)
+        .and_then(|i| i.as_array_of_tables_mut());
+    let Some(aot) = aot else {
+        warn_natural_key_doc_kind_mismatch(
+            parent_segs,
+            array_key,
+            alias,
+            "array_key",
+            array_key,
+            "ensure",
+        );
+        return None;
+    };
+
+    let pos = aot
+        .iter()
+        .position(|t| t.get(natural_key_field).and_then(|i| i.as_str()) == Some(alias));
+    let idx = match pos {
+        Some(i) => i,
+        None => {
+            let mut new_table = toml_edit::Table::new();
+            new_table.insert(natural_key_field, toml_edit::value(alias.to_string()));
+            aot.push(new_table);
+            aot.len() - 1
+        }
+    };
+    aot.get_mut(idx)
+}
+
+/// Read-only counterpart to [`ensure_array_of_tables_entry`] used by
+/// the delete path: never creates a missing array or entry, just
+/// locates one if present. Returning `None` on a miss lets the caller
+/// skip the doc-mutation step entirely. Distinguishes "node doesn't
+/// exist" (silent no-op — the legitimate fresh-alias case) from "node
+/// exists but has the wrong kind" (a `WARN`-logged bail — the
+/// hand-edited inline-array hazard).
+fn find_array_of_tables_entry_mut<'a>(
+    root: &'a mut toml_edit::Table,
+    parent_segs: &[&str],
+    array_key: &str,
+    natural_key_field: &str,
+    alias: &str,
+) -> Option<&'a mut toml_edit::Table> {
+    let mut cursor: &mut toml_edit::Table = root;
+    for seg in parent_segs {
+        let item = cursor.get_mut(seg)?;
+        let Some(next) = item.as_table_mut() else {
+            warn_natural_key_doc_kind_mismatch(
+                parent_segs,
+                array_key,
+                alias,
+                "parent_segment",
+                seg,
+                "find",
+            );
+            return None;
+        };
+        cursor = next;
+    }
+    let item = cursor.get_mut(array_key)?;
+    let Some(aot) = item.as_array_of_tables_mut() else {
+        warn_natural_key_doc_kind_mismatch(
+            parent_segs,
+            array_key,
+            alias,
+            "array_key",
+            array_key,
+            "find",
+        );
+        return None;
+    };
+    let pos = aot
+        .iter()
+        .position(|t| t.get(natural_key_field).and_then(|i| i.as_str()) == Some(alias))?;
+    aot.get_mut(pos)
+}
+
+/// Remove the `[[<section_path>]]` entry whose natural-key field
+/// equals `alias`. No-op if the array or entry isn't present. When the
+/// removal empties the `ArrayOfTables`, drop the array slot too so the
+/// on-disk file doesn't carry a vestigial `[[mcp.servers]]`-shaped
+/// blank section header.
+fn delete_array_of_tables_entry(
+    root: &mut toml_edit::Table,
+    parent_segs: &[&str],
+    array_key: &str,
+    natural_key_field: &str,
+    alias: &str,
+) {
+    let mut cursor: &mut toml_edit::Table = root;
+    for seg in parent_segs {
+        let Some(item) = cursor.get_mut(seg) else {
+            return;
+        };
+        match item.as_table_mut() {
+            Some(next) => cursor = next,
+            None => {
+                warn_natural_key_doc_kind_mismatch(
+                    parent_segs,
+                    array_key,
+                    alias,
+                    "parent_segment",
+                    seg,
+                    "delete",
+                );
+                return;
+            }
+        }
+    }
+    let Some(item) = cursor.get_mut(array_key) else {
+        return;
+    };
+    let aot = match item.as_array_of_tables_mut() {
+        Some(a) => a,
+        None => {
+            warn_natural_key_doc_kind_mismatch(
+                parent_segs,
+                array_key,
+                alias,
+                "array_key",
+                array_key,
+                "delete",
+            );
+            return;
+        }
+    };
+    let pos = aot
+        .iter()
+        .position(|t| t.get(natural_key_field).and_then(|i| i.as_str()) == Some(alias));
+    if let Some(idx) = pos {
+        aot.remove(idx);
+    }
+    if aot.is_empty() {
+        cursor.remove(array_key);
     }
 }
 
@@ -17131,6 +18150,7 @@ impl_enum_prop_kind!(
     SyntheticEndpoint,
     OpencodeEndpoint,
     KiloCliEndpoint,
+    KiloEndpoint,
     CustomEndpoint,
 );
 
@@ -17150,13 +18170,97 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    async fn amqp_validate_requires_paired_client_cert_and_key() {
+        let base = AmqpConfig {
+            enabled: true,
+            amqp_url: "amqps://broker.example.org:5671/%2Fpublic".into(),
+            exchange: "amq.topic".into(),
+            routing_keys: vec!["org.example.release".into()],
+            ca_cert: Some(std::path::PathBuf::from("/etc/ssl/ca.pem")),
+            ..AmqpConfig::default()
+        };
+
+        // Both absent: server-auth only, valid.
+        assert!(base.validate().is_ok());
+
+        // Cert without key: invalid.
+        let cert_only = AmqpConfig {
+            client_cert: Some(std::path::PathBuf::from("/etc/ssl/client.pem")),
+            ..base.clone()
+        };
+        assert!(cert_only.validate().is_err());
+
+        // Key without cert: invalid.
+        let key_only = AmqpConfig {
+            client_key: Some(std::path::PathBuf::from("/etc/ssl/client.key")),
+            ..base.clone()
+        };
+        assert!(key_only.validate().is_err());
+
+        // Both present: valid.
+        let both = AmqpConfig {
+            client_cert: Some(std::path::PathBuf::from("/etc/ssl/client.pem")),
+            client_key: Some(std::path::PathBuf::from("/etc/ssl/client.key")),
+            ..base
+        };
+        assert!(both.validate().is_ok());
+    }
     use super::*;
+    use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::path::Path;
     use std::path::PathBuf;
     use tempfile::TempDir;
     use tokio::sync::MutexGuard;
     use tokio::test;
+
+    struct EnvValueGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvValueGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: tests that mutate env vars serialize on env_override_lock().
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: tests that mutate env vars serialize on env_override_lock().
+            unsafe { std::env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvValueGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests that mutate env vars serialize on env_override_lock().
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_fake_op(bin_dir: &Path, script: &str) -> PathBuf {
+        let op_path = bin_dir.join("op");
+        std::fs::write(&op_path, script).expect("write fake op");
+        let mut perms = std::fs::metadata(&op_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&op_path, perms).unwrap();
+        op_path
+    }
 
     #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
     #[prefix = "test.object_array.entries"]
@@ -17265,6 +18369,7 @@ mod tests {
         assert_eq!(cfg.allowed_domains, vec!["*".to_string()]);
         assert!(!cfg.allow_private_hosts);
         assert!(cfg.allowed_private_hosts.is_empty());
+        assert!(cfg.secrets.is_empty());
     }
 
     #[test]
@@ -17280,6 +18385,36 @@ allowed_private_hosts = ["localhost", "10.0.0.1"]
         assert_eq!(
             c.http_request.allowed_private_hosts,
             vec!["localhost".to_string(), "10.0.0.1".to_string()]
+        );
+    }
+
+    #[test]
+    async fn http_request_config_deserializes_auth_secrets() {
+        let c = parse_test_config(
+            r#"
+[http_request.secrets]
+api_token = "Bearer test-token"
+"#,
+        );
+
+        assert_eq!(
+            c.http_request.secrets.get("api_token").map(String::as_str),
+            Some("Bearer test-token")
+        );
+    }
+
+    #[test]
+    async fn http_request_auth_secret_names_are_validated() {
+        let mut config = Config::default();
+        config
+            .http_request
+            .secrets
+            .insert("bad.name".to_string(), "Bearer test-token".to_string());
+
+        let err = config.validate().expect_err("invalid secret name");
+        assert!(
+            err.to_string().contains("http_request.secrets.bad.name"),
+            "validation error must name the bad auth secret path: {err}"
         );
     }
 
@@ -17744,7 +18879,7 @@ auto_save = true
         // Ollama-specific tuning lives on `OllamaModelProviderConfig`,
         // not on the generic `ModelProviderConfig` base. These knobs
         // ride alongside the flattened `base` so a TOML alias like
-        // `[model_providers.ollama.local]` accepts them at the same
+        // `[providers.models.ollama.local]` accepts them at the same
         // level as `model`, `api_key`, etc.
         let toml = r#"
             num_ctx = 16384
@@ -17782,6 +18917,42 @@ auto_save = true
         assert!(c.discord.is_empty());
         assert!(c.wecom_ws.is_empty());
         assert!(!c.show_tool_calls);
+        assert_eq!(
+            c.max_concurrent_per_channel,
+            default_channel_max_concurrent_per_channel()
+        );
+    }
+
+    #[test]
+    async fn channels_max_concurrent_per_channel_defaults_and_round_trips() {
+        let parsed: ChannelsConfig = toml::from_str("cli = true").unwrap();
+        assert_eq!(
+            parsed.max_concurrent_per_channel,
+            default_channel_max_concurrent_per_channel()
+        );
+
+        let parsed: ChannelsConfig =
+            toml::from_str("cli = true\nmax_concurrent_per_channel = 2").unwrap();
+        assert_eq!(parsed.max_concurrent_per_channel, 2);
+
+        let toml_str = toml::to_string_pretty(&parsed).unwrap();
+        let reparsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(reparsed.max_concurrent_per_channel, 2);
+    }
+
+    #[test]
+    async fn validate_rejects_zero_channel_max_concurrent_per_channel() {
+        let mut config = Config::default();
+        config.channels.max_concurrent_per_channel = 0;
+
+        let err = config
+            .validate()
+            .expect_err("zero channel concurrency budget must fail validate");
+        assert!(
+            err.to_string()
+                .contains("channels.max_concurrent_per_channel must be greater than 0"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -17972,7 +19143,9 @@ auto_save = true
                 voice_duplex: HashMap::new(),
                 voice_wake: HashMap::new(),
                 mqtt: HashMap::new(),
+                amqp: HashMap::new(),
                 message_timeout_secs: 300,
+                max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
                 ack_reactions: true,
                 show_tool_calls: true,
                 session_persistence: true,
@@ -18039,6 +19212,7 @@ auto_save = true
             escalation: EscalationConfig::default(),
             env_overridden_paths: std::collections::HashSet::new(),
             pre_override_snapshots: std::collections::HashMap::new(),
+            onepassword_reference_snapshots: std::collections::HashMap::new(),
             dirty_paths: std::collections::HashSet::new(),
         };
         // ModelProvider fields are now resolved directly — no cache needed.
@@ -18187,6 +19361,12 @@ auto_approve = ["my_custom_tool", "another_tool"]
                 "default tool '{default_tool}' must be present"
             );
         }
+    }
+
+    #[test]
+    async fn default_auto_approve_includes_tool_search() {
+        let defaults = default_auto_approve();
+        assert!(defaults.contains(&"tool_search".to_string()));
     }
 
     /// Regression test: empty auto_approve still gets defaults merged.
@@ -18409,6 +19589,38 @@ strict_tool_parsing = true
         assert_eq!(agent.resolved.max_tool_iterations, 10);
         assert_eq!(agent.resolved.tool_dispatcher, "auto");
         assert!(!agent.resolved.strict_tool_parsing);
+    }
+
+    #[test]
+    async fn runtime_profile_max_tool_iterations_is_honored() {
+        // #6877: `[runtime_profiles.*].max_tool_iterations` must actually take
+        // effect. It previously had no effect (the value had to be set on
+        // `[agents.*]`); now agent-inline is inert and the profile is the
+        // authoritative surface, so this guards the resolved value.
+        let raw = r#"
+[runtime_profiles.fast]
+max_tool_iterations = 25
+
+[agents.default]
+runtime_profile = "fast"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(parsed.effective_max_tool_iterations("default"), 25);
+    }
+
+    #[test]
+    async fn runtime_profile_unset_max_tool_iterations_uses_default() {
+        // A profile that does not set max_tool_iterations (sentinel 0) falls
+        // back to the global default rather than 0.
+        let raw = r#"
+[runtime_profiles.fast]
+max_history_messages = 80
+
+[agents.default]
+runtime_profile = "fast"
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(parsed.effective_max_tool_iterations("default"), 10);
     }
 
     #[test]
@@ -18657,6 +19869,7 @@ default_temperature = 0.7
             escalation: EscalationConfig::default(),
             env_overridden_paths: std::collections::HashSet::new(),
             pre_override_snapshots: std::collections::HashMap::new(),
+            onepassword_reference_snapshots: std::collections::HashMap::new(),
             dirty_paths: std::collections::HashSet::new(),
         };
 
@@ -18750,6 +19963,10 @@ default_temperature = 0.7
             "Authorization".to_string(),
             "Bearer upload-credential".to_string(),
         )]);
+        config.http_request.secrets = HashMap::from([(
+            "api_token".to_string(),
+            "Bearer http-request-credential".to_string(),
+        )]);
         config.channels.lark.insert(
             "feishu".to_string(),
             LarkConfig {
@@ -18764,6 +19981,10 @@ default_temperature = 0.7
                 port: None,
                 proxy_url: None,
                 excluded_tools: vec![],
+                approval_timeout_secs: 300,
+                per_user_session: false,
+                stream_mode: StreamMode::default(),
+                draft_update_interval_ms: default_draft_update_interval_ms(),
             },
         );
 
@@ -18833,6 +20054,7 @@ default_temperature = 0.7
             "nodes-auth-credential",
             "Bearer otel-credential",
             "Bearer upload-credential",
+            "Bearer http-request-credential",
             "mcp-env-credential",
             "Bearer mcp-cred",
             "tenant-42",
@@ -18966,6 +20188,13 @@ default_temperature = 0.7
         assert_eq!(
             store.decrypt(upload_auth).unwrap(),
             "Bearer upload-credential"
+        );
+
+        let http_request_auth = stored.http_request.secrets.get("api_token").unwrap();
+        assert!(crate::secrets::SecretStore::is_encrypted(http_request_auth));
+        assert_eq!(
+            store.decrypt(http_request_auth).unwrap(),
+            "Bearer http-request-credential"
         );
 
         let feishu = stored.channels.lark.get("feishu").unwrap();
@@ -19140,6 +20369,7 @@ default_temperature = 0.7
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
+            intents_mask: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
@@ -19167,6 +20397,7 @@ default_temperature = 0.7
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
+            intents_mask: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
@@ -19429,7 +20660,9 @@ allowed_users = ["@u:matrix.org"]
             voice_duplex: HashMap::new(),
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),
+            amqp: HashMap::new(),
             message_timeout_secs: 300,
+            max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: true,
             session_persistence: true,
@@ -19601,6 +20834,20 @@ bot_token = "xoxb-tok"
     }
 
     #[test]
+    async fn whatsapp_config_default_interrupt_on_new_message_is_false() {
+        let json = r#"{"session_path":"/tmp/zeroclaw-whatsapp-session.db"}"#;
+        let parsed: WhatsAppConfig = serde_json::from_str(json).unwrap();
+        assert!(!parsed.interrupt_on_new_message);
+    }
+
+    #[test]
+    async fn whatsapp_config_deserializes_interrupt_on_new_message_true() {
+        let json = r#"{"session_path":"/tmp/zeroclaw-whatsapp-session.db","interrupt_on_new_message":true}"#;
+        let parsed: WhatsAppConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.interrupt_on_new_message);
+    }
+
+    #[test]
     async fn webhook_config_with_secret() {
         let json = r#"{"port":8080,"secret":"my-secret-key"}"#;
         let parsed: WebhookConfig = serde_json::from_str(json).unwrap();
@@ -19676,6 +20923,7 @@ bot_token = "xoxb-tok"
             pair_code: None,
             ws_url: None,
             mention_only: false,
+            interrupt_on_new_message: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
@@ -19708,6 +20956,7 @@ bot_token = "xoxb-tok"
             pair_code: None,
             ws_url: None,
             mention_only: false,
+            interrupt_on_new_message: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
@@ -19763,6 +21012,7 @@ allowed_numbers = ["+1", "+2"]
             pair_code: None,
             ws_url: None,
             mention_only: false,
+            interrupt_on_new_message: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
@@ -19792,6 +21042,7 @@ allowed_numbers = ["+1", "+2"]
             pair_code: None,
             ws_url: None,
             mention_only: false,
+            interrupt_on_new_message: false,
             mode: WhatsAppWebMode::default(),
             dm_policy: WhatsAppChatPolicy::default(),
             group_policy: WhatsAppChatPolicy::default(),
@@ -19833,6 +21084,7 @@ allowed_numbers = ["+1", "+2"]
                     pair_code: None,
                     ws_url: None,
                     mention_only: false,
+                    interrupt_on_new_message: false,
                     mode: WhatsAppWebMode::default(),
                     dm_policy: WhatsAppChatPolicy::default(),
                     group_policy: WhatsAppChatPolicy::default(),
@@ -19870,7 +21122,9 @@ allowed_numbers = ["+1", "+2"]
             voice_duplex: HashMap::new(),
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),
+            amqp: HashMap::new(),
             message_timeout_secs: 300,
+            max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
             show_tool_calls: true,
             session_persistence: true,
@@ -19953,6 +21207,7 @@ allowed_numbers = ["+1", "+2"]
             host: "127.0.0.1".into(),
             require_pairing: true,
             allow_public_bind: false,
+            allow_remote_admin: false,
             paired_tokens: vec!["zc_test_token".into()],
             pair_rate_limit_per_minute: 12,
             webhook_rate_limit_per_minute: 80,
@@ -20941,6 +22196,10 @@ default_model = "legacy-model"
                 port: None,
                 proxy_url: None,
                 excluded_tools: vec![],
+                approval_timeout_secs: 300,
+                per_user_session: false,
+                stream_mode: StreamMode::default(),
+                draft_update_interval_ms: default_draft_update_interval_ms(),
             },
         );
         config.save().await.unwrap();
@@ -21504,6 +22763,10 @@ api_token = "tok"
             port: None,
             proxy_url: None,
             excluded_tools: vec![],
+            approval_timeout_secs: 300,
+            per_user_session: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: default_draft_update_interval_ms(),
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -21528,6 +22791,10 @@ api_token = "tok"
             port: Some(9898),
             proxy_url: None,
             excluded_tools: vec![],
+            approval_timeout_secs: 300,
+            per_user_session: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: default_draft_update_interval_ms(),
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -21831,6 +23098,593 @@ group_policy = "disabled"
         );
     }
 
+    /// Regression for the per-field `[[mcp.servers]]` editor: after
+    /// `d06ed25` shipped the natural-key arm, in-memory edits succeed
+    /// (the TUI / dashboard show the new value) but `save_dirty` is
+    /// silently a no-op because `apply_dirty_path` walks the serialized
+    /// TOML as if every segment is a `Table` — `mcp.servers` is an
+    /// array of tables, so `lookup_path_in_table` returns `None` at the
+    /// natural-key segment, the path is misclassified as
+    /// `should_delete`, and `delete_path_in_doc` bails when it hits the
+    /// array too. Net effect: the on-disk file keeps its stale value.
+    #[test]
+    async fn save_dirty_persists_mcp_server_field_via_natural_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Seed an on-disk file with a single MCP server so the
+        // incremental path (not the new-file fallback to full `save`)
+        // runs. Schema version is stamped to current so the writer
+        // doesn't have to migrate anything.
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [[mcp.servers]]\n\
+             name = \"fs\"\n\
+             transport = \"stdio\"\n\
+             command = \"/usr/bin/mcp-fs\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        // Build the in-memory config to match the seeded file. We
+        // don't need to round-trip through deserialization — the bug
+        // is purely on the save side, and the on-disk seed gives
+        // `save_dirty` an existing file to do an incremental write
+        // into (the new-file fallback to full `save` would mask the
+        // dirty-path bug because it serializes the whole struct).
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.mcp.servers.push(McpServerConfig {
+            name: "fs".into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            ..Default::default()
+        });
+        assert_eq!(config.mcp.servers[0].command, "/usr/bin/mcp-fs");
+
+        // The same call site the dashboard / TUI use: set_prop_persistent
+        // on a natural-key-routed inner path, then flush via save_dirty.
+        config
+            .set_prop_persistent("mcp.servers.fs.command", "/usr/local/bin/mcp-fs")
+            .expect("set_prop_persistent must route through the natural-key arm");
+        // The in-memory mutation must land — this is what the UI sees.
+        assert_eq!(config.mcp.servers[0].command, "/usr/local/bin/mcp-fs");
+
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            written.contains("/usr/local/bin/mcp-fs"),
+            "save_dirty must write the new command for `mcp.servers.fs.command`; \
+             on-disk file still reads:\n{written}"
+        );
+        assert!(
+            !written.contains("/usr/bin/mcp-fs"),
+            "stale command must be overwritten; got:\n{written}"
+        );
+        // The natural-key field itself must stay on disk — losing
+        // `name` would orphan every other field in the [[mcp.servers]]
+        // entry and break subsequent loads.
+        assert!(
+            written.contains("name = \"fs\""),
+            "natural-key `name` must survive the incremental save; got:\n{written}"
+        );
+    }
+
+    /// `create_map_key("mcp.servers", "new")` followed by per-field
+    /// edits must produce a complete `[[mcp.servers]]` table on disk —
+    /// including the seeded natural-key field. This is the path the
+    /// dashboard's `+ Add MCP server` affordance walks: insert, then
+    /// edit `command` / `transport` etc.
+    #[test]
+    async fn save_dirty_writes_new_mcp_server_added_via_create_map_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Seed an unrelated existing entry so we exercise the
+        // append-into-existing-array path (not the create-array-from-
+        // scratch path). Both matter; the empty-doc case is covered by
+        // `save` instead of `save_dirty` (see the `!config_path.exists()`
+        // branch at the top of `save_dirty`).
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [[mcp.servers]]\n\
+             name = \"fs\"\n\
+             transport = \"stdio\"\n\
+             command = \"/usr/bin/mcp-fs\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.mcp.servers.push(McpServerConfig {
+            name: "fs".into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            ..Default::default()
+        });
+
+        // The handle_config_map_key_create dispatch path runs
+        // create_map_key + mark_dirty(`<section>.<key>`). Replicate
+        // that here so we're testing the same wire sequence.
+        let created = config
+            .create_map_key("mcp.servers", "github")
+            .expect("create_map_key on a natural-key section must succeed");
+        assert!(created);
+        config.mark_dirty("mcp.servers.github");
+
+        // Per-field edit on the freshly-added entry.
+        config
+            .set_prop_persistent("mcp.servers.github.transport", "http")
+            .expect("set transport on freshly-added entry must route");
+        config
+            .set_prop_persistent("mcp.servers.github.url", "https://mcp.example/")
+            .expect("set url on freshly-added entry must route");
+
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        // Both entries survive, with their distinct fields.
+        assert!(
+            written.contains("name = \"fs\""),
+            "pre-existing entry must survive; got:\n{written}"
+        );
+        assert!(
+            written.contains("name = \"github\""),
+            "new entry's natural-key field must land on disk; got:\n{written}"
+        );
+        assert!(
+            written.contains("transport = \"http\""),
+            "per-field edit on the new entry must land; got:\n{written}"
+        );
+        assert!(
+            written.contains("url = \"https://mcp.example/\""),
+            "second per-field edit on the new entry must land; got:\n{written}"
+        );
+        // Round-trip: parsing the written file must yield exactly the
+        // shape we built up in memory. Catches mis-shaped output (e.g.
+        // a nested `mcp.servers.github` inline table sneaking in instead
+        // of a second `[[mcp.servers]]`).
+        let reparsed: Config = toml::from_str(&written).unwrap();
+        assert_eq!(reparsed.mcp.servers.len(), 2);
+        let gh = reparsed
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.name == "github")
+            .expect("reparse must surface the new entry by natural key");
+        assert_eq!(gh.transport, McpTransport::Http);
+        assert_eq!(gh.url.as_deref(), Some("https://mcp.example/"));
+    }
+
+    /// `rename_map_key("mcp.servers", "fs", "filesystem")` rewrites the
+    /// in-memory entry's `name` field in place and marks BOTH aliases
+    /// dirty. The incremental writer must update the matching
+    /// `[[mcp.servers]]` entry's `name` to the new value without
+    /// leaving a stale duplicate behind.
+    #[test]
+    async fn save_dirty_persists_mcp_server_rename_via_natural_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [[mcp.servers]]\n\
+             name = \"fs\"\n\
+             transport = \"stdio\"\n\
+             command = \"/usr/bin/mcp-fs\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.mcp.servers.push(McpServerConfig {
+            name: "fs".into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            ..Default::default()
+        });
+
+        // Mirror handle_config_map_key_rename: rename, then mark both
+        // the old and new aliases dirty.
+        let renamed = config
+            .rename_map_key("mcp.servers", "fs", "filesystem")
+            .expect("rename of a unique alias must succeed");
+        assert!(renamed);
+        config.mark_dirty("mcp.servers.fs");
+        config.mark_dirty("mcp.servers.filesystem");
+
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            written.contains("name = \"filesystem\""),
+            "rename target must land on disk; got:\n{written}"
+        );
+        assert!(
+            !written.contains("name = \"fs\""),
+            "stale rename source must NOT remain on disk; got:\n{written}"
+        );
+        // Other fields on the renamed entry are preserved.
+        assert!(
+            written.contains("command = \"/usr/bin/mcp-fs\""),
+            "rename must preserve sibling fields on the entry; got:\n{written}"
+        );
+
+        let reparsed: Config = toml::from_str(&written).unwrap();
+        assert_eq!(reparsed.mcp.servers.len(), 1);
+        assert_eq!(reparsed.mcp.servers[0].name, "filesystem");
+        assert_eq!(reparsed.mcp.servers[0].command, "/usr/bin/mcp-fs");
+    }
+
+    /// `delete_map_key("mcp.servers", "fs")` removes the in-memory
+    /// entry and marks the alias dirty. The incremental writer must
+    /// drop the corresponding `[[mcp.servers]]` entry from disk,
+    /// dropping the array slot entirely when no entries remain so the
+    /// file doesn't carry a dangling `[[mcp.servers]]` section header.
+    #[test]
+    async fn save_dirty_removes_mcp_server_deleted_via_natural_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Two entries on disk; we'll delete one and assert the other
+        // survives.
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [[mcp.servers]]\n\
+             name = \"fs\"\n\
+             transport = \"stdio\"\n\
+             command = \"/usr/bin/mcp-fs\"\n\n\
+             [[mcp.servers]]\n\
+             name = \"github\"\n\
+             transport = \"http\"\n\
+             url = \"https://mcp.example/\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.mcp.servers.push(McpServerConfig {
+            name: "fs".into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            ..Default::default()
+        });
+        config.mcp.servers.push(McpServerConfig {
+            name: "github".into(),
+            transport: McpTransport::Http,
+            url: Some("https://mcp.example/".to_string()),
+            ..Default::default()
+        });
+
+        let deleted = config
+            .delete_map_key("mcp.servers", "fs")
+            .expect("delete by natural key must resolve");
+        assert!(deleted);
+        config.mark_dirty("mcp.servers.fs");
+
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !written.contains("name = \"fs\""),
+            "deleted entry must not survive incremental save; got:\n{written}"
+        );
+        assert!(
+            written.contains("name = \"github\""),
+            "untouched sibling entry must survive; got:\n{written}"
+        );
+
+        let reparsed: Config = toml::from_str(&written).unwrap();
+        assert_eq!(reparsed.mcp.servers.len(), 1);
+        assert_eq!(reparsed.mcp.servers[0].name, "github");
+    }
+
+    /// Deleting the last `[[mcp.servers]]` entry drops the array slot
+    /// entirely. A vestigial empty `[[mcp.servers]]` header would
+    /// reparse as a single default-shaped element with an empty
+    /// natural-key field, which the validator then rejects on next
+    /// load — actively breaking the file the writer just produced.
+    #[test]
+    async fn save_dirty_drops_array_header_when_last_mcp_server_removed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [[mcp.servers]]\n\
+             name = \"fs\"\n\
+             transport = \"stdio\"\n\
+             command = \"/usr/bin/mcp-fs\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.mcp.servers.push(McpServerConfig {
+            name: "fs".into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            ..Default::default()
+        });
+
+        config.delete_map_key("mcp.servers", "fs").unwrap();
+        config.mark_dirty("mcp.servers.fs");
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !written.contains("[[mcp.servers]]"),
+            "empty array header must be dropped, otherwise it reparses as a default entry; got:\n{written}"
+        );
+        let reparsed: Config = toml::from_str(&written).unwrap();
+        assert!(reparsed.mcp.servers.is_empty());
+    }
+
+    /// `Config::map_key_sections()` must surface the natural-key field
+    /// for `mcp.servers`. This is the metadata `apply_dirty_path` reads
+    /// to decide whether to take the array-of-tables branch; if the
+    /// derive ever stops emitting it for `#[natural_key = "..."]` Vec
+    /// fields, the dirty-path writer falls back to the broken
+    /// Table-only walker and silently drops MCP edits on the floor
+    /// again. Lock the contract here.
+    #[test]
+    async fn map_key_sections_exposes_natural_key_for_mcp_servers() {
+        let sections = Config::map_key_sections();
+        let entry = sections
+            .iter()
+            .find(|s| s.path == "mcp.servers")
+            .expect("mcp.servers must be discoverable in map_key_sections()");
+        assert_eq!(entry.kind, crate::traits::MapKeyKind::List);
+        assert_eq!(
+            entry.natural_key,
+            Some("name"),
+            "natural_key must mirror the `#[natural_key = \"name\"]` attribute \
+             on McpConfig::servers; the dirty-path writer keys off this to take \
+             the array-of-tables branch"
+        );
+
+        // Sanity: a representative HashMap section (alias IS the TOML
+        // key) carries `natural_key: None`. The dirty-path writer's
+        // branch decision falls through to the generic Table walker
+        // for these.
+        let anthropic = sections
+            .iter()
+            .find(|s| s.path == "providers.models.anthropic")
+            .expect(
+                "providers.models.anthropic must surface as a HashMap-backed map-keyed section",
+            );
+        assert_eq!(anthropic.kind, crate::traits::MapKeyKind::Map);
+        assert_eq!(anthropic.natural_key, None);
+    }
+
+    /// A dirty path with a kebab-shaped inner field (e.g.
+    /// `mcp.servers.fs.tool-timeout-secs`) must resolve through the
+    /// shared `resolve_dirty_segments` helper inside the natural-key
+    /// branch the same way the top-level Table walker does — landing
+    /// on the snake `tool_timeout_secs` field on disk. This pins the
+    /// dash-aware resolution that's load-bearing for any future
+    /// natural-key struct field whose snake_case name is multi-word.
+    /// Without this, a UI client that emits kebab field names would
+    /// recreate the exact symptom the PR fixes (memory updates, disk
+    /// stays stale) for any such field.
+    #[test]
+    async fn save_dirty_persists_mcp_server_kebab_inner_field_via_natural_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [[mcp.servers]]\n\
+             name = \"fs\"\n\
+             transport = \"stdio\"\n\
+             command = \"/usr/bin/mcp-fs\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.mcp.servers.push(McpServerConfig {
+            name: "fs".into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            tool_timeout_secs: Some(45),
+            ..Default::default()
+        });
+
+        // mark_dirty directly with a kebab leaf segment so the
+        // dash-aware resolver inside `resolve_dirty_segments` is the
+        // only thing that can possibly land this on disk. set_prop /
+        // set_prop_persistent route through the macro which has its
+        // own snake-only field-name lookup; this test isolates the
+        // writer-side resolution. The in-memory mutation above
+        // simulates the dispatcher having already routed the
+        // set_prop side; what we're testing here is the save side.
+        config.mark_dirty("mcp.servers.fs.tool-timeout-secs");
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            written.contains("tool_timeout_secs = 45"),
+            "kebab dirty segment must resolve to the snake on-disk field; \
+             got:\n{written}"
+        );
+        assert!(
+            !written.contains("tool-timeout-secs"),
+            "kebab field name must never appear on disk; got:\n{written}"
+        );
+        // Other fields on the entry survive the targeted edit.
+        let reparsed: Config = toml::from_str(&written).unwrap();
+        assert_eq!(reparsed.mcp.servers.len(), 1);
+        assert_eq!(reparsed.mcp.servers[0].name, "fs");
+        assert_eq!(reparsed.mcp.servers[0].command, "/usr/bin/mcp-fs");
+        assert_eq!(reparsed.mcp.servers[0].tool_timeout_secs, Some(45));
+    }
+
+    /// An explicit per-field unset (the in-memory field reverts to
+    /// `None`, but the dirty path still names that specific inner
+    /// field rather than the whole element) must drive the case-1
+    /// `mem missing → delete` branch — removing the field from the
+    /// `[[mcp.servers]]` entry on disk without touching its siblings.
+    /// The pre-existing whole-element delete test covers a different
+    /// path (the rename source / `delete_map_key`); this one pins
+    /// the per-field delete branch independently. Without it, a
+    /// future refactor that collapses case-1's `None` branch into
+    /// the whole-element path would silently break "clear this field"
+    /// edits — the field would survive on disk while showing as
+    /// unset in the UI.
+    #[test]
+    async fn save_dirty_unset_per_field_drops_field_from_mcp_server_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Seed an entry with tool_timeout_secs set — this is the
+        // field we'll unset via a per-field dirty path.
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [[mcp.servers]]\n\
+             name = \"fs\"\n\
+             transport = \"stdio\"\n\
+             command = \"/usr/bin/mcp-fs\"\n\
+             tool_timeout_secs = 45\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        // In-memory mirror without the optional field set — i.e. the
+        // UI user just cleared `tool_timeout_secs`.
+        config.mcp.servers.push(McpServerConfig {
+            name: "fs".into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            tool_timeout_secs: None,
+            ..Default::default()
+        });
+        // Per-field dirty path — exactly what a UI "clear this
+        // field" affordance emits. The whole-element bare alias
+        // `mcp.servers.fs` is intentionally NOT marked: the bare
+        // alias is the rename/delete shape; the bug-prone case is
+        // the per-field one.
+        config.mark_dirty("mcp.servers.fs.tool_timeout_secs");
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !written.contains("tool_timeout_secs"),
+            "explicit per-field unset must drop the field from disk; got:\n{written}"
+        );
+        // Siblings survive: the entry isn't deleted, just the one
+        // field, and the natural-key field itself must stay so
+        // subsequent loads still know which alias this entry is.
+        assert!(
+            written.contains("name = \"fs\""),
+            "natural-key field must survive a per-field unset; got:\n{written}"
+        );
+        assert!(
+            written.contains("command = \"/usr/bin/mcp-fs\""),
+            "sibling fields must survive a per-field unset; got:\n{written}"
+        );
+
+        let reparsed: Config = toml::from_str(&written).unwrap();
+        assert_eq!(reparsed.mcp.servers.len(), 1);
+        assert_eq!(reparsed.mcp.servers[0].name, "fs");
+        assert_eq!(reparsed.mcp.servers[0].tool_timeout_secs, None);
+    }
+
+    /// When the on-disk node at `mcp.servers` exists but has the
+    /// wrong kind — e.g. a hand-edited `mcp.servers = "foo"`, or an
+    /// inline-array-of-tables literal `servers = [{ ... }]` that
+    /// `toml_edit` parses as `Item::Value(Value::Array)` rather than
+    /// `Item::ArrayOfTables` — the writer must refuse to clobber
+    /// rather than data-loss the user's hand-edit. The bail is
+    /// observable (a `WARN`-level log event), but here we just pin
+    /// the don't-clobber behavior at the disk level: the original
+    /// shape survives the save unchanged. This is the explicit
+    /// contract test for the wrong-kind bail surface; without it,
+    /// a refactor that "fixes" the bail by overwriting silently
+    /// would corrupt every operator who has either of these
+    /// (otherwise valid) TOML shapes in their config.
+    #[test]
+    async fn save_dirty_refuses_to_clobber_wrong_kind_mcp_servers_node() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Hand-edited file: operator wrote `mcp.servers` as a scalar.
+        // This is invalid against the schema but is what
+        // `Item::Value(Value::String)` looks like in toml_edit, and
+        // it's representative of the wrong-kind case (the same bail
+        // path also fires for `Item::Value(Value::Array)` inline
+        // arrays). Schema validation would reject this on load; the
+        // test forces the writer to face the shape regardless.
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [mcp]\n\
+             servers = \"hand-edited-scalar\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        // In-memory has a real server; the per-field edit would
+        // normally land on `[[mcp.servers]]` on disk.
+        config.mcp.servers.push(McpServerConfig {
+            name: "fs".into(),
+            transport: McpTransport::Stdio,
+            command: "/usr/bin/mcp-fs".into(),
+            ..Default::default()
+        });
+        config.mark_dirty("mcp.servers.fs.command");
+
+        // The save itself must succeed — bail is a no-op for the
+        // wrong-kind node, not an error.
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        // The hand-edited scalar shape survives untouched: we'd
+        // rather a load-time validation error the operator sees than
+        // a silent overwrite of their (possibly intentional) file
+        // surgery.
+        assert!(
+            written.contains("servers = \"hand-edited-scalar\""),
+            "wrong-kind `mcp.servers` node must survive the save unchanged; \
+             got:\n{written}"
+        );
+        assert!(
+            !written.contains("[[mcp.servers]]"),
+            "writer must not synthesize an array-of-tables next to a scalar \
+             hand-edit; got:\n{written}"
+        );
+        assert!(
+            !written.contains("/usr/bin/mcp-fs"),
+            "in-memory command must not leak past a wrong-kind bail; \
+             got:\n{written}"
+        );
+    }
+
     #[test]
     async fn collect_warnings_flags_wire_api_on_fixed_protocol_family() {
         let mut config = Config::default();
@@ -22027,6 +23881,45 @@ require_otp_to_resume = true
 
         let err = config.validate().expect_err("expected invalid domain glob");
         assert!(err.to_string().contains("gated_domains"));
+    }
+
+    #[test]
+    async fn security_validation_accepts_all_default_gated_actions_without_warning() {
+        let mut config = Config::default();
+        config.security.otp.gated_actions = default_otp_gated_actions();
+
+        config
+            .validate()
+            .expect("the canonical default gated actions must validate clean");
+    }
+
+    #[test]
+    async fn security_validation_accepts_unknown_gated_action_but_does_not_bail() {
+        // An unknown but well-formed action name is a silent no-op today
+        // (OTP enforcement of gated_actions is not wired through). Config load
+        // must not fail on it — the operator's whole config would be rejected
+        // for a typo'd gate — but the runtime emits a WARN so the no-op is not
+        // silent. This asserts the warn-and-continue contract: load succeeds.
+        let mut config = Config::default();
+        config.security.otp.gated_actions = vec!["kubectl_write".into()];
+
+        config
+            .validate()
+            .expect("an unknown gated action must warn, not reject the config");
+    }
+
+    #[test]
+    async fn security_validation_still_rejects_malformed_gated_action() {
+        // The unknown-name warn must not weaken the existing hard checks from
+        // the charset/empty validation: a name with invalid characters still
+        // bails rather than degrading to a warn.
+        let mut config = Config::default();
+        config.security.otp.gated_actions = vec!["kubectl write".into()];
+
+        let err = config
+            .validate()
+            .expect_err("malformed gated action must still be rejected");
+        assert!(err.to_string().contains("gated_actions"));
     }
 
     // The two `validate_*_transcription_default_provider` tests were removed
@@ -22343,10 +24236,45 @@ require_otp_to_resume = true
     }
 
     #[test]
-    async fn mcp_config_default_disabled_with_empty_servers() {
+    async fn mcp_config_defaults_enabled_eager_loading_with_empty_servers() {
         let cfg = McpConfig::default();
-        assert!(!cfg.enabled);
+        assert!(cfg.enabled);
+        assert!(!cfg.deferred_loading);
         assert!(cfg.servers.is_empty());
+    }
+
+    #[test]
+    async fn mcp_config_parsed_missing_flags_uses_enabled_eager_defaults() {
+        let raw = r#"
+[mcp]
+
+[[mcp.servers]]
+name = "svc"
+transport = "http"
+url = "http://localhost:8080/mcp"
+"#;
+        let parsed = parse_test_config(raw);
+        assert!(parsed.mcp.enabled);
+        assert!(!parsed.mcp.deferred_loading);
+        assert_eq!(parsed.mcp.servers.len(), 1);
+    }
+
+    #[test]
+    async fn mcp_config_explicit_disable_and_deferred_loading_are_respected() {
+        let raw = r#"
+[mcp]
+enabled = false
+deferred_loading = true
+
+[[mcp.servers]]
+name = "svc"
+transport = "http"
+url = "http://localhost:8080/mcp"
+"#;
+        let parsed = parse_test_config(raw);
+        assert!(!parsed.mcp.enabled);
+        assert!(parsed.mcp.deferred_loading);
+        assert_eq!(parsed.mcp.servers.len(), 1);
     }
 
     #[test]
@@ -23045,6 +24973,10 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let names: Vec<&str> = fields.iter().map(|f| f.name).collect();
         assert!(names.contains(&"channels.matrix.access_token"));
         assert!(names.contains(&"channels.matrix.recovery_key"));
+        assert!(
+            names.contains(&"http_request.secrets"),
+            "http_request.secrets must be classified as a secret map"
+        );
     }
 
     #[test]
@@ -23140,6 +25072,65 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 .set_secret("nonexistent.field", "val".into())
                 .is_err()
         );
+    }
+
+    #[test]
+    async fn config_set_http_request_secret_map_key_is_masked_and_encrypted() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        tokio::fs::write(&config_path, "schema_version = 1\n")
+            .await
+            .unwrap();
+        let mut config = Config {
+            config_path: config_path.clone(),
+            data_dir: dir.path().join("workspace"),
+            secrets: SecretsConfig { encrypt: true },
+            ..Config::default()
+        };
+        let path = "http_request.secrets.api_token";
+
+        assert!(
+            Config::prop_is_secret(path),
+            "dynamic http_request secret map entries must be classified as secret before the key exists"
+        );
+        config
+            .set_prop_persistent(path, "Bearer from-config-set")
+            .unwrap();
+
+        assert_eq!(
+            config
+                .http_request
+                .secrets
+                .get("api_token")
+                .map(String::as_str),
+            Some("Bearer from-config-set")
+        );
+        assert_eq!(config.get_prop(path).unwrap(), "****");
+
+        let field = config
+            .prop_fields()
+            .into_iter()
+            .find(|field| field.name == path)
+            .expect("dynamic secret map prop field");
+        assert!(field.is_secret);
+        assert_eq!(field.display_value, "****");
+        assert_eq!(
+            field.credential_class,
+            Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
+        );
+
+        config.save_dirty().await.unwrap();
+        let contents = tokio::fs::read_to_string(&config_path).await.unwrap();
+        assert!(
+            !contents.contains("Bearer from-config-set"),
+            "auth secret must not be written in plaintext: {contents}"
+        );
+
+        let stored = crate::migration::migrate_to_current(&contents).unwrap();
+        let encrypted = stored.http_request.secrets.get("api_token").unwrap();
+        assert!(crate::secrets::SecretStore::is_encrypted(encrypted));
+        let store = crate::secrets::SecretStore::new(dir.path(), true);
+        assert_eq!(store.decrypt(encrypted).unwrap(), "Bearer from-config-set");
     }
 
     #[test]
@@ -23701,6 +25692,204 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    async fn onepassword_reference_survives_load_save_cycle() {
+        let _env_guard = env_override_lock().await;
+        let dir = TempDir::new().unwrap();
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        write_fake_op(
+            &bin_dir,
+            r#"#!/bin/sh
+if [ "$1" = "read" ] && [ "$2" = "op://zeroclaw/provider/openai-api-key" ]; then
+  printf '%s\n' 'sk-proj-from-onepassword'
+  exit 0
+fi
+printf '%s\n' 'unexpected op invocation' >&2
+exit 65
+"#,
+        );
+        let path = match std::env::var_os("PATH") {
+            Some(existing) if !existing.is_empty() => {
+                format!("{}:{}", bin_dir.display(), existing.to_string_lossy())
+            }
+            _ => bin_dir.display().to_string(),
+        };
+        let _path_guard = EnvValueGuard::set("PATH", path);
+        let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", dir.path());
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+schema_version = 3
+
+[providers.models.openai.default]
+model = "gpt-5"
+api_key = "op://zeroclaw/provider/openai-api-key"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load_or_init().await.unwrap();
+        assert_eq!(
+            config
+                .providers
+                .models
+                .openai
+                .get("default")
+                .and_then(|entry| entry.base.api_key.as_deref()),
+            Some("sk-proj-from-onepassword"),
+            "runtime config uses resolved 1Password secret"
+        );
+
+        config.save().await.unwrap();
+        let raw_after = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            raw_after.contains("op://zeroclaw/provider/openai-api-key"),
+            "on-disk config must keep the 1Password reference: {raw_after}"
+        );
+        assert!(
+            !raw_after.contains("sk-proj-from-onepassword"),
+            "resolved secret must not be written back to disk: {raw_after}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "test asserts Tokio worker responsiveness"
+    )]
+    #[test(flavor = "multi_thread", worker_threads = 1)]
+    async fn onepassword_reference_load_does_not_block_runtime_worker() {
+        let _env_guard = env_override_lock().await;
+        let dir = TempDir::new().unwrap();
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        write_fake_op(
+            &bin_dir,
+            r#"#!/bin/sh
+if [ "$1" = "read" ] && [ "$2" = "op://zeroclaw/provider/openai-api-key" ]; then
+  sleep 1
+  printf '%s\n' 'sk-proj-from-onepassword'
+  exit 0
+fi
+exit 65
+"#,
+        );
+        let path = match std::env::var_os("PATH") {
+            Some(existing) if !existing.is_empty() => {
+                format!("{}:{}", bin_dir.display(), existing.to_string_lossy())
+            }
+            _ => bin_dir.display().to_string(),
+        };
+        let _path_guard = EnvValueGuard::set("PATH", path);
+        let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", dir.path());
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+schema_version = 3
+
+[providers.models.openai.default]
+model = "gpt-5"
+api_key = "op://zeroclaw/provider/openai-api-key"
+"#,
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let load_task = tokio::spawn(Config::load_or_init());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "op:// config load should not block the async runtime worker"
+        );
+
+        let config = load_task.await.unwrap().unwrap();
+        assert_eq!(
+            config
+                .providers
+                .models
+                .openai
+                .get("default")
+                .and_then(|entry| entry.base.api_key.as_deref()),
+            Some("sk-proj-from-onepassword")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    async fn dirty_onepassword_secret_edit_replaces_reference() {
+        let _env_guard = env_override_lock().await;
+        let dir = TempDir::new().unwrap();
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        write_fake_op(
+            &bin_dir,
+            r#"#!/bin/sh
+printf '%s\n' 'sk-proj-from-onepassword'
+"#,
+        );
+        let path = match std::env::var_os("PATH") {
+            Some(existing) if !existing.is_empty() => {
+                format!("{}:{}", bin_dir.display(), existing.to_string_lossy())
+            }
+            _ => bin_dir.display().to_string(),
+        };
+        let _path_guard = EnvValueGuard::set("PATH", path);
+        let _config_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", dir.path());
+        let _workspace_guard = EnvValueGuard::remove("ZEROCLAW_WORKSPACE");
+
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+schema_version = 3
+
+[providers.models.openai.default]
+model = "gpt-5"
+api_key = "op://zeroclaw/provider/openai-api-key"
+"#,
+        )
+        .unwrap();
+
+        let mut config = Config::load_or_init().await.unwrap();
+        config
+            .set_prop_persistent(
+                "providers.models.openai.default.api_key",
+                "sk-proj-new-direct-key",
+            )
+            .unwrap();
+        config.save_dirty().await.unwrap();
+
+        let raw_after = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !raw_after.contains("op://zeroclaw/provider/openai-api-key"),
+            "dirty secret edits should replace the old 1Password reference: {raw_after}"
+        );
+        assert!(
+            !raw_after.contains("sk-proj-new-direct-key"),
+            "direct replacement should still be encrypted at rest: {raw_after}"
+        );
+
+        let stored: Config = toml::from_str(&raw_after).unwrap();
+        let encrypted = stored
+            .providers
+            .models
+            .openai
+            .get("default")
+            .and_then(|entry| entry.base.api_key.as_deref())
+            .unwrap();
+        let store = crate::secrets::SecretStore::new(dir.path(), true);
+        assert_eq!(store.decrypt(encrypted).unwrap(), "sk-proj-new-direct-key");
+    }
+
     #[test]
     async fn enum_variants_callback_returns_values() {
         let mx = test_matrix_config();
@@ -23839,6 +26028,127 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     }
 
     #[test]
+    async fn provider_slot_names_match_struct_fields() {
+        // TtsProviders/TranscriptionProviders::slot_names are inline lists
+        // (their slot macros carry a rate-type param); pin them against the
+        // actual serialized field names so adding a family without updating
+        // slot_names fails here.
+        let tts = toml::Value::try_from(crate::providers::TtsProviders {
+            openai: std::iter::once(("a".to_string(), Default::default())).collect(),
+            elevenlabs: std::iter::once(("a".to_string(), Default::default())).collect(),
+            google: std::iter::once(("a".to_string(), Default::default())).collect(),
+            edge: std::iter::once(("a".to_string(), Default::default())).collect(),
+            piper: std::iter::once(("a".to_string(), Default::default())).collect(),
+        })
+        .unwrap();
+        let mut tts_fields: Vec<&str> =
+            tts.as_table().unwrap().keys().map(String::as_str).collect();
+        tts_fields.sort_unstable();
+        let mut tts_slots = crate::providers::TtsProviders::slot_names().to_vec();
+        tts_slots.sort_unstable();
+        assert_eq!(tts_fields, tts_slots);
+
+        let tr = toml::Value::try_from(crate::providers::TranscriptionProviders {
+            groq: std::iter::once(("a".to_string(), Default::default())).collect(),
+            openai: std::iter::once(("a".to_string(), Default::default())).collect(),
+            deepgram: std::iter::once(("a".to_string(), Default::default())).collect(),
+            assemblyai: std::iter::once(("a".to_string(), Default::default())).collect(),
+            google: std::iter::once(("a".to_string(), Default::default())).collect(),
+            local_whisper: std::iter::once(("a".to_string(), Default::default())).collect(),
+        })
+        .unwrap();
+        let mut tr_fields: Vec<&str> = tr.as_table().unwrap().keys().map(String::as_str).collect();
+        tr_fields.sort_unstable();
+        let mut tr_slots = crate::providers::TranscriptionProviders::slot_names().to_vec();
+        tr_slots.sort_unstable();
+        assert_eq!(tr_fields, tr_slots);
+    }
+
+    #[test]
+    async fn unknown_provider_families_flags_silent_serde_drop() {
+        // serde ignores unknown keys under providers.models, so a typo'd
+        // family parses cleanly and its aliases vanish on reload. The
+        // detector must flag it; known families must pass.
+        let raw = r#"
+schema_version = 3
+
+[providers.models.antropic.main]
+model = "claude-sonnet-4-6"
+
+[providers.models.openai.work]
+model = "gpt-4o"
+"#;
+        let parsed: Config = toml::from_str(raw).expect("unknown family must not fail parse");
+        assert!(
+            parsed.providers.models.find("antropic", "main").is_none(),
+            "precondition: serde silently drops the unknown family"
+        );
+        assert_eq!(
+            Config::unknown_provider_families(raw),
+            vec!["models.antropic".to_string()]
+        );
+        assert_eq!(
+            Config::unknown_provider_families(
+                "schema_version = 3\n[providers.tts.bogustts.x]\nenabled = true\n",
+            ),
+            vec!["tts.bogustts".to_string()]
+        );
+        assert!(Config::unknown_provider_families("not even toml {{{").is_empty());
+        // Hostile shapes: scalar providers node, scalar kind node,
+        // array-of-tables family. as_table() filters all of them; the
+        // detector must stay silent rather than panic or false-positive.
+        assert!(Config::unknown_provider_families("providers = 3\n").is_empty());
+        assert!(Config::unknown_provider_families("[providers]\nmodels = 3\n").is_empty());
+        assert_eq!(
+            Config::unknown_provider_families("[[providers.models.weird]]\nx = 1\n"),
+            vec!["models.weird".to_string()],
+            "array-of-tables under an unknown family is still an unknown family"
+        );
+    }
+
+    #[test]
+    async fn map_key_create_survives_incremental_save() {
+        // Repro for the zerocode "providers vanish after restart" report:
+        // the RPC config/map-key-create path is create_map_key + mark_dirty
+        // + save_dirty. The new alias must reach config.toml, otherwise it
+        // exists only in-memory and a daemon restart silently drops it
+        // (and any agents.*.model_provider referencing it dangles).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Seed a non-empty on-disk file so the incremental path runs, not
+        // the new-file fallback to full save().
+        std::fs::write(
+            &config_path,
+            "schema_version = 9\n\n[observability]\nbackend = \"none\"\n",
+        )
+        .unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        let created = config
+            .create_map_key("providers.models.openai", "myalias")
+            .expect("typed family slot accepts a new alias");
+        assert!(created);
+        config.mark_dirty("providers.models.openai.myalias");
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        let reloaded: Config = toml::from_str(&written)
+            .unwrap_or_else(|e| panic!("rewritten config must reparse: {e}\n---\n{written}"));
+        assert!(
+            reloaded
+                .providers
+                .models
+                .find("openai", "myalias")
+                .is_some(),
+            "created alias must survive save_dirty + reload; got:\n{written}"
+        );
+    }
+
+    #[test]
     async fn init_defaults_instantiates_none_sections() {
         let mut config = Config::default();
         assert!(config.channels.matrix.is_empty());
@@ -23963,12 +26273,247 @@ allowed_users = []
         assert_eq!(config.mcp.servers[0].name, "fs");
 
         // Per-entry fields are mutated via standard set_prop on the inner
-        // path (the same call site the per-prop PUT handler uses); the
-        // McpServerConfig schema's `#[prefix = "mcp.servers"]` makes the
-        // path resolution work without hand-table dispatch.
-        // (Wider per-entry path routing through Vec<T> requires a
-        // future generalization of route_hashmap_path-equivalent for
-        // List sections; tracked as future work.)
+        // path; routing goes through the `#[natural_key = "name"]` arm
+        // on `McpConfig::servers` (see `route_vec_path` and the
+        // `Configurable` derive's natural-key arm for the wiring).
+        config
+            .set_prop("mcp.servers.fs.command", "/usr/bin/mcp-fs")
+            .expect("set_prop on mcp.servers.fs.command should route through natural-key arm");
+        assert_eq!(config.mcp.servers[0].command, "/usr/bin/mcp-fs");
+
+        // Round-trip via get_prop.
+        let got = config.get_prop("mcp.servers.fs.command").expect(
+            "get_prop on mcp.servers.fs.command should resolve through the natural-key arm",
+        );
+        assert_eq!(got, "/usr/bin/mcp-fs");
+
+        // Enum-typed fields (transport) parse from their wire form.
+        config
+            .set_prop("mcp.servers.fs.transport", "http")
+            .expect("transport should accept its enum variants as strings");
+        assert_eq!(
+            config.mcp.servers[0].transport,
+            crate::schema::McpTransport::Http
+        );
+
+        // The natural-key field itself is read-only via set_prop — the
+        // routing arm returns an explicit error pointing at
+        // config_map_key_rename rather than mutating `name` in place
+        // (which would silently re-key the entry and strand any
+        // in-flight references to the old key).
+        let err = config
+            .set_prop("mcp.servers.fs.name", "filesystem")
+            .expect_err("set_prop on the natural-key field must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("natural key")
+                && msg.contains("read-only")
+                && msg.contains("config_map_key_rename"),
+            "unexpected error message for read-only natural-key set: {msg}"
+        );
+
+        // Rename via the dedicated path. The element's `name` field
+        // changes in place; subsequent prop access uses the new key.
+        let renamed = config
+            .rename_map_key("mcp.servers", "fs", "filesystem")
+            .expect("rename should succeed when the new key is free");
+        assert!(renamed, "rename_map_key should report Ok(true) on success");
+        assert_eq!(config.mcp.servers[0].name, "filesystem");
+        assert_eq!(
+            config.get_prop("mcp.servers.filesystem.command").unwrap(),
+            "/usr/bin/mcp-fs"
+        );
+
+        // The old key no longer resolves — confirming the rename was
+        // not just an alias add.
+        assert!(
+            config.get_prop("mcp.servers.fs.command").is_err(),
+            "old natural key should stop resolving after rename"
+        );
+
+        // prop_fields enumerates the per-element fields under the
+        // current natural key, and filters out the natural-key field
+        // itself (no editable `name` row in the TUI).
+        let paths: Vec<String> = config
+            .prop_fields()
+            .into_iter()
+            .map(|f| f.name)
+            .filter(|n| n.starts_with("mcp.servers."))
+            .collect();
+        assert!(
+            paths.iter().any(|n| n == "mcp.servers.filesystem.command"),
+            "prop_fields should surface per-element child props; got: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|n| n == "mcp.servers.filesystem.name"),
+            "prop_fields must hide the natural-key field to keep it read-only; got: {paths:?}"
+        );
+
+        // delete_map_key by natural key removes the matching element.
+        let deleted = config
+            .delete_map_key("mcp.servers", "filesystem")
+            .expect("delete by natural key should resolve");
+        assert!(deleted);
+        assert!(config.mcp.servers.is_empty());
+    }
+
+    #[test]
+    async fn mcp_servers_create_map_key_is_idempotent_on_existing_natural_key() {
+        // Regression for the per-field editor contract: the rest of the
+        // natural-key surface (`get_prop` / `set_prop` / `rename_map_key`)
+        // treats duplicate natural keys as `VecRoute::Ambiguous` and
+        // refuses to mutate (see `mcp_servers_routing_is_ambiguous_on_
+        // duplicate_names`). If `create_map_key` always appended, a UI
+        // retry — or any caller that re-issued the same add after an
+        // uncertain RPC response — would drop `mcp.servers` into that
+        // invalid state and leave `mcp.servers.<name>.command` no longer
+        // routing until the operator hand-repaired the duplicate.
+        //
+        // The contract is the same as the `HashMap<String, T>` arm:
+        // re-adding an existing key is `Ok(false)` (idempotent no-op),
+        // not "append a second element that happens to share the key".
+        let mut config = Config::default();
+
+        let first = config
+            .create_map_key("mcp.servers", "fs")
+            .expect("first add should succeed");
+        assert!(first, "first add should report created=true");
+        assert_eq!(config.mcp.servers.len(), 1);
+        assert_eq!(config.mcp.servers[0].name, "fs");
+
+        // Seed an inner field so we can prove the existing entry's
+        // state is preserved across the no-op second add (rather than,
+        // say, the second call clobbering it with a default).
+        config
+            .set_prop("mcp.servers.fs.command", "/usr/bin/mcp-fs")
+            .expect("set_prop on the freshly-added entry should route");
+
+        // Repeat add for the same natural key. Must report Ok(false)
+        // and must not push a second element.
+        let second = config
+            .create_map_key("mcp.servers", "fs")
+            .expect("repeat add for an existing natural key must not error");
+        assert!(
+            !second,
+            "repeat add for an existing natural key should report created=false (idempotent)"
+        );
+        assert_eq!(
+            config.mcp.servers.len(),
+            1,
+            "repeat add must not append a duplicate; got {} entries",
+            config.mcp.servers.len()
+        );
+        assert_eq!(config.mcp.servers[0].name, "fs");
+
+        // The natural-key surface still routes — the duplicate was
+        // never created, so `set_prop` / `get_prop` are not in the
+        // `VecRoute::Ambiguous` state. The previously-set command
+        // round-trips and a new edit lands on the original entry.
+        assert_eq!(
+            config.get_prop("mcp.servers.fs.command").unwrap(),
+            "/usr/bin/mcp-fs",
+            "existing entry's state must survive the no-op second add"
+        );
+        config
+            .set_prop("mcp.servers.fs.command", "/usr/local/bin/mcp-fs")
+            .expect("set_prop must keep routing after the repeat add");
+        assert_eq!(config.mcp.servers[0].command, "/usr/local/bin/mcp-fs");
+
+        // A genuinely new key is still added: idempotency is per-key,
+        // not "first add wins everything".
+        let third = config
+            .create_map_key("mcp.servers", "github")
+            .expect("a distinct natural key should still be addable");
+        assert!(third, "distinct-key add should report created=true");
+        assert_eq!(config.mcp.servers.len(), 2);
+    }
+
+    #[test]
+    async fn mcp_servers_routing_is_ambiguous_on_duplicate_names() {
+        // `validate_mcp_config` rejects duplicate `name` at save time,
+        // but until the operator repairs the config the in-flight
+        // routing must refuse to silently mutate one of the duplicates.
+        // This is the schema-side anchor for that contract; the helper
+        // function's behaviour is unit-tested directly in
+        // `helpers::tests::route_vec_path_reports_ambiguous_duplicates`.
+        let mut config = Config::default();
+        config.mcp.servers.push(McpServerConfig {
+            name: "dupe".into(),
+            transport: McpTransport::Stdio,
+            command: "/a".into(),
+            ..Default::default()
+        });
+        config.mcp.servers.push(McpServerConfig {
+            name: "dupe".into(),
+            transport: McpTransport::Stdio,
+            command: "/b".into(),
+            ..Default::default()
+        });
+
+        let set_err = config
+            .set_prop("mcp.servers.dupe.command", "/c")
+            .expect_err("set_prop on a duplicated natural key must refuse");
+        assert!(
+            set_err.to_string().contains("ambiguous"),
+            "expected ambiguity error, got: {set_err}"
+        );
+
+        let get_err = config
+            .get_prop("mcp.servers.dupe.command")
+            .expect_err("get_prop on a duplicated natural key must refuse");
+        assert!(
+            get_err.to_string().contains("ambiguous"),
+            "expected ambiguity error, got: {get_err}"
+        );
+
+        // Neither side mutated the underlying state.
+        assert_eq!(config.mcp.servers[0].command, "/a");
+        assert_eq!(config.mcp.servers[1].command, "/b");
+
+        // rename_map_key likewise refuses, with an actionable message.
+        let rename_err = config
+            .rename_map_key("mcp.servers", "dupe", "ok")
+            .expect_err("rename of a duplicated natural key must refuse");
+        assert!(
+            rename_err.contains("ambiguous"),
+            "expected ambiguity error from rename, got: {rename_err}"
+        );
+    }
+
+    #[test]
+    async fn mcp_servers_rename_refuses_when_new_key_is_taken() {
+        let mut config = Config::default();
+        config.create_map_key("mcp.servers", "fs").unwrap();
+        config.create_map_key("mcp.servers", "github").unwrap();
+
+        let err = config
+            .rename_map_key("mcp.servers", "fs", "github")
+            .expect_err("rename should refuse when the target key already exists");
+        assert!(
+            err.contains("already exists"),
+            "expected target-collision error, got: {err}"
+        );
+
+        // State untouched.
+        assert_eq!(config.mcp.servers.len(), 2);
+        assert_eq!(config.mcp.servers[0].name, "fs");
+        assert_eq!(config.mcp.servers[1].name, "github");
+    }
+
+    #[test]
+    async fn mcp_servers_get_map_keys_lists_natural_keys_in_insertion_order() {
+        let mut config = Config::default();
+        config.create_map_key("mcp.servers", "a").unwrap();
+        config.create_map_key("mcp.servers", "b").unwrap();
+        config.create_map_key("mcp.servers", "c").unwrap();
+
+        let keys = config
+            .get_map_keys("mcp.servers")
+            .expect("mcp.servers must surface its natural keys via get_map_keys");
+        assert_eq!(
+            keys,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
     }
 
     #[test]

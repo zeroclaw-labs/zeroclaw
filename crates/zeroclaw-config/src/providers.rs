@@ -14,19 +14,19 @@ use super::schema::{
     GeminiCliModelProviderConfig, GeminiModelProviderConfig, GithubModelsModelProviderConfig,
     GlmModelProviderConfig, GroqModelProviderConfig, HuggingfaceModelProviderConfig,
     HunyuanModelProviderConfig, HyperbolicModelProviderConfig, InceptionModelProviderConfig,
-    KiloCliModelProviderConfig, LambdaAiModelProviderConfig, LeptonModelProviderConfig,
-    LitellmModelProviderConfig, LlamacppModelProviderConfig, LmstudioModelProviderConfig,
-    MinimaxModelProviderConfig, MistralModelProviderConfig, ModelProviderConfig,
-    MoonshotModelProviderConfig, MorphModelProviderConfig, NebiusModelProviderConfig,
-    NovitaModelProviderConfig, NscaleModelProviderConfig, NvidiaModelProviderConfig,
-    OllamaModelProviderConfig, OpenAIModelProviderConfig, OpenRouterModelProviderConfig,
-    OpencodeModelProviderConfig, OsaurusModelProviderConfig, OvhModelProviderConfig,
-    PerplexityModelProviderConfig, QianfanModelProviderConfig, QwenModelProviderConfig,
-    RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
-    SiliconflowModelProviderConfig, StepfunModelProviderConfig, SyntheticModelProviderConfig,
-    TelnyxModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
-    VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
-    XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    KiloCliModelProviderConfig, KiloModelProviderConfig, LambdaAiModelProviderConfig,
+    LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
+    LmstudioModelProviderConfig, MinimaxModelProviderConfig, MistralModelProviderConfig,
+    ModelProviderConfig, MoonshotModelProviderConfig, MorphModelProviderConfig,
+    NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
+    NvidiaModelProviderConfig, OllamaModelProviderConfig, OpenAIModelProviderConfig,
+    OpenRouterModelProviderConfig, OpencodeModelProviderConfig, OsaurusModelProviderConfig,
+    OvhModelProviderConfig, PerplexityModelProviderConfig, QianfanModelProviderConfig,
+    QwenModelProviderConfig, RekaModelProviderConfig, SambanovaModelProviderConfig,
+    SglangModelProviderConfig, SiliconflowModelProviderConfig, StepfunModelProviderConfig,
+    SyntheticModelProviderConfig, TelnyxModelProviderConfig, TogetherModelProviderConfig,
+    UpstageModelProviderConfig, VeniceModelProviderConfig, VercelModelProviderConfig,
+    VllmModelProviderConfig, XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
 };
 use super::schema::{
     AssemblyAiTranscriptionProviderConfig, DeepgramTranscriptionProviderConfig,
@@ -247,7 +247,9 @@ macro_rules! for_each_model_provider_slot {
             (lambda_ai, "lambda_ai", LambdaAiModelProviderConfig),
             (inception, "inception", InceptionModelProviderConfig),
             (synthetic, "synthetic", SyntheticModelProviderConfig),
-            (opencode, "opencode", OpencodeModelProviderConfig),            (kilocli, "kilocli", KiloCliModelProviderConfig),
+            (opencode, "opencode", OpencodeModelProviderConfig),
+            (kilocli, "kilocli", KiloCliModelProviderConfig),
+            (kilo, "kilo", KiloModelProviderConfig),
             (custom, "custom", CustomModelProviderConfig),
         }
     };
@@ -263,11 +265,11 @@ macro_rules! emit_model_providers_struct {
         /// extras visible at the type level).
         ///
         /// TOML shape is preserved byte-identical: each named field deserializes
-        /// from the same `[model_providers.<type>.<alias>]` block as before.
+        /// from the same `[providers.models.<type>.<alias>]` block as before.
         ///
         /// Adding a new model_provider family means: define the typed config in
-        /// `schema.rs`, then add one row to `for_each_model_provider_slot!` —
-        /// every helper picks up the new slot automatically.
+        /// `schema.rs`, then add one row to `for_each_model_provider_slot!`,
+        /// and every helper picks up the new slot automatically.
         #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
         #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
         #[prefix = "providers.models"]
@@ -445,6 +447,21 @@ impl ModelProviders {
         for_each_model_provider_slot!(emit_aliases)
     }
 
+    /// Canonical family slot names, straight from
+    /// `for_each_model_provider_slot!`. Use this to distinguish "unknown
+    /// family" from "known family, missing alias" in validation messages,
+    /// and to detect raw-TOML sections that deserialization silently drops.
+    #[must_use]
+    pub fn slot_names() -> &'static [&'static str] {
+        macro_rules! emit_slot_names {
+            ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
+                &[$($type_str),+]
+            };
+        }
+        const NAMES: &[&str] = for_each_model_provider_slot!(emit_slot_names);
+        NAMES
+    }
+
     /// Remove the entry for `<provider_type>.<alias>`, returning whether it
     /// existed. Returns `false` for unknown families.
     pub fn remove_alias(&mut self, family: &str, alias: &str) -> bool {
@@ -607,6 +624,15 @@ pub struct TranscriptionProviders {
     pub local_whisper: HashMap<String, LocalWhisperTranscriptionProviderConfig>,
 }
 
+pub enum TranscriptionProviderEntry<'a> {
+    Groq(&'a GroqTranscriptionProviderConfig),
+    OpenAi(&'a OpenAiTranscriptionProviderConfig),
+    Deepgram(&'a DeepgramTranscriptionProviderConfig),
+    AssemblyAi(&'a AssemblyAiTranscriptionProviderConfig),
+    Google(&'a GoogleTranscriptionProviderConfig),
+    LocalWhisper(&'a LocalWhisperTranscriptionProviderConfig),
+}
+
 impl TranscriptionProviders {
     /// True when no slot has any entry.
     pub fn is_empty(&self) -> bool {
@@ -640,6 +666,116 @@ impl TranscriptionProviders {
             out.push(("local_whisper", k.as_str()));
         }
         out.into_iter()
+    }
+
+    pub fn iter_entries(
+        &self,
+    ) -> Box<dyn Iterator<Item = (&'static str, &str, TranscriptionProviderEntry<'_>)> + '_> {
+        Box::new(
+            std::iter::empty()
+                .chain(self.groq.iter().map(|(alias, config)| {
+                    (
+                        "groq",
+                        alias.as_str(),
+                        TranscriptionProviderEntry::Groq(config),
+                    )
+                }))
+                .chain(self.openai.iter().map(|(alias, config)| {
+                    (
+                        "openai",
+                        alias.as_str(),
+                        TranscriptionProviderEntry::OpenAi(config),
+                    )
+                }))
+                .chain(self.deepgram.iter().map(|(alias, config)| {
+                    (
+                        "deepgram",
+                        alias.as_str(),
+                        TranscriptionProviderEntry::Deepgram(config),
+                    )
+                }))
+                .chain(self.assemblyai.iter().map(|(alias, config)| {
+                    (
+                        "assemblyai",
+                        alias.as_str(),
+                        TranscriptionProviderEntry::AssemblyAi(config),
+                    )
+                }))
+                .chain(self.google.iter().map(|(alias, config)| {
+                    (
+                        "google",
+                        alias.as_str(),
+                        TranscriptionProviderEntry::Google(config),
+                    )
+                }))
+                .chain(self.local_whisper.iter().map(|(alias, config)| {
+                    (
+                        "local_whisper",
+                        alias.as_str(),
+                        TranscriptionProviderEntry::LocalWhisper(config),
+                    )
+                })),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcription_iter_entries_walks_every_typed_slot() {
+        let mut providers = TranscriptionProviders::default();
+        providers
+            .groq
+            .insert("fast".into(), GroqTranscriptionProviderConfig::default());
+        providers.openai.insert(
+            "whisper".into(),
+            OpenAiTranscriptionProviderConfig::default(),
+        );
+        providers.deepgram.insert(
+            "nova".into(),
+            DeepgramTranscriptionProviderConfig::default(),
+        );
+        providers.assemblyai.insert(
+            "default".into(),
+            AssemblyAiTranscriptionProviderConfig::default(),
+        );
+        providers.google.insert(
+            "speech".into(),
+            GoogleTranscriptionProviderConfig::default(),
+        );
+        providers.local_whisper.insert(
+            "lan".into(),
+            LocalWhisperTranscriptionProviderConfig::default(),
+        );
+
+        let entries: Vec<(&str, String, &str)> = providers
+            .iter_entries()
+            .map(|(family, alias, entry)| {
+                let variant = match entry {
+                    TranscriptionProviderEntry::Groq(_) => "groq",
+                    TranscriptionProviderEntry::OpenAi(_) => "openai",
+                    TranscriptionProviderEntry::Deepgram(_) => "deepgram",
+                    TranscriptionProviderEntry::AssemblyAi(_) => "assemblyai",
+                    TranscriptionProviderEntry::Google(_) => "google",
+                    TranscriptionProviderEntry::LocalWhisper(_) => "local_whisper",
+                };
+                (family, alias.to_string(), variant)
+            })
+            .collect();
+
+        assert_eq!(
+            entries,
+            vec![
+                ("groq", "fast".into(), "groq"),
+                ("openai", "whisper".into(), "openai"),
+                ("deepgram", "nova".into(), "deepgram"),
+                ("assemblyai", "default".into(), "assemblyai"),
+                ("google", "speech".into(), "google"),
+                ("local_whisper", "lan".into(), "local_whisper"),
+            ]
+        );
     }
 }
 
@@ -787,6 +923,36 @@ macro_rules! for_each_transcription_provider_slot {
             (local_whisper, "local_whisper"),
         }
     };
+}
+
+/// Collect the `$type_str` names out of a rate-typed slot macro
+/// (`for_each_tts_provider_slot!` / `for_each_transcription_provider_slot!`).
+/// The `$rate_ty` head is consumed and ignored; the macro exists so
+/// `slot_names()` derives from the same source the structs are built from.
+macro_rules! collect_rate_slot_names {
+    ($rate_ty:ty, $(($field:ident, $type_str:literal)),+ $(,)?) => {
+        &[$($type_str),+]
+    };
+}
+
+impl TtsProviders {
+    /// Canonical TTS family slot names, derived from
+    /// `for_each_tts_provider_slot!`.
+    #[must_use]
+    pub fn slot_names() -> &'static [&'static str] {
+        const NAMES: &[&str] = for_each_tts_provider_slot!(collect_rate_slot_names, ());
+        NAMES
+    }
+}
+
+impl TranscriptionProviders {
+    /// Canonical transcription family slot names, derived from
+    /// `for_each_transcription_provider_slot!`.
+    #[must_use]
+    pub fn slot_names() -> &'static [&'static str] {
+        const NAMES: &[&str] = for_each_transcription_provider_slot!(collect_rate_slot_names, ());
+        NAMES
+    }
 }
 
 /// Emit a `<Family>CostRatesByProvider` struct from a slot list. Used

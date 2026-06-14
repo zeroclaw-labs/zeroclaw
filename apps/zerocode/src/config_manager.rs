@@ -27,6 +27,11 @@ use crate::theme;
 
 pub(crate) type Term = Terminal<CrosstermBackend<Stdout>>;
 
+fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        | KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+}
+
 pub(crate) fn init_terminal() -> Result<Term> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -44,7 +49,7 @@ pub(crate) fn init_terminal() -> Result<Term> {
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
         let _ = execute!(
             stdout,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+            PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
         );
     }
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
@@ -336,6 +341,42 @@ impl App {
         if !self.sections.is_empty() {
             self.load_section_content(self.section_cursor).await?;
         }
+        Ok(())
+    }
+
+    pub(crate) async fn open_agent_config(&mut self, alias: &str) -> Result<()> {
+        self.section = ConfigSection::Zeroclaw;
+        self.zeroclaw_pane = ZeroclawPane::Detail;
+        self.deactivate_filter();
+
+        let Some(section_idx) = self.sections.iter().position(|s| s.key == "agents") else {
+            return Ok(());
+        };
+
+        self.section_cursor = section_idx;
+        self.loaded_section = Some(section_idx);
+        self.load_aliases("agents").await?;
+
+        let Some(alias_idx) = self.aliases.iter().position(|a| a == alias) else {
+            self.alias_cursor = 0;
+            self.screen = Screen::AliasList {
+                section_idx,
+                map_path: "agents".to_string(),
+                breadcrumb: vec!["agents".to_string()],
+            };
+            self.status_msg = None;
+            return Ok(());
+        };
+
+        self.alias_cursor = alias_idx;
+        let prefix = format!("agents.{alias}");
+        self.load_fields(&prefix).await?;
+        self.screen = Screen::FieldList {
+            section_idx,
+            prefix,
+            breadcrumb: vec!["agents".to_string(), alias.to_string()],
+        };
+        self.status_msg = None;
         Ok(())
     }
 
@@ -3954,7 +3995,7 @@ fn edit_in_external_editor(
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
         let _ = execute!(
             term.backend_mut(),
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+            PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
         );
     }
     // Force a full redraw so ratatui repaints everything.
@@ -3975,5 +4016,19 @@ fn edit_in_external_editor(
             let _ = std::fs::remove_file(&tmp_path);
             Err(format!("failed to launch {editor}: {e}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyboard_enhancement_flags_disambiguate_modified_enter() {
+        assert!(
+            keyboard_enhancement_flags()
+                .contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+            "Shift+Enter reaches crossterm as plain Enter on common terminals unless keyboard enhancement asks for modified-key disambiguation"
+        );
     }
 }

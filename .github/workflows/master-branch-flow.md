@@ -7,7 +7,7 @@ Use with:
 - [`docs/book/src/maintainers/ci-and-actions.md`](../../docs/book/src/maintainers/ci-and-actions.md)
 - [`docs/book/src/maintainers/release-runbook.md`](../../docs/book/src/maintainers/release-runbook.md)
 
-Last updated: **May 2026** (post-v0.7.4 cleanup).
+Last updated: **June 2026** (merge queue enabled on `master`).
 
 ---
 
@@ -24,7 +24,7 @@ Maintainers with merge authority: `JordanTheJet`, `singlerider`, `Audacity88`, `
 
 | File | Trigger | Purpose |
 |---|---|---|
-| `ci.yml` | `pull_request` → `master` | Lint + test + build on every PR |
+| `ci.yml` | `pull_request` → `master`; `push` → `master`; `merge_group` | Lint + test + build on PRs, merge-queue batches, and trusted post-merge cache-warming runs |
 | `release-stable-manual.yml` | `workflow_dispatch`, tag push `v*` | Stable release (manual, version-gated) |
 | `cross-platform-build-manual.yml` | `workflow_dispatch` | Full platform build matrix (manual smoke check) |
 | `pr-path-labeler.yml` | `pull_request` lifecycle | Automatic path-based PR labeling |
@@ -36,12 +36,15 @@ Maintainers with merge authority: `JordanTheJet`, `singlerider`, `Audacity88`, `
 | Event | What runs |
 |---|---|
 | PR opened or updated against `master` | `ci.yml` (full lint + test + build) |
+| PR added to the merge queue (`merge_group`) | `ci.yml` runs the full gate on a temporary `gh-readonly-queue/master/…` branch that stacks the base + earlier queue entries + this PR |
+| Push to `master` | `ci.yml` (post-merge quality signal + trusted Rust cache warming) |
 | Manual dispatch | `cross-platform-build-manual.yml` or `release-stable-manual.yml` |
 | Tag push `vX.Y.Z` | `release-stable-manual.yml` (full release pipeline) |
 
-There is no automatic CI run on push to master and no automatic release on
-merge. Releases are always intentional — either a manual dispatch or a
-deliberate tag push.
+There is no automatic release on merge. `ci.yml` does run after trusted
+`master` pushes so post-merge Quality Gate runs can seed Rust caches for later
+PRs, but releases remain intentional — either a manual dispatch or a deliberate
+tag push.
 
 ---
 
@@ -62,8 +65,15 @@ deliberate tag push.
    - `test` — `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on `ubuntu-latest`.
    - `security` — `cargo deny check`.
    - `CI Required Gate` — composite job; branch protection requires this.
-3. Maintainer reviews and merges once the gate is green and review policy is
-   satisfied.
+3. Maintainer reviews. Once the gate is green and review policy is satisfied,
+   they click **Merge when ready** to add the PR to the merge queue rather than
+   merging directly.
+4. The merge queue builds a temporary `gh-readonly-queue/master/…` branch
+   stacking `master` + any earlier queued PRs + this PR, and re-runs `ci.yml`
+   (the `merge_group` event) against it. The PR lands only when
+   `CI Required Gate` is green on that combined branch; if it fails, the PR is
+   ejected from the queue and the author is notified, while PRs ahead of it
+   continue unaffected.
 
 ### 2) Stable Release (manual)
 
@@ -118,7 +128,10 @@ flowchart TD
   L --> SEC["security\ncargo deny check"]
   T & BLD & CHK & C32 & BCH & SEC --> G["CI Required Gate"]
   G -->|red| D["PR stays open"]
-  G -->|green| R["Maintainer merges"]
+  G -->|green| Q["Maintainer: Merge when ready → merge queue"]
+  Q --> MG["merge_group: ci.yml on\ngh-readonly-queue/master/…"]
+  MG -->|red| E["PR ejected from queue\nauthor notified"]
+  MG -->|green| R["PR lands on master"]
 ```
 
 ### Stable release
