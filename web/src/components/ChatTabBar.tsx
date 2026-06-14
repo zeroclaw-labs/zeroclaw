@@ -107,7 +107,7 @@ export function ChatTabBar({
   const availableToOpen = allAgents.filter((a) => !openChats.includes(a));
 
   return (
-    <div className="flex items-stretch border-b border-pc-border bg-pc-surface">
+    <div className="relative z-20 flex items-stretch border-b border-pc-border bg-pc-surface">
       <div
         role="tablist"
         aria-label={t('workspace.tablist_label')}
@@ -163,9 +163,12 @@ export function ChatTabBar({
             </button>
           );
         })}
+      </div>
 
-        {/* Agent picker */}
-        <div className="relative flex items-center" ref={pickerRef}>
+      {/* Agent picker — sibling of the scrolling tablist (NOT inside it):
+          overflow-x-auto on the tablist clips the y-axis too, which would hide
+          this dropdown. */}
+      <div className="relative flex items-center px-1" ref={pickerRef}>
           <button
             type="button"
             onClick={openPicker}
@@ -182,7 +185,7 @@ export function ChatTabBar({
             <div
               role="menu"
               aria-label={t('workspace.open_chat')}
-              className="absolute left-0 top-full mt-1.5 z-50 min-w-[200px] max-h-72 overflow-y-auto rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated py-1 shadow-[var(--pc-shadow-md)]"
+              className="absolute right-0 top-full mt-1.5 z-50 min-w-[200px] max-h-72 overflow-y-auto rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated py-1 shadow-[var(--pc-shadow-md)]"
             >
               {pickerLoading && (
                 <div className="flex items-center gap-2 px-3 py-2 text-xs text-pc-text-muted">
@@ -211,8 +214,6 @@ export function ChatTabBar({
             </div>
           )}
         </div>
-      </div>
-
       {/* Layout toggle */}
       <div className="flex items-center px-2 border-l border-pc-border">
         <Button
