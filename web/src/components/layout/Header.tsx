@@ -1,32 +1,54 @@
 import { useState, useRef, useEffect } from 'react';
 import { useLocation } from 'react-router-dom';
-import { LogOut, Settings, ChevronDown, PanelLeftClose, PanelLeftOpen, Menu, Globe } from 'lucide-react';
+import { LogOut, Settings, ChevronDown, PanelLeftClose, PanelLeftOpen, Menu, Globe, Search } from 'lucide-react';
 import { t, SUPPORTED_LOCALES } from '@/lib/i18n';
 import { useLocaleContext } from '@/App';
 import { useAuth } from '@/hooks/useAuth';
 import { SettingsModal } from '@/components/SettingsModal';
 
-const routeTitles: Record<string, string> = {
+// Exact-path titles. The dashboard ('/') must stay exact so it doesn't
+// swallow every other route as a prefix.
+const exactRouteTitles: Record<string, string> = {
   '/': 'nav.dashboard',
-  '/agent': 'nav.agent',
-  '/tools': 'nav.tools',
-  '/cron': 'nav.cron',
-  '/integrations': 'nav.integrations',
-  '/config': 'nav.config',
-  '/logs': 'nav.logs',
-  '/doctor': 'nav.doctor',
-  '/canvas': 'nav.canvas',
-  '/acp-console': 'nav.acp',
-  '/quickstart': 'nav.quickstart',
 };
+
+// Section titles keyed by the first path segment. Resolving by the matched
+// section (not the literal pathname) means nested routes like /config/agents,
+// /agent/:alias, or /agents all surface a correct <h1> instead of an empty one.
+const sectionTitles: Record<string, string> = {
+  agent: 'nav.agent',
+  agents: 'nav.agents',
+  tools: 'nav.tools',
+  cron: 'nav.cron',
+  integrations: 'nav.integrations',
+  config: 'nav.config',
+  setup: 'nav.config',
+  memory: 'nav.memory',
+  logs: 'nav.logs',
+  doctor: 'nav.doctor',
+  pairing: 'nav.doctor',
+  canvas: 'nav.canvas',
+  'acp-console': 'nav.acp',
+  quickstart: 'nav.quickstart',
+};
+
+// Derive the i18n title key from the matched route/section so every page —
+// including nested config routes — renders a non-empty heading. Unknown routes
+// fall back to an empty title rather than mislabeling them.
+function titleKeyFor(pathname: string): string | undefined {
+  if (exactRouteTitles[pathname]) return exactRouteTitles[pathname];
+  const section = pathname.split('/').filter(Boolean)[0];
+  return section ? sectionTitles[section] : undefined;
+}
 
 interface HeaderProps {
   onMenuToggle: () => void;
   onCollapseToggle: () => void;
   collapsed: boolean;
+  onOpenPalette: () => void;
 }
 
-export default function Header({ onMenuToggle, onCollapseToggle, collapsed }: HeaderProps) {
+export default function Header({ onMenuToggle, onCollapseToggle, collapsed, onOpenPalette }: HeaderProps) {
   const location = useLocation();
   const { logout } = useAuth();
   const { locale, setAppLocale } = useLocaleContext();
@@ -37,7 +59,7 @@ export default function Header({ onMenuToggle, onCollapseToggle, collapsed }: He
   // Fall back to a plain title for unknown routes rather than mislabeling
   // them as "Dashboard" — e.g. early /quickstart hits before the entry was
   // mapped here showed "Dashboard" for the first-run flow.
-  const titleKey = routeTitles[location.pathname];
+  const titleKey = titleKeyFor(location.pathname);
   const pageTitle = titleKey ? t(titleKey) : '';
 
   const handleLogout = () => {
@@ -93,6 +115,32 @@ export default function Header({ onMenuToggle, onCollapseToggle, collapsed }: He
 
         {/* Right-side controls */}
         <div className="flex items-center gap-2 h-9">
+          {/* Command-palette trigger — styled like a search field. Opens the
+              palette; the same action is bound globally to ⌘K / Ctrl+K, shown
+              as a hint chip on the right. */}
+          <button
+            type="button"
+            onClick={onOpenPalette}
+            className="hidden sm:flex h-9 items-center gap-2 rounded-[var(--radius-md)] border border-pc-border bg-pc-input pl-2.5 pr-2 text-sm text-pc-text-muted transition-colors hover:border-pc-border-strong hover:text-pc-text-secondary hover:bg-[var(--pc-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-surface"
+            aria-label={t('nav.cmdk.placeholder')}
+          >
+            <Search className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+            <span className="hidden md:inline w-32 text-left">{t('nav.cmdk.placeholder')}</span>
+            <kbd className="ml-1 flex items-center gap-0.5 rounded-[var(--radius-sm)] border border-pc-border bg-pc-elevated px-1.5 py-0.5 text-[11px] font-mono text-pc-text-faint">
+              <span className="text-[13px] leading-none">⌘</span>K
+            </kbd>
+          </button>
+
+          {/* Command-palette trigger — compact icon-only on the smallest screens. */}
+          <button
+            type="button"
+            onClick={onOpenPalette}
+            className="sm:hidden h-9 w-9 flex items-center justify-center rounded-[var(--radius-md)] text-pc-text-muted transition-colors hover:text-pc-text hover:bg-[var(--pc-hover)]"
+            aria-label={t('nav.cmdk.placeholder')}
+          >
+            <Search className="h-3.5 w-3.5" />
+          </button>
+
           {/* Settings */}
           <button
             type="button"

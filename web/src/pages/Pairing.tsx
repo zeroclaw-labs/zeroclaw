@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Smartphone, Trash2 } from 'lucide-react';
+import { Smartphone, Trash2, X } from 'lucide-react';
 import { getAdminPairCode } from '@/lib/api';
+import { Button, Card, PageHeader } from '@/components/ui';
 import { t } from '@/lib/i18n';
 
 interface Device {
@@ -87,93 +88,112 @@ export default function Pairing() {
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="h-8 w-8 border-2 rounded-full animate-spin" style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }} />
+        <div className="h-8 w-8 border-2 rounded-full animate-spin border-pc-border border-t-pc-accent" />
       </div>
     );
   }
 
   return (
-    <div className="p-6 space-y-6 animate-fade-in">
-      <div className="flex items-center justify-between">
-        <h2 className="text-sm font-semibold uppercase tracking-wider" style={{ color: 'var(--pc-text-primary)' }}>
-          {t('pairing.title')}
-        </h2>
-        <button
-          onClick={handleInitiatePairing}
-          className="btn-electric flex items-center gap-2 text-sm px-4 py-2"
-        >
-          <Smartphone className="h-4 w-4" />
-          {t('pairing.pair_new_device')}
-        </button>
-      </div>
+    <div className="p-6 space-y-6">
+      <PageHeader
+        title={t('pairing.title')}
+        actions={
+          <Button onClick={handleInitiatePairing}>
+            <Smartphone className="h-4 w-4" />
+            {t('pairing.pair_new_device')}
+          </Button>
+        }
+      />
 
       {error && (
-        <div className="rounded-xl border p-3 text-sm animate-fade-in" style={{ background: 'var(--color-status-error-alpha-08)', borderColor: 'var(--color-status-error-alpha-20)', color: 'var(--color-status-error)' }}>
-          {error}
-          <button onClick={() => setError(null)} className="ml-2 font-bold">×</button>
-        </div>
+        <Card className="flex items-start gap-2 text-sm border-status-error/25 bg-status-error/10 text-status-error">
+          <span className="flex-1">{error}</span>
+          <button
+            type="button"
+            onClick={() => setError(null)}
+            className="flex-shrink-0 text-status-error/70 hover:text-status-error transition-colors"
+            aria-label="Dismiss"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </Card>
       )}
 
       {pairingCode && (
-        <div className="card p-6 text-center rounded-2xl">
-          <p className="text-xs uppercase tracking-wider mb-2" style={{ color: 'var(--pc-text-muted)' }}>{t('pairing.pairing_code')}</p>
-          <div className="text-4xl font-mono font-bold tracking-[0.4em] py-4" style={{ color: 'var(--pc-text-primary)' }}>
+        <Card className="p-6 text-center">
+          <p className="text-xs uppercase tracking-wider mb-2 text-pc-text-muted">
+            {t('pairing.pairing_code')}
+          </p>
+          <div className="text-4xl font-mono font-bold tracking-[0.4em] py-4 text-pc-text">
             {pairingCode}
           </div>
-          <p className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>{t('pairing.code_hint')}</p>
-        </div>
+          <p className="text-xs text-pc-text-muted">{t('pairing.code_hint')}</p>
+        </Card>
       )}
 
-      <div className="card rounded-2xl overflow-hidden">
-        <div className="px-5 py-4 border-b" style={{ borderColor: 'var(--pc-border)' }}>
-          <h3 className="text-sm font-semibold" style={{ color: 'var(--pc-text-primary)' }}>
+      <Card padded={false} className="overflow-hidden">
+        <div className="px-5 py-4 border-b border-pc-border">
+          <h3 className="text-sm font-semibold text-pc-text">
             {t('pairing.paired_devices')} ({devices.length})
           </h3>
         </div>
         {devices.length === 0 ? (
-          <div className="p-8 text-center" style={{ color: 'var(--pc-text-muted)' }}>
+          <div className="p-8 text-center text-sm text-pc-text-muted">
             {t('pairing.no_devices')}
           </div>
         ) : (
-          <table className="table-electric">
-            <thead>
-              <tr>
-                <th>{t('pairing.name')}</th>
-                <th>{t('pairing.type')}</th>
-                <th>{t('pairing.paired')}</th>
-                <th>{t('pairing.last_seen')}</th>
-                <th>IP</th>
-                <th className="text-right">{t('pairing.actions')}</th>
-              </tr>
-            </thead>
-            <tbody>
-              {devices.map((device) => (
-                <tr key={device.id}>
-                  <td style={{ color: 'var(--pc-text-primary)' }}>{device.name || 'Unnamed'}</td>
-                  <td style={{ color: 'var(--pc-text-secondary)' }}>{device.device_type || 'Unknown'}</td>
-                  <td className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
-                    {new Date(device.paired_at).toLocaleDateString()}
-                  </td>
-                  <td className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
-                    {new Date(device.last_seen).toLocaleString()}
-                  </td>
-                  <td className="font-mono text-xs" style={{ color: 'var(--pc-text-secondary)' }}>
-                    {device.ip_address || '-'}
-                  </td>
-                  <td className="text-right">
-                    <button
-                      onClick={() => handleRevokeDevice(device.id)}
-                      className="btn-icon"
-                    >
-                      <Trash2 className="h-4 w-4" />
-                    </button>
-                  </td>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-pc-border text-left text-xs uppercase tracking-wider text-pc-text-muted">
+                  <th className="px-5 py-3 font-medium">{t('pairing.name')}</th>
+                  <th className="px-5 py-3 font-medium">{t('pairing.type')}</th>
+                  <th className="px-5 py-3 font-medium">{t('pairing.paired')}</th>
+                  <th className="px-5 py-3 font-medium">{t('pairing.last_seen')}</th>
+                  <th className="px-5 py-3 font-medium">IP</th>
+                  <th className="px-5 py-3 font-medium text-right">
+                    {t('pairing.actions')}
+                  </th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody className="divide-y divide-pc-border">
+                {devices.map((device) => (
+                  <tr
+                    key={device.id}
+                    className="transition-colors hover:bg-pc-elevated/50"
+                  >
+                    <td className="px-5 py-3 text-pc-text">
+                      {device.name || 'Unnamed'}
+                    </td>
+                    <td className="px-5 py-3 text-pc-text-secondary">
+                      {device.device_type || 'Unknown'}
+                    </td>
+                    <td className="px-5 py-3 text-xs text-pc-text-muted">
+                      {new Date(device.paired_at).toLocaleDateString()}
+                    </td>
+                    <td className="px-5 py-3 text-xs text-pc-text-muted">
+                      {new Date(device.last_seen).toLocaleString()}
+                    </td>
+                    <td className="px-5 py-3 font-mono text-xs text-pc-text-secondary">
+                      {device.ip_address || '-'}
+                    </td>
+                    <td className="px-5 py-3 text-right">
+                      <Button
+                        variant="danger"
+                        size="sm"
+                        onClick={() => handleRevokeDevice(device.id)}
+                        aria-label={t('pairing.actions')}
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
-      </div>
+      </Card>
     </div>
   );
 }

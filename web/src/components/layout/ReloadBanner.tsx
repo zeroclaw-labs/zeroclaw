@@ -66,21 +66,9 @@ export default function ReloadBanner() {
   const isQuickstart = location.pathname.startsWith('/quickstart');
   if (isQuickstart && pendingReload && driftedCount === 0) {
     return (
-      <div
-        className="px-4 py-3 border-b flex items-start gap-3"
-        style={{
-          background: 'rgba(14, 165, 233, 0.06)',
-          borderColor: 'rgba(14, 165, 233, 0.2)',
-        }}
-      >
-        <AlertTriangle
-          className="h-4 w-4 flex-shrink-0 mt-0.5"
-          style={{ color: 'var(--pc-accent)' }}
-        />
-        <p
-          className="text-sm font-medium"
-          style={{ color: 'var(--pc-text-primary)' }}
-        >
+      <div className="px-4 py-3 border-b border-status-info/20 bg-status-info/[0.06] flex items-start gap-3">
+        <AlertTriangle className="h-4 w-4 flex-shrink-0 mt-0.5 text-status-info" />
+        <p className="text-sm font-medium text-pc-text">
           Changes saved. Continue setup.
         </p>
       </div>
@@ -98,22 +86,10 @@ export default function ReloadBanner() {
   }
 
   return (
-    <div
-      className="px-4 py-3 border-b flex items-center gap-3"
-      style={{
-        background: 'rgba(245, 180, 0, 0.06)',
-        borderColor: 'rgba(245, 180, 0, 0.25)',
-      }}
-    >
-      <AlertTriangle
-        className="h-4 w-4 flex-shrink-0 mt-0.5"
-        style={{ color: 'var(--color-status-warning, #f5b400)' }}
-      />
+    <div className="px-4 py-3 border-b border-status-warning/25 bg-status-warning/[0.06] flex items-center gap-3">
+      <AlertTriangle className="h-4 w-4 flex-shrink-0 mt-0.5 text-status-warning" />
       <div className="flex-1 min-w-0">
-        <p
-          className="text-sm font-medium"
-          style={{ color: 'var(--pc-text-primary)' }}
-        >
+        <p className="text-sm font-medium text-pc-text">
           {pendingReload && driftedCount > 0
             ? 'Config changed this session and on-disk drift detected'
             : pendingReload
@@ -121,15 +97,12 @@ export default function ReloadBanner() {
               : `${driftedCount} path${driftedCount === 1 ? '' : 's'} differ from on-disk`}
         </p>
         {driftedCount > 0 && (
-          <ul
-            className="text-xs mt-1 flex flex-col gap-0.5"
-            style={{ color: 'var(--pc-text-muted)' }}
-          >
+          <ul className="text-xs mt-1 flex flex-col gap-0.5 text-pc-text-muted">
             {drifted.slice(0, 4).map((d) => (
               <li key={d.path} className="font-mono break-all">
                 {d.path}
                 {d.secret && (
-                  <span style={{ color: 'var(--pc-text-faint)' }}>
+                  <span className="text-pc-text-faint">
                     {' '}
                     (secret)
                   </span>
@@ -137,7 +110,7 @@ export default function ReloadBanner() {
               </li>
             ))}
             {driftedCount > 4 && (
-              <li style={{ color: 'var(--pc-text-faint)' }}>
+              <li className="text-pc-text-faint">
                 …and {driftedCount - 4} more
               </li>
             )}
@@ -150,8 +123,7 @@ export default function ReloadBanner() {
         onClick={() => setDismissedSig(sig)}
         aria-label="Dismiss"
         title="Dismiss"
-        className="flex-shrink-0 p-1 rounded transition-colors hover:opacity-80"
-        style={{ color: 'var(--pc-text-muted)' }}
+        className="flex-shrink-0 p-1 rounded-[var(--radius-sm)] text-pc-text-muted transition-colors hover:bg-[var(--pc-hover)] hover:text-pc-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base"
       >
         <X className="h-4 w-4" />
       </button>

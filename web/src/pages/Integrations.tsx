@@ -3,6 +3,8 @@ import { Puzzle, Check, Zap } from 'lucide-react';
 import type { Integration } from '@/types/api';
 import { getIntegrations } from '@/lib/api';
 import { t } from '@/lib/i18n';
+import { Badge, Card, PageHeader } from '@/components/ui';
+import type { BadgeTone } from '@/components/ui';
 
 function statusBadge(status: Integration['status']) {
   switch (status) {
@@ -10,17 +12,13 @@ function statusBadge(status: Integration['status']) {
       return {
         icon: Check,
         label: t('integrations.status_active'),
-        color: 'var(--color-status-success)',
-        border: 'rgba(0, 230, 138, 0.2)',
-        bg: 'rgba(0, 230, 138, 0.06)'
+        tone: 'ok' as BadgeTone,
       };
     case 'Available':
       return {
         icon: Zap,
         label: t('integrations.status_available'),
-        color: 'var(--pc-accent)',
-        border: 'var(--pc-accent-dim)',
-        bg: 'var(--pc-accent-glow)'
+        tone: 'neutral' as BadgeTone,
       };
   }
 }
@@ -53,87 +51,84 @@ export default function Integrations() {
 
   if (error) {
     return (
-    <div className="p-6 animate-fade-in">
-      <div className="rounded-2xl border p-4" style={{ background: 'var(--color-status-error-alpha-08)', borderColor: 'var(--color-status-error-alpha-20)', color: 'var(--color-status-error)' }}>
-        {t('integrations.load_error')}: {error}
+      <div className="p-6">
+        <div className="rounded-[var(--radius-md)] border border-status-error/25 bg-status-error/10 p-4 text-sm text-status-error">
+          {t('integrations.load_error')}: {error}
+        </div>
       </div>
-    </div>
-  );
+    );
   }
 
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="h-8 w-8 border-2 rounded-full animate-spin" style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }} />
+        <div className="h-8 w-8 border-2 rounded-full animate-spin border-pc-border" style={{ borderTopColor: 'var(--pc-accent)' }} />
       </div>
     );
   }
 
   return (
-    <div className="p-6 space-y-6 animate-fade-in">
-      <div className="flex items-center gap-2">
-        <Puzzle className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
-        <h2 className="text-sm font-semibold uppercase tracking-wider" style={{ color: 'var(--pc-text-primary)' }}>
-          {t('integrations.title')} ({integrations.length})
-        </h2>
-      </div>
+    <div className="p-6 space-y-6">
+      <PageHeader
+        title={t('integrations.title')}
+        actions={<Badge tone="neutral">{integrations.length}</Badge>}
+      />
 
       {/* Category Filter Tabs */}
       <div className="flex flex-wrap gap-2">
-        {categories.map((cat) => (
-          <button
-            key={cat}
-            onClick={() => setActiveCategory(cat)}
-            className="px-3.5 py-1.5 rounded-xl text-xs font-semibold transition-all capitalize"
-            style={activeCategory === cat
-              ? { background: 'var(--pc-accent)', color: 'white' }
-              : { color: 'var(--pc-text-muted)', border: '1px solid var(--pc-border)', background: 'transparent' }
-            }
-          >
-            {cat}
-          </button>
-        ))}
+        {categories.map((cat) => {
+          const active = activeCategory === cat;
+          return (
+            <button
+              key={cat}
+              type="button"
+              onClick={() => setActiveCategory(cat)}
+              className={[
+                'px-3 h-7 inline-flex items-center rounded-[var(--radius-md)] text-[13px] font-medium capitalize transition-colors cursor-pointer border',
+                active
+                  ? 'bg-pc-accent border-transparent text-[#0b1220]'
+                  : 'bg-transparent border-pc-border text-pc-text-secondary hover:bg-[var(--pc-hover)] hover:text-pc-text hover:border-pc-border-strong',
+              ].join(' ')}
+            >
+              {cat}
+            </button>
+          );
+        })}
       </div>
 
       {/* Grouped Integration Cards */}
       {Object.keys(grouped).length === 0 ? (
-        <div className="card p-8 text-center">
-          <Puzzle className="h-10 w-10 mx-auto mb-3" style={{ color: 'var(--pc-text-faint)' }} />
-          <p style={{ color: 'var(--pc-text-muted)' }}>{t('integrations.empty')}</p>
-        </div>
+        <Card className="p-10 text-center">
+          <Puzzle className="h-10 w-10 mx-auto mb-3 text-pc-text-faint" />
+          <p className="text-sm text-pc-text-muted">{t('integrations.empty')}</p>
+        </Card>
       ) : (
         Object.entries(grouped).sort(([a], [b]) => a.localeCompare(b)).map(([category, items]) => (
           <div key={category}>
-            <h3 className="text-[10px] font-semibold uppercase tracking-wider mb-3 capitalize" style={{ color: 'var(--pc-text-faint)' }}>
+            <h3 className="text-[11px] font-medium uppercase tracking-wider mb-3 capitalize text-pc-text-faint">
               {category}
             </h3>
-            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 stagger-children">
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
               {items.map((integration) => {
                 const badge = statusBadge(integration.status);
                 const BadgeIcon = badge.icon;
                 return (
-                  <div
-                    key={integration.name}
-                    className="card p-5 animate-slide-in-up"
-                  >
+                  <Card key={integration.name} className="p-5">
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
-                        <h4 className="text-sm font-semibold truncate" style={{ color: 'var(--pc-text-primary)' }}>
+                        <h4 className="text-sm font-medium truncate text-pc-text">
                           {integration.name}
                         </h4>
-                        <p className="text-sm mt-1 line-clamp-2" style={{ color: 'var(--pc-text-muted)' }}>
+                        <p className="text-sm mt-1 line-clamp-2 text-pc-text-muted">
                           {integration.description}
                         </p>
                       </div>
-                      <span
-                        className="flex-shrink-0 inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-semibold border"
-                        style={badge}
-                      >
+                      <Badge tone={badge.tone} className="flex-shrink-0">
                         <BadgeIcon className="h-3 w-3" />
                         {badge.label}
-                      </span>
+                      </Badge>
                     </div>
-                  </div>
+                  </Card>
                 );
               })}
             </div>

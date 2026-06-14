@@ -30,12 +30,17 @@ import {
   ExternalLink,
   FolderOpen,
   List as ListIcon,
+  MessageSquarePlus,
   Plus,
   Save,
   Trash2,
   Type as TypeIcon,
+  X,
 } from "lucide-react";
 import DirectoryPicker from "./DirectoryPicker";
+import { Badge, Button } from "@/components/ui";
+import type { BadgeTone } from "@/components/ui";
+import { t } from "@/lib/i18n";
 import {
   ApiError,
   descriptionForPath,
@@ -181,6 +186,22 @@ function fieldShortLabel(entry: ListResponseEntry): string {
   return entry.path.split(".").pop()!.replace(/[-_]/g, " ");
 }
 
+// Humanize the schema-provided dotted path's LAST segment into a Title-ish
+// label (de-kebab/de-snake, capitalize words). Purely a presentation transform
+// of the schema's own path — no hardcoded field names — so the config renderer
+// stays schema-driven (#6175). The dotted path itself remains visible as a
+// secondary line for unambiguous identification.
+function humanizeFieldLabel(path: string): string {
+  const leaf = path.split(".").pop() ?? path;
+  return leaf
+    .replace(/[-_]/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
+}
+
 function setupFieldPriority(entry: ListResponseEntry): number {
   const leaf = entry.path.split(".").pop() ?? "";
   if (/^providers\.models\.[^.]+\.[^.]+\./.test(entry.path)) {
@@ -256,6 +277,17 @@ function setupRequirement(
   if (entry.path === "memory.backend")
     return { label: "Recommended", tone: "choice" };
   return null;
+}
+
+// Map the schema-derived requirement tone to a calm Badge tone. The label
+// text is whatever `setupRequirement` produced from the schema path — only
+// the tint is chosen here, so nothing is hardcoded.
+function requirementBadgeTone(
+  tone: "required" | "choice" | "optional",
+): BadgeTone {
+  if (tone === "required") return "warn";
+  if (tone === "choice") return "neutral";
+  return "neutral";
 }
 
 function isLocalModelProviderPath(path: string): boolean {
@@ -985,15 +1017,16 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
                   </span>
                 )}
               </div>
-              <button
-                type="button"
+              <Button
+                variant="primary"
+                size="md"
                 onClick={() => void handleSave()}
                 disabled={saving || unsavedCount === 0}
-                className="btn-electric flex items-center gap-2 text-sm px-4 py-2 flex-shrink-0"
+                className="flex-shrink-0"
               >
                 <Save className="h-4 w-4" />
                 {saving ? "Saving…" : "Save"}
-              </button>
+              </Button>
             </div>
           </div>
         )}
@@ -1042,6 +1075,10 @@ function FieldRow({
 }: FieldRowProps) {
   const renderer = rendererFor(entry);
   const requirement = setupRequirement(entry);
+  // The per-row "why?" comment is gated behind a reveal so it doesn't add a
+  // permanent second input to every row. Open it automatically when a
+  // comment value is already staged so the operator sees their own note.
+  const [showComment, setShowComment] = useState(comment.length > 0);
   const [providerModels, setProviderModels] = useState<string[] | null>(null);
   const [modelsFetchFailed, setModelsFetchFailed] = useState(false);
   // Per-alias model field — `providers.models.<type>.<alias>.model`.
@@ -1179,49 +1216,35 @@ function FieldRow({
       <div className="flex items-start justify-between gap-3">
         <div className="flex-1 min-w-0">
           <label
-            className="block text-sm font-medium font-mono break-all"
+            className="block text-sm font-medium font-sans break-words"
             style={{ color: "var(--pc-text-primary)" }}
             htmlFor={entry.path}
-            title={entry.type_hint}
+            title={`${entry.path}${entry.type_hint ? ` — ${entry.type_hint}` : ""}`}
           >
-            {entry.path}
+            {humanizeFieldLabel(entry.path)}
             {requirement && (
-              <span
-                className="ml-2 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide font-sans"
-                style={{
-                  color:
-                    requirement.tone === "required"
-                      ? "#fca5a5"
-                      : requirement.tone === "choice"
-                        ? "#67e8f9"
-                        : "var(--pc-text-muted)",
-                  background:
-                    requirement.tone === "required"
-                      ? "rgba(239, 68, 68, 0.12)"
-                      : requirement.tone === "choice"
-                        ? "rgba(34, 211, 238, 0.10)"
-                        : "var(--pc-bg-surface-subtle)",
-                  border: "1px solid",
-                  borderColor:
-                    requirement.tone === "required"
-                      ? "rgba(239, 68, 68, 0.24)"
-                      : requirement.tone === "choice"
-                        ? "rgba(34, 211, 238, 0.20)"
-                        : "var(--pc-border)",
-                }}
+              <Badge
+                tone={requirementBadgeTone(requirement.tone)}
+                className="ml-2 uppercase tracking-wide"
               >
                 {requirement.label}
-              </span>
+              </Badge>
             )}
             {entry.is_secret && (
-              <span
-                className="ml-2 text-xs font-sans"
-                style={{ color: "var(--pc-text-muted)" }}
-              >
+              <span className="ml-2 text-xs font-sans text-pc-text-muted">
                 🔒 {entry.populated ? "set" : "unset"}
               </span>
             )}
           </label>
+          {/* Demoted: the raw schema path stays visible (faint, monospace) so
+              the field is still unambiguously identifiable, but the humanized
+              leaf above is now the primary label. */}
+          <code
+            className="block text-[11px] font-mono break-all mt-0.5"
+            style={{ color: "var(--pc-text-faint)" }}
+          >
+            {entry.path}
+          </code>
           {description && (
             <p
               className="text-xs mt-0.5"
@@ -1403,6 +1426,7 @@ function FieldRow({
               />
               <button
                 type="button"
+                data-dirpicker-trigger
                 onClick={() => setPickerOpen((open) => !open)}
                 className="btn-secondary inline-flex items-center gap-1.5 text-sm px-3 py-2 flex-shrink-0"
                 title="Browse shared/ for a directory"
@@ -1442,14 +1466,39 @@ function FieldRow({
           />
         )}
 
-        <input
-          type="text"
-          value={comment}
-          onChange={(e) => onCommentChange(e.target.value)}
-          placeholder="Optional comment (why?)"
-          className="input-electric w-full px-3 py-1.5 text-xs"
-          style={{ color: "var(--pc-text-secondary)" }}
-        />
+        {showComment ? (
+          <div className="flex items-center gap-1.5">
+            <input
+              type="text"
+              value={comment}
+              autoFocus={comment.length === 0}
+              onChange={(e) => onCommentChange(e.target.value)}
+              placeholder={t("cfg.field.commentPlaceholder")}
+              className="input-electric flex-1 px-3 py-1.5 text-xs text-pc-text-secondary"
+            />
+            <button
+              type="button"
+              onClick={() => {
+                onCommentChange("");
+                setShowComment(false);
+              }}
+              title={t("cfg.field.commentHide")}
+              aria-label={t("cfg.field.commentHide")}
+              className="btn-icon flex-shrink-0"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={() => setShowComment(true)}
+            className="inline-flex items-center gap-1 text-xs text-pc-text-faint hover:text-pc-text-secondary transition-colors"
+          >
+            <MessageSquarePlus className="h-3.5 w-3.5" />
+            {t("cfg.field.commentAdd")}
+          </button>
+        )}
 
         {error && (
           <p

@@ -14,6 +14,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, Check } from "lucide-react";
 import { fuzzyFilter } from "../../lib/fuzzy";
 import { ApiError, getSectionPicker, type PickerItem } from "../../lib/api";
+import { Badge, Button } from "@/components/ui";
+import type { BadgeTone } from "@/components/ui";
 
 interface SectionPickerProps {
   /** Section key, e.g. 'providers'. */
@@ -113,49 +115,33 @@ export default function SectionPicker({
 
   return (
     <div className="flex flex-col gap-4">
-      {help && (
-        <p className="text-sm" style={{ color: "var(--pc-text-secondary)" }}>
-          {help}
-        </p>
-      )}
+      {help && <p className="text-sm text-pc-text-secondary">{help}</p>}
 
       {error && (
-        <div
-          className="rounded-xl border p-3 text-sm animate-fade-in"
-          style={{
-            background: "rgba(239, 68, 68, 0.08)",
-            borderColor: "rgba(239, 68, 68, 0.2)",
-            color: "#f87171",
-          }}
-        >
+        <div className="rounded-[var(--radius-md)] border border-status-error/25 bg-status-error/10 p-3 text-sm text-status-error animate-fade-in">
           {error}
         </div>
       )}
 
-      <div className="relative">
-        <input
-          ref={filterRef}
-          type="text"
-          value={filter}
-          onChange={(e) => {
-            setFilter(e.target.value);
-            setHighlightIdx(0);
-          }}
-          onKeyDown={handleKey}
-          placeholder="Filter — fuzzy match. Enter to pick, Esc to skip."
-          className="input-electric w-full px-3 py-2.5 text-sm"
-        />
-      </div>
+      <input
+        ref={filterRef}
+        type="text"
+        value={filter}
+        onChange={(e) => {
+          setFilter(e.target.value);
+          setHighlightIdx(0);
+        }}
+        onKeyDown={handleKey}
+        placeholder="Filter — fuzzy match. Enter to pick, Esc to skip."
+        className="w-full px-3 py-2.5 text-sm rounded-[var(--radius-md)] bg-pc-input border border-pc-border text-pc-text placeholder:text-pc-text-faint focus-visible:outline-none focus-visible:border-pc-border-strong focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
+      />
 
       <div
-        className="surface-panel divide-y overflow-y-auto"
-        style={{ borderColor: "var(--pc-border)", maxHeight: "60vh" }}
+        className="rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface divide-y divide-pc-border overflow-y-auto"
+        style={{ maxHeight: "60vh" }}
       >
         {filtered.length === 0 ? (
-          <div
-            className="px-4 py-6 text-sm text-center"
-            style={{ color: "var(--pc-text-muted)" }}
-          >
+          <div className="px-4 py-6 text-sm text-center text-pc-text-muted">
             No matches. Try a different filter.
           </div>
         ) : (
@@ -165,55 +151,31 @@ export default function SectionPicker({
               type="button"
               onClick={() => onPick(item)}
               onMouseEnter={() => setHighlightIdx(idx)}
-              className="w-full flex items-center justify-between gap-3 px-4 py-2.5 text-left transition-colors"
-              style={{
-                background:
-                  idx === highlightIdx ? "var(--pc-hover)" : "transparent",
-              }}
+              className={[
+                "w-full flex items-center justify-between gap-3 px-4 py-2.5 text-left transition-colors",
+                idx === highlightIdx ? "bg-pc-accent/10" : "bg-transparent",
+              ].join(" ")}
             >
               <div className="flex-1 min-w-0">
-                <div
-                  className="text-sm font-medium"
-                  style={{ color: "var(--pc-text-primary)" }}
-                >
+                <div className="text-sm font-medium text-pc-text">
                   {item.label}
                   {item.label !== item.key && (
-                    <code
-                      className="ml-2 text-xs"
-                      style={{ color: "var(--pc-text-faint)" }}
-                    >
+                    <code className="ml-2 text-xs text-pc-text-faint">
                       {item.key}
                     </code>
                   )}
                 </div>
                 {item.description && (
-                  <div
-                    className="text-xs mt-0.5"
-                    style={{ color: "var(--pc-text-muted)" }}
-                  >
+                  <div className="text-xs mt-0.5 text-pc-text-muted">
                     {item.description}
                   </div>
                 )}
               </div>
               {item.badge && (
-                <span
-                  className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full"
-                  style={{
-                    background: badgeIsGood(item.badge)
-                      ? "rgba(0, 230, 138, 0.12)"
-                      : item.badge === "needs setup"
-                        ? "rgba(245, 180, 0, 0.12)"
-                        : "var(--pc-bg-elevated)",
-                    color: badgeIsGood(item.badge)
-                      ? "var(--color-status-success)"
-                      : item.badge === "needs setup"
-                        ? "var(--color-status-warning, #f5b400)"
-                        : "var(--pc-text-secondary)",
-                  }}
-                >
+                <Badge tone={badgeTone(item.badge)}>
                   {badgeIsGood(item.badge) && <Check className="h-3 w-3" />}
                   {item.badge}
-                </span>
+                </Badge>
               )}
             </button>
           ))
@@ -222,14 +184,10 @@ export default function SectionPicker({
 
       {onBack && (
         <div>
-          <button
-            type="button"
-            onClick={onBack}
-            className="btn-secondary flex items-center gap-2 text-sm px-3 py-2"
-          >
+          <Button variant="ghost" size="md" onClick={onBack}>
             <ArrowLeft className="h-4 w-4" />
             Back
-          </button>
+          </Button>
         </div>
       )}
     </div>
@@ -238,4 +196,13 @@ export default function SectionPicker({
 
 function badgeIsGood(badge: string | undefined): boolean {
   return badge === "configured" || badge === "active" || badge === "set";
+}
+
+// Map a schema-driven badge string to a calm Badge tone. The badge text
+// itself is rendered verbatim — only the tint is chosen here, so no
+// section/option names are hardcoded.
+function badgeTone(badge: string): BadgeTone {
+  if (badgeIsGood(badge)) return "ok";
+  if (badge === "needs setup") return "warn";
+  return "neutral";
 }

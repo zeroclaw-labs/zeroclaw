@@ -42,6 +42,8 @@ import SectionTabs, {
 import CostRatesEditor, {
   type CostRatesCategory,
 } from "../components/sections/CostRatesEditor";
+import { Badge, Button, Card, PageHeader } from "@/components/ui";
+import { t } from "@/lib/i18n";
 
 // Display order for the curated sidebar groups. Each `SectionInfo.group`
 // from the gateway lands in one of these buckets (anything else falls
@@ -205,14 +207,7 @@ export default function Config() {
   if (error) {
     return (
       <div className="p-6">
-        <div
-          className="rounded-xl border p-4 text-sm"
-          style={{
-            background: "rgba(239, 68, 68, 0.08)",
-            borderColor: "rgba(239, 68, 68, 0.2)",
-            color: "#f87171",
-          }}
-        >
+        <div className="rounded-[var(--radius-md)] border border-status-error/25 bg-status-error/10 p-4 text-sm text-status-error">
           {error}
         </div>
       </div>
@@ -252,14 +247,15 @@ export default function Config() {
         : typeParam;
       return (
         <div className="flex flex-col gap-3 flex-1 min-h-0">
-          <button
-            type="button"
+          <Button
+            variant="ghost"
+            size="sm"
             onClick={() => navigate(-1)}
-            className="btn-secondary inline-flex items-center gap-2 text-sm px-3 py-1.5 self-start"
+            className="self-start"
           >
             <ArrowLeft className="h-4 w-4" />
             Back
-          </button>
+          </Button>
           <WireTabForm
             key={`${reloadKey}-${fieldsPrefix}`}
             prefix={fieldsPrefix}
@@ -320,16 +316,17 @@ export default function Config() {
 
       return (
         <div className="flex flex-col gap-3 flex-1 min-h-0">
-          <button
-            type="button"
+          <Button
+            variant="ghost"
+            size="sm"
             onClick={() =>
               navigate(`/config/${encodeURIComponent(activeSection.key)}`)
             }
-            className="btn-secondary inline-flex items-center gap-2 text-sm px-3 py-1.5 self-start"
+            className="self-start"
           >
             <ArrowLeft className="h-4 w-4" />
             Back to {activeSection.label}
-          </button>
+          </Button>
           <WireTabForm
             key={`${reloadKey}-${fieldsPrefix}`}
             prefix={fieldsPrefix}
@@ -390,16 +387,17 @@ export default function Config() {
       // Non-alias-tiered section with a type in the URL: treat as form
       return (
         <div className="flex flex-col gap-3 flex-1 min-h-0">
-          <button
-            type="button"
+          <Button
+            variant="ghost"
+            size="sm"
             onClick={() =>
               navigate(`/config/${encodeURIComponent(activeSection.key)}`)
             }
-            className="btn-secondary inline-flex items-center gap-2 text-sm px-3 py-1.5 self-start"
+            className="self-start"
           >
             <ArrowLeft className="h-4 w-4" />
             Back to {activeSection.label}
-          </button>
+          </Button>
           <FieldForm
             key={`${reloadKey}-${typeParam}`}
             prefix={typeParam}
@@ -498,13 +496,11 @@ export default function Config() {
   return (
     <div className="flex h-full overflow-hidden">
       {!lockedSection && (
-        <aside
-          className="w-56 flex-shrink-0 border-r overflow-y-auto"
-          style={{
-            borderColor: "var(--pc-border)",
-            background: "var(--pc-bg-surface)",
-          }}
-        >
+        // Secondary master pane. Deliberately lighter than the global app
+        // sidebar: no surface fill, faint uppercase group headings, and a
+        // subtle accent-tinted active row (not a heavy fill) so it reads as
+        // a section list inside Config — not a second top-level nav.
+        <aside className="w-52 flex-shrink-0 border-r border-pc-border overflow-y-auto py-2">
           <nav className="flex flex-col">
             {GROUP_ORDER.map((groupName) => {
               const known = new Set(GROUP_ORDER);
@@ -526,41 +522,33 @@ export default function Config() {
                 });
               if (items.length === 0) return null;
               return (
-                <div key={groupName}>
-                  <div
-                    className="px-4 pt-4 pb-1.5 text-xs font-semibold uppercase tracking-wider"
-                    style={{ color: "var(--pc-text-secondary)" }}
-                  >
+                <div key={groupName} className="mb-1">
+                  <div className="px-3 pt-3 pb-1 text-[10px] font-medium uppercase tracking-wider text-pc-text-faint">
                     {groupName}
                   </div>
-                  {items.map((s) => (
-                    <button
-                      key={s.key}
-                      type="button"
-                      onClick={() => goToSection(s.key)}
-                      className="flex items-center justify-between gap-2 px-4 py-2 text-sm text-left transition-colors"
-                      style={{
-                        background:
-                          s.key === activeKey
-                            ? "var(--pc-accent-glow)"
-                            : "transparent",
-                        color:
-                          s.key === activeKey
-                            ? "var(--pc-accent)"
-                            : "var(--pc-text-primary)",
-                        fontWeight: s.key === activeKey ? 600 : 400,
-                        borderLeft:
-                          s.key === activeKey
-                            ? "2px solid var(--pc-accent)"
-                            : "2px solid transparent",
-                      }}
-                    >
-                      <span>{s.label}</span>
-                      {s.key === activeKey && (
-                        <ChevronRight className="h-3.5 w-3.5" />
-                      )}
-                    </button>
-                  ))}
+                  {items.map((s) => {
+                    const active = s.key === activeKey;
+                    return (
+                      <button
+                        key={s.key}
+                        type="button"
+                        onClick={() => goToSection(s.key)}
+                        aria-current={active ? "page" : undefined}
+                        className={[
+                          "mx-1.5 flex items-center justify-between gap-2 rounded-[var(--radius-sm)]",
+                          "px-2.5 py-1.5 text-sm text-left transition-colors",
+                          active
+                            ? "bg-pc-accent/10 text-pc-accent font-medium"
+                            : "text-pc-text-secondary hover:bg-pc-elevated/60 hover:text-pc-text",
+                        ].join(" ")}
+                      >
+                        <span className="truncate">{s.label}</span>
+                        {active && (
+                          <ChevronRight className="h-3.5 w-3.5 flex-shrink-0" />
+                        )}
+                      </button>
+                    );
+                  })}
                 </div>
               );
             })}
@@ -577,53 +565,57 @@ export default function Config() {
                 that chain, the save bar's `sticky bottom-0` anchors
                 to a content-height column and floats mid-viewport
                 instead of pinning to the bottom of the scroll area. */}
-            {/* Breadcrumb */}
-            <div className="flex items-center justify-between gap-3 flex-wrap">
-              <div
-                className="text-sm flex items-center gap-1.5 flex-wrap"
-                style={{ color: "var(--pc-text-muted)" }}
-              >
-                {crumbs.map((crumb, i) => (
-                  <span key={i} className="flex items-center gap-1.5">
-                    {i > 0 && <ChevronRight className="h-3 w-3" />}
-                    {crumb.url && i < crumbs.length - 1 ? (
-                      <span
-                        style={{
-                          color: "var(--pc-text-secondary)",
-                          cursor: "pointer",
-                        }}
-                        onClick={() => navigate(crumb.url!)}
-                      >
-                        {crumb.label}
-                      </span>
-                    ) : (
-                      <span
-                        style={{ color: "var(--pc-accent)", fontWeight: 600 }}
-                      >
-                        {crumb.label}
-                      </span>
-                    )}
-                  </span>
-                ))}
-              </div>
-              <div className="flex items-center gap-2">
-                <Link
-                  to="/quickstart"
-                  className="btn-secondary inline-flex items-center gap-1.5 text-xs px-3 py-1.5"
-                  title="Run Quickstart again"
-                >
-                  <Sparkles className="h-3.5 w-3.5" />
-                  Run Quickstart again
-                </Link>
-                <ReloadDaemonButton
-                  onReloaded={() => {
-                    goToSection(activeSection.key);
-                    fetchDrift();
-                    setReloadKey((n) => n + 1);
-                  }}
-                />
-              </div>
-            </div>
+            {/* Config header: section title + breadcrumb trail (as the
+                description slot) + the page-level actions. ReloadDaemonButton
+                keeps its own confirm modal — only the surrounding chrome is
+                restyled. */}
+            <PageHeader
+              title={activeSection.label}
+              description={
+                <span className="flex items-center gap-1.5 flex-wrap text-pc-text-muted">
+                  {crumbs.map((crumb, i) => (
+                    <span key={i} className="flex items-center gap-1.5">
+                      {i > 0 && (
+                        <ChevronRight className="h-3 w-3 text-pc-text-faint" />
+                      )}
+                      {crumb.url && i < crumbs.length - 1 ? (
+                        <button
+                          type="button"
+                          onClick={() => navigate(crumb.url!)}
+                          className="text-pc-text-secondary hover:text-pc-text transition-colors"
+                        >
+                          {crumb.label}
+                        </button>
+                      ) : (
+                        <span className="text-pc-text font-medium">
+                          {crumb.label}
+                        </span>
+                      )}
+                    </span>
+                  ))}
+                </span>
+              }
+              actions={
+                <>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => navigate("/quickstart")}
+                    title={t("cfg.header.quickstart")}
+                  >
+                    <Sparkles className="h-3.5 w-3.5" />
+                    {t("cfg.header.quickstart")}
+                  </Button>
+                  <ReloadDaemonButton
+                    onReloaded={() => {
+                      goToSection(activeSection.key);
+                      fetchDrift();
+                      setReloadKey((n) => n + 1);
+                    }}
+                  />
+                </>
+              }
+            />
 
             <div className="flex-1 min-h-0 flex flex-col">{mainContent}</div>
           </div>
@@ -641,12 +633,8 @@ export default function Config() {
 function ConfigAliasHelpBox() {
   return (
     <div
-      className="rounded-md border px-3 py-2 text-xs"
-      style={{
-        borderColor: "var(--pc-border)",
-        background: "var(--pc-bg-surface-subtle)",
-        color: "var(--pc-text-secondary)",
-      }}
+      className="rounded-[var(--radius-md)] border border-pc-border px-3 py-2 text-xs text-pc-text-secondary"
+      style={{ background: "var(--pc-bg-surface-subtle)" }}
     >
       <p className="mb-1">
         <strong>Alias.</strong> A short stable name you’ll use everywhere else
@@ -757,20 +745,18 @@ function AliasListView({
 
   return (
     <div className="flex flex-col gap-4">
-      <button
-        type="button"
+      <Button
+        variant="ghost"
+        size="sm"
         onClick={onBack}
-        className="btn-secondary inline-flex items-center gap-2 text-sm px-3 py-1.5 self-start"
+        className="self-start"
       >
         <ArrowLeft className="h-4 w-4" />
         Back
-      </button>
+      </Button>
 
       {sectionHelp && (
-        <p
-          className="text-sm leading-relaxed"
-          style={{ color: "var(--pc-text-secondary)" }}
-        >
+        <p className="text-sm leading-relaxed text-pc-text-secondary">
           {sectionHelp}
         </p>
       )}
@@ -778,14 +764,7 @@ function AliasListView({
       <ConfigAliasHelpBox />
 
       {error && (
-        <div
-          className="rounded-xl border p-3 text-sm"
-          style={{
-            background: "rgba(239,68,68,0.08)",
-            borderColor: "rgba(239,68,68,0.2)",
-            color: "#f87171",
-          }}
-        >
+        <div className="rounded-[var(--radius-md)] border border-status-error/25 bg-status-error/10 p-3 text-sm text-status-error">
           {error}
         </div>
       )}
@@ -801,10 +780,7 @@ function AliasListView({
           />
         </div>
       ) : (
-        <div
-          className="surface-panel divide-y"
-          style={{ borderColor: "var(--pc-border)" }}
-        >
+        <Card padded={false} className="divide-y divide-pc-border overflow-hidden">
           {aliases.map((alias) => (
             <AliasRow
               key={alias}
@@ -844,13 +820,14 @@ function AliasListView({
                   if (e.key === "Enter") void submit();
                 }}
               />
-              <button
-                type="button"
+              <Button
+                variant="primary"
+                size="sm"
                 onClick={() => void submit()}
-                className="btn-electric text-sm px-3 py-1.5 flex-shrink-0"
+                className="flex-shrink-0"
               >
                 Add
-              </button>
+              </Button>
             </div>
             {aliasError && (
               <p
@@ -861,7 +838,7 @@ function AliasListView({
               </p>
             )}
           </div>
-        </div>
+        </Card>
       )}
     </div>
   );
@@ -1270,42 +1247,29 @@ function AliasRow({
   };
 
   return (
-    <div className="w-full flex items-center justify-between gap-3 px-4 py-3 text-sm hover:opacity-90">
+    <div className="w-full flex items-center justify-between gap-3 px-4 py-3 text-sm transition-colors hover:bg-pc-elevated/50">
       <button
         type="button"
         onClick={onSelect}
         className="flex-1 min-w-0 flex items-center justify-between gap-3 text-left"
       >
         <div className="min-w-0">
-          <span style={{ color: "var(--pc-text-primary)", fontWeight: 500 }}>
-            {alias}
-          </span>
-          <code
-            className="block text-xs mt-0.5"
-            style={{ color: "var(--pc-text-faint)" }}
-          >
+          <span className="font-medium text-pc-text">{alias}</span>
+          <code className="block text-xs mt-0.5 text-pc-text-faint">
             {mapPath}.{alias}
           </code>
         </div>
-        <ChevronRight
-          className="h-4 w-4 flex-shrink-0"
-          style={{ color: "var(--pc-text-muted)" }}
-        />
+        <ChevronRight className="h-4 w-4 flex-shrink-0 text-pc-text-muted" />
       </button>
       <button
         type="button"
         onClick={onTrashClick}
         disabled={deleting}
         title={armed ? "Click again to confirm delete" : "Delete this alias"}
-        className="btn-icon flex-shrink-0"
-        style={
-          armed
-            ? {
-                color: "var(--color-status-error, #f87171)",
-                borderColor: "var(--color-status-error, #f87171)",
-              }
-            : undefined
-        }
+        className={[
+          "btn-icon flex-shrink-0",
+          armed ? "text-status-error border-status-error/40" : "",
+        ].join(" ")}
       >
         {armed ? (
           <span className="text-xs px-1">Confirm</span>
@@ -1367,14 +1331,15 @@ function SectionOverview({
   if (showPicker) {
     return (
       <div className="flex flex-col gap-3">
-        <button
-          type="button"
+        <Button
+          variant="ghost"
+          size="sm"
           onClick={() => setShowPicker(false)}
-          className="btn-secondary inline-flex items-center gap-2 text-sm px-3 py-1.5 self-start"
+          className="self-start"
         >
           <ArrowLeft className="h-4 w-4" />
           Back to {section.label}
-        </button>
+        </Button>
         <SectionPicker
           sectionKey={section.key}
           help={section.help}
@@ -1390,18 +1355,17 @@ function SectionOverview({
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex items-center justify-between">
-        <p className="text-sm" style={{ color: "var(--pc-text-secondary)" }}>
-          {section.help}
-        </p>
-        <button
-          type="button"
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-sm text-pc-text-secondary">{section.help}</p>
+        <Button
+          variant="primary"
+          size="md"
           onClick={() => setShowPicker(true)}
-          className="btn-electric flex items-center gap-2 text-sm px-3 py-2 flex-shrink-0"
+          className="flex-shrink-0"
         >
           <Plus className="h-4 w-4" />
           Add
-        </button>
+        </Button>
       </div>
       <ConfiguredOnlyPicker
         section={section}
@@ -1475,14 +1439,7 @@ function ConfiguredOnlyPicker({
 
   if (error) {
     return (
-      <div
-        className="rounded-xl border p-3 text-sm"
-        style={{
-          background: "rgba(239, 68, 68, 0.08)",
-          borderColor: "rgba(239, 68, 68, 0.2)",
-          color: "#f87171",
-        }}
-      >
+      <div className="rounded-[var(--radius-md)] border border-status-error/25 bg-status-error/10 p-3 text-sm text-status-error">
         {error}
       </div>
     );
@@ -1490,48 +1447,40 @@ function ConfiguredOnlyPicker({
 
   if (items.length === 0) {
     return (
-      <div
-        className="surface-panel p-8 text-center text-sm"
-        style={{ color: "var(--pc-text-muted)" }}
-      >
+      <Card className="p-8 text-center text-sm text-pc-text-muted">
         Nothing configured under <strong>{section.label}</strong> yet. Click{" "}
         <strong>+ Add</strong> to get started.
-      </div>
+      </Card>
     );
   }
 
   return (
-    <div
-      className="surface-panel divide-y"
-      style={{ borderColor: "var(--pc-border)" }}
-    >
+    <Card padded={false} className="divide-y divide-pc-border overflow-hidden">
       {items.map((item) => (
         <button
           key={item.key}
           type="button"
           onClick={() => onPickType(item.key)}
-          className="w-full flex items-center justify-between gap-3 px-4 py-3 text-left transition-colors hover:opacity-90"
+          className="w-full flex items-center justify-between gap-3 px-4 py-3 text-left transition-colors hover:bg-pc-elevated/50"
         >
           <div className="flex-1 min-w-0">
-            <div
-              className="text-sm font-medium"
-              style={{ color: "var(--pc-text-primary)" }}
-            >
+            <div className="text-sm font-medium text-pc-text">
               {item.label}
             </div>
-            <code
-              className="block text-xs mt-0.5"
-              style={{ color: "var(--pc-text-faint)" }}
-            >
+            <code className="block text-xs mt-0.5 text-pc-text-faint">
               {item.key}
             </code>
           </div>
-          <ChevronRight
-            className="h-4 w-4 flex-shrink-0"
-            style={{ color: "var(--pc-text-muted)" }}
-          />
+          <div className="flex items-center gap-2 flex-shrink-0">
+            {item.badge && (
+              <Badge tone={item.badge === "active" ? "ok" : "neutral"}>
+                {item.badge}
+              </Badge>
+            )}
+            <ChevronRight className="h-4 w-4 text-pc-text-muted" />
+          </div>
         </button>
       ))}
-    </div>
+    </Card>
   );
 }

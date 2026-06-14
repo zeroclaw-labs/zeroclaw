@@ -19,25 +19,8 @@ import {
 } from 'lucide-react';
 import type { LucideProps } from 'lucide-react';
 import type { AgentSummary } from '@/lib/agents';
+import { Card, Badge } from '@/components/ui';
 import EntityLink from './EntityLink';
-
-function ChipRow({
-  icon: Icon,
-  children,
-}: {
-  icon: ComponentType<LucideProps>;
-  children: ReactNode;
-}) {
-  return (
-    <div
-      className="flex items-start gap-1.5 flex-wrap text-xs"
-      style={{ color: 'var(--pc-text-muted)' }}
-    >
-      <Icon className="h-3 w-3 mt-0.5 flex-shrink-0" />
-      <div className="flex flex-wrap gap-1 min-w-0">{children}</div>
-    </div>
-  );
-}
 
 export interface AgentCardProps {
   agent: AgentSummary;
@@ -62,12 +45,44 @@ function formatUsd(value: number | null): string {
   return `$${value.toFixed(2)}`;
 }
 
+// Calm chip: a muted token surface that links into config. Replaces the old
+// accent-tinted pill clutter with a single restrained treatment.
 const CHIP_CLASS =
-  'font-mono text-[10px] px-1.5 py-0.5 rounded-full hover:underline';
-const CHIP_STYLE = {
-  background: 'rgba(var(--pc-accent-rgb), 0.08)',
-  color: 'var(--pc-text-secondary)',
-};
+  'inline-block font-mono text-[10px] px-2 py-0.5 rounded-full ' +
+  'bg-pc-elevated text-pc-text-secondary hover:text-pc-text transition-colors';
+
+// Shared layout for the route-action links. Mirrors the Button primitive's
+// shape/size (size="sm") and focus ring so they read as the same component.
+const ACTION_BASE =
+  'inline-flex items-center justify-center gap-1.5 h-7 px-2.5 text-[13px] ' +
+  'font-medium whitespace-nowrap rounded-[var(--radius-md)] border ' +
+  'transition-colors duration-150 select-none ' +
+  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] ' +
+  'focus-visible:ring-offset-2 focus-visible:ring-offset-pc-surface';
+
+// A labelled row that groups a set of related facts behind one muted caption +
+// icon, so the card reads as a few scannable groups instead of a pill storm.
+function FactGroup({
+  icon: Icon,
+  label,
+  children,
+}: {
+  icon: ComponentType<LucideProps>;
+  label: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className="flex items-start gap-2">
+      <span className="flex items-center gap-1.5 text-[11px] text-pc-text-faint flex-shrink-0 pt-0.5 w-20">
+        <Icon className="h-3 w-3 flex-shrink-0" />
+        <span className="truncate">{label}</span>
+      </span>
+      <div className="flex flex-wrap items-center gap-1 min-w-0 text-xs text-pc-text-secondary">
+        {children}
+      </div>
+    </div>
+  );
+}
 
 export default function AgentCard({ agent, toggling, onToggle }: AgentCardProps) {
   const channelCount = agent.channels.length;
@@ -76,44 +91,35 @@ export default function AgentCard({ agent, toggling, onToggle }: AgentCardProps)
   const mcpCount = agent.mcpBundles.length;
   const cronCount = agent.cronJobs.length;
   const peerCount = agent.peerGroups.length;
+
   return (
-    <div
-      className="rounded-2xl border p-5 transition-colors"
-      style={{
-        background: 'var(--pc-bg-surface)',
-        borderColor: 'var(--pc-border)',
-      }}
-    >
-      <div className="flex items-start justify-between mb-3">
-        <div className="flex items-center gap-2 min-w-0">
-          <div
-            className="h-9 w-9 rounded-xl flex-shrink-0 flex items-center justify-center"
-            style={{ background: 'var(--pc-accent-glow)' }}
-          >
-            <Bot className="h-4 w-4" style={{ color: 'var(--pc-accent)' }} />
+    <Card className="flex flex-col gap-4 p-5">
+      {/* Header: identity + enabled state */}
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="h-9 w-9 rounded-[var(--radius-md)] flex-shrink-0 flex items-center justify-center bg-pc-accent/10">
+            <Bot className="h-4 w-4 text-pc-accent" />
           </div>
           <div className="min-w-0">
             <EntityLink
               kind="agent"
               id={agent.alias}
-              className="text-sm font-semibold truncate hover:underline"
+              className="block text-[15px] font-semibold truncate text-pc-text hover:underline"
               title={`Open agents.${agent.alias} config`}
             >
-              <span style={{ color: 'var(--pc-text-primary)' }}>{agent.alias}</span>
+              {agent.alias}
             </EntityLink>
             {agent.modelProvider ? (
               <EntityLink
                 kind="model-provider"
                 id={agent.modelProvider}
-                className="text-xs truncate font-mono block hover:underline"
+                className="block text-xs truncate font-mono text-pc-text-muted hover:text-pc-text-secondary hover:underline"
                 title={`Open providers.models.${agent.modelProvider} config`}
               >
-                <span style={{ color: 'var(--pc-text-muted)' }}>
-                  {agent.modelProvider}
-                </span>
+                {agent.modelProvider}
               </EntityLink>
             ) : (
-              <p className="text-xs truncate" style={{ color: 'var(--pc-text-muted)' }}>
+              <p className="text-xs truncate text-pc-text-muted">
                 no model_provider set
               </p>
             )}
@@ -123,35 +129,25 @@ export default function AgentCard({ agent, toggling, onToggle }: AgentCardProps)
           type="button"
           onClick={onToggle}
           disabled={toggling}
-          className="flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-medium transition-colors disabled:opacity-50"
-          style={{
-            background: agent.enabled
-              ? 'var(--color-status-success-alpha-08)'
-              : 'var(--pc-bg-elevated)',
-            color: agent.enabled
-              ? 'var(--color-status-success)'
-              : 'var(--pc-text-muted)',
-            border: '1px solid',
-            borderColor: agent.enabled
-              ? 'var(--color-status-success-alpha-20)'
-              : 'var(--pc-border)',
-          }}
+          className="flex-shrink-0 rounded-full transition-opacity disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-surface"
           aria-pressed={agent.enabled}
           aria-label={agent.enabled ? 'Disable agent' : 'Enable agent'}
+          title={agent.enabled ? 'Disable agent' : 'Enable agent'}
         >
-          <Power className="h-3 w-3" />
-          {agent.enabled ? 'enabled' : 'disabled'}
+          <Badge tone={agent.enabled ? 'ok' : 'neutral'}>
+            <Power className="h-3 w-3" />
+            {agent.enabled ? 'enabled' : 'disabled'}
+          </Badge>
         </button>
       </div>
 
-      <div className="flex flex-col gap-1.5 mb-4">
-        {channelCount === 0 ? (
-          <ChipRow icon={Wifi}>
-            <span>No channels bound</span>
-          </ChipRow>
-        ) : (
-          <ChipRow icon={Wifi}>
-            {agent.channels.map((ch) => (
+      {/* Configuration facts, grouped under muted captions */}
+      <div className="flex flex-col gap-2">
+        <FactGroup icon={Wifi} label="Channels">
+          {channelCount === 0 ? (
+            <span className="text-pc-text-muted">none bound</span>
+          ) : (
+            agent.channels.map((ch) => (
               <EntityLink
                 key={ch}
                 kind="channel"
@@ -159,62 +155,62 @@ export default function AgentCard({ agent, toggling, onToggle }: AgentCardProps)
                 className={CHIP_CLASS}
                 title={`Open channels.${ch} config`}
               >
-                <span style={CHIP_STYLE} className="inline-block px-1.5 py-0.5 rounded-full">
-                  {ch}
-                </span>
+                {ch}
               </EntityLink>
-            ))}
-          </ChipRow>
-        )}
+            ))
+          )}
+        </FactGroup>
 
-        <div
-          className="flex items-center gap-3 text-xs flex-wrap"
-          style={{ color: 'var(--pc-text-muted)' }}
-        >
+        <FactGroup icon={Shield} label="Profile">
           {agent.riskProfile ? (
             <EntityLink
               kind="risk-profile"
               id={agent.riskProfile}
-              className="inline-flex items-center gap-1 hover:underline"
+              className="inline-flex items-center gap-1 hover:text-pc-text hover:underline"
               title="Risk profile (autonomy/sandbox tier)"
             >
-              <Shield className="h-3 w-3" />
               {agent.riskProfile}
             </EntityLink>
           ) : (
-            <span className="inline-flex items-center gap-1" title="Risk profile (autonomy/sandbox tier)">
-              <Shield className="h-3 w-3" />
+            <span
+              className="text-pc-text-muted"
+              title="Risk profile (autonomy/sandbox tier)"
+            >
               no risk profile
             </span>
           )}
+          <span className="text-pc-text-faint">·</span>
           <EntityLink
             kind="memory-backend"
             id=""
-            className="inline-flex items-center gap-1 hover:underline"
+            className="inline-flex items-center gap-1 hover:text-pc-text hover:underline"
             title={
               agent.memoryBackend
                 ? `Memory backend: ${agent.memoryBackend}`
                 : 'No per-agent override. Inherits the default backend (sqlite) from [memory].'
             }
           >
-            <Database className="h-3 w-3" />
+            <Database className="h-3 w-3 flex-shrink-0" />
             {agent.memoryBackend || 'sqlite (default)'}
           </EntityLink>
           {agent.runtimeProfile && (
-            <EntityLink
-              kind="runtime-profile"
-              id={agent.runtimeProfile}
-              className="inline-flex items-center gap-1 hover:underline"
-              title="Runtime profile (loop, token limits, retries)"
-            >
-              <Zap className="h-3 w-3" />
-              {agent.runtimeProfile}
-            </EntityLink>
+            <>
+              <span className="text-pc-text-faint">·</span>
+              <EntityLink
+                kind="runtime-profile"
+                id={agent.runtimeProfile}
+                className="inline-flex items-center gap-1 hover:text-pc-text hover:underline"
+                title="Runtime profile (loop, token limits, retries)"
+              >
+                <Zap className="h-3 w-3 flex-shrink-0" />
+                {agent.runtimeProfile}
+              </EntityLink>
+            </>
           )}
-        </div>
+        </FactGroup>
 
         {skillCount > 0 && (
-          <ChipRow icon={Sparkles}>
+          <FactGroup icon={Sparkles} label="Skills">
             {agent.skillBundles.map((s) => (
               <EntityLink
                 key={s}
@@ -223,16 +219,14 @@ export default function AgentCard({ agent, toggling, onToggle }: AgentCardProps)
                 className={CHIP_CLASS}
                 title={`Open skill-bundles.${s} config`}
               >
-                <span style={CHIP_STYLE} className="inline-block px-1.5 py-0.5 rounded-full">
-                  {s}
-                </span>
+                {s}
               </EntityLink>
             ))}
-          </ChipRow>
+          </FactGroup>
         )}
 
         {knowledgeCount > 0 && (
-          <ChipRow icon={BookOpen}>
+          <FactGroup icon={BookOpen} label="Knowledge">
             {agent.knowledgeBundles.map((k) => (
               <EntityLink
                 key={k}
@@ -241,16 +235,14 @@ export default function AgentCard({ agent, toggling, onToggle }: AgentCardProps)
                 className={CHIP_CLASS}
                 title={`Open knowledge-bundles.${k} config`}
               >
-                <span style={CHIP_STYLE} className="inline-block px-1.5 py-0.5 rounded-full">
-                  {k}
-                </span>
+                {k}
               </EntityLink>
             ))}
-          </ChipRow>
+          </FactGroup>
         )}
 
         {mcpCount > 0 && (
-          <ChipRow icon={Plug}>
+          <FactGroup icon={Plug} label="MCP">
             {agent.mcpBundles.map((m) => (
               <EntityLink
                 key={m}
@@ -259,16 +251,14 @@ export default function AgentCard({ agent, toggling, onToggle }: AgentCardProps)
                 className={CHIP_CLASS}
                 title={`Open mcp-bundles.${m} config`}
               >
-                <span style={CHIP_STYLE} className="inline-block px-1.5 py-0.5 rounded-full">
-                  {m}
-                </span>
+                {m}
               </EntityLink>
             ))}
-          </ChipRow>
+          </FactGroup>
         )}
 
         {peerCount > 0 && (
-          <ChipRow icon={Users}>
+          <FactGroup icon={Users} label="Peers">
             {agent.peerGroups.map((pg) => (
               <EntityLink
                 key={pg}
@@ -277,16 +267,14 @@ export default function AgentCard({ agent, toggling, onToggle }: AgentCardProps)
                 className={CHIP_CLASS}
                 title={`Open peer_groups.${pg} config`}
               >
-                <span style={CHIP_STYLE} className="inline-block px-1.5 py-0.5 rounded-full">
-                  {pg}
-                </span>
+                {pg}
               </EntityLink>
             ))}
-          </ChipRow>
+          </FactGroup>
         )}
 
         {cronCount > 0 && (
-          <ChipRow icon={Clock}>
+          <FactGroup icon={Clock} label="Cron">
             {agent.cronJobs.map((c) => (
               <EntityLink
                 key={c}
@@ -295,89 +283,94 @@ export default function AgentCard({ agent, toggling, onToggle }: AgentCardProps)
                 className={CHIP_CLASS}
                 title={`Open cron.${c} config`}
               >
-                <span style={CHIP_STYLE} className="inline-block px-1.5 py-0.5 rounded-full">
-                  {c}
-                </span>
+                {c}
               </EntityLink>
             ))}
-          </ChipRow>
+          </FactGroup>
         )}
+      </div>
 
-        <p
-          className="text-xs flex items-center gap-1.5"
-          style={{ color: 'var(--pc-text-muted)' }}
-        >
-          <MessageSquare className="h-3 w-3" />
-          {agent.sessionCount === 0 ? (
-            <span>No sessions</span>
-          ) : (
-            <Link
-              to={`/?tab=sessions&agent=${encodeURIComponent(agent.alias)}`}
-              className="hover:underline"
-              title={`Show sessions for ${agent.alias}`}
-            >
-              {agent.sessionCount === 1
-                ? '1 session'
-                : `${agent.sessionCount} sessions`}
-            </Link>
-          )}
-          <span
-            className="inline-flex items-center gap-1 ml-2"
-            style={{ color: 'var(--pc-text-faint)' }}
-          >
-            <Clock className="h-3 w-3" />
+      {/* Activity stats: sessions / memories / spend */}
+      <div className="grid grid-cols-3 gap-2 pt-3 border-t border-pc-border">
+        <div className="min-w-0">
+          <div className="flex items-center gap-1 text-[11px] text-pc-text-faint">
+            <MessageSquare className="h-3 w-3 flex-shrink-0" />
+            Sessions
+          </div>
+          <div className="mt-0.5 text-sm text-pc-text">
+            {agent.sessionCount === 0 ? (
+              <span className="text-pc-text-muted">none</span>
+            ) : (
+              <Link
+                to={`/?tab=sessions&agent=${encodeURIComponent(agent.alias)}`}
+                className="hover:text-pc-accent hover:underline"
+                title={`Show sessions for ${agent.alias}`}
+              >
+                {agent.sessionCount}
+              </Link>
+            )}
+          </div>
+          <div className="text-[11px] text-pc-text-muted truncate">
             {formatRelative(agent.lastActivity)}
-          </span>
-        </p>
-        <p
-          className="text-xs flex items-center gap-1.5"
-          style={{ color: 'var(--pc-text-muted)' }}
-        >
-          <Brain className="h-3 w-3" />
-          {agent.memoryCount === 0 ? (
-            <span>No memories</span>
-          ) : (
-            <Link
-              to={`/?tab=memories&agent=${encodeURIComponent(agent.alias)}`}
-              className="hover:underline"
-              title={`Show memories for ${agent.alias}`}
-            >
-              {agent.memoryCount === 1
-                ? '1 memory'
-                : `${agent.memoryCount} memories`}
-            </Link>
-          )}
-        </p>
-        <p
-          className="text-xs flex items-center gap-1.5"
-          style={{ color: 'var(--pc-text-muted)' }}
+          </div>
+        </div>
+
+        <div className="min-w-0">
+          <div className="flex items-center gap-1 text-[11px] text-pc-text-faint">
+            <Brain className="h-3 w-3 flex-shrink-0" />
+            Memories
+          </div>
+          <div className="mt-0.5 text-sm text-pc-text">
+            {agent.memoryCount === 0 ? (
+              <span className="text-pc-text-muted">none</span>
+            ) : (
+              <Link
+                to={`/?tab=memories&agent=${encodeURIComponent(agent.alias)}`}
+                className="hover:text-pc-accent hover:underline"
+                title={`Show memories for ${agent.alias}`}
+              >
+                {agent.memoryCount}
+              </Link>
+            )}
+          </div>
+        </div>
+
+        <div
+          className="min-w-0"
           title={
             agent.monthCostUsd === null
               ? 'Per-agent tracking disabled in [cost].track_per_agent'
               : 'Month-to-date spend attributed to this agent'
           }
         >
-          <DollarSign className="h-3 w-3" />
-          {formatUsd(agent.monthCostUsd)} this month
-        </p>
+          <div className="flex items-center gap-1 text-[11px] text-pc-text-faint">
+            <DollarSign className="h-3 w-3 flex-shrink-0" />
+            This month
+          </div>
+          <div className="mt-0.5 text-sm text-pc-text">
+            {formatUsd(agent.monthCostUsd)}
+          </div>
+        </div>
       </div>
 
+      {/* Actions. Routes are <Link>s styled to match the Button primitive
+          (Button renders a native <button>, so it can't host navigation). */}
       <div className="flex items-center gap-2">
         <Link
           to={`/agent/${encodeURIComponent(agent.alias)}`}
-          className="btn-electric flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-xl text-xs"
+          className={`${ACTION_BASE} flex-1 bg-pc-accent border-transparent text-[#0b1220] hover:bg-pc-accent-light active:brightness-95`}
         >
           <MessageSquare className="h-3.5 w-3.5" />
           Open chat
         </Link>
         <Link
           to={`/config/agents/${encodeURIComponent(agent.alias)}`}
-          className="btn-secondary flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-xl text-xs"
+          className={`${ACTION_BASE} bg-transparent border-pc-border text-pc-text-secondary hover:bg-[var(--pc-hover)] hover:text-pc-text hover:border-pc-border-strong`}
         >
           <Pencil className="h-3.5 w-3.5" />
           Edit
         </Link>
       </div>
-    </div>
+    </Card>
   );
 }

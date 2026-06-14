@@ -25,11 +25,22 @@ export default function EntityLink({
   const onClick: MouseEventHandler = stopPropagation
     ? (e) => e.stopPropagation()
     : () => {};
+  // Tokenized link color via --pc-text-link (tracks the per-theme accent),
+  // a calm hover underline, and a strong focus-visible ring. Callers can
+  // still override color through `className`/`style`.
   return (
     <Link
       to={entityConfigPath(kind, id)}
-      className={className}
-      style={style}
+      className={[
+        'underline-offset-2 hover:underline rounded-[var(--radius-sm)]',
+        'transition-colors duration-150',
+        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]',
+        'focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base',
+        className ?? '',
+      ]
+        .filter(Boolean)
+        .join(' ')}
+      style={{ color: 'var(--pc-text-link)', ...style }}
       title={title ?? `Open ${kind} config: ${id}`}
       onClick={onClick}
     >

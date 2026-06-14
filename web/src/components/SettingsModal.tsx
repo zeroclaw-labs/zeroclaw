@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { X, Settings, Sun, Moon, Monitor, Laptop, Check, Type, CaseSensitive, Palette } from 'lucide-react';
 import { useTheme } from '@/hooks/useTheme';
 import { t } from '@/lib/i18n';
@@ -39,12 +39,26 @@ const monoFontOptions: { value: MonoFont; label: string; sample: string }[] = [
 const uiSizes = [14, 15, 16, 17, 18];
 const monoSizes = [13, 14, 15, 16, 17];
 
+// Shared selectable-chip classes. Hover is pure CSS (no JS handlers): the
+// inactive state lifts to `--pc-hover` on hover; the active state is an
+// accent-tinted token surface. Both carry a strong focus-visible ring.
+const chipBase =
+  'border transition-colors duration-150 focus-visible:outline-none ' +
+  'focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] ' +
+  'focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base cursor-pointer';
+const chipInactive =
+  'border-pc-border text-pc-text-muted bg-transparent ' +
+  'hover:bg-[var(--pc-hover)] hover:text-pc-text';
+const chipActive =
+  'border-pc-accent-dim bg-pc-accent/10 text-pc-accent-light';
+
+function chip(active: boolean, extra = '') {
+  return [chipBase, active ? chipActive : chipInactive, extra].filter(Boolean).join(' ');
+}
+
 function SectionTitle({ children }: { children: React.ReactNode }) {
   return (
-    <div
-      className="text-[10px] uppercase tracking-wider mb-2 mt-5 first:mt-0"
-      style={{ color: 'var(--pc-text-faint)', fontWeight: 600 }}
-    >
+    <div className="text-[10px] uppercase tracking-wider font-semibold mb-2 mt-5 first:mt-0 text-pc-text-faint">
       {children}
     </div>
   );
@@ -63,17 +77,21 @@ function ThemePreviewCard({
   const [bg, c1, c2, c3, text] = theme.preview;
   return (
     <button
+      type="button"
       onClick={onClick}
-      className="flex flex-col gap-1.5 p-2 rounded-xl border transition-all text-left group"
-      style={{
-        borderColor: active ? 'var(--pc-accent)' : 'var(--pc-border)',
-        background: active ? 'var(--pc-accent-glow)' : 'transparent',
-        boxShadow: active ? '0 0 12px var(--pc-accent-glow)' : 'none',
-        minWidth: '110px',
-      }}
+      className={[
+        'flex flex-col gap-1.5 p-2 rounded-[var(--radius-lg)] border text-left group',
+        'transition-colors duration-150 cursor-pointer',
+        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]',
+        'focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base',
+        active
+          ? 'border-pc-accent bg-pc-accent/10'
+          : 'border-pc-border hover:bg-[var(--pc-hover)] hover:border-pc-border-strong',
+      ].join(' ')}
+      style={{ minWidth: '110px' }}
       aria-pressed={active}
     >
-      {/* Mini terminal */}
+      {/* Mini terminal — keeps the theme's literal preview colors (it is a preview). */}
       <div
         className="w-full rounded-lg overflow-hidden"
         style={{ background: bg, border: `1px solid ${theme.scheme === 'dark' ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)'}` }}
@@ -103,10 +121,12 @@ function ThemePreviewCard({
       </div>
       {/* Label */}
       <div className="flex items-center gap-1 px-0.5">
-        {active && <Check size={10} style={{ color: 'var(--pc-accent)' }} />}
+        {active && <Check size={10} className="text-pc-accent" />}
         <span
-          className="text-[10px] font-medium truncate"
-          style={{ color: active ? 'var(--pc-accent-light)' : 'var(--pc-text-muted)' }}
+          className={[
+            'text-[10px] font-medium truncate',
+            active ? 'text-pc-accent-light' : 'text-pc-text-muted',
+          ].join(' ')}
         >
           {theme.name}
         </span>
@@ -129,6 +149,8 @@ export function SettingsModal({ open, onClose }: Props) {
   type TabId = 'appearance' | 'themes' | 'typography';
   const [tab, setTab] = useState<TabId>('appearance');
 
+  const panelRef = useRef<HTMLDivElement>(null);
+
   const tabs: { id: TabId; label: string; icon: typeof Palette }[] = useMemo(() => [
     { id: 'appearance', label: t('settings.tab.appearance'), icon: Settings },
     { id: 'themes', label: 'Themes', icon: Palette },
@@ -139,10 +161,46 @@ export function SettingsModal({ open, onClose }: Props) {
   const darkThemes = useMemo(() => colorThemes.filter(ct => ct.scheme === 'dark'), []);
   const lightThemes = useMemo(() => colorThemes.filter(ct => ct.scheme === 'light'), []);
 
+  // Focus management: focus the first control on open, restore focus to the
+  // trigger on close.
+  useEffect(() => {
+    if (!open) return;
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+    const panel = panelRef.current;
+    const firstFocusable = panel?.querySelector<HTMLElement>(
+      'a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    );
+    firstFocusable?.focus();
+    return () => previouslyFocused?.focus?.();
+  }, [open]);
+
+  // Esc closes; Tab is trapped within the modal panel.
   useEffect(() => {
     if (!open) return;
     const handler = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+      if (e.key === 'Escape') {
+        onClose();
+        return;
+      }
+      if (e.key !== 'Tab') return;
+      const panel = panelRef.current;
+      if (!panel) return;
+      const focusable = Array.from(
+        panel.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((el) => el.offsetParent !== null || el === document.activeElement);
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (!first || !last) return;
+      const active = document.activeElement;
+      if (e.shiftKey && active === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && active === last) {
+        e.preventDefault();
+        first.focus();
+      }
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
@@ -158,28 +216,23 @@ export function SettingsModal({ open, onClose }: Props) {
       className="fixed inset-0 z-50 flex items-center justify-center"
       onClick={onClose}
     >
-      <div className="absolute inset-0" style={{ background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(8px)' }} />
+      <div className="absolute inset-0 bg-pc-base/70 backdrop-blur-sm" />
       <div
-        className="relative w-full max-w-2xl mx-4 rounded-3xl border shadow-2xl animate-fade-in"
-        style={{ background: 'var(--pc-bg-base)', borderColor: 'var(--pc-border)' }}
+        ref={panelRef}
+        className="relative w-full max-w-2xl mx-4 rounded-[var(--radius-xl)] border border-pc-border bg-pc-base shadow-[var(--pc-shadow-md)] animate-fade-in"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div
-          className="flex items-center justify-between px-6 py-4 border-b"
-          style={{ borderColor: 'var(--pc-border)' }}
-        >
+        <div className="flex items-center justify-between px-6 py-4 border-b border-pc-border">
           <div className="flex items-center gap-2.5">
-            <Settings size={18} style={{ color: 'var(--pc-accent-light)' }} />
-            <h2 className="text-sm font-semibold" style={{ color: 'var(--pc-text-primary)' }}>{t('settings.title')}</h2>
+            <Settings size={18} className="text-pc-accent-light" />
+            <h2 className="text-sm font-semibold text-pc-text">{t('settings.title')}</h2>
           </div>
           <button
+            type="button"
             onClick={onClose}
-            className="h-8 w-8 rounded-xl flex items-center justify-center transition-colors"
-            style={{ color: 'var(--pc-text-muted)', background: 'transparent', border: 'none', cursor: 'pointer' }}
-            onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--pc-text-primary)'; e.currentTarget.style.background = 'var(--pc-hover)'; }}
-            onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--pc-text-muted)'; e.currentTarget.style.background = 'transparent'; }}
             aria-label="Close"
+            className="h-8 w-8 rounded-[var(--radius-md)] flex items-center justify-center text-pc-text-muted transition-colors hover:bg-[var(--pc-hover)] hover:text-pc-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base"
           >
             <X size={16} />
           </button>
@@ -192,14 +245,13 @@ export function SettingsModal({ open, onClose }: Props) {
             {tabs.map(tTab => (
               <button
                 key={tTab.id}
+                type="button"
                 onClick={() => setTab(tTab.id)}
-                className="flex-1 rounded-xl border px-3 py-2 text-xs font-medium transition-colors flex items-center justify-center gap-1.5"
-                style={tab === tTab.id
-                  ? { borderColor: 'var(--pc-accent-dim)', background: 'var(--pc-accent-glow)', color: 'var(--pc-accent-light)' }
-                  : { borderColor: 'var(--pc-border)', color: 'var(--pc-text-muted)', background: 'transparent' }
-                }
-                onMouseEnter={(e) => { if (tab !== tTab.id) e.currentTarget.style.background = 'var(--pc-hover)'; }}
-                onMouseLeave={(e) => { if (tab !== tTab.id) e.currentTarget.style.background = 'transparent'; }}
+                className={chip(
+                  tab === tTab.id,
+                  'flex-1 rounded-[var(--radius-md)] px-3 py-2 text-xs font-medium flex items-center justify-center gap-1.5',
+                )}
+                aria-pressed={tab === tTab.id}
               >
                 <tTab.icon size={13} />
                 {tTab.label}
@@ -214,7 +266,7 @@ export function SettingsModal({ open, onClose }: Props) {
 
               {/* Theme Mode */}
               <div className="mb-3">
-                <div className="text-xs mb-2" style={{ color: 'var(--pc-text-secondary)' }}>{t('theme.mode')}</div>
+                <div className="text-xs mb-2 text-pc-text-secondary">{t('theme.mode')}</div>
                 <div className="flex gap-1.5">
                   {themeOptions.map(opt => {
                     const Icon = opt.icon;
@@ -222,17 +274,15 @@ export function SettingsModal({ open, onClose }: Props) {
                     return (
                       <button
                         key={opt.value}
+                        type="button"
                         onClick={() => setTheme(opt.value)}
                         aria-pressed={active}
-                        className="flex-1 flex flex-col items-center gap-1.5 py-2 rounded-xl border text-xs transition-all"
-                        style={active
-                          ? { borderColor: 'var(--pc-accent-dim)', background: 'var(--pc-accent-glow)', color: 'var(--pc-accent-light)' }
-                          : { borderColor: 'var(--pc-border)', color: 'var(--pc-text-muted)', background: 'transparent' }
-                        }
-                        onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = 'var(--pc-hover)'; }}
-                        onMouseLeave={(e) => { if (!active) e.currentTarget.style.background = 'transparent'; }}
+                        className={chip(
+                          active,
+                          'flex-1 flex flex-col items-center gap-1.5 py-2 rounded-[var(--radius-md)] text-xs',
+                        )}
                       >
-                        {/* Theme preview swatch */}
+                        {/* Theme preview swatch — keeps its literal colors (it previews a mode). */}
                         <div
                           className="w-8 h-5 rounded-md border"
                           style={{
@@ -253,13 +303,14 @@ export function SettingsModal({ open, onClose }: Props) {
 
               {/* Accent Color */}
               <div className="mb-4">
-                <div className="text-xs mb-2" style={{ color: 'var(--pc-text-secondary)' }}>{t('theme.accent')}</div>
+                <div className="text-xs mb-2 text-pc-text-secondary">{t('theme.accent')}</div>
                 <div className="flex gap-2">
                   {accentOptions.map(opt => (
                     <button
                       key={opt.value}
+                      type="button"
                       onClick={() => setAccent(opt.value)}
-                      className="relative h-7 w-7 rounded-full transition-all flex items-center justify-center"
+                      className="relative h-7 w-7 rounded-full transition-all flex items-center justify-center cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base"
                       style={{
                         backgroundColor: opt.color,
                         border: accent === opt.value ? `2px solid ${opt.color}` : '2px solid transparent',
@@ -304,19 +355,13 @@ export function SettingsModal({ open, onClose }: Props) {
               </div>
 
               {/* Active theme info */}
-              <div
-                className="rounded-2xl border p-3 mt-2"
-                style={{ background: 'var(--pc-bg-surface)', borderColor: 'var(--pc-border)' }}
-              >
+              <div className="rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface p-3 mt-2">
                 <div className="flex items-center gap-2">
-                  <Palette size={14} style={{ color: 'var(--pc-accent)' }} />
-                  <span className="text-xs font-medium" style={{ color: 'var(--pc-text-primary)' }}>
+                  <Palette size={14} className="text-pc-accent" />
+                  <span className="text-xs font-medium text-pc-text">
                     {colorThemes.find(ct => ct.id === colorTheme)?.name ?? 'Default Dark'}
                   </span>
-                  <span
-                    className="text-[10px] px-1.5 py-0.5 rounded-full"
-                    style={{ background: 'var(--pc-accent-glow)', color: 'var(--pc-accent-light)' }}
-                  >
+                  <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-pc-accent/10 text-pc-accent-light">
                     Active
                   </span>
                 </div>
@@ -331,7 +376,7 @@ export function SettingsModal({ open, onClose }: Props) {
 
               {/* UI Font */}
               <div className="mb-4">
-                <div className="flex items-center gap-2 text-xs mb-2" style={{ color: 'var(--pc-text-secondary)' }}>
+                <div className="flex items-center gap-2 text-xs mb-2 text-pc-text-secondary">
                   <Type size={14} />
                   {t('settings.fontUi')}
                 </div>
@@ -339,17 +384,16 @@ export function SettingsModal({ open, onClose }: Props) {
                   {uiFontOptions.map(opt => (
                     <button
                       key={opt.value}
+                      type="button"
                       onClick={() => setUiFont(opt.value)}
-                      className="flex items-center gap-2 px-3 py-2 rounded-xl border text-xs transition-all"
-                      style={uiFont === opt.value
-                        ? { borderColor: 'var(--pc-accent-dim)', background: 'var(--pc-accent-glow)', color: 'var(--pc-accent-light)' }
-                        : { borderColor: 'var(--pc-border)', color: 'var(--pc-text-muted)', background: 'transparent' }
-                      }
-                      onMouseEnter={(e) => { if (uiFont !== opt.value) e.currentTarget.style.background = 'var(--pc-hover)'; }}
-                      onMouseLeave={(e) => { if (uiFont !== opt.value) e.currentTarget.style.background = 'transparent'; }}
+                      className={chip(
+                        uiFont === opt.value,
+                        'flex items-center gap-2 px-3 py-2 rounded-[var(--radius-md)] text-xs',
+                      )}
+                      aria-pressed={uiFont === opt.value}
                     >
                       <span style={{ fontSize: '14px', fontFamily: uiFontStacks[opt.value] }}>{opt.sample}</span>
-                      <span style={{ fontSize: '11px', color: 'var(--pc-text-faint)' }}>{opt.label}</span>
+                      <span className="text-pc-text-faint" style={{ fontSize: '11px' }}>{opt.label}</span>
                     </button>
                   ))}
                 </div>
@@ -357,7 +401,7 @@ export function SettingsModal({ open, onClose }: Props) {
 
               {/* Mono Font */}
               <div className="mb-4">
-                <div className="flex items-center gap-2 text-xs mb-2" style={{ color: 'var(--pc-text-secondary)' }}>
+                <div className="flex items-center gap-2 text-xs mb-2 text-pc-text-secondary">
                   <CaseSensitive size={14} />
                   {t('settings.fontMono')}
                 </div>
@@ -365,17 +409,16 @@ export function SettingsModal({ open, onClose }: Props) {
                   {monoFontOptions.map(opt => (
                     <button
                       key={opt.value}
+                      type="button"
                       onClick={() => setMonoFont(opt.value)}
-                      className="flex items-center gap-2 px-3 py-2 rounded-xl border text-xs transition-all"
-                      style={monoFont === opt.value
-                        ? { borderColor: 'var(--pc-accent-dim)', background: 'var(--pc-accent-glow)', color: 'var(--pc-accent-light)' }
-                        : { borderColor: 'var(--pc-border)', color: 'var(--pc-text-muted)', background: 'transparent' }
-                      }
-                      onMouseEnter={(e) => { if (monoFont !== opt.value) e.currentTarget.style.background = 'var(--pc-hover)'; }}
-                      onMouseLeave={(e) => { if (monoFont !== opt.value) e.currentTarget.style.background = 'transparent'; }}
+                      className={chip(
+                        monoFont === opt.value,
+                        'flex items-center gap-2 px-3 py-2 rounded-[var(--radius-md)] text-xs',
+                      )}
+                      aria-pressed={monoFont === opt.value}
                     >
                       <span style={{ fontSize: '14px', fontFamily: monoFontStacks[opt.value] }}>{opt.sample}</span>
-                      <span style={{ fontSize: '11px', color: 'var(--pc-text-faint)' }}>{opt.label}</span>
+                      <span className="text-pc-text-faint" style={{ fontSize: '11px' }}>{opt.label}</span>
                     </button>
                   ))}
                 </div>
@@ -383,19 +426,18 @@ export function SettingsModal({ open, onClose }: Props) {
 
               {/* UI Font Size */}
               <div className="mb-4">
-                <div className="text-xs mb-2" style={{ color: 'var(--pc-text-secondary)' }}>{t('settings.fontSize')}</div>
+                <div className="text-xs mb-2 text-pc-text-secondary">{t('settings.fontSize')}</div>
                 <div className="flex gap-1.5 flex-wrap">
                   {uiSizes.map(size => (
                     <button
                       key={size}
+                      type="button"
                       onClick={() => setUiFontSize(size)}
-                      className="px-3 py-1.5 rounded-lg border text-xs transition-all"
-                      style={uiFontSize === size
-                        ? { borderColor: 'var(--pc-accent-dim)', background: 'var(--pc-accent-glow)', color: 'var(--pc-accent-light)' }
-                        : { borderColor: 'var(--pc-border)', color: 'var(--pc-text-muted)', background: 'transparent' }
-                      }
-                      onMouseEnter={(e) => { if (uiFontSize !== size) e.currentTarget.style.background = 'var(--pc-hover)'; }}
-                      onMouseLeave={(e) => { if (uiFontSize !== size) e.currentTarget.style.background = 'transparent'; }}
+                      className={chip(
+                        uiFontSize === size,
+                        'px-3 py-1.5 rounded-[var(--radius-md)] text-xs',
+                      )}
+                      aria-pressed={uiFontSize === size}
                     >
                       {size}px
                     </button>
@@ -405,19 +447,18 @@ export function SettingsModal({ open, onClose }: Props) {
 
               {/* Mono Font Size */}
               <div className="mb-4">
-                <div className="text-xs mb-2" style={{ color: 'var(--pc-text-secondary)' }}>{t('settings.fontMonoSize')}</div>
+                <div className="text-xs mb-2 text-pc-text-secondary">{t('settings.fontMonoSize')}</div>
                 <div className="flex gap-1.5 flex-wrap">
                   {monoSizes.map(size => (
                     <button
                       key={size}
+                      type="button"
                       onClick={() => setMonoFontSize(size)}
-                      className="px-3 py-1.5 rounded-lg border text-xs transition-all"
-                      style={monoFontSize === size
-                        ? { borderColor: 'var(--pc-accent-dim)', background: 'var(--pc-accent-glow)', color: 'var(--pc-accent-light)' }
-                        : { borderColor: 'var(--pc-border)', color: 'var(--pc-text-muted)', background: 'transparent' }
-                      }
-                      onMouseEnter={(e) => { if (monoFontSize !== size) e.currentTarget.style.background = 'var(--pc-hover)'; }}
-                      onMouseLeave={(e) => { if (monoFontSize !== size) e.currentTarget.style.background = 'transparent'; }}
+                      className={chip(
+                        monoFontSize === size,
+                        'px-3 py-1.5 rounded-[var(--radius-md)] text-xs',
+                      )}
+                      aria-pressed={monoFontSize === size}
                     >
                       {size}px
                     </button>
@@ -426,25 +467,19 @@ export function SettingsModal({ open, onClose }: Props) {
               </div>
 
               {/* Preview */}
-              <div
-                className="rounded-2xl border p-3"
-                style={{ background: 'var(--pc-bg-surface)', borderColor: 'var(--pc-border)' }}
-              >
-                <div
-                  className="text-[11px] uppercase tracking-wide mb-2"
-                  style={{ color: 'var(--pc-text-faint)' }}
-                >
+              <div className="rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface p-3">
+                <div className="text-[11px] uppercase tracking-wide mb-2 text-pc-text-faint">
                   {t('settings.preview')}
                 </div>
                 <div
-                  className="text-sm mb-2"
-                  style={{ color: 'var(--pc-text-primary)', fontFamily: 'var(--pc-font-ui)', fontSize: 'var(--pc-font-size)' }}
+                  className="text-sm mb-2 text-pc-text"
+                  style={{ fontFamily: 'var(--pc-font-ui)', fontSize: 'var(--pc-font-size)' }}
                 >
                   {t('settings.previewText')}
                 </div>
                 <div
-                  className="rounded-xl border p-2 text-[13px]"
-                  style={{ fontFamily: 'var(--pc-font-mono)', fontSize: 'var(--pc-font-size-mono)', color: 'var(--pc-text-primary)', borderColor: 'var(--pc-border)', background: 'var(--pc-bg-code)' }}
+                  className="rounded-[var(--radius-md)] border border-pc-border bg-pc-code p-2 text-[13px] text-pc-text"
+                  style={{ fontFamily: 'var(--pc-font-mono)', fontSize: 'var(--pc-font-size-mono)' }}
                 >
                   const hello = 'ZeroClaw'; // typography preview
                 </div>

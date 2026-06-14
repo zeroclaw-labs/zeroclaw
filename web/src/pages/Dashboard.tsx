@@ -94,6 +94,7 @@ import EntityLink from "@/components/EntityLink";
 import EntityEnabledToggle from "@/components/EntityEnabledToggle";
 import { useSSE } from "@/hooks/useSSE";
 import { t } from "@/lib/i18n";
+import { StatCard, PageHeader } from "@/components/ui";
 
 type TabId =
   | "overview"
@@ -2635,6 +2636,83 @@ function truncateForPreview(content: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Dashboard metrics row — real aggregates derived from the agents list the
+// section already loads. Every value is computed from AgentSummary fields, so
+// nothing here is fabricated. Metrics that depend on data the page does not
+// have are simply omitted.
+// ---------------------------------------------------------------------------
+
+function formatMetricUsd(value: number): string {
+  if (value <= 0) return "$0";
+  if (value < 0.01) return "<$0.01";
+  if (value < 1) return `$${value.toFixed(2)}`;
+  if (value < 100) return `$${value.toFixed(2)}`;
+  return `$${Math.round(value).toLocaleString()}`;
+}
+
+function DashboardMetrics({ agents }: { agents: AgentSummary[] }) {
+  const total = agents.length;
+  const enabled = agents.filter((a) => a.enabled).length;
+  const totalSessions = agents.reduce((sum, a) => sum + a.sessionCount, 0);
+  const totalMemories = agents.reduce((sum, a) => sum + a.memoryCount, 0);
+  // monthCostUsd is null when per-agent cost tracking is disabled; only sum the
+  // agents that actually report a figure, and surface whether any did.
+  const trackedSpend = agents.filter((a) => a.monthCostUsd !== null);
+  const totalSpend = trackedSpend.reduce(
+    (sum, a) => sum + (a.monthCostUsd ?? 0),
+    0,
+  );
+
+  return (
+    <div className="grid grid-cols-2 gap-3 sm:gap-4 lg:grid-cols-5">
+      <StatCard
+        label={t("dash.metric.agents")}
+        value={total}
+        sublabel={
+          total === 0
+            ? t("dash.metric.agents.none")
+            : `${enabled} ${t("dash.metric.agents.enabled_sub")}`
+        }
+        icon={<Bot className="h-5 w-5" />}
+        tone="neutral"
+      />
+      <StatCard
+        label={t("dash.metric.enabled")}
+        value={`${enabled}/${total}`}
+        sublabel={t("dash.metric.enabled.sub")}
+        icon={<Activity className="h-5 w-5" />}
+        tone={enabled > 0 ? "ok" : "neutral"}
+      />
+      <StatCard
+        label={t("dash.metric.sessions")}
+        value={totalSessions.toLocaleString()}
+        sublabel={t("dash.metric.sessions.sub")}
+        icon={<MessageSquare className="h-5 w-5" />}
+        tone="neutral"
+      />
+      <StatCard
+        label={t("dash.metric.memories")}
+        value={totalMemories.toLocaleString()}
+        sublabel={t("dash.metric.memories.sub")}
+        icon={<Brain className="h-5 w-5" />}
+        tone="neutral"
+      />
+      <StatCard
+        label={t("dash.metric.spend")}
+        value={trackedSpend.length === 0 ? "—" : formatMetricUsd(totalSpend)}
+        sublabel={
+          trackedSpend.length === 0
+            ? t("dash.metric.spend.untracked")
+            : t("dash.metric.spend.sub")
+        }
+        icon={<DollarSign className="h-5 w-5" />}
+        tone="neutral"
+      />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // AgentsSection — top-of-dashboard agent grid. Always visible (above the
 // global-stats tabs) so the dashboard reads as "many agents + system state"
 // rather than "the agent". Same card component used on /agents.
@@ -2708,35 +2786,46 @@ function AgentsSection() {
     : 0;
 
   return (
-    <section>
-      <header className="flex items-center justify-between mb-4">
-        <div className="flex items-center gap-2">
-          <h2
-            className="text-sm font-semibold uppercase tracking-wider"
-            style={{ color: "var(--pc-text-primary)" }}
+    <section className="space-y-6">
+      <PageHeader
+        title={t("dash.title")}
+        description={t("dash.subtitle")}
+        actions={
+          <Link
+            to="/agents"
+            className="text-xs flex items-center gap-1 hover:underline"
+            style={{ color: "var(--pc-text-muted)" }}
           >
-            Agents
-          </h2>
-          {sortedAgents && sortedAgents.length > 0 && (
-            <span
-              className="text-xs font-mono px-2 py-0.5 rounded-full"
-              style={{
-                background: "rgba(var(--pc-accent-rgb), 0.1)",
-                color: "var(--pc-accent)",
-              }}
-            >
-              {sortedAgents.length}
-            </span>
-          )}
-        </div>
-        <Link
-          to="/agents"
-          className="text-xs flex items-center gap-1 hover:underline"
-          style={{ color: "var(--pc-text-muted)" }}
+            {hiddenCount > 0
+              ? `${t("dash.view_all")} (${sortedAgents!.length})`
+              : t("dash.view_all")}
+            <ChevronRight className="h-3 w-3" />
+          </Link>
+        }
+      />
+
+      {sortedAgents && sortedAgents.length > 0 && (
+        <DashboardMetrics agents={sortedAgents} />
+      )}
+
+      <header className="flex items-center gap-2">
+        <h2
+          className="text-sm font-semibold uppercase tracking-wider"
+          style={{ color: "var(--pc-text-secondary)" }}
         >
-          {hiddenCount > 0 ? `View all (${sortedAgents!.length})` : "View all"}
-          <ChevronRight className="h-3 w-3" />
-        </Link>
+          {t("dash.agents_heading")}
+        </h2>
+        {sortedAgents && sortedAgents.length > 0 && (
+          <span
+            className="text-xs font-mono px-2 py-0.5 rounded-full"
+            style={{
+              background: "rgba(var(--pc-accent-rgb), 0.1)",
+              color: "var(--pc-accent)",
+            }}
+          >
+            {sortedAgents.length}
+          </span>
+        )}
       </header>
 
       {error && (

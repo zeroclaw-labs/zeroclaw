@@ -26,6 +26,14 @@ import {
   quickstartDismiss,
   quickstartFields,
 } from "@/lib/api";
+import { Badge, Button, Card, PageHeader } from "@/components/ui";
+
+// Shared tokenized field control classes. Calm input surface with an accent
+// focus ring — replaces the legacy `input-electric` utility.
+const INPUT_CLASS =
+  "w-full h-9 px-3 rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-sm text-pc-text placeholder:text-pc-text-faint focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-pc-accent/40 focus-visible:border-pc-accent/40";
+const TEXTAREA_CLASS =
+  "w-full px-3 py-2 rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-sm text-pc-text placeholder:text-pc-text-faint focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-pc-accent/40 focus-visible:border-pc-accent/40";
 
 interface StagedProvider {
   provider_type: string;
@@ -181,21 +189,34 @@ export default function Quickstart() {
   };
 
   const providerDone = form.provider !== null;
-  const allDone =
-    providerDone &&
-    form.risk !== null &&
-    form.memory !== null &&
-    form.agentName.trim() !== "";
+  const riskDone = form.risk !== null;
+  const memoryDone = form.memory !== null;
+  const agentDone = form.agentName.trim() !== "";
+  const allDone = providerDone && riskDone && memoryDone && agentDone;
+
+  // Required-step progress for the wizard stepper. Channels / peer groups /
+  // personality files are optional and intentionally excluded from the gate.
+  const steps = [
+    { label: "Provider", done: providerDone },
+    { label: "Risk", done: riskDone },
+    { label: "Memory", done: memoryDone },
+    { label: "Agent", done: agentDone },
+  ];
+  const completedCount = steps.filter((s) => s.done).length;
 
   return (
     <div className="max-w-3xl mx-auto px-6 py-8 space-y-5">
-      <header className="space-y-1">
-        <h1 className="text-2xl font-semibold">Quickstart</h1>
-        <p className="text-sm" style={MUTED}>
-          Create one working agent end-to-end. Pick a provider, choose your
-          profiles, and start chatting.
-        </p>
-      </header>
+      <PageHeader
+        title="Quickstart"
+        description="Create one working agent end-to-end. Pick a provider, choose your profiles, and start chatting."
+        actions={
+          <Badge tone={allDone ? "ok" : "neutral"}>
+            {completedCount}/{steps.length} required
+          </Badge>
+        }
+      />
+
+      <Stepper steps={steps} />
 
       <Section
         icon={<Cpu className="h-4 w-4" />}
@@ -365,7 +386,7 @@ export default function Quickstart() {
       </Section>
 
       {errors.length > 0 && (
-        <ul className="card p-4 space-y-1 text-sm" style={ERROR}>
+        <ul className="rounded-[var(--radius-md)] border border-status-error/20 bg-status-error/10 p-4 space-y-1 text-sm text-status-error">
           {errors.map((e, i) => (
             <li key={i}>
               <code>
@@ -379,15 +400,60 @@ export default function Quickstart() {
       )}
 
       <div className="flex justify-end pt-2">
-        <button
-          className="btn-primary px-6 py-2"
+        <Button
+          size="md"
+          className="px-6"
           disabled={busy || !allDone}
           onClick={() => void submit()}
         >
           {busy ? "Creating..." : "Create"}
-        </button>
+        </Button>
       </div>
     </div>
+  );
+}
+
+function Stepper({ steps }: { steps: { label: string; done: boolean }[] }) {
+  // The first not-yet-done step is treated as the "active" cursor so the
+  // accent lands on what the operator should fill in next.
+  const activeIdx = steps.findIndex((s) => !s.done);
+  return (
+    <ol className="flex items-center gap-2" aria-label="Setup progress">
+      {steps.map((step, i) => {
+        const active = i === activeIdx;
+        const state = step.done
+          ? "bg-pc-accent/10 border-pc-accent/30 text-pc-accent"
+          : active
+            ? "bg-pc-elevated border-pc-border-strong text-pc-text"
+            : "bg-pc-surface border-pc-border text-pc-text-muted";
+        return (
+          <li key={step.label} className="flex items-center gap-2 flex-1 min-w-0">
+            <div
+              className={`flex items-center gap-2 px-3 py-1.5 rounded-[var(--radius-md)] border text-xs font-medium min-w-0 ${state}`}
+            >
+              <span
+                className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[11px] ${
+                  step.done
+                    ? "bg-pc-accent/20 text-pc-accent"
+                    : active
+                      ? "bg-pc-accent text-[#0b1220]"
+                      : "bg-pc-elevated text-pc-text-muted"
+                }`}
+              >
+                {step.done ? <Check className="h-3 w-3" /> : i + 1}
+              </span>
+              <span className="truncate">{step.label}</span>
+            </div>
+            {i < steps.length - 1 && (
+              <span
+                className={`h-px flex-1 ${step.done ? "bg-pc-accent/30" : "bg-pc-border"}`}
+                aria-hidden="true"
+              />
+            )}
+          </li>
+        );
+      })}
+    </ol>
   );
 }
 
@@ -405,26 +471,19 @@ function Section({
   children: React.ReactNode;
 }) {
   return (
-    <section className="card p-5 space-y-4">
+    <Card className="p-5 space-y-4">
       <header className="flex items-center gap-3">
         <span
-          className="flex h-7 w-7 items-center justify-center rounded-lg"
-          style={{
-            background: done
-              ? "rgba(0, 230, 138, 0.12)"
-              : "var(--pc-bg-elevated)",
-            color: done ? "var(--color-status-success)" : MUTED.color,
-          }}
+          className={`flex h-7 w-7 items-center justify-center rounded-[var(--radius-md)] ${
+            done
+              ? "bg-status-success/10 text-status-success"
+              : "bg-pc-elevated text-pc-text-muted"
+          }`}
         >
           {icon}
         </span>
-        <h2 className="font-semibold flex-1 flex items-center gap-2">
-          {done && (
-            <Check
-              className="h-4 w-4"
-              style={{ color: "var(--color-status-success)" }}
-            />
-          )}
+        <h2 className="font-semibold flex-1 flex items-center gap-2 text-pc-text">
+          {done && <Check className="h-4 w-4 text-status-success" />}
           {title}
         </h2>
         {summary && (
@@ -434,7 +493,7 @@ function Section({
         )}
       </header>
       <div className="space-y-3">{children}</div>
-    </section>
+    </Card>
   );
 }
 
@@ -463,37 +522,34 @@ function PresetSection({
           Loading…
         </div>
       ) : (
-        <div
-          className="surface-panel divide-y rounded-xl overflow-hidden"
-          style={{ borderColor: "var(--pc-border)" }}
-        >
-          {rows.map((r) => (
-            <button
-              key={r.value}
-              type="button"
-              onClick={() => onChange(r.value)}
-              className="w-full flex items-center gap-3 px-4 py-3 text-left text-sm hover:opacity-90"
-              style={{
-                background:
-                  r.value === value ? "rgba(0,128,255,0.08)" : "transparent",
-              }}
-            >
-              <div className="flex-1 min-w-0">
-                <div style={{ fontWeight: 500 }}>{r.label}</div>
-                {r.help && (
-                  <div className="text-xs mt-0.5" style={MUTED}>
-                    {r.help}
-                  </div>
+        <div className="rounded-[var(--radius-md)] border border-pc-border bg-pc-base divide-y divide-pc-border overflow-hidden">
+          {rows.map((r) => {
+            const selected = r.value === value;
+            return (
+              <button
+                key={r.value}
+                type="button"
+                onClick={() => onChange(r.value)}
+                className={`w-full flex items-center gap-3 px-4 py-3 text-left text-sm transition-colors ${
+                  selected
+                    ? "bg-pc-accent/[0.08] text-pc-text"
+                    : "text-pc-text hover:bg-[var(--pc-hover)]"
+                }`}
+              >
+                <div className="flex-1 min-w-0">
+                  <div className="font-medium">{r.label}</div>
+                  {r.help && (
+                    <div className="text-xs mt-0.5" style={MUTED}>
+                      {r.help}
+                    </div>
+                  )}
+                </div>
+                {selected && (
+                  <ChevronRight className="h-4 w-4 flex-shrink-0 text-pc-accent" />
                 )}
-              </div>
-              {r.value === value && (
-                <ChevronRight
-                  className="h-4 w-4 flex-shrink-0"
-                  style={{ color: "var(--pc-accent)" }}
-                />
-              )}
-            </button>
-          ))}
+              </button>
+            );
+          })}
         </div>
       )}
     </Section>
@@ -510,21 +566,18 @@ function StagedRow({
   onRemove: () => void;
 }) {
   return (
-    <div
-      className="flex items-center justify-between gap-3 px-4 py-3 rounded-xl"
-      style={{ background: "var(--pc-bg-elevated)" }}
-    >
+    <div className="flex items-center justify-between gap-3 px-4 py-3 rounded-[var(--radius-md)] bg-pc-elevated">
       <div className="min-w-0">
-        <div style={{ fontWeight: 500 }}>{label}</div>
+        <div className="font-medium text-pc-text">{label}</div>
         {sub && (
           <code className="block text-xs mt-0.5" style={FAINT}>
             {sub}
           </code>
         )}
       </div>
-      <button type="button" onClick={onRemove} className="btn-icon" title="Clear">
+      <Button variant="ghost" size="sm" onClick={onRemove} title="Clear">
         <Trash2 className="h-4 w-4" />
-      </button>
+      </Button>
     </div>
   );
 }
@@ -558,14 +611,14 @@ function LabeledInput({
       ) : null}
       {multiline ? (
         <textarea
-          className="input-electric w-full px-3 py-2 min-h-24"
+          className={`${TEXTAREA_CLASS} min-h-24`}
           value={value}
           onChange={(e) => onChange(e.target.value)}
           placeholder={placeholder}
         />
       ) : (
         <input
-          className="input-electric w-full px-3 py-2"
+          className={INPUT_CLASS}
           type={type}
           value={value}
           onChange={(e) => onChange(e.target.value)}
@@ -667,7 +720,7 @@ function ProviderForm({
           Provider type
         </div>
         <select
-          className="input-electric w-full px-3 py-2"
+          className={INPUT_CLASS}
           value={type}
           onChange={(e) => {
             const next = e.target.value;
@@ -694,7 +747,7 @@ function ProviderForm({
           model
         </div>
         <input
-          className="input-electric w-full px-3 py-2"
+          className={INPUT_CLASS}
           value={model}
           onChange={(e) => setModel(e.target.value)}
           list="qs-model-catalog"
@@ -723,9 +776,8 @@ function ProviderForm({
         ))}
 
       <div className="flex justify-end">
-        <button
-          type="button"
-          className="btn-primary px-4 py-2 text-sm inline-flex items-center gap-2"
+        <Button
+          size="sm"
           disabled={!canAdd}
           onClick={() => {
             const fields: Record<string, string> = {};
@@ -745,7 +797,7 @@ function ProviderForm({
         >
           <Plus className="h-3.5 w-3.5" />
           Add
-        </button>
+        </Button>
       </div>
     </>
   );
@@ -777,30 +829,23 @@ function ChannelsList({
   return (
     <>
       {staged.length > 0 && (
-        <div
-          className="surface-panel divide-y rounded-xl overflow-hidden"
-          style={{ borderColor: "var(--pc-border)" }}
-        >
+        <div className="rounded-[var(--radius-md)] border border-pc-border bg-pc-base divide-y divide-pc-border overflow-hidden">
           {staged.map((c, i) => (
             <div
               key={`${c.channel_type}.${c.alias}.${i}`}
               className="flex items-center justify-between gap-3 px-4 py-3 text-sm"
             >
               <div className="min-w-0">
-                <span style={{ fontWeight: 500 }}>
+                <span className="font-medium text-pc-text">
                   {c.channel_type}.{c.alias}
                 </span>
                 <span className="ml-2 text-xs" style={MUTED}>
                   {c.mode === "existing" ? "reuse" : "new"}
                 </span>
               </div>
-              <button
-                type="button"
-                className="btn-icon"
-                onClick={() => onRemove(i)}
-              >
+              <Button variant="ghost" size="sm" onClick={() => onRemove(i)}>
                 <Trash2 className="h-4 w-4" />
-              </button>
+              </Button>
             </div>
           ))}
         </div>
@@ -819,14 +864,10 @@ function ChannelsList({
           onCancel={() => setAdding(false)}
         />
       ) : (
-        <button
-          type="button"
-          className="btn-secondary px-4 py-2 text-sm inline-flex items-center gap-2"
-          onClick={() => setAdding(true)}
-        >
+        <Button variant="ghost" size="md" onClick={() => setAdding(true)}>
           <Plus className="h-3.5 w-3.5" />
           Add channel
-        </button>
+        </Button>
       )}
     </>
   );
@@ -901,37 +942,27 @@ function ChannelAddForm({
   };
 
   return (
-    <div
-      className="card p-4 space-y-3"
-      style={{ background: "var(--pc-bg-elevated)" }}
-    >
+    <Card className="p-4 space-y-3 bg-pc-elevated">
       <div className="flex gap-2">
-        <button
-          type="button"
-          className={mode === "existing" ? "btn-primary" : "btn-secondary"}
+        <Button
+          variant={mode === "existing" ? "primary" : "ghost"}
+          size="sm"
           disabled={reusable.length === 0}
           onClick={() => setMode("existing")}
-          style={{ padding: "0.4rem 0.8rem", fontSize: "0.85rem" }}
         >
           Use existing
-        </button>
-        <button
-          type="button"
-          className={mode === "fresh" ? "btn-primary" : "btn-secondary"}
+        </Button>
+        <Button
+          variant={mode === "fresh" ? "primary" : "ghost"}
+          size="sm"
           onClick={() => setMode("fresh")}
-          style={{ padding: "0.4rem 0.8rem", fontSize: "0.85rem" }}
         >
           Create new
-        </button>
+        </Button>
         <div className="flex-1" />
-        <button
-          type="button"
-          className="btn-secondary"
-          onClick={onCancel}
-          style={{ padding: "0.4rem 0.8rem", fontSize: "0.85rem" }}
-        >
+        <Button variant="ghost" size="sm" onClick={onCancel}>
           Cancel
-        </button>
+        </Button>
       </div>
 
       {mode === "existing" ? (
@@ -941,7 +972,7 @@ function ChannelAddForm({
           </div>
         ) : (
           <select
-            className="input-electric w-full px-3 py-2"
+            className={INPUT_CLASS}
             value={existingRef}
             onChange={(e) => setExistingRef(e.target.value)}
           >
@@ -959,7 +990,7 @@ function ChannelAddForm({
               Channel type
             </div>
             <select
-              className="input-electric w-full px-3 py-2"
+              className={INPUT_CLASS}
               value={type}
               onChange={(e) => {
                 const next = e.target.value;
@@ -1000,17 +1031,12 @@ function ChannelAddForm({
       )}
 
       <div className="flex justify-end">
-        <button
-          type="button"
-          className="btn-primary px-4 py-2 text-sm inline-flex items-center gap-2"
-          disabled={!canAdd}
-          onClick={submit}
-        >
+        <Button size="sm" disabled={!canAdd} onClick={submit}>
           <Plus className="h-3.5 w-3.5" />
           Add
-        </button>
+        </Button>
       </div>
-    </div>
+    </Card>
   );
 }
 
@@ -1050,17 +1076,14 @@ function PeerGroupsList({
   return (
     <>
       {stagedPeerGroups.length > 0 && (
-        <div
-          className="surface-panel divide-y rounded-xl overflow-hidden"
-          style={{ borderColor: "var(--pc-border)" }}
-        >
+        <div className="rounded-[var(--radius-md)] border border-pc-border bg-pc-base divide-y divide-pc-border overflow-hidden">
           {stagedPeerGroups.map((pg, i) => (
             <div
               key={`${pg.name}.${i}`}
               className="flex items-center justify-between gap-3 px-4 py-3 text-sm"
             >
               <div className="min-w-0">
-                <div style={{ fontWeight: 500 }}>{pg.name}</div>
+                <div className="font-medium text-pc-text">{pg.name}</div>
                 <code className="block text-xs mt-0.5" style={FAINT}>
                   channel: {pg.channel}
                   {pg.external_peers.length > 0
@@ -1068,13 +1091,9 @@ function PeerGroupsList({
                     : " · no peers"}
                 </code>
               </div>
-              <button
-                type="button"
-                className="btn-icon"
-                onClick={() => onRemove(i)}
-              >
+              <Button variant="ghost" size="sm" onClick={() => onRemove(i)}>
                 <Trash2 className="h-4 w-4" />
-              </button>
+              </Button>
             </div>
           ))}
         </div>
@@ -1096,14 +1115,10 @@ function PeerGroupsList({
           onCancel={() => setAdding(false)}
         />
       ) : (
-        <button
-          type="button"
-          className="btn-secondary px-4 py-2 text-sm inline-flex items-center gap-2"
-          onClick={() => setAdding(true)}
-        >
+        <Button variant="ghost" size="md" onClick={() => setAdding(true)}>
           <Plus className="h-3.5 w-3.5" />
           Add peer group
-        </button>
+        </Button>
       )}
     </>
   );
@@ -1141,16 +1156,13 @@ function PeerGroupAddForm({
   const canAdd = channel !== "" && name !== "";
 
   return (
-    <div
-      className="card p-4 space-y-3"
-      style={{ background: "var(--pc-bg-elevated)" }}
-    >
+    <Card className="p-4 space-y-3 bg-pc-elevated">
       <label className="block">
         <div className="text-xs uppercase tracking-wider mb-1" style={MUTED}>
           Channel
         </div>
         <select
-          className="input-electric w-full px-3 py-2"
+          className={INPUT_CLASS}
           value={channel}
           onChange={(e) => setChannel(e.target.value)}
         >
@@ -1175,25 +1187,19 @@ function PeerGroupAddForm({
       </div>
 
       <div className="flex justify-end gap-2">
-        <button
-          type="button"
-          className="btn-secondary"
-          onClick={onCancel}
-          style={{ padding: "0.4rem 0.8rem", fontSize: "0.85rem" }}
-        >
+        <Button variant="ghost" size="sm" onClick={onCancel}>
           Cancel
-        </button>
-        <button
-          type="button"
-          className="btn-primary px-4 py-2 text-sm inline-flex items-center gap-2"
+        </Button>
+        <Button
+          size="sm"
           disabled={!canAdd}
           onClick={() => onAdd({ name, channel, external_peers: peers })}
         >
           <Plus className="h-3.5 w-3.5" />
           Add
-        </button>
+        </Button>
       </div>
-    </div>
+    </Card>
   );
 }
 
@@ -1246,10 +1252,7 @@ function PersonalityFilesList({
 
   return (
     <div className="space-y-3">
-      <div
-        className="surface-panel divide-y rounded-xl overflow-hidden"
-        style={{ borderColor: "var(--pc-border)" }}
-      >
+      <div className="rounded-[var(--radius-md)] border border-pc-border bg-pc-base divide-y divide-pc-border overflow-hidden">
         {filenames.map((fn) => {
           const isStaged = stagedByFilename.has(fn);
           const isEditing = editing === fn;
@@ -1257,7 +1260,7 @@ function PersonalityFilesList({
             <div key={fn} className="px-4 py-3 text-sm space-y-2">
               <div className="flex items-center justify-between gap-3">
                 <div className="min-w-0">
-                  <span style={{ fontWeight: 500 }}>{fn}</span>
+                  <span className="font-medium text-pc-text">{fn}</span>
                   {isStaged && (
                     <span className="ml-2 text-xs" style={MUTED}>
                       staged
@@ -1266,19 +1269,18 @@ function PersonalityFilesList({
                 </div>
                 <div className="flex gap-2">
                   {isStaged && (
-                    <button
-                      type="button"
-                      className="btn-icon"
+                    <Button
+                      variant="ghost"
+                      size="sm"
                       onClick={() => onRemove(fn)}
                       title="Discard"
                     >
                       <Trash2 className="h-4 w-4" />
-                    </button>
+                    </Button>
                   )}
-                  <button
-                    type="button"
-                    className="btn-secondary"
-                    style={{ padding: "0.3rem 0.7rem", fontSize: "0.8rem" }}
+                  <Button
+                    variant="ghost"
+                    size="sm"
                     onClick={async () => {
                       const map = await loadTemplates();
                       const content = map[fn] ?? "";
@@ -1289,11 +1291,10 @@ function PersonalityFilesList({
                     title="Stage the default template content for this file"
                   >
                     Use template
-                  </button>
-                  <button
-                    type="button"
-                    className="btn-secondary"
-                    style={{ padding: "0.3rem 0.7rem", fontSize: "0.8rem" }}
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
                     onClick={() => {
                       if (isEditing) {
                         if (buf.trim() === "") {
@@ -1309,12 +1310,12 @@ function PersonalityFilesList({
                     }}
                   >
                     {isEditing ? "Save" : isStaged ? "Edit" : "Add"}
-                  </button>
+                  </Button>
                 </div>
               </div>
               {isEditing && (
                 <textarea
-                  className="input-electric w-full px-3 py-2 min-h-32 font-mono text-xs"
+                  className={`${TEXTAREA_CLASS} min-h-32 font-mono text-xs`}
                   value={buf}
                   onChange={(e) => setBuf(e.target.value)}
                   placeholder={`Contents of ${fn}…`}

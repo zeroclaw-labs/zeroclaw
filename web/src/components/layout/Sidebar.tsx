@@ -2,6 +2,7 @@ import { NavLink } from 'react-router-dom';
 import { basePath } from '../../lib/basePath';
 import {
   Activity,
+  Bot,
   Clock,
   LayoutDashboard,
   MessageSquare,
@@ -22,17 +23,42 @@ interface NavItem {
   labelKey: string;
 }
 
-const navItems: NavItem[] = [
-  { to: '/', icon: LayoutDashboard, labelKey: 'nav.dashboard' },
-  { to: '/agents', icon: MessageSquare, labelKey: 'nav.agents' },
-  { to: '/tools', icon: Wrench, labelKey: 'nav.tools' },
-  { to: '/cron', icon: Clock, labelKey: 'nav.cron' },
-  { to: '/integrations', icon: Puzzle, labelKey: 'nav.integrations' },
-  { to: '/config', icon: Settings, labelKey: 'nav.config' },
-  { to: '/logs', icon: Activity, labelKey: 'nav.logs' },
-  { to: '/doctor', icon: Stethoscope, labelKey: 'nav.doctor' },
-  { to: '/canvas', icon: Monitor, labelKey: 'nav.canvas' },
-  { to: '/acp-console', icon: Terminal, labelKey: 'nav.acp' },
+interface NavGroup {
+  headingKey: string;
+  items: NavItem[];
+}
+
+// Grouped navigation. Every existing route/link is preserved — the flat list
+// is just organized under four headings so the sidebar reads top-down by task:
+// Home → Chat → Configure → Operations.
+const navGroups: NavGroup[] = [
+  {
+    headingKey: 'nav.group.home',
+    items: [{ to: '/', icon: LayoutDashboard, labelKey: 'nav.dashboard' }],
+  },
+  {
+    headingKey: 'nav.group.chat',
+    items: [{ to: '/agents', icon: MessageSquare, labelKey: 'nav.agents' }],
+  },
+  {
+    headingKey: 'nav.group.configure',
+    items: [
+      { to: '/config', icon: Settings, labelKey: 'nav.config' },
+      { to: '/config/agents', icon: Bot, labelKey: 'nav.agent' },
+      { to: '/tools', icon: Wrench, labelKey: 'nav.tools' },
+      { to: '/integrations', icon: Puzzle, labelKey: 'nav.integrations' },
+      { to: '/cron', icon: Clock, labelKey: 'nav.cron' },
+    ],
+  },
+  {
+    headingKey: 'nav.group.operations',
+    items: [
+      { to: '/logs', icon: Activity, labelKey: 'nav.logs' },
+      { to: '/doctor', icon: Stethoscope, labelKey: 'nav.doctor' },
+      { to: '/canvas', icon: Monitor, labelKey: 'nav.canvas' },
+      { to: '/acp-console', icon: Terminal, labelKey: 'nav.acp' },
+    ],
+  },
 ];
 
 // The 6 Quickstart sections (Workspace, Providers, Channels, Memory,
@@ -58,24 +84,36 @@ function SidebarNavItem({ item, showLabel, showTooltip, onClick }: {
       onClick={onClick}
       className={({ isActive }) =>
         [
-          'flex items-center rounded-xl text-sm font-medium transition-all group relative',
-          showLabel ? 'justify-start gap-3 px-3 py-2.5' : 'justify-center w-10 h-10 mx-auto',
+          // Calm console row: subtle accent tint + a 2px left accent bar when
+          // active (the bar/icon carry the accent; the label stays primary
+          // text so the row reads quiet rather than as a bright filled pill).
+          'flex items-center rounded-[var(--radius-md)] text-sm font-medium transition-colors duration-150 group relative',
+          showLabel ? 'justify-start gap-3 px-3 py-2' : 'justify-center w-10 h-10 mx-auto',
           isActive
-            ? 'text-(--pc-accent-light)'
-            : 'text-(--pc-text-muted) hover:text-(--pc-text-secondary) hover:bg-(--pc-hover)',
+            ? 'bg-pc-accent/10 text-pc-text'
+            : 'text-pc-text-muted hover:text-pc-text-secondary hover:bg-[var(--pc-hover)]',
         ].join(' ')
       }
-      style={({ isActive }) => ({
-        ...(isActive ? { background: 'var(--pc-accent-glow)', border: '1px solid var(--pc-accent-dim)' } : {}),
-      })}
     >
       {({ isActive }) => (
         <>
-          <Icon className={`h-5 w-5 shrink-0 transition-colors ${isActive ? 'text-(--pc-accent)' : 'group-hover:text-(--pc-accent)'}`} />
+          {/* 2px left accent bar — only on the expanded (labelled) layout so it
+              doesn't crowd the centered collapsed icons. */}
+          {isActive && showLabel && (
+            <span
+              aria-hidden="true"
+              className="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-full bg-pc-accent"
+            />
+          )}
+          <Icon
+            className={`h-[18px] w-[18px] shrink-0 transition-colors ${
+              isActive ? 'text-pc-accent' : 'group-hover:text-pc-text-secondary'
+            }`}
+          />
           {showLabel && <span className="whitespace-nowrap">{text}</span>}
           {showTooltip && (
             <span
-              className="absolute left-full ml-2 px-2 py-1 rounded-md text-xs whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-9999"
+              className="absolute left-full ml-2 px-2 py-1 rounded-[var(--radius-sm)] text-xs whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-9999"
               style={{ background: 'var(--pc-bg-elevated)', color: 'var(--pc-text-primary)', border: '1px solid var(--pc-border)' }}
             >
               {text}
@@ -87,9 +125,52 @@ function SidebarNavItem({ item, showLabel, showTooltip, onClick }: {
   );
 }
 
-// Group header label — only shown when the sidebar is expanded. In the
-// collapsed state we render a thin divider instead so the icons stay
-// aligned and the separator is still discoverable.
+// Renders one nav group: a heading (or a thin divider when collapsed) plus its
+// items. The heading is associated with its <ul> via aria-labelledby so screen
+// readers announce the group name. The leading group renders without a top
+// divider so the list doesn't open with a stray rule.
+function SidebarGroup({ group, index, showLabel, showTooltip, onClick }: {
+  group: NavGroup;
+  index: number;
+  showLabel: boolean;
+  showTooltip: boolean;
+  onClick: () => void;
+}) {
+  const heading = t(group.headingKey);
+  const headingId = `nav-group-${index}`;
+  return (
+    <div role="group" aria-labelledby={showLabel ? headingId : undefined} className="space-y-0.5">
+      {showLabel ? (
+        <h2
+          id={headingId}
+          className="px-3 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider select-none"
+          style={{ color: 'var(--pc-text-faint)' }}
+        >
+          {heading}
+        </h2>
+      ) : (
+        index > 0 && (
+          <div
+            className="mx-auto my-2 h-px w-6"
+            style={{ background: 'var(--pc-separator)' }}
+            role="presentation"
+            aria-label={heading}
+          />
+        )
+      )}
+      {group.items.map((item) => (
+        <SidebarNavItem
+          key={item.to}
+          item={item}
+          showLabel={showLabel}
+          showTooltip={showTooltip}
+          onClick={onClick}
+        />
+      ))}
+    </div>
+  );
+}
+
 interface SidebarProps {
   open: boolean;
   onClose: () => void;
@@ -114,15 +195,16 @@ export default function Sidebar({ open, onClose, collapsed }: SidebarProps) {
       {/* Desktop sidebar — collapsible */}
       <aside
         className="hidden md:flex fixed top-0 left-0 h-screen flex-col border-r z-50 transition-all duration-300 ease-in-out"
-        style={{ background: 'var(--pc-bg-base)', borderColor: 'var(--pc-border)', width: collapsed ? '56px' : '240px' }}
+        style={{ background: 'var(--pc-bg-surface)', borderColor: 'var(--pc-border)', width: collapsed ? '56px' : '240px' }}
         aria-label={collapsed ? 'Collapsed sidebar' : 'Main sidebar'}
       >
         <SidebarLogo collapsed={collapsed} />
-        <nav className="flex-1 overflow-y-auto py-4 px-2 space-y-1">
-          {navItems.map((item) => (
-            <SidebarNavItem
-              key={item.to}
-              item={item}
+        <nav className="flex-1 overflow-y-auto py-3 px-2 space-y-0.5" aria-label={t('nav.aria.primary')}>
+          {navGroups.map((group, index) => (
+            <SidebarGroup
+              key={group.headingKey}
+              group={group}
+              index={index}
               showLabel={!collapsed}
               showTooltip={collapsed}
               onClick={onClose}
@@ -138,15 +220,16 @@ export default function Sidebar({ open, onClose, collapsed }: SidebarProps) {
           'md:hidden fixed top-0 left-0 h-screen w-60 flex flex-col border-r z-50 transition-transform duration-200 ease-out',
           open ? 'translate-x-0' : '-translate-x-full',
         ].join(' ')}
-        style={{ background: 'var(--pc-bg-base)', borderColor: 'var(--pc-border)' }}
+        style={{ background: 'var(--pc-bg-surface)', borderColor: 'var(--pc-border)' }}
         aria-label="Mobile menu"
       >
         <SidebarLogo collapsed={false} />
-        <nav className="flex-1 overflow-y-auto py-4 px-3 space-y-1">
-          {navItems.map((item) => (
-            <SidebarNavItem
-              key={item.to}
-              item={item}
+        <nav className="flex-1 overflow-y-auto py-3 px-2 space-y-0.5" aria-label={t('nav.aria.primary')}>
+          {navGroups.map((group, index) => (
+            <SidebarGroup
+              key={group.headingKey}
+              group={group}
+              index={index}
               showLabel
               showTooltip={false}
               onClick={onClose}

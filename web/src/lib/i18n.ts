@@ -12,6 +12,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': '仪表盘',
     'nav.agent': '智能体',
+    'nav.agents': '智能体',
     'nav.tools': '工具',
     'nav.cron': '定时任务',
     'nav.integrations': '集成',
@@ -417,6 +418,42 @@ const translations: Record<Locale, Record<string, string>> = {
     'nav.canvas': 'Canvas',
     'nav.acp': 'ACP',
     'nav.quickstart': 'Quickstart',
+    'nav.group.home': 'Home',
+    'nav.group.chat': 'Chat',
+    'nav.group.configure': 'Configure',
+    'nav.group.operations': 'Operations',
+    'nav.aria.primary': 'Primary navigation',
+    'nav.cmdk.placeholder': 'Search…',
+    'nav.cmdk.title': 'Command palette',
+    'nav.cmdk.empty': 'No results',
+    'nav.cmdk.close': 'Close command palette',
+    'nav.cmdk.hint.navigate': 'Navigate',
+    'nav.cmdk.hint.open': 'Open',
+    'nav.cmdk.hint.dismiss': 'Dismiss',
+
+    // Dashboard
+    'dash.title': 'Dashboard',
+    'dash.subtitle': 'Your agents and system at a glance',
+    'dash.view_all': 'View all',
+    'dash.agents_heading': 'Agents',
+    'dash.metric.agents': 'Agents',
+    'dash.metric.agents.none': 'none configured',
+    'dash.metric.agents.enabled_sub': 'enabled',
+    'dash.metric.enabled': 'Enabled',
+    'dash.metric.enabled.sub': 'active / total',
+    'dash.metric.sessions': 'Sessions',
+    'dash.metric.sessions.sub': 'across all agents',
+    'dash.metric.memories': 'Memories',
+    'dash.metric.memories.sub': 'stored rows',
+    'dash.metric.spend': 'Spend',
+    'dash.metric.spend.sub': 'this month',
+    'dash.metric.spend.untracked': 'per-agent tracking off',
+
+    // Config explorer
+    'cfg.header.quickstart': 'Run Quickstart again',
+    'cfg.field.commentAdd': 'Add comment',
+    'cfg.field.commentHide': 'Remove comment',
+    'cfg.field.commentPlaceholder': 'Optional comment (why?)',
 
     // ACP Console
     'acp.title': 'ACP Console',
@@ -845,6 +882,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'Kontrol Paneli',
     'nav.agent': 'Ajan',
+    'nav.agents': 'Ajan',
     'nav.tools': 'Araçlar',
     'nav.cron': 'Zamanlanmış Görevler',
     'nav.integrations': 'Entegrasyonlar',
@@ -1213,6 +1251,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'لوحة التحكم',
     'nav.agent': 'الوكيل',
+    'nav.agents': 'الوكيل',
     'nav.tools': 'الأدوات',
     'nav.cron': 'المهام المجدولة',
     'nav.integrations': 'التكاملات',
@@ -1569,6 +1608,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'ড্যাশবোর্ড',
     'nav.agent': 'এজেন্ট',
+    'nav.agents': 'এজেন্ট',
     'nav.tools': 'টুলস',
     'nav.cron': 'নির্ধারিত কাজ',
     'nav.integrations': 'ইন্টিগ্রেশন',
@@ -1925,6 +1965,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'Přehled',
     'nav.agent': 'Agent',
+    'nav.agents': 'Agent',
     'nav.tools': 'Nástroje',
     'nav.cron': 'Plánované úlohy',
     'nav.integrations': 'Integrace',
@@ -2281,6 +2322,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'Dashboard',
     'nav.agent': 'Agent',
+    'nav.agents': 'Agent',
     'nav.tools': 'Værktøjer',
     'nav.cron': 'Planlagte opgaver',
     'nav.integrations': 'Integrationer',
@@ -2637,6 +2679,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'Dashboard',
     'nav.agent': 'Agent',
+    'nav.agents': 'Agent',
     'nav.tools': 'Werkzeuge',
     'nav.cron': 'Geplante Aufgaben',
     'nav.integrations': 'Integrationen',
@@ -2993,6 +3036,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'Πίνακας ελέγχου',
     'nav.agent': 'Πράκτορας',
+    'nav.agents': 'Πράκτορας',
     'nav.tools': 'Εργαλεία',
     'nav.cron': 'Προγραμματισμένες εργασίες',
     'nav.integrations': 'Ενσωματώσεις',
@@ -3349,6 +3393,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'Panel de control',
     'nav.agent': 'Agente',
+    'nav.agents': 'Agente',
     'nav.tools': 'Herramientas',
     'nav.cron': 'Tareas programadas',
     'nav.integrations': 'Integraciones',
@@ -3705,6 +3750,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'Hallintapaneeli',
     'nav.agent': 'Agentti',
+    'nav.agents': 'Agentti',
     'nav.tools': 'Työkalut',
     'nav.cron': 'Ajastetut tehtävät',
     'nav.integrations': 'Integraatiot',
@@ -4061,6 +4107,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'Tableau de bord',
     'nav.agent': 'Agent',
+    'nav.agents': 'Agent',
     'nav.tools': 'Outils',
     'nav.cron': 'Tâches planifiées',
     'nav.integrations': 'Intégrations',
@@ -4431,6 +4478,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'לוח בקרה',
     'nav.agent': 'סוכן',
+    'nav.agents': 'סוכן',
     'nav.tools': 'כלים',
     'nav.cron': 'משימות מתוזמנות',
     'nav.integrations': 'אינטגרציות',
@@ -4787,6 +4835,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'डैशबोर्ड',
     'nav.agent': 'एजेंट',
+    'nav.agents': 'एजेंट',
     'nav.tools': 'उपकरण',
     'nav.cron': 'शेड्यूल्ड कार्य',
     'nav.integrations': 'इंटीग्रेशन',
@@ -5143,6 +5192,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'Vezérlőpult',
     'nav.agent': 'Ügynök',
+    'nav.agents': 'Ügynök',
     'nav.tools': 'Eszközök',
     'nav.cron': 'Ütemezett feladatok',
     'nav.integrations': 'Integrációk',
@@ -5499,6 +5549,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'Dasbor',
     'nav.agent': 'Agen',
+    'nav.agents': 'Agen',
     'nav.tools': 'Alat',
     'nav.cron': 'Tugas Terjadwal',
     'nav.integrations': 'Integrasi',
@@ -5855,6 +5906,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'Pannello di controllo',
     'nav.agent': 'Agente',
+    'nav.agents': 'Agente',
     'nav.tools': 'Strumenti',
     'nav.cron': 'Attività pianificate',
     'nav.integrations': 'Integrazioni',
@@ -6211,6 +6263,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'ダッシュボード',
     'nav.agent': 'エージェント',
+    'nav.agents': 'エージェント',
     'nav.tools': 'ツール',
     'nav.cron': 'スケジュールジョブ',
     'nav.integrations': 'インテグレーション',
@@ -6581,6 +6634,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': '대시보드',
     'nav.agent': '에이전트',
+    'nav.agents': '에이전트',
     'nav.tools': '도구',
     'nav.cron': '예약 작업',
     'nav.integrations': '통합',
@@ -6937,6 +6991,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'Dashbord',
     'nav.agent': 'Agent',
+    'nav.agents': 'Agent',
     'nav.tools': 'Verktøy',
     'nav.cron': 'Planlagte jobber',
     'nav.integrations': 'Integrasjoner',
@@ -7293,6 +7348,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'Dashboard',
     'nav.agent': 'Agent',
+    'nav.agents': 'Agent',
     'nav.tools': 'Gereedschappen',
     'nav.cron': 'Geplande taken',
     'nav.integrations': 'Integraties',
@@ -7649,6 +7705,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'Panel',
     'nav.agent': 'Agent',
+    'nav.agents': 'Agent',
     'nav.tools': 'Narzędzia',
     'nav.cron': 'Zaplanowane zadania',
     'nav.integrations': 'Integracje',
@@ -8005,6 +8062,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'Painel',
     'nav.agent': 'Agente',
+    'nav.agents': 'Agente',
     'nav.tools': 'Ferramentas',
     'nav.cron': 'Tarefas Agendadas',
     'nav.integrations': 'Integrações',
@@ -8361,6 +8419,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'Panou de control',
     'nav.agent': 'Agent',
+    'nav.agents': 'Agent',
     'nav.tools': 'Instrumente',
     'nav.cron': 'Sarcini programate',
     'nav.integrations': 'Integrări',
@@ -8717,6 +8776,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'Панель управления',
     'nav.agent': 'Агент',
+    'nav.agents': 'Агент',
     'nav.tools': 'Инструменты',
     'nav.cron': 'Запланированные задачи',
     'nav.integrations': 'Интеграции',
@@ -9087,6 +9147,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'Instrumentpanel',
     'nav.agent': 'Agent',
+    'nav.agents': 'Agent',
     'nav.tools': 'Verktyg',
     'nav.cron': 'Schemalagda jobb',
     'nav.integrations': 'Integrationer',
@@ -9443,6 +9504,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'แดชบอร์ด',
     'nav.agent': 'เอเจนต์',
+    'nav.agents': 'เอเจนต์',
     'nav.tools': 'เครื่องมือ',
     'nav.cron': 'งานตามกำหนดเวลา',
     'nav.integrations': 'การเชื่อมต่อ',
@@ -9799,6 +9861,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'Dashboard',
     'nav.agent': 'Ahente',
+    'nav.agents': 'Ahente',
     'nav.tools': 'Mga Kagamitan',
     'nav.cron': 'Mga Nakaiskedyul na Gawain',
     'nav.integrations': 'Mga Integrasyon',
@@ -10155,6 +10218,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'Панель керування',
     'nav.agent': 'Агент',
+    'nav.agents': 'Агент',
     'nav.tools': 'Інструменти',
     'nav.cron': 'Заплановані завдання',
     'nav.integrations': 'Інтеграції',
@@ -10511,6 +10575,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'ڈیش بورڈ',
     'nav.agent': 'ایجنٹ',
+    'nav.agents': 'ایجنٹ',
     'nav.tools': 'ٹولز',
     'nav.cron': 'شیڈول شدہ کام',
     'nav.integrations': 'انٹیگریشنز',
@@ -10867,6 +10932,7 @@ const translations: Record<Locale, Record<string, string>> = {
     // Navigation
     'nav.dashboard': 'Bảng điều khiển',
     'nav.agent': 'Tác nhân',
+    'nav.agents': 'Tác nhân',
     'nav.tools': 'Công cụ',
     'nav.cron': 'Tác vụ đã lên lịch',
     'nav.integrations': 'Tích hợp',

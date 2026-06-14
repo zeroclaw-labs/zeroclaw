@@ -4,12 +4,14 @@ import Sidebar from '@/components/layout/Sidebar';
 import Header from '@/components/layout/Header';
 import ReloadBanner from '@/components/layout/ReloadBanner';
 import UnsavedChangesBanner from '@/components/layout/UnsavedChangesBanner';
+import CommandPalette, { useCommandPalette } from '@/components/CommandPalette';
 import { ErrorBoundary } from '@/App';
 
 const SIDEBAR_COLLAPSED_KEY = 'zeroclaw-sidebar-collapsed';
 
 export default function Layout() {
   const { pathname } = useLocation();
+  const { open: paletteOpen, openPalette, closePalette } = useCommandPalette();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [collapsed, setCollapsed] = useState(() => {
     try {
@@ -34,7 +36,7 @@ export default function Layout() {
   }, [collapsed]);
 
   return (
-    <div className="min-h-screen text-white" style={{ background: 'var(--pc-bg-base)' }}>
+    <div className="min-h-screen bg-pc-base text-pc-text">
       {/* Fixed sidebar */}
       <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} collapsed={collapsed} />
 
@@ -50,6 +52,7 @@ export default function Layout() {
           onMenuToggle={() => setSidebarOpen((v) => !v)}
           onCollapseToggle={() => setCollapsed((c) => !c)}
           collapsed={collapsed}
+          onOpenPalette={openPalette}
         />
         <ReloadBanner />
         <UnsavedChangesBanner />
@@ -66,6 +69,10 @@ export default function Layout() {
           </ErrorBoundary>
         </main>
       </div>
+
+      {/* Command palette — mounted once for the whole app. Toggled globally
+          via ⌘K / Ctrl+K and from the Header search trigger. */}
+      <CommandPalette open={paletteOpen} onClose={closePalette} />
     </div>
   );
 }
