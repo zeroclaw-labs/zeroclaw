@@ -3630,6 +3630,47 @@ mod tests {
         }
     }
 
+    struct FinalOnlyModelProvider;
+
+    #[async_trait]
+    impl ModelProvider for FinalOnlyModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("delegate saw tool".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("delegate saw tool".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for FinalOnlyModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "FinalOnlyModelProvider"
+        }
+    }
+
     #[tokio::test]
     async fn mcp_tools_included_in_subagent_tool_list() {
         // Build DelegateTool with NO parent tools initially
@@ -3661,6 +3702,79 @@ mod tests {
         assert!(
             result.output.contains("mcp done"),
             "Expected output containing 'mcp done', got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_mcp_activation_updates_delegate_parent_tools() {
+        let config = agentic_agent_config();
+        let parent_tools: Arc<RwLock<Vec<Arc<dyn Tool>>>> = Arc::new(RwLock::new(Vec::new()));
+        let delegate = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec![
+                "mcp_service_a__list_projects".to_string(),
+            ]))
+            .with_parent_tools(Arc::clone(&parent_tools));
+
+        let activated = Arc::new(std::sync::Mutex::new(crate::tools::ActivatedToolSet::new()));
+        let deferred = crate::tools::DeferredMcpToolSet {
+            stubs: vec![{
+                let def = zeroclaw_tools::mcp_protocol::McpToolDef {
+                    name: "list_projects".to_string(),
+                    description: Some("List projects".to_string()),
+                    input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                };
+                zeroclaw_tools::mcp_deferred::DeferredMcpToolStub::new(
+                    "mcp_service_a__list_projects".to_string(),
+                    def,
+                )
+            }],
+            registry: Arc::new(
+                zeroclaw_tools::mcp_client::McpRegistry::connect_all(&[])
+                    .await
+                    .unwrap(),
+            ),
+        };
+        let handle = Arc::clone(&parent_tools);
+        let tool_search = crate::tools::ToolSearchTool::new(deferred, Arc::clone(&activated))
+            .with_activation_hook(Arc::new(move |tool| {
+                let mut tools = handle.write();
+                if !tools.iter().any(|existing| existing.name() == tool.name()) {
+                    tools.push(tool);
+                }
+            }));
+
+        let search = tool_search
+            .execute(serde_json::json!({"query": "select:mcp_service_a__list_projects"}))
+            .await
+            .unwrap();
+        assert!(search.success);
+
+        {
+            let tools = parent_tools.read();
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].name(), "mcp_service_a__list_projects");
+        }
+
+        let model_provider = FinalOnlyModelProvider;
+        let result = delegate
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &model_provider,
+                "run mcp",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "Expected success, got: {:?}", result.error);
+        assert!(
+            result.output.contains("delegate saw tool"),
+            "Expected final output from delegate loop, got: {}",
             result.output
         );
     }

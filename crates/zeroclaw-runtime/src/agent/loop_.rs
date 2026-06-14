@@ -1059,6 +1059,20 @@ pub async fn run(
                             if let Some(policy) = mcp_policy {
                                 tool_search = tool_search.with_access_policy(policy);
                             }
+                            if let Some(ref handle) = delegate_handle {
+                                let delegate_tools = std::sync::Arc::clone(handle);
+                                tool_search = tool_search.with_activation_hook(
+                                    std::sync::Arc::new(move |tool| {
+                                        let mut tools = delegate_tools.write();
+                                        let already_registered = tools
+                                            .iter()
+                                            .any(|existing| existing.name() == tool.name());
+                                        if !already_registered {
+                                            tools.push(tool);
+                                        }
+                                    }),
+                                );
+                            }
                             tools_registry.push(Box::new(tool_search));
                         }
                     } else {
@@ -2476,6 +2490,20 @@ pub async fn process_message(
                                 crate::tools::ToolSearchTool::new(deferred_set, activated);
                             if let Some(policy) = mcp_policy_pm {
                                 tool_search_pm = tool_search_pm.with_access_policy(policy);
+                            }
+                            if let Some(ref handle) = delegate_handle_pm {
+                                let delegate_tools = std::sync::Arc::clone(handle);
+                                tool_search_pm = tool_search_pm.with_activation_hook(
+                                    std::sync::Arc::new(move |tool| {
+                                        let mut tools = delegate_tools.write();
+                                        let already_registered = tools
+                                            .iter()
+                                            .any(|existing| existing.name() == tool.name());
+                                        if !already_registered {
+                                            tools.push(tool);
+                                        }
+                                    }),
+                                );
                             }
                             tools_registry.push(Box::new(tool_search_pm));
                         }
