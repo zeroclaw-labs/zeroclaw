@@ -14,6 +14,7 @@ import {
 import { agentBoundChannels, type AgentBoundChannel } from '@/lib/agentChannels';
 import { t } from '@/lib/i18n';
 import { Badge, Button, Card, PageHeader } from '@/components/ui';
+import ToolPicker from '@/components/ToolPicker';
 import type { CronJob, CronRun } from '@/types/api';
 import {
   AlertCircle,
@@ -729,12 +730,19 @@ export default function Cron() {
                         <label className="block text-[11px] font-medium mb-1.5 uppercase tracking-wider text-pc-text-faint">
                           {t('cron.allowed_tools_optional')}
                         </label>
-                        <input
-                          type="text"
-                          value={formAllowedTools}
-                          onChange={(e) => setFormAllowedTools(e.target.value)}
-                          placeholder={t('cron.allowed_tools_placeholder')}
-                          className="rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-faint transition-colors focus:outline-none focus:border-pc-border-strong focus:ring-2 focus:ring-[var(--pc-focus)]/30 w-full px-3 py-2.5 text-sm font-mono"
+                        {/* The form keeps `formAllowedTools` as the canonical
+                            comma-joined string so the submit path (split on
+                            ',' → parsedTools → body.allowed_tools) is
+                            unchanged. The ToolPicker just reads that string as
+                            string[] and writes the selection back joined with
+                            ', '. */}
+                        <ToolPicker
+                          id="cron-allowed-tools"
+                          value={formAllowedTools
+                            .split(',')
+                            .map((s) => s.trim())
+                            .filter(Boolean)}
+                          onChange={(next) => setFormAllowedTools(next.join(', '))}
                         />
                       </div>
                     </>

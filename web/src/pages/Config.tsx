@@ -36,6 +36,8 @@ import PersonalityEditor from "../components/sections/PersonalityEditor";
 import SkillsBundleEditor from "../components/sections/SkillsBundleEditor";
 import ReloadDaemonButton from "../components/sections/ReloadDaemonButton";
 import SectionPicker from "../components/sections/SectionPicker";
+import SectionNavigator from "../components/sections/SectionNavigator";
+import AddEntityDialog from "../components/sections/AddEntityDialog";
 import SectionTabs, {
   type SectionTabSpec,
 } from "../components/sections/SectionTabs";
@@ -101,6 +103,11 @@ export default function Config() {
   useEffect(fetchDrift, [activeKey]);
 
   const [reloadKey, setReloadKey] = useState(0);
+  // Section whose "+ Add" affordance is open in the navigator (modal).
+  const [addSection, setAddSection] = useState<SectionInfo | null>(null);
+  // Bumped to make the navigator re-fetch its expanded sections' entities
+  // after an add / reload (so a new alias appears without a hard refresh).
+  const [navRefresh, setNavRefresh] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -493,72 +500,80 @@ export default function Config() {
     });
   if (aliasParam) crumbs.push({ label: aliasParam });
 
+  // A "real" selection exists only when the URL carries a section param.
+  // Bare /config (no params) shows the calm empty-state placeholder in the
+  // detail pane even though `activeKey` defaults to the first section (it's
+  // used by the navigator for highlight, not as a selection).
+  const hasSelection = Boolean(sectionParam);
+
   return (
     <div className="flex h-full overflow-hidden">
       {!lockedSection && (
-        // Secondary master pane. Deliberately lighter than the global app
-        // sidebar: no surface fill, faint uppercase group headings, and a
-        // subtle accent-tinted active row (not a heavy fill) so it reads as
-        // a section list inside Config — not a second top-level nav.
-        <aside className="w-52 flex-shrink-0 border-r border-pc-border overflow-y-auto py-2">
-          <nav className="flex flex-col">
-            {GROUP_ORDER.map((groupName) => {
-              const known = new Set(GROUP_ORDER);
-              const items = sections
-                .filter((s) =>
-                  groupName === "Other"
-                    ? s.group === "Other" ||
-                      !known.has(s.group as (typeof GROUP_ORDER)[number])
-                    : s.group === groupName,
-                )
-                .sort((a, b) => {
-                  // Foundation: preserve server-provided canonical order
-                  // (driven by `QUICKSTART_SECTIONS` in the Rust config
-                  // crate). Other groups: alphabetize by label.
-                  if (groupName === "Foundation") {
-                    return sections.indexOf(a) - sections.indexOf(b);
-                  }
-                  return a.label.localeCompare(b.label);
-                });
-              if (items.length === 0) return null;
-              return (
-                <div key={groupName} className="mb-1">
-                  <div className="px-3 pt-3 pb-1 text-[10px] font-medium uppercase tracking-wider text-pc-text-faint">
-                    {groupName}
-                  </div>
-                  {items.map((s) => {
-                    const active = s.key === activeKey;
-                    return (
-                      <button
-                        key={s.key}
-                        type="button"
-                        onClick={() => goToSection(s.key)}
-                        aria-current={active ? "page" : undefined}
-                        className={[
-                          "mx-1.5 flex items-center justify-between gap-2 rounded-[var(--radius-sm)]",
-                          "px-2.5 py-1.5 text-sm text-left transition-colors",
-                          active
-                            ? "bg-pc-accent/10 text-pc-accent font-medium"
-                            : "text-pc-text-secondary hover:bg-pc-elevated/60 hover:text-pc-text",
-                        ].join(" ")}
-                      >
-                        <span className="truncate">{s.label}</span>
-                        {active && (
-                          <ChevronRight className="h-3.5 w-3.5 flex-shrink-0" />
-                        )}
-                      </button>
-                    );
-                  })}
-                </div>
-              );
-            })}
-          </nav>
-        </aside>
+        // Master navigator: searchable section → entity tree. Selecting an
+        // entity navigates to its existing form URL so the detail pane's
+        // dispatch (unchanged) renders the right editor.
+        <SectionNavigator
+          sections={sections}
+          groupOrder={GROUP_ORDER}
+          activeSectionKey={hasSelection ? activeKey : null}
+          selectedPath={location.pathname}
+          onNavigate={(url) => navigate(url)}
+          onSelectSection={(key) => goToSection(key)}
+          onAddToSection={(s) => setAddSection(s)}
+          refreshKey={navRefresh + reloadKey}
+          // Mobile: single-column. Show the navigator when nothing is
+          // selected; once an entity is open the detail pane takes over and
+          // the navigator hides (a "back to list" button returns here).
+          className={hasSelection ? "hidden md:flex" : "flex"}
+        />
       )}
 
-      <main className="flex-1 overflow-y-auto p-6">
-        {activeSection && (
+      {addSection && (
+        <AddEntityDialog
+          section={addSection}
+          onClose={() => setAddSection(null)}
+          onCreated={(url) => {
+            setAddSection(null);
+            setNavRefresh((n) => n + 1);
+            navigate(url);
+          }}
+        />
+      )}
+
+      <main
+        className={`flex-1 overflow-y-auto p-6 ${hasSelection ? "" : "hidden md:block"}`}
+      >
+        {!hasSelection ? (
+          // Empty state — no entity selected. Calm placeholder in the detail
+          // pane; the navigator on the left is the call to action.
+          <div className="flex h-full items-center justify-center">
+            <div className="text-center max-w-sm">
+              <Sparkles className="h-8 w-8 mx-auto mb-3 text-pc-text-faint" />
+              {/* i18n: reuse existing keys if present; otherwise these are
+                  the proposed new keys cfg.empty.title / cfg.empty.body
+                  (reported back to the owner of i18n.ts). */}
+              <p className="text-sm font-medium text-pc-text-secondary">
+                Select a setting
+              </p>
+              <p className="text-xs mt-1 text-pc-text-muted">
+                Pick a section or entry from the navigator to view and edit it
+                here.
+              </p>
+            </div>
+          </div>
+        ) : (
+          activeSection && (
           <div className="flex flex-col gap-4 max-w-3xl min-h-full">
+            {/* Mobile-only: return to the navigator (single-column nav↔detail). */}
+            <Button
+              variant="ghost"
+              size="sm"
+              className="md:hidden self-start"
+              onClick={() => navigate("/config")}
+            >
+              <ArrowLeft className="h-4 w-4" />
+              All settings
+            </Button>
             {/* Layout note: every wrapper between <main> (the scroll
                 container) and FieldForm's save bar uses flex-1 + min-h-0
                 so the form stretches to the viewport bottom. Without
@@ -611,6 +626,7 @@ export default function Config() {
                       goToSection(activeSection.key);
                       fetchDrift();
                       setReloadKey((n) => n + 1);
+                      setNavRefresh((n) => n + 1);
                     }}
                   />
                 </>
@@ -619,6 +635,7 @@ export default function Config() {
 
             <div className="flex-1 min-h-0 flex flex-col">{mainContent}</div>
           </div>
+          )
         )}
       </main>
     </div>

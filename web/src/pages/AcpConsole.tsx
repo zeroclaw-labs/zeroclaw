@@ -508,12 +508,14 @@ export default function AcpConsole() {
         }
         description={t('acp.subtitle')}
         actions={
-          <>
+          // Wrap so the agent-select / status badge / reconnect button stack on
+          // narrow screens instead of clipping out of a single non-wrapping row.
+          <div className="flex flex-wrap items-center gap-2 min-w-0">
             <select
               value={selectedAgentAlias ?? ''}
               onChange={(event) => setSelectedAgentAlias(event.target.value || null)}
               disabled={agentsLoading || !hasEnabledAgent || busy}
-              className="h-9 rounded-[var(--radius-md)] border border-pc-border bg-pc-input px-3 text-[13px] font-medium text-pc-text-secondary disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-pc-accent/40 focus-visible:border-pc-accent/40"
+              className="h-9 min-w-0 max-w-full rounded-[var(--radius-md)] border border-pc-border bg-pc-input px-3 text-[13px] font-medium text-pc-text-secondary disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-pc-accent/40 focus-visible:border-pc-accent/40"
               aria-label="ACP agent"
               title="ACP agent"
             >
@@ -544,7 +546,7 @@ export default function AcpConsole() {
               <RefreshCw className="h-4 w-4" />
               {t('acp.reconnect')}
             </Button>
-          </>
+          </div>
         }
       />
 

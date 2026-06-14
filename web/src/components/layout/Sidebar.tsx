@@ -29,8 +29,10 @@ interface NavGroup {
 }
 
 // Grouped navigation. Every existing route/link is preserved — the flat list
-// is just organized under four headings so the sidebar reads top-down by task:
-// Home → Chat → Configure → Operations.
+// is just organized under four clusters so the rail reads top-down by task:
+// Home → Chat → Configure → Operations. On the desktop rail the cluster
+// boundaries become thin divider rules (no text headings); the mobile drawer
+// still renders the headings as full labels.
 const navGroups: NavGroup[] = [
   {
     headingKey: 'nav.group.home',
@@ -67,39 +69,37 @@ const navGroups: NavGroup[] = [
 // route still works for bookmarks, but no top-level nav entries point
 // at it. Run-setup-again link in /config covers the wizard re-entry.
 
-// Shared nav item sub-component — eliminates duplication between mobile & desktop nav
-function SidebarNavItem({ item, showLabel, showTooltip, onClick }: {
-  item: NavItem;
-  showLabel: boolean;
-  showTooltip: boolean;
-  onClick: () => void;
-}) {
+// ── Desktop rail item ───────────────────────────────────────────────────────
+// Icon-only nav item for the slim rail. The icon is the affordance; the label
+// is exposed three ways: title (native tooltip), aria-label (screen readers),
+// and a token-styled popover to the right shown on hover OR keyboard focus.
+// Active state = accent icon + a 2px left accent bar + subtle accent tint, with
+// aria-current="page" so assistive tech announces the current section.
+function RailNavItem({ item, onClick }: { item: NavItem; onClick: () => void }) {
   const { to, icon: Icon, labelKey } = item;
   const text = t(labelKey);
   return (
     <NavLink
-      key={to}
       to={to}
       end={to === '/'}
       onClick={onClick}
+      title={text}
+      aria-label={text}
       className={({ isActive }) =>
         [
-          // Calm console row: subtle accent tint + a 2px left accent bar when
-          // active (the bar/icon carry the accent; the label stays primary
-          // text so the row reads quiet rather than as a bright filled pill).
-          'flex items-center rounded-[var(--radius-md)] text-sm font-medium transition-colors duration-150 group relative',
-          showLabel ? 'justify-start gap-3 px-3 py-2' : 'justify-center w-10 h-10 mx-auto',
+          'group relative flex h-10 w-10 mx-auto items-center justify-center',
+          'rounded-[var(--radius-md)] transition-colors duration-150',
+          'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]',
           isActive
-            ? 'bg-pc-accent/10 text-pc-text'
+            ? 'bg-pc-accent/10 text-pc-accent'
             : 'text-pc-text-muted hover:text-pc-text-secondary hover:bg-[var(--pc-hover)]',
         ].join(' ')
       }
     >
       {({ isActive }) => (
         <>
-          {/* 2px left accent bar — only on the expanded (labelled) layout so it
-              doesn't crowd the centered collapsed icons. */}
-          {isActive && showLabel && (
+          {/* 2px left accent bar marking the active item against the rail edge. */}
+          {isActive && (
             <span
               aria-hidden="true"
               className="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-full bg-pc-accent"
@@ -110,62 +110,89 @@ function SidebarNavItem({ item, showLabel, showTooltip, onClick }: {
               isActive ? 'text-pc-accent' : 'group-hover:text-pc-text-secondary'
             }`}
           />
-          {showLabel && <span className="whitespace-nowrap">{text}</span>}
-          {showTooltip && (
-            <span
-              className="absolute left-full ml-2 px-2 py-1 rounded-[var(--radius-sm)] text-xs whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-9999"
-              style={{ background: 'var(--pc-bg-elevated)', color: 'var(--pc-text-primary)', border: '1px solid var(--pc-border)' }}
-            >
-              {text}
-            </span>
-          )}
+          {/* Tooltip popover to the right — appears on pointer hover and on
+              keyboard focus (focus-within) so the rail is usable without a
+              mouse. Token-styled; non-interactive so it never traps focus. */}
+          <span
+            role="tooltip"
+            className="pointer-events-none absolute left-full ml-2 z-9999 whitespace-nowrap rounded-[var(--radius-sm)] px-2 py-1 text-xs opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100"
+            style={{
+              background: 'var(--pc-bg-elevated)',
+              color: 'var(--pc-text-primary)',
+              border: '1px solid var(--pc-border)',
+            }}
+          >
+            {text}
+          </span>
         </>
       )}
     </NavLink>
   );
 }
 
-// Renders one nav group: a heading (or a thin divider when collapsed) plus its
-// items. The heading is associated with its <ul> via aria-labelledby so screen
-// readers announce the group name. The leading group renders without a top
-// divider so the list doesn't open with a stray rule.
-function SidebarGroup({ group, index, showLabel, showTooltip, onClick }: {
+// ── Mobile drawer item ──────────────────────────────────────────────────────
+// Full labelled row (icon + text) for the mobile drawer, with the same calm
+// active treatment as before: subtle accent tint, 2px left accent bar, accent
+// icon, and aria-current via NavLink.
+function DrawerNavItem({ item, onClick }: { item: NavItem; onClick: () => void }) {
+  const { to, icon: Icon, labelKey } = item;
+  const text = t(labelKey);
+  return (
+    <NavLink
+      to={to}
+      end={to === '/'}
+      onClick={onClick}
+      className={({ isActive }) =>
+        [
+          'group relative flex items-center justify-start gap-3 px-3 py-2',
+          'rounded-[var(--radius-md)] text-sm font-medium transition-colors duration-150',
+          isActive
+            ? 'bg-pc-accent/10 text-pc-text'
+            : 'text-pc-text-muted hover:text-pc-text-secondary hover:bg-[var(--pc-hover)]',
+        ].join(' ')
+      }
+    >
+      {({ isActive }) => (
+        <>
+          {isActive && (
+            <span
+              aria-hidden="true"
+              className="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-full bg-pc-accent"
+            />
+          )}
+          <Icon
+            className={`h-[18px] w-[18px] shrink-0 transition-colors ${
+              isActive ? 'text-pc-accent' : 'group-hover:text-pc-text-secondary'
+            }`}
+          />
+          <span className="whitespace-nowrap">{text}</span>
+        </>
+      )}
+    </NavLink>
+  );
+}
+
+// ── Mobile drawer group ─────────────────────────────────────────────────────
+// One labelled cluster: a faint uppercase heading associated with its <ul> via
+// aria-labelledby so screen readers announce the group name.
+function DrawerGroup({ group, index, onClick }: {
   group: NavGroup;
   index: number;
-  showLabel: boolean;
-  showTooltip: boolean;
   onClick: () => void;
 }) {
   const heading = t(group.headingKey);
   const headingId = `nav-group-${index}`;
   return (
-    <div role="group" aria-labelledby={showLabel ? headingId : undefined} className="space-y-0.5">
-      {showLabel ? (
-        <h2
-          id={headingId}
-          className="px-3 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider select-none"
-          style={{ color: 'var(--pc-text-faint)' }}
-        >
-          {heading}
-        </h2>
-      ) : (
-        index > 0 && (
-          <div
-            className="mx-auto my-2 h-px w-6"
-            style={{ background: 'var(--pc-separator)' }}
-            role="presentation"
-            aria-label={heading}
-          />
-        )
-      )}
+    <div role="group" aria-labelledby={headingId} className="space-y-0.5">
+      <h2
+        id={headingId}
+        className="px-3 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider select-none"
+        style={{ color: 'var(--pc-text-faint)' }}
+      >
+        {heading}
+      </h2>
       {group.items.map((item) => (
-        <SidebarNavItem
-          key={item.to}
-          item={item}
-          showLabel={showLabel}
-          showTooltip={showTooltip}
-          onClick={onClick}
-        />
+        <DrawerNavItem key={item.to} item={item} onClick={onClick} />
       ))}
     </div>
   );
@@ -174,10 +201,9 @@ function SidebarGroup({ group, index, showLabel, showTooltip, onClick }: {
 interface SidebarProps {
   open: boolean;
   onClose: () => void;
-  collapsed: boolean;
 }
 
-export default function Sidebar({ open, onClose, collapsed }: SidebarProps) {
+export default function Sidebar({ open, onClose }: SidebarProps) {
   return (
     <>
       {/* Backdrop — mobile only */}
@@ -192,71 +218,95 @@ export default function Sidebar({ open, onClose, collapsed }: SidebarProps) {
         />
       )}
 
-      {/* Desktop sidebar — collapsible */}
+      {/* Desktop rail — permanent slim icon rail, always 56px. No collapse
+          toggle: the rail is the navigation. Grouping is expressed as thin
+          divider rules between the icon clusters. */}
       <aside
-        className="hidden md:flex fixed top-0 left-0 h-screen flex-col border-r z-50 transition-all duration-300 ease-in-out"
-        style={{ background: 'var(--pc-bg-surface)', borderColor: 'var(--pc-border)', width: collapsed ? '56px' : '240px' }}
-        aria-label={collapsed ? 'Collapsed sidebar' : 'Main sidebar'}
+        className="hidden md:flex fixed top-0 left-0 h-screen w-14 flex-col border-r z-50"
+        style={{ background: 'var(--pc-bg-sidebar)', borderColor: 'var(--pc-border)' }}
+        aria-label={t('nav.aria.primary')}
       >
-        <SidebarLogo collapsed={collapsed} />
-        <nav className="flex-1 overflow-y-auto py-3 px-2 space-y-0.5" aria-label={t('nav.aria.primary')}>
+        <RailLogo />
+        <nav className="flex-1 overflow-y-auto py-3 px-1.5" aria-label={t('nav.aria.primary')}>
           {navGroups.map((group, index) => (
-            <SidebarGroup
-              key={group.headingKey}
-              group={group}
-              index={index}
-              showLabel={!collapsed}
-              showTooltip={collapsed}
-              onClick={onClose}
-            />
+            <div key={group.headingKey} className="space-y-1" role="group" aria-label={t(group.headingKey)}>
+              {/* Thin divider between clusters (skipped before the first). */}
+              {index > 0 && (
+                <div
+                  className="mx-auto my-2 h-px w-6"
+                  style={{ background: 'var(--pc-separator)' }}
+                  role="presentation"
+                />
+              )}
+              {group.items.map((item) => (
+                <RailNavItem key={item.to} item={item} onClick={onClose} />
+              ))}
+            </div>
           ))}
         </nav>
-        <SidebarFooter collapsed={collapsed} layout="desktop" />
+        <RailFooter />
       </aside>
 
-      {/* Mobile sidebar — slides in/out */}
+      {/* Mobile drawer — labelled full version (icons + labels), slides in/out. */}
       <aside
         className={[
           'md:hidden fixed top-0 left-0 h-screen w-60 flex flex-col border-r z-50 transition-transform duration-200 ease-out',
           open ? 'translate-x-0' : '-translate-x-full',
         ].join(' ')}
-        style={{ background: 'var(--pc-bg-surface)', borderColor: 'var(--pc-border)' }}
+        style={{ background: 'var(--pc-bg-sidebar)', borderColor: 'var(--pc-border)' }}
         aria-label="Mobile menu"
       >
-        <SidebarLogo collapsed={false} />
+        <DrawerLogo />
         <nav className="flex-1 overflow-y-auto py-3 px-2 space-y-0.5" aria-label={t('nav.aria.primary')}>
           {navGroups.map((group, index) => (
-            <SidebarGroup
-              key={group.headingKey}
-              group={group}
-              index={index}
-              showLabel
-              showTooltip={false}
-              onClick={onClose}
-            />
+            <DrawerGroup key={group.headingKey} group={group} index={index} onClick={onClose} />
           ))}
         </nav>
-        <SidebarFooter collapsed={false} layout="mobile" />
+        <DrawerFooter />
       </aside>
     </>
   );
 }
 
-// Extracted sub-components to keep markup DRY
+// ── Logo / mark ─────────────────────────────────────────────────────────────
 
-function SidebarLogo({ collapsed }: { collapsed: boolean }) {
+// Compact mark for the slim rail — the logo image only, centered, no wordmark.
+function RailLogo() {
+  return (
+    <div
+      className="flex items-center justify-center border-b shrink-0"
+      style={{ borderColor: 'var(--pc-border)', height: '56px' }}
+    >
+      <div className="relative shrink-0">
+        <div
+          className="absolute -inset-1.5 rounded-xl"
+          style={{ background: 'linear-gradient(135deg, rgba(var(--pc-accent-rgb), 0.15), rgba(var(--pc-accent-rgb), 0.05))' }}
+        />
+        <img
+          src={`${basePath}/_app/zeroclaw-trans.png`}
+          alt="ZeroClaw"
+          className="relative h-8 w-8 rounded-xl object-cover"
+          onError={(e) => {
+            e.currentTarget.style.display = 'none';
+          }}
+        />
+      </div>
+    </div>
+  );
+}
+
+// Full mark + wordmark for the mobile drawer.
+function DrawerLogo() {
   return (
     <div
       className="flex items-center border-b shrink-0 overflow-hidden"
-      style={{
-        borderColor: 'var(--pc-border)',
-        height: '56px',
-        padding: collapsed ? '0 14px' : '0 16px',
-        gap: collapsed ? '0' : '12px',
-      }}
+      style={{ borderColor: 'var(--pc-border)', height: '56px', padding: '0 16px', gap: '12px' }}
     >
       <div className="relative shrink-0">
-        <div className="absolute -inset-1.5 rounded-xl" style={{ background: 'linear-gradient(135deg, rgba(var(--pc-accent-rgb), 0.15), rgba(var(--pc-accent-rgb), 0.05))' }} />
+        <div
+          className="absolute -inset-1.5 rounded-xl"
+          style={{ background: 'linear-gradient(135deg, rgba(var(--pc-accent-rgb), 0.15), rgba(var(--pc-accent-rgb), 0.05))' }}
+        />
         <img
           src={`${basePath}/_app/zeroclaw-trans.png`}
           alt="ZeroClaw"
@@ -267,12 +317,8 @@ function SidebarLogo({ collapsed }: { collapsed: boolean }) {
         />
       </div>
       <span
-        className="text-sm font-semibold tracking-wide whitespace-nowrap transition-opacity duration-200"
-        style={{
-          color: 'var(--pc-text-primary)',
-          opacity: collapsed ? 0 : 1,
-          pointerEvents: collapsed ? 'none' : 'auto',
-        }}
+        className="text-sm font-semibold tracking-wide whitespace-nowrap"
+        style={{ color: 'var(--pc-text-primary)' }}
       >
         ZeroClaw
       </span>
@@ -280,47 +326,48 @@ function SidebarLogo({ collapsed }: { collapsed: boolean }) {
   );
 }
 
-function SidebarFooter({ collapsed, layout }: { collapsed: boolean; layout: 'desktop' | 'mobile' }) {
-  const [version, setVersion] = useState<string | null>(null);
+// ── Footers ─────────────────────────────────────────────────────────────────
 
+function useVersion() {
+  const [version, setVersion] = useState<string | null>(null);
   useEffect(() => {
     getStatus()
       .then((s) => { if (s.version) setVersion(s.version); })
       .catch(() => { /* silently ignore */ });
   }, []);
+  return version;
+}
 
-  if (layout === 'mobile') {
-    return (
-      <div
-        className="px-5 py-4 border-t text-[10px] uppercase tracking-wider"
-        style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-faint)' }}
-      >
-        ZeroClaw Gateway
-        {version && (
-          <div className="mt-0.5 normal-case tracking-normal" style={{ fontSize: '9px' }}>
-            v{version}
-          </div>
-        )}
-      </div>
-    );
-  }
+// Rail footer — version tag only, centered, with a native tooltip carrying the
+// full "ZeroClaw Gateway vX" string since the rail has no room for the label.
+function RailFooter() {
+  const version = useVersion();
   return (
     <div
-      className="border-t shrink-0 whitespace-nowrap overflow-hidden transition-opacity duration-200"
-      style={{
-        borderColor: 'var(--pc-border)',
-        padding: collapsed ? '12px 0' : '16px 20px',
-        fontSize: '10px',
-        color: 'var(--pc-text-faint)',
-        textTransform: 'uppercase',
-        letterSpacing: '0.1em',
-        opacity: collapsed ? 0 : 1,
-        textAlign: collapsed ? 'center' : 'left',
-      }}
+      className="border-t shrink-0 flex items-center justify-center"
+      style={{ borderColor: 'var(--pc-border)', padding: '10px 0' }}
+      title={version ? `ZeroClaw Gateway v${version}` : 'ZeroClaw Gateway'}
     >
-      {!collapsed && 'ZeroClaw Gateway'}
-      {!collapsed && version && (
-        <div style={{ marginTop: '2px', fontSize: '9px', textTransform: 'none', letterSpacing: 'normal' }}>
+      {version && (
+        <span style={{ fontSize: '9px', color: 'var(--pc-text-faint)' }}>
+          v{version}
+        </span>
+      )}
+    </div>
+  );
+}
+
+// Drawer footer — full labelled gateway line for mobile.
+function DrawerFooter() {
+  const version = useVersion();
+  return (
+    <div
+      className="px-5 py-4 border-t text-[10px] uppercase tracking-wider"
+      style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-faint)' }}
+    >
+      ZeroClaw Gateway
+      {version && (
+        <div className="mt-0.5 normal-case tracking-normal" style={{ fontSize: '9px' }}>
           v{version}
         </div>
       )}

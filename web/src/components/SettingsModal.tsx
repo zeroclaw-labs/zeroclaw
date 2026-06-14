@@ -81,6 +81,7 @@ function ThemePreviewCard({
       onClick={onClick}
       className={[
         'flex flex-col gap-1.5 p-2 rounded-[var(--radius-lg)] border text-left group',
+        'min-w-0 w-full', // let the card shrink with the grid track on narrow screens
         'transition-colors duration-150 cursor-pointer',
         'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]',
         'focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base',
@@ -88,7 +89,6 @@ function ThemePreviewCard({
           ? 'border-pc-accent bg-pc-accent/10'
           : 'border-pc-border hover:bg-[var(--pc-hover)] hover:border-pc-border-strong',
       ].join(' ')}
-      style={{ minWidth: '110px' }}
       aria-pressed={active}
     >
       {/* Mini terminal — keeps the theme's literal preview colors (it is a preview). */}
@@ -219,11 +219,11 @@ export function SettingsModal({ open, onClose }: Props) {
       <div className="absolute inset-0 bg-pc-base/70 backdrop-blur-sm" />
       <div
         ref={panelRef}
-        className="relative w-full max-w-2xl mx-4 rounded-[var(--radius-xl)] border border-pc-border bg-pc-base shadow-[var(--pc-shadow-md)] animate-fade-in"
+        className="relative flex flex-col w-full max-w-2xl mx-4 max-h-[90vh] rounded-[var(--radius-xl)] border border-pc-border bg-pc-base shadow-[var(--pc-shadow-md)] animate-fade-in"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-pc-border">
+        <div className="flex-shrink-0 flex items-center justify-between px-6 py-4 border-b border-pc-border">
           <div className="flex items-center gap-2.5">
             <Settings size={18} className="text-pc-accent-light" />
             <h2 className="text-sm font-semibold text-pc-text">{t('settings.title')}</h2>
@@ -232,14 +232,14 @@ export function SettingsModal({ open, onClose }: Props) {
             type="button"
             onClick={onClose}
             aria-label="Close"
-            className="h-8 w-8 rounded-[var(--radius-md)] flex items-center justify-center text-pc-text-muted transition-colors hover:bg-[var(--pc-hover)] hover:text-pc-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base"
+            className="h-11 w-11 -mr-2 rounded-[var(--radius-md)] flex items-center justify-center text-pc-text-muted transition-colors hover:bg-[var(--pc-hover)] hover:text-pc-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base"
           >
             <X size={16} />
           </button>
         </div>
 
         {/* Body */}
-        <div className="px-6 py-4 max-h-[65vh] overflow-y-auto">
+        <div className="flex-1 min-h-0 px-6 py-4 overflow-y-auto">
           {/* Tabs */}
           <div className="flex gap-2 mb-4">
             {tabs.map(tTab => (
@@ -304,22 +304,29 @@ export function SettingsModal({ open, onClose }: Props) {
               {/* Accent Color */}
               <div className="mb-4">
                 <div className="text-xs mb-2 text-pc-text-secondary">{t('theme.accent')}</div>
-                <div className="flex gap-2">
+                {/* flex-wrap so swatches never overflow the modal on a phone; each
+                    button carries a ≥44px hit area (min-h/min-w + padding) while the
+                    visible swatch stays 28px. */}
+                <div className="flex flex-wrap gap-1">
                   {accentOptions.map(opt => (
                     <button
                       key={opt.value}
                       type="button"
                       onClick={() => setAccent(opt.value)}
-                      className="relative h-7 w-7 rounded-full transition-all flex items-center justify-center cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base"
-                      style={{
-                        backgroundColor: opt.color,
-                        border: accent === opt.value ? `2px solid ${opt.color}` : '2px solid transparent',
-                        boxShadow: accent === opt.value ? `0 0 8px ${opt.color}40` : 'none',
-                      }}
+                      className="relative flex min-h-[44px] min-w-[44px] items-center justify-center rounded-full p-2 cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base"
                       aria-pressed={accent === opt.value}
                       aria-label={`${opt.value} accent`}
                     >
-                      {accent === opt.value && <Check size={14} style={{ color: 'white' }} />}
+                      <span
+                        className="flex h-7 w-7 items-center justify-center rounded-full transition-all"
+                        style={{
+                          backgroundColor: opt.color,
+                          border: accent === opt.value ? `2px solid ${opt.color}` : '2px solid transparent',
+                          boxShadow: accent === opt.value ? `0 0 8px ${opt.color}40` : 'none',
+                        }}
+                      >
+                        {accent === opt.value && <Check size={14} style={{ color: 'white' }} />}
+                      </span>
                     </button>
                   ))}
                 </div>
@@ -331,7 +338,7 @@ export function SettingsModal({ open, onClose }: Props) {
           {tab === 'themes' && (
             <>
               <SectionTitle>Dark Themes</SectionTitle>
-              <div className="grid grid-cols-3 sm:grid-cols-4 gap-2 mb-4">
+              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2 mb-4">
                 {darkThemes.map(ct => (
                   <ThemePreviewCard
                     key={ct.id}
@@ -343,7 +350,7 @@ export function SettingsModal({ open, onClose }: Props) {
               </div>
 
               <SectionTitle>Light Themes</SectionTitle>
-              <div className="grid grid-cols-3 sm:grid-cols-4 gap-2 mb-4">
+              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2 mb-4">
                 {lightThemes.map(ct => (
                   <ThemePreviewCard
                     key={ct.id}

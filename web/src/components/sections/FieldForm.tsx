@@ -38,6 +38,7 @@ import {
   X,
 } from "lucide-react";
 import DirectoryPicker from "./DirectoryPicker";
+import ToolPicker from "@/components/ToolPicker";
 import { Badge, Button } from "@/components/ui";
 import type { BadgeTone } from "@/components/ui";
 import { t } from "@/lib/i18n";
@@ -392,6 +393,57 @@ function isOptionalArray(typeHint: string): boolean {
   );
 }
 
+// A field is "required" (in the display-only validation sense) when its Rust
+// type signature is NOT wrapped in `Option<…>`. Read purely from the schema's
+// own `type_hint`, so nothing is hardcoded per field. Used only to surface an
+// inline hint — the authoritative required/optional check still runs in
+// `Config::validate()` on the server at save time.
+function isRequiredField(typeHint: string): boolean {
+  return !typeHint.replace(/\s+/g, "").startsWith("Option<");
+}
+
+// Display-only, pre-save validation derived entirely from the entry's own
+// metadata (`kind` + `type_hint`). Returns a short message to show under the
+// input (red), or null when the current draft value looks fine. This NEVER
+// blocks typing and NEVER changes what gets serialized on save — the
+// authoritative validation remains `Config::validate()` server-side, surfaced
+// inline via the `.path`-bound `ConfigApiError`. Scope is deliberately narrow:
+// only constraints we can read locally (a required scalar left empty; a
+// non-numeric value in an integer/float field).
+function validationHint(entry: ListResponseEntry, raw: string): string | null {
+  // Secrets: an empty box means "keep the stored value", never "cleared" —
+  // so emptiness is never an error here.
+  if (entry.is_secret) return null;
+  const renderer = rendererFor(entry);
+  const trimmed = raw.trim();
+
+  if (renderer === "number" && trimmed.length > 0) {
+    const n = Number(trimmed);
+    if (!Number.isFinite(n)) {
+      return entry.kind === "integer"
+        ? "Must be a whole number."
+        : "Must be a number.";
+    }
+    if (entry.kind === "integer" && !Number.isInteger(n)) {
+      return "Must be a whole number (no decimals).";
+    }
+  }
+
+  // Required scalar left empty. Arrays/object-arrays carry their own three-state
+  // semantics (empty list vs none) handled at save time, so we don't flag them.
+  if (
+    isRequiredField(entry.type_hint) &&
+    renderer !== "array" &&
+    renderer !== "object-array" &&
+    renderer !== "bool" &&
+    trimmed.length === 0
+  ) {
+    return "This field is required.";
+  }
+
+  return null;
+}
+
 // Per-provider+alias catalog cache. Cleared via clearFieldFormCatalogCaches() on
 // nav so a new model alias added under (say) `anthropic` shows up the next
 // time the user opens an agent form without a hard refresh.
@@ -473,6 +525,32 @@ function agentFieldKey(path: string): string | null {
 function peerGroupFieldKey(path: string): string | null {
   const m = path.match(/^peer_groups\.[^.]+\.(.+)$/);
   return m && m[1] ? m[1] : null;
+}
+
+// Leaf-based single-alias reference map. The agent/peer-group maps above are
+// gated on the `agents.*` / `peer_groups.*` prefix; this map matches the same
+// clearly-referential fields by their dotted-path LEAF, in the same
+// field-semantic spirit as the `…model` datalist and `allowed_tools` ToolPicker
+// hooks (no hardcoded parent section). It is consulted only as a fallback when
+// the prefixed maps don't apply, so existing behavior is unchanged. Each leaf's
+// value is a single alias string of the target section — byte-identical to the
+// free-text value it replaces — so the save/PATCH serialization is untouched.
+// If the target section's aliases can't be fetched, the field FALLS BACK to the
+// existing text input (the picker only renders when `agentOptions` is loaded
+// and the option list is non-empty).
+const LEAF_SINGLE_ALIAS_FIELDS: Record<string, keyof AgentOptionsResponse> = {
+  model_provider: "model_providers",
+  risk_profile: "risk_profiles",
+  runtime_profile: "runtime_profiles",
+  memory_namespace: "memory_namespaces",
+};
+
+// Resolve the single-alias reference section for a field by its path leaf.
+// Returns null for anything not in the conservative reference map, leaving the
+// field as free text.
+function leafSingleAliasKind(path: string): keyof AgentOptionsResponse | null {
+  const leaf = path.split(".").pop() ?? "";
+  return LEAF_SINGLE_ALIAS_FIELDS[leaf] ?? null;
 }
 
 // Cross-section navigation map for agent alias-ref fields. Each entry
@@ -1075,6 +1153,12 @@ function FieldRow({
 }: FieldRowProps) {
   const renderer = rendererFor(entry);
   const requirement = setupRequirement(entry);
+  // Display-only inline validation derived from this entry's schema metadata.
+  // Pure read of `value` — it does not feed the save/PATCH path in any way.
+  const validationMessage = validationHint(entry, value);
+  // Suppress the local hint while a server-side error is already bound to this
+  // field so the two don't stack; the authoritative server message wins.
+  const showValidation = validationMessage !== null && !error;
   // The per-row "why?" comment is gated behind a reveal so it doesn't add a
   // permanent second input to every row. Open it automatically when a
   // comment value is already staged so the operator sees their own note.
@@ -1111,6 +1195,24 @@ function FieldRow({
   const showPicker = skillBundleAlias !== null || isDirectoryField;
   const [pickerOpen, setPickerOpen] = useState(false);
 
+  // Tool-list enrichment — mirrors the per-alias `…model` field hook above.
+  // Any `string-array` field whose dotted-path leaf is `allowed_tools`
+  // (risk profiles, agents, …) renders the multi-select ToolPicker instead
+  // of the one-value-per-line chip/text editor. Matched on the schema's own
+  // path leaf, not a hardcoded section, so every `*.allowed_tools` list
+  // gets the same picker. The draft value it reads/writes is the SAME
+  // JSON-array string the ArrayFieldEditor uses, so parseInput() at save
+  // time is untouched and the PATCH op is byte-identical.
+  // Tool-list fields (allowed_tools / excluded_tools) get the catalog-backed
+  // ToolPicker; detection is by leaf name, in the same field-semantic spirit
+  // as the provider model-field datalist hook (no hardcoded section keys).
+  const isAllowedToolsField =
+    entry.kind === "string-array" &&
+    (() => {
+      const leaf = entry.path.split(".").pop();
+      return leaf === "allowed_tools" || leaf === "excluded_tools";
+    })();
+
   // Agent-form alias pickers. Each `agents.<alias>.<field>` row that
   // references another section's aliases (channels, model_provider, etc.)
   // renders as a picker over the live config rather than a free-text
@@ -1119,11 +1221,20 @@ function FieldRow({
   const peerGroupField = peerGroupFieldKey(entry.path);
   // Schema path is kebab-case (matches prop_fields() emission).
   const isAgentSystemPrompt = agentField === "system-prompt";
-  const agentSingleAliasKind: keyof AgentOptionsResponse | null = agentField
-    ? (AGENT_SINGLE_ALIAS_FIELDS[agentField] ?? null)
-    : peerGroupField
-      ? (PEER_GROUP_SINGLE_ALIAS_FIELDS[peerGroupField] ?? null)
-      : null;
+  // Resolve which referenced section (if any) this single-value field points
+  // at. Prefer the agent / peer-group field maps; otherwise fall back to a
+  // leaf-name match (model_provider / risk_profile / runtime_profile /
+  // memory_namespace). The leaf fallback runs LAST so it also covers those
+  // reference fields when they appear UNDER `agents.*` (e.g.
+  // agents.<alias>.risk_profile, which the agent field map doesn't list).
+  // Falls back to free text if the target section's aliases can't be fetched.
+  const agentSingleAliasKind: keyof AgentOptionsResponse | null =
+    (agentField ? AGENT_SINGLE_ALIAS_FIELDS[agentField] : undefined) ??
+    (peerGroupField
+      ? PEER_GROUP_SINGLE_ALIAS_FIELDS[peerGroupField]
+      : undefined) ??
+    leafSingleAliasKind(entry.path) ??
+    null;
   const agentMultiAliasKind: keyof AgentOptionsResponse | null = agentField
     ? (AGENT_MULTI_ALIAS_FIELDS[agentField] ?? null)
     : peerGroupField
@@ -1267,7 +1378,14 @@ function FieldRow({
         )}
       </div>
 
-      <div className="mt-2 space-y-1.5">
+      <div
+        className={
+          showValidation
+            ? "mt-2 space-y-1.5 rounded-[var(--radius-md)] ring-1 ring-status-error p-1.5 -m-1.5"
+            : "mt-2 space-y-1.5"
+        }
+        aria-invalid={showValidation || undefined}
+      >
         {renderer === "bool" ? (
           <BoolSwitch
             id={entry.path}
@@ -1387,6 +1505,19 @@ function FieldRow({
               suggestions={agentOptions[agentMultiAliasKind]}
             />
           )
+        ) : isAllowedToolsField ? (
+          // `allowed_tools` lists get the catalog-backed multi-select. We
+          // bridge to the picker using the SAME draft representation every
+          // other string-array field uses: the value is the JSON-array
+          // string, so `parseArrayRows` decodes it to `string[]` for the
+          // picker and `JSON.stringify` re-encodes the picker's output —
+          // identical to ArrayFieldEditor.writeRows. The save path
+          // (parseInput → parseStringArrayValue) never sees a difference.
+          <ToolPicker
+            id={entry.path}
+            value={parseArrayRows(value)}
+            onChange={(next) => onChange(JSON.stringify(next))}
+          />
         ) : renderer === "array" ? (
           <ArrayFieldEditor
             inputId={entry.path}
@@ -1464,6 +1595,12 @@ function FieldRow({
                 : ""
             }
           />
+        )}
+
+        {showValidation && (
+          <p className="text-xs text-status-error" role="alert">
+            {validationMessage}
+          </p>
         )}
 
         {showComment ? (

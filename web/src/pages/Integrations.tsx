@@ -1,10 +1,42 @@
 import { useState, useEffect } from 'react';
-import { Puzzle, Check, Zap } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
+import { Puzzle, Check, Zap, ArrowRight } from 'lucide-react';
 import type { Integration } from '@/types/api';
 import { getIntegrations } from '@/lib/api';
 import { t } from '@/lib/i18n';
 import { Badge, Card, PageHeader } from '@/components/ui';
 import type { BadgeTone } from '@/components/ui';
+
+/**
+ * Derive a channel-type slug from an integration's display name so a card can
+ * link into the schema-driven Channels config. Lower-cased, trimmed, with runs
+ * of non-alphanumerics collapsed to a single hyphen and edges trimmed.
+ * Returns `null` when nothing slug-worthy remains, signalling the caller to
+ * fall back to the bare Channels section.
+ */
+function channelSlug(name: string): string | null {
+  const slug = name
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return slug.length > 0 ? slug : null;
+}
+
+/** Config destination for an integration, routed by its category: AI-model
+ *  providers land under the model-providers section, chat platforms under
+ *  channels, everything else on the config root (the navigator). */
+function configHref(name: string, category: string): string {
+  const slug = channelSlug(name);
+  const c = category.toLowerCase();
+  if (c.includes('model')) {
+    return slug ? `/config/providers.models/${slug}` : '/config/providers.models';
+  }
+  if (c.includes('chat') || c.includes('channel')) {
+    return slug ? `/config/channels/${slug}` : '/config/channels';
+  }
+  return '/config';
+}
 
 function statusBadge(status: Integration['status']) {
   switch (status) {
@@ -24,6 +56,7 @@ function statusBadge(status: Integration['status']) {
 }
 
 export default function Integrations() {
+  const navigate = useNavigate();
   const [integrations, setIntegrations] = useState<Integration[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -71,6 +104,7 @@ export default function Integrations() {
     <div className="p-6 space-y-6">
       <PageHeader
         title={t('integrations.title')}
+        description="Browse available integrations and jump to their channel configuration."
         actions={<Badge tone="neutral">{integrations.length}</Badge>}
       />
 
@@ -112,8 +146,23 @@ export default function Integrations() {
               {items.map((integration) => {
                 const badge = statusBadge(integration.status);
                 const BadgeIcon = badge.icon;
+                const href = configHref(integration.name, integration.category);
+                const ctaLabel =
+                  integration.status === 'Active' ? 'Configure' : 'Set up';
                 return (
-                  <Card key={integration.name} className="p-5">
+                  <button
+                    key={integration.name}
+                    type="button"
+                    onClick={() => navigate(href)}
+                    aria-label={`${ctaLabel}: ${integration.name}`}
+                    className={[
+                      'group p-5 w-full text-left flex flex-col gap-3 cursor-pointer',
+                      'bg-pc-surface border border-pc-border rounded-[var(--radius-lg)]',
+                      'transition-colors hover:bg-[var(--pc-hover)] hover:border-pc-border-strong',
+                      'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]',
+                      'focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base',
+                    ].join(' ')}
+                  >
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
                         <h4 className="text-sm font-medium truncate text-pc-text">
@@ -128,7 +177,11 @@ export default function Integrations() {
                         {badge.label}
                       </Badge>
                     </div>
-                  </Card>
+                    <div className="flex items-center gap-1 text-[13px] font-medium text-pc-accent">
+                      {ctaLabel}
+                      <ArrowRight className="h-3.5 w-3.5 transition-transform group-hover:translate-x-0.5" />
+                    </div>
+                  </button>
                 );
               })}
             </div>

@@ -10,7 +10,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { markdown } from '@codemirror/lang-markdown';
 import { oneDark } from '@codemirror/theme-one-dark';
+import { githubLight } from '@uiw/codemirror-theme-github';
 import CodeMirror from '@uiw/react-codemirror';
+import { useTheme } from '@/hooks/useTheme';
 import ReactMarkdown from 'react-markdown';
 import rehypeHighlight from 'rehype-highlight';
 import remarkGfm from 'remark-gfm';
@@ -38,6 +40,12 @@ interface Props {
 }
 
 export default function PersonalityEditor({ agent }: Props) {
+  // Drive the CodeMirror theme from the active console theme's scheme so the
+  // editor isn't a dark slab inside a light (operator-light etc.) palette.
+  // `resolvedTheme` is 'dark' | 'light' | 'oled'; only 'light' is a light scheme.
+  const { resolvedTheme } = useTheme();
+  const cmTheme = resolvedTheme === 'light' ? githubLight : oneDark;
+
   const [index, setIndex] = useState<PersonalityIndex | null>(null);
   const [active, setActive] = useState<string | null>(null);
   const [buffers, setBuffers] = useState<Record<string, BufferState>>({});
@@ -441,7 +449,7 @@ export default function PersonalityEditor({ agent }: Props) {
                   }))
                 }
                 extensions={[markdown()]}
-                theme={oneDark}
+                theme={cmTheme}
                 height="32rem"
                 basicSetup={{
                   lineNumbers: true,

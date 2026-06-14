@@ -7,51 +7,26 @@ import UnsavedChangesBanner from '@/components/layout/UnsavedChangesBanner';
 import CommandPalette, { useCommandPalette } from '@/components/CommandPalette';
 import { ErrorBoundary } from '@/App';
 
-const SIDEBAR_COLLAPSED_KEY = 'zeroclaw-sidebar-collapsed';
-
 export default function Layout() {
   const { pathname } = useLocation();
   const { open: paletteOpen, openPalette, closePalette } = useCommandPalette();
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [collapsed, setCollapsed] = useState(() => {
-    try {
-      return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === 'true';
-    } catch {
-      return false;
-    }
-  });
 
-  // Close sidebar on route change (mobile navigation)
+  // Close the mobile drawer on route change.
   useEffect(() => {
     setSidebarOpen(false);
   }, [pathname]);
 
-  // Persist collapsed state
-  useEffect(() => {
-    try {
-      localStorage.setItem(SIDEBAR_COLLAPSED_KEY, String(collapsed));
-    } catch {
-      // localStorage may not be available
-    }
-  }, [collapsed]);
-
   return (
     <div className="min-h-screen bg-pc-base text-pc-text">
-      {/* Fixed sidebar */}
-      <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} collapsed={collapsed} />
+      {/* Fixed slim icon rail (desktop) + drawer (mobile). */}
+      <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
 
-      {/* Main area — offset by sidebar width on desktop, full-width on mobile */}
-      <div
-        className={`
-          flex flex-col flex-1 min-w-0 h-screen transition-all duration-300 ease-in-out
-          ${collapsed ? 'md:ml-14' : 'md:ml-60'}
-          ml-0
-        `}
-      >
+      {/* Main area — offset by the fixed 56px rail on desktop, full-width on
+          mobile. The rail is always slim, so the offset is constant. */}
+      <div className="flex flex-col flex-1 min-w-0 h-screen md:ml-14 ml-0">
         <Header
           onMenuToggle={() => setSidebarOpen((v) => !v)}
-          onCollapseToggle={() => setCollapsed((c) => !c)}
-          collapsed={collapsed}
           onOpenPalette={openPalette}
         />
         <ReloadBanner />

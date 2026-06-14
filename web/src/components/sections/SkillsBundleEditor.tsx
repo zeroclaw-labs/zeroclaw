@@ -9,7 +9,9 @@
 import { useCallback, useEffect, useState } from 'react';
 import { markdown } from '@codemirror/lang-markdown';
 import { oneDark } from '@codemirror/theme-one-dark';
+import { githubLight } from '@uiw/codemirror-theme-github';
 import CodeMirror from '@uiw/react-codemirror';
+import { useTheme } from '@/hooks/useTheme';
 import {
   createSkill,
   deleteSkill,
@@ -30,6 +32,12 @@ interface EditorBuffer {
 }
 
 export default function SkillsBundleEditor({ bundle }: Props) {
+  // Match the SKILL.md editor to the active console scheme — a dark CodeMirror
+  // theme inside a light palette is the light-mode bug we're fixing.
+  // `resolvedTheme` is 'dark' | 'light' | 'oled'; only 'light' is a light scheme.
+  const { resolvedTheme } = useTheme();
+  const cmTheme = resolvedTheme === 'light' ? githubLight : oneDark;
+
   const [skills, setSkills] = useState<SkillEntry[]>([]);
   const [active, setActive] = useState<string | null>(null);
   const [buffer, setBuffer] = useState<EditorBuffer | null>(null);
@@ -288,7 +296,7 @@ export default function SkillsBundleEditor({ bundle }: Props) {
             <CodeMirror
               value={buffer.draft.body}
               height="320px"
-              theme={oneDark}
+              theme={cmTheme}
               extensions={[markdown()]}
               onChange={(v) =>
                 setBuffer((prev) =>

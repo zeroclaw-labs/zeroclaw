@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { Bot, Plus, AlertCircle } from 'lucide-react';
 import AgentCard from '@/components/AgentCard';
+import AgentDrawer from '@/components/AgentDrawer';
 import { Button, PageHeader } from '@/components/ui';
 import { t } from '@/lib/i18n';
 import { loadAgentSummaries, toggleAgentEnabled, type AgentSummary } from '@/lib/agents';
@@ -19,6 +20,9 @@ export default function AgentsList() {
     agents: [],
   });
   const [toggling, setToggling] = useState<Set<string>>(new Set());
+  // Selecting a row sets the drawer's agent (by alias); closing clears it. We
+  // key off the alias so the open drawer reflects live toggle updates.
+  const [selectedAlias, setSelectedAlias] = useState<string | null>(null);
 
   const refresh = useCallback(() => {
     setState((s) => ({ ...s, loading: true, error: null }));
@@ -61,6 +65,11 @@ export default function AgentsList() {
     }
   }, []);
 
+  const selectedAgent =
+    selectedAlias === null
+      ? null
+      : state.agents.find((a) => a.alias === selectedAlias) ?? null;
+
   return (
     <div className="p-6 max-w-6xl mx-auto">
       <PageHeader
@@ -91,17 +100,24 @@ export default function AgentsList() {
       ) : state.agents.length === 0 ? (
         <EmptyState />
       ) : (
-        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+        <div className="rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface overflow-hidden">
           {state.agents.map((agent) => (
             <AgentCard
               key={agent.alias}
               agent={agent}
-              toggling={toggling.has(agent.alias)}
-              onToggle={() => toggleEnabled(agent)}
+              selected={agent.alias === selectedAlias}
+              onSelect={() => setSelectedAlias(agent.alias)}
             />
           ))}
         </div>
       )}
+
+      <AgentDrawer
+        agent={selectedAgent}
+        onClose={() => setSelectedAlias(null)}
+        onToggle={toggleEnabled}
+        toggling={selectedAgent ? toggling.has(selectedAgent.alias) : false}
+      />
     </div>
   );
 }

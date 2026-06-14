@@ -1,10 +1,11 @@
 import { useState, useRef, useEffect } from 'react';
 import { useLocation } from 'react-router-dom';
-import { LogOut, Settings, ChevronDown, PanelLeftClose, PanelLeftOpen, Menu, Globe, Search } from 'lucide-react';
+import { LogOut, Settings, ChevronDown, Menu, Globe, Search } from 'lucide-react';
 import { t, SUPPORTED_LOCALES } from '@/lib/i18n';
 import { useLocaleContext } from '@/App';
 import { useAuth } from '@/hooks/useAuth';
 import { SettingsModal } from '@/components/SettingsModal';
+import { Button } from '@/components/ui';
 
 // Exact-path titles. The dashboard ('/') must stay exact so it doesn't
 // swallow every other route as a prefix.
@@ -34,7 +35,8 @@ const sectionTitles: Record<string, string> = {
 
 // Derive the i18n title key from the matched route/section so every page —
 // including nested config routes — renders a non-empty heading. Unknown routes
-// fall back to an empty title rather than mislabeling them.
+// fall back to an empty title rather than mislabeling them. With the rail now
+// icon-only, this <h1> is the primary on-screen name for the current section.
 function titleKeyFor(pathname: string): string | undefined {
   if (exactRouteTitles[pathname]) return exactRouteTitles[pathname];
   const section = pathname.split('/').filter(Boolean)[0];
@@ -43,12 +45,10 @@ function titleKeyFor(pathname: string): string | undefined {
 
 interface HeaderProps {
   onMenuToggle: () => void;
-  onCollapseToggle: () => void;
-  collapsed: boolean;
   onOpenPalette: () => void;
 }
 
-export default function Header({ onMenuToggle, onCollapseToggle, collapsed, onOpenPalette }: HeaderProps) {
+export default function Header({ onMenuToggle, onOpenPalette }: HeaderProps) {
   const location = useLocation();
   const { logout } = useAuth();
   const { locale, setAppLocale } = useLocaleContext();
@@ -83,33 +83,19 @@ export default function Header({ onMenuToggle, onCollapseToggle, collapsed, onOp
     <>
       <header className="h-14 flex items-center justify-between px-6 border-b animate-fade-in relative" style={{ background: 'var(--pc-bg-surface)', borderColor: 'var(--pc-border)', backdropFilter: 'blur(12px)', zIndex: 100 }}>
         <div className="flex items-center gap-3">
-          {/* Hamburger — visible only on mobile */}
-          <button
-            type="button"
+          {/* Hamburger — opens the mobile drawer; hidden on desktop where the
+              slim rail is always present. */}
+          <Button
+            variant="ghost"
             onClick={onMenuToggle}
-            className="md:hidden p-1.5 -ml-1.5 rounded-lg transition-colors duration-200"
-            style={{ color: 'var(--pc-text-muted)' }}
-            onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--pc-text-primary)'; e.currentTarget.style.background = 'var(--pc-hover)'; }}
-            onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--pc-text-muted)'; e.currentTarget.style.background = 'transparent'; }}
+            className="md:hidden h-9 w-9 -ml-1.5 border-transparent px-0"
             aria-label="Open menu"
           >
             <Menu className="h-5 w-5" />
-          </button>
+          </Button>
 
-          {/* Collapse toggle — visible only on desktop */}
-          <button
-            type="button"
-            onClick={onCollapseToggle}
-            className="hidden md:flex p-1.5 -ml-1.5 rounded-lg transition-colors duration-200"
-            style={{ color: 'var(--pc-text-muted)' }}
-            onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--pc-text-primary)'; e.currentTarget.style.background = 'var(--pc-hover)'; }}
-            onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--pc-text-muted)'; e.currentTarget.style.background = 'transparent'; }}
-            aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-          >
-            {collapsed ? <PanelLeftOpen className="h-5 w-5" /> : <PanelLeftClose className="h-5 w-5" />}
-          </button>
-
-          {/* Page title */}
+          {/* Page title — the primary on-screen label for the current section
+              now that the rail is icon-only. */}
           <h1 className="h-9 leading-9 text-lg font-semibold tracking-tight" style={{ color: 'var(--pc-text-primary)' }}>{pageTitle}</h1>
         </div>
 
@@ -132,54 +118,39 @@ export default function Header({ onMenuToggle, onCollapseToggle, collapsed, onOp
           </button>
 
           {/* Command-palette trigger — compact icon-only on the smallest screens. */}
-          <button
-            type="button"
+          <Button
+            variant="ghost"
             onClick={onOpenPalette}
-            className="sm:hidden h-9 w-9 flex items-center justify-center rounded-[var(--radius-md)] text-pc-text-muted transition-colors hover:text-pc-text hover:bg-[var(--pc-hover)]"
+            className="sm:hidden h-9 w-9 border-transparent px-0"
             aria-label={t('nav.cmdk.placeholder')}
           >
             <Search className="h-3.5 w-3.5" />
-          </button>
+          </Button>
 
           {/* Settings */}
-          <button
-            type="button"
+          <Button
+            variant="ghost"
             onClick={() => setSettingsOpen(true)}
-            className="h-9 w-9 flex items-center justify-center rounded-xl text-xs transition-all"
-            style={{ color: 'var(--pc-text-muted)', background: 'transparent', border: 'none', cursor: 'pointer' }}
-            onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--pc-text-primary)'; e.currentTarget.style.background = 'var(--pc-hover)'; }}
-            onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--pc-text-muted)'; e.currentTarget.style.background = 'transparent'; }}
+            className="h-9 w-9 border-transparent px-0"
             aria-label={t('settings.title')}
           >
             <Settings className="h-3.5 w-3.5" />
-          </button>
+          </Button>
 
           {/* Language switcher dropdown */}
           <div ref={langRef} className="relative" style={{ zIndex: 9999 }}>
-            <button
-              type="button"
+            <Button
+              variant="ghost"
               onClick={() => setLangOpen(!langOpen)}
-              className="h-9 px-3 rounded-xl text-xs font-semibold border transition-all flex items-center gap-1.5"
-              style={{
-                borderColor: langOpen ? 'var(--pc-accent-dim)' : 'var(--pc-border)',
-                color: langOpen ? 'var(--pc-text-primary)' : 'var(--pc-text-secondary)',
-                background: 'var(--pc-bg-elevated)',
-              }}
-              onMouseEnter={(e) => {
-                e.currentTarget.style.borderColor = 'var(--pc-accent-dim)';
-                e.currentTarget.style.color = 'var(--pc-text-primary)';
-              }}
-              onMouseLeave={(e) => {
-                if (!langOpen) {
-                  e.currentTarget.style.borderColor = 'var(--pc-border)';
-                  e.currentTarget.style.color = 'var(--pc-text-secondary)';
-                }
-              }}
+              aria-expanded={langOpen}
+              aria-label={t('settings.language')}
+              className="h-9 px-3 text-xs font-semibold gap-1.5"
+              style={{ background: 'var(--pc-bg-elevated)' }}
             >
               <Globe className="h-3.5 w-3.5" />
               {locale.toUpperCase()}
               <ChevronDown className="h-3 w-3" style={{ transform: langOpen ? 'rotate(180deg)' : undefined, transition: 'transform 0.15s' }} />
-            </button>
+            </Button>
 
             {langOpen && (
               <div
@@ -229,23 +200,15 @@ export default function Header({ onMenuToggle, onCollapseToggle, collapsed, onOp
           </div>
 
           {/* Logout */}
-          <button
-            type="button"
+          <Button
+            variant="ghost"
             onClick={handleLogout}
-            className="h-9 px-3 rounded-xl text-xs transition-all flex items-center gap-1.5"
-            style={{ color: 'var(--pc-text-muted)', background: 'transparent', border: 'none', cursor: 'pointer' }}
-            onMouseEnter={(e) => {
-              e.currentTarget.style.color = 'var(--color-status-error)';
-              e.currentTarget.style.background = 'var(--color-status-error-alpha-08)';
-            }}
-            onMouseLeave={(e) => {
-              e.currentTarget.style.color = 'var(--pc-text-muted)';
-              e.currentTarget.style.background = 'transparent';
-            }}
+            className="h-9 px-3 text-xs gap-1.5 hover:text-status-error hover:border-status-error/25 hover:bg-status-error/10"
+            aria-label={t('auth.logout')}
           >
             <LogOut className="h-3.5 w-3.5" />
             <span className="hidden sm:inline">{t('auth.logout')}</span>
-          </button>
+          </Button>
         </div>
       </header>
 

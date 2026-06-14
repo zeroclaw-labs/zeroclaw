@@ -90,6 +90,7 @@ import {
   type AgentSummary,
 } from "@/lib/agents";
 import AgentCard from "@/components/AgentCard";
+import AgentDrawer from "@/components/AgentDrawer";
 import EntityLink from "@/components/EntityLink";
 import EntityEnabledToggle from "@/components/EntityEnabledToggle";
 import { useSSE } from "@/hooks/useSSE";
@@ -2723,6 +2724,9 @@ function AgentsSection() {
   const [quickstartLabel, setQuickstartLabel] = useState("Start Quickstart");
   const [error, setError] = useState<string | null>(null);
   const [toggling, setToggling] = useState<Set<string>>(new Set());
+  // Selecting a row sets the drawer's agent (by alias); closing clears it.
+  // Keying off the alias keeps the open drawer in sync with live toggles.
+  const [selectedAlias, setSelectedAlias] = useState<string | null>(null);
 
   useEffect(() => {
     loadAgentSummaries()
@@ -2784,6 +2788,11 @@ function AgentsSection() {
   const hiddenCount = sortedAgents
     ? Math.max(0, sortedAgents.length - AGENT_GLANCE_LIMIT)
     : 0;
+
+  const selectedAgent =
+    selectedAlias === null
+      ? null
+      : (agents?.find((a) => a.alias === selectedAlias) ?? null);
 
   return (
     <section className="space-y-6">
@@ -2871,41 +2880,34 @@ function AgentsSection() {
           </Link>
         </div>
       ) : (
-        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+        <div className="rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface overflow-hidden">
           {visibleAgents!.map((agent) => (
             <AgentCard
               key={agent.alias}
               agent={agent}
-              toggling={toggling.has(agent.alias)}
-              onToggle={() => handleToggle(agent)}
+              selected={agent.alias === selectedAlias}
+              onSelect={() => setSelectedAlias(agent.alias)}
             />
           ))}
           {hiddenCount > 0 && (
             <Link
               to="/agents"
-              className="rounded-2xl border p-5 flex flex-col items-center justify-center text-center transition-colors hover:opacity-90"
-              style={{
-                background: "var(--pc-bg-surface)",
-                borderColor: "var(--pc-border)",
-                borderStyle: "dashed",
-                color: "var(--pc-text-muted)",
-              }}
+              className="flex items-center justify-center gap-1.5 px-4 py-3 text-sm font-medium border-t border-pc-border text-pc-text-muted transition-colors hover:bg-[var(--pc-hover)] hover:text-pc-text"
             >
-              <Plus
-                className="h-6 w-6 mb-2"
-                style={{ color: "var(--pc-accent)" }}
-              />
-              <p
-                className="text-sm font-medium"
-                style={{ color: "var(--pc-text-primary)" }}
-              >
-                {hiddenCount} more {hiddenCount === 1 ? "agent" : "agents"}
-              </p>
-              <p className="text-xs mt-1">View all on /agents</p>
+              {t("dash.view_all")} · {hiddenCount} more{" "}
+              {hiddenCount === 1 ? "agent" : "agents"}
+              <ChevronRight className="h-3.5 w-3.5" />
             </Link>
           )}
         </div>
       )}
+
+      <AgentDrawer
+        agent={selectedAgent}
+        onClose={() => setSelectedAlias(null)}
+        onToggle={handleToggle}
+        toggling={selectedAgent ? toggling.has(selectedAgent.alias) : false}
+      />
     </section>
   );
 }

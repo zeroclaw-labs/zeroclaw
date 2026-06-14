@@ -5,17 +5,20 @@ import {
   Bot,
   Clock,
   CornerDownLeft,
+  FolderTree,
   LayoutDashboard,
   MessageSquare,
   Monitor,
   Puzzle,
   Search,
   Settings,
+  SlidersHorizontal,
   Stethoscope,
   Terminal,
   Wrench,
 } from 'lucide-react';
 import { t } from '@/lib/i18n';
+import { loadConfigSearchItems, type ConfigSearchItem } from '@/lib/configSearch';
 
 // Navigation destinations mirror the Sidebar's grouped nav. They're
 // re-declared locally (rather than imported from Sidebar) to keep the palette
@@ -42,6 +45,70 @@ const DESTINATIONS: Destination[] = [
   { to: '/acp-console', icon: Terminal, labelKey: 'nav.acp', groupKey: 'nav.group.operations' },
 ];
 
+// The three result buckets, rendered in this order with their own headers.
+// "page" = static nav destinations; "section"/"entry" come from configSearch.
+type ResultKind = 'page' | 'section' | 'entry';
+
+// A unified, keyboard-navigable result row. Nav destinations and config items
+// are normalized into this single shape so the filter / selection / render
+// pipeline treats them identically.
+interface PaletteItem {
+  kind: ResultKind;
+  /** Navigated to on select. */
+  to: string;
+  /** Primary display + match text. */
+  label: string;
+  /** Secondary context shown on the right (group / owning section). */
+  sublabel: string;
+  /** Extra match text (the url/path) — searched but not displayed. */
+  searchExtra: string;
+  icon: typeof LayoutDashboard;
+}
+
+// Cap on rendered rows so a large config tree (100s of entities) stays snappy.
+// Excess matches collapse into a "+N more — keep typing" hint.
+const MAX_RESULTS = 50;
+
+// Section headers + the bucket order they render in.
+const KIND_ORDER: ResultKind[] = ['page', 'section', 'entry'];
+const KIND_HEADER: Record<ResultKind, string> = {
+  page: 'Pages',
+  section: 'Config sections',
+  entry: 'Config entries',
+};
+const KIND_ICON: Record<Exclude<ResultKind, 'page'>, typeof LayoutDashboard> = {
+  section: FolderTree,
+  entry: SlidersHorizontal,
+};
+
+// Map a configSearch item into a PaletteItem. Config sections and entries get
+// distinct icons + buckets; the section/owning-section label is the sublabel.
+function toPaletteItem(c: ConfigSearchItem): PaletteItem {
+  const kind: ResultKind = c.group === 'Config section' ? 'section' : 'entry';
+  return {
+    kind,
+    to: c.url,
+    label: c.label,
+    sublabel: c.sublabel,
+    searchExtra: c.url,
+    icon: KIND_ICON[kind],
+  };
+}
+
+// Substring (case-insensitive) match across label + sublabel + path. Returns a
+// small score so exact-prefix / label hits sort above incidental path hits;
+// null when there's no match at all.
+function matchScore(item: PaletteItem, q: string): number | null {
+  const label = item.label.toLowerCase();
+  const sub = item.sublabel.toLowerCase();
+  const extra = item.searchExtra.toLowerCase();
+  if (label.startsWith(q)) return 3;
+  if (label.includes(q)) return 2;
+  if (sub.includes(q)) return 1;
+  if (extra.includes(q)) return 0;
+  return null;
+}
+
 // Focusable selector for the simple focus trap.
 const FOCUSABLE =
   'a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])';
@@ -64,23 +131,98 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
   const navigate = useNavigate();
   const [query, setQuery] = useState('');
   const [selected, setSelected] = useState(0);
+  // Config search items, loaded lazily on open (cached for the session by
+  // configSearch). `loadingConfig` drives the subtle "loading settings…" hint;
+  // nav destinations are usable the whole time regardless.
+  const [configItems, setConfigItems] = useState<ConfigSearchItem[]>([]);
+  const [loadingConfig, setLoadingConfig] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
   const restoreFocusRef = useRef<HTMLElement | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
 
-  // Substring (case-insensitive) filter on the localized label.
-  const results = useMemo(() => {
+  // Load config search items on open. Nav destinations render immediately;
+  // config items fold in once resolved. Errors are already swallowed by the
+  // loader (resolves to []), so the palette never breaks on a config failure.
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    setLoadingConfig(true);
+    void loadConfigSearchItems()
+      .then((items) => {
+        if (!cancelled) setConfigItems(items);
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingConfig(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
+
+  // All searchable items in one flat list: static pages first, then config
+  // sections, then config entries (toPaletteItem assigns the bucket/icon).
+  const allItems = useMemo<PaletteItem[]>(() => {
+    const pages: PaletteItem[] = DESTINATIONS.map((d) => ({
+      kind: 'page',
+      to: d.to,
+      label: t(d.labelKey),
+      sublabel: t(d.groupKey),
+      searchExtra: d.to,
+      icon: d.icon,
+    }));
+    return [...pages, ...configItems.map(toPaletteItem)];
+  }, [configItems]);
+
+  // Filter + sort + bucket + cap. The flat `results` list (header rows
+  // interleaved) is what we render; `items` (no headers) is the keyboard-
+  // navigable subset and `extraCount` feeds the "+N more" hint.
+  const { rows, items: flatItems, extraCount } = useMemo(() => {
     const q = query.trim().toLowerCase();
-    const withLabels = DESTINATIONS.map((d) => ({ ...d, label: t(d.labelKey), group: t(d.groupKey) }));
-    if (!q) return withLabels;
-    return withLabels.filter((d) => d.label.toLowerCase().includes(q));
-  }, [query]);
+
+    // Score + filter, preserving each item's natural order as a tiebreak.
+    const scored = allItems
+      .map((item, idx) => ({ item, idx, score: q ? matchScore(item, q) : 0 }))
+      .filter((s): s is { item: PaletteItem; idx: number; score: number } => s.score !== null);
+    scored.sort((a, b) => (b.score - a.score) || (a.idx - b.idx));
+
+    const matched = scored.map((s) => s.item);
+    const capped = matched.slice(0, MAX_RESULTS);
+    const extra = matched.length - capped.length;
+
+    // Interleave bucket headers. `rows` carries either a header or an item with
+    // its index into the (capped) keyboard-navigable `items` list.
+    type Row =
+      | { type: 'header'; kind: ResultKind; key: string }
+      | { type: 'item'; item: PaletteItem; index: number };
+    const out: Row[] = [];
+    let navIdx = 0;
+    for (const kind of KIND_ORDER) {
+      const group = capped.filter((it) => it.kind === kind);
+      if (group.length === 0) continue;
+      out.push({ type: 'header', kind, key: `h-${kind}` });
+      for (const it of group) {
+        out.push({ type: 'item', item: it, index: navIdx });
+        navIdx += 1;
+      }
+    }
+    // `items` must match the navIdx order used above (group-by-kind), so rebuild
+    // it from the same traversal rather than from `capped` directly.
+    const ordered = out.flatMap((r) => (r.type === 'item' ? [r.item] : []));
+    return { rows: out, items: ordered, extraCount: Math.max(0, extra) };
+  }, [allItems, query]);
+
+  const results = flatItems;
 
   // Keep the selection in range whenever the result set changes.
   useEffect(() => {
     setSelected(0);
   }, [query]);
+
+  // If config items arrive (or otherwise shrink the list), clamp the selection.
+  useEffect(() => {
+    setSelected((s) => (results.length === 0 ? 0 : Math.min(s, results.length - 1)));
+  }, [results.length]);
 
   // On open: remember the focused element, focus the input. On close: restore.
   useEffect(() => {
@@ -198,6 +340,11 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
             spellCheck={false}
             className="h-12 w-full bg-transparent text-sm text-pc-text placeholder:text-pc-text-faint outline-none border-none"
           />
+          {loadingConfig && (
+            <span className="shrink-0 text-[11px] text-pc-text-faint whitespace-nowrap">
+              loading settings…
+            </span>
+          )}
         </div>
 
         {/* Results */}
@@ -212,12 +359,25 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
               {t('nav.cmdk.empty')}
             </div>
           ) : (
-            results.map((d, i) => {
+            rows.map((row) => {
+              if (row.type === 'header') {
+                return (
+                  <div
+                    key={row.key}
+                    role="presentation"
+                    className="px-3 pt-3 pb-1 text-[10px] font-medium uppercase tracking-wider text-pc-text-faint"
+                  >
+                    {KIND_HEADER[row.kind]}
+                  </div>
+                );
+              }
+              const d = row.item;
+              const i = row.index;
               const Icon = d.icon;
               const isSel = i === selected;
               return (
                 <button
-                  key={d.to}
+                  key={`${d.kind}-${d.to}-${i}`}
                   type="button"
                   role="option"
                   aria-selected={isSel}
@@ -234,8 +394,8 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
                     aria-hidden="true"
                   />
                   <span className="flex-1 truncate">{d.label}</span>
-                  <span className="text-[11px] uppercase tracking-wider text-pc-text-faint">
-                    {d.group}
+                  <span className="max-w-[40%] truncate text-[11px] uppercase tracking-wider text-pc-text-faint">
+                    {d.sublabel}
                   </span>
                   {isSel && (
                     <CornerDownLeft className="h-3.5 w-3.5 shrink-0 text-pc-text-muted" aria-hidden="true" />
@@ -243,6 +403,11 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
                 </button>
               );
             })
+          )}
+          {extraCount > 0 && (
+            <div className="px-3 py-2 text-center text-[11px] text-pc-text-faint">
+              +{extraCount} more — keep typing
+            </div>
           )}
         </div>
 
