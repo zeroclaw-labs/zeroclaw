@@ -1649,6 +1649,49 @@ mod tests {
         assert!(Arc::strong_count(&shared_audit) >= 3);
     }
 
+    /// Regression for #6687 blocker: a config with `sop.sops_dir` set but no
+    /// `agents.default` must not fail SOP engine construction. The per-agent
+    /// paths now use `agent_alias` instead of the hardcoded `"default"` string.
+    #[tokio::test]
+    async fn sop_audit_memory_uses_agent_alias_not_default() {
+        let tmp = TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        std::fs::create_dir_all(&sops_dir).unwrap();
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "ops".to_string(),
+            AliasedAgentConfig {
+                ..Default::default()
+            },
+        );
+
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            sop: zeroclaw_config::schema::SopConfig {
+                sops_dir: Some(sops_dir.to_string_lossy().into_owned()),
+                ..zeroclaw_config::schema::SopConfig::default()
+            },
+            agents: agents.clone(),
+            ..Config::default()
+        };
+
+        // Using the session alias ("ops") must succeed even with no "default" agent.
+        let mem = zeroclaw_memory::create_memory_for_agent(&config, "ops", None).await;
+        assert!(
+            mem.is_ok(),
+            "create_memory_for_agent with session alias should succeed"
+        );
+
+        // The old hardcoded "default" must fail — proving the fix is load-bearing.
+        let mem_default = zeroclaw_memory::create_memory_for_agent(&config, "default", None).await;
+        assert!(
+            mem_default.is_err(),
+            "create_memory_for_agent(\"default\") must fail when agents.default is absent"
+        );
+    }
+
     /// A runtime that reports an ephemeral workspace (no host persistence) while
     /// delegating real shell execution to `NativeRuntime`. Used to exercise the
     /// registration wiring of `has_filesystem_access()` -> `persistent_writes`.

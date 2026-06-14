@@ -909,7 +909,7 @@ pub async fn run(
         // available on this path (CLI agent run).
         let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
-                zeroclaw_memory::create_memory_for_agent(&config, "default", None).await?;
+                zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
             let (engine, audit) =
                 crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, sop_mem);
             (Some(engine), Some(audit))
@@ -2420,7 +2420,7 @@ pub async fn process_message(
         // available on this path (process_message CLI agent).
         let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
-                zeroclaw_memory::create_memory_for_agent(&config, "default", None).await?;
+                zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
             let (engine, audit) =
                 crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, sop_mem);
             (Some(engine), Some(audit))

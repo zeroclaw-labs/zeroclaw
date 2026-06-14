@@ -3672,8 +3672,11 @@ async fn main() -> Result<()> {
                 // changed path, or removed sops_dir).
                 let (sop_engine, sop_audit) = if current_config.sop.sops_dir.is_some() {
                     let mem: Arc<dyn zeroclaw_memory::Memory> =
-                        zeroclaw_memory::create_memory_for_agent(&current_config, "default", None)
-                            .await?;
+                        Arc::from(zeroclaw_memory::create_memory(
+                            &current_config.memory,
+                            &current_config.data_dir,
+                            None,
+                        )?);
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
                         current_config.sop.clone(),
                         &current_config.data_dir,
@@ -4256,7 +4259,23 @@ async fn main() -> Result<()> {
                 }));
 
                 let cancel = tokio_util::sync::CancellationToken::new();
-                Box::pin(channels::start_channels(config, None, cancel, None, None)).await
+                let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
+                    let mem: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
+                        zeroclaw_memory::create_memory(&config.memory, &config.data_dir, None)?,
+                    );
+                    let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
+                        config.sop.clone(),
+                        &config.data_dir,
+                        mem,
+                    );
+                    (Some(engine), Some(audit))
+                } else {
+                    (None, None)
+                };
+                Box::pin(channels::start_channels(
+                    config, None, cancel, sop_engine, sop_audit,
+                ))
+                .await
             }
             ChannelCommands::Doctor => Box::pin(channels::doctor_channels(config)).await,
             other => Box::pin(channels::handle_command(other, &config)).await,
