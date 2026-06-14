@@ -81,26 +81,16 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     cargo fetch --locked
 
 # Build the web dashboard (gen-api + typescript build), no network
-# NOTE: pallet-rust ships both static (.a) and shared (.so) for system libs (libc, libunwind,
-# libcrypto, etc.). Rustc's musl target generates -Bdynamic before -lunwind/-lc, making the
-# linker prefer .so even with -static. We remove unversioned .so files where .a counterparts
-# exist, forcing the linker to use the static archives. Versioned .so.* files are preserved
-# for runtime loading (cargo/rustc need libunwind.so.1, etc.).
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --network=none \
     <<-EOF
     set -e
-    # Remove .so files that have corresponding .a — forces linker to use static archives
-    # Note: do NOT cd to /usr/lib (breaks cargo's config resolution from /src/.cargo/)
-    for a_file in /usr/lib/*.a; do
-      base="${a_file%.a}"
-      so_file="${base}.so"
-      [ -f "$so_file" ] || [ -L "$so_file" ] && rm -f "$so_file"
-    done
-    # Override .cargo/config.toml's -C link-arg=-static for musl, which conflicts with
-    # proc-macro dylib compilation. The xtask is ephemeral — dynamic linking is fine.
-    RUSTFLAGS="" cargo web build
+    # -crt-static so the ephemeral xtask and its proc-macro/build-script deps
+    # link dynamically. The musl target defaults crt-static on, which the StageX
+    # host (host == target == musl) cannot satisfy for host artifacts.
+    export RUSTFLAGS="-C target-feature=-crt-static"
+    cargo web build
 EOF
 
 # ── Stage: check (fmt, clippy, test validation) ────────────
@@ -118,14 +108,15 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     cargo fetch
 
 # Format + clippy (fully isolated — no network, reproducible)
-# NOTE: no RUSTFLAGS here. +crt-static breaks proc-macro dylib production,
-# and the check stage validates code correctness, not linking. Static
-# linking is validated by the build stage.
+# -crt-static: the musl target defaults crt-static on, but host == target in
+# StageX, so proc-macro/build-script host artifacts cannot link statically.
+# This validates code correctness; the target static link is checked in build.
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --network=none \
     <<-EOF
     set -e
+    export RUSTFLAGS="-C target-feature=-crt-static"
     mkdir -p web/dist
     touch web/dist/.gitkeep
     cargo fmt --all -- --check
@@ -142,11 +133,18 @@ EOF
 #   symbols (operator new/delete, __cxa_throw, etc.) for YAML scanner code.
 #   The build stage succeeds because it uses -static + libstdc++.a stub, but test
 #   (dynamic) linking needs a real libstdc++.so that pallet-rust doesn't ship.
+# --exclude xtask: its doc-gen gates read docs/ and .github/ paths that
+#   .dockerignore keeps out of the build context; those gates run in the
+#   standard CI Test job against the full tree.
+# --exclude zeroclaw-tools: content_search/git_operations tests shell out to
+#   GNU rg/grep/git, which the minimal StageX image does not ship (busybox grep
+#   lacks the GNU flags); they run in the standard CI Test job.
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     <<-EOF
     set -e
-    cargo test --workspace --exclude zeroclaw-desktop --exclude zerocode --offline --locked
+    export RUSTFLAGS="-C target-feature=-crt-static"
+    cargo test --workspace --exclude zeroclaw-desktop --exclude zerocode --exclude xtask --exclude zeroclaw-tools --offline --locked
 EOF
 
 # ── Stage: build (zeroclaw + zerocode, default channels) ────
@@ -168,12 +166,14 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     set -e
     ARCH="$(uname -m)"
 
-    # Override config's per-target rustflags (the -static in config breaks proc-macros
-    # because host=target in StageX). RUSTFLAGS applied directly works with Rust 1.95+
-    # and LLD — it does NOT break proc-macro dylib compilation.
-    # +crt-static ensures static CRT objects; -static forces linker to use .a only.
+    # Host build-scripts/proc-macros and the target binary share the musl triple
+    # in StageX. The per-target RUSTFLAGS env is target-scoped (it does not apply
+    # to host artifacts), so the final binary links +crt-static -static while host
+    # build-scripts keep the default dynamic link they require. A plain RUSTFLAGS
+    # would hit both and break the host link.
     TARGET="${ARCH}-unknown-linux-musl"
-    export RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-static"
+    export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-static"
+    export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-static"
 
     # Build combined libstdc++.a from libc++.a + libc++abi.a (stagex ships LLVM libc++, not GCC libstdc++)
     (mkdir -p /tmp/libwrap/cxx /tmp/libwrap/cxxabi && cd /tmp/libwrap/cxx && ar x /usr/lib/libc++.a && cd /tmp/libwrap/cxxabi && ar x /usr/lib/libc++abi.a && ar rcs /usr/lib/libstdc++.a /tmp/libwrap/cxx/*.o /tmp/libwrap/cxxabi/*.o && rm -rf /tmp/libwrap)
@@ -252,12 +252,14 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     set -e
     ARCH="$(uname -m)"
 
-    # Override config's per-target rustflags (the -static in config breaks proc-macros
-    # because host=target in StageX). RUSTFLAGS applied directly works with Rust 1.95+
-    # and LLD — it does NOT break proc-macro dylib compilation.
-    # +crt-static ensures static CRT objects; -static forces linker to use .a only.
+    # Host build-scripts/proc-macros and the target binary share the musl triple
+    # in StageX. The per-target RUSTFLAGS env is target-scoped (it does not apply
+    # to host artifacts), so the final binary links +crt-static -static while host
+    # build-scripts keep the default dynamic link they require. A plain RUSTFLAGS
+    # would hit both and break the host link.
     TARGET="${ARCH}-unknown-linux-musl"
-    export RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-static"
+    export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-static"
+    export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-static"
 
     # Build combined libstdc++.a from libc++.a + libc++abi.a (stagex ships LLVM libc++, not GCC libstdc++)
     (mkdir -p /tmp/libwrap/cxx /tmp/libwrap/cxxabi && cd /tmp/libwrap/cxx && ar x /usr/lib/libc++.a && cd /tmp/libwrap/cxxabi && ar x /usr/lib/libc++abi.a && ar rcs /usr/lib/libstdc++.a /tmp/libwrap/cxx/*.o /tmp/libwrap/cxxabi/*.o && rm -rf /tmp/libwrap)
