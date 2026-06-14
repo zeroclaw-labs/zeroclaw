@@ -12352,7 +12352,7 @@ impl WhatsAppConfig {
     ///
     /// Runtime currently prefers Cloud mode in this case for backward compatibility.
     pub fn is_ambiguous_config(&self) -> bool {
-        self.phone_number_id.is_some() && self.session_path.is_some()
+        self.phone_number_id.is_some() && self.has_web_selector()
     }
 }
 
@@ -21073,6 +21073,15 @@ allowed_numbers = ["+1", "+2"]
             ..Default::default()
         };
         assert_eq!(empty.backend_type(), "cloud");
+
+        let cloud_plus_pairing = WhatsAppConfig {
+            enabled: true,
+            phone_number_id: Some("123".into()),
+            pair_phone: Some("+10000000000".into()),
+            ..Default::default()
+        };
+        assert_eq!(cloud_plus_pairing.backend_type(), "cloud");
+        assert!(cloud_plus_pairing.is_ambiguous_config());
     }
 
     #[test]
