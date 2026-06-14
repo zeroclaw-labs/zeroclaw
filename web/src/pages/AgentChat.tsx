@@ -3,10 +3,11 @@ import { Navigate, useParams } from 'react-router-dom';
 import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { AgentProvider, useAgent, type ChatMessage } from '@/contexts/AgentContext';
+import { useAgent, type ChatMessage } from '@/contexts/AgentContext';
 import { useDraft } from '@/hooks/useDraft';
 import { t } from '@/lib/i18n';
 import { Badge, Button } from '@/components/ui';
+import ChatWorkspace from '@/pages/ChatWorkspace';
 
 import ToolCallCard from '@/components/ToolCallCard';
 import ApprovalBanner from '@/components/ApprovalBanner';
@@ -15,23 +16,43 @@ const DRAFT_KEY_PREFIX = 'agent-chat';
 
 /**
  * Route entry point for `/agent/:alias`. Reads the alias from the URL and
- * mounts an AgentProvider keyed by it so React tears down and rebuilds the
- * WebSocket / chat state on alias change. Missing alias → redirect to the
- * agents list.
+ * hands it to the multi-agent ChatWorkspace as the initial chat to open and
+ * activate. The workspace itself owns the set of open chats and never
+ * remounts on tab/layout switches, so the alias is passed as a prop (not used
+ * as a React `key`) — that keeps every chat's AgentProvider WebSocket alive
+ * across tab switches. Missing alias → redirect to the agents list.
  */
 export default function AgentChat() {
   const { alias } = useParams<{ alias: string }>();
   if (!alias) {
     return <Navigate to="/agents" replace />;
   }
-  return (
-    <AgentProvider key={alias} agentAlias={alias}>
-      <AgentChatInner agentAlias={alias} />
-    </AgentProvider>
-  );
+  return <ChatWorkspace initialAlias={alias} />;
 }
 
-function AgentChatInner({ agentAlias }: { agentAlias: string }) {
+/** Status snapshot a chat pane pushes up to the workspace tab bar. */
+export interface AgentChatStatus {
+  typing: boolean;
+  messageCount: number;
+}
+
+/**
+ * Full chat view for a single agent. Must be rendered inside an
+ * `<AgentProvider>` (it calls `useAgent()` internally). Exported so the
+ * multi-agent `ChatWorkspace` can mount one instance per open chat and keep
+ * them all alive simultaneously.
+ *
+ * `onStatus` lets the host (the workspace) observe live typing / message-count
+ * changes per pane without itself subscribing to the agent context — used to
+ * drive the streaming and unread indicators in the tab bar.
+ */
+export function AgentChatInner({
+  agentAlias,
+  onStatus,
+}: {
+  agentAlias: string;
+  onStatus?: (s: AgentChatStatus) => void;
+}) {
   const {
     messages,
     sendMessage,
@@ -76,6 +97,14 @@ function AgentChatInner({ agentAlias }: { agentAlias: string }) {
   useEffect(() => {
     saveDraft(input);
   }, [input, saveDraft]);
+
+  // Report live status (typing + message count) up to the host workspace so it
+  // can render streaming / unread indicators in the tab bar. Fires on every
+  // typing flip or message-count change; the workspace decides what to do with
+  // it (e.g. mark a hidden tab unread when its count grows).
+  useEffect(() => {
+    onStatus?.({ typing, messageCount: messages.length });
+  }, [typing, messages.length, onStatus]);
 
   // Scroll to bottom on new messages / streaming.
   // Note: WebSocket lifecycle, hydration, and tool_call/tool_result handling

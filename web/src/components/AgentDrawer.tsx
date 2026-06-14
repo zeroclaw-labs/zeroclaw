@@ -22,6 +22,7 @@ import {
 import type { LucideProps } from 'lucide-react';
 import type { AgentSummary } from '@/lib/agents';
 import { Badge } from '@/components/ui';
+import { t } from '@/lib/i18n';
 import EntityLink from './EntityLink';
 
 export interface AgentDrawerProps {
@@ -36,11 +37,11 @@ export interface AgentDrawerProps {
 }
 
 function formatRelative(iso: string | null): string {
-  if (!iso) return 'no sessions yet';
+  if (!iso) return t('agent.no_sessions_yet');
   const ts = Date.parse(iso);
-  if (Number.isNaN(ts)) return 'no sessions yet';
+  if (Number.isNaN(ts)) return t('agent.no_sessions_yet');
   const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
-  if (diffSec < 60) return 'just now';
+  if (diffSec < 60) return t('agent.just_now');
   if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m ago`;
   if (diffSec < 86_400) return `${Math.floor(diffSec / 3600)}h ago`;
   return `${Math.floor(diffSec / 86_400)}d ago`;
@@ -152,7 +153,7 @@ export default function AgentDrawer({
     <div
       role="dialog"
       aria-modal="true"
-      aria-label={`Agent ${agent.alias} detail`}
+      aria-label={`${t('agent.detail_aria_prefix')} ${agent.alias} ${t('agent.detail_aria_suffix')}`}
       className="fixed inset-0 z-50 flex justify-end"
       onClick={onClose}
     >
@@ -191,7 +192,7 @@ export default function AgentDrawer({
                 </EntityLink>
               ) : (
                 <p className="text-xs truncate text-pc-text-muted">
-                  no model_provider set
+                  {t('agent.no_model_provider')}
                 </p>
               )}
             </div>
@@ -200,8 +201,8 @@ export default function AgentDrawer({
             ref={closeBtnRef}
             type="button"
             onClick={onClose}
-            aria-label="Close"
-            title="Close"
+            aria-label={t('agent.close')}
+            title={t('agent.close')}
             className="h-8 w-8 flex-shrink-0 rounded-[var(--radius-md)] flex items-center justify-center text-pc-text-muted transition-colors hover:bg-[var(--pc-hover)] hover:text-pc-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base"
           >
             <X className="h-4 w-4" />
@@ -213,7 +214,7 @@ export default function AgentDrawer({
           {/* Status */}
           <div className="flex items-center justify-between gap-3">
             <span className="text-[11px] uppercase tracking-wide text-pc-text-faint">
-              Status
+              {t('common.status')}
             </span>
             <button
               type="button"
@@ -221,20 +222,20 @@ export default function AgentDrawer({
               disabled={toggling}
               className="rounded-full transition-opacity disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base"
               aria-pressed={agent.enabled}
-              aria-label={agent.enabled ? 'Disable agent' : 'Enable agent'}
-              title={agent.enabled ? 'Disable agent' : 'Enable agent'}
+              aria-label={agent.enabled ? t('agent.disable') : t('agent.enable')}
+              title={agent.enabled ? t('agent.disable') : t('agent.enable')}
             >
               <Badge tone={agent.enabled ? 'ok' : 'neutral'}>
                 <Power className="h-3 w-3" />
-                {agent.enabled ? 'enabled' : 'disabled'}
+                {agent.enabled ? t('agent.enabled') : t('agent.disabled')}
               </Badge>
             </button>
           </div>
 
           {/* Configuration facts */}
-          <DetailGroup icon={Wifi} label="Channels">
+          <DetailGroup icon={Wifi} label={t('agent.section.channels')}>
             {channelCount === 0 ? (
-              <span className="text-pc-text-muted">none bound</span>
+              <span className="text-pc-text-muted">{t('agent.none_bound')}</span>
             ) : (
               agent.channels.map((ch) => (
                 <EntityLink
@@ -250,22 +251,22 @@ export default function AgentDrawer({
             )}
           </DetailGroup>
 
-          <DetailGroup icon={Shield} label="Profile">
+          <DetailGroup icon={Shield} label={t('agent.section.profile')}>
             {agent.riskProfile ? (
               <EntityLink
                 kind="risk-profile"
                 id={agent.riskProfile}
                 className="inline-flex items-center gap-1 hover:text-pc-text hover:underline"
-                title="Risk profile (autonomy/sandbox tier)"
+                title={t('agent.risk_profile_title')}
               >
                 {agent.riskProfile}
               </EntityLink>
             ) : (
               <span
                 className="text-pc-text-muted"
-                title="Risk profile (autonomy/sandbox tier)"
+                title={t('agent.risk_profile_title')}
               >
-                no risk profile
+                {t('agent.no_risk_profile')}
               </span>
             )}
             <span className="text-pc-text-faint">·</span>
@@ -275,12 +276,12 @@ export default function AgentDrawer({
               className="inline-flex items-center gap-1 hover:text-pc-text hover:underline"
               title={
                 agent.memoryBackend
-                  ? `Memory backend: ${agent.memoryBackend}`
-                  : 'No per-agent override. Inherits the default backend (sqlite) from [memory].'
+                  ? `${t('agent.memory_backend_title_prefix')} ${agent.memoryBackend}`
+                  : t('agent.memory_backend_default_title')
               }
             >
               <Database className="h-3 w-3 flex-shrink-0" />
-              {agent.memoryBackend || 'sqlite (default)'}
+              {agent.memoryBackend || t('agent.memory_backend_default')}
             </EntityLink>
             {agent.runtimeProfile && (
               <>
@@ -289,7 +290,7 @@ export default function AgentDrawer({
                   kind="runtime-profile"
                   id={agent.runtimeProfile}
                   className="inline-flex items-center gap-1 hover:text-pc-text hover:underline"
-                  title="Runtime profile (loop, token limits, retries)"
+                  title={t('agent.runtime_profile_title')}
                 >
                   <Zap className="h-3 w-3 flex-shrink-0" />
                   {agent.runtimeProfile}
@@ -299,7 +300,7 @@ export default function AgentDrawer({
           </DetailGroup>
 
           {skillCount > 0 && (
-            <DetailGroup icon={Sparkles} label="Skills">
+            <DetailGroup icon={Sparkles} label={t('agent.section.skills')}>
               {agent.skillBundles.map((s) => (
                 <EntityLink
                   key={s}
@@ -315,7 +316,7 @@ export default function AgentDrawer({
           )}
 
           {knowledgeCount > 0 && (
-            <DetailGroup icon={BookOpen} label="Knowledge">
+            <DetailGroup icon={BookOpen} label={t('agent.section.knowledge')}>
               {agent.knowledgeBundles.map((k) => (
                 <EntityLink
                   key={k}
@@ -331,7 +332,7 @@ export default function AgentDrawer({
           )}
 
           {mcpCount > 0 && (
-            <DetailGroup icon={Plug} label="MCP">
+            <DetailGroup icon={Plug} label={t('agent.section.mcp')}>
               {agent.mcpBundles.map((m) => (
                 <EntityLink
                   key={m}
@@ -347,7 +348,7 @@ export default function AgentDrawer({
           )}
 
           {peerCount > 0 && (
-            <DetailGroup icon={Users} label="Peers">
+            <DetailGroup icon={Users} label={t('agent.section.peers')}>
               {agent.peerGroups.map((pg) => (
                 <EntityLink
                   key={pg}
@@ -363,7 +364,7 @@ export default function AgentDrawer({
           )}
 
           {cronCount > 0 && (
-            <DetailGroup icon={Clock} label="Cron">
+            <DetailGroup icon={Clock} label={t('agent.section.cron')}>
               {agent.cronJobs.map((c) => (
                 <EntityLink
                   key={c}
@@ -383,16 +384,16 @@ export default function AgentDrawer({
             <div className="min-w-0">
               <div className="flex items-center gap-1 text-[11px] text-pc-text-faint">
                 <MessageSquare className="h-3 w-3 flex-shrink-0" />
-                Sessions
+                {t('agent.stat.sessions')}
               </div>
               <div className="mt-0.5 text-sm text-pc-text">
                 {agent.sessionCount === 0 ? (
-                  <span className="text-pc-text-muted">none</span>
+                  <span className="text-pc-text-muted">{t('agent.stat.none')}</span>
                 ) : (
                   <Link
                     to={`/?tab=sessions&agent=${encodeURIComponent(agent.alias)}`}
                     className="hover:text-pc-accent hover:underline"
-                    title={`Show sessions for ${agent.alias}`}
+                    title={`${t('agent.show_sessions_title')} ${agent.alias}`}
                   >
                     {agent.sessionCount}
                   </Link>
@@ -406,16 +407,16 @@ export default function AgentDrawer({
             <div className="min-w-0">
               <div className="flex items-center gap-1 text-[11px] text-pc-text-faint">
                 <Brain className="h-3 w-3 flex-shrink-0" />
-                Memories
+                {t('agent.stat.memories')}
               </div>
               <div className="mt-0.5 text-sm text-pc-text">
                 {agent.memoryCount === 0 ? (
-                  <span className="text-pc-text-muted">none</span>
+                  <span className="text-pc-text-muted">{t('agent.stat.none')}</span>
                 ) : (
                   <Link
                     to={`/?tab=memories&agent=${encodeURIComponent(agent.alias)}`}
                     className="hover:text-pc-accent hover:underline"
-                    title={`Show memories for ${agent.alias}`}
+                    title={`${t('agent.show_memories_title')} ${agent.alias}`}
                   >
                     {agent.memoryCount}
                   </Link>
@@ -427,13 +428,13 @@ export default function AgentDrawer({
               className="min-w-0"
               title={
                 agent.monthCostUsd === null
-                  ? 'Per-agent tracking disabled in [cost].track_per_agent'
-                  : 'Month-to-date spend attributed to this agent'
+                  ? t('agent.cost_untracked_title')
+                  : t('agent.cost_tracked_title')
               }
             >
               <div className="flex items-center gap-1 text-[11px] text-pc-text-faint">
                 <DollarSign className="h-3 w-3 flex-shrink-0" />
-                This month
+                {t('agent.stat.this_month')}
               </div>
               <div className="mt-0.5 text-sm text-pc-text">
                 {formatUsd(agent.monthCostUsd)}
@@ -450,14 +451,14 @@ export default function AgentDrawer({
             className={`${ACTION_BASE} flex-1 bg-pc-accent border-transparent text-[#0b1220] hover:bg-pc-accent-light active:brightness-95`}
           >
             <MessageSquare className="h-4 w-4" />
-            Open chat
+            {t('agent.open_chat')}
           </Link>
           <Link
             to={`/config/agents/${encodeURIComponent(agent.alias)}`}
             className={`${ACTION_BASE} bg-transparent border-pc-border text-pc-text-secondary hover:bg-[var(--pc-hover)] hover:text-pc-text hover:border-pc-border-strong`}
           >
             <Pencil className="h-4 w-4" />
-            Edit
+            {t('agent.edit')}
           </Link>
         </div>
       </div>

@@ -104,7 +104,7 @@ export default function Integrations() {
     <div className="p-6 space-y-6">
       <PageHeader
         title={t('integrations.title')}
-        description="Browse available integrations and jump to their channel configuration."
+        description={t('integrations.subtitle')}
         actions={<Badge tone="neutral">{integrations.length}</Badge>}
       />
 
@@ -148,7 +148,9 @@ export default function Integrations() {
                 const BadgeIcon = badge.icon;
                 const href = configHref(integration.name, integration.category);
                 const ctaLabel =
-                  integration.status === 'Active' ? 'Configure' : 'Set up';
+                  integration.status === 'Active'
+                    ? t('integrations.configure')
+                    : t('integrations.set_up');
                 return (
                   <button
                     key={integration.name}

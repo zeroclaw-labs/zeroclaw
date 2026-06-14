@@ -183,23 +183,40 @@ function rendererFor(
   }
 }
 
-function fieldShortLabel(entry: ListResponseEntry): string {
-  return entry.path.split(".").pop()!.replace(/[-_]/g, " ");
+// The dotted path's LAST segment, de-kebab/de-snake'd into space-separated
+// words (lower-case form — used for sorting/search).
+function leafLabel(path: string): string {
+  return (path.split(".").pop() ?? path).replace(/[-_]/g, " ");
 }
 
+function fieldShortLabel(entry: ListResponseEntry): string {
+  return leafLabel(entry.path);
+}
+
+// Common acronyms that should render fully upper-cased in a humanized label
+// (so `api_key` → "API Key", `mcp` → "MCP", not "Api Key" / "Mcp").
+const LABEL_ACRONYMS = new Set([
+  "api", "url", "uri", "id", "ip", "ui", "os", "db", "vm", "ai", "llm",
+  "mcp", "tts", "acp", "ttl", "sop", "cpu", "ram", "gpu", "dns", "ssl",
+  "tls", "json", "toml", "yaml", "csv", "sql", "jwt", "sse", "ws", "wss",
+  "http", "https", "rpc", "grpc", "cli", "sdk", "pdf", "cwd", "env",
+]);
+
 // Humanize the schema-provided dotted path's LAST segment into a Title-ish
-// label (de-kebab/de-snake, capitalize words). Purely a presentation transform
-// of the schema's own path — no hardcoded field names — so the config renderer
-// stays schema-driven (#6175). The dotted path itself remains visible as a
-// secondary line for unambiguous identification.
+// label (de-kebab/de-snake, capitalize words, upper-case known acronyms).
+// Purely a presentation transform of the schema's own path — no hardcoded field
+// names — so the config renderer stays schema-driven (#6175). The dotted path
+// itself remains visible as a secondary line for unambiguous identification.
 function humanizeFieldLabel(path: string): string {
-  const leaf = path.split(".").pop() ?? path;
-  return leaf
-    .replace(/[-_]/g, " ")
+  return leafLabel(path)
     .trim()
     .split(/\s+/)
     .filter(Boolean)
-    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .map((w) =>
+      LABEL_ACRONYMS.has(w.toLowerCase())
+        ? w.toUpperCase()
+        : w.charAt(0).toUpperCase() + w.slice(1),
+    )
     .join(" ");
 }
 
@@ -421,11 +438,11 @@ function validationHint(entry: ListResponseEntry, raw: string): string | null {
     const n = Number(trimmed);
     if (!Number.isFinite(n)) {
       return entry.kind === "integer"
-        ? "Must be a whole number."
-        : "Must be a number.";
+        ? t("cfg.field.validation.mustBeWholeNumber")
+        : t("cfg.field.validation.mustBeNumber");
     }
     if (entry.kind === "integer" && !Number.isInteger(n)) {
-      return "Must be a whole number (no decimals).";
+      return t("cfg.field.validation.noDecimals");
     }
   }
 
@@ -438,7 +455,7 @@ function validationHint(entry: ListResponseEntry, raw: string): string | null {
     renderer !== "bool" &&
     trimmed.length === 0
   ) {
-    return "This field is required.";
+    return t("cfg.field.validation.required");
   }
 
   return null;

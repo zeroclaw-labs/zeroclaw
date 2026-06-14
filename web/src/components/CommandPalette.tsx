@@ -71,11 +71,17 @@ const MAX_RESULTS = 50;
 
 // Section headers + the bucket order they render in.
 const KIND_ORDER: ResultKind[] = ['page', 'section', 'entry'];
-const KIND_HEADER: Record<ResultKind, string> = {
-  page: 'Pages',
-  section: 'Config sections',
-  entry: 'Config entries',
-};
+// Resolved at render time so the locale catalog is consulted on each render.
+function kindHeader(kind: ResultKind): string {
+  switch (kind) {
+    case 'page':
+      return t('nav.cmdk.header.pages');
+    case 'section':
+      return t('nav.cmdk.header.sections');
+    case 'entry':
+      return t('nav.cmdk.header.entries');
+  }
+}
 const KIND_ICON: Record<Exclude<ResultKind, 'page'>, typeof LayoutDashboard> = {
   section: FolderTree,
   entry: SlidersHorizontal,
@@ -342,7 +348,7 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
           />
           {loadingConfig && (
             <span className="shrink-0 text-[11px] text-pc-text-faint whitespace-nowrap">
-              loading settings…
+              {t('nav.cmdk.loading_settings')}
             </span>
           )}
         </div>
@@ -367,7 +373,7 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
                     role="presentation"
                     className="px-3 pt-3 pb-1 text-[10px] font-medium uppercase tracking-wider text-pc-text-faint"
                   >
-                    {KIND_HEADER[row.kind]}
+                    {kindHeader(row.kind)}
                   </div>
                 );
               }
@@ -406,7 +412,7 @@ export default function CommandPalette({ open, onClose }: CommandPaletteProps) {
           )}
           {extraCount > 0 && (
             <div className="px-3 py-2 text-center text-[11px] text-pc-text-faint">
-              +{extraCount} more — keep typing
+              {t('nav.cmdk.more_prefix')}{extraCount} {t('nav.cmdk.more_suffix')}
             </div>
           )}
         </div>

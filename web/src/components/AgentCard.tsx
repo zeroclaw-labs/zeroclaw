@@ -9,6 +9,7 @@ import {
 } from 'lucide-react';
 import type { AgentSummary } from '@/lib/agents';
 import { Badge } from '@/components/ui';
+import { t } from '@/lib/i18n';
 
 export interface AgentCardProps {
   agent: AgentSummary;
@@ -63,7 +64,7 @@ export default function AgentCard({ agent, onSelect, selected = false }: AgentCa
       type="button"
       onClick={onSelect}
       aria-haspopup="dialog"
-      aria-label={`Open ${agent.alias} detail`}
+      aria-label={`${t('agentcard.open_detail_prefix')} ${agent.alias} ${t('agentcard.open_detail_suffix')}`}
       className={[
         'group w-full flex items-center gap-3 px-4 py-3 text-left',
         'border-b border-pc-border last:border-b-0',
@@ -86,11 +87,11 @@ export default function AgentCard({ agent, onSelect, selected = false }: AgentCa
           </span>
           <Badge tone={agent.enabled ? 'ok' : 'neutral'} className="flex-shrink-0">
             <Power className="h-3 w-3" />
-            {agent.enabled ? 'enabled' : 'disabled'}
+            {agent.enabled ? t('agent.enabled') : t('agent.disabled')}
           </Badge>
         </div>
         <span className="block text-xs truncate font-mono text-pc-text-muted">
-          {agent.modelProvider || 'no model_provider set'}
+          {agent.modelProvider || t('agent.no_model_provider')}
         </span>
       </div>
 
@@ -99,33 +100,33 @@ export default function AgentCard({ agent, onSelect, selected = false }: AgentCa
         <RowFact
           icon={Wifi}
           value={channelCount}
-          label={channelCount === 1 ? 'channel' : 'channels'}
+          label={channelCount === 1 ? t('agentcard.channel') : t('agentcard.channels')}
           title={
             channelCount === 0
-              ? 'No channels bound'
-              : `Channels: ${agent.channels.join(', ')}`
+              ? t('agentcard.no_channels_bound')
+              : `${t('agentcard.channels_title')}: ${agent.channels.join(', ')}`
           }
         />
         <RowFact
           icon={MessageSquare}
           value={agent.sessionCount}
-          label={agent.sessionCount === 1 ? 'session' : 'sessions'}
-          title="Active sessions"
+          label={agent.sessionCount === 1 ? t('agentcard.session') : t('agentcard.sessions')}
+          title={t('agentcard.active_sessions')}
         />
         <RowFact
           icon={Brain}
           value={agent.memoryCount}
-          label={agent.memoryCount === 1 ? 'memory' : 'memories'}
-          title="Stored memories"
+          label={agent.memoryCount === 1 ? t('agentcard.memory') : t('agentcard.memories')}
+          title={t('agentcard.stored_memories')}
         />
         <RowFact
           icon={DollarSign}
           value={formatUsd(agent.monthCostUsd)}
-          label="this month"
+          label={t('agentcard.this_month')}
           title={
             agent.monthCostUsd === null
-              ? 'Per-agent tracking disabled in [cost].track_per_agent'
-              : 'Month-to-date spend attributed to this agent'
+              ? t('agent.cost_untracked_title')
+              : t('agent.cost_tracked_title')
           }
         />
       </div>
