@@ -335,6 +335,7 @@ impl DelegateTool {
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "target_agent": target_alias,
+                        "caller_alias": self.caller_alias,
                         "caller_risk_profile": self.security.risk_profile_name,
                     })),
                 "delegate refused: caller delegation_policy forbids delegation"
@@ -376,6 +377,7 @@ impl DelegateTool {
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "target_agent": target_alias,
+                        "caller_alias": self.caller_alias,
                         "error": format!("{}", e),
                     })),
                 "delegate: could not resolve target's security policy"
@@ -396,6 +398,7 @@ impl DelegateTool {
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "target_agent": target_alias,
+                        "caller_alias": self.caller_alias,
                         "caller_risk_profile": self.security.risk_profile_name,
                         "target_risk_profile": target_policy.risk_profile_name,
                         "violation": format!("{violation:?}"),
