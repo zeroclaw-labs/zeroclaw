@@ -3179,6 +3179,26 @@ pub struct AliasedAgentConfig {
     #[serde(default)]
     pub classifier_provider: crate::providers::ModelProviderRef,
 
+    /// Auto-allow delegation to every agent sharing this agent's risk
+    /// profile. Default `true` preserves the historical reach where any
+    /// same-profile peer is a delegation target. Set `false` to opt this
+    /// agent out so only the explicit `delegates` list is reachable.
+    /// Gating (whether delegation is permitted at all) still lives on the
+    /// risk profile's `delegation_policy.mode`; this only narrows reach.
+    #[tab(General)]
+    #[serde(default = "default_true")]
+    pub delegate_same_profile: bool,
+
+    /// Explicit delegate roster: additional agent aliases this agent may
+    /// delegate to, beyond same-profile peers. Possibly empty. Entries
+    /// may name agents on a different risk profile; such cross-profile
+    /// targets run under the target's own resolved policy and tool
+    /// registry. `Config::validate()` fails loud on a dangling alias or a
+    /// self-reference.
+    #[tab(General)]
+    #[serde(default)]
+    pub delegates: Vec<String>,
+
     // ── Resolved runtime tunables (populated by `resolved_agent_config`
     // from the runtime profile; not config-settable on the agent). ──
     #[serde(skip)]
@@ -3229,6 +3249,8 @@ impl Default for AliasedAgentConfig {
             tts_provider: crate::providers::TtsProviderRef::default(),
             transcription_provider: crate::providers::TranscriptionProviderRef::default(),
             classifier_provider: crate::providers::ModelProviderRef::default(),
+            delegate_same_profile: true,
+            delegates: Vec::new(),
             resolved: ResolvedRuntime::default(),
             workspace: crate::multi_agent::AgentWorkspaceConfig::default(),
             memory: crate::multi_agent::AgentMemoryConfig::default(),
@@ -3302,6 +3324,47 @@ impl Config {
             return None;
         }
         self.risk_profiles.get(profile_alias)
+    }
+
+    /// Resolve the set of agent aliases `caller_alias` may delegate to:
+    /// same-profile peers when `delegate_same_profile` is set, unioned
+    /// with the explicit `delegates` roster, minus the caller. Single
+    /// source of truth for delegate reach; gating (`delegation_policy`)
+    /// is enforced separately by the caller. Deduped, sorted; unknown
+    /// caller yields empty. Disabled targets are never reachable.
+    #[must_use]
+    pub fn reachable_delegate_targets(&self, caller_alias: &str) -> Vec<String> {
+        let Some(caller) = self.agents.get(caller_alias) else {
+            return Vec::new();
+        };
+
+        let mut targets: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+        if caller.delegate_same_profile {
+            let caller_profile = caller.risk_profile.trim();
+            if !caller_profile.is_empty() {
+                for (alias, agent) in &self.agents {
+                    if alias.as_str() != caller_alias
+                        && agent.enabled
+                        && agent.risk_profile.trim() == caller_profile
+                    {
+                        targets.insert(alias.clone());
+                    }
+                }
+            }
+        }
+
+        for explicit in &caller.delegates {
+            let trimmed = explicit.trim();
+            if trimmed.is_empty() || trimmed == caller_alias {
+                continue;
+            }
+            if self.agents.get(trimmed).is_some_and(|agent| agent.enabled) {
+                targets.insert(trimmed.to_string());
+            }
+        }
+
+        targets.into_iter().collect()
     }
 
     /// Resolve the `[runtime_profiles.<alias>]` entry owned by an agent
@@ -16711,6 +16774,35 @@ impl Config {
                 );
             }
 
+            // delegates: explicit roster entries must point at OTHER
+            // configured agents, never self. Cross-profile targets are
+            // permitted (they run under the target's own policy), so no
+            // profile match is required here.
+            for (i, target) in agent.delegates.iter().enumerate() {
+                let target_str = target.trim();
+                if target_str.is_empty() {
+                    validation_bail!(
+                        RequiredFieldEmpty,
+                        format!("agents.{alias}.delegates[{i}]"),
+                        "agents.{alias}.delegates[{i}] is empty; remove it or name a configured agent",
+                    );
+                }
+                if target_str == alias.as_str() {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.delegates[{i}]"),
+                        "agents.{alias}.delegates[{i}] = {target_str:?} names this agent itself; an agent cannot delegate to itself",
+                    );
+                }
+                if !self.agents.contains_key(target_str) {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("agents.{alias}.delegates[{i}]"),
+                        "agents.{alias}.delegates[{i}] = {target_str:?} but agents.{target_str} is not configured",
+                    );
+                }
+            }
+
             // workspace.access: keys must point at OTHER agents, never
             // self, and every target must be a configured agent.
             for (target, mode) in &agent.workspace.access {
@@ -27590,5 +27682,124 @@ allowed_users = []
             .insert("primary".to_string(), entry);
 
         assert!(config.collect_warnings().is_empty());
+    }
+
+    fn delegate_roster_config() -> Config {
+        let mut cfg = Config::default();
+        cfg.providers.models.ollama.insert(
+            "default".to_string(),
+            crate::schema::OllamaModelProviderConfig::default(),
+        );
+        cfg.risk_profiles
+            .insert("shared".to_string(), RiskProfileConfig::default());
+        cfg.risk_profiles
+            .insert("lore".to_string(), RiskProfileConfig::default());
+        for (alias, profile) in [
+            ("aaa", "shared"),
+            ("aaatools", "shared"),
+            ("aaalore", "lore"),
+        ] {
+            cfg.agents.insert(
+                alias.to_string(),
+                AliasedAgentConfig {
+                    risk_profile: profile.to_string(),
+                    model_provider: "ollama.default".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
+        cfg
+    }
+
+    #[test]
+    async fn reachable_targets_auto_allows_same_profile_peers() {
+        let cfg = delegate_roster_config();
+        assert_eq!(cfg.reachable_delegate_targets("aaa"), vec!["aaatools"]);
+    }
+
+    #[test]
+    async fn reachable_targets_excludes_self() {
+        let cfg = delegate_roster_config();
+        assert!(
+            !cfg.reachable_delegate_targets("aaa")
+                .iter()
+                .any(|a| a == "aaa")
+        );
+    }
+
+    #[test]
+    async fn reachable_targets_opt_out_hides_peers_keeps_explicit() {
+        let mut cfg = delegate_roster_config();
+        let aaa = cfg.agents.get_mut("aaa").unwrap();
+        aaa.delegate_same_profile = false;
+        aaa.delegates = vec!["aaalore".to_string()];
+        assert_eq!(cfg.reachable_delegate_targets("aaa"), vec!["aaalore"]);
+    }
+
+    #[test]
+    async fn reachable_targets_unions_peers_and_explicit_cross_profile() {
+        let mut cfg = delegate_roster_config();
+        cfg.agents.get_mut("aaa").unwrap().delegates = vec!["aaalore".to_string()];
+        assert_eq!(
+            cfg.reachable_delegate_targets("aaa"),
+            vec!["aaalore", "aaatools"]
+        );
+    }
+
+    #[test]
+    async fn reachable_targets_unknown_caller_is_empty() {
+        let cfg = delegate_roster_config();
+        assert!(cfg.reachable_delegate_targets("nope").is_empty());
+    }
+
+    #[test]
+    async fn reachable_targets_excludes_disabled_same_profile_peer() {
+        let mut cfg = delegate_roster_config();
+        cfg.agents.get_mut("aaatools").unwrap().enabled = false;
+        assert!(
+            cfg.reachable_delegate_targets("aaa").is_empty(),
+            "disabled same-profile peer must not be reachable"
+        );
+    }
+
+    #[test]
+    async fn reachable_targets_excludes_disabled_explicit_delegate() {
+        let mut cfg = delegate_roster_config();
+        cfg.agents.get_mut("aaa").unwrap().delegate_same_profile = false;
+        cfg.agents.get_mut("aaa").unwrap().delegates = vec!["aaalore".to_string()];
+        cfg.agents.get_mut("aaalore").unwrap().enabled = false;
+        assert!(
+            cfg.reachable_delegate_targets("aaa").is_empty(),
+            "disabled explicit delegate must not be reachable"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_dangling_delegate_target() {
+        let mut cfg = delegate_roster_config();
+        cfg.agents.get_mut("aaa").unwrap().delegates = vec!["ghost".to_string()];
+        let err = cfg.validate().expect_err("dangling delegate must fail");
+        assert!(format!("{err:#}").contains("delegates"), "{err:#}");
+    }
+
+    #[test]
+    async fn validate_rejects_self_delegate() {
+        let mut cfg = delegate_roster_config();
+        cfg.agents.get_mut("aaa").unwrap().delegates = vec!["aaa".to_string()];
+        let err = cfg.validate().expect_err("self-delegate must fail");
+        assert!(format!("{err:#}").contains("itself"), "{err:#}");
+    }
+
+    #[test]
+    async fn delegate_fields_default_for_legacy_config_roundtrip() {
+        let toml_src = "\
+[agents.legacy]
+risk_profile = \"shared\"
+model_provider = \"ollama.default\"
+";
+        let cfg: Config = toml::from_str(toml_src).expect("legacy config parses");
+        let agent = cfg.agents.get("legacy").expect("agent present");
+        assert!(agent.delegate_same_profile, "default must be true");
+        assert!(agent.delegates.is_empty(), "default must be empty");
     }
 }
