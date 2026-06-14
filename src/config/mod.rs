@@ -121,6 +121,7 @@ mod tests {
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
             slash_commands: false,
+            intents_mask: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
             reply_min_interval_secs: 0,

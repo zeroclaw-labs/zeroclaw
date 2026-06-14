@@ -11379,6 +11379,17 @@ pub struct DiscordConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub stall_timeout_secs: u64,
+    /// Raw gateway intent mask override. When set, this exact value is sent
+    /// in IDENTIFY instead of the derived mask: an operator escape hatch
+    /// for downstream deployments that consume gateway events through
+    /// custom builds or forks. The operator owns the consequences:
+    /// privileged bits still need their Developer Portal toggles, and
+    /// dropping baseline bits silences message handling (a warning is
+    /// logged). Unset (default) = derive the mask from the channel's
+    /// feature config.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub intents_mask: Option<u64>,
     /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
     #[tab(Behavior)]
     #[serde(default = "default_channel_approval_timeout_secs")]
@@ -20340,6 +20351,7 @@ default_temperature = 0.7
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
+            intents_mask: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
@@ -20368,6 +20380,7 @@ default_temperature = 0.7
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
+            intents_mask: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
