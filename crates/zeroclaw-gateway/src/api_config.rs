@@ -1764,9 +1764,10 @@ pub async fn handle_options_prop(
         header::ALLOW,
         HeaderValue::from_static("GET, PUT, DELETE, OPTIONS"),
     );
-    response
-        .headers_mut()
-        .insert(header::ETAG, HeaderValue::from_str(etag).expect("etag is valid ASCII"));
+    response.headers_mut().insert(
+        header::ETAG,
+        HeaderValue::from_str(etag).expect("etag is valid ASCII"),
+    );
     response
 }
 
@@ -1777,9 +1778,10 @@ fn schema_response(_label: &'static str) -> Response {
         header::ALLOW,
         HeaderValue::from_static("GET, PUT, PATCH, OPTIONS"),
     );
-    response
-        .headers_mut()
-        .insert(header::ETAG, HeaderValue::from_str(etag).expect("etag is valid ASCII"));
+    response.headers_mut().insert(
+        header::ETAG,
+        HeaderValue::from_str(etag).expect("etag is valid ASCII"),
+    );
     response
 }
 
