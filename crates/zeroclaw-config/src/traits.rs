@@ -57,22 +57,6 @@ impl AliasSource {
                 | Self::Channels
         )
     }
-
-    #[must_use]
-    pub const fn all() -> &'static [AliasSource] {
-        &[
-            Self::ModelProviders,
-            Self::TtsProviders,
-            Self::TranscriptionProviders,
-            Self::Channels,
-            Self::RiskProfiles,
-            Self::RuntimeProfiles,
-            Self::Agents,
-            Self::SkillBundles,
-            Self::KnowledgeBundles,
-            Self::McpBundles,
-        ]
-    }
 }
 
 /// Runtime type classification for config property values.
