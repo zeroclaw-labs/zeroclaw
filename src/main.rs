@@ -381,8 +381,8 @@ impl LogLevel {
 enum Commands {
     /// Quickstart — create one working agent end-to-end. Replaces the
     /// section-by-section onboarding flow with a single preset-driven
-    /// path. Non-interactive in this build: writes balanced defaults
-    /// for risk/runtime/memory and prints next-step instructions.
+    /// path. Interactive: the flags below pre-seed checklist selectors
+    /// but do not skip them; a terminal is required.
     Quickstart {
         /// Provider type (anthropic / openai / openrouter / ollama).
         #[arg(long)]
@@ -1082,6 +1082,28 @@ async fn run_quickstart_cli(
         snapshot_state,
     };
 
+    // The checklist below is driven by dialoguer prompts, which read keys
+    // from stdin and render on `Term::stderr()`. If *either* end is not an
+    // interactive terminal the selector cannot make progress: with a
+    // non-TTY stdin or stderr `read_key()` yields `Key::Unknown`, which
+    // `FuzzySelect` does not treat as a terminal condition, so it redraws
+    // in a tight loop forever instead of failing (#7507 — e.g. piped stdin
+    // `echo "" | … quickstart`, or redirected stderr `… quickstart > log 2>&1`).
+    // Fail fast and point headless callers at the scriptable alternative.
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin())
+        || !std::io::IsTerminal::is_terminal(&std::io::stderr())
+    {
+        anyhow::bail!(
+            "{}",
+            t(
+                "cli-quickstart-needs-tty",
+                "Quickstart is interactive and needs a terminal on stdin and stderr. \
+                 Run it from an interactive shell, or use \
+                 `zeroclaw config set <path> <value>` for headless configuration."
+            )
+        );
+    }
+
     // ── Form state ──────────────────────────────────────────────
     //
     // Every field is `Option<…>` and starts `None`. A selector is
@@ -1345,9 +1367,12 @@ async fn run_quickstart_cli(
         ];
         let create_enabled = form.all_done();
         labels.push(if create_enabled {
-            "── Create agent".to_string()
+            t("cli-quickstart-create-agent", "── Create agent")
         } else {
-            "── Create agent (locked — fill every selector first)".to_string()
+            t(
+                "cli-quickstart-create-agent-locked",
+                "── Create agent (locked — fill every selector first)",
+            )
         });
 
         let actions = [
@@ -1361,7 +1386,10 @@ async fn run_quickstart_cli(
         ];
 
         let pick = FuzzySelect::new()
-            .with_prompt("Open a selector (Enter), or pick Create. Esc to quit.")
+            .with_prompt(t(
+                "cli-quickstart-open-selector-prompt",
+                "Open a selector (Enter), or pick Create. Esc to quit.",
+            ))
             .items(&labels)
             .default(0)
             .max_length(labels.len())
@@ -1401,16 +1429,16 @@ async fn run_quickstart_cli(
                 let mut mode_labels: Vec<String> = Vec::new();
                 let mut mode_kinds: Vec<&str> = Vec::new();
                 if !state.model_providers.is_empty() {
-                    mode_labels.push("Use existing".to_string());
+                    mode_labels.push(t("cli-quickstart-use-existing", "Use existing"));
                     mode_kinds.push("existing");
                 }
-                mode_labels.push("Create new".to_string());
+                mode_labels.push(t("cli-quickstart-create-new", "Create new"));
                 mode_kinds.push("fresh");
                 let mode = if mode_labels.len() == 1 {
                     Some(0)
                 } else {
                     FuzzySelect::new()
-                        .with_prompt("Model provider")
+                        .with_prompt(t("cli-quickstart-model-provider-prompt", "Model provider"))
                         .items(&mode_labels)
                         .default(0)
                         .max_length(mode_labels.len())
@@ -1420,7 +1448,10 @@ async fn run_quickstart_cli(
                 if mode_kinds[mi] == "existing" {
                     let labels: Vec<String> = state.model_providers.clone();
                     let Some(i) = FuzzySelect::new()
-                        .with_prompt("Pick a configured provider")
+                        .with_prompt(t(
+                            "cli-quickstart-pick-configured-provider",
+                            "Pick a configured provider",
+                        ))
                         .items(&labels)
                         .default(0)
                         .max_length(labels.len().max(1))
