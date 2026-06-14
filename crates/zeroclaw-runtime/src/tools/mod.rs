@@ -497,7 +497,7 @@ pub fn all_tools_with_runtime(
     is_subagent_caller: bool,
     tui_env: Option<HashMap<String, String>>,
     sop_engine: Option<Arc<Mutex<SopEngine>>>,
-    _sop_audit: Option<Arc<SopAuditLogger>>,
+    sop_audit: Option<Arc<SopAuditLogger>>,
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
@@ -1128,9 +1128,21 @@ pub fn all_tools_with_runtime(
     // SOP tools (registered when engine handle is provided)
     if let Some(ref sop_engine) = sop_engine {
         tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(sop_engine))));
-        tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(sop_engine))));
-        tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(sop_engine))));
-        tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(sop_engine))));
+        if let Some(ref sop_audit) = sop_audit {
+            tool_arcs.push(Arc::new(
+                SopExecuteTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
+            ));
+            tool_arcs.push(Arc::new(
+                SopAdvanceTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
+            ));
+            tool_arcs.push(Arc::new(
+                SopApproveTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
+            ));
+        } else {
+            tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(sop_engine))));
+            tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(sop_engine))));
+            tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(sop_engine))));
+        }
         tool_arcs.push(Arc::new(SopStatusTool::new(Arc::clone(sop_engine))));
     }
 
@@ -1753,6 +1765,88 @@ mod tests {
         assert!(names.contains(&"model_routing_config"));
         assert!(names.contains(&"pushover"));
         assert!(names.contains(&"proxy_config"));
+    }
+
+    /// Wiring guard for issue #6689: SOP tools registered via `all_tools` must
+    /// carry a real audit logger, so a tool-driven run persists the documented
+    /// `sop_run_*` Memory key. The per-tool unit tests prove `with_audit` works;
+    /// this is the only test proving registration actually wires it. Without the
+    /// `.with_audit(...)` calls in the SOP block, the audit trail is silently a
+    /// no-op on the agent path (the path the AMQP/sop_execute deployment uses).
+    #[tokio::test]
+    async fn registered_sop_tools_persist_audit_trail() {
+        let tmp = TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        let sop_subdir = sops_dir.join("canary");
+        std::fs::create_dir_all(&sop_subdir).unwrap();
+        std::fs::write(
+            sop_subdir.join("SOP.toml"),
+            "[sop]\nname = \"canary\"\ndescription = \"audit wiring guard\"\nversion = \"1.0.0\"\n\n[[triggers]]\ntype = \"manual\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            sop_subdir.join("SOP.md"),
+            "## Steps\n\n1. **Resolve** Do the first step\n   - tools: shell\n",
+        )
+        .unwrap();
+
+        let mem_cfg = MemoryConfig {
+            backend: "sqlite".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let security = Arc::new(SecurityPolicy::default());
+        let mut cfg = test_config(&tmp);
+        cfg.sop.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
+
+        let tools = {
+            let mut engine = crate::sop::SopEngine::new(cfg.sop.clone());
+            engine.reload(tmp.path());
+            let sop_engine = Arc::new(std::sync::Mutex::new(engine));
+            let sop_audit = Arc::new(crate::sop::SopAuditLogger::new(mem.clone()));
+            all_tools_with_runtime(
+                Arc::new(Config::default()),
+                &security,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+                "test-agent",
+                Arc::new(NativeRuntime::new()),
+                mem.clone(),
+                None,
+                None,
+                &BrowserConfig::default(),
+                &zeroclaw_config::schema::HttpRequestConfig::default(),
+                &zeroclaw_config::schema::WebFetchConfig::default(),
+                tmp.path(),
+                &HashMap::new(),
+                None,
+                &cfg,
+                None,
+                false,
+                None,
+                Some(sop_engine),
+                Some(sop_audit),
+            )
+            .tools
+        };
+
+        let execute = tools
+            .iter()
+            .find(|t| t.name() == "sop_execute")
+            .expect("sop_execute must be registered when sops_dir is set");
+        let result = execute
+            .execute(serde_json::json!({"name": "canary"}))
+            .await
+            .unwrap();
+        assert!(result.success, "sop_execute failed: {result:?}");
+
+        let audit = crate::sop::SopAuditLogger::new(mem.clone());
+        let run_keys = audit.list_runs().await.unwrap();
+        assert!(
+            !run_keys.is_empty(),
+            "registered sop_execute must persist a sop_run_* audit entry; got none (audit not wired)"
+        );
     }
 
     #[test]
