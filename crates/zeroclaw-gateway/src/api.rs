@@ -2128,6 +2128,8 @@ mod tests {
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             reload_tx: None,
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
