@@ -8,7 +8,7 @@
 # Default fallback. Only fires for genuinely uncategorized paths after the
 # explicit legacy/common fallback sections below.
 # ---------------------------------------------------------------------------
-* @Audacity88
+* @WareWolf-MoonWall @Audacity88
 
 # ---------------------------------------------------------------------------
 # Audacity-primary areas (runtime, agent, tools, gateway, config, memory)
@@ -50,28 +50,28 @@
 # ---------------------------------------------------------------------------
 # Legacy root crate and common source paths (shared maintainer triage)
 # ---------------------------------------------------------------------------
-/src/main.rs              @Audacity88
-/src/lib.rs               @Audacity88
-/src/bin/**               @Audacity88
-/src/approval/**          @Audacity88
-/src/auth/**              @Audacity88
-/src/commands/**          @Audacity88
-/src/cron/**              @Audacity88
-/src/daemon/**            @Audacity88
-/src/doctor/**            @Audacity88
-/src/health/**            @Audacity88
-/src/hooks/**             @Audacity88
-/src/nodes/**             @Audacity88
-/src/observability/**     @Audacity88
-/src/peripherals/**       @Audacity88
-/src/platform/**          @Audacity88
-/src/rag/**               @Audacity88
-/src/routines/**          @Audacity88
-/src/service/**           @Audacity88
-/src/sop/**               @Audacity88
-/src/trust/**             @Audacity88
-/src/tunnel/**            @Audacity88
-/src/verifiable_intent/** @Audacity88
+/src/main.rs              @WareWolf-MoonWall @Audacity88
+/src/lib.rs               @WareWolf-MoonWall @Audacity88
+/src/bin/**               @WareWolf-MoonWall @Audacity88
+/src/approval/**          @WareWolf-MoonWall @Audacity88
+/src/auth/**              @WareWolf-MoonWall @Audacity88
+/src/commands/**          @WareWolf-MoonWall @Audacity88
+/src/cron/**              @WareWolf-MoonWall @Audacity88
+/src/daemon/**            @WareWolf-MoonWall @Audacity88
+/src/doctor/**            @WareWolf-MoonWall @Audacity88
+/src/health/**            @WareWolf-MoonWall @Audacity88
+/src/hooks/**             @WareWolf-MoonWall @Audacity88
+/src/nodes/**             @WareWolf-MoonWall @Audacity88
+/src/observability/**     @WareWolf-MoonWall @Audacity88
+/src/peripherals/**       @WareWolf-MoonWall @Audacity88
+/src/platform/**          @WareWolf-MoonWall @Audacity88
+/src/rag/**               @WareWolf-MoonWall @Audacity88
+/src/routines/**          @WareWolf-MoonWall @Audacity88
+/src/service/**           @WareWolf-MoonWall @Audacity88
+/src/sop/**               @WareWolf-MoonWall @Audacity88
+/src/trust/**             @WareWolf-MoonWall @Audacity88
+/src/tunnel/**            @WareWolf-MoonWall @Audacity88
+/src/verifiable_intent/** @WareWolf-MoonWall @Audacity88
 /src/config/**            @Audacity88 @singlerider
 /src/cost/**              @Audacity88
 /src/cli_input.rs         @Audacity88
@@ -82,26 +82,26 @@
 # ---------------------------------------------------------------------------
 # Tests, benches, fuzzing, and examples (shared maintainer triage)
 # ---------------------------------------------------------------------------
-/tests/**   @Audacity88
-/benches/** @Audacity88
-/fuzz/**    @Audacity88
+/tests/**   @WareWolf-MoonWall @Audacity88
+/benches/** @WareWolf-MoonWall @Audacity88
+/fuzz/**    @WareWolf-MoonWall @Audacity88
 
 # ---------------------------------------------------------------------------
 # Repository metadata and local development tooling
 # ---------------------------------------------------------------------------
-/.actrc                    @Audacity88
-/.cargo/**                 @Audacity88
-/.dockerignore             @Audacity88
-/.editorconfig             @Audacity88
-/.env.example              @Audacity88
-/.envrc                    @Audacity88
-/.gemini/**                @Audacity88
-/.gitattributes            @Audacity88
-/.githooks/**              @Audacity88
-/.gitignore                @Audacity88
-/.markdownlint-cli2.yaml   @Audacity88
-/.vscode/**                @Audacity88
-/CNAME                     @Audacity88
+/.actrc                    @WareWolf-MoonWall @Audacity88
+/.cargo/**                 @WareWolf-MoonWall @Audacity88
+/.dockerignore             @WareWolf-MoonWall @Audacity88
+/.editorconfig             @WareWolf-MoonWall @Audacity88
+/.env.example              @WareWolf-MoonWall @Audacity88
+/.envrc                    @WareWolf-MoonWall @Audacity88
+/.gemini/**                @WareWolf-MoonWall @Audacity88
+/.gitattributes            @WareWolf-MoonWall @Audacity88
+/.githooks/**              @WareWolf-MoonWall @Audacity88
+/.gitignore                @WareWolf-MoonWall @Audacity88
+/.markdownlint-cli2.yaml   @WareWolf-MoonWall @Audacity88
+/.vscode/**                @WareWolf-MoonWall @Audacity88
+/CNAME                     @WareWolf-MoonWall @Audacity88
 
 # ---------------------------------------------------------------------------
 # Channels (Audacity primary + singlerider specialist)
@@ -112,19 +112,19 @@
 # ---------------------------------------------------------------------------
 # Skills, plugins (per Jordan's suggested patch on PR #6537)
 # ---------------------------------------------------------------------------
-/crates/zeroclaw-plugins/**                @JordanTheJet @Audacity88
-/crates/zeroclaw-runtime/src/skills/**     @JordanTheJet @Audacity88
-/crates/zeroclaw-runtime/src/skillforge/** @JordanTheJet @Audacity88
-/plugins/**                                @JordanTheJet @Audacity88
-/src/plugins/**                            @JordanTheJet @Audacity88
-/src/skills/**                             @JordanTheJet @Audacity88
-/src/skillforge/**                         @JordanTheJet @Audacity88
-/.claude/skills/**                         @JordanTheJet @Audacity88
+/crates/zeroclaw-plugins/**                @JordanTheJet @WareWolf-MoonWall @Audacity88
+/crates/zeroclaw-runtime/src/skills/**     @JordanTheJet @WareWolf-MoonWall @Audacity88
+/crates/zeroclaw-runtime/src/skillforge/** @JordanTheJet @WareWolf-MoonWall @Audacity88
+/plugins/**                                @JordanTheJet @WareWolf-MoonWall @Audacity88
+/src/plugins/**                            @JordanTheJet @WareWolf-MoonWall @Audacity88
+/src/skills/**                             @JordanTheJet @WareWolf-MoonWall @Audacity88
+/src/skillforge/**                         @JordanTheJet @WareWolf-MoonWall @Audacity88
+/.claude/skills/**                         @JordanTheJet @WareWolf-MoonWall @Audacity88
 
 # ---------------------------------------------------------------------------
 # Desktop app (Tauri)
 # ---------------------------------------------------------------------------
-/apps/tauri/** @JordanTheJet @Audacity88
+/apps/tauri/** @JordanTheJet @WareWolf-MoonWall @Audacity88
 
 # ---------------------------------------------------------------------------
 # Internationalization (singlerider specialist)

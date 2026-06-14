@@ -48,9 +48,11 @@ Core maintainers and their focus areas:
 | Handle | Role | Focus |
 |---|---|---|
 | [@JordanTheJet](https://github.com/JordanTheJet) | Project lead | Hardware, edge deployments |
-| [@theonlyhennygod](https://github.com/theonlyhennygod) | Original creator | Channels, gateway |
+| [@Audacity88](https://github.com/Audacity88) | Maintainer | Runtime, agent, tools, gateway, config |
+| [@singlerider](https://github.com/singlerider) | Maintainer | Providers, infra, hardware, web, i18n |
 | [@WareWolf-MoonWall](https://github.com/WareWolf-MoonWall) | Maintainer | Governance, docs, reviewer playbook |
-| [@singlerider](https://github.com/singlerider) | Maintainer | Runtime, providers, infra |
+| [@Nillth](https://github.com/Nillth) | Maintainer | Providers, channels |
+| [@tidux](https://github.com/tidux) | Maintainer | Channels (Matrix, ACP) |
 
 `@`-mention sparingly — CC maintainers only when the issue genuinely needs their attention. Default to letting the team triage.
 
