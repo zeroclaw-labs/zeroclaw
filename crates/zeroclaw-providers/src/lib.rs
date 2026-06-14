@@ -23,6 +23,7 @@ pub mod bedrock;
 pub mod catalog;
 pub mod compatible;
 pub mod copilot;
+pub mod dispatch;
 pub mod factory;
 pub mod gemini;
 pub mod gemini_cli;
@@ -47,6 +48,7 @@ pub use traits::{
     ChatMessage, ChatRequest, ChatResponse, ConversationMessage, ModelProvider,
     ProviderCapabilityError, ToolCall, ToolResultMessage,
 };
+pub use dispatch::ProviderDispatch;
 
 use reliable::ReliableModelProvider;
 use serde::Deserialize;
