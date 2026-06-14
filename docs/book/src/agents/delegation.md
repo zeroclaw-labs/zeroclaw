@@ -126,8 +126,8 @@ This is a thin signal for the agent-loop spawn path. A dedicated "subagent start
 
 2. **Reachability**: the target agent must be in the caller's reachable set, resolved by `Config::reachable_delegate_targets`. The reachable set is the union of two per-agent sources on `[agents.<caller>]`, minus the caller itself:
 
-   - **same-profile peers** — every other agent sharing the caller's risk profile, included while `delegate_same_profile = true` (the default). Set it `false` to opt the caller out of auto-allowing peers.
-   - **explicit roster** — `delegates`, a possibly-empty list of agent aliases the caller may delegate to even across risk profiles.
+   - **same-profile peers**: every other agent sharing the caller's risk profile, included while `delegate_same_profile = true` (the default). Set it `false` to opt the caller out of auto-allowing peers.
+   - **explicit roster**: `delegates`, a possibly-empty list of agent aliases the caller may delegate to even across risk profiles.
 
    When the target is outside that set the refusal is:
    ```text
@@ -141,7 +141,7 @@ This is a thin signal for the agent-loop spawn path. A dedicated "subagent start
 
 The advertised roster (the `agent` parameter's enum in the tool schema) lists exactly this reachable set, and only when `delegation_policy.mode = "allow"`. Disabled agents (`enabled = false`) are never reachable, whether as same-profile peers or explicit `delegates` entries.
 
-In agentic delegation the sub-agent's tools are drawn from the caller's already-policy-filtered registry, intersected with the target's own `allowed_tools`. The caller's registry is the ceiling: a cross-profile target whose risk profile names a tool the caller was never granted does not receive it. This is the invariant that keeps `ensure_no_escalation_beyond` (which does not itself diff tool allowlists) sufficient — the target can never exceed the caller's tool surface.
+In agentic delegation the sub-agent's tools are drawn from the caller's already-policy-filtered registry, intersected with the target's own `allowed_tools`. The caller's registry is the ceiling: a cross-profile target whose risk profile names a tool the caller was never granted does not receive it. This is the invariant that keeps `ensure_no_escalation_beyond` (which does not itself diff tool allowlists) sufficient, since the target can never exceed the caller's tool surface.
 
 Depth is capped per the parent's `runtime_profile.max_delegation_depth`. Set it to `1` to allow the top agent a single delegation hop with no further sub-delegation.
 
