@@ -20423,8 +20423,7 @@ Done."#;
 
         let err = deliver_announcement(&config, "whatsapp.default", "+15551234567", None, "hi")
             .await
-            .err()
-            .expect("expected whatsapp.default to bail because channel is not configured");
+            .expect_err("expected whatsapp.default to bail because channel is not configured");
         let msg = format!("{err:#}");
         assert!(
             !msg.contains("unsupported delivery channel"),
