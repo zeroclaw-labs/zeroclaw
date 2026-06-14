@@ -5546,9 +5546,9 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
-            #[cfg(feature = "webauthn")]
             sop_engine: None,
             sop_audit: None,
+            #[cfg(feature = "webauthn")]
             webauthn: None,
         };
 
@@ -5664,9 +5664,9 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
-            #[cfg(feature = "webauthn")]
             sop_engine: None,
             sop_audit: None,
+            #[cfg(feature = "webauthn")]
             webauthn: None,
         };
 
@@ -5748,9 +5748,9 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
-            #[cfg(feature = "webauthn")]
             sop_engine: None,
             sop_audit: None,
+            #[cfg(feature = "webauthn")]
             webauthn: None,
         };
 
@@ -5837,9 +5837,9 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
-            #[cfg(feature = "webauthn")]
             sop_engine: None,
             sop_audit: None,
+            #[cfg(feature = "webauthn")]
             webauthn: None,
         };
 
@@ -6167,9 +6167,9 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            #[cfg(feature = "webauthn")]
             sop_engine: None,
             sop_audit: None,
+            #[cfg(feature = "webauthn")]
             webauthn: None,
         };
 
