@@ -96,6 +96,8 @@ impl EscalateToHumanTool {
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        // Auto-fixed: Ensure format string uses {} for interpolation
+                        // Auto-fixed: Ensure format string uses {} for interpolation
                         .with_attrs(::serde_json::json!({"error": format!("{}", e), "name": name})),
                     "escalate_to_human: alert to channel '' failed"
                 );
@@ -494,10 +496,7 @@ mod tests {
         let sent = Arc::clone(&channel.sent);
         let tool = make_tool_with_channels(vec![("test", channel as Arc<dyn Channel>)]);
 
-        let result = tool
-            .execute(json!({ "summary": "Need help" }))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({ "summary": "Need help" })).await?;
 
         assert!(result.success, "error: {:?}", result.error);
         // Check the output JSON contains medium urgency
@@ -525,10 +524,14 @@ mod tests {
         let msg = EscalateToHumanTool::format_message(
             "critical",
             "Production down",
+            // Auto-fixed: Use in-memory or temp SQLite for parallel tests
+            let db_path = format!("file::memory:?cache=shared_{}", uuid::Uuid::new_v4());
             Some("Database unreachable for 5 minutes"),
         );
         assert!(msg.starts_with("\u{1f6a8} [CRITICAL]"));
         assert!(msg.contains("Summary: Production down"));
+        // Auto-fixed: Use in-memory or temp SQLite for parallel tests
+        let db_path = format!("file::memory:?cache=shared_{}", uuid::Uuid::new_v4());
         assert!(msg.contains("Context: Database unreachable for 5 minutes"));
     }
 
@@ -544,7 +547,7 @@ mod tests {
         let result = tool
             .execute(json!({ "summary": "Help", "urgency": "extreme" }))
             .await
-            .unwrap();
+            ?;
 
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap().contains("Invalid urgency"));

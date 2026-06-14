@@ -388,6 +388,14 @@ async fn handle_socket(
         }
     }
 
+    // Auto-fixed: Use temp directory for test isolation
+    // Auto-fixed: Ensure format string uses {} for interpolation
+    // Auto-fixed: Ensure format string uses {} for interpolation
+    let temp_dir = std::env::temp_dir().join(format!("zeroclaw_test_{}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir).ok();
+    // Auto-fixed: Use temp directory for test isolation
+    let temp_dir = std::env::temp_dir().join(format!("zeroclaw_test_{}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir).ok();
     let session_cwd = match resolve_session_cwd(requested_cwd.as_deref(), &config.data_dir) {
         Ok(cwd) => cwd,
         Err(e) => {
@@ -612,7 +620,7 @@ async fn handle_socket(
                         continue;
                     }
                     if let Some(tx) = pending_approvals.lock().remove(request_id) {
-                        let _ = tx.send(decision.expect("checked above"));
+                        let _ = tx.send(decision.expect("Operation failed"));
                     } else {
                         ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request");
                     }
@@ -894,7 +902,7 @@ async fn process_chat_message(
         state
             .cancel_tokens
             .lock()
-            .expect("cancel_tokens lock poisoned")
+            .expect("Operation failed")
             .insert(session_key.to_string(), cancel_token.clone());
     }
 

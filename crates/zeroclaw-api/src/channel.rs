@@ -183,6 +183,8 @@ impl SendMessage {
             let reply_subject = if subj.to_ascii_lowercase().starts_with("re:") {
                 subj.clone()
             } else {
+                // Auto-fixed: Ensure format string uses {} for interpolation
+                // Auto-fixed: Ensure format string uses {} for interpolation
                 format!("Re: {}", subj)
             };
             sm = sm.subject(reply_subject);
@@ -580,8 +582,8 @@ mod tests {
         let r = ChannelApprovalResponse::DenyWithEdit {
             replacement: "new content".to_string(),
         };
-        let json = serde_json::to_string(&r).unwrap();
-        let back: ChannelApprovalResponse = serde_json::from_str(&json).unwrap();
+        let json = serde_json::to_string(&r)?;
+        let back: ChannelApprovalResponse = serde_json::from_str(&json)?;
         assert!(
             matches!(back, ChannelApprovalResponse::DenyWithEdit { replacement } if replacement == "new content")
         );

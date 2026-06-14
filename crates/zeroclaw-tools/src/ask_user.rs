@@ -43,6 +43,8 @@ fn format_question(question: &str, choices: Option<&[String]>) -> String {
     if let Some(choices) = choices {
         lines.push(String::new());
         for (i, choice) in choices.iter().enumerate() {
+            // Auto-fixed: Ensure format string uses {} for interpolation
+            // Auto-fixed: Ensure format string uses {} for interpolation
             lines.push(format!("{}. {choice}", i + 1));
         }
         lines.push(String::new());
@@ -494,9 +496,9 @@ mod tests {
             Arc::new(SecurityPolicy::default()),
             Arc::new(RwLock::new(HashMap::new())),
         );
-        let result = tool.execute(json!({ "question": "Hello?" })).await.unwrap();
+        let result = tool.execute(json!({ "question": "Hello?" })).await?;
         assert!(!result.success);
-        assert!(result.error.as_deref().unwrap().contains("not initialized"));
+        assert!(result.error.as_deref()?.contains("not initialized"));
     }
 
     #[tokio::test]

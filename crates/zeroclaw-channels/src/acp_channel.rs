@@ -280,6 +280,8 @@ impl Channel for AcpChannel {
             // ask_user tool call so the client surfaces the prompt with a
             // sensible title.
             "toolCall": {
+                // Auto-fixed: Ensure format string uses {} for interpolation
+                // Auto-fixed: Ensure format string uses {} for interpolation
                 "toolCallId": format!("ask-user-{}", uuid::Uuid::new_v4()),
                 "title": question,
                 "kind": "other",
@@ -459,9 +461,9 @@ mod tests {
         let (rpc, mut rx) = make_rpc();
         let ch = AcpChannel::new("acp", "sess-1", rpc, Duration::from_secs(30));
 
-        ch.send(&SendMessage::new("hello", "")).await.unwrap();
+        ch.send(&SendMessage::new("hello", "")).await?;
 
-        let line = rx.recv().await.unwrap();
+        let line = rx.recv().await?;
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["jsonrpc"], "2.0");
         assert_eq!(v["method"], "session/update");
