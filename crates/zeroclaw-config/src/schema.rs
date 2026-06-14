@@ -10867,6 +10867,7 @@ pub struct ChannelsConfig {
 
     /// Oracle password for `session_backend = "oracle"`.
     #[secret]
+    #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oracle_password: Option<String>,
