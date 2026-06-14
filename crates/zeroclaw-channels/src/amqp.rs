@@ -341,8 +341,8 @@ impl Channel for AmqpChannel {
     }
 
     async fn health_check(&self) -> bool {
-        match self.establish_consumer().await {
-            Ok((conn, _consumer)) => {
+        match self.connect().await {
+            Ok(conn) => {
                 let _ = conn.close(200, "health check").await;
                 true
             }
