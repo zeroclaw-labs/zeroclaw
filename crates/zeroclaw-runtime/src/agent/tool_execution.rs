@@ -13,7 +13,7 @@ use crate::observability::{Observer, ObserverEvent};
 use crate::tools::Tool;
 
 // Items that still live in `loop_` — import via the parent module.
-use super::loop_::{ParsedToolCall, ToolLoopCancelled, scrub_credentials};
+use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled, scrub_credentials};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -318,6 +318,12 @@ pub async fn execute_tools_parallel(
 
 // ── Sequential execution ─────────────────────────────────────────────────
 
+/// Cancellation contract: a cancel mid-batch stops dispatch and returns
+/// `Ok` with the outcomes of the calls that completed (a strict prefix of
+/// `tool_calls`) — never an error. The token is checked before each call so
+/// a tool that fires the token never lets a later call start, and a cancel
+/// that interrupts a running tool drops that call's outcome. Callers detect
+/// the cut-short batch by comparing lengths.
 pub async fn execute_tools_sequential(
     tool_calls: &[ParsedToolCall],
     tools_registry: &[Box<dyn Tool>],
@@ -329,19 +335,26 @@ pub async fn execute_tools_sequential(
     let mut outcomes = Vec::with_capacity(tool_calls.len());
 
     for call in tool_calls {
-        outcomes.push(
-            execute_one_tool(
-                &call.name,
-                call.arguments.clone(),
-                call.tool_call_id.as_deref(),
-                tools_registry,
-                activated_tools,
-                observer,
-                cancellation_token,
-                receipt_generator,
-            )
-            .await?,
-        );
+        if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
+            break;
+        }
+        let outcome = match execute_one_tool(
+            &call.name,
+            call.arguments.clone(),
+            call.tool_call_id.as_deref(),
+            tools_registry,
+            activated_tools,
+            observer,
+            cancellation_token,
+            receipt_generator,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) if is_tool_loop_cancelled(&e) => break,
+            Err(e) => return Err(e),
+        };
+        outcomes.push(outcome);
     }
 
     Ok(outcomes)

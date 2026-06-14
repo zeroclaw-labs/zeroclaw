@@ -1,4 +1,4 @@
-use crate::agent::loop_::{TOOL_LOOP_SESSION_KEY, run_tool_call_loop};
+use crate::agent::loop_::{LoopKnobs, TOOL_LOOP_SESSION_KEY, run_tool_call_loop};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::security::SecurityPolicy;
@@ -19,6 +19,11 @@ use zeroclaw_config::schema::{
 use zeroclaw_log::Instrument as _;
 use zeroclaw_memory::Memory;
 use zeroclaw_providers::{self, ChatMessage, ModelProvider};
+use zeroclaw_tools::memory_export::MemoryExportTool;
+use zeroclaw_tools::memory_forget::MemoryForgetTool;
+use zeroclaw_tools::memory_purge::MemoryPurgeTool;
+use zeroclaw_tools::memory_recall::MemoryRecallTool;
+use zeroclaw_tools::memory_store::MemoryStoreTool;
 
 fn current_tool_loop_session_key() -> Option<String> {
     TOOL_LOOP_SESSION_KEY.try_with(Clone::clone).ok().flatten()
@@ -431,6 +436,35 @@ impl DelegateTool {
             credential,
             &self.provider_runtime_options,
         )
+    }
+
+    async fn memory_for_target_agent(
+        &self,
+        agent_name: &str,
+    ) -> anyhow::Result<Option<Arc<dyn Memory>>> {
+        let Some(config) = self.root_config.as_deref() else {
+            return Ok(self.memory.clone());
+        };
+
+        let api_key = config
+            .resolved_model_provider_for_agent(agent_name)
+            .and_then(|(_, _, cfg)| cfg.api_key.as_deref());
+        zeroclaw_memory::create_memory_for_agent(config, agent_name, api_key)
+            .await
+            .map(Some)
+    }
+
+    fn memory_tools_for_target(
+        memory: Arc<dyn Memory>,
+        security: Arc<SecurityPolicy>,
+    ) -> Vec<Box<dyn Tool>> {
+        vec![
+            Box::new(MemoryStoreTool::new(memory.clone(), security.clone())),
+            Box::new(MemoryRecallTool::new(memory.clone())),
+            Box::new(MemoryForgetTool::new(memory.clone(), security.clone())),
+            Box::new(MemoryExportTool::new(memory.clone())),
+            Box::new(MemoryPurgeTool::new(memory, security)),
+        ]
     }
 
     /// Resolve `model_provider` ("type.alias") → (provider_type, credential, model, temperature).
@@ -1106,6 +1140,7 @@ impl DelegateTool {
         let skill_bundles = Arc::clone(&self.skill_bundles);
         let root_config = self.root_config.clone();
         let caller_alias = self.caller_alias.clone();
+        let memory = self.memory.clone();
         // Capture the parent loop's session-key task-local so the
         // detached background task scopes its tool calls under the
         // same key — channel tools (sessions_send, etc.) need the
@@ -1128,7 +1163,7 @@ impl DelegateTool {
                     delegate_config,
                     workspace_dir: workspace_dir.clone(),
                     cancellation_token: child_token.clone(),
-                    memory: None,
+                    memory,
                     providers_models,
                     risk_profiles,
                     runtime_profiles,
@@ -1332,6 +1367,7 @@ impl DelegateTool {
             let root_config = self.root_config.clone();
             let caller_alias = self.caller_alias.clone();
             let session_key = parent_session_key.clone();
+            let memory = self.memory.clone();
             let __zc_delegate_alias = agent_name.clone();
 
             handles.push(zeroclaw_spawn::spawn!(
@@ -1347,7 +1383,7 @@ impl DelegateTool {
                         delegate_config,
                         workspace_dir,
                         cancellation_token,
-                        memory: None,
+                        memory,
                         providers_models,
                         risk_profiles,
                         runtime_profiles,
@@ -1731,13 +1767,51 @@ impl DelegateTool {
             .filter(|name| !name.is_empty())
             .collect::<std::collections::HashSet<_>>();
 
+        let target_policy = match self.policy_for_target(agent_name) {
+            Ok(policy) => policy,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("{e:#}")),
+                });
+            }
+        };
+        let needs_memory_tools = allowed
+            .iter()
+            .any(|name| zeroclaw_tools::MEMORY_TOOL_NAMES.contains(name));
+        let mut target_memory_tools: HashMap<String, Box<dyn Tool>> = if needs_memory_tools {
+            match self.memory_for_target_agent(agent_name).await {
+                Ok(Some(memory)) => Self::memory_tools_for_target(memory, target_policy)
+                    .into_iter()
+                    .map(|tool| (tool.name().to_string(), tool))
+                    .collect(),
+                Ok(None) => HashMap::new(),
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Failed to initialize memory for delegate target '{agent_name}': {e:#}"
+                        )),
+                    });
+                }
+            }
+        } else {
+            HashMap::new()
+        };
+
         let sub_tools: Vec<Box<dyn Tool>> = {
             let parent_tools = self.parent_tools.read();
             parent_tools
                 .iter()
                 .filter(|tool| allowed.contains(tool.name()))
                 .filter(|tool| tool.name() != "delegate")
-                .map(|tool| Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>)
+                .map(|tool| {
+                    target_memory_tools
+                        .remove(tool.name())
+                        .unwrap_or_else(|| Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>)
+                })
                 .collect()
         };
 
@@ -1822,6 +1896,11 @@ impl DelegateTool {
                 None, // channel: delegate subagents don't support approval
                 receipt_generator,
                 collected_receipts,
+                None, // event_tx
+                None, // steering
+                None, // new_messages_out
+                &LoopKnobs::default(),
+                None,
             )
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(agent_name)
@@ -1919,11 +1998,15 @@ impl Observer for NoopObserver {
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use crate::tools::{MemoryRecallTool, MemoryStoreTool};
     use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
     use tokio::time::{Instant, sleep};
     use zeroclaw_config::schema::{
-        DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS, DEFAULT_DELEGATE_TIMEOUT_SECS,
+        Config, CustomModelProviderConfig, DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS,
+        DEFAULT_DELEGATE_TIMEOUT_SECS, ModelProviderConfig,
     };
+    use zeroclaw_memory::{AgentScopedMemory, SqliteMemory};
     use zeroclaw_providers::{ChatRequest, ChatResponse, ToolCall};
 
     zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool, FilesystemWriteFileMcpTool);
@@ -2325,6 +2408,342 @@ mod tests {
             },
         );
         profiles
+    }
+
+    struct DelegateMemoryFixture {
+        _tmp: TempDir,
+        inner_memory: Arc<SqliteMemory>,
+        caller_uuid: String,
+        target_uuid: String,
+        workspace_dir: PathBuf,
+        tool: DelegateTool,
+        target_config: AliasedAgentConfig,
+    }
+
+    fn scoped_sqlite_memory(inner: Arc<SqliteMemory>, agent_id: &str) -> Arc<dyn Memory> {
+        let inner_dyn: Arc<dyn Memory> = inner;
+        Arc::new(AgentScopedMemory::new(
+            inner_dyn,
+            agent_id.to_string(),
+            Vec::<String>::new(),
+        ))
+    }
+
+    fn memory_parent_tools(
+        memory: Arc<dyn Memory>,
+        security: Arc<SecurityPolicy>,
+    ) -> Vec<Arc<dyn Tool>> {
+        vec![
+            Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
+            Arc::new(MemoryRecallTool::new(memory)),
+        ]
+    }
+
+    async fn delegate_memory_fixture(model_uri: Option<String>) -> DelegateMemoryFixture {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data");
+        let workspace_dir = tmp.path().join("workspace");
+        let mut root_config = Config {
+            data_dir: data_dir.clone(),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        let model_provider_config = ModelProviderConfig {
+            uri: model_uri,
+            model: Some("delegate-test-model".to_string()),
+            api_key: Some("delegate-test-key".to_string()),
+            timeout_secs: Some(2),
+            ..ModelProviderConfig::default()
+        };
+        root_config.providers.models.custom.insert(
+            "local".to_string(),
+            CustomModelProviderConfig {
+                base: model_provider_config.clone(),
+            },
+        );
+        root_config.risk_profiles.insert(
+            "agentic_test".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec!["memory_store".to_string(), "memory_recall".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        root_config.runtime_profiles.insert(
+            "agentic_test".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 5,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        let target_config = AliasedAgentConfig {
+            model_provider: "custom.local".into(),
+            risk_profile: "agentic_test".to_string(),
+            runtime_profile: "agentic_test".to_string(),
+            ..AliasedAgentConfig::default()
+        };
+        root_config
+            .agents
+            .insert("caller".to_string(), target_config.clone());
+        root_config
+            .agents
+            .insert("target".to_string(), target_config.clone());
+
+        let inner_memory = Arc::new(SqliteMemory::new("delegate-test", &data_dir).unwrap());
+        let caller_uuid = inner_memory.ensure_agent_uuid("caller").await.unwrap();
+        let target_uuid = inner_memory.ensure_agent_uuid("target").await.unwrap();
+        let root_config = Arc::new(root_config);
+        let caller_security = Arc::new(SecurityPolicy::for_agent(&root_config, "caller").unwrap());
+        let caller_memory = scoped_sqlite_memory(inner_memory.clone(), &caller_uuid);
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        providers_models
+            .entry("custom".to_string())
+            .or_default()
+            .insert("local".to_string(), model_provider_config);
+
+        let tool = DelegateTool::new(
+            root_config.agents.clone(),
+            None,
+            Arc::clone(&caller_security),
+        )
+        .with_root_config(Arc::clone(&root_config))
+        .with_workspace_dir(workspace_dir.clone())
+        .with_memory(Arc::clone(&caller_memory))
+        .with_parent_tools(Arc::new(RwLock::new(memory_parent_tools(
+            caller_memory,
+            caller_security,
+        ))))
+        .with_providers_models(providers_models)
+        .with_risk_profiles(root_config.risk_profiles.clone())
+        .with_runtime_profiles(root_config.runtime_profiles.clone());
+
+        DelegateMemoryFixture {
+            _tmp: tmp,
+            inner_memory,
+            caller_uuid,
+            target_uuid,
+            workspace_dir,
+            tool,
+            target_config,
+        }
+    }
+
+    struct MemoryStoreRecallThenFinalModelProvider {
+        key: &'static str,
+        content: &'static str,
+    }
+
+    #[async_trait]
+    impl ModelProvider for MemoryStoreRecallThenFinalModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let tool_message_count = request.messages.iter().filter(|m| m.role == "tool").count();
+            match tool_message_count {
+                0 => Ok(ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_store".to_string(),
+                        name: "memory_store".to_string(),
+                        arguments: serde_json::json!({
+                            "key": self.key,
+                            "content": self.content,
+                            "category": "core"
+                        })
+                        .to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                }),
+                1 => Ok(ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_recall".to_string(),
+                        name: "memory_recall".to_string(),
+                        arguments: serde_json::json!({
+                            "query": self.key,
+                            "limit": 5
+                        })
+                        .to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                }),
+                _ => Ok(ChatResponse {
+                    text: Some("memory workflow done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                }),
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for MemoryStoreRecallThenFinalModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "MemoryStoreRecallThenFinalModelProvider"
+        }
+    }
+
+    fn chat_completion_tool_call(
+        name: &str,
+        id: &str,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments.to_string()
+                        }
+                    }]
+                }
+            }]
+        })
+    }
+
+    struct LocalChatServer {
+        uri: String,
+        _task: tokio::task::JoinHandle<()>,
+    }
+
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+
+        let mut buf = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let n = socket.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            let Some(header_end) = buf.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&buf[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if buf.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+        buf
+    }
+
+    async fn write_json_response(socket: &mut tokio::net::TcpStream, body: serde_json::Value) {
+        use tokio::io::AsyncWriteExt;
+
+        let body = body.to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    async fn start_memory_tool_chat_server(key: &str, content: &str) -> LocalChatServer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let responses = vec![
+            chat_completion_tool_call(
+                "memory_store",
+                "call_store",
+                serde_json::json!({
+                    "key": key,
+                    "content": content,
+                    "category": "core"
+                }),
+            ),
+            chat_completion_tool_call(
+                "memory_recall",
+                "call_recall",
+                serde_json::json!({
+                    "query": key,
+                    "limit": 5
+                }),
+            ),
+            serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": "memory workflow done"
+                    }
+                }]
+            }),
+        ];
+
+        let task = zeroclaw_spawn::spawn!(async move {
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let _request = read_http_request(&mut socket).await;
+                write_json_response(&mut socket, response).await;
+            }
+        });
+
+        LocalChatServer { uri, _task: task }
+    }
+
+    async fn assert_stored_for_target_only(fixture: &DelegateMemoryFixture, key: &str) {
+        let target_entry = fixture
+            .inner_memory
+            .get_for_agent(key, &fixture.target_uuid)
+            .await
+            .unwrap();
+        assert!(
+            target_entry.is_some(),
+            "delegated memory tools must write to the target agent scope"
+        );
+        let caller_entry = fixture
+            .inner_memory
+            .get_for_agent(key, &fixture.caller_uuid)
+            .await
+            .unwrap();
+        assert!(
+            caller_entry.is_none(),
+            "delegated memory tools must not write to the caller agent scope"
+        );
     }
 
     #[test]
@@ -2786,6 +3205,88 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains("(openrouter/model-test, agentic)"));
         assert!(result.output.contains("done"));
+    }
+
+    #[tokio::test]
+    async fn execute_agentic_rebinds_memory_tools_to_target_agent_scope() {
+        let fixture = delegate_memory_fixture(None).await;
+        let model_provider = MemoryStoreRecallThenFinalModelProvider {
+            key: "sync-key",
+            content: "sync target memory",
+        };
+
+        let result = fixture
+            .tool
+            .execute_agentic(
+                "target",
+                &fixture.target_config,
+                "custom",
+                "delegate-test-model",
+                &model_provider,
+                "store and recall target memory",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "agentic delegate failed: {result:?}");
+        assert!(result.output.contains("memory workflow done"));
+        assert_stored_for_target_only(&fixture, "sync-key").await;
+    }
+
+    #[tokio::test]
+    async fn background_agentic_delegate_rebinds_memory_tools_to_target_agent_scope() {
+        let server =
+            start_memory_tool_chat_server("background-key", "background target memory").await;
+        let fixture = delegate_memory_fixture(Some(server.uri.clone())).await;
+
+        let result = fixture
+            .tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "store and recall target memory",
+                "background": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "background delegate failed: {result:?}");
+        let task_id = result
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .unwrap()
+            .trim_start_matches("task_id: ")
+            .trim();
+        let bg_result = wait_for_terminal_background_result(&fixture.workspace_dir, task_id).await;
+        assert_eq!(bg_result.status, BackgroundTaskStatus::Completed);
+        assert!(
+            bg_result
+                .output
+                .as_deref()
+                .unwrap_or_default()
+                .contains("memory workflow done")
+        );
+        assert_stored_for_target_only(&fixture, "background-key").await;
+    }
+
+    #[tokio::test]
+    async fn parallel_agentic_delegate_rebinds_memory_tools_to_target_agent_scope() {
+        let server = start_memory_tool_chat_server("parallel-key", "parallel target memory").await;
+        let fixture = delegate_memory_fixture(Some(server.uri.clone())).await;
+
+        let result = fixture
+            .tool
+            .execute(json!({
+                "parallel": ["target"],
+                "prompt": "store and recall target memory"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "parallel delegate failed: {result:?}");
+        assert!(result.output.contains("memory workflow done"));
+        assert_stored_for_target_only(&fixture, "parallel-key").await;
     }
 
     #[tokio::test]

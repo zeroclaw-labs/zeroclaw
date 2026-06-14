@@ -401,6 +401,18 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(None)
     }
 
+    /// The name of the back-channel that produced the most recent
+    /// [`Channel::request_approval`] decision, when this channel fans a single
+    /// request out to several registered back-channels (the agent's approval
+    /// bridge does this so an ACP editor and a WebSocket dashboard can both
+    /// answer). Ordinary single channels return `None` — their own
+    /// [`Channel::name`] already identifies the deciding surface — so the
+    /// approval audit trail can record the channel that actually decided
+    /// instead of the turn loop's static channel name.
+    fn last_decision_channel(&self) -> Option<String> {
+        None
+    }
+
     /// Ask the user a multiple-choice question and return the chosen option's text.
     ///
     /// Returns `Ok(Some(answer))` if the channel handled the question natively
