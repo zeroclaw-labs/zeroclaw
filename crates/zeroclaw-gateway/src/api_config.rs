@@ -1766,7 +1766,7 @@ pub async fn handle_options_prop(
     );
     response
         .headers_mut()
-        .insert(header::ETAG, HeaderValue::from_str(etag).unwrap());
+        .insert(header::ETAG, HeaderValue::from_str(etag).expect("etag is valid ASCII"));
     response
 }
 
@@ -1779,7 +1779,7 @@ fn schema_response(_label: &'static str) -> Response {
     );
     response
         .headers_mut()
-        .insert(header::ETAG, HeaderValue::from_str(etag).unwrap());
+        .insert(header::ETAG, HeaderValue::from_str(etag).expect("etag is valid ASCII"));
     response
 }
 
