@@ -1679,16 +1679,22 @@ export default function Dashboard() {
     <div className="p-6 space-y-6 animate-fade-in">
       <AgentsSection />
 
-      {/* Global system stats — tab navigation */}
+      {/* Global system stats — tab navigation. Scrolls horizontally when the
+          six tabs don't fit (mobile) instead of overflowing the frame; each
+          button keeps its size (flex-shrink-0) so labels never get clipped. */}
       <div
-        className="flex items-center gap-1 p-1 rounded-2xl"
+        className="flex items-center gap-1 p-1 rounded-2xl overflow-x-auto"
         style={{ background: "var(--pc-bg-elevated)" }}
+        role="tablist"
+        aria-label={t("nav.dashboard")}
       >
         {TABS.map(({ id, labelKey, icon: Icon }) => (
           <button
             key={id}
+            role="tab"
+            aria-selected={activeTab === id}
             onClick={() => setActiveTab(id)}
-            className="flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-medium transition-all"
+            className="flex flex-shrink-0 items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-medium transition-all whitespace-nowrap"
             style={
               activeTab === id
                 ? {
