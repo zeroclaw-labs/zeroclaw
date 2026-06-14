@@ -300,11 +300,16 @@ zc-quickstart-block-peers = ピアグループ
 zc-quickstart-block-agent = エージェント
 zc-quickstart-personality-help = パーソナリティファイル (e=編集, t=テンプレートを使用, c=クリア)
 zc-quickstart-save-and-close = 保存して閉じる
+zc-quickstart-no-template = `{ $filename }` に使えるテンプレートはありません
+zc-quickstart-agent-name-field = 名前
+zc-quickstart-file-bytes = { $bytes } バイト
 zc-chat-pane-chat = チャット
 zc-chat-pane-acp = ACP
 zc-chat-no-agents = 有効なエージェントがありません。Configタブでエージェントを設定してください。
 zc-chat-error-fetch-agents = エージェントの取得に失敗しました: { $error }
 zc-chat-error-create-session = セッションの作成に失敗しました: { $error }
+zc-chat-session-restarted = 新しいセッションを開始しました。
+zc-chat-session-restart-error = 新しいセッションを開始できませんでした: { $error }
 zc-chat-thinking-visible = 思考出力: 表示
 zc-chat-thinking-hidden = 思考出力: 非表示
 zc-model-picker-hint = /model の後にモデル名を入力するか、Tab で自動補完します。

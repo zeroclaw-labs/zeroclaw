@@ -823,6 +823,9 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
         }
         // Default: chat_completions wire with standard API key.
         let mut p = crate::openai::OpenAiModelProvider::with_base_url(alias, api_url, key);
+        if let Some(t) = opts.provider_timeout_secs {
+            p = p.with_timeout_secs(t);
+        }
         if let Some(mt) = opts.provider_max_tokens {
             p = p.with_max_tokens(Some(mt));
         }
