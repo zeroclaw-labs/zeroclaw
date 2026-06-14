@@ -202,6 +202,13 @@ pub fn heavyweight_features(pkg: &cargo_metadata::Package) -> Vec<String> {
     read_registry_list(pkg, "heavyweight_features")
 }
 
+/// Features whose build needs system libraries/tooling absent from the minimal
+/// static container image, excluded from `Selection::All`. Read from
+/// `[package.metadata.zeroclaw] container_excluded_features`; never shadowed.
+pub fn container_excluded_features(pkg: &cargo_metadata::Package) -> Vec<String> {
+    read_registry_list(pkg, "container_excluded_features")
+}
+
 fn read_registry_list(pkg: &cargo_metadata::Package, key: &str) -> Vec<String> {
     pkg.metadata
         .get("zeroclaw")
@@ -351,11 +358,13 @@ pub fn resolve_feature_list(
     let all_features: Vec<String> = root.features.keys().cloned().collect();
     let non_row = non_row_features(&meta, &root);
     let heavyweight = heavyweight_features(&root);
+    let container_excluded = container_excluded_features(&root);
     let ctx = FeatureCtx {
         graph: &root.features,
         all: &all_features,
         non_row: &non_row,
         heavyweight: &heavyweight,
+        container_excluded: &container_excluded,
     };
     selection.to_feature_list(&ctx)
 }
@@ -386,6 +395,7 @@ pub fn resolve(manifest_dir: &Path, selection: &Selection) -> anyhow::Result<Res
     let all_features: Vec<String> = root.features.keys().cloned().collect();
     let non_row = non_row_features(&meta, root);
     let heavyweight = heavyweight_features(root);
+    let container_excluded = container_excluded_features(root);
     let default_features = expand_default(&root.features, &non_row);
 
     let ctx = FeatureCtx {
@@ -393,6 +403,7 @@ pub fn resolve(manifest_dir: &Path, selection: &Selection) -> anyhow::Result<Res
         all: &all_features,
         non_row: &non_row,
         heavyweight: &heavyweight,
+        container_excluded: &container_excluded,
     };
     let cargo_flags = selection.to_cargo_flags(&ctx)?;
 
@@ -510,7 +521,11 @@ impl Selection {
             Selection::All => ctx
                 .all
                 .iter()
-                .filter(|f| !ctx.non_row.contains(f) && !ctx.is_alias(f))
+                .filter(|f| {
+                    !ctx.non_row.contains(f)
+                        && !ctx.is_alias(f)
+                        && !ctx.container_excluded.contains(f)
+                })
                 .cloned()
                 .collect(),
             Selection::Features(feats) => {
@@ -544,6 +559,7 @@ pub struct FeatureCtx<'a> {
     pub all: &'a [String],
     pub non_row: &'a [String],
     pub heavyweight: &'a [String],
+    pub container_excluded: &'a [String],
 }
 
 impl FeatureCtx<'_> {

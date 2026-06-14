@@ -268,6 +268,15 @@ heavyweight_features = [
     "voice-wake",
 ]
 
+# Features whose build needs system C libraries or tooling the minimal static
+# container image (StageX, no system package manager) does not provide. Excluded
+# from the container kitchen-sink (Selection::All) so the all-features image
+# builds; still available via source --features or a nix override. Not derivable
+# from the feature graph, so it lives in the canonical registry.
+container_excluded_features = [
+    "voice-wake",
+]
+
 [features]
 default = [
     "agent-runtime",
