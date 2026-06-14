@@ -17,6 +17,7 @@ use zeroclaw_api::tool::Tool;
 use zeroclaw_config::schema::{MultimodalConfig, PacingConfig, SkillImprovementConfig};
 use zeroclaw_providers::{ChatMessage, ModelProvider};
 
+use crate::agent::loop_::LoopKnobs;
 use crate::observability::Observer;
 use crate::tools::skill_manage::{SkillManageTool, SkillViewTool, SkillsListTool};
 
@@ -122,7 +123,12 @@ pub async fn maybe_run_skill_review(
                 None, // shared_budget
                 None, // channel
                 None, // receipt_generator
-                Some(&receipts),
+                Some(&receipts), // collected_receipts
+                None,            // event_tx
+                None,            // steering
+                None,            // new_messages_out
+                &LoopKnobs::default(), // knobs
+                None,            // image_cache
             )
             .await
         })
