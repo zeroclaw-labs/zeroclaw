@@ -2738,6 +2738,7 @@ impl Channel for WhatsAppWebChannel {
                     participant: None,
                 }),
                 text: Some(emoji.to_string()),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -2787,6 +2788,7 @@ impl Channel for WhatsAppWebChannel {
                 // Empty text removes the reaction per WhatsApp
                 // protocol.
                 text: Some(String::new()),
+                ..Default::default()
             }),
             ..Default::default()
         };
