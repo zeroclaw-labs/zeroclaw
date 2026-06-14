@@ -624,19 +624,6 @@ pub async fn handle_api_cron_patch(
     }
 
     let config = state.config.read().clone();
-    // The agent only gates a shell `command` change (risk profile). Skip the
-    // existence check for patches that don't touch the command — schedule, name,
-    // and enable/disable toggles don't need an agent supplied.
-    if body.command.is_some() && config.agent(&body.agent).is_none() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!(
-                "Unknown agent {a:?} (no [agents.{a}] entry configured)",
-                a = body.agent
-            )})),
-        )
-            .into_response();
-    }
     let agent_alias = body.agent.clone();
     let CronPatchBody {
         agent: _,
@@ -663,6 +650,26 @@ pub async fn handle_api_cron_patch(
                 .into_response();
         }
     };
+    let is_agent = matches!(existing.job_type, zeroclaw_runtime::cron::JobType::Agent);
+    // The agent only gates a shell `command` change (risk profile). For a shell
+    // job the new command can arrive via either `command` OR `prompt` (the
+    // `prompt` field is folded into the command below), so the existence check
+    // must cover both. Skip it for patches that don't set a shell command —
+    // schedule, name, and enable/disable toggles don't need an agent supplied —
+    // and for agent-type jobs, where `prompt` is an LLM prompt, not a shell
+    // command, and so is not agent-gated. This needs `existing.job_type`, hence
+    // it runs after the job is fetched.
+    let setting_shell_command = !is_agent && (command.is_some() || prompt.is_some());
+    if setting_shell_command && config.agent(&agent_alias).is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!(
+                "Unknown agent {a:?} (no [agents.{a}] entry configured)",
+                a = agent_alias
+            )})),
+        )
+            .into_response();
+    }
     let new_expr = schedule_expr
         .as_deref()
         .map(str::trim)
@@ -697,7 +704,6 @@ pub async fn handle_api_cron_patch(
     } else {
         None
     };
-    let is_agent = matches!(existing.job_type, zeroclaw_runtime::cron::JobType::Agent);
     let (patch_command, patch_prompt) = if is_agent {
         (None, command.or(prompt))
     } else {
