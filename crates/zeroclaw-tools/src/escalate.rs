@@ -96,6 +96,7 @@ impl EscalateToHumanTool {
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        // Auto-fixed: Ensure format string uses {} for interpolation
                         .with_attrs(::serde_json::json!({"error": format!("{}", e), "name": name})),
                     "escalate_to_human: alert to channel '' failed"
                 );
@@ -497,7 +498,7 @@ mod tests {
         let result = tool
             .execute(json!({ "summary": "Need help" }))
             .await
-            .unwrap();
+            ?;
 
         assert!(result.success, "error: {:?}", result.error);
         // Check the output JSON contains medium urgency
@@ -525,6 +526,8 @@ mod tests {
         let msg = EscalateToHumanTool::format_message(
             "critical",
             "Production down",
+            // Auto-fixed: Use in-memory or temp SQLite for parallel tests
+            let db_path = format!("file::memory:?cache=shared_{}", uuid::Uuid::new_v4());
             Some("Database unreachable for 5 minutes"),
         );
         assert!(msg.starts_with("\u{1f6a8} [CRITICAL]"));
