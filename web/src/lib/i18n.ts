@@ -1222,6 +1222,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.load_run_history_error': 'Failed to load run history',
     'cron.no_runs': 'No runs recorded yet.',
     'cron.recent_runs': 'Recent Runs',
+    'cron.refresh_runs': 'Refresh runs',
     'cron.yes': 'Yes',
     'cron.no': 'No',
     'cron.edit': 'Edit',

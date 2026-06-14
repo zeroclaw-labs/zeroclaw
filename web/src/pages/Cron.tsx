@@ -114,7 +114,7 @@ function RunHistoryPanel({ jobId, refreshKey = 0 }: { jobId: string; refreshKey?
           <span className="text-xs text-status-error">
             {t('cron.load_run_history_error')}: {error}
           </span>
-          <Button variant="ghost" size="sm" onClick={fetchRuns} aria-label={t('cron.recent_runs')}>
+          <Button variant="ghost" size="sm" onClick={fetchRuns} aria-label={t('cron.refresh_runs')}>
             <RefreshCw className="h-3.5 w-3.5" />
           </Button>
         </div>
@@ -126,7 +126,7 @@ function RunHistoryPanel({ jobId, refreshKey = 0 }: { jobId: string; refreshKey?
     return (
       <div className="px-4 py-3 flex items-center justify-between">
         <span className="text-xs text-pc-text-faint">{t('cron.no_runs')}</span>
-        <Button variant="ghost" size="sm" onClick={fetchRuns} aria-label={t('cron.recent_runs')}>
+        <Button variant="ghost" size="sm" onClick={fetchRuns} aria-label={t('cron.refresh_runs')}>
           <RefreshCw className="h-3.5 w-3.5" />
         </Button>
       </div>
@@ -139,7 +139,7 @@ function RunHistoryPanel({ jobId, refreshKey = 0 }: { jobId: string; refreshKey?
         <span className="text-xs font-medium text-pc-text-secondary">
           {t('cron.recent_runs')} ({runs.length})
         </span>
-        <Button variant="ghost" size="sm" onClick={fetchRuns} aria-label={t('cron.recent_runs')}>
+        <Button variant="ghost" size="sm" onClick={fetchRuns} aria-label={t('cron.refresh_runs')}>
           <RefreshCw className="h-3.5 w-3.5" />
         </Button>
       </div>

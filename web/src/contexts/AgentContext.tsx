@@ -641,13 +641,19 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       }
 
       const ws = new WebSocketClient({ agentAlias });
+      // Point wsRef at the NEW client before connect(), so a synchronous
+      // connect() throw (e.g. an invalid WebSocket URL/protocol token) still
+      // leaves a live, reconnect-capable socket in the ref instead of the old
+      // intentionally-closed one — otherwise the page strands offline with no
+      // reconnect path until reload.
+      wsRef.current = ws;
       attachSocketCallbacks(ws);
       ws.connect();
-      wsRef.current = ws;
     } catch (err) {
-      // A superseded switch can reject late; only the still-active switch owns
-      // the shared state (same identity guard as the watchdog + bail-outs above),
-      // so a stale rejection can't clobber a newer in-flight switch.
+      // If the per-phase watchdog already fired (timed out) and nulled the
+      // pending ref while this request was in flight, bail so a late rejection
+      // doesn't overwrite the timeout state. (The `if (modelLoading) return`
+      // debounce above prevents truly concurrent switches.)
       if (pendingModelSwitchRef.current !== model) return;
       if (switchTimeoutRef.current) {
         clearTimeout(switchTimeoutRef.current);
@@ -713,9 +719,11 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         oldWs.disconnect();
 
         const ws = new WebSocketClient({ agentAlias });
+        // Assign wsRef before connect() so a synchronous throw can't strand the
+        // page on the old intentionally-closed socket (see switchModel).
+        wsRef.current = ws;
         attachSocketCallbacks(ws);
         ws.connect();
-        wsRef.current = ws;
       }
     })();
   }, [agentAlias, attachSocketCallbacks]);
