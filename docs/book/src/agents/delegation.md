@@ -126,12 +126,12 @@ This is a thin signal for the agent-loop spawn path. A dedicated "subagent start
 
 2. **Reachability**: the target agent must be in the caller's reachable set, resolved by `Config::reachable_delegate_targets`. The reachable set is the union of two per-agent sources on `[agents.<caller>]`, minus the caller itself:
 
-   - **same-profile peers**: every other agent sharing the caller's risk profile, included while `delegate_same_profile = true` (the default). Set it `false` to opt the caller out of auto-allowing peers.
+   - **same-profile peers**: every other agent sharing the caller's risk profile, included while `delegate_same_risk_profile = true` (the default). Set it `false` to opt the caller out of auto-allowing peers.
    - **explicit roster**: `delegates`, a possibly-empty list of agent aliases the caller may delegate to even across risk profiles.
 
    When the target is outside that set the refusal is:
    ```text
-   delegate target "<target>" is not reachable from "<caller>"; add it to [agents.<caller>].delegates or share a risk profile with delegate_same_profile enabled
+   delegate target "<target>" is not reachable from "<caller>"; add it to [agents.<caller>].delegates or share a risk profile with delegate_same_risk_profile enabled
    ```
 
    A same-profile target inherits the caller's session workspace boundary and shares its action/cost tracker. An explicit **cross-profile** target runs under its own resolved policy and must pass `ensure_no_escalation_beyond` the caller: a listed delegate that would widen privilege (broader autonomy, extra roots, higher budgets, etc.) is refused with:
@@ -141,7 +141,7 @@ This is a thin signal for the agent-loop spawn path. A dedicated "subagent start
 
 The advertised roster (the `agent` parameter's enum in the tool schema) lists exactly this reachable set, and only when `delegation_policy.mode = "allow"`. Disabled agents (`enabled = false`) are never reachable, whether as same-profile peers or explicit `delegates` entries.
 
-In agentic delegation the sub-agent's tools are drawn from the caller's already-policy-filtered registry, intersected with the target's own `allowed_tools`. The caller's registry is the ceiling: a cross-profile target whose risk profile names a tool the caller was never granted does not receive it. This is the invariant that keeps `ensure_no_escalation_beyond` (which does not itself diff tool allowlists) sufficient, since the target can never exceed the caller's tool surface.
+In agentic delegation the sub-agent's tools are drawn from the caller's already-policy-filtered registry, intersected with the target's own `allowed_tools`. An **empty** `allowed_tools` on the target means "inherit": the sub-agent runs with the caller's full delegatable registry rather than being rejected. A non-empty list intersects with that registry. Either way the caller's registry is the ceiling: a cross-profile target whose risk profile names a tool the caller was never granted does not receive it. This is the invariant that keeps `ensure_no_escalation_beyond` (which does not itself diff tool allowlists) sufficient, since the target can never exceed the caller's tool surface.
 
 Depth is capped per the parent's `runtime_profile.max_delegation_depth`. Set it to `1` to allow the top agent a single delegation hop with no further sub-delegation.
 
@@ -186,8 +186,8 @@ Exact, sourced from `crates/zeroclaw-runtime/src/tools/delegate.rs`.
 | **Spawn depth** | Hard cap at 1 | Up to `runtime_profile.max_delegation_depth` (default 3) |
 | **Background mode** | Not supported | `background: true` returns a `task_id` |
 | **Parallel fan-out** | No built-in argument; multiple calls in one turn run concurrently when `parallel_tools = true` | `parallel: [...]` runs multiple targets concurrently |
-| **Gating** | `risk_profile.allowed_tools` must list `spawn_subagent` | `allowed_tools` must list `delegate`, caller's `delegation_policy mode = "allow"`, and target shares the caller's risk profile |
-| **Use when** | Internal subtask that should stay within the same identity | Want a different specialist (different model, different alias) on the **same trust tier** to handle the task |
+| **Gating** | `risk_profile.allowed_tools` must list `spawn_subagent` | `allowed_tools` must list `delegate`, caller's `delegation_policy mode = "allow"`, and the target is in the caller's reachable set (same-profile peer or explicit `delegates` entry) |
+| **Use when** | Internal subtask that should stay within the same identity | Want a different specialist (different model, different alias) to handle the task, on the same trust tier or an explicitly-allowed stricter/cross-profile one |
 
 ## What's not supported
 

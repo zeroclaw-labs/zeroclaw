@@ -364,7 +364,7 @@ impl DelegateTool {
             return Err(anyhow::Error::msg(format!(
                 "delegate target {target_alias:?} is not reachable from {:?}; \
                  add it to [agents.{}].delegates or share a risk profile with \
-                 delegate_same_profile enabled",
+                 delegate_same_risk_profile enabled",
                 self.caller_alias, self.caller_alias
             )));
         }
@@ -1699,22 +1699,17 @@ impl DelegateTool {
     ) -> anyhow::Result<ToolResult> {
         let allowed_tools = self.resolve_allowed_tools(&agent_config.risk_profile);
 
-        if allowed_tools.is_empty() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Agent '{agent_name}' is agentic but risk_profile '{}' has no allowed_tools",
-                    agent_config.risk_profile
-                )),
-            });
-        }
+        // Empty `allowed_tools` means "inherit": the target is bounded by the
+        // caller's already-policy-filtered registry rather than a per-agent
+        // allowlist. A non-empty list intersects with that registry.
+        let inherit_all = allowed_tools.is_empty();
 
         let allowed = allowed_tools
             .iter()
             .map(|name: &String| name.trim())
             .filter(|name| !name.is_empty())
             .collect::<std::collections::HashSet<_>>();
+        let tool_admitted = |name: &str| inherit_all || allowed.contains(name);
 
         let target_policy = match self.policy_for_target(agent_name) {
             Ok(policy) => policy,
@@ -1726,9 +1721,10 @@ impl DelegateTool {
                 });
             }
         };
-        let needs_memory_tools = allowed
-            .iter()
-            .any(|name| zeroclaw_tools::MEMORY_TOOL_NAMES.contains(name));
+        let needs_memory_tools = inherit_all
+            || allowed
+                .iter()
+                .any(|name| zeroclaw_tools::MEMORY_TOOL_NAMES.contains(name));
         let mut target_memory_tools: HashMap<String, Box<dyn Tool>> = if needs_memory_tools {
             match self.memory_for_target_agent(agent_name).await {
                 Ok(Some(memory)) => Self::memory_tools_for_target(memory, target_policy)
@@ -1754,7 +1750,7 @@ impl DelegateTool {
             let parent_tools = self.parent_tools.read();
             parent_tools
                 .iter()
-                .filter(|tool| allowed.contains(tool.name()))
+                .filter(|tool| tool_admitted(tool.name()))
                 .filter(|tool| tool.name() != "delegate")
                 .map(|tool| {
                     target_memory_tools
@@ -1765,12 +1761,16 @@ impl DelegateTool {
         };
 
         if sub_tools.is_empty() {
+            let detail = if inherit_all {
+                "inherited from the caller's tool registry (empty allowed_tools), but the caller has no delegatable tools".to_string()
+            } else {
+                format!("filtering allowlist ({})", allowed_tools.join(", "))
+            };
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Agent '{agent_name}' has no executable tools after filtering allowlist ({})",
-                    allowed_tools.join(", ")
+                    "Agent '{agent_name}' has no executable tools after {detail}"
                 )),
             });
         }
@@ -2910,7 +2910,7 @@ mod tests {
     fn schema_roster_opt_out_hides_peers_keeps_explicit() {
         let mut config = (*roster_schema_config()).clone();
         let aaa = config.agents.get_mut("aaa").unwrap();
-        aaa.delegate_same_profile = false;
+        aaa.delegate_same_risk_profile = false;
         aaa.delegates = vec!["aaalore".to_string()];
         let tool = roster_tool(Arc::new(config));
         let desc = tool.parameters_schema()["properties"]["agent"]["description"]
@@ -3165,7 +3165,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agentic_mode_rejects_empty_allowed_tools() {
+    async fn agentic_mode_empty_allowed_tools_inherits_caller_registry() {
+        // Empty allowed_tools now means "inherit": the target runs with the
+        // caller's already-filtered tools instead of being rejected (#7470).
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(Vec::new()))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let model_provider = OneToolThenFinalModelProvider;
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &model_provider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains("done"));
+    }
+
+    #[tokio::test]
+    async fn agentic_mode_empty_allowed_tools_empty_registry_errors_gracefully() {
         let mut agents = HashMap::new();
         agents.insert("agentic".to_string(), agentic_agent_config());
 
@@ -3184,7 +3212,7 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or("")
-                .contains("has no allowed_tools"),
+                .contains("no executable tools"),
             "got: {:?}",
             result.error
         );

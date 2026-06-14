@@ -375,7 +375,7 @@ impl ModelRoutingConfigTool {
                     "agentic": runtime.map(|r| r.agentic),
                     "allowed_tools": risk.map(|r| &r.allowed_tools),
                     "max_tool_iterations": runtime.map(|r| r.max_tool_iterations),
-                    "delegate_same_profile": agent.delegate_same_profile,
+                    "delegate_same_risk_profile": agent.delegate_same_risk_profile,
                     "delegates": agent.delegates,
                 }),
             );
@@ -837,8 +837,8 @@ impl ModelRoutingConfigTool {
             None
         };
 
-        let delegate_same_profile_update =
-            Self::parse_optional_bool(args, "delegate_same_profile")?;
+        let delegate_same_risk_profile_update =
+            Self::parse_optional_bool(args, "delegate_same_risk_profile")?;
         let delegates_update = if let Some(raw) = args.get("delegates") {
             Some(Self::parse_string_list(raw, "delegates")?)
         } else {
@@ -919,15 +919,6 @@ impl ModelRoutingConfigTool {
             } else if runtime.max_delegation_depth == 0 {
                 runtime.max_delegation_depth = DEFAULT_AGENT_MAX_DEPTH;
             }
-            if runtime.agentic {
-                let allowed_tools_empty = cfg
-                    .risk_profiles
-                    .get(&name)
-                    .is_none_or(|r| r.allowed_tools.is_empty());
-                if allowed_tools_empty {
-                    anyhow::bail!("Agent '{name}' has agentic=true but allowed_tools is empty.");
-                }
-            }
         }
 
         // Get or create the agent and wire up alias references.
@@ -935,8 +926,8 @@ impl ModelRoutingConfigTool {
         next_agent.model_provider = agent_model_provider_ref.into();
         next_agent.risk_profile = name.clone();
         next_agent.runtime_profile = name.clone();
-        if let Some(same_profile) = delegate_same_profile_update {
-            next_agent.delegate_same_profile = same_profile;
+        if let Some(same_profile) = delegate_same_risk_profile_update {
+            next_agent.delegate_same_risk_profile = same_profile;
         }
         if let Some(delegates) = delegates_update {
             next_agent.delegates = delegates;
@@ -1085,7 +1076,7 @@ impl Tool for ModelRoutingConfigTool {
                     "minimum": 1,
                     "description": "Maximum tool-call iterations for agentic delegate mode"
                 },
-                "delegate_same_profile": {
+                "delegate_same_risk_profile": {
                     "type": "boolean",
                     "description": "Auto-allow delegation to same-risk-profile peers (default true). Set false to restrict reach to the explicit delegates list."
                 },
@@ -1342,7 +1333,7 @@ mod tests {
                 "name": "aaa",
                 "model_provider": "openai",
                 "model": "gpt-5.3",
-                "delegate_same_profile": false,
+                "delegate_same_risk_profile": false,
                 "delegates": ["aaalore"]
             }))
             .await
@@ -1352,7 +1343,7 @@ mod tests {
         let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
         let output: Value = serde_json::from_str(&get_result.output).unwrap();
         assert_eq!(
-            output["agents"]["aaa"]["delegate_same_profile"],
+            output["agents"]["aaa"]["delegate_same_risk_profile"],
             json!(false)
         );
         assert_eq!(output["agents"]["aaa"]["delegates"], json!(["aaalore"]));

@@ -3187,7 +3187,7 @@ pub struct AliasedAgentConfig {
     /// risk profile's `delegation_policy.mode`; this only narrows reach.
     #[tab(General)]
     #[serde(default = "default_true")]
-    pub delegate_same_profile: bool,
+    pub delegate_same_risk_profile: bool,
 
     /// Explicit delegate roster: additional agent aliases this agent may
     /// delegate to, beyond same-profile peers. Possibly empty. Entries
@@ -3249,7 +3249,7 @@ impl Default for AliasedAgentConfig {
             tts_provider: crate::providers::TtsProviderRef::default(),
             transcription_provider: crate::providers::TranscriptionProviderRef::default(),
             classifier_provider: crate::providers::ModelProviderRef::default(),
-            delegate_same_profile: true,
+            delegate_same_risk_profile: true,
             delegates: Vec::new(),
             resolved: ResolvedRuntime::default(),
             workspace: crate::multi_agent::AgentWorkspaceConfig::default(),
@@ -3327,7 +3327,7 @@ impl Config {
     }
 
     /// Resolve the set of agent aliases `caller_alias` may delegate to:
-    /// same-profile peers when `delegate_same_profile` is set, unioned
+    /// same-profile peers when `delegate_same_risk_profile` is set, unioned
     /// with the explicit `delegates` roster, minus the caller. Single
     /// source of truth for delegate reach; gating (`delegation_policy`)
     /// is enforced separately by the caller. Deduped, sorted; unknown
@@ -3340,7 +3340,7 @@ impl Config {
 
         let mut targets: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
-        if caller.delegate_same_profile {
+        if caller.delegate_same_risk_profile {
             let caller_profile = caller.risk_profile.trim();
             if !caller_profile.is_empty() {
                 for (alias, agent) in &self.agents {
@@ -27731,7 +27731,7 @@ allowed_users = []
     async fn reachable_targets_opt_out_hides_peers_keeps_explicit() {
         let mut cfg = delegate_roster_config();
         let aaa = cfg.agents.get_mut("aaa").unwrap();
-        aaa.delegate_same_profile = false;
+        aaa.delegate_same_risk_profile = false;
         aaa.delegates = vec!["aaalore".to_string()];
         assert_eq!(cfg.reachable_delegate_targets("aaa"), vec!["aaalore"]);
     }
@@ -27765,7 +27765,10 @@ allowed_users = []
     #[test]
     async fn reachable_targets_excludes_disabled_explicit_delegate() {
         let mut cfg = delegate_roster_config();
-        cfg.agents.get_mut("aaa").unwrap().delegate_same_profile = false;
+        cfg.agents
+            .get_mut("aaa")
+            .unwrap()
+            .delegate_same_risk_profile = false;
         cfg.agents.get_mut("aaa").unwrap().delegates = vec!["aaalore".to_string()];
         cfg.agents.get_mut("aaalore").unwrap().enabled = false;
         assert!(
@@ -27799,7 +27802,7 @@ model_provider = \"ollama.default\"
 ";
         let cfg: Config = toml::from_str(toml_src).expect("legacy config parses");
         let agent = cfg.agents.get("legacy").expect("agent present");
-        assert!(agent.delegate_same_profile, "default must be true");
+        assert!(agent.delegate_same_risk_profile, "default must be true");
         assert!(agent.delegates.is_empty(), "default must be empty");
     }
 }
