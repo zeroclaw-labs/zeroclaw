@@ -2736,10 +2736,8 @@ impl Channel for WhatsAppWebChannel {
                     // that requires plumbing message metadata
                     // through the trait.
                     participant: None,
-                    ..Default::default()
                 }),
-                text: Some(emoji.to_string()),
-                ..Default::default()
+                text: Some(emoji.to_string())
             }),
             ..Default::default()
         };
@@ -2785,12 +2783,10 @@ impl Channel for WhatsAppWebChannel {
                     id: Some(message_id.to_string()),
                     // `participant` is not needed for 1:1 chats.
                     participant: None,
-                    ..Default::default()
                 }),
                 // Empty text removes the reaction per WhatsApp
                 // protocol.
-                text: Some(String::new()),
-                ..Default::default()
+                text: Some(String::new())
             }),
             ..Default::default()
         };
