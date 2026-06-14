@@ -1368,9 +1368,12 @@ async fn run_quickstart_cli(
         ];
         let create_enabled = form.all_done();
         labels.push(if create_enabled {
-            "── Create agent".to_string()
+            t("cli-quickstart-create-agent", "── Create agent")
         } else {
-            "── Create agent (locked — fill every selector first)".to_string()
+            t(
+                "cli-quickstart-create-agent-locked",
+                "── Create agent (locked — fill every selector first)",
+            )
         });
 
         let actions = [
@@ -1384,7 +1387,10 @@ async fn run_quickstart_cli(
         ];
 
         let pick = FuzzySelect::new()
-            .with_prompt("Open a selector (Enter), or pick Create. Esc to quit.")
+            .with_prompt(t(
+                "cli-quickstart-open-selector-prompt",
+                "Open a selector (Enter), or pick Create. Esc to quit.",
+            ))
             .items(&labels)
             .default(0)
             .max_length(labels.len())
@@ -1424,16 +1430,16 @@ async fn run_quickstart_cli(
                 let mut mode_labels: Vec<String> = Vec::new();
                 let mut mode_kinds: Vec<&str> = Vec::new();
                 if !state.model_providers.is_empty() {
-                    mode_labels.push("Use existing".to_string());
+                    mode_labels.push(t("cli-quickstart-use-existing", "Use existing"));
                     mode_kinds.push("existing");
                 }
-                mode_labels.push("Create new".to_string());
+                mode_labels.push(t("cli-quickstart-create-new", "Create new"));
                 mode_kinds.push("fresh");
                 let mode = if mode_labels.len() == 1 {
                     Some(0)
                 } else {
                     FuzzySelect::new()
-                        .with_prompt("Model provider")
+                        .with_prompt(t("cli-quickstart-model-provider-prompt", "Model provider"))
                         .items(&mode_labels)
                         .default(0)
                         .max_length(mode_labels.len())
@@ -1443,7 +1449,10 @@ async fn run_quickstart_cli(
                 if mode_kinds[mi] == "existing" {
                     let labels: Vec<String> = state.model_providers.clone();
                     let Some(i) = FuzzySelect::new()
-                        .with_prompt("Pick a configured provider")
+                        .with_prompt(t(
+                            "cli-quickstart-pick-configured-provider",
+                            "Pick a configured provider",
+                        ))
                         .items(&labels)
                         .default(0)
                         .max_length(labels.len().max(1))

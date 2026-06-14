@@ -1738,9 +1738,54 @@ pub async fn run(
                     }
                 }
             }
+            // Emit the user-visible response before any background work so the
+            // skill-review fork can never delay the user's answer.
             final_output = response;
             println!("{final_output}");
             observer.record_event(&ObserverEvent::TurnComplete);
+
+            // Background skill review fork — post-turn, opt-in
+            // (`skills.skill-improvement.enabled`, default false). Runs a forked
+            // agent with a restricted toolset (skills_list, skill_view,
+            // skill_manage) over a snapshot of the conversation and decides
+            // whether to patch SKILL.md, add a support file, or do nothing.
+            //
+            // Scoped under TOOL_LOOP_COST_TRACKING_CONTEXT with the same
+            // `cost_tracking_context` as the parent turn, so the fork's provider
+            // calls are recorded against — and bounded by — the same cost
+            // tracker and budget (the scope wrapping the parent turn's
+            // `run_tool_call_loop` has already exited by this point).
+            // See `crate::skills::review::maybe_run_skill_review`.
+            if config.skills.skill_improvement.enabled {
+                let review_workspace = config.agent_workspace_dir(agent_alias);
+                let review_config = config.skills.skill_improvement.clone();
+                let failed_slugs: Vec<String> =
+                    crate::skills::improver::extract_skill_executions_from_history(&history)
+                        .into_iter()
+                        .filter_map(|(slug, ok)| if ok { None } else { Some(slug) })
+                        .collect();
+                TOOL_LOOP_COST_TRACKING_CONTEXT
+                    .scope(
+                        cost_tracking_context.clone(),
+                        crate::skills::review::maybe_run_skill_review(
+                            review_workspace,
+                            review_config,
+                            config.skills.allow_scripts,
+                            history.clone(),
+                            failed_slugs,
+                            model_provider.as_ref(),
+                            &provider_name,
+                            &model_name,
+                            observer.as_ref(),
+                            &config.multimodal,
+                            &config.pacing,
+                            agent.resolved.max_tool_result_chars,
+                            agent.resolved.max_context_tokens,
+                            None, // cancellation_token — no parent token in single-shot run
+                        ),
+                    )
+                    .await;
+            }
         } else {
             println!("🦀 ZeroClaw Interactive Mode");
             println!("Type /help for commands.\n");
@@ -10453,6 +10498,188 @@ Let me check the result."#;
         .expect("should succeed without cost scope");
 
         assert_eq!(result, "ok");
+    }
+
+    // ── Skill review fork cost-accounting tests ──
+    //
+    // The post-turn skill-review fork (`crate::skills::review::maybe_run_skill_review`)
+    // runs AFTER the parent turn's `TOOL_LOOP_COST_TRACKING_CONTEXT.scope(...)`
+    // has exited, so `agent::loop_::run` re-scopes it under the SAME
+    // `cost_tracking_context` as the parent turn. These tests pin that wiring:
+    // the fork's provider calls must be recorded against — and bounded by — the
+    // same tracker/budget as the parent.
+
+    fn review_test_pricing() -> crate::agent::cost::ModelProviderPricing {
+        use std::collections::HashMap;
+        let mut model_pricing: HashMap<String, f64> = HashMap::new();
+        model_pricing.insert("mock-model.input".to_string(), 3.0);
+        model_pricing.insert("mock-model.output".to_string(), 15.0);
+        let mut pricing: crate::agent::cost::ModelProviderPricing = HashMap::new();
+        pricing.insert("mock-provider".to_string(), model_pricing);
+        pricing
+    }
+
+    fn review_test_history() -> Vec<ChatMessage> {
+        // One completed tool call so `should_trigger` (threshold 1) fires.
+        vec![
+            ChatMessage::system("test"),
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("..."),
+            ChatMessage {
+                role: "tool".to_string(),
+                content: "ok".to_string(),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn skill_review_fork_records_cost_usage_under_parent_scope() {
+        use super::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
+        use crate::cost::CostTracker;
+        use crate::observability::noop::NoopObserver;
+
+        // Fork's single provider turn returns "Nothing to save." with usage —
+        // no tool calls, so the fork ends after one recorded provider call.
+        let model_provider = ScriptedModelProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                text: Some("Nothing to save.".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(800),
+                    output_tokens: Some(120),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            }]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+        let observer = NoopObserver;
+        let workspace = tempfile::TempDir::new().unwrap();
+        let cost_config = zeroclaw_config::schema::CostConfig {
+            enabled: true,
+            ..zeroclaw_config::schema::CostConfig::default()
+        };
+        let tracker = Arc::new(CostTracker::new(cost_config, workspace.path()).unwrap());
+        let ctx =
+            ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(review_test_pricing()));
+
+        let review_config = zeroclaw_config::schema::SkillImprovementConfig {
+            enabled: true,
+            cooldown_secs: 0,
+            nudge_interval_iterations: 1,
+            max_review_iterations: 2,
+        };
+
+        TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(ctx),
+                crate::skills::review::maybe_run_skill_review(
+                    workspace.path().to_path_buf(),
+                    review_config,
+                    false,
+                    review_test_history(),
+                    Vec::new(),
+                    &model_provider,
+                    "mock-provider",
+                    "mock-model",
+                    &observer,
+                    &zeroclaw_config::schema::MultimodalConfig::default(),
+                    &zeroclaw_config::schema::PacingConfig::default(),
+                    0,
+                    0,
+                    None,
+                ),
+            )
+            .await;
+
+        let summary = tracker.get_summary().unwrap();
+        assert_eq!(
+            summary.request_count, 1,
+            "review fork must record its provider call under the parent cost scope"
+        );
+        assert_eq!(summary.total_tokens, 920);
+        assert!(summary.session_cost_usd > 0.0);
+    }
+
+    #[tokio::test]
+    async fn skill_review_fork_respects_budget_under_parent_scope() {
+        use super::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
+        use crate::cost::CostTracker;
+        use crate::observability::noop::NoopObserver;
+
+        // Provider that WOULD record usage if reached — but the pre-exceeded
+        // budget must block the call before it happens.
+        let model_provider = ScriptedModelProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                text: Some("should not be reached".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(800),
+                    output_tokens: Some(120),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            }]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+        let observer = NoopObserver;
+        let workspace = tempfile::TempDir::new().unwrap();
+        let cost_config = zeroclaw_config::schema::CostConfig {
+            enabled: true,
+            daily_limit_usd: 0.001, // very low limit
+            ..zeroclaw_config::schema::CostConfig::default()
+        };
+        let tracker = Arc::new(CostTracker::new(cost_config, workspace.path()).unwrap());
+        // Record usage that already exceeds the daily limit.
+        tracker
+            .record_usage(crate::cost::types::TokenUsage::new(
+                "mock-model",
+                100_000,
+                50_000,
+                0,
+                1.0,
+                1.0,
+                0.0,
+            ))
+            .unwrap();
+        let before = tracker.get_summary().unwrap().request_count;
+
+        let ctx =
+            ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(review_test_pricing()));
+        let review_config = zeroclaw_config::schema::SkillImprovementConfig {
+            enabled: true,
+            cooldown_secs: 0,
+            nudge_interval_iterations: 1,
+            max_review_iterations: 2,
+        };
+
+        TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(ctx),
+                crate::skills::review::maybe_run_skill_review(
+                    workspace.path().to_path_buf(),
+                    review_config,
+                    false,
+                    review_test_history(),
+                    Vec::new(),
+                    &model_provider,
+                    "mock-provider",
+                    "mock-model",
+                    &observer,
+                    &zeroclaw_config::schema::MultimodalConfig::default(),
+                    &zeroclaw_config::schema::PacingConfig::default(),
+                    0,
+                    0,
+                    None,
+                ),
+            )
+            .await;
+
+        let after = tracker.get_summary().unwrap().request_count;
+        assert_eq!(
+            after, before,
+            "budget-exceeded fork must not make a recorded provider call"
+        );
     }
 
     // ── apply_policy_tool_filter coverage ─────────────────────
