@@ -23,18 +23,44 @@ function channelSlug(name: string): string | null {
   return slug.length > 0 ? slug : null;
 }
 
-/** Config destination for an integration, routed by its category: AI-model
- *  providers land under the model-providers section, chat platforms under
- *  channels, everything else on the config root (the navigator). */
-function configHref(name: string, category: string): string {
-  const slug = channelSlug(name);
+// Config-backed automations in the ToolsAutomation bucket that live under a
+// schema [section] (or a dedicated page) rather than on the Tools page. Keyed
+// by integration display name (lower-cased); this is exactly the set surfaced
+// by Config::integration_descriptors(). Everything else in the bucket is a
+// built-in tool, which the Tools page manages.
+const TOOLS_AUTOMATION_ROUTES: Record<string, string> = {
+  cron: '/cron',
+  browser: '/config/browser',
+  'google workspace': '/config/google_workspace',
+};
+
+/** Where an integration's "Configure / Set up" CTA should land, routed by
+ *  category. Returns null when the integration isn't configurable — Platform
+ *  entries (macOS / Linux / Windows) are compile-time OS facts with nothing to
+ *  set up — so the card renders as an inert status tile instead of dead-ending
+ *  on the bare /config root. AI-model providers go to the model-providers
+ *  section, chat platforms to channels, built-in tools to the Tools page
+ *  (allow/block per risk profile), and Cron (a config-backed automation) to its
+ *  own page. */
+function configHref(name: string, category: string): string | null {
   const c = category.toLowerCase();
+  // Compile-time OS facts (macOS/Linux/Windows) — nothing to configure.
+  if (c === 'platform') return null;
+
+  const slug = channelSlug(name);
   if (c.includes('model')) {
     return slug ? `/config/providers.models/${slug}` : '/config/providers.models';
   }
   if (c.includes('chat') || c.includes('channel')) {
     return slug ? `/config/channels/${slug}` : '/config/channels';
   }
+  if (c.includes('tool') || c.includes('automation')) {
+    // Config-backed automations (Cron, Browser, Google Workspace) deep-link to
+    // their own config; every other entry here is a built-in tool managed on
+    // the Tools page.
+    return TOOLS_AUTOMATION_ROUTES[name.trim().toLowerCase()] ?? '/tools';
+  }
+  // Unknown / future category — the config root still beats a broken link.
   return '/config';
 }
 
@@ -184,20 +210,8 @@ export default function Integrations() {
                   integration.status === 'Active'
                     ? t('integrations.configure')
                     : t('integrations.set_up');
-                return (
-                  <button
-                    key={integration.name}
-                    type="button"
-                    onClick={() => navigate(href)}
-                    aria-label={`${ctaLabel}: ${integration.name}`}
-                    className={[
-                      'group p-5 w-full text-left flex flex-col gap-3 cursor-pointer',
-                      'bg-pc-surface border border-pc-border rounded-[var(--radius-lg)]',
-                      'transition-colors hover:bg-[var(--pc-hover)] hover:border-pc-border-strong',
-                      'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]',
-                      'focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base',
-                    ].join(' ')}
-                  >
+                const body = (
+                  <>
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
                         <h4 className="text-sm font-medium truncate text-pc-text">
@@ -212,11 +226,39 @@ export default function Integrations() {
                         {badge.label}
                       </Badge>
                     </div>
-                    <div className="flex items-center gap-1 text-[13px] font-medium text-pc-accent">
-                      {ctaLabel}
-                      <ArrowRight className="h-3.5 w-3.5 transition-transform group-hover:translate-x-0.5" />
-                    </div>
+                    {href && (
+                      <div className="flex items-center gap-1 text-[13px] font-medium text-pc-accent">
+                        {ctaLabel}
+                        <ArrowRight className="h-3.5 w-3.5 transition-transform group-hover:translate-x-0.5" />
+                      </div>
+                    )}
+                  </>
+                );
+                // Configurable integrations are launcher buttons; the rest
+                // (Platform/OS facts) render as inert status tiles.
+                return href ? (
+                  <button
+                    key={integration.name}
+                    type="button"
+                    onClick={() => navigate(href)}
+                    aria-label={`${ctaLabel}: ${integration.name}`}
+                    className={[
+                      'group p-5 w-full text-left flex flex-col gap-3 cursor-pointer',
+                      'bg-pc-surface border border-pc-border rounded-[var(--radius-lg)]',
+                      'transition-colors hover:bg-[var(--pc-hover)] hover:border-pc-border-strong',
+                      'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]',
+                      'focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base',
+                    ].join(' ')}
+                  >
+                    {body}
                   </button>
+                ) : (
+                  <div
+                    key={integration.name}
+                    className="p-5 w-full text-left flex flex-col gap-3 bg-pc-surface border border-pc-border rounded-[var(--radius-lg)]"
+                  >
+                    {body}
+                  </div>
                 );
               })}
             </div>
