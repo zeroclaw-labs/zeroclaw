@@ -795,6 +795,12 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<serde_json::Value>,
+    /// Path to a PEM-encoded CA certificate for TLS connections to this provider.
+    /// Must be an absolute path; shell expansion (e.g. `~`) is not performed.
+    /// Leave unset to use the system's default trust store.
+    #[tab(Connection)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ca_cert_path: Option<String>,
 }
 
 // ── Per-family model model_provider configs ────────────────────────────
@@ -5097,30 +5103,55 @@ pub struct SkillInstallSuggestionsConfig {
     pub enabled: bool,
 }
 
-/// Skill self-improvement configuration (`[skills.auto_improve]` section).
+/// Skill self-improvement configuration (`[skills.skill-improvement]` section).
+///
+/// Controls the post-turn background review fork that may patch, expand, or
+/// archive skills based on what the conversation revealed. The fork runs in a
+/// restricted toolset (only `skills_list`, `skill_view`, `skill_manage`) and
+/// never touches the user-visible conversation.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "skills.skill_improvement"]
 pub struct SkillImprovementConfig {
-    /// Enable automatic skill improvement after successful skill usage.
-    /// Default: `true`.
-    #[serde(default = "default_true")]
+    /// Enable the background skill-review fork. Default: `false`.
+    /// Opt-in: users must explicitly enable this to allow post-turn skill
+    /// mutations.
+    #[serde(default)]
     pub enabled: bool,
-    /// Minimum interval (in seconds) between improvements for the same skill.
-    /// Default: `3600` (1 hour).
+    /// Minimum interval (in seconds) between reviews for the same skill.
+    /// Acts as a durable rate limit on patches to any one skill. Default: `3600`.
     #[serde(default = "default_skill_improvement_cooldown")]
     pub cooldown_secs: u64,
+    /// Spawn a review fork once at least this many tool-call iterations have
+    /// accumulated in the current run. `0` disables iteration-based triggering.
+    /// Default: `10`.
+    #[serde(default = "default_nudge_interval_iterations")]
+    pub nudge_interval_iterations: u32,
+    /// Maximum tool-call iterations the review fork itself is allowed to make.
+    /// Caps the fork's LLM cost. Default: `8`.
+    #[serde(default = "default_max_review_iterations")]
+    pub max_review_iterations: u32,
 }
 
 fn default_skill_improvement_cooldown() -> u64 {
     3600
 }
 
+fn default_nudge_interval_iterations() -> u32 {
+    10
+}
+
+fn default_max_review_iterations() -> u32 {
+    8
+}
+
 impl Default for SkillImprovementConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             cooldown_secs: 3600,
+            nudge_interval_iterations: 10,
+            max_review_iterations: 8,
         }
     }
 }
