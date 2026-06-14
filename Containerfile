@@ -139,12 +139,15 @@ EOF
 # --exclude zeroclaw-tools: content_search/git_operations tests shell out to
 #   GNU rg/grep/git, which the minimal StageX image does not ship (busybox grep
 #   lacks the GNU flags); they run in the standard CI Test job.
+# --all-targets runs lib/bins/tests/benches but not doctests: rustdoc compiles
+#   doctests as host artifacts that hit the musl static-link wall and never
+#   execute; doctests run in the standard CI Test job.
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     <<-EOF
     set -e
     export RUSTFLAGS="-C target-feature=-crt-static"
-    cargo test --workspace --exclude zeroclaw-desktop --exclude zerocode --exclude xtask --exclude zeroclaw-tools --offline --locked
+    cargo test --workspace --all-targets --exclude zeroclaw-desktop --exclude zerocode --exclude xtask --exclude zeroclaw-tools --offline --locked
 EOF
 
 # ── Stage: build (zeroclaw + zerocode, default channels) ────
