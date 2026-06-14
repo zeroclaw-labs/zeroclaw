@@ -514,7 +514,10 @@ pub async fn run(
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-        format!("Socket: {}", crate::rpc::local::socket_path(&config).display())
+        format!(
+            "Socket: {}",
+            crate::rpc::local::socket_path(&config).display()
+        )
     );
     ::zeroclaw_log::record!(
         INFO,
