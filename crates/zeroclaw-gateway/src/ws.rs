@@ -419,6 +419,8 @@ async fn handle_socket(
             Some(&session_cwd),
             true,
             false,
+            state.sop_engine.clone(),
+            state.sop_audit.clone(),
         )
         .await
         {

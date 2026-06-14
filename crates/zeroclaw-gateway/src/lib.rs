@@ -517,6 +517,11 @@ pub struct AppState {
     /// TUI session registry from the daemon (for /api/tuis endpoint).
     /// `None` when the gateway runs standalone without a daemon.
     pub tui_registry: Option<Arc<zeroclaw_runtime::rpc::tui_identity::TuiRegistry>>,
+    /// Shared SOP engine from the daemon (for WS agent sessions).
+    /// `None` when the gateway runs standalone — sessions build their own.
+    pub sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    /// Shared SOP audit logger from the daemon (for WS agent sessions).
+    pub sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -533,6 +538,9 @@ pub async fn run_gateway(
     // TUI session registry from the daemon for the /api/tuis endpoint.
     tui_registry: Option<Arc<zeroclaw_runtime::rpc::tui_identity::TuiRegistry>>,
     canvas_store: Option<CanvasStore>,
+    // Shared SOP engine from the daemon. `None` when standalone — sessions build their own.
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 ) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
@@ -816,8 +824,8 @@ pub async fn run_gateway(
                 Some(canvas_store.clone()),
                 false,
                 None,
-                None,
-                None,
+                sop_engine.clone(),
+                sop_audit.clone(),
             );
             // Wire channel-driven tool handles so the dashboard agent can
             // deliver messages to configured channels (same pattern as
@@ -1472,6 +1480,8 @@ pub async fn run_gateway(
         cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         tui_registry,
+        sop_engine,
+        sop_audit,
         #[cfg(feature = "webauthn")]
         webauthn: if config.security.webauthn.enabled {
             let secret_store = Arc::new(zeroclaw_runtime::security::SecretStore::new(
@@ -4346,7 +4356,7 @@ mod tests {
         // the spawn: a still-running task at the deadline means boot
         // got far enough to start serving.
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None).await
+            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
         });
 
         match tokio::time::timeout(
@@ -4410,7 +4420,7 @@ mod tests {
         config.agents.insert("fake123".to_string(), agent);
 
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None).await
+            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
         });
 
         match tokio::time::timeout(
@@ -4451,7 +4461,7 @@ mod tests {
         );
 
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None).await
+            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
         });
 
         match tokio::time::timeout(

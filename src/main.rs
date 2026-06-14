@@ -3654,9 +3654,13 @@ async fn main() -> Result<()> {
                 };
 
                 #[cfg(feature = "gateway")]
-                registry.register_gateway(Box::new(
+                registry.register_gateway(Box::new({
+                    let sop_e = sop_engine.clone();
+                    let sop_a = sop_audit.clone();
                     move |host, port, config, tx, reload_tx, tui_registry| {
                         let canvas_store = canvas_store_for_gateway.clone();
+                        let sop_engine = sop_e.clone();
+                        let sop_audit = sop_a.clone();
                         Box::pin(async move {
                             Box::pin(zeroclaw_gateway::run_gateway(
                                 &host,
@@ -3666,22 +3670,32 @@ async fn main() -> Result<()> {
                                 reload_tx,
                                 tui_registry,
                                 Some(canvas_store),
+                                sop_engine,
+                                sop_audit,
                             ))
                             .await
                         })
-                    },
-                ));
+                    }
+                }));
 
-                registry.register_channels(Box::new(move |config, cancel| {
-                    let canvas_store = canvas_store_for_channels.clone();
-                    Box::pin(async move {
-                        Box::pin(zeroclaw_channels::orchestrator::start_channels(
-                            config,
-                            Some(canvas_store),
-                            cancel,
-                        ))
-                        .await
-                    })
+                registry.register_channels(Box::new({
+                    let sop_e = sop_engine.clone();
+                    let sop_a = sop_audit.clone();
+                    move |config, cancel| {
+                        let canvas_store = canvas_store_for_channels.clone();
+                        let sop_engine = sop_e.clone();
+                        let sop_audit = sop_a.clone();
+                        Box::pin(async move {
+                            Box::pin(zeroclaw_channels::orchestrator::start_channels(
+                                config,
+                                Some(canvas_store),
+                                cancel,
+                                sop_engine,
+                                sop_audit,
+                            ))
+                            .await
+                        })
+                    }
                 }));
 
                 #[cfg(feature = "channel-mqtt")]
@@ -3748,6 +3762,11 @@ async fn main() -> Result<()> {
                         .await
                     })
                 }));
+
+                // Pass the shared SOP engine through the registry so
+                // RpcContext (RPC/TUI agent sessions) can share it.
+                registry.set_sop_engine(sop_engine, sop_audit);
+
                 let exit = Box::pin(daemon::run(
                     current_config.clone(),
                     host.clone(),
@@ -4206,7 +4225,7 @@ async fn main() -> Result<()> {
                 }));
 
                 let cancel = tokio_util::sync::CancellationToken::new();
-                Box::pin(channels::start_channels(config, None, cancel)).await
+                Box::pin(channels::start_channels(config, None, cancel, None, None)).await
             }
             ChannelCommands::Doctor => Box::pin(channels::doctor_channels(config)).await,
             other => Box::pin(channels::handle_command(other, &config)).await,
@@ -6345,7 +6364,7 @@ async fn run_gateway_if_enabled(
     // manually" message, None for tui_registry (no TUI socket), and None
     // for canvas_store so the gateway falls back to its own default.
     let result = Box::pin(gateway::run_gateway(
-        host, port, config, tx, None, None, None,
+        host, port, config, tx, None, None, None, None, None,
     ))
     .await;
     match result {
