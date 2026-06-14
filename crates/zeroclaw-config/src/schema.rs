@@ -9660,8 +9660,22 @@ pub struct RiskProfileConfig {
     /// authorization constraint. Authorization decision: which tools is
     /// the agent permitted to invoke at all. See `excluded_tools` for
     /// the inverse denylist scoped to non-CLI channels.
+    ///
+    /// MCP exception: when the list is non-empty, runtime-discovered MCP
+    /// tools (any name containing `__`, which is the `<server>__<tool>`
+    /// convention used by the MCP wrapper) are auto-admitted into the
+    /// effective allow-list without needing to be listed here individually.
+    /// This keeps the post-#7464 eager-MCP default usable for agents with an
+    /// explicit allow-list. Block individual MCP tools via `excluded_tools`.
+    /// An explicit empty list (`allowed_tools = []`) still denies everything,
+    /// including MCP tools.
     pub allowed_tools: Vec<String>,
     /// Tools excluded from non-CLI channels under this profile.
+    ///
+    /// Also subtracts from the agentic-delegate allow-list resolved at
+    /// runtime, which is the only way to block individual
+    /// `<server>__<tool>` MCP names that would otherwise be auto-admitted
+    /// by the `allowed_tools` MCP exception described above.
     pub excluded_tools: Vec<String>,
     // ── Sandbox (from security.sandbox) ─────────────────────────────
     /// Whether the sandbox is enabled for this profile. `None` inherits global.

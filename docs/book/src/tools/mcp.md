@@ -58,4 +58,17 @@ MCP tool calls go through the same approval gate as every other tool, governed b
 - Otherwise, an MCP tool call prompts for approval unless its **prefixed** name (`<server>__<tool>`) is in the profile's `auto_approve` list. `auto_approve = ["*"]` approves everything; an exact entry like `auto_approve = ["filesystem__read_file"]` approves just that tool.
 - `always_ask` is the inverse: a name (or `"*"`) there always prompts, overriding `auto_approve`.
 
+### Authorization: `allowed_tools` / `excluded_tools`
+
+Approval gates *when* a tool call needs a human green-light. Authorization gates *whether* the agent can call a tool at all. The two are independent.
+
+For runtime-discovered MCP tools the authorization contract has an MCP-specific exception:
+
+- If the risk profile's `allowed_tools` is empty or omitted, no authorization constraint applies — every discovered tool (MCP or built-in) is reachable.
+- If `allowed_tools` is non-empty, any MCP tool whose name contains `__` (the `<server>__<tool>` convention) is auto-admitted into the effective allow-list without being listed there individually. Non-MCP built-ins still need an exact entry.
+- If `allowed_tools = []` (explicit empty list), everything is denied, MCP included. This is the "default-deny" escape hatch.
+- `excluded_tools` always subtracts, including from the auto-admitted MCP set. To block a single MCP tool like `filesystem__write_file` while keeping the rest of the `filesystem` server reachable, put it in `excluded_tools`.
+
+The rationale: before this exception, every agent that pinned an `allowed_tools` list to lock down its built-in surface would silently lose every MCP tool, even ones the operator explicitly configured. The cost is that the deny-list is now the operator's primary lever for blocking destructive MCP capabilities under an allow-list-pinned profile.
+
 See [Autonomy levels](../security/autonomy.md) for the full per-profile field surface, and the [Config reference](../reference/config.md#mcp) for every MCP field and default.
