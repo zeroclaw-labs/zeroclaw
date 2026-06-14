@@ -1274,10 +1274,8 @@ fn apply_channels(
                 }
                 // Write extra channel-specific fields (e.g. port for webhook).
                 for (key, value) in &entry.fields {
-                    let field_path = format!(
-                        "channels.{}.{}.{}",
-                        entry.channel_type, entry.alias, key
-                    );
+                    let field_path =
+                        format!("channels.{}.{}.{}", entry.channel_type, entry.alias, key);
                     if let Err(err) = config.set_prop_persistent(&field_path, value) {
                         errors.push(QuickstartError::new(
                             QuickstartStep::Channels,
