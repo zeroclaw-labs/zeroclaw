@@ -184,6 +184,7 @@ export default function Cron() {
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [expandedJob, setExpandedJob] = useState<string | null>(null);
   const [triggering, setTriggering] = useState<string | null>(null);
+  const [toggling, setToggling] = useState<string | null>(null);
   const [triggerError, setTriggerError] = useState<string | null>(null);
   // Localized error for the pause/resume toggle. Kept SEPARATE from the
   // page-level `error` (which drives a full-page guard) so a single job's
@@ -466,7 +467,9 @@ export default function Cron() {
   // Pause/resume a job without deleting it — toggles the existing `enabled`
   // flag the scheduler already honours.
   const handleToggleEnabled = async (job: CronJob) => {
+    if (toggling === job.id) return;
     const desired = !job.enabled;
+    setToggling(job.id);
     try {
       const updated = await patchCronJob(job.id, {
         agent: job.agent_alias,
@@ -484,6 +487,8 @@ export default function Cron() {
       }
     } catch (err: unknown) {
       setToggleError(err instanceof Error ? err.message : t('cron.edit_error'));
+    } finally {
+      setToggling(null);
     }
   };
 
@@ -1082,8 +1087,11 @@ export default function Cron() {
                           onClick={() => handleToggleEnabled(job)}
                           title={job.enabled ? t('cron.pause') : t('cron.resume')}
                           aria-label={job.enabled ? t('cron.pause') : t('cron.resume')}
+                          disabled={toggling === job.id}
                         >
-                          {job.enabled ? (
+                          {toggling === job.id ? (
+                            <RefreshCw className="h-4 w-4 animate-spin" />
+                          ) : job.enabled ? (
                             <Pause className="h-4 w-4" />
                           ) : (
                             <Power className="h-4 w-4" />

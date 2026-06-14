@@ -464,21 +464,16 @@ export function AgentChatInner({
   );
 }
 
-const SERVER_TIMESTAMP_RE = /\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [^\]]+)\]\s*/;
+// Channel-user (and some agent) messages arrive with a leading
+// `[YYYY-MM-DD HH:MM:SS TZ] ` prefix the gateway prepends. The zone is a chrono
+// `%Z` abbreviation (e.g. CEST) that JS `Date` can't reliably parse, so we
+// don't try — we just strip the prefix for display and copy; the bubble shows
+// its own wall-clock caption separately. Anchored to the start so a bracketed
+// datetime appearing mid-message (a log line, an error report) is left intact.
+const SERVER_TIMESTAMP_RE = /^\s*\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [^\]]+\]\s*/;
 
-function extractServerTimestamp(content: string): {
-  cleanContent: string;
-  serverTimestamp: Date | null;
-} {
-  const m = content.match(SERVER_TIMESTAMP_RE);
-  if (!m) return { cleanContent: content, serverTimestamp: null };
-  const tsStr = m[1];
-  if (!tsStr) return { cleanContent: content, serverTimestamp: null };
-  const ts = new Date(tsStr);
-  if (isNaN(ts.getTime())) return { cleanContent: content, serverTimestamp: null };
-  const prefix = content.slice(0, m.index!);
-  const suffix = content.slice(m.index! + m[0].length);
-  return { cleanContent: prefix + suffix, serverTimestamp: ts };
+function stripServerTimestamp(content: string): string {
+  return content.replace(SERVER_TIMESTAMP_RE, '');
 }
 
 // Each chat message is rendered through this memoized component so that
@@ -503,7 +498,7 @@ const MessageItem = memo(function MessageItem({
   onCopy,
   onDelete,
 }: MessageItemProps) {
-  const { cleanContent } = extractServerTimestamp(msg.content);
+  const cleanContent = stripServerTimestamp(msg.content);
 
   return (
     <div

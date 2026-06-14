@@ -645,6 +645,10 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       ws.connect();
       wsRef.current = ws;
     } catch (err) {
+      // A superseded switch can reject late; only the still-active switch owns
+      // the shared state (same identity guard as the watchdog + bail-outs above),
+      // so a stale rejection can't clobber a newer in-flight switch.
+      if (pendingModelSwitchRef.current !== model) return;
       if (switchTimeoutRef.current) {
         clearTimeout(switchTimeoutRef.current);
         switchTimeoutRef.current = null;
