@@ -18,3 +18,6 @@ export type { PageHeaderProps } from './PageHeader';
 
 export { ConfirmDialog } from './ConfirmDialog';
 export type { ConfirmDialogProps } from './ConfirmDialog';
+
+export { ComboBox } from './ComboBox';
+export type { ComboBoxProps } from './ComboBox';

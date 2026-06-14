@@ -39,7 +39,7 @@ import {
 } from "lucide-react";
 import DirectoryPicker from "./DirectoryPicker";
 import ToolPicker from "@/components/ToolPicker";
-import { Badge, Button } from "@/components/ui";
+import { Badge, Button, ComboBox } from "@/components/ui";
 import type { BadgeTone } from "@/components/ui";
 import { t } from "@/lib/i18n";
 import {
@@ -1186,6 +1186,12 @@ function FieldRow({
   const isProviderModelField = /^providers\.models\.[^.]+\.[^.]+\.model$/.test(
     entry.path,
   );
+  // The same alias's `fallback_models` array — a list of model IDs from the
+  // same provider catalog, so it gets the same known-model dropdown per row.
+  const isProviderModelArrayField =
+    /^providers\.models\.[^.]+\.[^.]+\.fallback_models$/.test(entry.path);
+  // Either model field needs the provider's catalog fetched.
+  const needsProviderModels = isProviderModelField || isProviderModelArrayField;
   // Skill-bundle directory field — `skill-bundles.<alias>.directory` (or
   // the legacy snake form `skill_bundles.<alias>.directory`). When unset
   // the runtime falls back to `<install>/shared/skills/<alias>/`; render
@@ -1264,7 +1270,7 @@ function FieldRow({
   );
 
   useEffect(() => {
-    if (!isProviderModelField) return;
+    if (!needsProviderModels) return;
     void primeModelProviderCatalog();
     const [, , provider, alias] = entry.path.split('.');
     if (!provider || !alias) return;
@@ -1290,7 +1296,7 @@ function FieldRow({
         setProviderModels([]);
         setModelsFetchFailed(true);
       });
-  }, [isProviderModelField, entry.path]);
+  }, [needsProviderModels, entry.path]);
 
   // Refetch on every mount so newly-created channels / agents / bundles
   // (added in a different section) surface without a page reload.
@@ -1426,21 +1432,18 @@ function FieldRow({
         ) : isProviderModelField &&
           providerModels !== null &&
           providerModels.length > 0 ? (
-          <>
-            <input
-              id={entry.path}
-              list={`models-${entry.path}`}
-              value={value}
-              onChange={(e) => onChange(e.target.value)}
-              className="input-electric w-full px-3 py-2 text-sm"
-              placeholder="Pick from list or type a model name"
-            />
-            <datalist id={`models-${entry.path}`}>
-              {providerModels.map((m) => (
-                <option key={m} value={m} />
-              ))}
-            </datalist>
-          </>
+          // Discoverable combobox (caret + filterable listbox) rather than a
+          // native <datalist>, which showed no affordance — users never saw
+          // the known-model list. Free text is still accepted for unlisted IDs.
+          <ComboBox
+            id={entry.path}
+            value={value}
+            onChange={onChange}
+            options={providerModels}
+            placeholder="Pick from list or type a model name"
+            emptyText="No matching model — your text is kept as-is"
+            aria-label="Model"
+          />
         ) : isProviderModelField && modelsFetchFailed ? (
           // Fetch failed — fall back to free text with explicit help.
           <>
@@ -1534,6 +1537,16 @@ function FieldRow({
             id={entry.path}
             value={parseArrayRows(value)}
             onChange={(next) => onChange(JSON.stringify(next))}
+          />
+        ) : isProviderModelArrayField ? (
+          // Fallback models: same array editor, but each row gets the known-
+          // model dropdown (falls back to free text while the catalog loads).
+          <ArrayFieldEditor
+            inputId={entry.path}
+            value={value}
+            onChange={onChange}
+            isOptional={isOptionalArray(entry.type_hint)}
+            suggestions={providerModels ?? undefined}
           />
         ) : renderer === "array" ? (
           <ArrayFieldEditor
@@ -1773,18 +1786,27 @@ function ArrayFieldEditor({
             <ul className="space-y-1.5" id={inputId}>
               {rows.map((row, i) => (
                 <li key={i} className="flex items-center gap-2">
-                  <input
-                    type="text"
-                    value={row}
-                    onChange={(e) => setRow(i, e.target.value)}
-                    className="input-electric flex-1 px-3 py-1.5 text-sm"
-                    placeholder={
-                      suggestions && suggestions.length > 0
-                        ? "pick from list"
-                        : "empty"
-                    }
-                    list={suggestions ? `${inputId}-suggestions` : undefined}
-                  />
+                  {suggestions && suggestions.length > 0 ? (
+                    // Discoverable dropdown (caret + filterable listbox) instead
+                    // of a native <datalist>, which showed no affordance. Free
+                    // text is still accepted for values not in the list.
+                    <ComboBox
+                      className="flex-1"
+                      value={row}
+                      onChange={(v) => setRow(i, v)}
+                      options={suggestions}
+                      placeholder="pick from list or type a value"
+                      emptyText="No match — your text is kept as-is"
+                    />
+                  ) : (
+                    <input
+                      type="text"
+                      value={row}
+                      onChange={(e) => setRow(i, e.target.value)}
+                      className="input-electric flex-1 px-3 py-1.5 text-sm"
+                      placeholder="empty"
+                    />
+                  )}
                   <button
                     type="button"
                     onClick={() => removeRow(i)}
@@ -1796,13 +1818,6 @@ function ArrayFieldEditor({
                 </li>
               ))}
             </ul>
-          )}
-          {suggestions && (
-            <datalist id={`${inputId}-suggestions`}>
-              {suggestions.map((s) => (
-                <option key={s} value={s} />
-              ))}
-            </datalist>
           )}
           <button
             type="button"
