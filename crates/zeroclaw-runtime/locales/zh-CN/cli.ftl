@@ -549,3 +549,8 @@ cli-channels-notion = {"  "}{$status} Notion
 cli-channels-start-hint = 启动渠道：zeroclaw channel start
 cli-channels-doctor-hint = 检查健康状况：    zeroclaw channel doctor
 cli-channels-configure-hint = 配置方法：      zeroclaw config set channels.<name>.<field>=<value>
+cli-quickstart-needs-tty = Quickstart 是交互式的，需要在 stdin 和 stderr 上有终端。请从交互式 shell 运行，或使用 `zeroclaw config set <path> <value>` 进行无头配置。
+turn-interrupted-by-user = [被用户中断]
+turn-stream-interrupted = [流已中断]
+turn-tool-interrupted-before-result = [在工具返回结果前被用户中断]
+channel-runtime-malformed-tool-output = 我生成了内部工具调用格式错误，无法完成此请求。请重试。
