@@ -1263,6 +1263,11 @@ const translations: Record<Locale, Record<string, string>> = {
     'integrations.subtitle': 'Browse available integrations and jump to their channel configuration.',
     'integrations.configure': 'Configure',
     'integrations.set_up': 'Set up',
+    'integrations.cat_all': 'All',
+    'integrations.cat_chat': 'Chat Providers',
+    'integrations.cat_ai_model': 'AI Models',
+    'integrations.cat_tools_automation': 'Tools & Automation',
+    'integrations.cat_platform': 'Platforms',
 
     // Memory
     'memory.title': 'Memory Store',

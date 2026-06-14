@@ -66,6 +66,19 @@ function statusBadge(status: Integration['status']) {
   }
 }
 
+// Display labels for the integration `category` enum, keyed by the stable
+// enum-variant value the API emits (Chat / AiModel / ToolsAutomation /
+// Platform). Routed through t() at the call site so the label localizes;
+// unknown/future variants fall back to the raw key. Values mirror the backend
+// IntegrationCategory::label() (zeroclaw-labs/zeroclaw#6490), which we cannot
+// consume directly since we ship web-only.
+const CATEGORY_LABEL_KEYS: Record<string, string> = {
+  Chat: 'integrations.cat_chat',
+  AiModel: 'integrations.cat_ai_model',
+  ToolsAutomation: 'integrations.cat_tools_automation',
+  Platform: 'integrations.cat_platform',
+};
+
 export default function Integrations() {
   const navigate = useNavigate();
   const [integrations, setIntegrations] = useState<Integration[]>([]);
@@ -92,6 +105,15 @@ export default function Integrations() {
     acc[key].push(item);
     return acc;
   }, {});
+
+  // Resolve a category enum key to its human label. 'all' is the synthetic
+  // filter pseudo-category; real keys map through CATEGORY_LABEL_KEYS, and
+  // anything unrecognized falls back to the raw key rather than rendering blank.
+  const labelFor = (cat: string): string => {
+    if (cat === 'all') return t('integrations.cat_all');
+    const key = CATEGORY_LABEL_KEYS[cat];
+    return key ? t(key) : cat;
+  };
 
   if (error) {
     return (
@@ -129,13 +151,13 @@ export default function Integrations() {
               type="button"
               onClick={() => setActiveCategory(cat)}
               className={[
-                'px-3 h-7 inline-flex items-center rounded-[var(--radius-md)] text-[13px] font-medium capitalize transition-colors cursor-pointer border',
+                'px-3 h-7 inline-flex items-center rounded-[var(--radius-md)] text-[13px] font-medium transition-colors cursor-pointer border',
                 active
                   ? 'bg-pc-accent border-transparent text-[#0b1220]'
                   : 'bg-transparent border-pc-border text-pc-text-secondary hover:bg-[var(--pc-hover)] hover:text-pc-text hover:border-pc-border-strong',
               ].join(' ')}
             >
-              {cat}
+              {labelFor(cat)}
             </button>
           );
         })}
@@ -150,8 +172,8 @@ export default function Integrations() {
       ) : (
         Object.entries(grouped).sort(([a], [b]) => a.localeCompare(b)).map(([category, items]) => (
           <div key={category}>
-            <h3 className="text-[11px] font-medium uppercase tracking-wider mb-3 capitalize text-pc-text-faint">
-              {category}
+            <h3 className="text-[11px] font-medium uppercase tracking-wider mb-3 text-pc-text-faint">
+              {labelFor(category)}
             </h3>
             <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
               {items.map((integration) => {
