@@ -123,6 +123,11 @@ pub async fn maybe_run_skill_review(
                 None, // channel
                 None, // receipt_generator
                 Some(&receipts),
+                None, // event_tx
+                None, // steering
+                None, // new_messages_out
+                &crate::agent::loop_::LoopKnobs::default(),
+                None, // image_cache
             )
             .await
         })
