@@ -120,15 +120,15 @@ pub async fn maybe_run_skill_review(
                 false, // parallel_tools — sequential for the mutation-capable fork
                 max_tool_result_chars,
                 max_context_tokens,
-                None, // shared_budget
-                None, // channel
-                None, // receipt_generator
-                Some(&receipts), // collected_receipts
-                None,            // event_tx
-                None,            // steering
-                None,            // new_messages_out
+                None,                  // shared_budget
+                None,                  // channel
+                None,                  // receipt_generator
+                Some(&receipts),       // collected_receipts
+                None,                  // event_tx
+                None,                  // steering
+                None,                  // new_messages_out
                 &LoopKnobs::default(), // knobs
-                None,            // image_cache
+                None,                  // image_cache
             )
             .await
         })

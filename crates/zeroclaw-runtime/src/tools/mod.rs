@@ -1564,6 +1564,91 @@ mod tests {
         }
     }
 
+    /// Regression for #6687: two tool registries built from clones of the same
+    /// engine `Arc` must reference the same underlying `SopEngine`. This is the
+    /// property the daemon relies on so MQTT-triggered runs are visible to
+    /// `sop_status`/`sop_approve`/`sop_advance` invoked from agent sessions.
+    #[test]
+    fn shared_sop_engine_arc_is_observed_by_multiple_registrations() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let cfg = test_config(&tmp);
+        let browser = BrowserConfig::default();
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let web = zeroclaw_config::schema::WebFetchConfig::default();
+        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
+
+        let shared_engine = Arc::new(Mutex::new(SopEngine::new(
+            zeroclaw_config::schema::SopConfig::default(),
+        )));
+        let shared_audit = Arc::new(crate::sop::SopAuditLogger::new(mem.clone()));
+
+        // Two independent registrations using clones of the same Arc — the
+        // pattern the daemon uses when wiring gateway, channels, MQTT, and
+        // RPC sessions from one engine pair.
+        let session_a = all_tools_with_runtime(
+            Arc::new(Config::default()),
+            &security,
+            &risk,
+            "session-a",
+            Arc::new(NativeRuntime::new()),
+            mem.clone(),
+            None,
+            None,
+            &browser,
+            &http,
+            &web,
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            Some(shared_engine.clone()),
+            Some(shared_audit.clone()),
+        );
+        let session_b = all_tools_with_runtime(
+            Arc::new(Config::default()),
+            &security,
+            &risk,
+            "session-b",
+            Arc::new(NativeRuntime::new()),
+            mem.clone(),
+            None,
+            None,
+            &browser,
+            &http,
+            &web,
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            Some(shared_engine.clone()),
+            Some(shared_audit.clone()),
+        );
+
+        for tools in [&session_a.tools, &session_b.tools] {
+            assert!(tools.iter().any(|t| t.name() == "sop_status"));
+        }
+
+        // Outer Arc + both registrations = 3+ strong refs. Confirms the
+        // registries kept references to the same instance instead of
+        // copying state.
+        assert!(Arc::strong_count(&shared_engine) >= 3);
+        assert!(Arc::strong_count(&shared_audit) >= 3);
+    }
+
     /// A runtime that reports an ephemeral workspace (no host persistence) while
     /// delegating real shell execution to `NativeRuntime`. Used to exercise the
     /// registration wiring of `has_filesystem_access()` -> `persistent_writes`.
