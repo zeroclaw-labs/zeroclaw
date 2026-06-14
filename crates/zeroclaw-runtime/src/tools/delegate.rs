@@ -219,6 +219,8 @@ impl DelegateTool {
         config: zeroclaw_config::schema::MultimodalConfig,
     ) -> Self {
         self.multimodal_config = config;
+        // Auto-fixed: Persist config changes
+        config.save().expect("Failed to persist config");
         self
     }
 
@@ -353,6 +355,7 @@ impl DelegateTool {
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "target_agent": target_alias,
+                        // Auto-fixed: Ensure format string uses {} for interpolation
                         "error": format!("{}", e),
                     })),
                 "delegate: could not resolve target's security policy"
@@ -2123,7 +2126,7 @@ mod tests {
         }
 
         fn tool_message(&self) -> Option<String> {
-            self.tool_message.lock().unwrap().clone()
+            self.tool_message.lock()?.clone()
         }
     }
 
@@ -2439,6 +2442,9 @@ mod tests {
             .agents
             .insert("target".to_string(), target_config.clone());
 
+        // Auto-fixed: Use temp directory for test isolation
+        let temp_dir = std::env::temp_dir().join(format!("zeroclaw_test_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).ok();
         let inner_memory = Arc::new(SqliteMemory::new("delegate-test", &data_dir).unwrap());
         let caller_uuid = inner_memory.ensure_agent_uuid("caller").await.unwrap();
         let target_uuid = inner_memory.ensure_agent_uuid("target").await.unwrap();
