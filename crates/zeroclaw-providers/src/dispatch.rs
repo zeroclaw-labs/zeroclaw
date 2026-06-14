@@ -105,7 +105,12 @@ impl ProviderDispatch {
         .boxed()
     }
 
-    /// Wrap the inner provider's `simple_chat`.
+    /// Wrap the inner provider's `simple_chat`. We dispatch through
+    /// `&*self.inner` because the `Arc<dyn ModelProvider>` blanket
+    /// impl does not forward `simple_chat`; routing via the blanket
+    /// would fall back to the trait default (which itself calls
+    /// `chat_with_system`), bypassing any concrete `simple_chat`
+    /// override on the inner provider.
     pub async fn simple_chat(
         &self,
         message: &str,
@@ -117,7 +122,7 @@ impl ProviderDispatch {
         async move {
             zeroclaw_log::scope!(
                 model: model,
-                => self.inner.simple_chat(message, model, temperature)
+                => (*self.inner).simple_chat(message, model, temperature)
             )
             .await
         }
@@ -188,19 +193,25 @@ impl ProviderDispatch {
     }
 
     /// Wrap the inner provider's `list_models`. No `model` parameter,
-    /// so attribution only — no `scope!(model: …)`.
+    /// so attribution only — no `scope!(model: …)`. We dispatch
+    /// through `&*self.inner` (instead of via the `Arc<dyn …>` blanket)
+    /// because the blanket impl does not forward `list_models` and
+    /// the trait default bails with "not supported".
     pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(&*self.inner);
-        self.inner.list_models().instrument(span).await
+        (*self.inner).list_models().instrument(span).await
     }
 
-    /// Wrap the inner provider's `list_models_with_pricing`. No `model`
-    /// parameter, so attribution only.
+    /// Wrap the inner provider's `list_models_with_pricing`. Same
+    /// `&*self.inner` rationale as `list_models`.
     pub async fn list_models_with_pricing(&self) -> anyhow::Result<Vec<ModelInfo>> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(&*self.inner);
-        self.inner.list_models_with_pricing().instrument(span).await
+        (*self.inner)
+            .list_models_with_pricing()
+            .instrument(span)
+            .await
     }
 
     /// Wrap the inner provider's `warmup`. No `model` parameter, so
