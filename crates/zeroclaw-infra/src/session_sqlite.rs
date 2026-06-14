@@ -5,7 +5,8 @@
 //! Designed as the default backend, replacing JSONL for new installations.
 
 use crate::session_backend::{
-    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState,
+    BackendCapabilities, SessionBackend, SessionBackendError, SessionContext, SessionMetadata,
+    SessionQuery, SessionResult, SessionState,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
@@ -236,6 +237,15 @@ impl SqliteSessionBackend {
 }
 
 impl SessionBackend for SqliteSessionBackend {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            full_text_search: true,
+            timestamps: true,
+            transactions: true,
+            shared_remote: false,
+        }
+    }
+
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         let conn = self.conn.lock();
         let mut stmt = match conn
@@ -291,33 +301,39 @@ impl SessionBackend for SqliteSessionBackend {
         rows.filter_map(|r| r.ok()).collect()
     }
 
-    fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
-        let conn = self.conn.lock();
+    fn append(&self, session_key: &str, message: &ChatMessage) -> SessionResult<()> {
+        let mut conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
+        let tx = conn
+            .transaction()
+            .map_err(|e| SessionBackendError::Transaction(e.to_string()))?;
 
-        conn.execute(
+        tx.execute(
             "INSERT INTO sessions (session_key, role, content, created_at)
              VALUES (?1, ?2, ?3, ?4)",
-            params![session_key, message.role, message.content, now],
+            params![session_key, &message.role, &message.content, &now],
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
         // Upsert metadata
-        conn.execute(
+        tx.execute(
             "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count)
              VALUES (?1, ?2, ?3, 1)
              ON CONFLICT(session_key) DO UPDATE SET
                 last_activity = excluded.last_activity,
                 message_count = message_count + 1",
-            params![session_key, now, now],
+            params![session_key, &now, &now],
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
-        Ok(())
+        tx.commit()
+            .map_err(|e| SessionBackendError::Transaction(e.to_string()))
     }
 
-    fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
+    fn remove_last(&self, session_key: &str) -> SessionResult<bool> {
         let conn = self.conn.lock();
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| SessionBackendError::Transaction(e.to_string()))?;
 
         let last_id: Option<i64> = conn
             .query_row(
@@ -328,11 +344,13 @@ impl SessionBackend for SqliteSessionBackend {
             .ok();
 
         let Some(id) = last_id else {
+            conn.execute_batch("COMMIT")
+                .map_err(|e| SessionBackendError::Transaction(e.to_string()))?;
             return Ok(false);
         };
 
         conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
         // Update metadata count
         conn.execute(
@@ -340,15 +358,20 @@ impl SessionBackend for SqliteSessionBackend {
              WHERE session_key = ?1",
             params![session_key],
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
+
+        conn.execute_batch("COMMIT")
+            .map_err(|e| SessionBackendError::Transaction(e.to_string()))?;
 
         Ok(true)
     }
 
     /// Efficiently update the last message in-place (single UPDATE instead of
     /// DELETE + INSERT). Used for incremental persistence during streaming.
-    fn update_last(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<bool> {
+    fn update_last(&self, session_key: &str, message: &ChatMessage) -> SessionResult<bool> {
         let conn = self.conn.lock();
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| SessionBackendError::Transaction(e.to_string()))?;
 
         let last_id: Option<i64> = conn
             .query_row(
@@ -359,14 +382,16 @@ impl SessionBackend for SqliteSessionBackend {
             .ok();
 
         let Some(id) = last_id else {
+            conn.execute_batch("COMMIT")
+                .map_err(|e| SessionBackendError::Transaction(e.to_string()))?;
             return Ok(false);
         };
 
         conn.execute(
             "UPDATE sessions SET role = ?1, content = ?2 WHERE id = ?3",
-            params![message.role, message.content, id],
+            params![&message.role, &message.content, id],
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
         // NOTE: FTS index becomes stale here (no UPDATE trigger, only
         // INSERT/DELETE triggers). This is acceptable — update_last is
@@ -378,7 +403,10 @@ impl SessionBackend for SqliteSessionBackend {
             "UPDATE session_metadata SET last_activity = ?1 WHERE session_key = ?2",
             params![now, session_key],
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
+
+        conn.execute_batch("COMMIT")
+            .map_err(|e| SessionBackendError::Transaction(e.to_string()))?;
 
         Ok(true)
     }
@@ -448,7 +476,7 @@ impl SessionBackend for SqliteSessionBackend {
         rows.filter_map(|r| r.ok()).collect()
     }
 
-    fn cleanup_stale(&self, ttl_hours: u32) -> std::io::Result<usize> {
+    fn cleanup_stale(&self, ttl_hours: u32) -> SessionResult<usize> {
         let conn = self.conn.lock();
         let cutoff = (Utc::now() - Duration::hours(i64::from(ttl_hours))).to_rfc3339();
 
@@ -456,10 +484,10 @@ impl SessionBackend for SqliteSessionBackend {
         let stale_keys: Vec<String> = {
             let mut stmt = conn
                 .prepare("SELECT session_key FROM session_metadata WHERE last_activity < ?1")
-                .map_err(std::io::Error::other)?;
+                .map_err(|e| SessionBackendError::Query(e.to_string()))?;
             let rows = stmt
                 .query_map(params![cutoff], |row| row.get(0))
-                .map_err(std::io::Error::other)?;
+                .map_err(|e| SessionBackendError::Query(e.to_string()))?;
             rows.filter_map(|r| r.ok()).collect()
         };
 
@@ -475,14 +503,14 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(count)
     }
 
-    fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
+    fn clear_messages(&self, session_key: &str) -> SessionResult<usize> {
         let conn = self.conn.lock();
 
         conn.execute(
             "DELETE FROM sessions WHERE session_key = ?1",
             params![session_key],
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
         let count = conn.changes() as usize;
 
@@ -491,13 +519,13 @@ impl SessionBackend for SqliteSessionBackend {
                 "UPDATE session_metadata SET message_count = 0, last_activity = ?1 WHERE session_key = ?2",
                 params![Utc::now().to_rfc3339(), session_key],
             )
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         }
 
         Ok(count)
     }
 
-    fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
+    fn delete_session(&self, session_key: &str) -> SessionResult<bool> {
         let conn = self.conn.lock();
 
         // Check if session exists
@@ -518,14 +546,14 @@ impl SessionBackend for SqliteSessionBackend {
             "DELETE FROM sessions WHERE session_key = ?1",
             params![session_key],
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
         // Delete metadata
         conn.execute(
             "DELETE FROM session_metadata WHERE session_key = ?1",
             params![session_key],
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
         Ok(true)
     }
@@ -545,25 +573,25 @@ impl SessionBackend for SqliteSessionBackend {
         .is_ok()
     }
 
-    fn set_session_name(&self, session_key: &str, name: &str) -> std::io::Result<()> {
+    fn set_session_name(&self, session_key: &str, name: &str) -> SessionResult<()> {
         let conn = self.conn.lock();
         let name_val = if name.is_empty() { None } else { Some(name) };
         conn.execute(
             "UPDATE session_metadata SET name = ?1 WHERE session_key = ?2",
             params![name_val, session_key],
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         Ok(())
     }
 
-    fn get_session_name(&self, session_key: &str) -> std::io::Result<Option<String>> {
+    fn get_session_name(&self, session_key: &str) -> SessionResult<Option<String>> {
         let conn = self.conn.lock();
         conn.query_row(
             "SELECT name FROM session_metadata WHERE session_key = ?1",
             params![session_key],
             |row| row.get(0),
         )
-        .map_err(std::io::Error::other)
+        .map_err(|e| SessionBackendError::Query(e.to_string()))
     }
 
     fn get_session_metadata(&self, session_key: &str) -> Option<SessionMetadata> {
@@ -612,7 +640,7 @@ impl SessionBackend for SqliteSessionBackend {
         session_key: &str,
         state: &str,
         turn_id: Option<&str>,
-    ) -> std::io::Result<()> {
+    ) -> SessionResult<()> {
         let conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
         let started_at = if state == "running" {
@@ -625,11 +653,11 @@ impl SessionBackend for SqliteSessionBackend {
              WHERE session_key = ?4",
             params![state, turn_id, started_at, session_key],
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         Ok(())
     }
 
-    fn get_session_state(&self, session_key: &str) -> std::io::Result<Option<SessionState>> {
+    fn get_session_state(&self, session_key: &str) -> SessionResult<Option<SessionState>> {
         let conn = self.conn.lock();
         conn.query_row(
             "SELECT state, turn_id, turn_started_at FROM session_metadata WHERE session_key = ?1",
@@ -653,7 +681,7 @@ impl SessionBackend for SqliteSessionBackend {
         .map(Some)
         .or_else(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            other => Err(std::io::Error::other(other)),
+            other => Err(SessionBackendError::Query(other.to_string())),
         })
     }
 
@@ -823,7 +851,7 @@ impl SessionBackend for SqliteSessionBackend {
             .collect()
     }
 
-    fn set_session_agent_alias(&self, session_key: &str, agent_alias: &str) -> std::io::Result<()> {
+    fn set_session_agent_alias(&self, session_key: &str, agent_alias: &str) -> SessionResult<()> {
         let conn = self.conn.lock();
         let alias_val = if agent_alias.is_empty() {
             None
@@ -837,11 +865,11 @@ impl SessionBackend for SqliteSessionBackend {
              ON CONFLICT(session_key) DO UPDATE SET agent_alias = excluded.agent_alias",
             params![session_key, now, now, alias_val],
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         Ok(())
     }
 
-    fn get_session_agent_alias(&self, session_key: &str) -> std::io::Result<Option<String>> {
+    fn get_session_agent_alias(&self, session_key: &str) -> SessionResult<Option<String>> {
         let conn = self.conn.lock();
         conn.query_row(
             "SELECT agent_alias FROM session_metadata WHERE session_key = ?1",
@@ -850,7 +878,7 @@ impl SessionBackend for SqliteSessionBackend {
         )
         .or_else(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            other => Err(std::io::Error::other(other)),
+            other => Err(SessionBackendError::Query(other.to_string())),
         })
     }
 
@@ -858,7 +886,7 @@ impl SessionBackend for SqliteSessionBackend {
         &self,
         session_key: &str,
         context: SessionContext<'_>,
-    ) -> std::io::Result<()> {
+    ) -> SessionResult<()> {
         let conn = self.conn.lock();
         fn normalize(v: Option<&str>) -> Option<&str> {
             v.map(str::trim).filter(|s| !s.is_empty())
@@ -882,7 +910,7 @@ impl SessionBackend for SqliteSessionBackend {
                 sender_id  = COALESCE(excluded.sender_id,  session_metadata.sender_id)",
             params![session_key, now, now, channel_id, room_id, sender_id],
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         Ok(())
     }
 }

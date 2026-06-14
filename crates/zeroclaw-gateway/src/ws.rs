@@ -302,26 +302,35 @@ async fn handle_socket(
     let mut effective_name: Option<String> = None;
     let mut stored_messages = Vec::new();
     if let Some(ref backend) = state.session_backend {
-        let messages = backend.load(&session_key);
+        let backend = Arc::clone(backend);
+        let session_key_for_load = session_key.clone();
+        let agent_alias_for_stamp = agent_alias.clone();
+        let session_name_for_persist = session_name.clone();
+        let (messages, name) = tokio::task::spawn_blocking(move || {
+            let messages = backend.load(&session_key_for_load);
+            let mut effective_name = None;
+            if let Some(ref name) = session_name_for_persist
+                && !name.is_empty()
+            {
+                let _ = backend.set_session_name(&session_key_for_load, name);
+                effective_name = Some(name.clone());
+            }
+            if effective_name.is_none() {
+                effective_name = backend
+                    .get_session_name(&session_key_for_load)
+                    .unwrap_or(None);
+            }
+            let _ = backend.set_session_agent_alias(&session_key_for_load, &agent_alias_for_stamp);
+            (messages, effective_name)
+        })
+        .await
+        .unwrap_or_default();
         if !messages.is_empty() {
             message_count = messages.len();
             stored_messages = messages;
             resumed = true;
         }
-        // Set session name if provided (non-empty) on connect
-        if let Some(ref name) = session_name
-            && !name.is_empty()
-        {
-            let _ = backend.set_session_name(&session_key, name);
-            effective_name = Some(name.clone());
-        }
-        // If no name was provided via query param, load the stored name
-        if effective_name.is_none() {
-            effective_name = backend.get_session_name(&session_key).unwrap_or(None);
-        }
-        // Stamp the agent alias so future /api/sessions queries and
-        // per-agent filters can attribute this session to its agent.
-        let _ = backend.set_session_agent_alias(&session_key, &agent_alias);
+        effective_name = name;
     }
 
     // Send session_start message to client
@@ -744,7 +753,7 @@ fn session_queue_ws_error_code(error: &crate::session_queue::SessionQueueError) 
     }
 }
 
-fn persist_conversation_messages(
+fn persist_conversation_messages_sync(
     backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
     session_key: &str,
     messages: &[zeroclaw_providers::ConversationMessage],
@@ -882,7 +891,13 @@ async fn process_chat_message(
     // Set session state to running
     let turn_id = uuid::Uuid::new_v4().to_string();
     if let Some(ref backend) = state.session_backend {
-        let _ = backend.set_session_state(session_key, "running", Some(&turn_id));
+        let backend = Arc::clone(backend);
+        let session_key = session_key.to_string();
+        let turn_id_for_state = turn_id.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = backend.set_session_state(&session_key, "running", Some(&turn_id_for_state));
+        })
+        .await;
     }
 
     // ── Cancellation token lifecycle ─────────────────────────────
@@ -1153,51 +1168,39 @@ async fn process_chat_message(
             // resurrected history. Skip every write when the session no
             // longer exists — the `aborted` frame below still tells the
             // client the turn ended.
-            let still_exists = backend.session_exists(session_key);
-            if still_exists {
-                match &result {
-                    Err(error) if !error.new_messages.is_empty() => {
-                        persist_conversation_messages(
-                            backend.as_ref(),
-                            session_key,
-                            &error.new_messages,
-                        );
-                        if !has_assistant_chat_message(&error.new_messages) {
-                            let marker = zeroclaw_runtime::i18n::get_required_cli_string(
-                                "turn-interrupted-by-user",
-                            );
-                            let truncated = if accumulated_text.is_empty() {
-                                marker
-                            } else {
-                                format!("{accumulated_text}\n\n{marker}")
-                            };
-                            let assistant_msg =
-                                zeroclaw_providers::ChatMessage::assistant(&truncated);
-                            // Re-check before the raw append — the user can
-                            // delete the session between the outer check and
-                            // here; `persist_conversation_messages` already
-                            // re-checks internally.
-                            if backend.session_exists(session_key) {
-                                let _ = backend.append(session_key, &assistant_msg);
-                            }
-                        }
-                    }
-                    _ => {
-                        let marker = zeroclaw_runtime::i18n::get_required_cli_string(
-                            "turn-interrupted-by-user",
-                        );
-                        let truncated = if accumulated_text.is_empty() {
-                            marker
-                        } else {
-                            format!("{accumulated_text}\n\n{marker}")
-                        };
-                        let assistant_msg = zeroclaw_providers::ChatMessage::assistant(&truncated);
-                        if backend.session_exists(session_key) {
-                            let _ = backend.append(session_key, &assistant_msg);
-                        }
-                    }
+            let backend = Arc::clone(backend);
+            let session_key = session_key.to_string();
+            let accumulated_text = accumulated_text.clone();
+            let new_messages = match &result {
+                Err(error) => error.new_messages.clone(),
+                Ok(_) => Vec::new(),
+            };
+            let needs_marker =
+                new_messages.is_empty() || !has_assistant_chat_message(&new_messages);
+            let _ = tokio::task::spawn_blocking(move || {
+                if !backend.session_exists(&session_key) {
+                    return;
                 }
-            }
+                if !new_messages.is_empty() {
+                    persist_conversation_messages_sync(
+                        backend.as_ref(),
+                        &session_key,
+                        &new_messages,
+                    );
+                }
+                if needs_marker && backend.session_exists(&session_key) {
+                    let marker =
+                        zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
+                    let truncated = if accumulated_text.is_empty() {
+                        marker
+                    } else {
+                        format!("{accumulated_text}\n\n{marker}")
+                    };
+                    let assistant_msg = zeroclaw_providers::ChatMessage::assistant(&truncated);
+                    let _ = backend.append(&session_key, &assistant_msg);
+                }
+            })
+            .await;
         }
 
         // Inform the client the turn was aborted
@@ -1209,10 +1212,15 @@ async fn process_chat_message(
         // so on a deleted session it's a harmless no-op (0 rows updated)
         // for SQLite but we still guard for cheap consistency with the
         // append path above.
-        if let Some(ref backend) = state.session_backend
-            && backend.session_exists(session_key)
-        {
-            let _ = backend.set_session_state(session_key, "idle", None);
+        if let Some(ref backend) = state.session_backend {
+            let backend = Arc::clone(backend);
+            let session_key = session_key.to_string();
+            let _ = tokio::task::spawn_blocking(move || {
+                if backend.session_exists(&session_key) {
+                    let _ = backend.set_session_state(&session_key, "idle", None);
+                }
+            })
+            .await;
         }
 
         // Broadcast agent_end event
@@ -1245,7 +1253,17 @@ async fn process_chat_message(
     match result {
         Ok(outcome) => {
             if let Some(ref backend) = state.session_backend {
-                persist_conversation_messages(backend.as_ref(), session_key, &outcome.new_messages);
+                let backend = Arc::clone(backend);
+                let session_key_for_persist = session_key.to_string();
+                let new_messages = outcome.new_messages.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    persist_conversation_messages_sync(
+                        backend.as_ref(),
+                        &session_key_for_persist,
+                        &new_messages,
+                    );
+                })
+                .await;
             }
 
             // Fire-and-forget memory consolidation so facts from WS sessions
@@ -1320,7 +1338,12 @@ async fn process_chat_message(
 
             // Set session state to idle
             if let Some(ref backend) = state.session_backend {
-                let _ = backend.set_session_state(session_key, "idle", None);
+                let backend = Arc::clone(backend);
+                let session_key_for_state = session_key.to_string();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = backend.set_session_state(&session_key_for_state, "idle", None);
+                })
+                .await;
             }
 
             // Broadcast agent_end event
@@ -1354,12 +1377,32 @@ async fn process_chat_message(
             if let Some(ref backend) = state.session_backend
                 && !e.new_messages.is_empty()
             {
-                persist_conversation_messages(backend.as_ref(), session_key, &e.new_messages);
+                let backend = Arc::clone(backend);
+                let session_key_for_persist = session_key.to_string();
+                let new_messages = e.new_messages.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    persist_conversation_messages_sync(
+                        backend.as_ref(),
+                        &session_key_for_persist,
+                        &new_messages,
+                    );
+                })
+                .await;
             }
 
             // Set session state to error
             if let Some(ref backend) = state.session_backend {
-                let _ = backend.set_session_state(session_key, "error", Some(&turn_id));
+                let backend = Arc::clone(backend);
+                let session_key_for_state = session_key.to_string();
+                let turn_id_for_state = turn_id.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = backend.set_session_state(
+                        &session_key_for_state,
+                        "error",
+                        Some(&turn_id_for_state),
+                    );
+                })
+                .await;
             }
 
             ::zeroclaw_log::record!(
@@ -1919,14 +1962,17 @@ mod tests {
             &self,
             session_key: &str,
             message: &zeroclaw_providers::ChatMessage,
-        ) -> std::io::Result<()> {
+        ) -> zeroclaw_infra::session_backend::SessionResult<()> {
             self.append_calls.lock().unwrap().push(format!(
                 "{}:{}:{}",
                 session_key, message.role, message.content
             ));
             Ok(())
         }
-        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+        fn remove_last(
+            &self,
+            _session_key: &str,
+        ) -> zeroclaw_infra::session_backend::SessionResult<bool> {
             Ok(false)
         }
         fn list_sessions(&self) -> Vec<String> {
@@ -1949,7 +1995,7 @@ mod tests {
             ConversationMessage::Chat(ChatMessage::assistant("[interrupted by user]")),
         ];
 
-        persist_conversation_messages(&backend, "gw_deleted", &messages);
+        persist_conversation_messages_sync(&backend, "gw_deleted", &messages);
 
         assert!(
             backend.append_calls.lock().unwrap().is_empty(),

@@ -9,6 +9,7 @@ use axum::{
     response::{IntoResponse, Json},
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use zeroclaw_config::schema::{ChannelAliasInfo, Config};
 use zeroclaw_memory::MemoryEntry;
 
@@ -1468,7 +1469,10 @@ pub async fn handle_api_sessions_list(
     // or a channel_id that resolves to an owning agent).
     // Pre-migration rows with neither set are skipped as orphans.
     let config = state.config.read().clone();
-    let all_metadata = backend.list_sessions_with_metadata();
+    let backend = Arc::clone(backend);
+    let all_metadata = tokio::task::spawn_blocking(move || backend.list_sessions_with_metadata())
+        .await
+        .unwrap_or_default();
     let sessions: Vec<serde_json::Value> = all_metadata
         .into_iter()
         .filter(|meta| meta.agent_alias.is_some() || meta.channel_id.is_some())
@@ -1538,7 +1542,10 @@ pub async fn handle_api_session_messages(
     } else {
         format!("gw_{id}")
     };
-    let msgs = backend.load_with_timestamps(&session_key);
+    let backend = Arc::clone(backend);
+    let msgs = tokio::task::spawn_blocking(move || backend.load_with_timestamps(&session_key))
+        .await
+        .unwrap_or_default();
     let messages: Vec<serde_json::Value> = msgs
         .into_iter()
         .map(|m| {
@@ -1586,11 +1593,17 @@ pub async fn handle_api_session_message_post(
     };
 
     let session_key = format!("gw_{id}");
-    if !backend
-        .list_sessions()
-        .iter()
-        .any(|key| key == &session_key)
-    {
+    let backend_for_exists = Arc::clone(backend);
+    let session_key_for_exists = session_key.clone();
+    let exists = tokio::task::spawn_blocking(move || {
+        backend_for_exists
+            .list_sessions()
+            .iter()
+            .any(|key| key == &session_key_for_exists)
+    })
+    .await
+    .unwrap_or(false);
+    if !exists {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Session not found"})),
@@ -1617,7 +1630,19 @@ pub async fn handle_api_session_message_post(
     };
 
     let message = zeroclaw_providers::ChatMessage::assistant(&body.content);
-    if let Err(e) = backend.append(&session_key, &message) {
+    let backend_for_append = Arc::clone(backend);
+    let session_key_for_append = session_key.clone();
+    let message_for_append = message.clone();
+    let append_result = tokio::task::spawn_blocking(move || {
+        backend_for_append.append(&session_key_for_append, &message_for_append)
+    })
+    .await;
+    if let Err(e) = match append_result {
+        Ok(result) => result,
+        Err(e) => {
+            Err(zeroclaw_infra::session_backend::SessionBackendError::Transient(e.to_string()))
+        }
+    } {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to append session message: {e}")})),
@@ -1694,7 +1719,14 @@ pub async fn handle_api_session_delete(
         );
     }
 
-    match backend.delete_session(&session_key) {
+    let backend = Arc::clone(backend);
+    let deleted = tokio::task::spawn_blocking(move || backend.delete_session(&session_key)).await;
+    match match deleted {
+        Ok(result) => result,
+        Err(e) => {
+            Err(zeroclaw_infra::session_backend::SessionBackendError::Transient(e.to_string()))
+        }
+    } {
         Ok(true) => Json(serde_json::json!({"deleted": true, "session_id": id})).into_response(),
         Ok(false) => (
             StatusCode::NOT_FOUND,
@@ -1740,7 +1772,10 @@ pub async fn handle_api_session_rename(
     let session_key = format!("gw_{id}");
 
     // Verify the session exists before renaming
-    let sessions = backend.list_sessions();
+    let backend_for_list = Arc::clone(backend);
+    let sessions = tokio::task::spawn_blocking(move || backend_for_list.list_sessions())
+        .await
+        .unwrap_or_default();
     if !sessions.contains(&session_key) {
         return (
             StatusCode::NOT_FOUND,
@@ -1749,7 +1784,18 @@ pub async fn handle_api_session_rename(
             .into_response();
     }
 
-    match backend.set_session_name(&session_key, name) {
+    let backend = Arc::clone(backend);
+    let name = name.to_string();
+    let name_for_call = name.clone();
+    let renamed =
+        tokio::task::spawn_blocking(move || backend.set_session_name(&session_key, &name_for_call))
+            .await;
+    match match renamed {
+        Ok(result) => result,
+        Err(e) => {
+            Err(zeroclaw_infra::session_backend::SessionBackendError::Transient(e.to_string()))
+        }
+    } {
         Ok(()) => Json(serde_json::json!({"session_id": id, "name": name})).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1776,7 +1822,10 @@ pub async fn handle_api_sessions_running(
         .into_response();
     };
 
-    let running = backend.list_running_sessions();
+    let backend = Arc::clone(backend);
+    let running = tokio::task::spawn_blocking(move || backend.list_running_sessions())
+        .await
+        .unwrap_or_default();
     let sessions: Vec<serde_json::Value> = running
         .into_iter()
         .filter_map(|meta| {
@@ -1812,7 +1861,14 @@ pub async fn handle_api_session_state(
     };
 
     let session_key = format!("gw_{id}");
-    match backend.get_session_state(&session_key) {
+    let backend = Arc::clone(backend);
+    let state = tokio::task::spawn_blocking(move || backend.get_session_state(&session_key)).await;
+    match match state {
+        Ok(result) => result,
+        Err(e) => {
+            Err(zeroclaw_infra::session_backend::SessionBackendError::Transient(e.to_string()))
+        }
+    } {
         Ok(Some(ss)) => {
             let mut resp = serde_json::json!({
                 "session_id": id,

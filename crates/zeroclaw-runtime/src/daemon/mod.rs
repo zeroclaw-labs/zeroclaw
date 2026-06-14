@@ -317,11 +317,8 @@ pub async fn run(
                 }
             });
         }
-        let session_backend = zeroclaw_infra::make_session_backend(
-            &config.data_dir,
-            &config.channels.session_backend,
-        )
-        .ok();
+        let session_backend =
+            zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels).ok();
 
         // Wire the memory subsystem so `memory/list` and `memory/search`
         // work over RPC transports (same pattern as the gateway).

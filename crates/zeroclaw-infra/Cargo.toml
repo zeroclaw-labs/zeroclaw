@@ -8,7 +8,7 @@ publish = false
 
 [features]
 ## PostgreSQL session backend (adds `postgres`, `r2d2`, `r2d2_postgres`).
-backend-postgres = ["dep:postgres", "dep:r2d2", "dep:r2d2_postgres"]
+backend-postgres = ["dep:native-tls", "dep:postgres", "dep:postgres-native-tls", "dep:r2d2", "dep:r2d2_postgres"]
 ## Oracle 23ai session backend (adds `oracle`, `r2d2`).
 ## Requires Oracle Instant Client at runtime; set LD_LIBRARY_PATH accordingly.
 backend-oracle = ["dep:oracle", "dep:r2d2"]
@@ -22,6 +22,7 @@ backend-mysql = ["dep:mysql"]
 [dependencies]
 zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
+zeroclaw-spawn.workspace = true
 zeroclaw-config = { workspace = true, features = ["schema-export"] }
 anyhow = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
@@ -30,10 +31,13 @@ portable-atomic = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
+thiserror = "2"
 tokio = { version = "1.50", default-features = false, features = ["sync", "time"] }
 
 # Optional: PostgreSQL backend
+native-tls    = { version = "0.2", optional = true }
 postgres      = { version = "0.19", optional = true, features = ["with-chrono-0_4"] }
+postgres-native-tls = { version = "0.5", optional = true }
 r2d2          = { version = "0.8",  optional = true }
 r2d2_postgres = { version = "0.18", optional = true }
 

@@ -33,7 +33,8 @@
 //! backends so data can be migrated between backends without transformation.
 
 use crate::session_backend::{
-    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState, TimestampedMessage,
+    BackendCapabilities, SessionBackend, SessionBackendError, SessionContext, SessionMetadata,
+    SessionQuery, SessionResult, SessionState, TimestampedMessage,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -105,10 +106,11 @@ impl OracleSessionBackend {
     /// `"//db-host:1521/ORCLPDB1"`.  `pool_size` sets the maximum number
     /// of pooled OCI connections.
     pub fn new(user: &str, password: &str, dsn: &str, pool_size: u32) -> Result<Self> {
+        let dsn = oracle_tls_dsn(dsn);
         let manager = OracleManager {
             user: user.to_owned(),
             password: password.to_owned(),
-            dsn: dsn.to_owned(),
+            dsn,
         };
         let pool = Pool::builder()
             .max_size(pool_size)
@@ -172,9 +174,36 @@ impl OracleSessionBackend {
     }
 }
 
+fn oracle_tls_dsn(dsn: &str) -> String {
+    let lower = dsn.to_ascii_lowercase();
+    if lower.contains("ssl_server_dn_match=no")
+        || lower.contains("ssl_server_cert_dn=")
+        || lower.contains("protocol=tcp)")
+        || lower.starts_with("tcp://")
+        || lower.starts_with("tcps://")
+        || lower.contains("protocol=tcps")
+    {
+        return dsn.to_owned();
+    }
+    if dsn.starts_with("//") {
+        format!("tcps:{dsn}")
+    } else {
+        dsn.to_owned()
+    }
+}
+
 // ── SessionBackend impl ───────────────────────────────────────────────────
 
 impl SessionBackend for OracleSessionBackend {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            full_text_search: false,
+            timestamps: true,
+            transactions: true,
+            shared_remote: true,
+        }
+    }
+
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         let Ok(mut g) = self.pool.get() else {
             return Vec::new();
@@ -195,8 +224,11 @@ impl SessionBackend for OracleSessionBackend {
             .collect()
     }
 
-    fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
-        let mut g = self.pool.get().map_err(std::io::Error::other)?;
+    fn append(&self, session_key: &str, message: &ChatMessage) -> SessionResult<()> {
+        let mut g = self
+            .pool
+            .get()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
         let conn = &mut g.0;
 
         conn.execute(
@@ -204,7 +236,7 @@ impl SessionBackend for OracleSessionBackend {
              VALUES (:1, :2, :3, SYSTIMESTAMP)",
             &[&session_key, &message.role, &message.content],
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
         // MERGE acts as an upsert: insert the metadata row on first message,
         // then increment message_count + refresh last_activity on subsequent ones.
@@ -219,14 +251,18 @@ impl SessionBackend for OracleSessionBackend {
              VALUES (src.SK, SYSTIMESTAMP, SYSTIMESTAMP, 1)",
             &[&session_key],
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
-        conn.commit().map_err(std::io::Error::other)?;
+        conn.commit()
+            .map_err(|e| SessionBackendError::Transaction(e.to_string()))?;
         Ok(())
     }
 
-    fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
-        let mut g = self.pool.get().map_err(std::io::Error::other)?;
+    fn remove_last(&self, session_key: &str) -> SessionResult<bool> {
+        let mut g = self
+            .pool
+            .get()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
         let conn = &mut g.0;
 
         let stmt = conn
@@ -236,9 +272,12 @@ impl SessionBackend for OracleSessionBackend {
                  )",
                 &[&session_key],
             )
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
-        let deleted = stmt.row_count().map_err(std::io::Error::other)? > 0;
+        let deleted = stmt
+            .row_count()
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?
+            > 0;
 
         if deleted {
             conn.execute(
@@ -248,8 +287,9 @@ impl SessionBackend for OracleSessionBackend {
                  WHERE SESSION_KEY = :1",
                 &[&session_key],
             )
-            .map_err(std::io::Error::other)?;
-            conn.commit().map_err(std::io::Error::other)?;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
+            conn.commit()
+                .map_err(|e| SessionBackendError::Transaction(e.to_string()))?;
         }
 
         Ok(deleted)
@@ -287,8 +327,11 @@ impl SessionBackend for OracleSessionBackend {
         rows_to_metadata(rows)
     }
 
-    fn cleanup_stale(&self, ttl_hours: u32) -> std::io::Result<usize> {
-        let mut g = self.pool.get().map_err(std::io::Error::other)?;
+    fn cleanup_stale(&self, ttl_hours: u32) -> SessionResult<usize> {
+        let mut g = self
+            .pool
+            .get()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
         let conn = &mut g.0;
 
         // Collect stale session keys first so we can return an accurate count.
@@ -308,12 +351,13 @@ impl SessionBackend for OracleSessionBackend {
         let n = keys.len();
         for key in &keys {
             conn.execute("DELETE FROM ZC_SESSIONS WHERE SESSION_KEY = :1", &[key])
-                .map_err(std::io::Error::other)?;
+                .map_err(|e| SessionBackendError::Query(e.to_string()))?;
             conn.execute("DELETE FROM ZC_SESSION_META WHERE SESSION_KEY = :1", &[key])
-                .map_err(std::io::Error::other)?;
+                .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         }
         if n > 0 {
-            conn.commit().map_err(std::io::Error::other)?;
+            conn.commit()
+                .map_err(|e| SessionBackendError::Transaction(e.to_string()))?;
         }
 
         Ok(n)
@@ -346,43 +390,54 @@ impl SessionBackend for OracleSessionBackend {
         rows_to_metadata(rows)
     }
 
-    fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
-        let mut g = self.pool.get().map_err(std::io::Error::other)?;
+    fn delete_session(&self, session_key: &str) -> SessionResult<bool> {
+        let mut g = self
+            .pool
+            .get()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
         let conn = &mut g.0;
 
         conn.execute(
             "DELETE FROM ZC_SESSIONS WHERE SESSION_KEY = :1",
             &[&session_key],
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
         let stmt = conn
             .execute(
                 "DELETE FROM ZC_SESSION_META WHERE SESSION_KEY = :1",
                 &[&session_key],
             )
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
-        let deleted = stmt.row_count().map_err(std::io::Error::other)? > 0;
+        let deleted = stmt
+            .row_count()
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?
+            > 0;
         if deleted {
-            conn.commit().map_err(std::io::Error::other)?;
+            conn.commit()
+                .map_err(|e| SessionBackendError::Transaction(e.to_string()))?;
         }
         Ok(deleted)
     }
 
-    fn set_session_name(&self, session_key: &str, name: &str) -> std::io::Result<()> {
-        let mut g = self.pool.get().map_err(std::io::Error::other)?;
+    fn set_session_name(&self, session_key: &str, name: &str) -> SessionResult<()> {
+        let mut g = self
+            .pool
+            .get()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
         let conn = &mut g.0;
         conn.execute(
             "UPDATE ZC_SESSION_META SET NAME = :1 WHERE SESSION_KEY = :2",
             &[&name, &session_key],
         )
-        .map_err(std::io::Error::other)?;
-        conn.commit().map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
+        conn.commit()
+            .map_err(|e| SessionBackendError::Transaction(e.to_string()))?;
         Ok(())
     }
 
-    fn get_session_name(&self, session_key: &str) -> std::io::Result<Option<String>> {
+    fn get_session_name(&self, session_key: &str) -> SessionResult<Option<String>> {
         let Ok(mut g) = self.pool.get() else {
             return Ok(None);
         };
@@ -404,8 +459,11 @@ impl SessionBackend for OracleSessionBackend {
         session_key: &str,
         state: &str,
         turn_id: Option<&str>,
-    ) -> std::io::Result<()> {
-        let mut g = self.pool.get().map_err(std::io::Error::other)?;
+    ) -> SessionResult<()> {
+        let mut g = self
+            .pool
+            .get()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
         let conn = &mut g.0;
         conn.execute(
             "UPDATE ZC_SESSION_META
@@ -413,12 +471,13 @@ impl SessionBackend for OracleSessionBackend {
              WHERE SESSION_KEY = :3",
             &[&state, &turn_id, &session_key],
         )
-        .map_err(std::io::Error::other)?;
-        conn.commit().map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
+        conn.commit()
+            .map_err(|e| SessionBackendError::Transaction(e.to_string()))?;
         Ok(())
     }
 
-    fn get_session_state(&self, session_key: &str) -> std::io::Result<Option<SessionState>> {
+    fn get_session_state(&self, session_key: &str) -> SessionResult<Option<SessionState>> {
         let Ok(mut g) = self.pool.get() else {
             return Ok(None);
         };
@@ -530,16 +589,21 @@ impl SessionBackend for OracleSessionBackend {
             .collect()
     }
 
-    fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
-        let mut g = self.pool.get().map_err(std::io::Error::other)?;
+    fn clear_messages(&self, session_key: &str) -> SessionResult<usize> {
+        let mut g = self
+            .pool
+            .get()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
         let conn = &mut g.0;
         let stmt = conn
             .execute(
                 "DELETE FROM ZC_SESSIONS WHERE SESSION_KEY = :1",
                 &[&session_key],
             )
-            .map_err(std::io::Error::other)?;
-        let n = stmt.row_count().map_err(std::io::Error::other)? as usize;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
+        let n = stmt
+            .row_count()
+            .map_err(|e| SessionBackendError::Query(e.to_string()))? as usize;
         if n > 0 {
             conn.execute(
                 "UPDATE ZC_SESSION_META
@@ -547,14 +611,18 @@ impl SessionBackend for OracleSessionBackend {
                  WHERE SESSION_KEY = :1",
                 &[&session_key],
             )
-            .map_err(std::io::Error::other)?;
-            conn.commit().map_err(std::io::Error::other)?;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
+            conn.commit()
+                .map_err(|e| SessionBackendError::Transaction(e.to_string()))?;
         }
         Ok(n)
     }
 
-    fn set_session_agent_alias(&self, session_key: &str, agent_alias: &str) -> std::io::Result<()> {
-        let mut g = self.pool.get().map_err(std::io::Error::other)?;
+    fn set_session_agent_alias(&self, session_key: &str, agent_alias: &str) -> SessionResult<()> {
+        let mut g = self
+            .pool
+            .get()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
         let conn = &mut g.0;
         let alias_val: Option<&str> = if agent_alias.is_empty() {
             None
@@ -570,12 +638,13 @@ impl SessionBackend for OracleSessionBackend {
              VALUES (src.SK, SYSTIMESTAMP, SYSTIMESTAMP, 0, src.ALIAS)",
             &[&session_key, &alias_val],
         )
-        .map_err(std::io::Error::other)?;
-        conn.commit().map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
+        conn.commit()
+            .map_err(|e| SessionBackendError::Transaction(e.to_string()))?;
         Ok(())
     }
 
-    fn get_session_agent_alias(&self, session_key: &str) -> std::io::Result<Option<String>> {
+    fn get_session_agent_alias(&self, session_key: &str) -> SessionResult<Option<String>> {
         let Ok(mut g) = self.pool.get() else {
             return Ok(None);
         };
@@ -596,8 +665,11 @@ impl SessionBackend for OracleSessionBackend {
         &self,
         session_key: &str,
         context: SessionContext<'_>,
-    ) -> std::io::Result<()> {
-        let mut g = self.pool.get().map_err(std::io::Error::other)?;
+    ) -> SessionResult<()> {
+        let mut g = self
+            .pool
+            .get()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
         let conn = &mut g.0;
         fn norm(v: Option<&str>) -> Option<&str> {
             v.map(str::trim).filter(|s| !s.is_empty())
@@ -621,8 +693,9 @@ impl SessionBackend for OracleSessionBackend {
              VALUES (src.SK, SYSTIMESTAMP, SYSTIMESTAMP, 0, src.CID, src.RID, src.SID)",
             &[&session_key, &channel_id, &room_id, &sender_id],
         )
-        .map_err(std::io::Error::other)?;
-        conn.commit().map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
+        conn.commit()
+            .map_err(|e| SessionBackendError::Transaction(e.to_string()))?;
         Ok(())
     }
 }

@@ -5,7 +5,9 @@
 //! one-per-line as JSON, never modifying old lines. On daemon restart, sessions
 //! are loaded from disk to restore conversation context.
 
-use crate::session_backend::SessionBackend;
+use crate::session_backend::{
+    BackendCapabilities, SessionBackend, SessionBackendError, SessionResult,
+};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use zeroclaw_api::model_provider::ChatMessage;
@@ -57,17 +59,17 @@ impl SessionStore {
     }
 
     /// Append a single message to the session JSONL file.
-    pub fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
+    pub fn append(&self, session_key: &str, message: &ChatMessage) -> SessionResult<()> {
         let path = self.session_path(session_key);
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&path)?;
+            .open(&path)
+            .map_err(|e| SessionBackendError::Connection(e.to_string()))?;
 
-        let json = serde_json::to_string(message)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let json = serde_json::to_string(message)?;
 
-        writeln!(file, "{json}")?;
+        writeln!(file, "{json}").map_err(|e| SessionBackendError::Query(e.to_string()))?;
         Ok(())
     }
 
@@ -75,7 +77,7 @@ impl SessionStore {
     ///
     /// Rewrite approach: load all messages, drop the last, rewrite. This is
     /// O(n) but rollbacks are rare.
-    pub fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
+    pub fn remove_last(&self, session_key: &str) -> SessionResult<bool> {
         let mut messages = self.load(session_key);
         if messages.is_empty() {
             return Ok(false);
@@ -86,25 +88,25 @@ impl SessionStore {
     }
 
     /// Compact a session file by rewriting only valid messages (removes corrupt lines).
-    pub fn compact(&self, session_key: &str) -> std::io::Result<()> {
+    pub fn compact(&self, session_key: &str) -> SessionResult<()> {
         let messages = self.load(session_key);
         self.rewrite(session_key, &messages)
     }
 
-    fn rewrite(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
+    fn rewrite(&self, session_key: &str, messages: &[ChatMessage]) -> SessionResult<()> {
         let path = self.session_path(session_key);
-        let mut file = std::fs::File::create(&path)?;
+        let mut file = std::fs::File::create(&path)
+            .map_err(|e| SessionBackendError::Connection(e.to_string()))?;
         for msg in messages {
-            let json = serde_json::to_string(msg)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            writeln!(file, "{json}")?;
+            let json = serde_json::to_string(msg)?;
+            writeln!(file, "{json}").map_err(|e| SessionBackendError::Query(e.to_string()))?;
         }
         Ok(())
     }
 
     /// Clear all messages from a session by truncating its JSONL file.
     /// The file is preserved (empty) so the session key remains in `list_sessions`.
-    pub fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
+    pub fn clear_messages(&self, session_key: &str) -> SessionResult<usize> {
         let count = self.load(session_key).len();
         if count > 0 {
             self.rewrite(session_key, &[])?;
@@ -113,12 +115,12 @@ impl SessionStore {
     }
 
     /// Delete a session's JSONL file. Returns `true` if the file existed.
-    pub fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
+    pub fn delete_session(&self, session_key: &str) -> SessionResult<bool> {
         let path = self.session_path(session_key);
         if !path.exists() {
             return Ok(false);
         }
-        std::fs::remove_file(&path)?;
+        std::fs::remove_file(&path).map_err(|e| SessionBackendError::Query(e.to_string()))?;
         Ok(true)
     }
 
@@ -147,15 +149,24 @@ impl SessionStore {
 }
 
 impl SessionBackend for SessionStore {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            full_text_search: false,
+            timestamps: false,
+            transactions: false,
+            shared_remote: false,
+        }
+    }
+
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         self.load(session_key)
     }
 
-    fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
+    fn append(&self, session_key: &str, message: &ChatMessage) -> SessionResult<()> {
         self.append(session_key, message)
     }
 
-    fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
+    fn remove_last(&self, session_key: &str) -> SessionResult<bool> {
         self.remove_last(session_key)
     }
 
@@ -192,15 +203,15 @@ impl SessionBackend for SessionStore {
             .collect()
     }
 
-    fn compact(&self, session_key: &str) -> std::io::Result<()> {
+    fn compact(&self, session_key: &str) -> SessionResult<()> {
         self.compact(session_key)
     }
 
-    fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
+    fn clear_messages(&self, session_key: &str) -> SessionResult<usize> {
         self.clear_messages(session_key)
     }
 
-    fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
+    fn delete_session(&self, session_key: &str) -> SessionResult<bool> {
         self.delete_session(session_key)
     }
 

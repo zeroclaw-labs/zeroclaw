@@ -774,6 +774,7 @@ mod tests {
     use tempfile::TempDir;
     use zeroclaw_api::model_provider::ChatMessage;
     use zeroclaw_infra::session_backend::SessionMetadata;
+    use zeroclaw_infra::session_backend::SessionResult;
     use zeroclaw_infra::session_store::SessionStore;
 
     fn test_security() -> Arc<SecurityPolicy> {
@@ -828,11 +829,11 @@ mod tests {
             self.inner.load(key)
         }
 
-        fn append(&self, key: &str, msg: &ChatMessage) -> std::io::Result<()> {
+        fn append(&self, key: &str, msg: &ChatMessage) -> SessionResult<()> {
             self.inner.append(key, msg)
         }
 
-        fn remove_last(&self, key: &str) -> std::io::Result<bool> {
+        fn remove_last(&self, key: &str) -> SessionResult<bool> {
             self.inner.remove_last(key)
         }
 
@@ -840,11 +841,11 @@ mod tests {
             self.inner.list_sessions()
         }
 
-        fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
+        fn clear_messages(&self, session_key: &str) -> SessionResult<usize> {
             self.inner.clear_messages(session_key)
         }
 
-        fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
+        fn delete_session(&self, session_key: &str) -> SessionResult<bool> {
             let deleted = self.inner.delete_session(session_key)?;
             if deleted {
                 self.metadata.lock().unwrap().remove(session_key);
@@ -1688,10 +1689,10 @@ mod tests {
         fn load(&self, key: &str) -> Vec<ChatMessage> {
             self.0.load(key)
         }
-        fn append(&self, key: &str, msg: &ChatMessage) -> std::io::Result<()> {
+        fn append(&self, key: &str, msg: &ChatMessage) -> SessionResult<()> {
             self.0.append(key, msg)
         }
-        fn remove_last(&self, key: &str) -> std::io::Result<bool> {
+        fn remove_last(&self, key: &str) -> SessionResult<bool> {
             self.0.remove_last(key)
         }
         fn list_sessions(&self) -> Vec<String> {

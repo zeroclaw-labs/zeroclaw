@@ -27,7 +27,8 @@
 //! transformation.
 
 use crate::session_backend::{
-    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState, TimestampedMessage,
+    BackendCapabilities, SessionBackend, SessionBackendError, SessionContext, SessionMetadata,
+    SessionQuery, SessionResult, SessionState, TimestampedMessage,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -58,11 +59,26 @@ impl MysqlSessionBackend {
         let constraints =
             mysql::PoolConstraints::new(1, pool_size).context("invalid pool constraints")?;
         let pool_opts = mysql::PoolOpts::new().with_constraints(constraints);
-        let builder = mysql::OptsBuilder::from_opts(opts)
+        let tls_disabled = database_url
+            .to_ascii_lowercase()
+            .contains("ssl-mode=disabled")
+            || database_url
+                .to_ascii_lowercase()
+                .contains("ssl-mode=disable")
+            || database_url
+                .to_ascii_lowercase()
+                .contains("ssl_mode=disabled")
+            || database_url
+                .to_ascii_lowercase()
+                .contains("ssl_mode=disable");
+        let mut builder = mysql::OptsBuilder::from_opts(opts)
             // Enforce UTC for all connections so DATETIME(6) values round-trip
             // correctly without server-side timezone configuration.
             .init(vec!["SET time_zone = '+00:00'"])
             .pool_opts(pool_opts);
+        if !tls_disabled {
+            builder = builder.ssl_opts(Some(mysql::SslOpts::default()));
+        }
         let pool = Pool::new(builder).context("failed to build MySQL connection pool")?;
 
         let mut conn = pool
@@ -113,6 +129,15 @@ impl MysqlSessionBackend {
 // ── SessionBackend impl ───────────────────────────────────────────────────
 
 impl SessionBackend for MysqlSessionBackend {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            full_text_search: false,
+            timestamps: true,
+            transactions: true,
+            shared_remote: true,
+        }
+    }
+
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         let Ok(mut conn) = self.pool.get_conn() else {
             return Vec::new();
@@ -126,18 +151,24 @@ impl SessionBackend for MysqlSessionBackend {
         .unwrap_or_default()
     }
 
-    fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
-        let mut conn = self.pool.get_conn().map_err(std::io::Error::other)?;
+    fn append(&self, session_key: &str, message: &ChatMessage) -> SessionResult<()> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
+        let mut tx = conn
+            .start_transaction(mysql::TxOpts::default())
+            .map_err(|e| SessionBackendError::Transaction(e.to_string()))?;
 
-        conn.exec_drop(
+        tx.exec_drop(
             "INSERT INTO sessions (session_key, role, content, created_at)
              VALUES (?, ?, ?, NOW(6))",
             (session_key, &message.role, &message.content),
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
         // INSERT … ON DUPLICATE KEY UPDATE is MySQL's upsert idiom.
-        conn.exec_drop(
+        tx.exec_drop(
             "INSERT INTO session_metadata
                  (session_key, created_at, last_activity, message_count)
              VALUES (?, NOW(6), NOW(6), 1)
@@ -146,37 +177,50 @@ impl SessionBackend for MysqlSessionBackend {
                  message_count = message_count + 1",
             (session_key,),
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
-        Ok(())
+        tx.commit()
+            .map_err(|e| SessionBackendError::Transaction(e.to_string()))
     }
 
-    fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
-        let mut conn = self.pool.get_conn().map_err(std::io::Error::other)?;
+    fn remove_last(&self, session_key: &str) -> SessionResult<bool> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
+        let mut tx = conn
+            .start_transaction(mysql::TxOpts::default())
+            .map_err(|e| SessionBackendError::Transaction(e.to_string()))?;
 
         // Find the max id for this session; None means nothing to remove.
-        let max_id: Option<u64> = conn
+        let max_id: Option<u64> = tx
             .exec_first(
                 "SELECT MAX(id) FROM sessions WHERE session_key = ?",
                 (session_key,),
             )
-            .map_err(std::io::Error::other)?
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?
             .flatten();
 
-        let Some(id) = max_id else { return Ok(false) };
+        let Some(id) = max_id else {
+            tx.commit()
+                .map_err(|e| SessionBackendError::Transaction(e.to_string()))?;
+            return Ok(false);
+        };
 
-        conn.exec_drop("DELETE FROM sessions WHERE id = ?", (id,))
-            .map_err(std::io::Error::other)?;
+        tx.exec_drop("DELETE FROM sessions WHERE id = ?", (id,))
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
-        conn.exec_drop(
+        tx.exec_drop(
             "UPDATE session_metadata
              SET message_count = GREATEST(0, CAST(message_count AS SIGNED) - 1),
                  last_activity  = NOW(6)
              WHERE session_key = ?",
             (session_key,),
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
+        tx.commit()
+            .map_err(|e| SessionBackendError::Transaction(e.to_string()))?;
         Ok(true)
     }
 
@@ -206,8 +250,11 @@ impl SessionBackend for MysqlSessionBackend {
         .unwrap_or_default()
     }
 
-    fn cleanup_stale(&self, ttl_hours: u32) -> std::io::Result<usize> {
-        let mut conn = self.pool.get_conn().map_err(std::io::Error::other)?;
+    fn cleanup_stale(&self, ttl_hours: u32) -> SessionResult<usize> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
         let keys: Vec<String> = conn
             .exec_map(
@@ -216,14 +263,14 @@ impl SessionBackend for MysqlSessionBackend {
                 (ttl_hours,),
                 |k: String| k,
             )
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
         let n = keys.len();
         for key in &keys {
             conn.exec_drop("DELETE FROM sessions WHERE session_key = ?", (key,))
-                .map_err(std::io::Error::other)?;
+                .map_err(|e| SessionBackendError::Query(e.to_string()))?;
             conn.exec_drop("DELETE FROM session_metadata WHERE session_key = ?", (key,))
-                .map_err(std::io::Error::other)?;
+                .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         }
         Ok(n)
     }
@@ -253,32 +300,38 @@ impl SessionBackend for MysqlSessionBackend {
         .unwrap_or_default()
     }
 
-    fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
-        let mut conn = self.pool.get_conn().map_err(std::io::Error::other)?;
+    fn delete_session(&self, session_key: &str) -> SessionResult<bool> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
         conn.exec_drop("DELETE FROM sessions WHERE session_key = ?", (session_key,))
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
         conn.exec_drop(
             "DELETE FROM session_metadata WHERE session_key = ?",
             (session_key,),
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
         Ok(conn.affected_rows() > 0)
     }
 
-    fn set_session_name(&self, session_key: &str, name: &str) -> std::io::Result<()> {
-        let mut conn = self.pool.get_conn().map_err(std::io::Error::other)?;
+    fn set_session_name(&self, session_key: &str, name: &str) -> SessionResult<()> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         conn.exec_drop(
             "UPDATE session_metadata SET name = ? WHERE session_key = ?",
             (name, session_key),
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         Ok(())
     }
 
-    fn get_session_name(&self, session_key: &str) -> std::io::Result<Option<String>> {
+    fn get_session_name(&self, session_key: &str) -> SessionResult<Option<String>> {
         let Ok(mut conn) = self.pool.get_conn() else {
             return Ok(None);
         };
@@ -287,7 +340,7 @@ impl SessionBackend for MysqlSessionBackend {
                 "SELECT name FROM session_metadata WHERE session_key = ?",
                 (session_key,),
             )
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         Ok(row.flatten())
     }
 
@@ -296,19 +349,22 @@ impl SessionBackend for MysqlSessionBackend {
         session_key: &str,
         state: &str,
         turn_id: Option<&str>,
-    ) -> std::io::Result<()> {
-        let mut conn = self.pool.get_conn().map_err(std::io::Error::other)?;
+    ) -> SessionResult<()> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         conn.exec_drop(
             "UPDATE session_metadata
              SET state = ?, turn_id = ?, turn_started_at = NOW(6)
              WHERE session_key = ?",
             (state, turn_id, session_key),
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         Ok(())
     }
 
-    fn get_session_state(&self, session_key: &str) -> std::io::Result<Option<SessionState>> {
+    fn get_session_state(&self, session_key: &str) -> SessionResult<Option<SessionState>> {
         let Ok(mut conn) = self.pool.get_conn() else {
             return Ok(None);
         };
@@ -319,7 +375,7 @@ impl SessionBackend for MysqlSessionBackend {
                   FROM session_metadata WHERE session_key = ?",
                 (session_key,),
             )
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
         let Some((state, turn_id, ts_str)) = row else {
             return Ok(None);
@@ -399,10 +455,13 @@ impl SessionBackend for MysqlSessionBackend {
         .unwrap_or_default()
     }
 
-    fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
-        let mut conn = self.pool.get_conn().map_err(std::io::Error::other)?;
+    fn clear_messages(&self, session_key: &str) -> SessionResult<usize> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         conn.exec_drop("DELETE FROM sessions WHERE session_key = ?", (session_key,))
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         let n = conn.affected_rows() as usize;
         if n > 0 {
             conn.exec_drop(
@@ -411,13 +470,16 @@ impl SessionBackend for MysqlSessionBackend {
                  WHERE session_key = ?",
                 (session_key,),
             )
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         }
         Ok(n)
     }
 
-    fn set_session_agent_alias(&self, session_key: &str, agent_alias: &str) -> std::io::Result<()> {
-        let mut conn = self.pool.get_conn().map_err(std::io::Error::other)?;
+    fn set_session_agent_alias(&self, session_key: &str, agent_alias: &str) -> SessionResult<()> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         let alias_val: Option<&str> = if agent_alias.is_empty() {
             None
         } else {
@@ -430,11 +492,11 @@ impl SessionBackend for MysqlSessionBackend {
              ON DUPLICATE KEY UPDATE agent_alias = VALUES(agent_alias)",
             (session_key, alias_val),
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         Ok(())
     }
 
-    fn get_session_agent_alias(&self, session_key: &str) -> std::io::Result<Option<String>> {
+    fn get_session_agent_alias(&self, session_key: &str) -> SessionResult<Option<String>> {
         let Ok(mut conn) = self.pool.get_conn() else {
             return Ok(None);
         };
@@ -443,7 +505,7 @@ impl SessionBackend for MysqlSessionBackend {
                 "SELECT agent_alias FROM session_metadata WHERE session_key = ?",
                 (session_key,),
             )
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         Ok(row.flatten())
     }
 
@@ -451,8 +513,11 @@ impl SessionBackend for MysqlSessionBackend {
         &self,
         session_key: &str,
         context: SessionContext<'_>,
-    ) -> std::io::Result<()> {
-        let mut conn = self.pool.get_conn().map_err(std::io::Error::other)?;
+    ) -> SessionResult<()> {
+        let mut conn = self
+            .pool
+            .get_conn()
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         fn norm(v: Option<&str>) -> Option<String> {
             v.map(str::trim)
                 .filter(|s| !s.is_empty())
@@ -472,7 +537,7 @@ impl SessionBackend for MysqlSessionBackend {
                  sender_id  = COALESCE(VALUES(sender_id),  sender_id)",
             (session_key, channel_id, room_id, sender_id),
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         Ok(())
     }
 }
@@ -487,18 +552,20 @@ impl SessionBackend for MysqlSessionBackend {
 /// `created_at` and `last_activity` are MySQL `DATETIME(6)` values, which
 /// the `mysql` crate deserialises as `chrono::NaiveDateTime`.  We treat all
 /// values as UTC (enforced by `SET time_zone = '+00:00'` on connect).
+type MetadataRow = (
+    String,
+    Option<String>,
+    chrono::NaiveDateTime,
+    chrono::NaiveDateTime,
+    u64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 fn map_row(
-    (key, name, created_at, last_activity, count, agent_alias, channel_id, room_id, sender_id): (
-        String,
-        Option<String>,
-        chrono::NaiveDateTime,
-        chrono::NaiveDateTime,
-        u64,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ),
+    (key, name, created_at, last_activity, count, agent_alias, channel_id, room_id, sender_id): MetadataRow,
 ) -> SessionMetadata {
     SessionMetadata {
         key,

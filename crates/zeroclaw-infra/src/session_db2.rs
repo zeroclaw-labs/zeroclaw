@@ -46,7 +46,8 @@
 //! connection string at the correct endpoint.
 
 use crate::session_backend::{
-    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState, TimestampedMessage,
+    BackendCapabilities, SessionBackend, SessionBackendError, SessionContext, SessionMetadata,
+    SessionQuery, SessionResult, SessionState, TimestampedMessage,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -131,7 +132,7 @@ impl Db2SessionBackend {
     /// `pool_size` sets the maximum number of pooled ODBC connections.
     pub fn new(conn_str: &str, pool_size: u32) -> Result<Self> {
         let manager = Db2Manager {
-            conn_str: conn_str.to_owned(),
+            conn_str: db2_tls_conn_str(conn_str),
         };
         let pool = Pool::builder()
             .max_size(pool_size)
@@ -201,6 +202,23 @@ impl Db2SessionBackend {
 
         Ok(Self { pool })
     }
+}
+
+fn db2_tls_conn_str(conn_str: &str) -> String {
+    let lower = conn_str.to_ascii_lowercase();
+    if lower.contains("security=ssl")
+        || lower.contains("sslservercertificate=")
+        || lower.contains("security=none")
+        || lower.contains("ssl=false")
+    {
+        return conn_str.to_owned();
+    }
+    let suffix = if conn_str.trim_end().ends_with(';') {
+        "SECURITY=SSL;"
+    } else {
+        ";SECURITY=SSL;"
+    };
+    format!("{conn_str}{suffix}")
 }
 
 /// Returns `true` when the ODBC error indicates the object already exists.
@@ -310,6 +328,15 @@ fn row_to_meta(row: &[Option<String>]) -> SessionMetadata {
 // ── SessionBackend impl ───────────────────────────────────────────────────
 
 impl SessionBackend for Db2SessionBackend {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            full_text_search: false,
+            timestamps: true,
+            transactions: true,
+            shared_remote: true,
+        }
+    }
+
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         let Ok(g) = self.pool.get() else {
             return Vec::new();
@@ -328,8 +355,11 @@ impl SessionBackend for Db2SessionBackend {
         .collect()
     }
 
-    fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
-        let g = self.pool.get().map_err(std::io::Error::other)?;
+    fn append(&self, session_key: &str, message: &ChatMessage) -> SessionResult<()> {
+        let g = self
+            .pool
+            .get()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
         let conn = &g.0;
         let now = fmt_ts(&Utc::now());
 
@@ -342,7 +372,7 @@ impl SessionBackend for Db2SessionBackend {
              VALUES (?, ?, ?, TIMESTAMP(?))",
             (&sk, &role, &content, &ts),
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
         // MERGE for upsert — same syntax works in Oracle compat mode.
         conn.execute(
@@ -356,13 +386,16 @@ impl SessionBackend for Db2SessionBackend {
              VALUES (src.SK, SYSTIMESTAMP, SYSTIMESTAMP, 1)",
             &VarCharSlice::new(session_key.as_bytes()),
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
         Ok(())
     }
 
-    fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
-        let g = self.pool.get().map_err(std::io::Error::other)?;
+    fn remove_last(&self, session_key: &str) -> SessionResult<bool> {
+        let g = self
+            .pool
+            .get()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
         let conn = &g.0;
 
         // Find the maximum ID for this session (None → nothing to remove).
@@ -380,7 +413,7 @@ impl SessionBackend for Db2SessionBackend {
         let Some(id) = max_id else { return Ok(false) };
 
         conn.execute("DELETE FROM ZC_SESSIONS WHERE ID = ?", &id)
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
         conn.execute(
             "UPDATE ZC_SESSION_META
@@ -389,7 +422,7 @@ impl SessionBackend for Db2SessionBackend {
              WHERE SESSION_KEY = ?",
             &VarCharSlice::new(session_key.as_bytes()),
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
         Ok(true)
     }
@@ -424,8 +457,11 @@ impl SessionBackend for Db2SessionBackend {
         .collect()
     }
 
-    fn cleanup_stale(&self, ttl_hours: u32) -> std::io::Result<usize> {
-        let g = self.pool.get().map_err(std::io::Error::other)?;
+    fn cleanup_stale(&self, ttl_hours: u32) -> SessionResult<usize> {
+        let g = self
+            .pool
+            .get()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
         let conn = &g.0;
 
         // Compute the cutoff timestamp in Rust — Db2 does not support
@@ -448,12 +484,12 @@ impl SessionBackend for Db2SessionBackend {
                 "DELETE FROM ZC_SESSIONS WHERE SESSION_KEY = ?",
                 &VarCharSlice::new(key.as_bytes()),
             )
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
             conn.execute(
                 "DELETE FROM ZC_SESSION_META WHERE SESSION_KEY = ?",
                 &VarCharSlice::new(key.as_bytes()),
             )
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         }
 
         Ok(n)
@@ -488,8 +524,11 @@ impl SessionBackend for Db2SessionBackend {
         .collect()
     }
 
-    fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
-        let g = self.pool.get().map_err(std::io::Error::other)?;
+    fn delete_session(&self, session_key: &str) -> SessionResult<bool> {
+        let g = self
+            .pool
+            .get()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
         let conn = &g.0;
 
         // Check existence before delete so we can return an accurate bool.
@@ -509,29 +548,32 @@ impl SessionBackend for Db2SessionBackend {
             "DELETE FROM ZC_SESSIONS WHERE SESSION_KEY = ?",
             &VarCharSlice::new(session_key.as_bytes()),
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         conn.execute(
             "DELETE FROM ZC_SESSION_META WHERE SESSION_KEY = ?",
             &VarCharSlice::new(session_key.as_bytes()),
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
         Ok(true)
     }
 
-    fn set_session_name(&self, session_key: &str, name: &str) -> std::io::Result<()> {
-        let g = self.pool.get().map_err(std::io::Error::other)?;
+    fn set_session_name(&self, session_key: &str, name: &str) -> SessionResult<()> {
+        let g = self
+            .pool
+            .get()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
         let n = VarCharSlice::new(name.as_bytes());
         let sk = VarCharSlice::new(session_key.as_bytes());
         g.0.execute(
             "UPDATE ZC_SESSION_META SET NAME = ? WHERE SESSION_KEY = ?",
             (&n, &sk),
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         Ok(())
     }
 
-    fn get_session_name(&self, session_key: &str) -> std::io::Result<Option<String>> {
+    fn get_session_name(&self, session_key: &str) -> SessionResult<Option<String>> {
         let Ok(g) = self.pool.get() else {
             return Ok(None);
         };
@@ -548,8 +590,11 @@ impl SessionBackend for Db2SessionBackend {
         session_key: &str,
         state: &str,
         turn_id: Option<&str>,
-    ) -> std::io::Result<()> {
-        let g = self.pool.get().map_err(std::io::Error::other)?;
+    ) -> SessionResult<()> {
+        let g = self
+            .pool
+            .get()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
         let turn_id_val = match turn_id {
             Some(s) => VarCharBox::from_string(s.to_string()),
             None => VarCharBox::null(),
@@ -562,11 +607,11 @@ impl SessionBackend for Db2SessionBackend {
              WHERE SESSION_KEY = ?",
             (&st, &turn_id_val, &sk),
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         Ok(())
     }
 
-    fn get_session_state(&self, session_key: &str) -> std::io::Result<Option<SessionState>> {
+    fn get_session_state(&self, session_key: &str) -> SessionResult<Option<SessionState>> {
         let Ok(g) = self.pool.get() else {
             return Ok(None);
         };
@@ -672,8 +717,11 @@ impl SessionBackend for Db2SessionBackend {
         .collect()
     }
 
-    fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
-        let g = self.pool.get().map_err(std::io::Error::other)?;
+    fn clear_messages(&self, session_key: &str) -> SessionResult<usize> {
+        let g = self
+            .pool
+            .get()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
         let conn = &g.0;
         let sk = VarCharSlice::new(session_key.as_bytes());
         // Count before delete so we can return an accurate value.
@@ -693,20 +741,23 @@ impl SessionBackend for Db2SessionBackend {
                 "DELETE FROM ZC_SESSIONS WHERE SESSION_KEY = ?",
                 &VarCharSlice::new(session_key.as_bytes()),
             )
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
             conn.execute(
                 "UPDATE ZC_SESSION_META
                  SET MESSAGE_COUNT = 0, LAST_ACTIVITY = SYSTIMESTAMP
                  WHERE SESSION_KEY = ?",
                 &VarCharSlice::new(session_key.as_bytes()),
             )
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         }
         Ok(n)
     }
 
-    fn set_session_agent_alias(&self, session_key: &str, agent_alias: &str) -> std::io::Result<()> {
-        let g = self.pool.get().map_err(std::io::Error::other)?;
+    fn set_session_agent_alias(&self, session_key: &str, agent_alias: &str) -> SessionResult<()> {
+        let g = self
+            .pool
+            .get()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
         let alias_val = if agent_alias.is_empty() {
             VarCharBox::null()
         } else {
@@ -725,11 +776,11 @@ impl SessionBackend for Db2SessionBackend {
              VALUES (src.SK, SYSTIMESTAMP, SYSTIMESTAMP, 0, src.ALIAS)",
             (&sk, &alias_val),
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         Ok(())
     }
 
-    fn get_session_agent_alias(&self, session_key: &str) -> std::io::Result<Option<String>> {
+    fn get_session_agent_alias(&self, session_key: &str) -> SessionResult<Option<String>> {
         let Ok(g) = self.pool.get() else {
             return Ok(None);
         };
@@ -745,8 +796,11 @@ impl SessionBackend for Db2SessionBackend {
         &self,
         session_key: &str,
         context: SessionContext<'_>,
-    ) -> std::io::Result<()> {
-        let g = self.pool.get().map_err(std::io::Error::other)?;
+    ) -> SessionResult<()> {
+        let g = self
+            .pool
+            .get()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
         fn to_varchar(v: Option<&str>) -> VarCharBox {
             match v.map(str::trim).filter(|s| !s.is_empty()) {
                 Some(s) => VarCharBox::from_string(s.to_string()),
@@ -772,7 +826,7 @@ impl SessionBackend for Db2SessionBackend {
              VALUES (src.SK, SYSTIMESTAMP, SYSTIMESTAMP, 0, src.CID, src.RID, src.SID)",
             (&sk, &channel_id, &room_id, &sender_id),
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         Ok(())
     }
 }

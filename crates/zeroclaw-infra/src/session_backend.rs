@@ -5,7 +5,51 @@
 //! and SQLite (and future backends) share a common interface.
 
 use chrono::{DateTime, Utc};
+use thiserror::Error;
 use zeroclaw_api::model_provider::ChatMessage;
+
+#[derive(Debug, Error)]
+pub enum SessionBackendError {
+    #[error("session backend connection error: {0}")]
+    Connection(String),
+    #[error("session backend pool error: {0}")]
+    Pool(String),
+    #[error("session backend query error: {0}")]
+    Query(String),
+    #[error("session backend serialization error: {0}")]
+    Serialization(String),
+    #[error("session not found: {0}")]
+    NotFound(String),
+    #[error("session backend transaction error: {0}")]
+    Transaction(String),
+    #[error("session backend unsupported operation: {0}")]
+    Unsupported(String),
+    #[error("transient session backend error: {0}")]
+    Transient(String),
+}
+
+impl From<std::io::Error> for SessionBackendError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Query(value.to_string())
+    }
+}
+
+impl From<serde_json::Error> for SessionBackendError {
+    fn from(value: serde_json::Error) -> Self {
+        Self::Serialization(value.to_string())
+    }
+}
+
+pub type SessionResult<T> = Result<T, SessionBackendError>;
+
+/// Static behavior advertised by a session backend.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub struct BackendCapabilities {
+    pub full_text_search: bool,
+    pub timestamps: bool,
+    pub transactions: bool,
+    pub shared_remote: bool,
+}
 
 /// Metadata about a persisted session.
 #[derive(Debug, Clone)]
@@ -72,7 +116,14 @@ pub struct TimestampedMessage {
 /// Trait for session persistence backends.
 ///
 /// Implementations must be `Send + Sync` for sharing across async tasks.
+/// The trait is synchronous; async callers must run backend calls from a
+/// Tokio context inside `tokio::task::spawn_blocking`, especially for shared
+/// remote backends whose network I/O can otherwise stall the executor.
 pub trait SessionBackend: Send + Sync {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities::default()
+    }
+
     /// Load all messages for a session. Returns empty vec if session doesn't exist.
     fn load(&self, session_key: &str) -> Vec<ChatMessage>;
 
@@ -90,17 +141,17 @@ pub trait SessionBackend: Send + Sync {
     }
 
     /// Append a single message to a session.
-    fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()>;
+    fn append(&self, session_key: &str, message: &ChatMessage) -> SessionResult<()>;
 
     /// Remove the last message from a session. Returns `true` if a message was removed.
-    fn remove_last(&self, session_key: &str) -> std::io::Result<bool>;
+    fn remove_last(&self, session_key: &str) -> SessionResult<bool>;
 
     /// Update the content of the last message in a session. Used for incremental
     /// persistence of streaming responses — append a placeholder first, then
     /// update_last periodically as more content arrives. Returns `false` if
     /// the session is empty. Default implementation is remove_last + append
     /// (backends can override for efficiency).
-    fn update_last(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<bool> {
+    fn update_last(&self, session_key: &str, message: &ChatMessage) -> SessionResult<bool> {
         if self.remove_last(session_key)? {
             self.append(session_key, message)?;
             Ok(true)
@@ -135,12 +186,12 @@ pub trait SessionBackend: Send + Sync {
     }
 
     /// Compact a session file (remove duplicates/corruption). No-op by default.
-    fn compact(&self, _session_key: &str) -> std::io::Result<()> {
+    fn compact(&self, _session_key: &str) -> SessionResult<()> {
         Ok(())
     }
 
     /// Remove sessions that haven't been active within the given TTL hours.
-    fn cleanup_stale(&self, _ttl_hours: u32) -> std::io::Result<usize> {
+    fn cleanup_stale(&self, _ttl_hours: u32) -> SessionResult<usize> {
         Ok(0)
     }
 
@@ -155,7 +206,7 @@ pub trait SessionBackend: Send + Sync {
     /// Override for production use. The default is O(n²) via iterative
     /// `remove_last` — acceptable for tests but may cause latency on
     /// sessions with >100 messages.
-    fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
+    fn clear_messages(&self, session_key: &str) -> SessionResult<usize> {
         let mut count = 0;
         while self.remove_last(session_key)? {
             count += 1;
@@ -164,7 +215,7 @@ pub trait SessionBackend: Send + Sync {
     }
 
     /// Delete all messages for a session. Returns `true` if the session existed.
-    fn delete_session(&self, _session_key: &str) -> std::io::Result<bool> {
+    fn delete_session(&self, _session_key: &str) -> SessionResult<bool> {
         Ok(false)
     }
 
@@ -178,28 +229,24 @@ pub trait SessionBackend: Send + Sync {
     }
 
     /// Set or update the human-readable name for a session.
-    fn set_session_name(&self, _session_key: &str, _name: &str) -> std::io::Result<()> {
+    fn set_session_name(&self, _session_key: &str, _name: &str) -> SessionResult<()> {
         Ok(())
     }
 
     /// Get the human-readable name for a session (if set).
-    fn get_session_name(&self, _session_key: &str) -> std::io::Result<Option<String>> {
+    fn get_session_name(&self, _session_key: &str) -> SessionResult<Option<String>> {
         Ok(None)
     }
 
     /// Record the agent alias that owns a session. Called on WebSocket
     /// handshake when the alias is known. No-op for backends that don't
     /// track per-agent attribution.
-    fn set_session_agent_alias(
-        &self,
-        _session_key: &str,
-        _agent_alias: &str,
-    ) -> std::io::Result<()> {
+    fn set_session_agent_alias(&self, _session_key: &str, _agent_alias: &str) -> SessionResult<()> {
         Ok(())
     }
 
     /// Get the agent alias associated with a session, if recorded.
-    fn get_session_agent_alias(&self, _session_key: &str) -> std::io::Result<Option<String>> {
+    fn get_session_agent_alias(&self, _session_key: &str) -> SessionResult<Option<String>> {
         Ok(None)
     }
 
@@ -212,7 +259,7 @@ pub trait SessionBackend: Send + Sync {
         &self,
         _session_key: &str,
         _context: SessionContext<'_>,
-    ) -> std::io::Result<()> {
+    ) -> SessionResult<()> {
         Ok(())
     }
 
@@ -247,12 +294,12 @@ pub trait SessionBackend: Send + Sync {
         _session_key: &str,
         _state: &str,
         _turn_id: Option<&str>,
-    ) -> std::io::Result<()> {
+    ) -> SessionResult<()> {
         Ok(())
     }
 
     /// Get the current session state. Returns `None` if the backend doesn't track state.
-    fn get_session_state(&self, _session_key: &str) -> std::io::Result<Option<SessionState>> {
+    fn get_session_state(&self, _session_key: &str) -> SessionResult<Option<SessionState>> {
         Ok(None)
     }
 

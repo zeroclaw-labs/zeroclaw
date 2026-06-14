@@ -13,6 +13,7 @@ pub mod session_mysql;
 pub mod session_oracle;
 #[cfg(feature = "backend-postgres")]
 pub mod session_postgres;
+pub mod session_queue;
 pub mod session_sqlite;
 pub mod session_store;
 pub mod stall_watchdog;

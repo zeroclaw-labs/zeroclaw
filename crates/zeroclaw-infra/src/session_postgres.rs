@@ -23,12 +23,15 @@
 //! migrated between backends without transformation.
 
 use crate::session_backend::{
-    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState, TimestampedMessage,
+    BackendCapabilities, SessionBackend, SessionBackendError, SessionContext, SessionMetadata,
+    SessionQuery, SessionResult, SessionState, TimestampedMessage,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use native_tls::TlsConnector;
+use postgres_native_tls::MakeTlsConnector;
 use r2d2::Pool;
-use r2d2_postgres::{PostgresConnectionManager, postgres::NoTls};
+use r2d2_postgres::PostgresConnectionManager;
 use zeroclaw_api::model_provider::ChatMessage;
 
 /// PostgreSQL-backed session store.
@@ -36,7 +39,7 @@ use zeroclaw_api::model_provider::ChatMessage;
 /// Uses an `r2d2` connection pool. The pool retries on connection failure,
 /// making failover to a Patroni replica transparent to callers.
 pub struct PostgresSessionBackend {
-    pool: Pool<PostgresConnectionManager<NoTls>>,
+    pool: Pool<PostgresConnectionManager<MakeTlsConnector>>,
 }
 
 impl PostgresSessionBackend {
@@ -46,9 +49,14 @@ impl PostgresSessionBackend {
     /// `"postgresql://zeroclaw:secret@db-primary/zeroclaw"`.
     /// `pool_size` controls the maximum number of pooled connections.
     pub fn new(database_url: &str, pool_size: u32) -> Result<Self> {
+        let tls = MakeTlsConnector::new(
+            TlsConnector::builder()
+                .build()
+                .context("failed to build postgres TLS connector")?,
+        );
         let manager = PostgresConnectionManager::new(
             database_url.parse().context("invalid postgres URL")?,
-            NoTls,
+            tls,
         );
         let pool = Pool::builder()
             .max_size(pool_size)
@@ -98,6 +106,15 @@ impl PostgresSessionBackend {
 }
 
 impl SessionBackend for PostgresSessionBackend {
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            full_text_search: false,
+            timestamps: true,
+            transactions: true,
+            shared_remote: true,
+        }
+    }
+
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         let Ok(mut conn) = self.pool.get() else {
             return Vec::new();
@@ -117,18 +134,24 @@ impl SessionBackend for PostgresSessionBackend {
             .collect()
     }
 
-    fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
-        let mut conn = self.pool.get().map_err(std::io::Error::other)?;
+    fn append(&self, session_key: &str, message: &ChatMessage) -> SessionResult<()> {
+        let mut conn = self
+            .pool
+            .get()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
+        let mut tx = conn
+            .transaction()
+            .map_err(|e| SessionBackendError::Transaction(e.to_string()))?;
         let now = Utc::now();
 
-        conn.execute(
+        tx.execute(
             "INSERT INTO sessions (session_key, role, content, created_at)
              VALUES ($1, $2, $3, $4)",
             &[&session_key, &message.role, &message.content, &now],
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
-        conn.execute(
+        tx.execute(
             "INSERT INTO session_metadata
                  (session_key, created_at, last_activity, message_count)
              VALUES ($1, $2, $3, 1)
@@ -137,15 +160,22 @@ impl SessionBackend for PostgresSessionBackend {
                  message_count = session_metadata.message_count + 1",
             &[&session_key, &now, &now],
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
-        Ok(())
+        tx.commit()
+            .map_err(|e| SessionBackendError::Transaction(e.to_string()))
     }
 
-    fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
-        let mut conn = self.pool.get().map_err(std::io::Error::other)?;
+    fn remove_last(&self, session_key: &str) -> SessionResult<bool> {
+        let mut conn = self
+            .pool
+            .get()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
+        let mut tx = conn
+            .transaction()
+            .map_err(|e| SessionBackendError::Transaction(e.to_string()))?;
 
-        let n = conn
+        let n = tx
             .execute(
                 "DELETE FROM sessions WHERE id = (
                      SELECT id FROM sessions
@@ -154,19 +184,21 @@ impl SessionBackend for PostgresSessionBackend {
                  )",
                 &[&session_key],
             )
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
 
         if n > 0 {
-            conn.execute(
+            tx.execute(
                 "UPDATE session_metadata
                  SET message_count = GREATEST(0, message_count - 1),
                      last_activity  = now()
                  WHERE session_key = $1",
                 &[&session_key],
             )
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         }
 
+        tx.commit()
+            .map_err(|e| SessionBackendError::Transaction(e.to_string()))?;
         Ok(n > 0)
     }
 
@@ -213,8 +245,11 @@ impl SessionBackend for PostgresSessionBackend {
             .collect()
     }
 
-    fn cleanup_stale(&self, ttl_hours: u32) -> std::io::Result<usize> {
-        let mut conn = self.pool.get().map_err(std::io::Error::other)?;
+    fn cleanup_stale(&self, ttl_hours: u32) -> SessionResult<usize> {
+        let mut conn = self
+            .pool
+            .get()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
         let cutoff = Utc::now() - chrono::Duration::hours(i64::from(ttl_hours));
 
         let keys: Vec<String> = conn
@@ -222,7 +257,7 @@ impl SessionBackend for PostgresSessionBackend {
                 "SELECT session_key FROM session_metadata WHERE last_activity < $1",
                 &[&cutoff],
             )
-            .map_err(std::io::Error::other)?
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?
             .into_iter()
             .map(|r| r.get(0))
             .collect();
@@ -230,12 +265,12 @@ impl SessionBackend for PostgresSessionBackend {
         let n = keys.len();
         for key in &keys {
             conn.execute("DELETE FROM sessions WHERE session_key = $1", &[key])
-                .map_err(std::io::Error::other)?;
+                .map_err(|e| SessionBackendError::Query(e.to_string()))?;
             conn.execute(
                 "DELETE FROM session_metadata WHERE session_key = $1",
                 &[key],
             )
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         }
         Ok(n)
     }
@@ -280,33 +315,39 @@ impl SessionBackend for PostgresSessionBackend {
             .collect()
     }
 
-    fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
-        let mut conn = self.pool.get().map_err(std::io::Error::other)?;
+    fn delete_session(&self, session_key: &str) -> SessionResult<bool> {
+        let mut conn = self
+            .pool
+            .get()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
         conn.execute(
             "DELETE FROM sessions WHERE session_key = $1",
             &[&session_key],
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         let n = conn
             .execute(
                 "DELETE FROM session_metadata WHERE session_key = $1",
                 &[&session_key],
             )
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         Ok(n > 0)
     }
 
-    fn set_session_name(&self, session_key: &str, name: &str) -> std::io::Result<()> {
-        let mut conn = self.pool.get().map_err(std::io::Error::other)?;
+    fn set_session_name(&self, session_key: &str, name: &str) -> SessionResult<()> {
+        let mut conn = self
+            .pool
+            .get()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
         conn.execute(
             "UPDATE session_metadata SET name = $1 WHERE session_key = $2",
             &[&name, &session_key],
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         Ok(())
     }
 
-    fn get_session_name(&self, session_key: &str) -> std::io::Result<Option<String>> {
+    fn get_session_name(&self, session_key: &str) -> SessionResult<Option<String>> {
         let Ok(mut conn) = self.pool.get() else {
             return Ok(None);
         };
@@ -315,7 +356,7 @@ impl SessionBackend for PostgresSessionBackend {
                 "SELECT name FROM session_metadata WHERE session_key = $1",
                 &[&session_key],
             )
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         Ok(row.and_then(|r| r.get(0)))
     }
 
@@ -324,8 +365,11 @@ impl SessionBackend for PostgresSessionBackend {
         session_key: &str,
         state: &str,
         turn_id: Option<&str>,
-    ) -> std::io::Result<()> {
-        let mut conn = self.pool.get().map_err(std::io::Error::other)?;
+    ) -> SessionResult<()> {
+        let mut conn = self
+            .pool
+            .get()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
         let now = Utc::now();
         conn.execute(
             "UPDATE session_metadata
@@ -333,11 +377,11 @@ impl SessionBackend for PostgresSessionBackend {
              WHERE session_key = $4",
             &[&state, &turn_id, &now, &session_key],
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         Ok(())
     }
 
-    fn get_session_state(&self, session_key: &str) -> std::io::Result<Option<SessionState>> {
+    fn get_session_state(&self, session_key: &str) -> SessionResult<Option<SessionState>> {
         let Ok(mut conn) = self.pool.get() else {
             return Ok(None);
         };
@@ -347,7 +391,7 @@ impl SessionBackend for PostgresSessionBackend {
                  FROM session_metadata WHERE session_key = $1",
                 &[&session_key],
             )
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         Ok(row.map(|r| {
             let ts: Option<DateTime<Utc>> = r.get(2);
             SessionState {
@@ -471,14 +515,17 @@ impl SessionBackend for PostgresSessionBackend {
             .collect()
     }
 
-    fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
-        let mut conn = self.pool.get().map_err(std::io::Error::other)?;
+    fn clear_messages(&self, session_key: &str) -> SessionResult<usize> {
+        let mut conn = self
+            .pool
+            .get()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
         let n = conn
             .execute(
                 "DELETE FROM sessions WHERE session_key = $1",
                 &[&session_key],
             )
-            .map_err(std::io::Error::other)? as usize;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))? as usize;
         if n > 0 {
             conn.execute(
                 "UPDATE session_metadata
@@ -486,13 +533,16 @@ impl SessionBackend for PostgresSessionBackend {
                  WHERE session_key = $1",
                 &[&session_key],
             )
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         }
         Ok(n)
     }
 
-    fn set_session_agent_alias(&self, session_key: &str, agent_alias: &str) -> std::io::Result<()> {
-        let mut conn = self.pool.get().map_err(std::io::Error::other)?;
+    fn set_session_agent_alias(&self, session_key: &str, agent_alias: &str) -> SessionResult<()> {
+        let mut conn = self
+            .pool
+            .get()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
         let alias_val: Option<&str> = if agent_alias.is_empty() {
             None
         } else {
@@ -507,11 +557,11 @@ impl SessionBackend for PostgresSessionBackend {
                  agent_alias = EXCLUDED.agent_alias",
             &[&session_key, &now, &now, &alias_val],
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         Ok(())
     }
 
-    fn get_session_agent_alias(&self, session_key: &str) -> std::io::Result<Option<String>> {
+    fn get_session_agent_alias(&self, session_key: &str) -> SessionResult<Option<String>> {
         let Ok(mut conn) = self.pool.get() else {
             return Ok(None);
         };
@@ -520,7 +570,7 @@ impl SessionBackend for PostgresSessionBackend {
                 "SELECT agent_alias FROM session_metadata WHERE session_key = $1",
                 &[&session_key],
             )
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         Ok(row.and_then(|r| r.get(0)))
     }
 
@@ -528,8 +578,11 @@ impl SessionBackend for PostgresSessionBackend {
         &self,
         session_key: &str,
         context: SessionContext<'_>,
-    ) -> std::io::Result<()> {
-        let mut conn = self.pool.get().map_err(std::io::Error::other)?;
+    ) -> SessionResult<()> {
+        let mut conn = self
+            .pool
+            .get()
+            .map_err(|e| SessionBackendError::Pool(e.to_string()))?;
         fn norm(v: Option<&str>) -> Option<&str> {
             v.map(str::trim).filter(|s| !s.is_empty())
         }
@@ -548,7 +601,7 @@ impl SessionBackend for PostgresSessionBackend {
                  sender_id  = COALESCE(EXCLUDED.sender_id,  session_metadata.sender_id)",
             &[&session_key, &now, &now, &channel_id, &room_id, &sender_id],
         )
-        .map_err(std::io::Error::other)?;
+        .map_err(|e| SessionBackendError::Query(e.to_string()))?;
         Ok(())
     }
 }

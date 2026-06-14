@@ -626,12 +626,14 @@ impl RpcDispatcher {
         let ids = self.ctx.sessions.list_ids().await;
         // Count persisted sessions (channel-originated) that aren't already
         // in the in-memory RPC store.
-        let persisted_count = self
-            .ctx
-            .session_backend
-            .as_ref()
-            .map(|b| b.list_sessions_with_metadata().len())
-            .unwrap_or(0);
+        let persisted_count = if let Some(ref backend) = self.ctx.session_backend {
+            let backend = Arc::clone(backend);
+            tokio::task::spawn_blocking(move || backend.list_sessions_with_metadata().len())
+                .await
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let total = ids.len().max(persisted_count);
         to_result(StatusResult {
             server_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -903,8 +905,14 @@ impl RpcDispatcher {
             crate::rpc::types::ChatMode::Chat => {
                 if let Some(ref backend) = self.ctx.session_backend {
                     let session_key = format!("rpc_{session_id}");
-                    let _ = backend.set_session_agent_alias(&session_key, &req.agent_alias);
-                    let stored = backend.load(&session_key);
+                    let backend = Arc::clone(backend);
+                    let alias = req.agent_alias.clone();
+                    let stored = tokio::task::spawn_blocking(move || {
+                        let _ = backend.set_session_agent_alias(&session_key, &alias);
+                        backend.load(&session_key)
+                    })
+                    .await
+                    .unwrap_or_default();
                     if !stored.is_empty() {
                         self.ctx.sessions.seed_history(&session_id, &stored).await;
                         message_count = stored.len();
@@ -1516,19 +1524,25 @@ impl RpcDispatcher {
             }
             crate::rpc::types::ChatMode::Chat => {
                 if let Some(ref backend) = self.ctx.session_backend {
+                    let backend = Arc::clone(backend);
                     let key = format!("rpc_{sid}");
-                    let _ = backend.append(&key, &ChatMessage::user(&prompt));
-                    match &outcome {
-                        Ok(TurnOutcome::Completed { text, .. }) => {
-                            let _ = backend.append(&key, &ChatMessage::assistant(text));
-                        }
+                    let prompt = prompt.clone();
+                    let assistant_text_for_persist = match &outcome {
+                        Ok(TurnOutcome::Completed { text, .. }) => Some(text.clone()),
                         Ok(TurnOutcome::Cancelled { partial_text, .. })
                             if !partial_text.is_empty() =>
                         {
-                            let _ = backend.append(&key, &ChatMessage::assistant(partial_text));
+                            Some(partial_text.clone())
                         }
-                        _ => {}
-                    }
+                        _ => None,
+                    };
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ = backend.append(&key, &ChatMessage::user(&prompt));
+                        if let Some(text) = assistant_text_for_persist {
+                            let _ = backend.append(&key, &ChatMessage::assistant(&text));
+                        }
+                    })
+                    .await;
                 }
             }
         }
@@ -1810,19 +1824,27 @@ impl RpcDispatcher {
         let req: SessionListParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
 
+        let backend = Arc::clone(backend);
         // Use FTS when a query is provided, plain list otherwise.
         let all = if let Some(ref keyword) = req.query {
             if keyword.trim().is_empty() {
-                backend.list_sessions_with_metadata()
+                tokio::task::spawn_blocking(move || backend.list_sessions_with_metadata())
+                    .await
+                    .unwrap_or_default()
             } else {
                 use zeroclaw_infra::session_backend::SessionQuery;
-                backend.search(&SessionQuery {
+                let query = SessionQuery {
                     keyword: Some(keyword.clone()),
                     limit: req.limit,
-                })
+                };
+                tokio::task::spawn_blocking(move || backend.search(&query))
+                    .await
+                    .unwrap_or_default()
             }
         } else {
-            backend.list_sessions_with_metadata()
+            tokio::task::spawn_blocking(move || backend.list_sessions_with_metadata())
+                .await
+                .unwrap_or_default()
         };
 
         let sessions: Vec<SessionEntry> = all
@@ -1907,14 +1929,19 @@ impl RpcDispatcher {
             format!("rpc_{}", req.session_id),
             format!("gw_{}", req.session_id),
         ];
-        let mut raw: Vec<zeroclaw_api::model_provider::ChatMessage> = Vec::new();
-        for key in &candidates {
-            let loaded = backend.load(key);
-            if !loaded.is_empty() {
-                raw = loaded;
-                break;
-            }
-        }
+        let backend = Arc::clone(backend);
+        let raw: Vec<zeroclaw_api::model_provider::ChatMessage> =
+            tokio::task::spawn_blocking(move || {
+                for key in &candidates {
+                    let loaded = backend.load(key);
+                    if !loaded.is_empty() {
+                        return loaded;
+                    }
+                }
+                Vec::new()
+            })
+            .await
+            .unwrap_or_default();
 
         // Page-window the load. `before_index` is a 0-based index pointing
         // at the first message NOT to return — the page contains the N
@@ -1954,23 +1981,34 @@ impl RpcDispatcher {
             format!("rpc_{}", req.session_id),
             format!("gw_{}", req.session_id),
         ];
-        for key in &candidates {
-            match backend.get_session_state(key) {
-                Ok(Some(ss)) => {
-                    return to_result(SessionStateResult {
-                        session_id: req.session_id,
-                        state: ss.state,
-                        turn_id: ss.turn_id,
-                        turn_started_at: ss.turn_started_at.map(|t| t.to_rfc3339()),
-                    });
+        let backend = Arc::clone(backend);
+        let state = tokio::task::spawn_blocking(move || {
+            for key in &candidates {
+                match backend.get_session_state(key) {
+                    Ok(Some(ss)) => return Ok(Some(ss)),
+                    Ok(None) => continue,
+                    Err(e) => return Err(e),
                 }
-                Ok(None) => continue,
-                Err(e) => {
-                    return Err(rpc_err(
-                        INTERNAL_ERROR,
-                        format!("Failed to get session state: {e}"),
-                    ));
-                }
+            }
+            Ok(None)
+        })
+        .await
+        .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Session state task failed: {e}")))?;
+        match state {
+            Ok(Some(ss)) => {
+                return to_result(SessionStateResult {
+                    session_id: req.session_id,
+                    state: ss.state,
+                    turn_id: ss.turn_id,
+                    turn_started_at: ss.turn_started_at.map(|t| t.to_rfc3339()),
+                });
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return Err(rpc_err(
+                    INTERNAL_ERROR,
+                    format!("Failed to get session state: {e}"),
+                ));
             }
         }
         Err(rpc_err(SESSION_NOT_FOUND, "Session not found"))
@@ -1988,13 +2026,18 @@ impl RpcDispatcher {
         self.ctx.sessions.remove(&req.session_id).await;
         // Remove from persistent backend — try raw id, then prefixed variants.
         if let Some(ref backend) = self.ctx.session_backend {
-            for key in &[
+            let backend = Arc::clone(backend);
+            let keys = [
                 req.session_id.clone(),
                 format!("rpc_{}", req.session_id),
                 format!("gw_{}", req.session_id),
-            ] {
-                let _ = backend.delete_session(key);
-            }
+            ];
+            let _ = tokio::task::spawn_blocking(move || {
+                for key in &keys {
+                    let _ = backend.delete_session(key);
+                }
+            })
+            .await;
         }
         to_result(SessionDeleteResult {
             session_id: req.session_id,
@@ -2610,7 +2653,12 @@ impl RpcDispatcher {
         let rpc_counts = self.ctx.sessions.count_by_agent().await;
         let mut backend_counts = std::collections::HashMap::<String, usize>::new();
         if let Some(ref backend) = self.ctx.session_backend {
-            for meta in backend.list_sessions_with_metadata() {
+            let backend = Arc::clone(backend);
+            let metadata =
+                tokio::task::spawn_blocking(move || backend.list_sessions_with_metadata())
+                    .await
+                    .unwrap_or_default();
+            for meta in metadata {
                 let alias = meta.agent_alias.or_else(|| {
                     meta.channel_id
                         .as_deref()
