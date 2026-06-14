@@ -619,6 +619,19 @@ rpc_type! {
 }
 
 rpc_type! {
+    pub struct ConfigResolveAliasSourceParams {
+        pub source: zeroclaw_config::traits::AliasSource,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigResolveAliasSourceResult {
+        pub source: zeroclaw_config::traits::AliasSource,
+        pub values: Vec<String>,
+    }
+}
+
+rpc_type! {
     pub struct ConfigMapKeyCreateParams {
         pub path: String,
         pub key: String,

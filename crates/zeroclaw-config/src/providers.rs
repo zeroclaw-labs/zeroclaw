@@ -154,6 +154,8 @@ define_provider_ref!(ModelProviderRef, "providers.models");
 define_provider_ref!(TtsProviderRef, "providers.tts");
 define_provider_ref!(TranscriptionProviderRef, "providers.transcription");
 define_provider_ref!(ChannelRef, "channels");
+define_provider_ref!(RiskProfileRef, "risk_profiles");
+define_provider_ref!(RuntimeProfileRef, "runtime_profiles");
 
 /// Hard ceiling on `providers.models.<alias>.fallback` chain depth. The cycle
 /// guard only bounds chains that loop; a long acyclic chain would otherwise

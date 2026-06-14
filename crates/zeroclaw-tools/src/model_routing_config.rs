@@ -363,8 +363,8 @@ impl ModelRoutingConfigTool {
 
         let mut agents: BTreeMap<String, Value> = BTreeMap::new();
         for (name, agent) in &cfg.agents {
-            let risk = cfg.risk_profiles.get(&agent.risk_profile);
-            let runtime = cfg.runtime_profiles.get(&agent.runtime_profile);
+            let risk = cfg.risk_profiles.get(agent.risk_profile.as_str());
+            let runtime = cfg.runtime_profiles.get(agent.runtime_profile.as_str());
             agents.insert(
                 name.clone(),
                 json!({
@@ -923,8 +923,8 @@ impl ModelRoutingConfigTool {
         // Get or create the agent and wire up alias references.
         let next_agent = cfg.agents.entry(name.clone()).or_default();
         next_agent.model_provider = agent_model_provider_ref.into();
-        next_agent.risk_profile = name.clone();
-        next_agent.runtime_profile = name.clone();
+        next_agent.risk_profile = name.clone().into();
+        next_agent.runtime_profile = name.clone().into();
 
         cfg.save().await?;
 

@@ -2299,50 +2299,23 @@ impl App {
             }
         }
 
-        // `risk_profile` / `runtime_profile` inside an agent alias →
-        // present a picker populated from the matching map's aliases.
-        // agents.<alias>.risk_profile     → list keys of risk_profiles.*
-        // agents.<alias>.runtime_profile  → list keys of runtime_profiles.*
-        if field_path.starts_with("agents.") {
-            let segs: Vec<&str> = field_path.split('.').collect();
-            // Expect agents.<alias>.<field>
-            if segs.len() == 3 {
-                let map_path = match segs[2] {
-                    "risk_profile" => Some("risk_profiles"),
-                    "runtime_profile" => Some("runtime_profiles"),
-                    _ => None,
-                };
-                if let Some(map_path) = map_path {
-                    self.status_msg = Some(format!("Loading {map_path}..."));
-                    let _ = self.draw(term);
-                    match self.rpc.config_list(Some(map_path)).await {
-                        Ok(entries) => {
-                            let prefix = format!("{map_path}.");
-                            let mut aliases: Vec<String> = entries
-                                .iter()
-                                .filter_map(|e| e.path.strip_prefix(&prefix))
-                                .filter_map(|rest| rest.split('.').next())
-                                .map(|s| s.to_string())
-                                .collect();
-                            aliases.sort();
-                            aliases.dedup();
-                            if !aliases.is_empty() {
-                                self.select_cursor = aliases
-                                    .iter()
-                                    .position(|v| v == &field_current)
-                                    .unwrap_or(0);
-                                self.select_items = aliases;
-                                self.status_msg = None;
-                            } else {
-                                self.status_msg =
-                                    Some(format!("No {map_path} defined — enter manually"));
-                            }
-                        }
-                        Err(_) => {
-                            self.status_msg =
-                                Some(format!("{map_path} fetch failed — enter manually"));
-                        }
-                    }
+        // Alias-reference fields resolve their picker list generically from
+        // the field's `alias_source` — no per-path special-casing.
+        if let Some(source) = self.fields[idx].alias_source {
+            self.status_msg = Some(crate::i18n::t("zc-config-status-loading-aliases"));
+            let _ = self.draw(term);
+            match self.rpc.config_resolve_alias_source(source).await {
+                Ok(values) if !values.is_empty() => {
+                    self.select_cursor =
+                        values.iter().position(|v| v == &field_current).unwrap_or(0);
+                    self.select_items = values;
+                    self.status_msg = None;
+                }
+                Ok(_) => {
+                    self.status_msg = Some(crate::i18n::t("zc-config-status-no-aliases"));
+                }
+                Err(_) => {
+                    self.status_msg = Some(crate::i18n::t("zc-config-status-alias-fetch-failed"));
                 }
             }
         }
@@ -3411,7 +3384,7 @@ impl App {
 
             let title = match field.kind {
                 PropKind::Bool => format!(" {short_name} (toggle) "),
-                PropKind::Enum => format!(" {short_name} (select) "),
+                PropKind::Enum | PropKind::AliasRef => format!(" {short_name} (select) "),
                 _ => format!(" {short_name} "),
             };
 

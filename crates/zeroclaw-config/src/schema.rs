@@ -638,7 +638,9 @@ pub trait FamilyEndpoint {
 /// `chat_completions` routes through the legacy `/v1/chat/completions` (or
 /// the family's chat-completions-compatible endpoint). Auto-selected per
 /// family when unset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WireApi {
@@ -659,7 +661,9 @@ impl WireApi {
 /// Authentication mode for model model_provider families that support more than one
 /// (e.g. Qwen, Minimax can use API key OR OAuth). Families that only support a
 /// single auth flow simply omit this field from their config struct.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMode {
@@ -817,7 +821,9 @@ pub struct ModelProviderConfig {
 // ── OpenAI ──
 
 /// OpenAI canonical endpoint. Single variant — OpenAI publishes one base URL.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum OpenAIEndpoint {
@@ -852,7 +858,9 @@ pub struct OpenAIModelProviderConfig {
 /// Azure OpenAI endpoint template. Single variant; the URL is computed at
 /// runtime by substituting `{resource}` and `{deployment}` from the typed
 /// config fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AzureEndpoint {
@@ -908,7 +916,9 @@ pub struct AzureModelProviderConfig {
 // ── Anthropic ──
 
 /// Anthropic canonical endpoint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AnthropicEndpoint {
@@ -941,7 +951,9 @@ pub struct AnthropicModelProviderConfig {
 /// Moonshot endpoint variants. Operators pick the region that matches their
 /// account; the runtime resolves the URI from the chosen variant unless
 /// overridden by `base.uri`. Code variant is intl-only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum MoonshotEndpoint {
@@ -990,7 +1002,9 @@ impl FamilyEndpoint for MoonshotModelProviderConfig {
 // ── Qwen (multi-region + auth_mode exemplar) ──
 
 /// Qwen endpoint variants. Operators pick the region matching their account.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum QwenEndpoint {
@@ -1061,7 +1075,9 @@ impl FamilyEndpoint for QwenModelProviderConfig {
 
 // ── OpenRouter ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum OpenRouterEndpoint {
@@ -1088,7 +1104,9 @@ pub struct OpenRouterModelProviderConfig {
 
 // ── Ollama (local-default endpoint) ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum OllamaEndpoint {
@@ -1132,7 +1150,9 @@ pub struct OllamaModelProviderConfig {
 
 // ── Together ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum TogetherEndpoint {
@@ -1159,7 +1179,9 @@ pub struct TogetherModelProviderConfig {
 
 // ── Fireworks ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum FireworksEndpoint {
@@ -1186,7 +1208,9 @@ pub struct FireworksModelProviderConfig {
 
 // ── Groq ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum GroqEndpoint {
@@ -1213,7 +1237,9 @@ pub struct GroqModelProviderConfig {
 
 // ── Mistral ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum MistralEndpoint {
@@ -1267,7 +1293,9 @@ pub struct AtomicChatModelProviderConfig {
 
 // ── DeepSeek ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum DeepseekEndpoint {
@@ -1294,7 +1322,9 @@ pub struct DeepseekModelProviderConfig {
 
 // ── Cohere ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CohereEndpoint {
@@ -1321,7 +1351,9 @@ pub struct CohereModelProviderConfig {
 
 // ── Perplexity ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PerplexityEndpoint {
@@ -1348,7 +1380,9 @@ pub struct PerplexityModelProviderConfig {
 
 // ── xAI (Grok) ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum XaiEndpoint {
@@ -1375,7 +1409,9 @@ pub struct XaiModelProviderConfig {
 
 // ── Cerebras ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CerebrasEndpoint {
@@ -1402,7 +1438,9 @@ pub struct CerebrasModelProviderConfig {
 
 // ── SambaNova ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SambanovaEndpoint {
@@ -1429,7 +1467,9 @@ pub struct SambanovaModelProviderConfig {
 
 // ── Hyperbolic ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum HyperbolicEndpoint {
@@ -1456,7 +1496,9 @@ pub struct HyperbolicModelProviderConfig {
 
 // ── DeepInfra ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum DeepinfraEndpoint {
@@ -1483,7 +1525,9 @@ pub struct DeepinfraModelProviderConfig {
 
 // ── Hugging Face ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum HuggingfaceEndpoint {
@@ -1510,7 +1554,9 @@ pub struct HuggingfaceModelProviderConfig {
 
 // ── AI21 ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Ai21Endpoint {
@@ -1535,7 +1581,9 @@ pub struct Ai21ModelProviderConfig {
 
 // ── Reka ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum RekaEndpoint {
@@ -1560,7 +1608,9 @@ pub struct RekaModelProviderConfig {
 
 // ── BaseTen ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum BasetenEndpoint {
@@ -1585,7 +1635,9 @@ pub struct BasetenModelProviderConfig {
 
 // ── NScale ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum NscaleEndpoint {
@@ -1610,7 +1662,9 @@ pub struct NscaleModelProviderConfig {
 
 // ── AnyScale ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AnyscaleEndpoint {
@@ -1635,7 +1689,9 @@ pub struct AnyscaleModelProviderConfig {
 
 // ── Nebius ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum NebiusEndpoint {
@@ -1660,7 +1716,9 @@ pub struct NebiusModelProviderConfig {
 
 // ── Friendli ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum FriendliEndpoint {
@@ -1685,7 +1743,9 @@ pub struct FriendliModelProviderConfig {
 
 // ── Stepfun ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum StepfunEndpoint {
@@ -1722,7 +1782,9 @@ impl FamilyEndpoint for StepfunModelProviderConfig {
 
 // ── AIHubMix ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AihubmixEndpoint {
@@ -1747,7 +1809,9 @@ pub struct AihubmixModelProviderConfig {
 
 // ── SiliconFlow ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SiliconflowEndpoint {
@@ -1772,7 +1836,9 @@ pub struct SiliconflowModelProviderConfig {
 
 // ── Astrai ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AstraiEndpoint {
@@ -1797,7 +1863,9 @@ pub struct AstraiModelProviderConfig {
 
 // ── Avian ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AvianEndpoint {
@@ -1822,7 +1890,9 @@ pub struct AvianModelProviderConfig {
 
 // ── DeepMyst ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum DeepmystEndpoint {
@@ -1847,7 +1917,9 @@ pub struct DeepmystModelProviderConfig {
 
 // ── Venice ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum VeniceEndpoint {
@@ -1872,7 +1944,9 @@ pub struct VeniceModelProviderConfig {
 
 // ── Novita ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum NovitaEndpoint {
@@ -1897,7 +1971,9 @@ pub struct NovitaModelProviderConfig {
 
 // ── NVIDIA ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum NvidiaEndpoint {
@@ -1922,7 +1998,9 @@ pub struct NvidiaModelProviderConfig {
 
 // ── Telnyx ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum TelnyxEndpoint {
@@ -1947,7 +2025,9 @@ pub struct TelnyxModelProviderConfig {
 
 // ── Vercel AI Gateway ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum VercelEndpoint {
@@ -1972,7 +2052,9 @@ pub struct VercelModelProviderConfig {
 
 // ── Cloudflare AI Gateway ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CloudflareEndpoint {
@@ -1997,7 +2079,9 @@ pub struct CloudflareModelProviderConfig {
 
 // ── OVH ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum OvhEndpoint {
@@ -2022,7 +2106,9 @@ pub struct OvhModelProviderConfig {
 
 // ── GitHub Copilot ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CopilotEndpoint {
@@ -2047,7 +2133,9 @@ pub struct CopilotModelProviderConfig {
 
 // ── GLM (multi-region) ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum GlmEndpoint {
@@ -2082,7 +2170,9 @@ impl FamilyEndpoint for GlmModelProviderConfig {
 
 // ── Minimax (multi-region + auth_mode) ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum MinimaxEndpoint {
@@ -2145,7 +2235,9 @@ impl FamilyEndpoint for MinimaxModelProviderConfig {
 
 // ── Z.AI (multi-region) ──
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ZaiEndpoint {
@@ -2810,7 +2902,9 @@ pub struct KiloCliModelProviderConfig {
 // ── Kilo (AI Gateway — OpenAI-compatible) ──
 
 /// Kilo AI Gateway endpoint. Single canonical endpoint at kilo.ai.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum KiloEndpoint {
@@ -2882,7 +2976,9 @@ pub struct CustomModelProviderConfig {
 
 /// AWS Bedrock endpoint template. Single variant; the URL is computed at
 /// runtime by substituting `{region}` from the typed config field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum BedrockEndpoint {
@@ -3105,11 +3201,11 @@ pub struct AliasedAgentConfig {
     /// Risk profile alias (e.g. `"default"`). Resolves delegation guardrails at runtime.
     #[tab(General)]
     #[serde(default)]
-    pub risk_profile: String,
+    pub risk_profile: crate::providers::RiskProfileRef,
     /// Runtime profile alias (e.g. `"default"`). Resolves agentic/iteration settings.
     #[tab(General)]
     #[serde(default)]
-    pub runtime_profile: String,
+    pub runtime_profile: crate::providers::RuntimeProfileRef,
     /// Skill bundle aliases. Each entry resolves to
     /// `skill_bundles[key].directory` at runtime; the agent loads every
     /// listed bundle.
@@ -3220,8 +3316,8 @@ impl Default for AliasedAgentConfig {
             enabled: true,
             channels: Vec::new(),
             model_provider: crate::providers::ModelProviderRef::default(),
-            risk_profile: String::new(),
-            runtime_profile: String::new(),
+            risk_profile: crate::providers::RiskProfileRef::default(),
+            runtime_profile: crate::providers::RuntimeProfileRef::default(),
             skill_bundles: Vec::new(),
             knowledge_bundles: Vec::new(),
             mcp_bundles: Vec::new(),
@@ -3271,6 +3367,38 @@ pub struct ChannelAliasInfo {
 }
 
 impl Config {
+    /// Resolve the configured alias values valid for an [`AliasSource`].
+    /// Two-tier sources return dotted `<type>.<alias>` keys; flat sources
+    /// return bare alias keys. The single resolver every surface uses for
+    /// `PropKind::AliasRef` pickers and validation.
+    #[must_use]
+    pub fn resolve_alias_source(&self, source: crate::traits::AliasSource) -> Vec<String> {
+        let section = source.section_path();
+        if source.is_two_tier() {
+            let prefix = format!("{section}.");
+            let mut out: Vec<String> = Vec::new();
+            for f in self.prop_fields() {
+                if let Some(rest) = f.name.strip_prefix(&prefix) {
+                    let mut parts = rest.splitn(3, '.');
+                    if let (Some(ty), Some(alias), Some(_)) =
+                        (parts.next(), parts.next(), parts.next())
+                    {
+                        let dotted = format!("{ty}.{alias}");
+                        if !out.contains(&dotted) {
+                            out.push(dotted);
+                        }
+                    }
+                }
+            }
+            out.sort();
+            out
+        } else {
+            let mut out = self.get_map_keys(section).unwrap_or_default();
+            out.sort();
+            out
+        }
+    }
+
     /// Return the first concrete `model` string available for use as a
     /// default. Scans every typed slot's entries (iteration order is
     /// the macro slot order) for one with `model` set. Returns `None`
@@ -3838,6 +3966,15 @@ where
         .transpose()
 }
 
+fn deserialize_enum_lenient<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(T::deserialize(raw).unwrap_or_default())
+}
+
 /// Deserialize an `Option<String>` that maps an empty literal `""` to
 /// `None`. Used by `JiraConfig::email` so a config that round-tripped
 /// `email = ""` to disk (the legacy `email: String` had no
@@ -3858,7 +3995,9 @@ where
 // ── Hardware Config (wizard-driven) ─────────────────────────────
 
 /// Hardware transport mode.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub enum HardwareTransport {
     #[default]
@@ -4045,7 +4184,9 @@ impl Default for TranscriptionConfig {
 // ── MCP ─────────────────────────────────────────────────────────
 
 /// Transport type for MCP server connections.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(
+    Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum McpTransport {
@@ -4327,7 +4468,9 @@ pub trait TtsEndpoint {
     fn uri(&self) -> &'static str;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum OpenAITtsEndpoint {
@@ -4351,7 +4494,9 @@ pub struct OpenAITtsProviderConfig {
     pub base: TtsProviderConfig,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ElevenLabsTtsEndpoint {
@@ -4375,7 +4520,9 @@ pub struct ElevenLabsTtsProviderConfig {
     pub base: TtsProviderConfig,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum GoogleTtsEndpoint {
@@ -4399,7 +4546,9 @@ pub struct GoogleTtsProviderConfig {
     pub base: TtsProviderConfig,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeTtsEndpoint {
@@ -4424,7 +4573,9 @@ pub struct EdgeTtsProviderConfig {
     pub base: TtsProviderConfig,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PiperTtsEndpoint {
@@ -4662,7 +4813,9 @@ pub struct LocalWhisperTranscriptionProviderConfig {
 }
 
 /// Determines when a `ToolFilterGroup` is active.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ToolFilterGroupMode {
@@ -4946,7 +5099,9 @@ impl Default for PacingConfig {
 }
 
 /// Skills loading configuration (`[skills]` section).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SkillsPromptInjectionMode {
@@ -6332,7 +6487,9 @@ pub struct WebFetchConfig {
 }
 
 /// Firecrawl fallback mode: scrape a single page or crawl linked pages.
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum FirecrawlMode {
@@ -7878,7 +8035,9 @@ impl Default for OpenCodeCliConfig {
 // ── Proxy ───────────────────────────────────────────────────────
 
 /// Proxy application scope — determines which outbound traffic uses the proxy.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ProxyScope {
@@ -9062,7 +9221,7 @@ fn default_qdrant_collection() -> String {
 }
 
 /// Search strategy for memory recall.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, zeroclaw_macros::ConfigEnum)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SearchMode {
@@ -9337,13 +9496,92 @@ impl Default for MemoryConfig {
 
 // ── Observability ─────────────────────────────────────────────────
 
+/// Observability sink backend.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ObservabilityBackend {
+    #[default]
+    #[serde(alias = "noop")]
+    None,
+    Log,
+    Verbose,
+    Prometheus,
+    #[serde(alias = "opentelemetry", alias = "otlp")]
+    Otel,
+}
+
+impl ObservabilityBackend {
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Log => "log",
+            Self::Verbose => "verbose",
+            Self::Prometheus => "prometheus",
+            Self::Otel => "otel",
+        }
+    }
+}
+
+/// JSONL log persistence mode.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LogPersistence {
+    None,
+    #[default]
+    Rolling,
+    Full,
+}
+
+impl LogPersistence {
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Rolling => "rolling",
+            Self::Full => "full",
+        }
+    }
+}
+
+/// Tool I/O capture policy.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LogToolIo {
+    Off,
+    #[default]
+    Redacted,
+    Full,
+}
+
+impl LogToolIo {
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Redacted => "redacted",
+            Self::Full => "full",
+        }
+    }
+}
+
 /// Observability backend configuration (`[observability]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "observability"]
 pub struct ObservabilityConfig {
-    /// "none" | "log" | "verbose" | "prometheus" | "otel"
-    pub backend: String,
+    /// Observability sink: none | log | verbose | prometheus | otel.
+    #[serde(default, deserialize_with = "deserialize_enum_lenient")]
+    pub backend: ObservabilityBackend,
 
     /// OTLP endpoint (e.g. `"http://localhost:4318"`). Only used when backend = `"otel"`.
     #[serde(default)]
@@ -9367,8 +9605,12 @@ pub struct ObservabilityConfig {
     /// Log persistence mode: "none" | "rolling" | "full".
     /// Controls whether every event passing through `zeroclaw_log::record!`
     /// is appended to the on-disk JSONL log.
-    #[serde(default = "default_log_persistence", alias = "runtime_trace_mode")]
-    pub log_persistence: String,
+    #[serde(
+        default = "default_log_persistence",
+        alias = "runtime_trace_mode",
+        deserialize_with = "deserialize_enum_lenient"
+    )]
+    pub log_persistence: LogPersistence,
 
     /// Log persistence file path. Relative paths resolve under workspace_dir.
     #[serde(default = "default_log_persistence_path", alias = "runtime_trace_path")]
@@ -9387,8 +9629,11 @@ pub struct ObservabilityConfig {
     ///   truncated at `log_tool_io_truncate_bytes` before persisting.
     /// - `full`: full input + output, still leak-scanned. For operators
     ///   who need replay fidelity and accept the disk cost.
-    #[serde(default = "default_log_tool_io")]
-    pub log_tool_io: String,
+    #[serde(
+        default = "default_log_tool_io",
+        deserialize_with = "deserialize_enum_lenient"
+    )]
+    pub log_tool_io: LogToolIo,
 
     /// Truncate the captured tool input and output at this many bytes when
     /// `log_tool_io = "redacted"`. Truncated events carry an explicit
@@ -9407,7 +9652,7 @@ pub struct ObservabilityConfig {
 impl Default for ObservabilityConfig {
     fn default() -> Self {
         Self {
-            backend: "none".into(),
+            backend: ObservabilityBackend::None,
             otel_endpoint: None,
             otel_service_name: None,
             otel_headers: None,
@@ -9421,8 +9666,8 @@ impl Default for ObservabilityConfig {
     }
 }
 
-fn default_log_persistence() -> String {
-    "rolling".to_string()
+fn default_log_persistence() -> LogPersistence {
+    LogPersistence::Rolling
 }
 
 fn default_log_persistence_path() -> String {
@@ -9433,8 +9678,8 @@ fn default_log_persistence_max_entries() -> usize {
     200
 }
 
-fn default_log_tool_io() -> String {
-    "redacted".to_string()
+fn default_log_tool_io() -> LogToolIo {
+    LogToolIo::Redacted
 }
 
 fn default_log_tool_io_truncate_bytes() -> usize {
@@ -9854,14 +10099,38 @@ pub struct McpBundleConfig {
 
 // ── Runtime ──────────────────────────────────────────────────────
 
+/// Runtime adapter kind.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeKind {
+    #[default]
+    Native,
+    Docker,
+    Cloudflare,
+}
+
+impl RuntimeKind {
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Docker => "docker",
+            Self::Cloudflare => "cloudflare",
+        }
+    }
+}
+
 /// Runtime adapter configuration (`[runtime]` section).
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "runtime"]
 pub struct RuntimeConfig {
-    /// Runtime kind (`native` | `docker`).
-    #[serde(default = "default_runtime_kind")]
-    pub kind: String,
+    /// Runtime kind: native | docker | cloudflare.
+    #[serde(default, deserialize_with = "deserialize_enum_lenient")]
+    pub kind: RuntimeKind,
 
     /// Docker runtime settings (used when `kind = "docker"`).
     #[serde(default)]
@@ -9913,10 +10182,6 @@ pub struct DockerRuntimeConfig {
     pub allowed_workspace_roots: Vec<String>,
 }
 
-fn default_runtime_kind() -> String {
-    "native".into()
-}
-
 fn default_docker_image() -> String {
     "alpine:3.20".into()
 }
@@ -9943,17 +10208,6 @@ impl Default for DockerRuntimeConfig {
             read_only_rootfs: true,
             mount_workspace: true,
             allowed_workspace_roots: Vec::new(),
-        }
-    }
-}
-
-impl Default for RuntimeConfig {
-    fn default() -> Self {
-        Self {
-            kind: default_runtime_kind(),
-            docker: DockerRuntimeConfig::default(),
-            reasoning_enabled: None,
-            reasoning_effort: None,
         }
     }
 }
@@ -10381,7 +10635,7 @@ impl Default for CronJobDecl {
 }
 
 /// Schedule variant for declarative cron jobs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, zeroclaw_macros::ConfigEnum)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum CronScheduleDecl {
@@ -11182,7 +11436,9 @@ impl Default for ChannelsConfig {
 }
 
 /// Streaming mode for channels that support progressive message updates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum StreamMode {
@@ -11967,7 +12223,7 @@ impl ChannelConfig for SignalConfig {
 /// incoming messages that pass the DM/group/self-chat policy filters.
 /// `Business` (default) responds to all incoming messages, subject only to the
 /// `allowed_numbers` allowlist.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, zeroclaw_macros::ConfigEnum)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WhatsAppWebMode {
@@ -11980,7 +12236,7 @@ pub enum WhatsAppWebMode {
 
 /// Policy for a particular WhatsApp chat type (DMs or groups) when
 /// `mode = "personal"`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, zeroclaw_macros::ConfigEnum)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WhatsAppChatPolicy {
@@ -12737,7 +12993,7 @@ fn default_irc_port() -> u16 {
 ///
 /// - `websocket` (default) — persistent WSS long-connection; no public URL required.
 /// - `webhook`             — HTTP callback server; requires a public HTTPS endpoint.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum LarkReceiveMode {
@@ -12850,7 +13106,9 @@ impl ChannelConfig for LarkConfig {
 }
 
 /// DM (1:1 chat) access policy for the LINE channel.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum LineDmPolicy {
@@ -12865,7 +13123,9 @@ pub enum LineDmPolicy {
 }
 
 /// Group / multi-person chat policy for the LINE channel.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum LineGroupPolicy {
@@ -13035,7 +13295,9 @@ fn default_webauthn_rp_name() -> String {
 }
 
 /// OTP validation strategy.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, zeroclaw_macros::ConfigEnum,
+)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum OtpMethod {
@@ -13351,7 +13613,7 @@ impl Default for SandboxConfig {
 }
 
 /// Sandbox backend selection
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum SandboxBackend {
@@ -18022,112 +18284,12 @@ impl Default for SopConfig {
     }
 }
 
-// ── HasPropKind impls for config enums ──
-// Scalars (bool, String, integers, floats) are covered by impl_prop_kind! in traits.rs.
-// Config enums serialize as TOML strings and are classified as PropKind::Enum.
-macro_rules! impl_enum_prop_kind {
-    ($($ty:ty),+ $(,)?) => {
-        $(impl HasPropKind for $ty { const PROP_KIND: PropKind = PropKind::Enum; })+
-    };
+// Config enums self-declare via `#[derive(ConfigEnum)]` at their definition
+// site. `DelegationPolicy` is a struct whose `mode` leaf surfaces as the enum,
+// so it carries the impl directly.
+impl HasPropKind for crate::autonomy::DelegationPolicy {
+    const PROP_KIND: PropKind = PropKind::Enum;
 }
-impl_enum_prop_kind!(
-    WireApi,
-    HardwareTransport,
-    McpTransport,
-    ToolFilterGroupMode,
-    SkillsPromptInjectionMode,
-    FirecrawlMode,
-    ProxyScope,
-    SearchMode,
-    CronScheduleDecl,
-    StreamMode,
-    WhatsAppWebMode,
-    WhatsAppChatPolicy,
-    LineDmPolicy,
-    LineGroupPolicy,
-    LarkReceiveMode,
-    OtpMethod,
-    SandboxBackend,
-    AutonomyLevel,
-    DelegationPolicy,
-    AuthMode,
-    OpenAIEndpoint,
-    AzureEndpoint,
-    AnthropicEndpoint,
-    MoonshotEndpoint,
-    QwenEndpoint,
-    BedrockEndpoint,
-    OpenRouterEndpoint,
-    OllamaEndpoint,
-    TogetherEndpoint,
-    FireworksEndpoint,
-    GroqEndpoint,
-    MistralEndpoint,
-    DeepseekEndpoint,
-    CohereEndpoint,
-    PerplexityEndpoint,
-    XaiEndpoint,
-    CerebrasEndpoint,
-    SambanovaEndpoint,
-    HyperbolicEndpoint,
-    DeepinfraEndpoint,
-    HuggingfaceEndpoint,
-    Ai21Endpoint,
-    RekaEndpoint,
-    BasetenEndpoint,
-    NscaleEndpoint,
-    AnyscaleEndpoint,
-    NebiusEndpoint,
-    FriendliEndpoint,
-    StepfunEndpoint,
-    AihubmixEndpoint,
-    SiliconflowEndpoint,
-    AstraiEndpoint,
-    AvianEndpoint,
-    DeepmystEndpoint,
-    VeniceEndpoint,
-    NovitaEndpoint,
-    NvidiaEndpoint,
-    TelnyxEndpoint,
-    VercelEndpoint,
-    CloudflareEndpoint,
-    OvhEndpoint,
-    CopilotEndpoint,
-    OpenAITtsEndpoint,
-    ElevenLabsTtsEndpoint,
-    GoogleTtsEndpoint,
-    EdgeTtsEndpoint,
-    PiperTtsEndpoint,
-    GlmEndpoint,
-    MinimaxEndpoint,
-    ZaiEndpoint,
-    DoubaoEndpoint,
-    YiEndpoint,
-    HunyuanEndpoint,
-    QianfanEndpoint,
-    BaichuanEndpoint,
-    GeminiEndpoint,
-    GeminiCliEndpoint,
-    LmstudioEndpoint,
-    LlamacppEndpoint,
-    SglangEndpoint,
-    VllmEndpoint,
-    OsaurusEndpoint,
-    LitellmEndpoint,
-    LeptonEndpoint,
-    MorphEndpoint,
-    GithubModelsEndpoint,
-    UpstageEndpoint,
-    FeatherlessEndpoint,
-    ArceeEndpoint,
-    LambdaAiEndpoint,
-    InceptionEndpoint,
-    SyntheticEndpoint,
-    OpencodeEndpoint,
-    KiloCliEndpoint,
-    KiloEndpoint,
-    CustomEndpoint,
-);
 
 impl HasPropKind for serde_json::Value {
     // `serde_json::Value` is an arbitrary JSON document, not an enum.
@@ -18600,13 +18762,64 @@ enabled = true
     }
 
     #[test]
+    async fn observability_enums_deserialize_legacy_string_values() {
+        // Backward compat: TOML configs written before the enum conversion
+        // stored these as bare strings. They must still parse.
+        let toml = r#"
+backend = "otel"
+log_persistence = "full"
+log_tool_io = "off"
+"#;
+        let o: ObservabilityConfig = toml::from_str(toml).unwrap();
+        assert_eq!(o.backend, ObservabilityBackend::Otel);
+        assert_eq!(o.log_persistence, LogPersistence::Full);
+        assert_eq!(o.log_tool_io, LogToolIo::Off);
+
+        // Legacy alias key `runtime_trace_mode` still maps to log_persistence.
+        let aliased: ObservabilityConfig = toml::from_str("runtime_trace_mode = \"none\"").unwrap();
+        assert_eq!(aliased.log_persistence, LogPersistence::None);
+
+        // Round-trip: serialize back to the same wire strings the runtime
+        // boundary (`to_log_config`) and downstream `from_raw` expect.
+        assert_eq!(ObservabilityBackend::Otel.as_wire(), "otel");
+        assert_eq!(LogPersistence::Full.as_wire(), "full");
+        assert_eq!(LogToolIo::Off.as_wire(), "off");
+    }
+
+    #[test]
+    async fn observability_backend_unknown_falls_back_to_default() {
+        let parsed: ObservabilityConfig = toml::from_str("backend = \"bogus\"").unwrap();
+        assert_eq!(parsed.backend, ObservabilityBackend::None);
+        let noop: ObservabilityConfig = toml::from_str("backend = \"noop\"").unwrap();
+        assert_eq!(noop.backend, ObservabilityBackend::None);
+        let otlp: ObservabilityConfig = toml::from_str("backend = \"otlp\"").unwrap();
+        assert_eq!(otlp.backend, ObservabilityBackend::Otel);
+        let otel_alias: ObservabilityConfig =
+            toml::from_str("backend = \"opentelemetry\"").unwrap();
+        assert_eq!(otel_alias.backend, ObservabilityBackend::Otel);
+    }
+
+    #[test]
+    async fn runtime_kind_unknown_falls_back_to_default() {
+        let docker: RuntimeConfig = toml::from_str("kind = \"docker\"").unwrap();
+        assert_eq!(docker.kind, RuntimeKind::Docker);
+        let cf: RuntimeConfig = toml::from_str("kind = \"cloudflare\"").unwrap();
+        assert_eq!(cf.kind, RuntimeKind::Cloudflare);
+        let bogus: RuntimeConfig = toml::from_str("kind = \"bogus\"").unwrap();
+        assert_eq!(bogus.kind, RuntimeKind::Native);
+        let empty: RuntimeConfig = toml::from_str("kind = \"\"").unwrap();
+        assert_eq!(empty.kind, RuntimeKind::Native);
+        assert_eq!(RuntimeKind::default(), RuntimeKind::Native);
+    }
+
+    #[test]
     async fn observability_config_default() {
         let o = ObservabilityConfig::default();
-        assert_eq!(o.backend, "none");
-        assert_eq!(o.log_persistence, "rolling");
+        assert_eq!(o.backend, ObservabilityBackend::None);
+        assert_eq!(o.log_persistence, LogPersistence::Rolling);
         assert_eq!(o.log_persistence_path, "state/runtime-trace.jsonl");
         assert_eq!(o.log_persistence_max_entries, 200);
-        assert_eq!(o.log_tool_io, "redacted");
+        assert_eq!(o.log_tool_io, LogToolIo::Redacted);
         assert_eq!(o.log_tool_io_truncate_bytes, 40960);
         assert!(o.log_tool_io_denylist.is_empty());
     }
@@ -18645,7 +18858,7 @@ enabled = true
     #[test]
     async fn runtime_config_default() {
         let r = RuntimeConfig::default();
-        assert_eq!(r.kind, "native");
+        assert_eq!(r.kind, RuntimeKind::Native);
         assert_eq!(r.docker.image, "alpine:3.20");
         assert_eq!(r.docker.network, "none");
         assert_eq!(r.docker.memory_limit_mb, Some(512));
@@ -19015,7 +19228,7 @@ auto_save = true
             data_dir: PathBuf::from("/tmp/test/workspace"),
             config_path: PathBuf::from("/tmp/test/config.toml"),
             observability: ObservabilityConfig {
-                backend: "log".into(),
+                backend: ObservabilityBackend::Log,
                 ..ObservabilityConfig::default()
             },
             risk_profiles: {
@@ -19048,7 +19261,7 @@ auto_save = true
             security: SecurityConfig::default(),
             security_ops: SecurityOpsConfig::default(),
             runtime: RuntimeConfig {
-                kind: "docker".into(),
+                kind: RuntimeKind::Docker,
                 ..RuntimeConfig::default()
             },
             reliability: ReliabilityConfig::default(),
@@ -19196,12 +19409,15 @@ auto_save = true
         let parsed = parse_test_config(&toml_str);
 
         assert_eq!(parsed.providers.models.len(), config.providers.models.len());
-        assert_eq!(parsed.observability.backend, "log");
-        assert_eq!(parsed.observability.log_persistence, "rolling");
+        assert_eq!(parsed.observability.backend, ObservabilityBackend::Log);
+        assert_eq!(
+            parsed.observability.log_persistence,
+            LogPersistence::Rolling
+        );
         let default_profile = parsed.risk_profiles.get("default").unwrap();
         assert_eq!(default_profile.level, AutonomyLevel::Full);
         assert!(!default_profile.workspace_only);
-        assert_eq!(parsed.runtime.kind, "docker");
+        assert_eq!(parsed.runtime.kind, RuntimeKind::Docker);
         assert!(parsed.heartbeat.enabled);
         assert_eq!(parsed.heartbeat.interval_minutes, 15);
         assert_eq!(
@@ -19235,8 +19451,11 @@ default_temperature = 0.7
                 .and_then(|e| e.api_key.as_deref())
                 .is_none()
         );
-        assert_eq!(parsed.observability.backend, "none");
-        assert_eq!(parsed.observability.log_persistence, "rolling");
+        assert_eq!(parsed.observability.backend, ObservabilityBackend::None);
+        assert_eq!(
+            parsed.observability.log_persistence,
+            LogPersistence::Rolling
+        );
         // Migration synthesizes risk_profiles.default from the legacy
         // [autonomy] block; assert against the named entry rather than a
         // global "active" profile (no such concept exists).
@@ -19248,7 +19467,7 @@ default_temperature = 0.7
                 .level,
             AutonomyLevel::Supervised
         );
-        assert_eq!(parsed.runtime.kind, "native");
+        assert_eq!(parsed.runtime.kind, RuntimeKind::Native);
         // Heartbeat defaults to disabled.
         assert!(!parsed.heartbeat.enabled);
         assert!(parsed.channels.cli);
@@ -19929,7 +20148,7 @@ default_temperature = 0.7
         ];
         config.node_transport.shared_secret = "node-shared-credential".into();
         config.nodes.auth_token = Some("nodes-auth-credential".into());
-        config.observability.backend = "otel".into();
+        config.observability.backend = ObservabilityBackend::Otel;
         config.observability.otel_headers = Some(HashMap::from([(
             "Authorization".to_string(),
             "Bearer otel-credential".to_string(),
@@ -23046,7 +23265,7 @@ group_policy = "disabled"
             config_path: config_path.clone(),
             ..Default::default()
         };
-        config.observability.backend = "otel".to_string();
+        config.observability.backend = ObservabilityBackend::Otel;
         config.mark_dirty("observability.backend");
         config.save_dirty().await.unwrap();
 
@@ -27134,7 +27353,7 @@ allowed_users = []
         let agent = AliasedAgentConfig {
             channels: vec![ChannelRef::new("telegram.draft")],
             model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
-            risk_profile: "default".to_string(),
+            risk_profile: "default".into(),
             ..AliasedAgentConfig::default()
         };
         config.agents.insert("alpha".to_string(), agent);
@@ -27207,7 +27426,7 @@ allowed_users = []
         let beta = AliasedAgentConfig {
             channels: vec![crate::providers::ChannelRef::new("telegram.draft")],
             model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
-            risk_profile: "default".to_string(),
+            risk_profile: "default".into(),
             memory: crate::multi_agent::AgentMemoryConfig {
                 backend: crate::multi_agent::MemoryBackendKind::Postgres,
             },
@@ -27236,7 +27455,7 @@ allowed_users = []
     async fn validate_rejects_peer_group_dangling_member() {
         let mut config = multi_agent_test_config();
         let group = crate::multi_agent::PeerGroupConfig {
-            channel: "telegram".to_string(),
+            channel: "telegram".into(),
             agents: vec![
                 crate::multi_agent::AgentAlias::new("alpha"),
                 crate::multi_agent::AgentAlias::new("ghost"),
@@ -27265,14 +27484,14 @@ allowed_users = []
         let beta = AliasedAgentConfig {
             channels: vec![crate::providers::ChannelRef::new("discord.ops")],
             model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
-            risk_profile: "default".to_string(),
+            risk_profile: "default".into(),
             ..AliasedAgentConfig::default()
         };
         config.agents.insert("beta".to_string(), beta);
 
         // Group on telegram.draft includes beta (who only has discord).
         let group = crate::multi_agent::PeerGroupConfig {
-            channel: "telegram".to_string(),
+            channel: "telegram".into(),
             agents: vec![
                 crate::multi_agent::AgentAlias::new("alpha"),
                 crate::multi_agent::AgentAlias::new("beta"),
@@ -27299,14 +27518,14 @@ allowed_users = []
         let beta = AliasedAgentConfig {
             channels: vec![crate::providers::ChannelRef::new("telegram.draft")],
             model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
-            risk_profile: "default".to_string(),
+            risk_profile: "default".into(),
             ..AliasedAgentConfig::default()
         };
         config.agents.insert("beta".to_string(), beta);
 
         // Group on telegram.draft includes both members.
         let group = crate::multi_agent::PeerGroupConfig {
-            channel: "telegram".to_string(),
+            channel: "telegram".into(),
             agents: vec![
                 crate::multi_agent::AgentAlias::new("alpha"),
                 crate::multi_agent::AgentAlias::new("beta"),

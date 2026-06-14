@@ -1537,6 +1537,10 @@ pub async fn run_gateway(
         .route("/api/config/templates", get(api_config::handle_templates))
         .route("/api/config/map-keys", get(api_config::handle_get_map_keys))
         .route(
+            "/api/config/resolve-alias-source",
+            get(api_config::handle_resolve_alias_source),
+        )
+        .route(
             "/api/config/map-key",
             post(api_config::handle_map_key).delete(api_config::handle_delete_map_key),
         )
@@ -4402,7 +4406,7 @@ mod tests {
         // matching [risk_profiles.<key>] entry exists.
         let agent = AliasedAgentConfig {
             enabled: true,
-            risk_profile: "definitely_not_configured".to_string(),
+            risk_profile: "definitely_not_configured".into(),
             ..AliasedAgentConfig::default()
         };
         config.agents.insert("fake123".to_string(), agent);

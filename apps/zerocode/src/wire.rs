@@ -219,6 +219,7 @@ pub enum PropKind {
     Integer,
     Float,
     Enum,
+    AliasRef,
     StringArray,
     ObjectArray,
     Object,
@@ -235,11 +236,29 @@ impl PropKind {
             Self::Integer => "integer",
             Self::Float => "float",
             Self::Enum => "enum",
+            Self::AliasRef => "alias_ref",
             Self::StringArray => "string_array",
             Self::ObjectArray => "object_array",
             Self::Object => "object",
         }
     }
+}
+
+/// Alias namespace for `PropKind::AliasRef` fields. Mirrors
+/// `zeroclaw_config::traits::AliasSource`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AliasSource {
+    ModelProviders,
+    TtsProviders,
+    TranscriptionProviders,
+    Channels,
+    RiskProfiles,
+    RuntimeProfiles,
+    Agents,
+    SkillBundles,
+    KnowledgeBundles,
+    McpBundles,
 }
 
 /// Schema-defined config tab grouping. Mirrors
@@ -330,6 +349,8 @@ pub struct ConfigFieldEntry {
     pub section: Option<String>,
     #[serde(default, skip_serializing_if = "ConfigTab::is_none")]
     pub tab: ConfigTab,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias_source: Option<AliasSource>,
 }
 
 /// Section-page shape returned by `config/sections`. Mirrors

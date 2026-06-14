@@ -554,7 +554,10 @@ impl DelegateTool {
 
         let mut resolved = agent_config.resolved.clone();
 
-        if let Some(profile) = self.runtime_profiles.get(&agent_config.runtime_profile) {
+        if let Some(profile) = self
+            .runtime_profiles
+            .get(agent_config.runtime_profile.as_str())
+        {
             if profile.max_tool_iterations > 0 {
                 resolved.max_tool_iterations = profile.max_tool_iterations;
             }
@@ -2310,8 +2313,8 @@ mod tests {
     fn agentic_agent_config() -> AliasedAgentConfig {
         AliasedAgentConfig {
             model_provider: "openrouter.agentic".into(),
-            risk_profile: "agentic_test".to_string(),
-            runtime_profile: "agentic_test".to_string(),
+            risk_profile: "agentic_test".into(),
+            runtime_profile: "agentic_test".into(),
             ..Default::default()
         }
     }
@@ -2428,8 +2431,8 @@ mod tests {
         );
         let target_config = AliasedAgentConfig {
             model_provider: "custom.local".into(),
-            risk_profile: "agentic_test".to_string(),
-            runtime_profile: "agentic_test".to_string(),
+            risk_profile: "agentic_test".into(),
+            runtime_profile: "agentic_test".into(),
             ..AliasedAgentConfig::default()
         };
         root_config
@@ -4405,8 +4408,8 @@ mod tests {
         config.agents.insert(
             caller_alias.to_string(),
             AliasedAgentConfig {
-                risk_profile: "narrow".to_string(),
-                runtime_profile: "narrow".to_string(),
+                risk_profile: "narrow".into(),
+                runtime_profile: "narrow".into(),
                 model_provider: "ollama.caller".into(),
                 ..AliasedAgentConfig::default()
             },
@@ -4414,8 +4417,8 @@ mod tests {
         config.agents.insert(
             target_alias.to_string(),
             AliasedAgentConfig {
-                risk_profile: pick(target_max_actions > caller_max_actions),
-                runtime_profile: pick(target_max_actions > caller_max_actions),
+                risk_profile: pick(target_max_actions > caller_max_actions).into(),
+                runtime_profile: pick(target_max_actions > caller_max_actions).into(),
                 model_provider: "ollama.target".into(),
                 ..AliasedAgentConfig::default()
             },
@@ -4563,7 +4566,7 @@ mod tests {
         config.agents.insert(
             "caller".to_string(),
             AliasedAgentConfig {
-                risk_profile: "broad".to_string(),
+                risk_profile: "broad".into(),
                 model_provider: "ollama.caller".into(),
                 ..AliasedAgentConfig::default()
             },
@@ -4571,7 +4574,7 @@ mod tests {
         config.agents.insert(
             "target".to_string(),
             AliasedAgentConfig {
-                risk_profile: "narrow".to_string(),
+                risk_profile: "narrow".into(),
                 model_provider: "ollama.target".into(),
                 ..AliasedAgentConfig::default()
             },

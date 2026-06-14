@@ -3586,7 +3586,8 @@ async fn main() -> Result<()> {
                     .filter(|(_, a)| a.enabled)
                     .filter_map(|(alias, _)| config.risk_profile_for_agent(alias))
                     .any(|p| matches!(p.sandbox_config().backend, SandboxBackend::Docker));
-                let runtime_docker_mem = config.runtime.kind == "docker"
+                let runtime_docker_mem = config.runtime.kind
+                    == zeroclaw_config::schema::RuntimeKind::Docker
                     && config
                         .runtime
                         .docker
@@ -3879,13 +3880,14 @@ async fn main() -> Result<()> {
                 "{}",
                 ta(
                     "cli-status-observability",
-                    &[("v", &config.observability.backend.to_string())],
+                    &[("v", config.observability.backend.as_wire())],
                     "Observability"
                 )
             );
             println!(
                 "🧾 Trace storage:  {} ({})",
-                config.observability.log_persistence, config.observability.log_persistence_path
+                config.observability.log_persistence.as_wire(),
+                config.observability.log_persistence_path
             );
             // Per-agent autonomy: each enabled agent picks its own
             // risk_profile, so list them rather than collapsing to one.
@@ -3921,7 +3923,7 @@ async fn main() -> Result<()> {
                 "{}",
                 ta(
                     "cli-status-runtime",
-                    &[("v", &config.runtime.kind.to_string())],
+                    &[("v", config.runtime.kind.as_wire())],
                     "Runtime"
                 )
             );

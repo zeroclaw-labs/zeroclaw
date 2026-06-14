@@ -242,25 +242,9 @@ pub struct AgentOptionsResponse {
 /// underscore-bearing field silently returns `None` → empty `Vec` →
 /// dashboard renders "No X configured yet" even though X is configured.
 pub fn build_agent_options(cfg: &zeroclaw_config::schema::Config) -> AgentOptionsResponse {
-    fn dotted_aliases(cfg: &zeroclaw_config::schema::Config, prefix: &str) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        for f in cfg.prop_fields() {
-            if let Some(rest) = f.name.strip_prefix(&format!("{prefix}.")) {
-                let mut parts = rest.splitn(3, '.');
-                if let (Some(ty), Some(alias), Some(_)) = (parts.next(), parts.next(), parts.next())
-                {
-                    let dotted = format!("{ty}.{alias}");
-                    if !out.contains(&dotted) {
-                        out.push(dotted);
-                    }
-                }
-            }
-        }
-        out.sort();
-        out
-    }
+    use zeroclaw_config::traits::AliasSource;
 
-    let channels = dotted_aliases(cfg, "channels");
+    let channels = cfg.resolve_alias_source(AliasSource::Channels);
     let mut channel_types: Vec<String> = channels
         .iter()
         .filter_map(|d| d.split_once('.').map(|(t, _)| t.to_string()))
@@ -271,13 +255,13 @@ pub fn build_agent_options(cfg: &zeroclaw_config::schema::Config) -> AgentOption
     AgentOptionsResponse {
         channels,
         channel_types,
-        model_providers: dotted_aliases(cfg, "providers.models"),
-        risk_profiles: cfg.get_map_keys("risk_profiles").unwrap_or_default(),
-        runtime_profiles: cfg.get_map_keys("runtime_profiles").unwrap_or_default(),
-        skill_bundles: cfg.get_map_keys("skill_bundles").unwrap_or_default(),
-        knowledge_bundles: cfg.get_map_keys("knowledge_bundles").unwrap_or_default(),
-        mcp_bundles: cfg.get_map_keys("mcp_bundles").unwrap_or_default(),
-        agents: cfg.get_map_keys("agents").unwrap_or_default(),
+        model_providers: cfg.resolve_alias_source(AliasSource::ModelProviders),
+        risk_profiles: cfg.resolve_alias_source(AliasSource::RiskProfiles),
+        runtime_profiles: cfg.resolve_alias_source(AliasSource::RuntimeProfiles),
+        skill_bundles: cfg.resolve_alias_source(AliasSource::SkillBundles),
+        knowledge_bundles: cfg.resolve_alias_source(AliasSource::KnowledgeBundles),
+        mcp_bundles: cfg.resolve_alias_source(AliasSource::McpBundles),
+        agents: cfg.resolve_alias_source(AliasSource::Agents),
     }
 }
 
@@ -909,12 +893,12 @@ fn apply_first_run_agent_defaults(cfg: &mut zeroclaw_config::schema::Config, ali
     if agent.risk_profile.trim().is_empty()
         && let Some(risk_profile) = risk_profile
     {
-        agent.risk_profile = risk_profile;
+        agent.risk_profile = risk_profile.into();
     }
     if agent.runtime_profile.trim().is_empty()
         && let Some(runtime_profile) = runtime_profile
     {
-        agent.runtime_profile = runtime_profile;
+        agent.runtime_profile = runtime_profile.into();
     }
 }
 

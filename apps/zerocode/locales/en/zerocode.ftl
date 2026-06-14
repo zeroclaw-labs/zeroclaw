@@ -458,6 +458,9 @@ zc-config-status-fetching-templates = Fetching templates...
 zc-config-status-unsaved-discarded = Unsaved changes discarded
 zc-config-status-no-models = No models returned — enter manually
 zc-config-status-model-fetch-failed = Model fetch failed — enter manually
+zc-config-status-loading-aliases = Loading options...
+zc-config-status-no-aliases = None configured yet. Enter manually.
+zc-config-status-alias-fetch-failed = Options fetch failed. Enter manually.
 
 zc-config-footer-action-create = create
 zc-config-footer-action-cancel = cancel
