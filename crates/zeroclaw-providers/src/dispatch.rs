@@ -18,7 +18,8 @@ use std::sync::Arc;
 
 use futures_util::stream::{self, StreamExt as _};
 use zeroclaw_api::model_provider::{
-    ChatRequest, ChatResponse, ModelProvider, StreamEvent, StreamOptions, StreamResult,
+    ChatMessage, ChatRequest, ChatResponse, ModelInfo, ModelProvider, StreamEvent, StreamOptions,
+    StreamResult,
 };
 
 /// Wraps a model provider so every call opens the correct
@@ -102,6 +103,112 @@ impl ProviderDispatch {
             inner_stream.as_mut().poll_next(cx)
         })
         .boxed()
+    }
+
+    /// Wrap the inner provider's `simple_chat`.
+    pub async fn simple_chat(
+        &self,
+        message: &str,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<String> {
+        use zeroclaw_log::Instrument;
+        let span = zeroclaw_log::attribution_span!(&*self.inner);
+        async move {
+            zeroclaw_log::scope!(
+                model: model,
+                => self.inner.simple_chat(message, model, temperature)
+            )
+            .await
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Wrap the inner provider's `chat_with_system`.
+    pub async fn chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<String> {
+        use zeroclaw_log::Instrument;
+        let span = zeroclaw_log::attribution_span!(&*self.inner);
+        async move {
+            zeroclaw_log::scope!(
+                model: model,
+                => self.inner.chat_with_system(system_prompt, message, model, temperature)
+            )
+            .await
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Wrap the inner provider's `chat_with_history`.
+    pub async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<String> {
+        use zeroclaw_log::Instrument;
+        let span = zeroclaw_log::attribution_span!(&*self.inner);
+        async move {
+            zeroclaw_log::scope!(
+                model: model,
+                => self.inner.chat_with_history(messages, model, temperature)
+            )
+            .await
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Wrap the inner provider's `chat_with_tools`.
+    pub async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<ChatResponse> {
+        use zeroclaw_log::Instrument;
+        let span = zeroclaw_log::attribution_span!(&*self.inner);
+        async move {
+            zeroclaw_log::scope!(
+                model: model,
+                => self.inner.chat_with_tools(messages, tools, model, temperature)
+            )
+            .await
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Wrap the inner provider's `list_models`. No `model` parameter,
+    /// so attribution only — no `scope!(model: …)`.
+    pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        use zeroclaw_log::Instrument;
+        let span = zeroclaw_log::attribution_span!(&*self.inner);
+        self.inner.list_models().instrument(span).await
+    }
+
+    /// Wrap the inner provider's `list_models_with_pricing`. No `model`
+    /// parameter, so attribution only.
+    pub async fn list_models_with_pricing(&self) -> anyhow::Result<Vec<ModelInfo>> {
+        use zeroclaw_log::Instrument;
+        let span = zeroclaw_log::attribution_span!(&*self.inner);
+        self.inner.list_models_with_pricing().instrument(span).await
+    }
+
+    /// Wrap the inner provider's `warmup`. No `model` parameter, so
+    /// attribution only.
+    pub async fn warmup(&self) -> anyhow::Result<()> {
+        use zeroclaw_log::Instrument;
+        let span = zeroclaw_log::attribution_span!(&*self.inner);
+        self.inner.warmup().instrument(span).await
     }
 }
 
