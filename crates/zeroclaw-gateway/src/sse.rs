@@ -34,7 +34,7 @@ impl EventBuffer {
 
     /// Push an event into the buffer, evicting the oldest if at capacity.
     pub fn push(&self, event: serde_json::Value) {
-        let mut buf = self.inner.lock().unwrap();
+        let mut buf = self.inner.lock().expect("EventBuffer mutex not poisoned");
         if buf.len() == self.capacity {
             buf.pop_front();
         }
@@ -43,7 +43,7 @@ impl EventBuffer {
 
     /// Return a snapshot of all buffered events (oldest first).
     pub fn snapshot(&self) -> Vec<serde_json::Value> {
-        self.inner.lock().unwrap().iter().cloned().collect()
+        self.inner.lock().expect("EventBuffer mutex not poisoned").iter().cloned().collect()
     }
 }
 
