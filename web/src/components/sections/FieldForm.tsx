@@ -51,6 +51,7 @@ import {
   listProps,
   objectArrayElementProps,
   patchConfig,
+  resolveAliasSource,
   type AgentOptionsResponse,
   type ConfigApiError,
   type DriftEntry,
@@ -162,7 +163,7 @@ export interface FieldFormHandle {
 
 function rendererFor(
   entry: ListResponseEntry,
-): "bool" | "array" | "object-array" | "secret" | "select" | "number" | "text" {
+): "bool" | "array" | "object-array" | "secret" | "select" | "alias-ref" | "number" | "text" {
   if (entry.is_secret) return "secret";
   switch (entry.kind) {
     case "bool":
@@ -178,6 +179,11 @@ function rendererFor(
       return entry.enum_variants && entry.enum_variants.length > 0
         ? "select"
         : "text";
+    // Schema-driven alias reference (zeroclaw-labs/zeroclaw#7594). Dormant
+    // until the backend declares `PropKind::AliasRef`; until then no entry has
+    // this kind, so the per-section alias maps in FieldRow resolve refs.
+    case "alias-ref":
+      return "alias-ref";
     default:
       return "text";
   }
@@ -507,6 +513,25 @@ function loadAgentOptions(): Promise<AgentOptionsResponse> {
     agentOptionsPromise = null;
   });
   return agentOptionsPromise;
+}
+
+// Generic alias-source resolution with in-flight de-dupe, keyed by the wire
+// `alias_source` value. Backs the schema-driven `kind === 'alias-ref'` picker
+// from zeroclaw-labs/zeroclaw#7594. Dormant on backends that predate that PR
+// (they never emit `alias_source`, so loadAliasSource is never called); when
+// the backend does declare it, this resolves the live values generically with
+// no per-path special-casing, superseding the per-section maps below.
+const aliasSourcePromises: Record<string, Promise<string[]> | undefined> = {};
+function loadAliasSource(source: string): Promise<string[]> {
+  const inflight = aliasSourcePromises[source];
+  if (inflight) return inflight;
+  const p = resolveAliasSource(source)
+    .then((r) => r.values)
+    .finally(() => {
+      aliasSourcePromises[source] = undefined;
+    });
+  aliasSourcePromises[source] = p;
+  return p;
 }
 
 /// Clear the per-provider model catalog cache. Called by Config.tsx when
@@ -1355,6 +1380,31 @@ function FieldRow({
     };
   }, [agentNeedsOptions]);
 
+  // Generic alias-reference picker (zeroclaw-labs/zeroclaw#7594). Any field the
+  // schema types as `PropKind::AliasRef` carries `alias_source`; resolve its
+  // values from the live config with no per-path special-casing. Dormant on
+  // backends that predate #7594 — they never set `kind === 'alias-ref'`, so
+  // `aliasSource` is undefined and the effect is a no-op, leaving the maps
+  // above to resolve refs. When the backend does declare it, the
+  // `renderer === 'alias-ref'` branch takes precedence over those maps.
+  const aliasSource =
+    entry.kind === "alias-ref" ? entry.alias_source : undefined;
+  const [aliasValues, setAliasValues] = useState<string[] | null>(null);
+  useEffect(() => {
+    if (!aliasSource) return;
+    let cancelled = false;
+    void loadAliasSource(aliasSource)
+      .then((values) => {
+        if (!cancelled) setAliasValues(values);
+      })
+      .catch(() => {
+        if (!cancelled) setAliasValues([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [aliasSource]);
+
   if (tombstoned) {
     return (
       <div className="px-4 py-3 flex items-center justify-between gap-3 opacity-70">
@@ -1469,6 +1519,30 @@ function FieldRow({
               </option>
             ))}
           </select>
+        ) : renderer === "alias-ref" ? (
+          // Schema-driven alias-ref picker (zeroclaw-labs/zeroclaw#7594):
+          // a free-typeable input backed by a <datalist> of the live values
+          // resolved from `entry.alias_source`. Takes precedence over the
+          // per-section maps below; dormant until the backend emits this kind.
+          <>
+            <input
+              id={entry.path}
+              list={`alias-${entry.path}`}
+              value={value}
+              onChange={(e) => onChange(e.target.value)}
+              className="input-electric w-full px-3 py-2 text-sm"
+              placeholder={
+                aliasValues === null
+                  ? t("fieldform.alias_loading")
+                  : t("fieldform.alias_pick_or_type")
+              }
+            />
+            <datalist id={`alias-${entry.path}`}>
+              {(aliasValues ?? []).map((v) => (
+                <option key={v} value={v} />
+              ))}
+            </datalist>
+          </>
         ) : isProviderModelField &&
           providerModels !== null &&
           providerModels.length > 0 ? (

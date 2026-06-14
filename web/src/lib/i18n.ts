@@ -656,6 +656,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'fieldform.no_unsaved_changes': "No unsaved changes",
     'fieldform.option_none': "— (none)",
     'fieldform.optional_label': "optional",
+    'fieldform.alias_loading': "Loading options…",
+    'fieldform.alias_pick_or_type': "Pick from list or type a value",
     'fieldform.remove_entry': "Remove this entry",
     'fieldform.reset_to_default': "Reset to default / unset",
     'fieldform.save_failed_prefix': "Save failed: ",

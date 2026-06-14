@@ -366,6 +366,13 @@ export interface ListResponseEntry {
   is_secret: boolean;
   /** Variants for `kind === 'enum'` fields (drives <select> options). */
   enum_variants?: string[];
+  /**
+   * Alias namespace for `kind === 'alias-ref'` fields (drives the resolved
+   * picker). Emitted by the schema-driven `PropKind::AliasRef` backend from
+   * zeroclaw-labs/zeroclaw#7594; absent on backends that predate it, in which
+   * case FieldForm falls back to its per-section alias maps.
+   */
+  alias_source?: string;
   section?: string;
   /** Tab grouping from `ConfigTab` enum. Absent when `ConfigTab::None`. */
   tab?: string;
@@ -1204,6 +1211,26 @@ export interface AgentOptionsResponse {
 
 export function getAgentOptions(): Promise<AgentOptionsResponse> {
   return apiFetch<AgentOptionsResponse>("/api/config/agent-options");
+}
+
+export interface ResolveAliasSourceResponse {
+  source: string;
+  values: string[];
+}
+
+/**
+ * Resolve the live alias values for a schema-declared `alias_source`
+ * namespace. Backs the generic `kind === 'alias-ref'` picker introduced by
+ * zeroclaw-labs/zeroclaw#7594. The endpoint only exists on backends that
+ * declare `PropKind::AliasRef`; callers must gate on `entry.alias_source`
+ * being present so this is never hit on older daemons.
+ */
+export function resolveAliasSource(
+  source: string,
+): Promise<ResolveAliasSourceResponse> {
+  return apiFetch<ResolveAliasSourceResponse>(
+    `/api/config/resolve-alias-source?source=${encodeURIComponent(source)}`,
+  );
 }
 
 export interface PickerItem {
