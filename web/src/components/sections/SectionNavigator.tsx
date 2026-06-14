@@ -190,6 +190,10 @@ export default function SectionNavigator({
         })
         .catch((e) => {
           if (cancelled || reqSeq.current[key] !== seq) return;
+          // A failed load must not stay recorded as "loaded at this refreshKey",
+          // or the skip guard would block any retry until an unrelated refreshKey
+          // bump. Clear the stamp so the next effect run re-attempts this section.
+          delete loadedAtRefresh.current[key];
           setEntitiesBySection((prev) => ({
             ...prev,
             [key]: { error: e instanceof Error ? e.message : String(e) },

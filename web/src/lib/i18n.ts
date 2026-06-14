@@ -404,6 +404,13 @@ const translations: Record<Locale, Record<string, string>> = {
 
   en: {
     // ── i18n sweep: keys added by the conversion workflow ──
+    // Self-review follow-ups: singular forms for Doctor severity pills + the
+    // relative-time suffixes used by lib/format.ts formatRelative.
+    'doctor.severity_warning': "warning",
+    'doctor.severity_error': "error",
+    'agent.rel_minutes': "m ago",
+    'agent.rel_hours': "h ago",
+    'agent.rel_days': "d ago",
     'acp.agent_select_label': "ACP agent",
     'acp.agent_thought': "Agent thought",
     'acp.default_prompt': "Summarize the current ZeroClaw gateway state in one paragraph.",

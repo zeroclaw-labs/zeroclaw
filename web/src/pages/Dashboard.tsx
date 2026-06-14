@@ -1344,7 +1344,13 @@ function SessionsTab() {
         message={`${t("dashboard.confirm_delete_session_prefix")} ${pendingDelete?.session_id ?? ""}${t("dashboard.confirm_delete_suffix")}`}
         confirmLabel={t("common.delete")}
         onConfirm={() => {
-          if (pendingDelete) void handleDelete(pendingDelete);
+          // Close the dialog first (capturing the target): a confirm clicked
+          // while an earlier delete is still in flight would otherwise hit
+          // handleDelete's `if (deleting) return` and never clear pendingDelete,
+          // leaving the dialog stuck open.
+          const target = pendingDelete;
+          setPendingDelete(null);
+          if (target) void handleDelete(target);
         }}
         onClose={() => setPendingDelete(null)}
       />
@@ -2601,7 +2607,13 @@ function MemoriesTab() {
         message={`${t("dashboard.mem.confirm_delete_prefix")} ${pendingDelete?.key ?? ""}${t("dashboard.confirm_delete_suffix")}`}
         confirmLabel={t("common.delete")}
         onConfirm={() => {
-          if (pendingDelete) void handleDelete(pendingDelete);
+          // Close the dialog first (capturing the target): a confirm clicked
+          // while an earlier delete is still in flight would otherwise hit
+          // handleDelete's `if (deleting) return` and never clear pendingDelete,
+          // leaving the dialog stuck open.
+          const target = pendingDelete;
+          setPendingDelete(null);
+          if (target) void handleDelete(target);
         }}
         onClose={() => setPendingDelete(null)}
       />

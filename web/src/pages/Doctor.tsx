@@ -264,14 +264,14 @@ export default function Doctor() {
             <SeverityFilterToggle
               active={!hidden.has('warn')}
               count={warnCount}
-              label={t('doctor.severity_warnings')}
+              label={warnCount !== 1 ? t('doctor.severity_warnings') : t('doctor.severity_warning')}
               icon={<AlertTriangle className="h-5 w-5 text-status-warning" />}
               onToggle={() => toggleSeverity('warn')}
             />
             <SeverityFilterToggle
               active={!hidden.has('error')}
               count={errorCount}
-              label={t('doctor.severity_errors')}
+              label={errorCount !== 1 ? t('doctor.severity_errors') : t('doctor.severity_error')}
               icon={<XCircle className="h-5 w-5 text-status-error" />}
               onToggle={() => toggleSeverity('error')}
             />
