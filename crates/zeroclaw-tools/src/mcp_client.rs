@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::json;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, timeout};
@@ -117,9 +117,19 @@ impl McpServer {
             )
         })??;
 
-        let result = list_resp
-            .result
-            .ok_or_else(|| anyhow!("tools/list returned no result from `{}`", config.name))?;
+        let result = list_resp.result.ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"mcp_server": &config.name})),
+                "mcp_client: tools/list returned no result"
+            );
+            anyhow::Error::msg(format!(
+                "tools/list returned no result from `{}`",
+                config.name
+            ))
+        })?;
         let tool_list: McpToolsListResult = serde_json::from_value(result)
             .with_context(|| format!("failed to parse tools/list from `{}`", config.name))?;
 
@@ -135,10 +145,13 @@ impl McpServer {
             tools: tool_list.tools,
         };
 
-        tracing::info!(
-            "MCP server `{}` connected — {} tool(s) available",
-            inner.config.name,
-            tool_count
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "MCP server `{}` connected — {} tool(s) available",
+                inner.config.name, tool_count
+            )
         );
 
         Ok(Self {
@@ -184,11 +197,21 @@ impl McpServer {
         )
         .await
         .map_err(|_| {
-            anyhow!(
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Timeout)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "mcp_server": &inner.config.name,
+                        "tool": tool_name,
+                        "timeout_secs": tool_timeout,
+                    })),
+                "mcp_client: tool call timed out"
+            );
+            anyhow::Error::msg(format!(
                 "MCP server `{}` timed out after {}s during tool call `{tool_name}`",
-                inner.config.name,
-                tool_timeout
-            )
+                inner.config.name, tool_timeout
+            ))
         })?
         .with_context(|| {
             format!(
@@ -200,7 +223,49 @@ impl McpServer {
         if let Some(err) = resp.error {
             bail!("MCP tool `{tool_name}` error {}: {}", err.code, err.message);
         }
-        Ok(resp.result.unwrap_or(serde_json::Value::Null))
+
+        let result = resp.result.unwrap_or(serde_json::Value::Null);
+
+        // MCP servers signal *tool-execution* failures (as opposed to JSON-RPC
+        // protocol errors) with HTTP 200 + `result.isError: true` and the detail
+        // in `result.content[].text`, per the MCP spec. Without surfacing this,
+        // the error envelope is returned as a normal success — so the failure is
+        // invisible to the model and the daemon log, and callers only ever see a
+        // generic "error during tool call" with no detail.
+        if result.get("isError").and_then(serde_json::Value::as_bool) == Some(true) {
+            let detail = result
+                .get("content")
+                .and_then(|c| c.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .filter(|s: &String| !s.is_empty())
+                .unwrap_or_else(|| "(no error detail returned by server)".to_string());
+            // Server-controlled text: scrub secrets (sk-/ghp_/…) and bound length
+            // (`sanitize_api_error` truncates to MAX_API_ERROR_CHARS) before it
+            // reaches the daemon log or the returned error.
+            let detail = zeroclaw_providers::sanitize_api_error(&detail);
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "mcp_server": &inner.config.name,
+                        "tool": tool_name,
+                        "detail": &detail,
+                    })),
+                "mcp_client: tool returned isError:true"
+            );
+            bail!(
+                "MCP tool `{tool_name}` (server `{}`) returned isError: {detail}",
+                inner.config.name
+            );
+        }
+
+        Ok(result)
     }
 }
 
@@ -234,7 +299,12 @@ impl McpRegistry {
                 }
                 // Non-fatal — log and continue with remaining servers
                 Err(e) => {
-                    tracing::error!("Failed to connect to MCP server `{}`: {:#}", config.name, e);
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                        &format!("Failed to connect to MCP server `{}`: {:#}", config.name, e)
+                    );
                 }
             }
         }
@@ -267,10 +337,16 @@ impl McpRegistry {
         prefixed_name: &str,
         arguments: serde_json::Value,
     ) -> Result<String> {
-        let (server_idx, original_name) = self
-            .tool_index
-            .get(prefixed_name)
-            .ok_or_else(|| anyhow!("unknown MCP tool `{prefixed_name}`"))?;
+        let (server_idx, original_name) = self.tool_index.get(prefixed_name).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"tool": prefixed_name})),
+                "mcp_client: unknown MCP tool"
+            );
+            anyhow::Error::msg(format!("unknown MCP tool `{prefixed_name}`"))
+        })?;
         let result = self.servers[*server_idx]
             .call_tool(original_name, arguments)
             .await?;
@@ -413,5 +489,240 @@ mod tests {
         assert_eq!(registry.server_count(), 0);
         assert_eq!(registry.tool_count(), 0);
         assert!(registry.is_empty());
+    }
+
+    // ── McpServer::call_tool isError handling ──────────────────────────────
+    //
+    // These exercise the `result.isError == true` branch added to the
+    // *inherent* `McpServer::call_tool` (the one that talks to the transport,
+    // not the `McpRegistry::call_tool` wrapper). A fake transport returns a
+    // canned result so no live server is needed.
+
+    /// Transport that ignores the request and always returns one preset result.
+    struct FakeTransport {
+        result: serde_json::Value,
+    }
+
+    #[async_trait::async_trait]
+    impl McpTransportConn for FakeTransport {
+        async fn send_and_recv(
+            &mut self,
+            _request: &JsonRpcRequest,
+        ) -> Result<crate::mcp_protocol::JsonRpcResponse> {
+            Ok(crate::mcp_protocol::JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: Some(serde_json::json!(1)),
+                result: Some(self.result.clone()),
+                error: None,
+            })
+        }
+
+        async fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Build an `McpServer` whose transport yields `result` on every call.
+    fn server_returning(result: serde_json::Value) -> McpServer {
+        let inner = McpServerInner {
+            config: McpServerConfig {
+                name: "fake".into(),
+                ..Default::default()
+            },
+            transport: Box::new(FakeTransport { result }),
+            #[cfg(target_has_atomic = "64")]
+            next_id: AtomicU64::new(3),
+            #[cfg(not(target_has_atomic = "64"))]
+            next_id: AtomicU32::new(3),
+            tools: vec![],
+        };
+        McpServer {
+            inner: Arc::new(Mutex::new(inner)),
+        }
+    }
+
+    #[tokio::test]
+    async fn call_tool_iserror_err_is_sanitized_and_bounded() {
+        // A secret token in the server-controlled detail must be redacted
+        // before it reaches the returned error (and, by the same code path,
+        // the daemon log).
+        let server = server_returning(serde_json::json!({
+            "isError": true,
+            "content": [{ "type": "text", "text": "auth failed using sk-supersecrettoken12345abcdef" }],
+        }));
+        let err = server
+            .call_tool("do_thing", serde_json::json!({}))
+            .await
+            .expect_err("isError:true must map to Err");
+        let msg = err.to_string();
+        assert!(msg.contains("returned isError"), "got: {msg}");
+        assert!(msg.contains("[REDACTED]"), "secret not scrubbed: {msg}");
+        assert!(
+            !msg.contains("supersecrettoken"),
+            "raw secret leaked: {msg}"
+        );
+
+        // Oversized server text must be truncated; sanitize_api_error caps the
+        // detail at 500 chars and appends an ellipsis.
+        let huge = "A".repeat(5000);
+        let server = server_returning(serde_json::json!({
+            "isError": true,
+            "content": [{ "type": "text", "text": huge }],
+        }));
+        let msg = server
+            .call_tool("do_thing", serde_json::json!({}))
+            .await
+            .expect_err("isError:true must map to Err")
+            .to_string();
+        assert!(
+            msg.contains("..."),
+            "bounded detail should be truncated: {msg}"
+        );
+        assert!(
+            msg.len() < 1000,
+            "5000-char payload not bounded: len={}",
+            msg.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn call_tool_success_returns_ok_result() {
+        // isError absent → Ok with the raw result untouched.
+        let payload = serde_json::json!({
+            "content": [{ "type": "text", "text": "all good" }],
+        });
+        let out = server_returning(payload.clone())
+            .call_tool("do_thing", serde_json::json!({}))
+            .await
+            .expect("absent isError must be Ok");
+        assert_eq!(out, payload);
+
+        // isError explicitly false → still Ok.
+        let payload = serde_json::json!({ "isError": false, "value": 42 });
+        let out = server_returning(payload.clone())
+            .call_tool("do_thing", serde_json::json!({}))
+            .await
+            .expect("isError:false must be Ok");
+        assert_eq!(out, payload);
+    }
+
+    #[tokio::test]
+    async fn call_tool_iserror_empty_detail_falls_back() {
+        // isError true but no content array → fallback message.
+        let msg = server_returning(serde_json::json!({ "isError": true }))
+            .call_tool("do_thing", serde_json::json!({}))
+            .await
+            .expect_err("isError:true must map to Err")
+            .to_string();
+        assert!(
+            msg.contains("(no error detail returned by server)"),
+            "got: {msg}"
+        );
+
+        // isError true with content present but empty text → same fallback.
+        let msg = server_returning(serde_json::json!({
+            "isError": true,
+            "content": [{ "type": "text", "text": "" }],
+        }))
+        .call_tool("do_thing", serde_json::json!({}))
+        .await
+        .expect_err("isError:true must map to Err")
+        .to_string();
+        assert!(
+            msg.contains("(no error detail returned by server)"),
+            "got: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_stdio_registry_reaps_child_process() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::Path;
+        use tokio::time::{Duration, sleep};
+
+        fn process_is_alive(pid: u32) -> bool {
+            std::process::Command::new("kill")
+                .arg("-0")
+                .arg(pid.to_string())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        }
+
+        async fn read_pid(path: &Path) -> u32 {
+            for _ in 0..50 {
+                if let Ok(raw) = tokio::fs::read_to_string(path).await
+                    && let Ok(pid) = raw.trim().parse()
+                {
+                    return pid;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+            panic!("stdio MCP test server did not write its pid");
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let server_path = temp.path().join("echo-mcp.sh");
+        let pid_path = temp.path().join("echo-mcp.pid");
+        let mut script = std::fs::File::create(&server_path).expect("script");
+        script
+            .write_all(
+                br#"#!/bin/sh
+echo "$$" > "$1"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"echo-mcp","version":"0.1.0"}}}'
+      ;;
+    *'"method":"tools/list"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}'
+      exec tail -f /dev/null
+      ;;
+  esac
+done
+"#,
+            )
+            .expect("write script");
+        drop(script);
+        let mut perms = std::fs::metadata(&server_path)
+            .expect("metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&server_path, perms).expect("chmod");
+
+        let config = McpServerConfig {
+            name: "echo".to_string(),
+            command: server_path.display().to_string(),
+            args: vec![pid_path.display().to_string()],
+            env: std::collections::HashMap::default(),
+            tool_timeout_secs: None,
+            transport: McpTransport::Stdio,
+            url: None,
+            headers: std::collections::HashMap::default(),
+        };
+
+        let registry = McpRegistry::connect_all(&[config])
+            .await
+            .expect("connect_all should not fail");
+        assert_eq!(registry.server_count(), 1);
+        assert_eq!(registry.tool_count(), 0);
+        let child_pid = read_pid(&pid_path).await;
+        assert!(
+            process_is_alive(child_pid),
+            "stdio MCP child should be alive while the registry is alive"
+        );
+
+        drop(registry);
+
+        for _ in 0..50 {
+            if !process_is_alive(child_pid) {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        panic!("stdio MCP child process {child_pid} survived after registry drop");
     }
 }

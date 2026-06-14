@@ -1,5 +1,5 @@
 use super::sqlite::SqliteMemory;
-use super::traits::{Memory, MemoryCategory, MemoryEntry};
+use super::traits::{Memory, MemoryCategory, MemoryEntry, normalize_recent_recall_query};
 use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::Mutex;
@@ -10,6 +10,7 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 pub struct LucidMemory {
+    alias: String,
     local: SqliteMemory,
     lucid_cmd: String,
     token_budget: usize,
@@ -31,53 +32,25 @@ impl LucidMemory {
     const DEFAULT_LOCAL_HIT_THRESHOLD: usize = 3;
     const DEFAULT_FAILURE_COOLDOWN_MS: u64 = 15_000;
 
-    pub fn new(workspace_dir: &Path, local: SqliteMemory) -> Self {
-        let lucid_cmd = std::env::var("ZEROCLAW_LUCID_CMD")
-            .unwrap_or_else(|_| Self::DEFAULT_LUCID_CMD.to_string());
-
-        let token_budget = std::env::var("ZEROCLAW_LUCID_BUDGET")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(Self::DEFAULT_TOKEN_BUDGET);
-
-        let recall_timeout = Self::read_env_duration_ms(
-            "ZEROCLAW_LUCID_RECALL_TIMEOUT_MS",
-            Self::DEFAULT_RECALL_TIMEOUT_MS,
-            20,
-        );
-        let store_timeout = Self::read_env_duration_ms(
-            "ZEROCLAW_LUCID_STORE_TIMEOUT_MS",
-            Self::DEFAULT_STORE_TIMEOUT_MS,
-            50,
-        );
-        let local_hit_threshold = Self::read_env_usize(
-            "ZEROCLAW_LUCID_LOCAL_HIT_THRESHOLD",
-            Self::DEFAULT_LOCAL_HIT_THRESHOLD,
-            1,
-        );
-        let failure_cooldown = Self::read_env_duration_ms(
-            "ZEROCLAW_LUCID_FAILURE_COOLDOWN_MS",
-            Self::DEFAULT_FAILURE_COOLDOWN_MS,
-            100,
-        );
-
+    pub fn new(alias: &str, workspace_dir: &Path, local: SqliteMemory) -> Self {
         Self {
+            alias: alias.to_string(),
             local,
-            lucid_cmd,
-            token_budget,
+            lucid_cmd: Self::DEFAULT_LUCID_CMD.to_string(),
+            token_budget: Self::DEFAULT_TOKEN_BUDGET,
             workspace_dir: workspace_dir.to_path_buf(),
-            recall_timeout,
-            store_timeout,
-            local_hit_threshold,
-            failure_cooldown,
+            recall_timeout: Duration::from_millis(Self::DEFAULT_RECALL_TIMEOUT_MS),
+            store_timeout: Duration::from_millis(Self::DEFAULT_STORE_TIMEOUT_MS),
+            local_hit_threshold: Self::DEFAULT_LOCAL_HIT_THRESHOLD,
+            failure_cooldown: Duration::from_millis(Self::DEFAULT_FAILURE_COOLDOWN_MS),
             last_failure_at: Mutex::new(None),
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     #[allow(clippy::too_many_arguments)]
     fn with_options(
+        alias: &str,
         workspace_dir: &Path,
         local: SqliteMemory,
         lucid_cmd: String,
@@ -88,6 +61,7 @@ impl LucidMemory {
         failure_cooldown: Duration,
     ) -> Self {
         Self {
+            alias: alias.to_string(),
             local,
             lucid_cmd,
             token_budget,
@@ -98,21 +72,6 @@ impl LucidMemory {
             failure_cooldown,
             last_failure_at: Mutex::new(None),
         }
-    }
-
-    fn read_env_usize(name: &str, default: usize, min: usize) -> usize {
-        std::env::var(name)
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .map_or(default, |v| v.max(min))
-    }
-
-    fn read_env_duration_ms(name: &str, default_ms: u64, min_ms: u64) -> Duration {
-        let millis = std::env::var(name)
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .map_or(default_ms, |v| v.max(min_ms));
-        Duration::from_millis(millis)
     }
 
     fn in_failure_cooldown(&self) -> bool {
@@ -229,6 +188,8 @@ impl LucidMemory {
                 namespace: "default".into(),
                 importance: None,
                 superseded_by: None,
+                agent_alias: None,
+                agent_id: None,
             });
         }
 
@@ -244,10 +205,20 @@ impl LucidMemory {
         cmd.args(args);
 
         let output = timeout(timeout_window, cmd.output()).await.map_err(|_| {
-            anyhow::anyhow!(
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Timeout)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "command": lucid_cmd,
+                        "timeout_ms": timeout_window.as_millis() as u64,
+                    })),
+                "lucid command timed out"
+            );
+            anyhow::Error::msg(format!(
                 "lucid command timed out after {}ms",
                 timeout_window.as_millis()
-            )
+            ))
         })??;
 
         if !output.status.success() {
@@ -272,7 +243,7 @@ impl LucidMemory {
             "store".to_string(),
             payload,
             format!("--type={}", Self::to_lucid_type(category)),
-            format!("--project={}", self.workspace_dir.display()),
+            format!("--project={}", self.workspace_dir.display().to_string()),
         ]
     }
 
@@ -281,16 +252,19 @@ impl LucidMemory {
             "context".to_string(),
             query.to_string(),
             format!("--budget={}", self.token_budget),
-            format!("--project={}", self.workspace_dir.display()),
+            format!("--project={}", self.workspace_dir.display().to_string()),
         ]
     }
 
     async fn sync_to_lucid_async(&self, key: &str, content: &str, category: &MemoryCategory) {
         let args = self.build_store_args(key, content, category);
         if let Err(error) = self.run_lucid_command(&args, self.store_timeout).await {
-            tracing::debug!(
-                command = %self.lucid_cmd,
-                error = %error,
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(
+                        ::serde_json::json!({"command": self.lucid_cmd, "error": format!("{}", error)})
+                    ),
                 "Lucid store sync failed; sqlite remains authoritative"
             );
         }
@@ -334,20 +308,44 @@ impl Memory for LucidMemory {
         let since_dt = since
             .map(chrono::DateTime::parse_from_rfc3339)
             .transpose()
-            .map_err(|e| anyhow::anyhow!("invalid 'since' date (expected RFC 3339): {e}"))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(
+                            ::serde_json::json!({"field": "since", "error": format!("{}", e)})
+                        ),
+                    "recall window bound rejected"
+                );
+                anyhow::Error::msg(format!("invalid 'since' date (expected RFC 3339): {e}"))
+            })?;
         let until_dt = until
             .map(chrono::DateTime::parse_from_rfc3339)
             .transpose()
-            .map_err(|e| anyhow::anyhow!("invalid 'until' date (expected RFC 3339): {e}"))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(
+                            ::serde_json::json!({"field": "until", "error": format!("{}", e)})
+                        ),
+                    "recall window bound rejected"
+                );
+                anyhow::Error::msg(format!("invalid 'until' date (expected RFC 3339): {e}"))
+            })?;
         if let (Some(s), Some(u)) = (&since_dt, &until_dt)
             && s >= u
         {
             anyhow::bail!("'since' must be before 'until'");
         }
 
+        let recall_query = normalize_recent_recall_query(query);
+
         let local_results = self
             .local
-            .recall(query, limit, session_id, since, until)
+            .recall(recall_query, limit, session_id, since, until)
             .await?;
         if limit == 0
             || local_results.len() >= limit
@@ -360,7 +358,7 @@ impl Memory for LucidMemory {
             return Ok(local_results);
         }
 
-        match self.recall_from_lucid(query).await {
+        match self.recall_from_lucid(recall_query).await {
             Ok(lucid_results) if !lucid_results.is_empty() => {
                 self.clear_failure();
                 let merged = Self::merge_results(local_results, lucid_results, limit);
@@ -390,11 +388,7 @@ impl Memory for LucidMemory {
             }
             Err(error) => {
                 self.mark_failure_now();
-                tracing::debug!(
-                    command = %self.lucid_cmd,
-                    error = %error,
-                    "Lucid context unavailable; using local sqlite results"
-                );
+                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"command": self.lucid_cmd, "error": format!("{}", error)})), "Lucid context unavailable; using local sqlite results");
                 Ok(local_results)
             }
         }
@@ -402,6 +396,14 @@ impl Memory for LucidMemory {
 
     async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
         self.local.get(key).await
+    }
+
+    async fn get_for_agent(
+        &self,
+        key: &str,
+        agent_id: &str,
+    ) -> anyhow::Result<Option<MemoryEntry>> {
+        self.local.get_for_agent(key, agent_id).await
     }
 
     async fn list(
@@ -416,12 +418,79 @@ impl Memory for LucidMemory {
         self.local.forget(key).await
     }
 
+    async fn forget_for_agent(&self, key: &str, agent_id: &str) -> anyhow::Result<bool> {
+        self.local.forget_for_agent(key, agent_id).await
+    }
+
+    async fn purge_session_for_agent(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+    ) -> anyhow::Result<usize> {
+        self.local
+            .purge_session_for_agent(session_id, agent_id)
+            .await
+    }
+
     async fn count(&self) -> anyhow::Result<usize> {
         self.local.count().await
     }
 
     async fn health_check(&self) -> bool {
         self.local.health_check().await
+    }
+
+    async fn store_with_agent(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        namespace: Option<&str>,
+        importance: Option<f64>,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        // Lucid composes a local SqliteMemory + a remote Lucid daemon; the
+        // remote side has no agent_id concept, so the attribution lives
+        // only on the local SQLite mirror. The async sync to the daemon
+        // continues unchanged.
+        self.local
+            .store_with_agent(
+                key,
+                content,
+                category.clone(),
+                session_id,
+                namespace,
+                importance,
+                agent_id,
+            )
+            .await?;
+        self.sync_to_lucid_async(key, content, &category).await;
+        Ok(())
+    }
+
+    async fn recall_for_agents(
+        &self,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        // Lucid's remote-daemon recall has no agent_id awareness; the
+        // cross-agent allowlist is enforced on the local SQLite mirror
+        // only. If the local hits clear the threshold the remote leg
+        // never runs (matching `recall`'s short-circuit semantics).
+        self.local
+            .recall_for_agents(allowed_agent_ids, query, limit, session_id, since, until)
+            .await
+    }
+
+    async fn ensure_agent_uuid(&self, alias: &str) -> anyhow::Result<String> {
+        // Lucid's remote daemon has no agents table; the local SQLite
+        // mirror is the canonical agents-table store.
+        self.local.ensure_agent_uuid(alias).await
     }
 }
 
@@ -531,8 +600,9 @@ exit 1
     }
 
     fn test_memory(workspace: &Path, cmd: String) -> LucidMemory {
-        let sqlite = SqliteMemory::new(workspace).unwrap();
+        let sqlite = SqliteMemory::new("sqlite", workspace).unwrap();
         LucidMemory::with_options(
+            "test",
             workspace,
             sqlite,
             cmd,
@@ -628,8 +698,9 @@ exit 1
         let marker = tmp.path().join("context_calls.log");
         let probe_cmd = write_probe_lucid_script(tmp.path(), &marker);
 
-        let sqlite = SqliteMemory::new(tmp.path()).unwrap();
+        let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
         let memory = LucidMemory::with_options(
+            "test",
             tmp.path(),
             sqlite,
             probe_cmd,
@@ -700,8 +771,9 @@ exit 1
         let marker = tmp.path().join("failing_context_calls.log");
         let failing_cmd = write_failing_lucid_script(tmp.path(), &marker);
 
-        let sqlite = SqliteMemory::new(tmp.path()).unwrap();
+        let sqlite = SqliteMemory::new("test", tmp.path()).unwrap();
         let memory = LucidMemory::with_options(
+            "test",
             tmp.path(),
             sqlite,
             failing_cmd,
@@ -720,5 +792,14 @@ exit 1
 
         let calls = tokio::fs::read_to_string(&marker).await.unwrap_or_default();
         assert_eq!(calls.lines().count(), 1);
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for LucidMemory {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Memory(::zeroclaw_api::attribution::MemoryKind::Lucid)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }

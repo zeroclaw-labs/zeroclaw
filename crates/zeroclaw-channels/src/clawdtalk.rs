@@ -1,6 +1,6 @@
 //! ClawdTalk voice channel - real-time voice calling via Telnyx SIP infrastructure.
 //!
-//! ClawdTalk (https://clawdtalk.com) provides AI-powered voice conversations
+//! ClawdTalk (<https://clawdtalk.com>) provides AI-powered voice conversations
 //! using Telnyx's global SIP network for low-latency, high-quality calls.
 
 use async_trait::async_trait;
@@ -21,26 +21,26 @@ pub struct ClawdTalkChannel {
     from_number: String,
     /// Allowed destination numbers/patterns
     allowed_destinations: Vec<String>,
+    /// The alias key under `[channels.clawdtalk.<alias>]` this handle is
+    /// bound to. Used for attribution.
+    alias: String,
     /// HTTP client for Telnyx API
     client: Client,
-    /// Webhook secret for verifying incoming calls (used during webhook verification)
-    #[allow(dead_code)]
-    webhook_secret: Option<String>,
 }
 
 impl ClawdTalkChannel {
     /// Create a new ClawdTalk channel
-    pub fn new(config: ClawdTalkConfig) -> Self {
+    pub fn new(alias: impl Into<String>, config: ClawdTalkConfig) -> Self {
         Self {
             api_key: config.api_key,
             connection_id: config.connection_id,
             from_number: config.from_number,
             allowed_destinations: config.allowed_destinations,
+            alias: alias.into(),
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
-            webhook_secret: config.webhook_secret,
         }
     }
 
@@ -148,7 +148,12 @@ impl ClawdTalkChannel {
 
         if !response.status().is_success() {
             let error = response.text().await?;
-            tracing::warn!("Failed to hangup call: {}", error);
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!("Failed to hangup call: {}", error)
+            );
         }
 
         Ok(())
@@ -251,6 +256,17 @@ struct VoiceSettings {
     speed: f32,
 }
 
+impl ::zeroclaw_api::attribution::Attributable for ClawdTalkChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::ClawdTalk,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[async_trait]
 impl Channel for ClawdTalkChannel {
     fn name(&self) -> &str {
@@ -279,7 +295,11 @@ impl Channel for ClawdTalkChannel {
         // ClawdTalk listens for incoming calls via webhooks
         // This would typically be handled by the gateway module
         // For now, we signal that this channel is ready and wait indefinitely
-        tracing::info!("ClawdTalk channel listening for incoming calls");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "channel listening for incoming calls"
+        );
 
         // Keep the listener alive
         loop {
@@ -306,7 +326,13 @@ impl Channel for ClawdTalkChannel {
         match response {
             Ok(resp) => resp.status().is_success(),
             Err(e) => {
-                tracing::warn!("ClawdTalk health check failed: {}", e);
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "health check failed"
+                );
                 false
             }
         }
@@ -348,18 +374,19 @@ mod tests {
             from_number: "+15551234567".to_string(),
             allowed_destinations: vec!["+1555".to_string()],
             webhook_secret: None,
+            excluded_tools: vec![],
         }
     }
 
     #[test]
     fn creates_channel() {
-        let channel = ClawdTalkChannel::new(test_config());
+        let channel = ClawdTalkChannel::new("testbot", test_config());
         assert_eq!(channel.name(), "ClawdTalk");
     }
 
     #[test]
     fn destination_allowed_exact_match() {
-        let channel = ClawdTalkChannel::new(test_config());
+        let channel = ClawdTalkChannel::new("testbot", test_config());
         assert!(channel.is_destination_allowed("+15559876543"));
         assert!(!channel.is_destination_allowed("+14449876543"));
     }
@@ -368,7 +395,7 @@ mod tests {
     fn destination_allowed_wildcard() {
         let mut config = test_config();
         config.allowed_destinations = vec!["*".to_string()];
-        let channel = ClawdTalkChannel::new(config);
+        let channel = ClawdTalkChannel::new("testbot", config);
         assert!(channel.is_destination_allowed("+15559876543"));
         assert!(channel.is_destination_allowed("+14449876543"));
     }
@@ -377,7 +404,7 @@ mod tests {
     fn destination_allowed_empty_means_all() {
         let mut config = test_config();
         config.allowed_destinations = vec![];
-        let channel = ClawdTalkChannel::new(config);
+        let channel = ClawdTalkChannel::new("testbot", config);
         assert!(channel.is_destination_allowed("+15559876543"));
         assert!(channel.is_destination_allowed("+14449876543"));
     }

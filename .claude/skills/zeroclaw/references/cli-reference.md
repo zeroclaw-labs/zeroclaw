@@ -25,12 +25,14 @@ Complete command reference for the `zeroclaw` binary.
 Interactive chat or single-message mode.
 
 ```bash
-zeroclaw agent                                          # Interactive REPL
-zeroclaw agent -m "Summarize today's logs"              # Single message
-zeroclaw agent -p anthropic --model claude-sonnet-4-6   # Override provider/model
-zeroclaw agent -t 0.3                                   # Set temperature
-zeroclaw agent --peripheral nucleo-f401re:/dev/ttyACM0  # Attach hardware
+zeroclaw agent -a assistant                                          # Interactive REPL
+zeroclaw agent -a assistant -m "Summarize today's logs"              # Single message
+zeroclaw agent -a assistant -p anthropic --model claude-sonnet-4-6   # Override provider/model
+zeroclaw agent -a assistant -t 0.3                                   # Set temperature
+zeroclaw agent -a assistant --peripheral nucleo-f401re:/dev/ttyACM0  # Attach hardware
 ```
+
+`-a <alias>` is required and must match a configured `[agents.<alias>]` entry — there is no default agent.
 
 **Key flags:**
 - `-m <message>` — single message mode (no REPL)
@@ -43,28 +45,24 @@ The agent has access to 30+ tools gated by security policy: shell, file_read, fi
 
 ---
 
-## Onboarding
+## Quickstart
 
-First-time setup or reconfiguration.
+First-time setup. Picks a model provider, writes a working `~/.zeroclaw/config.toml`, and binds one agent to that provider in a single shot.
 
 ```bash
-zeroclaw onboard                                 # Quick mode (default: openrouter)
-zeroclaw onboard --provider anthropic            # Quick mode with specific provider
-zeroclaw onboard                                 # Guided wizard (default)
-zeroclaw onboard --memory sqlite                 # Set memory backend
-zeroclaw onboard --force                         # Overwrite existing config
-zeroclaw onboard --channels-only                 # Repair channels only
+zeroclaw quickstart                                                           # Interactive prompts
+zeroclaw quickstart --model-provider ollama --model qwen2.5:7b                # Non-interactive (local)
+zeroclaw quickstart --model-provider openrouter --model openrouter/auto \
+                    --api-key sk-or-... --agent or                            # Non-interactive (hosted)
 ```
 
-**Key flags:**
-- `--provider <name>` — openrouter (default), anthropic, openai, ollama
-- `--model <model>` — default model
-- `--memory <backend>` — sqlite, markdown, lucid, none
-- `--force` — overwrite existing config.toml
-- `--channels-only` — only repair channel configuration
-- `--reinit` — start fresh (backs up existing config)
+**Flags:**
+- `--model-provider <name>` — anthropic, openai, openrouter, ollama, gemini, glm, telnyx, …
+- `--model <id>` — model id to write for the new provider entry
+- `--api-key <key>` — API key (omit for local providers like ollama)
+- `--agent <alias>` — agent alias (defaults to a sanitized provider name)
 
-Creates `~/.zeroclaw/config.toml` with `0600` permissions.
+Creates `~/.zeroclaw/config.toml` with `0600` permissions. Quickstart is idempotent — re-running it on a configured install leaves the existing config alone. To change one field afterward, use `zeroclaw config set <key>=<value>`; to reconfigure channels, use `zeroclaw config set channels.<name>.<field>=<value>` (per-channel guides live under [Channels → Overview](../../docs/book/src/channels/overview.md)).
 
 ---
 
@@ -129,10 +127,11 @@ zeroclaw models status                            # Current model info
 ```
 
 Model routing in config.toml:
+
 ```toml
 [[model_routes]]
 hint = "reasoning"
-provider = "openrouter"
+model_provider = "openrouter"
 model = "anthropic/claude-sonnet-4-6"
 ```
 
@@ -215,13 +214,16 @@ zeroclaw estop resume --network                              # Resume (may requi
 - `domain-block` — blocks specific domain patterns
 - `tool-freeze` — freezes individual tools
 
-Autonomy config in config.toml:
+Autonomy lives on a risk profile and a runtime profile, both alias-keyed; the agent points at them via `[agents.<alias>] risk_profile = "..."` and `runtime_profile = "..."`:
+
 ```toml
-[autonomy]
-level = "supervised"                           # read_only | supervised | full
+[risk_profiles.assistant]
+level = "supervised"                           # readonly | supervised | full
 workspace_only = true
 allowed_commands = ["git", "cargo", "python"]
 forbidden_paths = ["/etc", "/root", "~/.ssh"]
+
+[runtime_profiles.assistant]
 max_actions_per_hour = 20
 max_cost_per_day_cents = 500
 ```
@@ -241,7 +243,7 @@ zeroclaw peripheral flash --port /dev/cu.usbmodem101    # Flash Arduino firmware
 
 **Supported boards:** STM32 Nucleo-F401RE, Arduino Uno R4, Raspberry Pi GPIO, ESP32.
 
-Attach to agent session: `zeroclaw agent --peripheral nucleo-f401re:/dev/ttyACM0`
+Attach to agent session: `zeroclaw agent -a assistant --peripheral nucleo-f401re:/dev/ttyACM0`
 
 ---
 

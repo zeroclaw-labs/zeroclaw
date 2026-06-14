@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, Transport};
-use tracing::{info, warn};
 
 use zeroclaw_config::schema::MqttConfig;
 use zeroclaw_runtime::sop::audit::SopAuditLogger;
@@ -40,7 +39,11 @@ pub async fn run_mqtt_sop_listener(
     // Configure TLS transport when mqtts:// scheme is used
     if config.use_tls {
         mqtt_options.set_transport(Transport::tls_with_default_config());
-        info!("MQTT SOP listener: TLS transport enabled");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "MQTT SOP listener: TLS transport enabled"
+        );
     }
 
     let (client, mut eventloop) = AsyncClient::new(mqtt_options, 64);
@@ -54,7 +57,12 @@ pub async fn run_mqtt_sop_listener(
     // Subscribe to all configured topics
     for topic in &config.topics {
         client.subscribe(topic, qos).await?;
-        info!("MQTT SOP listener: subscribed to '{topic}'");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"topic": topic})),
+            "MQTT SOP listener: subscribed to ''"
+        );
     }
 
     zeroclaw_runtime::health::mark_component_ok("mqtt");
@@ -77,14 +85,24 @@ pub async fn run_mqtt_sop_listener(
             }
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
                 zeroclaw_runtime::health::mark_component_ok("mqtt");
-                info!("MQTT SOP listener: connected to broker");
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "MQTT SOP listener: connected to broker"
+                );
             }
             Ok(_) => {
                 // Other events (PingResp, SubAck, etc.) — ignore
             }
             Err(e) => {
                 zeroclaw_runtime::health::mark_component_error("mqtt", e.to_string());
-                warn!("MQTT SOP listener: connection error: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "MQTT SOP listener: connection error"
+                );
                 // rumqttc handles auto-reconnect; loop continues
             }
         }
@@ -135,6 +153,7 @@ mod tests {
             password: None,
             use_tls: false,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("qos must be 0, 1, or 2"));
@@ -152,6 +171,7 @@ mod tests {
             password: None,
             use_tls: false,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("mqtt://"));
@@ -169,6 +189,7 @@ mod tests {
             password: None,
             use_tls: false,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("at least one topic"));
@@ -186,6 +207,7 @@ mod tests {
             password: None,
             use_tls: false,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("client_id must not be empty"));
@@ -203,6 +225,7 @@ mod tests {
             password: None,
             use_tls: false,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         assert!(config.validate().is_ok());
     }
@@ -219,6 +242,7 @@ mod tests {
             password: None,
             use_tls: true,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("use_tls is true"));
@@ -236,6 +260,7 @@ mod tests {
             password: None,
             use_tls: false,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("mqtts://"));
@@ -253,6 +278,7 @@ mod tests {
             password: None,
             use_tls: true,
             keep_alive_secs: 30,
+            excluded_tools: vec![],
         };
         assert!(config.validate().is_ok());
     }

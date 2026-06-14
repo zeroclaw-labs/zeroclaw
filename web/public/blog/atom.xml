@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>ZeroClaw Blog</title>
+  <subtitle>Updates from ZeroClaw Labs</subtitle>
+  <id>https://www.zeroclawlabs.ai/blog</id>
+  <link href="https://www.zeroclawlabs.ai/blog" />
+  <link href="https://www.zeroclawlabs.ai/blog/atom.xml" rel="self" />
+  <link href="https://www.zeroclawlabs.ai/blog/rss.xml" rel="alternate" type="application/rss+xml" />
+  <author>
+    <name>ZeroClaw Labs</name>
+  </author>
+  <updated>2026-05-19T13:55:46Z</updated>
+</feed>

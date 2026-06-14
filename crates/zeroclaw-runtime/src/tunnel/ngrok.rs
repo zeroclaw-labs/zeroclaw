@@ -55,10 +55,18 @@ impl Tunnel for NgrokTunnel {
             .kill_on_drop(true)
             .spawn()?;
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("Failed to capture ngrok stdout"))?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(
+                        ::serde_json::json!({"tunnel_provider": "ngrok", "stream": "stdout"})
+                    ),
+                "tunnel process: failed to capture child stream"
+            );
+            anyhow::Error::msg("Failed to capture ngrok stdout")
+        })?;
 
         let mut reader = tokio::io::BufReader::new(stdout).lines();
         let mut public_url = String::new();
@@ -71,7 +79,12 @@ impl Tunnel for NgrokTunnel {
 
             match line {
                 Ok(Ok(Some(l))) => {
-                    tracing::debug!("ngrok: {l}");
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"l": l})),
+                        "ngrok: "
+                    );
                     // ngrok logfmt: url=https://xxxx.ngrok-free.app
                     if let Some(idx) = l.find("url=https://") {
                         let url_start = idx + 4; // skip "url="

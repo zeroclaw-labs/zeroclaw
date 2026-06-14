@@ -8,13 +8,16 @@ publish = false
 
 [dependencies]
 zeroclaw-api.workspace = true
+zeroclaw-spawn.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-config.workspace = true
+zeroclaw-log.workspace = true
 zeroclaw-providers.workspace = true
 zeroclaw-memory.workspace = true
 zeroclaw-tools.workspace = true
 zeroclaw-plugins = { workspace = true, optional = true }
 zeroclaw-tool-call-parser.workspace = true
+fluent = "0.16"
 anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"
@@ -34,12 +37,13 @@ hostname = "0.4.2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 indicatif = "0.18"
 lru = "0.16"
+mime_guess = "2"
 nanohtml2text = "0.2"
 parking_lot = "0.12"
 portable-atomic = "1"
 rand = "0.10"
 regex = "1.10"
-rumqttc = "0.25"
+rumqttc = { version = "0.25", default-features = false, features = ["use-rustls-no-provider"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring", "blocking", "multipart", "stream", "socks"] }
 ring = "0.17"
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -62,7 +66,6 @@ tokio-util = { version = "0.7", default-features = false }
 toml = "1.0"
 tower = { optional = true, version = "0.5", default-features = false, features = ["util"] }
 tower-http = { optional = true, version = "0.6", default-features = false, features = ["limit", "timeout"] }
-tracing = { version = "0.1", default-features = false }
 urlencoding = "2.1"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 webpki-roots = "1.0.6"
@@ -76,6 +79,8 @@ prometheus = { version = "0.14", default-features = false, optional = true }
 opentelemetry = { version = "0.31", default-features = false, features = ["trace", "metrics"], optional = true }
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics"], optional = true }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots"], optional = true }
+# Optional deps for specific features
+pdf-extract = { version = "0.10", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = { version = "0.4", optional = true }
@@ -83,8 +88,9 @@ landlock = { version = "0.4", optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# Optional deps for specific features
-pdf-extract = { version = "0.10", optional = true }
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Console", "Win32_Globalization"] }
+encoding_rs = "0.8"
 
 [features]
 default = ["observability-prometheus", "schema-export"]
@@ -94,7 +100,6 @@ sandbox-landlock = ["dep:landlock"]
 schema-export = ["dep:schemars", "zeroclaw-config/schema-export"]
 
 
-channel-nostr = ["zeroclaw-config/channel-nostr"]
 browser-native = []
 rag-pdf = ["dep:pdf-extract"]
 plugins-wasm = ["dep:zeroclaw-plugins"]

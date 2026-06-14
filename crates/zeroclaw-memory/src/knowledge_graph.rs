@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use uuid::Uuid;
 
 // ── Domain types ────────────────────────────────────────────────
@@ -126,8 +126,6 @@ pub struct GraphStats {
 /// SQLite-backed knowledge graph.
 pub struct KnowledgeGraph {
     conn: Mutex<Connection>,
-    #[allow(dead_code)]
-    db_path: PathBuf,
     max_nodes: usize,
 }
 
@@ -196,7 +194,6 @@ impl KnowledgeGraph {
 
         Ok(Self {
             conn: Mutex::new(conn),
-            db_path: db_path.to_path_buf(),
             max_nodes,
         })
     }
@@ -395,7 +392,7 @@ impl KnowledgeGraph {
 
     /// Extract a subgraph starting from `root_id` up to `depth` hops.
     ///
-    /// `depth` must be between 1 and [`Self::MAX_SUBGRAPH_DEPTH`] (100).
+    /// `depth` must be between 1 and `MAX_SUBGRAPH_DEPTH` (100).
     /// Uses a recursive CTE for efficient single-query bidirectional traversal.
     pub fn get_subgraph(
         &self,
@@ -527,7 +524,7 @@ impl KnowledgeGraph {
             }
         }
         let mut top_tags: Vec<(String, usize)> = tag_counts.into_iter().collect();
-        top_tags.sort_by(|a, b| b.1.cmp(&a.1));
+        top_tags.sort_by_key(|tag| std::cmp::Reverse(tag.1));
         top_tags.truncate(10);
 
         Ok(GraphStats {

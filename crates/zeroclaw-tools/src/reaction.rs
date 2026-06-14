@@ -3,7 +3,7 @@
 //! Exposes `add_reaction` and `remove_reaction` from the [`Channel`] trait as an
 //! agent-callable tool. The tool holds a late-binding channel map handle that is
 //! populated once channels are initialized (after tool construction). This mirrors
-//! the pattern used by [`DelegateTool`] for its parent-tools handle.
+//! the pattern used by `DelegateTool` for its parent-tools handle.
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -25,24 +25,9 @@ pub struct ReactionTool {
 }
 
 impl ReactionTool {
-    /// Create a new reaction tool with an empty channel map.
-    /// Call [`populate`] or write to the returned [`ChannelMapHandle`] once channels
-    /// are available.
-    pub fn new(security: Arc<SecurityPolicy>) -> Self {
-        Self {
-            channels: Arc::new(RwLock::new(HashMap::new())),
-            security,
-        }
-    }
-
-    /// Return the shared handle so callers can populate it after channel init.
-    pub fn channel_map_handle(&self) -> ChannelMapHandle {
-        Arc::clone(&self.channels)
-    }
-
-    /// Convenience: populate the channel map from a pre-built map.
-    pub fn populate(&self, map: HashMap<String, Arc<dyn Channel>>) {
-        *self.channels.write() = map;
+    /// Create a new reaction tool using the given channel map.
+    pub fn new(security: Arc<SecurityPolicy>, channels: ChannelMapHandle) -> Self {
+        Self { channels, security }
     }
 }
 
@@ -104,22 +89,55 @@ impl Tool for ReactionTool {
         let channel_name = args
             .get("channel")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'channel' parameter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "channel"})),
+                    "reaction: missing channel parameter"
+                );
+                anyhow::Error::msg("Missing 'channel' parameter")
+            })?;
 
         let channel_id = args
             .get("channel_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'channel_id' parameter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "channel_id"})),
+                    "reaction: missing channel_id parameter"
+                );
+                anyhow::Error::msg("Missing 'channel_id' parameter")
+            })?;
 
         let message_id = args
             .get("message_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'message_id' parameter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "message_id"})),
+                    "reaction: missing message_id parameter"
+                );
+                anyhow::Error::msg("Missing 'message_id' parameter")
+            })?;
 
-        let emoji = args
-            .get("emoji")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'emoji' parameter"))?;
+        let emoji = args.get("emoji").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "emoji"})),
+                "reaction: missing emoji parameter"
+            );
+            anyhow::Error::msg("Missing 'emoji' parameter")
+        })?;
 
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("add");
 
@@ -221,6 +239,17 @@ mod tests {
         }
     }
 
+    impl ::zeroclaw_api::attribution::Attributable for MockChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
     #[async_trait]
     impl Channel for MockChannel {
         fn name(&self) -> &str {
@@ -245,7 +274,7 @@ mod tests {
             _emoji: &str,
         ) -> anyhow::Result<()> {
             if self.fail_on_add {
-                return Err(anyhow::anyhow!("API error: rate limited"));
+                return Err(anyhow::Error::msg("API error: rate limited"));
             }
             *self.last_channel_id.lock() = Some(channel_id.to_string());
             self.reaction_added.store(true, Ordering::SeqCst);
@@ -265,18 +294,22 @@ mod tests {
     }
 
     fn make_tool_with_channels(channels: Vec<(&str, Arc<dyn Channel>)>) -> ReactionTool {
-        let tool = ReactionTool::new(Arc::new(SecurityPolicy::default()));
-        let map: HashMap<String, Arc<dyn Channel>> = channels
-            .into_iter()
-            .map(|(name, ch)| (name.to_string(), ch))
-            .collect();
-        tool.populate(map);
-        tool
+        let handle = Arc::new(RwLock::new(HashMap::new()));
+        {
+            let mut map = handle.write();
+            for (name, ch) in channels {
+                map.insert(name.to_string(), ch);
+            }
+        }
+        ReactionTool::new(Arc::new(SecurityPolicy::default()), handle)
     }
 
     #[test]
     fn tool_metadata() {
-        let tool = ReactionTool::new(Arc::new(SecurityPolicy::default()));
+        let tool = ReactionTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(RwLock::new(HashMap::new())),
+        );
         assert_eq!(tool.name(), "reaction");
         assert!(!tool.description().is_empty());
         let schema = tool.parameters_schema();
@@ -433,7 +466,10 @@ mod tests {
 
     #[tokio::test]
     async fn empty_channels_returns_not_initialized() {
-        let tool = ReactionTool::new(Arc::new(SecurityPolicy::default()));
+        let tool = ReactionTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(RwLock::new(HashMap::new())),
+        );
         // No channels populated
 
         let result = tool
@@ -498,8 +534,8 @@ mod tests {
 
     #[tokio::test]
     async fn channel_map_handle_allows_late_binding() {
-        let tool = ReactionTool::new(Arc::new(SecurityPolicy::default()));
-        let handle = tool.channel_map_handle();
+        let handle = Arc::new(RwLock::new(HashMap::new()));
+        let tool = ReactionTool::new(Arc::new(SecurityPolicy::default()), handle.clone());
 
         // Initially empty — tool reports not initialized
         let result = tool
@@ -513,7 +549,7 @@ mod tests {
             .unwrap();
         assert!(!result.success);
 
-        // Populate via the handle
+        // Populate via the shared handle
         {
             let mut map = handle.write();
             map.insert(
@@ -537,7 +573,10 @@ mod tests {
 
     #[test]
     fn spec_matches_metadata() {
-        let tool = ReactionTool::new(Arc::new(SecurityPolicy::default()));
+        let tool = ReactionTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(RwLock::new(HashMap::new())),
+        );
         let spec = tool.spec();
         assert_eq!(spec.name, "reaction");
         assert_eq!(spec.description, tool.description());

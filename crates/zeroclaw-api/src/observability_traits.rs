@@ -1,5 +1,12 @@
 use std::time::Duration;
 
+/// Token usage breakdown for a single agent turn.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TurnTokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
 /// Discrete events emitted by the agent runtime for observability.
 ///
 /// Each variant represents a lifecycle event that observers can record,
@@ -9,46 +16,92 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub enum ObserverEvent {
     /// The agent orchestration loop has started a new session.
-    AgentStart { provider: String, model: String },
-    /// A request is about to be sent to an LLM provider.
+    AgentStart {
+        model_provider: String,
+        model: String,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
+    },
+    /// A request is about to be sent to an LLM model_provider.
     ///
-    /// This is emitted immediately before a provider call so observers can print
+    /// This is emitted immediately before a model_provider call so observers can print
     /// user-facing progress without leaking prompt contents.
     LlmRequest {
-        provider: String,
+        model_provider: String,
         model: String,
         messages_count: usize,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
-    /// Result of a single LLM provider call.
+    /// Result of a single LLM model_provider call.
     LlmResponse {
-        provider: String,
+        model_provider: String,
         model: String,
         duration: Duration,
         success: bool,
         error_message: Option<String>,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// The agent session has finished.
     ///
-    /// Carries aggregate usage data (tokens, cost) when the provider reports it.
+    /// Carries aggregate usage data (tokens, cost) when the model_provider reports it.
     AgentEnd {
-        provider: String,
+        model_provider: String,
         model: String,
         duration: Duration,
-        tokens_used: Option<u64>,
+        tokens_used: Option<TurnTokenUsage>,
         cost_usd: Option<f64>,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// A tool call is about to be executed.
     ToolCallStart {
         tool: String,
+        /// Provider-assigned tool call identifier, when the underlying tool
+        /// call originated from a native structured tool call block (e.g.
+        /// OpenAI `tool_calls[].id`, Anthropic `tool_use.id`). `None` for
+        /// text-parsed (XML/markdown) tool calls.
+        ///
+        /// Observers can correlate `ToolCallStart` → `ToolCall` → the
+        /// emitting LLM response via this id.
+        tool_call_id: Option<String>,
+        /// Full JSON arguments the agent passed to the tool. `None` when
+        /// arguments are unavailable at the call site.
         arguments: Option<String>,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// A tool call has completed with a success/failure outcome.
     ToolCall {
         tool: String,
+        /// Provider-assigned tool call identifier, when present. See
+        /// [`ObserverEvent::ToolCallStart::tool_call_id`].
+        tool_call_id: Option<String>,
         duration: Duration,
         success: bool,
+        /// Full JSON arguments the agent passed to the tool.
+        ///
+        /// Carried here (in addition to `ToolCallStart`) so observers that
+        /// build a single completed span per tool call — e.g. the OTel
+        /// exporter — can attach arguments at span-end time without holding
+        /// per-call state.
+        arguments: Option<String>,
+        /// Scrubbed tool output or error reason. Populated for both success
+        /// and failure outcomes so backends can show the actual tool result
+        /// in trace viewers. Credentials are scrubbed before this field is
+        /// emitted.
+        result: Option<String>,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// The agent produced a final answer for the current user message.
     TurnComplete,
@@ -75,24 +128,10 @@ pub enum ObserverEvent {
     },
     /// An error occurred in a named component.
     Error {
-        /// Subsystem where the error originated (e.g., `"provider"`, `"gateway"`).
+        /// Subsystem where the error originated (e.g., `"model_provider"`, `"gateway"`).
         component: String,
         /// Human-readable error description. Must not contain secrets or tokens.
         message: String,
-    },
-    /// A hand has started execution.
-    HandStarted { hand_name: String },
-    /// A hand has completed execution successfully.
-    HandCompleted {
-        hand_name: String,
-        duration_ms: u64,
-        findings_count: usize,
-    },
-    /// A hand has failed during execution.
-    HandFailed {
-        hand_name: String,
-        error: String,
-        duration_ms: u64,
     },
     /// A deployment has started.
     DeploymentStarted {
@@ -129,15 +168,6 @@ pub enum ObserverMetric {
     ActiveSessions(u64),
     /// Current depth of the inbound message queue.
     QueueDepth(u64),
-    /// Duration of a single hand run.
-    HandRunDuration {
-        hand_name: String,
-        duration: Duration,
-    },
-    /// Number of findings produced by a hand run.
-    HandFindingsCount { hand_name: String, count: u64 },
-    /// Records a hand run outcome for success-rate tracking.
-    HandSuccessRate { hand_name: String, success: bool },
     /// Time elapsed from commit to deployment (lead time for changes).
     DeploymentLeadTime(Duration),
     /// Time elapsed to recover from a failed deployment.
@@ -185,6 +215,35 @@ pub trait Observer: Send + Sync + 'static {
     /// Enables callers to access concrete observer types when needed
     /// (e.g., retrieving a Prometheus registry handle for custom metrics).
     fn as_any(&self) -> &dyn std::any::Any;
+}
+
+/// Blanket implementation: `Arc<T>` delegates all `Observer` methods to `T`.
+///
+/// Lets a singleton observer be handed out as `Arc<MyObserver>` and still be
+/// used wherever `Box<dyn Observer>` is expected (e.g.
+/// `Box::new(MyObserver::shared())`). `as_any` deliberately delegates to the
+/// inner `T` so downcasts in handlers like `/metrics` recover the concrete
+/// type rather than the `Arc` wrapper.
+impl<T: Observer + ?Sized> Observer for std::sync::Arc<T> {
+    fn record_event(&self, event: &ObserverEvent) {
+        self.as_ref().record_event(event);
+    }
+
+    fn record_metric(&self, metric: &ObserverMetric) {
+        self.as_ref().record_metric(metric);
+    }
+
+    fn flush(&self) {
+        self.as_ref().flush();
+    }
+
+    fn name(&self) -> &str {
+        self.as_ref().name()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self.as_ref().as_any()
+    }
 }
 
 #[cfg(test)]
@@ -244,11 +303,54 @@ mod tests {
     }
 
     #[test]
+    fn observer_events_carry_turn_metadata_and_structured_usage() {
+        let usage = TurnTokenUsage {
+            input_tokens: 12,
+            output_tokens: 34,
+        };
+
+        let event = ObserverEvent::AgentEnd {
+            model_provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            duration: Duration::from_millis(50),
+            tokens_used: Some(usage.clone()),
+            cost_usd: Some(0.001),
+            channel: Some("wss".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
+        };
+
+        match event {
+            ObserverEvent::AgentEnd {
+                tokens_used,
+                channel,
+                agent_alias,
+                turn_id,
+                ..
+            } => {
+                let tokens = tokens_used.expect("usage should be present");
+                assert_eq!(tokens.input_tokens, 12);
+                assert_eq!(tokens.output_tokens, 34);
+                assert_eq!(channel.as_deref(), Some("wss"));
+                assert_eq!(agent_alias.as_deref(), Some("default"));
+                assert_eq!(turn_id.as_deref(), Some("turn-1"));
+            }
+            _ => panic!("expected AgentEnd"),
+        }
+    }
+
+    #[test]
     fn observer_event_and_metric_are_cloneable() {
         let event = ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: Some("call_abc123".into()),
             duration: Duration::from_millis(10),
             success: true,
+            arguments: Some(r#"{"command":"date"}"#.into()),
+            result: Some("Mon Apr 22 12:00:00 UTC 2026\n".into()),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         };
         let metric = ObserverMetric::RequestLatency(Duration::from_millis(8));
 
@@ -257,68 +359,5 @@ mod tests {
 
         assert!(matches!(cloned_event, ObserverEvent::ToolCall { .. }));
         assert!(matches!(cloned_metric, ObserverMetric::RequestLatency(_)));
-    }
-
-    #[test]
-    fn hand_events_recordable() {
-        let observer = DummyObserver::default();
-
-        observer.record_event(&ObserverEvent::HandStarted {
-            hand_name: "review".into(),
-        });
-        observer.record_event(&ObserverEvent::HandCompleted {
-            hand_name: "review".into(),
-            duration_ms: 1500,
-            findings_count: 3,
-        });
-        observer.record_event(&ObserverEvent::HandFailed {
-            hand_name: "review".into(),
-            error: "timeout".into(),
-            duration_ms: 5000,
-        });
-
-        assert_eq!(*observer.events.lock(), 3);
-    }
-
-    #[test]
-    fn hand_metrics_recordable() {
-        let observer = DummyObserver::default();
-
-        observer.record_metric(&ObserverMetric::HandRunDuration {
-            hand_name: "review".into(),
-            duration: Duration::from_millis(1500),
-        });
-        observer.record_metric(&ObserverMetric::HandFindingsCount {
-            hand_name: "review".into(),
-            count: 3,
-        });
-        observer.record_metric(&ObserverMetric::HandSuccessRate {
-            hand_name: "review".into(),
-            success: true,
-        });
-
-        assert_eq!(*observer.metrics.lock(), 3);
-    }
-
-    #[test]
-    fn hand_event_and_metric_are_cloneable() {
-        let event = ObserverEvent::HandCompleted {
-            hand_name: "review".into(),
-            duration_ms: 500,
-            findings_count: 2,
-        };
-        let metric = ObserverMetric::HandRunDuration {
-            hand_name: "review".into(),
-            duration: Duration::from_millis(500),
-        };
-
-        let cloned_event = event.clone();
-        let cloned_metric = metric.clone();
-
-        assert!(matches!(cloned_event, ObserverEvent::HandCompleted { .. }));
-        assert!(matches!(
-            cloned_metric,
-            ObserverMetric::HandRunDuration { .. }
-        ));
     }
 }

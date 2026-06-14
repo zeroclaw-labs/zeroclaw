@@ -1,8 +1,8 @@
-//! Zhipu GLM provider with JWT authentication.
+//! Zhipu GLM model_provider with JWT authentication.
 //! The GLM API requires JWT tokens generated from the `id.secret` API key format
 //! with a custom `sign_type: "SIGN"` header, and uses `/v4/chat/completions`.
 
-use crate::traits::{ChatMessage, Provider};
+use crate::traits::{ChatMessage, ModelProvider};
 use async_trait::async_trait;
 use reqwest::Client;
 use ring::hmac;
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub struct GlmProvider {
+pub struct GlmModelProvider {
     api_key_id: String,
     api_key_secret: String,
     base_url: String,
@@ -22,7 +22,8 @@ pub struct GlmProvider {
 struct ChatRequest {
     model: String,
     messages: Vec<Message>,
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -78,7 +79,7 @@ fn base64url_encode_str(s: &str) -> String {
     base64url_encode_bytes(s.as_bytes())
 }
 
-impl GlmProvider {
+impl GlmModelProvider {
     pub fn new(api_key: Option<&str>) -> Self {
         let (id, secret) = api_key
             .and_then(|k| k.split_once('.'))
@@ -97,7 +98,7 @@ impl GlmProvider {
         if self.api_key_id.is_empty() || self.api_key_secret.is_empty() {
             anyhow::bail!(
                 "GLM API key not set or invalid format. Expected 'id.secret'. \
-                 Run `zeroclaw onboard` or set GLM_API_KEY env var."
+                 Set GLM_API_KEY env var or run `zeroclaw quickstart --model-provider glm --api-key <id.secret>`."
             );
         }
 
@@ -145,18 +146,18 @@ impl GlmProvider {
     }
 
     fn http_client(&self) -> Client {
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts("provider.glm", 120, 10)
+        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts("model_provider.glm", 120, 10)
     }
 }
 
 #[async_trait]
-impl Provider for GlmProvider {
+impl ModelProvider for GlmModelProvider {
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
         message: &str,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         let token = self.generate_token()?;
 
@@ -202,14 +203,22 @@ impl Provider for GlmProvider {
             .into_iter()
             .next()
             .map(|c| c.message.content)
-            .ok_or_else(|| anyhow::anyhow!("No response from GLM"))
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "glm: empty choices in response"
+                );
+                anyhow::Error::msg("No response from GLM")
+            })
     }
 
     async fn chat_with_history(
         &self,
         messages: &[ChatMessage],
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         let token = self.generate_token()?;
 
@@ -249,7 +258,15 @@ impl Provider for GlmProvider {
             .into_iter()
             .next()
             .map(|c| c.message.content)
-            .ok_or_else(|| anyhow::anyhow!("No response from GLM"))
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "glm: empty choices in response"
+                );
+                anyhow::Error::msg("No response from GLM")
+            })
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -277,28 +294,28 @@ mod tests {
 
     #[test]
     fn parses_api_key() {
-        let p = GlmProvider::new(Some("abc123.secretXYZ"));
+        let p = GlmModelProvider::new(Some("abc123.secretXYZ"));
         assert_eq!(p.api_key_id, "abc123");
         assert_eq!(p.api_key_secret, "secretXYZ");
     }
 
     #[test]
     fn handles_no_key() {
-        let p = GlmProvider::new(None);
+        let p = GlmModelProvider::new(None);
         assert!(p.api_key_id.is_empty());
         assert!(p.api_key_secret.is_empty());
     }
 
     #[test]
     fn handles_invalid_key_format() {
-        let p = GlmProvider::new(Some("no-dot-here"));
+        let p = GlmModelProvider::new(Some("no-dot-here"));
         assert!(p.api_key_id.is_empty());
         assert!(p.api_key_secret.is_empty());
     }
 
     #[test]
     fn generates_jwt_token() {
-        let p = GlmProvider::new(Some("testid.testsecret"));
+        let p = GlmModelProvider::new(Some("testid.testsecret"));
         let token = p.generate_token().unwrap();
         assert!(!token.is_empty());
         // JWT has 3 dot-separated parts
@@ -308,7 +325,7 @@ mod tests {
 
     #[test]
     fn caches_token() {
-        let p = GlmProvider::new(Some("testid.testsecret"));
+        let p = GlmModelProvider::new(Some("testid.testsecret"));
         let token1 = p.generate_token().unwrap();
         let token2 = p.generate_token().unwrap();
         assert_eq!(token1, token2, "Cached token should be reused");
@@ -316,7 +333,7 @@ mod tests {
 
     #[test]
     fn fails_without_key() {
-        let p = GlmProvider::new(None);
+        let p = GlmModelProvider::new(None);
         let result = p.generate_token();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key not set"));
@@ -324,23 +341,25 @@ mod tests {
 
     #[tokio::test]
     async fn chat_fails_without_key() {
-        let p = GlmProvider::new(None);
+        let p = GlmModelProvider::new(None);
         let result = p
-            .chat_with_system(None, "hello", "glm-4.7", 0.7)
+            .chat_with_system(None, "hello", "glm-4.7", Some(0.7))
             .await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn chat_with_history_fails_without_key() {
-        let p = GlmProvider::new(None);
+        let p = GlmModelProvider::new(None);
         let messages = vec![
             ChatMessage::system("You are helpful."),
             ChatMessage::user("Hello"),
             ChatMessage::assistant("Hi there!"),
             ChatMessage::user("What did I say?"),
         ];
-        let result = p.chat_with_history(&messages, "glm-4.7", 0.7).await;
+        let result = p
+            .chat_with_history(&messages, "glm-4.7", Some(0.7))
+            .await;
         assert!(result.is_err());
     }
 
@@ -354,8 +373,8 @@ mod tests {
 
     #[tokio::test]
     async fn warmup_without_key_is_noop() {
-        let provider = GlmProvider::new(None);
-        let result = provider.warmup().await;
+        let model_provider = GlmModelProvider::new(None);
+        let result = model_provider.warmup().await;
         assert!(result.is_ok());
     }
 }

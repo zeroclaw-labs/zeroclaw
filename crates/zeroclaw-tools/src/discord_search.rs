@@ -127,7 +127,7 @@ impl Tool for DiscordSearchTool {
                 for entry in &entries {
                     let score = entry
                         .score
-                        .map_or_else(String::new, |s| format!(" [{s:.0}%]"));
+                        .map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
                     let _ = writeln!(output, "- {}{score}", entry.content);
                 }
                 Ok(ToolResult {
@@ -153,7 +153,7 @@ mod tests {
 
     fn seeded_discord_mem() -> (TempDir, Arc<dyn Memory>) {
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new_named(tmp.path(), "discord").unwrap();
+        let mem = SqliteMemory::new_named("test", tmp.path(), "discord").unwrap();
         (tmp, Arc::new(mem))
     }
 
@@ -191,6 +191,21 @@ mod tests {
         let result = tool.execute(json!({})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_ref().unwrap().contains("at least"));
+    }
+
+    #[test]
+    fn score_formatted_as_percent() {
+        let score: Option<f64> = Some(0.63);
+        let formatted = score.map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
+        assert_eq!(formatted, " [63%]");
+
+        let score: Option<f64> = Some(0.42);
+        let formatted = score.map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
+        assert_eq!(formatted, " [42%]");
+
+        let score: Option<f64> = None;
+        let formatted = score.map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
+        assert_eq!(formatted, "");
     }
 
     #[test]

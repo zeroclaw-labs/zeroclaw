@@ -3,15 +3,55 @@ use crate::security::SecurityPolicy;
 use crate::security::traits::Sandbox;
 use async_trait::async_trait;
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolResult, with_ephemeral_workspace_warning};
 
-/// Default maximum shell command execution time before kill.
-const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
+const POST_EXIT_DRAIN: Duration = Duration::from_millis(250);
+
+/// Drop guard that SIGKILLs the child's process group on cancel/timeout paths.
+/// Disarmed after `child.wait()` returns so it never signals a recycled PID.
+#[cfg(unix)]
+struct ChildGroupGuard {
+    pgid: std::sync::atomic::AtomicI32,
+}
+
+#[cfg(unix)]
+impl ChildGroupGuard {
+    fn new(child_pid: Option<u32>) -> Self {
+        let pgid = child_pid.and_then(|p| i32::try_from(p).ok()).unwrap_or(0);
+        Self {
+            pgid: std::sync::atomic::AtomicI32::new(pgid),
+        }
+    }
+
+    fn disarm(&self) {
+        self.pgid.store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ChildGroupGuard {
+    fn drop(&mut self) {
+        let pgid = self.pgid.load(std::sync::atomic::Ordering::Acquire);
+        if pgid <= 0 {
+            return;
+        }
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Kill)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({ "pgid": pgid, "signal": "SIGKILL" })),
+            "shell tool reaping child process group"
+        );
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+}
 
 /// Environment variables safe to pass to shell commands.
 /// Only functional variables are included — never API keys or secrets.
@@ -47,15 +87,31 @@ pub struct ShellTool {
     runtime: Arc<dyn RuntimeAdapter>,
     sandbox: Arc<dyn Sandbox>,
     timeout_secs: u64,
+    /// Environment forwarded from the connected TUI client. When set, these
+    /// vars are overlaid on top of the safe-env snapshot, letting the user's
+    /// real shell environment (PATH, credentials, etc.) reach subprocesses
+    /// even though the daemon itself may have a stripped-down env.
+    tui_env: Option<HashMap<String, String>>,
+    /// Whether workspace writes performed by the command persist on the host.
+    /// `false` when the runtime uses an ephemeral sandbox (e.g. Docker without
+    /// a workspace volume mount), in which case files written via shell succeed
+    /// inside the container but are invisible on the host and discarded at
+    /// session end. The shell tool can't tell a read from a write, so rather
+    /// than refusing (like `file_write`) it attaches a loud warning to every
+    /// executed command's result. See issue #4627.
+    persistent_writes: bool,
 }
 
 impl ShellTool {
     pub fn new(security: Arc<SecurityPolicy>, runtime: Arc<dyn RuntimeAdapter>) -> Self {
+        let timeout_secs = security.shell_timeout_secs;
         Self {
             security,
             runtime,
             sandbox: Arc::new(crate::security::NoopSandbox),
-            timeout_secs: DEFAULT_SHELL_TIMEOUT_SECS,
+            timeout_secs,
+            tui_env: None,
+            persistent_writes: true,
         }
     }
 
@@ -64,12 +120,26 @@ impl ShellTool {
         runtime: Arc<dyn RuntimeAdapter>,
         sandbox: Arc<dyn Sandbox>,
     ) -> Self {
+        let timeout_secs = security.shell_timeout_secs;
         Self {
             security,
             runtime,
             sandbox,
-            timeout_secs: DEFAULT_SHELL_TIMEOUT_SECS,
+            timeout_secs,
+            tui_env: None,
+            persistent_writes: true,
         }
+    }
+
+    /// Mark whether the active runtime persists workspace writes to the host.
+    ///
+    /// Pass `false` for an ephemeral runtime (Docker tmpfs / no volume mount)
+    /// to attach a loud ephemeral-workspace warning to every executed command,
+    /// so silent data loss is visible (issue #4627). Defaults to `true`,
+    /// preserving existing behaviour on native runtimes and in tests.
+    pub fn with_persistent_writes(mut self, persistent: bool) -> Self {
+        self.persistent_writes = persistent;
+        self
     }
 
     /// Override the command execution timeout (in seconds).
@@ -77,6 +147,69 @@ impl ShellTool {
         self.timeout_secs = secs;
         self
     }
+
+    /// Overlay the TUI client's environment on top of the safe-env snapshot.
+    ///
+    /// Pass `Some(env)` to enable forwarding; `None` is a no-op (same as not
+    /// calling this method at all).
+    pub fn with_tui_env(mut self, env: Option<HashMap<String, String>>) -> Self {
+        self.tui_env = env;
+        self
+    }
+}
+
+/// Decode raw process output bytes to a UTF-8 String.
+///
+/// On Windows, cmd.exe emits bytes in the active console output code page
+/// (e.g. CP936/GBK on Simplified Chinese systems). We query the code page at
+/// runtime and transcode via `encoding_rs` so non-ASCII characters survive
+/// intact instead of being replaced by U+FFFD.
+///
+/// On all other platforms the shell runs under the user's locale (usually
+/// UTF-8 already), so `from_utf8_lossy` is sufficient.
+#[cfg(target_os = "windows")]
+fn decode_output(bytes: &[u8]) -> String {
+    use windows::Win32::Globalization::GetACP;
+    use windows::Win32::System::Console::GetConsoleOutputCP;
+
+    let cp = unsafe { GetConsoleOutputCP() };
+    let cp = if cp == 0 { unsafe { GetACP() } } else { cp };
+
+    let encoding = windows_code_page_to_encoding(cp);
+    if std::ptr::eq(encoding, encoding_rs::UTF_8) {
+        String::from_utf8_lossy(bytes).into_owned()
+    } else {
+        let (cow, _enc_used, _had_errors) = encoding.decode(bytes);
+        cow.into_owned()
+    }
+}
+
+/// Map a Windows code page identifier to an `encoding_rs` `Encoding`.
+/// Falls back to UTF-8 (lossy) for unknown code pages.
+#[cfg(target_os = "windows")]
+fn windows_code_page_to_encoding(cp: u32) -> &'static encoding_rs::Encoding {
+    match cp {
+        932 => encoding_rs::SHIFT_JIS,
+        936 | 54936 => encoding_rs::GBK,
+        949 => encoding_rs::EUC_KR,
+        950 => encoding_rs::BIG5,
+        1250 => encoding_rs::WINDOWS_1250,
+        1251 => encoding_rs::WINDOWS_1251,
+        1252 => encoding_rs::WINDOWS_1252,
+        1253 => encoding_rs::WINDOWS_1253,
+        1254 => encoding_rs::WINDOWS_1254,
+        1255 => encoding_rs::WINDOWS_1255,
+        1256 => encoding_rs::WINDOWS_1256,
+        1257 => encoding_rs::WINDOWS_1257,
+        1258 => encoding_rs::WINDOWS_1258,
+        20127 | 65001 => encoding_rs::UTF_8,
+        _ => encoding_rs::UTF_8,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn decode_output(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 fn is_valid_env_var_name(name: &str) -> bool {
@@ -139,7 +272,17 @@ impl Tool for ShellTool {
         let command = args
             .get("command")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "command"})),
+                    "tool argument validation failed"
+                );
+
+                anyhow::Error::msg("Missing 'command' parameter")
+            })?;
         let approved = args
             .get("approved")
             .and_then(|v| v.as_bool())
@@ -176,9 +319,16 @@ impl Tool for ShellTool {
         // Apply sandbox wrapping before execution.
         // The Sandbox trait operates on std::process::Command, so use as_std_mut()
         // to get a mutable reference to the underlying command.
-        self.sandbox
-            .wrap_command(cmd.as_std_mut())
-            .map_err(|e| anyhow::anyhow!("Sandbox error: {}", e))?;
+        self.sandbox.wrap_command(cmd.as_std_mut()).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "shell tool: sandbox wrap_command failed"
+            );
+            anyhow::Error::msg(format!("Sandbox error: {e}"))
+        })?;
 
         cmd.env_clear();
 
@@ -188,56 +338,142 @@ impl Tool for ShellTool {
             }
         }
 
-        let timeout_secs = self.timeout_secs;
-        let result = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await;
-
-        match result {
-            Ok(Ok(output)) => {
-                let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-                // Truncate output to prevent OOM
-                if stdout.len() > MAX_OUTPUT_BYTES {
-                    let mut b = MAX_OUTPUT_BYTES.min(stdout.len());
-                    while b > 0 && !stdout.is_char_boundary(b) {
-                        b -= 1;
-                    }
-                    stdout.truncate(b);
-                    stdout.push_str("\n... [output truncated at 1MB]");
-                }
-                if stderr.len() > MAX_OUTPUT_BYTES {
-                    let mut b = MAX_OUTPUT_BYTES.min(stderr.len());
-                    while b > 0 && !stderr.is_char_boundary(b) {
-                        b -= 1;
-                    }
-                    stderr.truncate(b);
-                    stderr.push_str("\n... [stderr truncated at 1MB]");
-                }
-
-                Ok(ToolResult {
-                    success: output.status.success(),
-                    output: stdout,
-                    error: if stderr.is_empty() {
-                        None
-                    } else {
-                        Some(stderr)
-                    },
-                })
+        // Overlay TUI env on top of the safe-env snapshot. TUI vars win on
+        // conflict — the user's real PATH etc. should take precedence over
+        // whatever the daemon process inherited.
+        if let Some(ref tui_env) = self.tui_env {
+            for (k, v) in tui_env {
+                cmd.env(k, v);
             }
-            Ok(Err(e)) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Failed to execute command: {e}")),
-            }),
-            Err(_) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Command timed out after {timeout_secs}s and was killed"
-                )),
-            }),
+        }
+
+        let timeout_secs = self.timeout_secs;
+        // Run in own process group so `ChildGroupGuard` can reap the
+        // whole subtree (backgrounded jobs, subshells) on any exit path.
+        #[cfg(unix)]
+        cmd.process_group(0);
+        cmd.kill_on_drop(true);
+        // `output()` pipes stdio implicitly; `spawn()` does not.
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        cmd.stdin(std::process::Stdio::null());
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to spawn command: {e}")),
+                });
+            }
+        };
+
+        #[cfg(unix)]
+        let group_guard = ChildGroupGuard::new(child.id());
+
+        let stdout_handle = child.stdout.take();
+        let stderr_handle = child.stderr.take();
+
+        let drain_stdout = drain_capped(stdout_handle, MAX_OUTPUT_BYTES);
+        let drain_stderr = drain_capped(stderr_handle, MAX_OUTPUT_BYTES);
+        let wait_fut = async {
+            let status = child.wait().await?;
+            #[cfg(unix)]
+            group_guard.disarm();
+            let (out, err) = tokio::join!(
+                tokio::time::timeout(POST_EXIT_DRAIN, drain_stdout),
+                tokio::time::timeout(POST_EXIT_DRAIN, drain_stderr),
+            );
+            Ok::<_, std::io::Error>((status, out.unwrap_or_default(), err.unwrap_or_default()))
+        };
+
+        let mut result =
+            match tokio::time::timeout(Duration::from_secs(timeout_secs), wait_fut).await {
+                Ok(Ok((status, stdout_bytes, stderr_bytes))) => {
+                    let mut stdout = decode_output(&stdout_bytes);
+                    let mut stderr = decode_output(&stderr_bytes);
+
+                    if stdout.len() > MAX_OUTPUT_BYTES {
+                        let mut b = MAX_OUTPUT_BYTES.min(stdout.len());
+                        while b > 0 && !stdout.is_char_boundary(b) {
+                            b -= 1;
+                        }
+                        stdout.truncate(b);
+                        stdout.push_str("\n... [output truncated at 1MB]");
+                    }
+                    if stderr.len() > MAX_OUTPUT_BYTES {
+                        let mut b = MAX_OUTPUT_BYTES.min(stderr.len());
+                        while b > 0 && !stderr.is_char_boundary(b) {
+                            b -= 1;
+                        }
+                        stderr.truncate(b);
+                        stderr.push_str("\n... [stderr truncated at 1MB]");
+                    }
+
+                    ToolResult {
+                        success: status.success(),
+                        output: stdout,
+                        error: if stderr.is_empty() {
+                            None
+                        } else {
+                            Some(stderr)
+                        },
+                    }
+                }
+                Ok(Err(e)) => ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to execute command: {e}")),
+                },
+                Err(_) => ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Command timed out after {timeout_secs}s and was killed"
+                    )),
+                },
+            };
+
+        // The command ran inside an ephemeral workspace: any files it wrote are
+        // invisible on the host and discarded at session end (issue #4627).
+        // Inject the warning into whichever field the dispatcher surfaces to the
+        // model — `output` on success, `error` on failure — so it is never lost.
+        if !self.persistent_writes {
+            result.output = with_ephemeral_workspace_warning(&result.output);
+            if let Some(err) = result.error.take() {
+                result.error = Some(with_ephemeral_workspace_warning(&err));
+            }
+        }
+
+        Ok(result)
+    }
+}
+
+async fn drain_capped<R>(reader: Option<R>, cap: usize) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let Some(mut reader) = reader else {
+        return Vec::new();
+    };
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => {
+                let take = n.min(cap.saturating_sub(buf.len()).max(1));
+                buf.extend_from_slice(&chunk[..take]);
+                if buf.len() >= cap {
+                    break;
+                }
+            }
+            Err(_) => break,
         }
     }
+    buf
 }
 
 #[cfg(test)]
@@ -296,6 +532,24 @@ mod tests {
                 .contains(&json!("command"))
         );
         assert!(schema["properties"]["approved"].is_object());
+    }
+
+    #[tokio::test]
+    async fn shell_stdin_is_eof_not_the_terminal() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["cat".into()],
+            ..SecurityPolicy::default()
+        });
+        let tool = ShellTool::new(security, test_runtime());
+        let fut = tool.execute(json!({"command": "cat"}));
+        let res = tokio::time::timeout(std::time::Duration::from_secs(10), fut).await;
+        assert!(
+            res.is_ok(),
+            "a stdin-reading command hung — stdin is not null and may reach the terminal"
+        );
+        assert!(res.unwrap().expect("cat should return a result").success);
     }
 
     #[tokio::test]
@@ -362,6 +616,105 @@ mod tests {
             .await
             .expect("command with nonexistent path should return a result");
         assert!(!result.success);
+    }
+
+    // ── Ephemeral-workspace warning (issue #4627) ────────────────
+
+    /// On an ephemeral runtime the shell tool stays usable but every executed
+    /// command's output carries a loud warning so writes that won't persist are
+    /// visible. The original command output must be preserved below the banner.
+    #[tokio::test]
+    async fn shell_warns_on_ephemeral_workspace() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime())
+            .with_persistent_writes(false);
+        let result = tool
+            .execute(json!({"command": "echo hello"}))
+            .await
+            .expect("echo command should run");
+        assert!(result.success);
+        assert!(
+            result.output.contains("EPHEMERAL WORKSPACE"),
+            "ephemeral warning must be present in output, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("mount_workspace"),
+            "warning must name the config key to fix it, got: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("hello"),
+            "original command output must be preserved, got: {}",
+            result.output
+        );
+    }
+
+    /// A failed command surfaces `error`, not `output`, to the model. The
+    /// ephemeral warning must be injected into the error field too so it is
+    /// never lost on the failure path.
+    #[tokio::test]
+    async fn shell_warns_on_ephemeral_workspace_failure_path() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime())
+            .with_persistent_writes(false);
+        let result = tool
+            .execute(json!({"command": "ls /nonexistent_dir_xyz_4627"}))
+            .await
+            .expect("command should return a result");
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("EPHEMERAL WORKSPACE"),
+            "ephemeral warning must reach the error field on failures, got: {:?}",
+            result.error
+        );
+    }
+
+    /// A command that exits 0 but also writes to stderr yields
+    /// `{ success: true, output, error: Some }`. The dispatcher shows `output`
+    /// on success, but the banner must land in BOTH fields so it survives
+    /// regardless of which the model reads. Exercises the dual-field branch.
+    #[tokio::test]
+    async fn shell_warns_on_ephemeral_success_with_stderr() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Full), test_runtime())
+            .with_persistent_writes(false);
+        let result = tool
+            .execute(json!({"command": "echo out; echo warn >&2"}))
+            .await
+            .expect("command should run");
+        assert!(
+            result.success,
+            "command should exit 0, got error: {:?}",
+            result.error
+        );
+        assert!(
+            result.output.contains("EPHEMERAL WORKSPACE") && result.output.contains("out"),
+            "output must carry banner and preserve stdout, got: {}",
+            result.output
+        );
+        let err = result.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("EPHEMERAL WORKSPACE") && err.contains("warn"),
+            "error must carry banner and preserve stderr, got: {err:?}"
+        );
+    }
+
+    /// On a persistent runtime (the default) no warning is attached.
+    #[tokio::test]
+    async fn shell_no_warning_when_persistent() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let result = tool
+            .execute(json!({"command": "echo hello"}))
+            .await
+            .expect("echo command should run");
+        assert!(result.success);
+        assert!(
+            !result.output.contains("EPHEMERAL WORKSPACE"),
+            "no ephemeral warning expected on a persistent runtime, got: {}",
+            result.output
+        );
     }
 
     #[tokio::test]
@@ -629,14 +982,6 @@ mod tests {
     // ── shell timeout enforcement tests ─────────────────
 
     #[test]
-    fn shell_timeout_default_is_reasonable() {
-        assert_eq!(
-            DEFAULT_SHELL_TIMEOUT_SECS, 60,
-            "default shell timeout must be 60 seconds"
-        );
-    }
-
-    #[test]
     fn shell_timeout_can_be_overridden() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime())
             .with_timeout_secs(120);
@@ -652,6 +997,64 @@ mod tests {
     }
 
     // ── Non-UTF8 binary output tests ────────────────────
+
+    #[test]
+    fn decode_output_valid_utf8_roundtrips() {
+        let input = "hello 世界 🌍".as_bytes();
+        assert_eq!(super::decode_output(input), "hello 世界 🌍");
+    }
+
+    #[test]
+    fn decode_output_invalid_utf8_uses_replacement_chars() {
+        // 0xFF is not valid UTF-8
+        let input = b"hello\xFF world";
+        let result = super::decode_output(input);
+        // Must not panic; non-UTF-8 bytes become replacement characters on non-Windows
+        assert!(result.contains("hello"));
+        assert!(result.contains("world"));
+    }
+
+    #[test]
+    fn decode_output_empty_bytes_returns_empty_string() {
+        assert_eq!(super::decode_output(b""), "");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_code_page_mapping_covers_cjk() {
+        use super::windows_code_page_to_encoding;
+        assert_eq!(windows_code_page_to_encoding(936), encoding_rs::GBK);
+        assert_eq!(windows_code_page_to_encoding(932), encoding_rs::SHIFT_JIS);
+        assert_eq!(windows_code_page_to_encoding(949), encoding_rs::EUC_KR);
+        assert_eq!(windows_code_page_to_encoding(950), encoding_rs::BIG5);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_code_page_mapping_utf8_variants() {
+        use super::windows_code_page_to_encoding;
+        assert_eq!(windows_code_page_to_encoding(65001), encoding_rs::UTF_8);
+        assert_eq!(windows_code_page_to_encoding(20127), encoding_rs::UTF_8);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_code_page_mapping_unknown_falls_back_to_utf8() {
+        use super::windows_code_page_to_encoding;
+        assert_eq!(windows_code_page_to_encoding(99999), encoding_rs::UTF_8);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn decode_output_gbk_bytes_transcode_to_utf8() {
+        // GBK encoding of "你好" is [0xC4, 0xE3, 0xBA, 0xC3]
+        let gbk_bytes: &[u8] = &[0xC4, 0xE3, 0xBA, 0xC3];
+        // When the console code page is GBK (936), windows_code_page_to_encoding
+        // returns GBK and decodes correctly.  We test the transcoding function
+        // directly since we cannot control GetConsoleOutputCP in unit tests.
+        let (cow, _enc, _errors) = encoding_rs::GBK.decode(gbk_bytes);
+        assert_eq!(cow.as_ref(), "你好");
+    }
 
     #[test]
     fn shell_safe_env_vars_excludes_secrets() {
@@ -802,5 +1205,131 @@ mod tests {
             .expect("command with sandbox should succeed");
         assert!(result.success);
         assert!(result.output.contains("sandbox_test"));
+    }
+
+    // ── TUI env overlay tests ─────────────────────────────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shell_tui_env_is_passed_to_subprocess() {
+        // A var that is NOT in SAFE_ENV_VARS and NOT in passthrough —
+        // it should only appear if tui_env injects it.
+        let tool =
+            ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(Some({
+                let mut m = std::collections::HashMap::new();
+                m.insert("ZC_TUI_TEST_VAR".to_string(), "tui_injected".to_string());
+                m
+            }));
+
+        let result = tool
+            .execute(json!({"command": "env"}))
+            .await
+            .expect("env command should succeed");
+
+        assert!(result.success);
+        assert!(
+            result.output.contains("ZC_TUI_TEST_VAR=tui_injected"),
+            "tui_env var should appear in subprocess env, got:\n{}",
+            result.output
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shell_without_tui_env_does_not_inject_extra_vars() {
+        // Without tui_env, a non-safe var must NOT appear.
+        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
+
+        let result = tool
+            .execute(json!({"command": "env"}))
+            .await
+            .expect("env command should succeed");
+
+        assert!(result.success);
+        assert!(
+            !result.output.contains("ZC_TUI_TEST_VAR"),
+            "non-safe var must not leak without tui_env"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shell_tui_env_overrides_safe_var() {
+        // tui_env wins over the process-level value for a var that is also in SAFE_ENV_VARS.
+        // This lets the TUI's PATH (e.g. with nix/brew) win over the daemon's PATH.
+        let _guard = EnvGuard::set("HOME", "/daemon-home");
+
+        let tool =
+            ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(Some({
+                let mut m = std::collections::HashMap::new();
+                m.insert("HOME".to_string(), "/tui-home".to_string());
+                m
+            }));
+
+        let result = tool
+            .execute(json!({"command": "env"}))
+            .await
+            .expect("env command should succeed");
+
+        assert!(
+            result.success,
+            "env should succeed, got output={:?} error={:?}",
+            result.output, result.error
+        );
+        assert!(
+            result.output.contains("HOME=/tui-home"),
+            "tui_env HOME should override daemon HOME, got:\n{}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("HOME=/daemon-home"),
+            "daemon HOME must not leak through when tui_env overrides it, got:\n{}",
+            result.output
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shell_tui_env_none_behaves_like_existing() {
+        // with_tui_env(None) must be identical to no tui_env at all —
+        // only SAFE_ENV_VARS + passthrough reach the subprocess.
+        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(None);
+
+        let result = tool
+            .execute(json!({"command": "env"}))
+            .await
+            .expect("env command should succeed");
+
+        assert!(result.success);
+        assert!(
+            !result.output.contains("ZC_TUI_TEST_VAR"),
+            "None tui_env must not inject anything extra"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shell_tui_env_secrets_reach_subprocess_but_not_safe_list() {
+        // The whole point: secrets from the TUI env (e.g. SSH_AUTH_SOCK)
+        // DO reach the subprocess via tui_env even though they are not
+        // in SAFE_ENV_VARS.
+        let tool =
+            ShellTool::new(test_security_with_env_cmd(), test_runtime()).with_tui_env(Some({
+                let mut m = std::collections::HashMap::new();
+                m.insert("SSH_AUTH_SOCK".to_string(), "/tmp/fake.sock".to_string());
+                m
+            }));
+
+        // Confirm SSH_AUTH_SOCK is not in the safe list (would be a bug if it were)
+        assert!(
+            !SAFE_ENV_VARS.contains(&"SSH_AUTH_SOCK"),
+            "SSH_AUTH_SOCK must not be in SAFE_ENV_VARS"
+        );
+
+        let result = tool
+            .execute(json!({"command": "env"}))
+            .await
+            .expect("env command should succeed");
+
+        assert!(result.success);
+        assert!(
+            result.output.contains("SSH_AUTH_SOCK=/tmp/fake.sock"),
+            "SSH_AUTH_SOCK from tui_env must reach subprocess"
+        );
     }
 }

@@ -1,8 +1,49 @@
-use super::traits::{Memory, MemoryCategory, MemoryEntry};
+use super::traits::{Memory, MemoryCategory, MemoryEntry, is_recent_recall_query};
 use async_trait::async_trait;
-use chrono::Local;
+use chrono::{DateTime, FixedOffset, Local, NaiveDate};
 use std::path::{Path, PathBuf};
 use tokio::fs;
+
+/// Decide whether a markdown entry's `timestamp` stem falls inside the
+/// recall `[since, until]` window. Markdown timestamps are file stems, not
+/// RFC 3339 strings: daily logs use a bare `YYYY-MM-DD` date and the core
+/// file uses `MEMORY.md`. We therefore (1) try RFC 3339, (2) fall back to a
+/// `NaiveDate` compared at day granularity, and (3) leave non-date stems
+/// (e.g. `MEMORY.md`) unfiltered so evergreen core memories still surface.
+fn entry_in_window(
+    timestamp: &str,
+    since: Option<&DateTime<FixedOffset>>,
+    until: Option<&DateTime<FixedOffset>>,
+) -> bool {
+    if let Ok(ts) = DateTime::parse_from_rfc3339(timestamp) {
+        if let Some(s) = since
+            && ts < *s
+        {
+            return false;
+        }
+        if let Some(u) = until
+            && ts > *u
+        {
+            return false;
+        }
+        return true;
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(timestamp, "%Y-%m-%d") {
+        if let Some(s) = since
+            && date < s.date_naive()
+        {
+            return false;
+        }
+        if let Some(u) = until
+            && date > u.date_naive()
+        {
+            return false;
+        }
+        return true;
+    }
+    // Non-date stems (e.g. MEMORY.md) are evergreen; never window-filtered.
+    true
+}
 
 /// Markdown-based memory — plain files as source of truth
 ///
@@ -10,12 +51,14 @@ use tokio::fs;
 ///   workspace/MEMORY.md          — curated long-term memory (core)
 ///   workspace/memory/YYYY-MM-DD.md — daily logs (append-only)
 pub struct MarkdownMemory {
+    alias: String,
     workspace_dir: PathBuf,
 }
 
 impl MarkdownMemory {
-    pub fn new(workspace_dir: &Path) -> Self {
+    pub fn new(alias: &str, workspace_dir: &Path) -> Self {
         Self {
+            alias: alias.to_string(),
             workspace_dir: workspace_dir.to_path_buf(),
         }
     }
@@ -94,6 +137,8 @@ impl MarkdownMemory {
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    agent_alias: None,
+                    agent_id: None,
                 }
             })
             .collect()
@@ -167,11 +212,33 @@ impl Memory for MarkdownMemory {
         let since_dt = since
             .map(chrono::DateTime::parse_from_rfc3339)
             .transpose()
-            .map_err(|e| anyhow::anyhow!("invalid 'since' date (expected RFC 3339): {e}"))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(
+                            ::serde_json::json!({"field": "since", "error": format!("{}", e)})
+                        ),
+                    "recall window bound rejected"
+                );
+                anyhow::Error::msg(format!("invalid 'since' date (expected RFC 3339): {e}"))
+            })?;
         let until_dt = until
             .map(chrono::DateTime::parse_from_rfc3339)
             .transpose()
-            .map_err(|e| anyhow::anyhow!("invalid 'until' date (expected RFC 3339): {e}"))?;
+            .map_err(|e| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(
+                            ::serde_json::json!({"field": "until", "error": format!("{}", e)})
+                        ),
+                    "recall window bound rejected"
+                );
+                anyhow::Error::msg(format!("invalid 'until' date (expected RFC 3339): {e}"))
+            })?;
         if let (Some(s), Some(u)) = (&since_dt, &until_dt)
             && s >= u
         {
@@ -179,22 +246,20 @@ impl Memory for MarkdownMemory {
         }
 
         let all = self.read_all_entries().await?;
-        let query_lower = query.to_lowercase();
-        let keywords: Vec<&str> = query_lower.split_whitespace().collect();
+        let keywords: Vec<String> = if is_recent_recall_query(query) {
+            Vec::new()
+        } else {
+            query
+                .to_lowercase()
+                .split_whitespace()
+                .map(str::to_string)
+                .collect()
+        };
 
         let mut scored: Vec<MemoryEntry> = all
             .into_iter()
             .filter_map(|mut entry| {
-                if let Some(ref s) = since_dt
-                    && let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&entry.timestamp)
-                    && ts < *s
-                {
-                    return None;
-                }
-                if let Some(ref u) = until_dt
-                    && let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&entry.timestamp)
-                    && ts > *u
-                {
+                if !entry_in_window(&entry.timestamp, since_dt.as_ref(), until_dt.as_ref()) {
                     return None;
                 }
                 if keywords.is_empty() {
@@ -204,7 +269,7 @@ impl Memory for MarkdownMemory {
                 let content_lower = entry.content.to_lowercase();
                 let matched = keywords
                     .iter()
-                    .filter(|kw| content_lower.contains(**kw))
+                    .filter(|kw| content_lower.contains(kw.as_str()))
                     .count();
                 if matched > 0 {
                     #[allow(clippy::cast_precision_loss)]
@@ -255,6 +320,10 @@ impl Memory for MarkdownMemory {
         Ok(false)
     }
 
+    async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
     async fn count(&self) -> anyhow::Result<usize> {
         let all = self.read_all_entries().await?;
         Ok(all.len())
@@ -263,16 +332,64 @@ impl Memory for MarkdownMemory {
     async fn health_check(&self) -> bool {
         self.workspace_dir.exists()
     }
+
+    async fn store_with_agent(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        _namespace: Option<&str>,
+        _importance: Option<f64>,
+        _agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        // Markdown's per-agent attribution is the on-disk path: the
+        // backend writes into `<workspace_dir>/MEMORY.md` and the
+        // workspace_dir is owned by the agent that constructed this
+        // backend. The agent_id parameter is redundant and ignored at
+        // the trait boundary; cross-agent reads merge multiple
+        // MarkdownMemory instances at the `AgentScopedMarkdownMemory`
+        // wrapper layer.
+        self.store(key, content, category, session_id).await
+    }
+
+    async fn recall_for_agents(
+        &self,
+        _allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        // Same per-agent-path attribution model as `store_with_agent`:
+        // a single MarkdownMemory instance reads only its own
+        // workspace_dir. Cross-agent recall is composed by
+        // `AgentScopedMarkdownMemory`, which holds an own
+        // MarkdownMemory plus a Vec<(alias, MarkdownMemory)> peer set
+        // and unions their results with attribution.
+        self.recall(query, limit, session_id, since, until).await
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for MarkdownMemory {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Memory(::zeroclaw_api::attribution::MemoryKind::Markdown)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use tempfile::TempDir;
 
     fn temp_workspace() -> (TempDir, MarkdownMemory) {
         let tmp = TempDir::new().unwrap();
-        let mem = MarkdownMemory::new(tmp.path());
+        let mem = MarkdownMemory::new("markdown", tmp.path());
         (tmp, mem)
     }
 
@@ -345,6 +462,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn markdown_recall_star_query_returns_recent_entries() {
+        let (_tmp, mem) = temp_workspace();
+        mem.store("a", "first memory", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("b", "second memory", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+
+        let results = mem.recall("*", 10, None, None, None).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(
+            results
+                .iter()
+                .any(|entry| entry.content.contains("first memory"))
+        );
+        assert!(
+            results
+                .iter()
+                .any(|entry| entry.content.contains("second memory"))
+        );
+    }
+
+    #[tokio::test]
     async fn markdown_count() {
         let (_tmp, mem) = temp_workspace();
         mem.store("a", "first", MemoryCategory::Core, None)
@@ -395,5 +536,90 @@ mod tests {
     async fn markdown_empty_count() {
         let (_tmp, mem) = temp_workspace();
         assert_eq!(mem.count().await.unwrap(), 0);
+    }
+
+    // Markdown has no agents table and no UUID indirection. Rows return
+    // `agent_alias = agent_id = None`; the dashboard renders these as
+    // "unattributed". This locks that contract so a future change can't
+    // silently leak a synthesized UUID into `agent_alias` (the bug that
+    // bit the SQL backends before the JOIN landed).
+    #[tokio::test]
+    async fn markdown_entries_carry_no_agent_attribution() {
+        let (_tmp, mem) = temp_workspace();
+        mem.store("k", "v", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let entry = mem.get("MEMORY.md:0").await.unwrap();
+        if let Some(entry) = entry {
+            assert!(
+                entry.agent_alias.is_none(),
+                "markdown rows must never claim an agent alias"
+            );
+            assert!(
+                entry.agent_id.is_none(),
+                "markdown rows must never claim a raw agent id either"
+            );
+        }
+        // list path must show the same shape regardless of how a row is
+        // surfaced (keyed lookup vs. enumeration).
+        let rows = mem.list(None, None).await.unwrap();
+        for row in rows {
+            assert!(
+                row.agent_alias.is_none(),
+                "list path must not synthesize aliases"
+            );
+            assert!(row.agent_id.is_none(), "list path must not synthesize ids");
+        }
+    }
+
+    // Markdown entry timestamps are file stems (a bare `YYYY-MM-DD` for daily
+    // logs), not RFC 3339. `recall` must still honour the `since`/`until`
+    // window: a daily entry is dropped when the window ends before its date
+    // and surfaces when the window opens in the past. Evergreen `MEMORY.md`
+    // entries (non-date stems) must NOT be filtered out by the window.
+    #[tokio::test]
+    async fn markdown_recall_since_until_filters_daily() {
+        let (_tmp, mem) = temp_workspace();
+        mem.store("today", "daily standup note", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+        mem.store("core", "evergreen daily fact", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let today = Local::now().date_naive();
+        let yesterday = (today - chrono::Duration::days(1))
+            .and_hms_opt(23, 59, 59)
+            .unwrap();
+        let yesterday_rfc = Local.from_local_datetime(&yesterday).unwrap().to_rfc3339();
+        let past = (today - chrono::Duration::days(7))
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let past_rfc = Local.from_local_datetime(&past).unwrap().to_rfc3339();
+
+        // until = yesterday: today's daily entry is outside the window and
+        // must be dropped, but the evergreen MEMORY.md entry must survive.
+        let bounded = mem
+            .recall("daily", 10, None, None, Some(&yesterday_rfc))
+            .await
+            .unwrap();
+        assert!(
+            !bounded.iter().any(|e| e.content.contains("standup")),
+            "today's daily entry must be excluded when until=yesterday"
+        );
+        assert!(
+            bounded.iter().any(|e| e.content.contains("evergreen")),
+            "evergreen MEMORY.md entry must not be window-filtered"
+        );
+
+        // since = a week ago: today's daily entry is inside the window.
+        let recent = mem
+            .recall("daily", 10, None, Some(&past_rfc), None)
+            .await
+            .unwrap();
+        assert!(
+            recent.iter().any(|e| e.content.contains("standup")),
+            "today's daily entry must be included when since is in the past"
+        );
     }
 }

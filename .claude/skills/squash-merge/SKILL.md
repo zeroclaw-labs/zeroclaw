@@ -89,6 +89,19 @@ Note: commits from the API are in API order, which is typically chronological bu
 
 ### Step 3: Derive the Squash Commit Subject
 
+Before deriving the final merge command, sanitize `$COMMITS`: strip bot/AI
+`Co-authored-by` trailers and generated tool footers, while preserving human
+co-author trailers only when they credit incorporated contributor work under the
+superseding and privacy rules. Then verify the body before asking for merge
+confirmation:
+
+```bash
+printf '%s\n' "$COMMITS" | rg -i '(^[[:space:]]*(Co-authored-by|Co-Authored-By):.*(Claude|Codex|ChatGPT|Copilot|GitHub Copilot|Gemini|\[bot\]|dependabot|github-actions|web-flow|blacksmith|noreply@(anthropic|openai)\.com)|^[[:space:]]*(Created with Claude Code|Generated with Claude Code)[[:space:]]*$)'
+```
+
+If this prints anything, stop and strip the remaining bot attribution or
+generated footer before continuing.
+
 ```bash
 PR_TITLE=$(gh pr view "$NUMBER" --repo zeroclaw-labs/zeroclaw --json title --jq '.title')
 SUBJECT="${PR_TITLE} (#${NUMBER})"
@@ -113,12 +126,13 @@ gh pr merge $NUMBER --repo zeroclaw-labs/zeroclaw --squash \
 
 **Effect:**
 - PR #$NUMBER will be permanently merged (state → Merged, purple badge)
-- Linked issues will auto-close
+- Issues referenced with closing keywords will auto-close
 - Squash commit subject: `$SUBJECT`
 - Squash commit body:
   ```
   $COMMITS
   ```
+- Bot/AI attribution has been stripped from the squash commit body.
 
 Run this command? (yes/no)
 
@@ -158,6 +172,9 @@ Report to the user: merge commit SHA and PR URL.
 - **Never push squash commits directly to `upstream/master`** — always use `gh pr merge`. Direct push produces "Closed" not "Merged", breaks issue auto-close, and loses PR association.
 - **Never use `gh pr merge --squash` without `--subject` and `--body`** — the auto-generated message omits the PR number and uses inconsistent formatting.
 - **Never let GitHub auto-generate the squash message** — no web UI merge, no merge button clicks.
+- **Always strip bot/AI attribution from the squash body** before confirmation.
+  Preserve intentional human co-author trailers only under the superseding and
+  privacy rules.
 - **Always assign PR title and commit body to shell variables** — never interpolate untrusted content directly into quoted command arguments.
 - **Always run pre-flight checks** (merge conflicts, review decision) before confirming — do not skip them even if the user says "just merge it."
 - **Always confirm before merging, no exceptions** — show the user the exact expanded command with real values and require an explicit yes. Never infer consent.

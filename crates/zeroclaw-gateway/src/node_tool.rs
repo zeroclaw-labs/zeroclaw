@@ -9,8 +9,12 @@ use async_trait::async_trait;
 use tokio::time::Duration;
 
 use crate::nodes::{NodeInvocation, NodeRegistry};
+use zeroclaw_api::attribution::ToolKind;
 use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool_attribution;
 use zeroclaw_tools::node_capabilities::requires_approval;
+
+tool_attribution!(NodeTool, ToolKind::Plugin);
 
 /// Default timeout for node invocations (30 seconds).
 const NODE_INVOKE_TIMEOUT_SECS: u64 = 30;
@@ -232,7 +236,7 @@ mod tests {
         );
 
         // Spawn a task that simulates the node responding
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             if let Some(invocation) = invoke_rx.recv().await {
                 let _ = invocation
                     .response_tx

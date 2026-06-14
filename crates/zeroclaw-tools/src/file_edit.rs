@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolResult, with_ephemeral_workspace_warning};
 use zeroclaw_config::policy::SecurityPolicy;
 
 /// Edit a file by replacing an exact string match with new content.
@@ -12,11 +12,31 @@ use zeroclaw_config::policy::SecurityPolicy;
 /// the matched text. Security checks mirror [`super::file_write::FileWriteTool`].
 pub struct FileEditTool {
     security: Arc<SecurityPolicy>,
+    /// Whether edits to the workspace persist on the host filesystem. `false`
+    /// on an ephemeral runtime (Docker tmpfs / no volume mount), where the
+    /// rewritten file succeeds inside the container but is invisible on the
+    /// host and discarded at session end. When `false`, successful edits carry
+    /// a loud ephemeral-workspace warning. Mirrors
+    /// [`super::file_write::FileWriteTool`]. See issue #4627.
+    persistent_writes: bool,
 }
 
 impl FileEditTool {
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
-        Self { security }
+        Self {
+            security,
+            persistent_writes: true,
+        }
+    }
+
+    /// Construct with an explicit persistence flag derived from the active
+    /// runtime adapter's `has_filesystem_access()`. Mirrors
+    /// [`super::file_write::FileWriteTool::new_with_persistence`].
+    pub fn new_with_persistence(security: Arc<SecurityPolicy>, persistent_writes: bool) -> Self {
+        Self {
+            security,
+            persistent_writes,
+        }
     }
 }
 
@@ -52,21 +72,59 @@ impl Tool for FileEditTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let mut result = self.edit_file(args).await?;
+        // A successful edit on an ephemeral runtime rewrites a file that never
+        // reaches the host and is lost at session end; warn loudly (issue #4627).
+        if !self.persistent_writes && result.success {
+            result.output = with_ephemeral_workspace_warning(&result.output);
+        }
+        Ok(result)
+    }
+}
+
+impl FileEditTool {
+    /// Perform the exact-string replacement edit. The ephemeral workspace
+    /// warning is applied by the `Tool::execute` wrapper above.
+    async fn edit_file(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         // ── 1. Extract parameters ──────────────────────────────────
-        let path = args
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'path' parameter"))?;
+        let path = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "path"})),
+                "file_edit: missing path parameter"
+            );
+            anyhow::Error::msg("Missing 'path' parameter")
+        })?;
 
         let old_string = args
             .get("old_string")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'old_string' parameter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "old_string"})),
+                    "file_edit: missing old_string parameter"
+                );
+                anyhow::Error::msg("Missing 'old_string' parameter")
+            })?;
 
         let new_string = args
             .get("new_string")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'new_string' parameter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "new_string"})),
+                    "file_edit: missing new_string parameter"
+                );
+                anyhow::Error::msg("Missing 'new_string' parameter")
+            })?;
 
         if old_string.is_empty() {
             return Ok(ToolResult {
@@ -85,27 +143,13 @@ impl Tool for FileEditTool {
             });
         }
 
-        // ── 3. Rate limit check ────────────────────────────────────
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
-
-        // ── 4. Path pre-validation ─────────────────────────────────
-        if !self.security.is_path_allowed(path) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Path not allowed by security policy: {path}")),
-            });
-        }
+        // Rate limiting and path-allowlist checks are applied by the
+        // RateLimitedTool + PathGuardedTool wrappers at registration time
+        // (see zeroclaw-runtime::tools::mod).
 
         let full_path = self.security.resolve_tool_path(path);
 
-        // ── 5. Canonicalize parent ─────────────────────────────────
+        // ── 5. Canonicalise parent ─────────────────────────────────
         let Some(parent) = full_path.parent() else {
             return Ok(ToolResult {
                 success: false,
@@ -172,15 +216,6 @@ impl Tool for FileEditTool {
             });
         }
 
-        // ── 8. Record action ───────────────────────────────────────
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
-        }
-
         // ── 9. Read → match → replace → write ─────────────────────
         let content = match tokio::fs::read_to_string(&resolved_target).await {
             Ok(c) => c,
@@ -199,7 +234,7 @@ impl Tool for FileEditTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("old_string not found in file".into()),
+                error: Some(no_match_diagnostic(&content, old_string)),
             });
         }
 
@@ -233,42 +268,217 @@ impl Tool for FileEditTool {
     }
 }
 
+/// Build an actionable error when `old_string` has zero exact matches.
+///
+/// The common failure is a leading-whitespace mismatch (indentation width or
+/// tabs-vs-spaces) where the text is otherwise identical. A bare "not found"
+/// gives the caller nothing to act on and invites blind retries. When the only
+/// difference is leading whitespace, say so explicitly so the caller can fix
+/// indentation in one shot instead of guessing.
+fn no_match_diagnostic(content: &str, old_string: &str) -> String {
+    fn strip_leading_ws(s: &str) -> String {
+        s.lines()
+            .map(str::trim_start)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    let needle_norm = strip_leading_ws(old_string);
+    let haystack_norm = strip_leading_ws(content);
+    let near = haystack_norm.matches(needle_norm.as_str()).count();
+
+    match near {
+        0 => "old_string not found in file".to_string(),
+        1 => "old_string not found exactly: a block matching it ignoring leading \
+              whitespace exists exactly once. The difference is indentation \
+              (width, or tabs vs spaces). Re-read the target region and copy its \
+              leading whitespace exactly, then retry."
+            .to_string(),
+        n => format!(
+            "old_string not found exactly: {n} blocks match it when leading \
+             whitespace is ignored. Indentation differs and the target is \
+             ambiguous. Re-read the region, copy exact indentation, and include \
+             enough surrounding lines to make the match unique."
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wrappers::{PathGuardedTool, RateLimitedTool};
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
 
-    fn test_security(workspace: std::path::PathBuf) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
+    fn test_tool(workspace: std::path::PathBuf) -> FileEditTool {
+        let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: workspace,
             ..SecurityPolicy::default()
-        })
+        });
+        FileEditTool::new(security)
     }
 
-    fn test_security_with(
+    /// Wraps `FileEditTool` with the production `PathGuardedTool` + `RateLimitedTool`
+    /// stack, mirroring the registration in `zeroclaw-runtime::tools::mod`. Use this
+    /// in tests that exercise path-allowlist or rate-limit behavior.
+    fn wrapped_tool(workspace: std::path::PathBuf) -> Box<dyn Tool> {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            ..SecurityPolicy::default()
+        });
+        Box::new(RateLimitedTool::new(
+            PathGuardedTool::new(FileEditTool::new(security.clone()), security.clone()),
+            security,
+        ))
+    }
+
+    fn test_tool_with(
         workspace: std::path::PathBuf,
         autonomy: AutonomyLevel,
         max_actions_per_hour: u32,
-    ) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
+    ) -> FileEditTool {
+        let security = Arc::new(SecurityPolicy {
             autonomy,
             workspace_dir: workspace,
             max_actions_per_hour,
             ..SecurityPolicy::default()
-        })
+        });
+        FileEditTool::new(security)
+    }
+
+    fn ephemeral_tool(workspace: std::path::PathBuf) -> FileEditTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            ..SecurityPolicy::default()
+        });
+        FileEditTool::new_with_persistence(security, false)
     }
 
     #[test]
     fn file_edit_name() {
-        let tool = FileEditTool::new(test_security(std::env::temp_dir()));
+        let tool = test_tool(std::env::temp_dir());
         assert_eq!(tool.name(), "file_edit");
+    }
+
+    // ── Ephemeral-workspace warning (issue #4627) ────────────────
+
+    /// A successful edit on an ephemeral runtime rewrites a file that won't
+    /// persist; the output carries a loud warning while preserving the status.
+    #[tokio::test]
+    async fn file_edit_warns_on_ephemeral_workspace() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_ephemeral");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("doc.txt"), "hello world")
+            .await
+            .unwrap();
+
+        let tool = ephemeral_tool(dir.clone());
+        let result = tool
+            .execute(json!({"path": "doc.txt", "old_string": "world", "new_string": "there"}))
+            .await
+            .unwrap();
+        assert!(result.success, "error: {:?}", result.error);
+        assert!(
+            result.output.contains("EPHEMERAL WORKSPACE"),
+            "ephemeral warning must be present, got: {}",
+            result.output
+        );
+        assert!(result.output.contains("mount_workspace"));
+        assert!(
+            result.output.contains("Edited"),
+            "original edit status must be preserved, got: {}",
+            result.output
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A failed edit performs no write — not data loss — so no banner is added.
+    #[tokio::test]
+    async fn file_edit_failure_not_warned_on_ephemeral_workspace() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_ephemeral_fail");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("doc.txt"), "hello world")
+            .await
+            .unwrap();
+
+        let tool = ephemeral_tool(dir.clone());
+        let result = tool
+            .execute(json!({"path": "doc.txt", "old_string": "absent", "new_string": "x"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(!result.output.contains("EPHEMERAL WORKSPACE"));
+        assert!(
+            !result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("EPHEMERAL WORKSPACE")
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// On a persistent runtime (the default) no warning is attached.
+    #[tokio::test]
+    async fn file_edit_no_warning_when_persistent() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_persistent");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("doc.txt"), "hello world")
+            .await
+            .unwrap();
+
+        let tool = test_tool(dir.clone());
+        let result = tool
+            .execute(json!({"path": "doc.txt", "old_string": "world", "new_string": "there"}))
+            .await
+            .unwrap();
+        assert!(result.success, "error: {:?}", result.error);
+        assert!(
+            !result.output.contains("EPHEMERAL WORKSPACE"),
+            "no ephemeral warning expected on a persistent runtime, got: {}",
+            result.output
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn no_match_diagnostic_flags_unique_whitespace_only_difference() {
+        // File uses 4-space indent; old_string uses 5-space. Same content
+        // otherwise — the diagnostic must point at indentation, not say "not found".
+        let content = "fn main() {\n    let x = 1;\n}\n";
+        let old = "     let x = 1;";
+        let msg = no_match_diagnostic(content, old);
+        assert!(msg.contains("ignoring leading whitespace"), "got: {msg}");
+        assert!(msg.contains("indentation"), "got: {msg}");
+    }
+
+    #[test]
+    fn no_match_diagnostic_plain_not_found_when_no_near_match() {
+        let content = "fn main() {}\n";
+        let msg = no_match_diagnostic(content, "totally unrelated text");
+        assert_eq!(msg, "old_string not found in file");
+    }
+
+    #[test]
+    fn no_match_diagnostic_flags_ambiguous_whitespace_matches() {
+        let content = "    a = 1;\n        a = 1;\n";
+        let msg = no_match_diagnostic(content, "a = 1;");
+        assert!(msg.contains("blocks match"), "got: {msg}");
+        assert!(msg.contains("ambiguous"), "got: {msg}");
     }
 
     #[test]
     fn file_edit_schema_has_required_params() {
-        let tool = FileEditTool::new(test_security(std::env::temp_dir()));
+        let tool = test_tool(std::env::temp_dir());
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["path"].is_object());
         assert!(schema["properties"]["old_string"].is_object());
@@ -288,7 +498,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileEditTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({
                 "path": "test.txt",
@@ -318,7 +528,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileEditTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({
                 "path": "test.txt",
@@ -331,7 +541,6 @@ mod tests {
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap_or("").contains("not found"));
 
-        // File should be unchanged
         let content = tokio::fs::read_to_string(dir.join("test.txt"))
             .await
             .unwrap();
@@ -349,7 +558,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileEditTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({
                 "path": "test.txt",
@@ -368,7 +577,6 @@ mod tests {
                 .contains("matches 2 times")
         );
 
-        // File should be unchanged
         let content = tokio::fs::read_to_string(dir.join("test.txt"))
             .await
             .unwrap();
@@ -386,7 +594,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileEditTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({
                 "path": "test.txt",
@@ -412,7 +620,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_edit_missing_path_param() {
-        let tool = FileEditTool::new(test_security(std::env::temp_dir()));
+        let tool = test_tool(std::env::temp_dir());
         let result = tool
             .execute(json!({"old_string": "a", "new_string": "b"}))
             .await;
@@ -421,7 +629,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_edit_missing_old_string_param() {
-        let tool = FileEditTool::new(test_security(std::env::temp_dir()));
+        let tool = test_tool(std::env::temp_dir());
         let result = tool
             .execute(json!({"path": "f.txt", "new_string": "b"}))
             .await;
@@ -430,7 +638,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_edit_missing_new_string_param() {
-        let tool = FileEditTool::new(test_security(std::env::temp_dir()));
+        let tool = test_tool(std::env::temp_dir());
         let result = tool
             .execute(json!({"path": "f.txt", "old_string": "a"}))
             .await;
@@ -446,7 +654,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileEditTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({
                 "path": "test.txt",
@@ -479,7 +687,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileEditTool::new(test_security(dir.clone()));
+        let tool = wrapped_tool(dir.clone());
         let result = tool
             .execute(json!({
                 "path": "../../etc/passwd",
@@ -490,14 +698,18 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("not allowed"));
+        assert!(
+            result.error.as_ref().unwrap().contains("Path blocked"),
+            "expected 'Path blocked' error, got: {:?}",
+            result.error
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_edit_blocks_absolute_path() {
-        let tool = FileEditTool::new(test_security(std::env::temp_dir()));
+        let tool = wrapped_tool(std::env::temp_dir());
         let result = tool
             .execute(json!({
                 "path": "/etc/passwd",
@@ -508,7 +720,11 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("not allowed"));
+        assert!(
+            result.error.as_ref().unwrap().contains("Path blocked"),
+            "expected 'Path blocked' error, got: {:?}",
+            result.error
+        );
     }
 
     #[tokio::test]
@@ -523,7 +739,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileEditTool::new(test_security(workspace.clone()));
+        let tool = test_tool(workspace.clone());
         let workspace_prefixed = workspace
             .strip_prefix(std::path::Path::new("/"))
             .unwrap()
@@ -562,7 +778,7 @@ mod tests {
 
         symlink(&outside, workspace.join("escape_dir")).unwrap();
 
-        let tool = FileEditTool::new(test_security(workspace.clone()));
+        let tool = test_tool(workspace.clone());
         let result = tool
             .execute(json!({
                 "path": "escape_dir/target.txt",
@@ -602,7 +818,7 @@ mod tests {
             .unwrap();
         symlink(outside.join("target.txt"), workspace.join("linked.txt")).unwrap();
 
-        let tool = FileEditTool::new(test_security(workspace.clone()));
+        let tool = test_tool(workspace.clone());
         let result = tool
             .execute(json!({
                 "path": "linked.txt",
@@ -635,7 +851,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileEditTool::new(test_security_with(dir.clone(), AutonomyLevel::ReadOnly, 20));
+        let tool = test_tool_with(dir.clone(), AutonomyLevel::ReadOnly, 20);
         let result = tool
             .execute(json!({
                 "path": "test.txt",
@@ -657,52 +873,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_edit_blocks_when_rate_limited() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_rate_limited");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join("test.txt"), "hello")
-            .await
-            .unwrap();
-
-        let tool = FileEditTool::new(test_security_with(
-            dir.clone(),
-            AutonomyLevel::Supervised,
-            0,
-        ));
-        let result = tool
-            .execute(json!({
-                "path": "test.txt",
-                "old_string": "hello",
-                "new_string": "world"
-            }))
-            .await
-            .unwrap();
-
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Rate limit exceeded")
-        );
-
-        let content = tokio::fs::read_to_string(dir.join("test.txt"))
-            .await
-            .unwrap();
-        assert_eq!(content, "hello");
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-    }
-
-    #[tokio::test]
     async fn file_edit_nonexistent_file() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_nofile");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileEditTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({
                 "path": "missing.txt",
@@ -737,9 +913,8 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileEditTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
 
-        // Pass an absolute path that is within the workspace
         let abs_path = dir.join("target.txt");
         let result = tool
             .execute(json!({
@@ -770,7 +945,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileEditTool::new(test_security(dir.clone()));
+        let tool = wrapped_tool(dir.clone());
         let result = tool
             .execute(json!({
                 "path": "test\0evil.txt",
@@ -780,46 +955,39 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("not allowed"));
+        assert!(
+            result.error.as_ref().unwrap().contains("Path blocked"),
+            "expected 'Path blocked' error, got: {:?}",
+            result.error
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
-    async fn file_edit_blocks_runtime_config_path() {
-        let root = std::env::temp_dir().join("zeroclaw_test_file_edit_runtime_config");
+    async fn file_edit_blocks_path_outside_workspace() {
+        let root = std::env::temp_dir().join("zeroclaw_test_file_edit_outside_workspace");
         let workspace = root.join("workspace");
-        let config_path = root.join("config.toml");
+        let outside = root.join("outside.txt");
         let _ = tokio::fs::remove_dir_all(&root).await;
         tokio::fs::create_dir_all(&workspace).await.unwrap();
-        tokio::fs::write(&config_path, "always_ask = [\"cron_add\"]")
-            .await
-            .unwrap();
+        tokio::fs::write(&outside, "original").await.unwrap();
 
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            workspace_dir: workspace.clone(),
-            workspace_only: false,
-            allowed_roots: vec![root.clone()],
-            forbidden_paths: vec![],
-            ..SecurityPolicy::default()
-        });
-        let tool = FileEditTool::new(security);
+        let tool = test_tool(workspace.clone());
         let result = tool
             .execute(json!({
-                "path": config_path.to_string_lossy(),
-                "old_string": "always_ask",
-                "new_string": "auto_approve"
+                "path": outside.to_string_lossy(),
+                "old_string": "original",
+                "new_string": "hacked"
             }))
             .await
             .unwrap();
 
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .unwrap_or_default()
-                .contains("runtime config/state file")
+        let content = tokio::fs::read_to_string(&outside).await.unwrap();
+        assert_eq!(
+            content, "original",
+            "file outside workspace must not be modified"
         );
 
         let _ = tokio::fs::remove_dir_all(&root).await;

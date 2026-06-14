@@ -58,12 +58,20 @@ pub fn flash_nucleo_firmware() -> Result<()> {
         .join("nucleo");
 
     if !elf_path.exists() {
-        anyhow::bail!("Built binary not found at {}", elf_path.display());
+        anyhow::bail!(
+            "Built binary not found at {}",
+            elf_path.display().to_string()
+        );
     }
 
     println!("Flashing to Nucleo-F401RE (connect via USB)...");
     let flash = Command::new("probe-rs")
-        .args(["run", "--chip", CHIP, elf_path.to_str().unwrap()])
+        .args([
+            "run",
+            "--chip",
+            CHIP,
+            elf_path.to_str().context("ELF path is not valid UTF-8")?,
+        ])
         .output()
         .context("probe-rs run failed")?;
 

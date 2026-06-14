@@ -24,6 +24,7 @@ pub struct HealthSnapshot {
 
 struct HealthRegistry {
     started_at: Instant,
+    started_at_wall: chrono::DateTime<chrono::Utc>,
     components: Mutex<BTreeMap<String, ComponentHealth>>,
 }
 
@@ -32,8 +33,16 @@ static REGISTRY: OnceLock<HealthRegistry> = OnceLock::new();
 fn registry() -> &'static HealthRegistry {
     REGISTRY.get_or_init(|| HealthRegistry {
         started_at: Instant::now(),
+        started_at_wall: Utc::now(),
         components: Mutex::new(BTreeMap::new()),
     })
+}
+
+/// Daemon start time as RFC 3339 UTC. Stable across the daemon's
+/// lifetime so the dashboard can implement "since daemon start"
+/// log queries without drift.
+pub fn daemon_started_at() -> String {
+    registry().started_at_wall.to_rfc3339()
 }
 
 fn now_rfc3339() -> String {

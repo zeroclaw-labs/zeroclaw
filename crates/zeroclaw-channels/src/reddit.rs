@@ -11,7 +11,11 @@ pub struct RedditChannel {
     client_secret: String,
     refresh_token: String,
     username: String,
-    subreddit: Option<String>,
+    /// Empty = accept items from any subreddit the bot has access to.
+    subreddits: Vec<String>,
+    /// The alias key under `[channels.reddit.<alias>]` this handle is
+    /// bound to. Used for attribution.
+    alias: String,
     auth: Mutex<RedditAuth>,
 }
 
@@ -66,18 +70,20 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 impl RedditChannel {
     pub fn new(
+        alias: impl Into<String>,
         client_id: String,
         client_secret: String,
         refresh_token: String,
         username: String,
-        subreddit: Option<String>,
+        subreddits: Vec<String>,
     ) -> Self {
         Self {
             client_id,
             client_secret,
             refresh_token,
             username,
-            subreddit,
+            subreddits,
+            alias: alias.into(),
             auth: Mutex::new(RedditAuth {
                 access_token: String::new(),
                 expires_at: Instant::now(),
@@ -109,7 +115,7 @@ impl RedditChannel {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("<failed to read response: {e}>"));
-            bail!("Reddit token refresh failed ({status}): {body}");
+            bail!("token refresh failed ({status}): {body}");
         }
 
         let token_resp: RedditTokenResponse = resp.json().await?;
@@ -152,7 +158,13 @@ impl RedditChannel {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("<failed to read response: {e}>"));
-            tracing::warn!("Reddit inbox fetch failed ({status}): {body}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"status": status.to_string(), "body": body})),
+                "inbox fetch failed"
+            );
             return Ok(Vec::new());
         }
 
@@ -178,7 +190,12 @@ impl RedditChannel {
             .await?;
 
         if !resp.status().is_success() {
-            tracing::warn!("Reddit mark_read failed: {}", resp.status());
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!("mark_read failed: {}", resp.status())
+            );
         }
         Ok(())
     }
@@ -194,10 +211,14 @@ impl RedditChannel {
             return None;
         }
 
-        // If a subreddit filter is set, skip items from other subreddits
-        if let Some(ref sub) = self.subreddit
+        // If a subreddit allowlist is set, skip items from other subreddits.
+        // Items without a subreddit (e.g. DMs) are always accepted.
+        if !self.subreddits.is_empty()
             && let Some(ref item_sub) = item.subreddit
-            && !item_sub.eq_ignore_ascii_case(sub)
+            && !self
+                .subreddits
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(item_sub))
         {
             return None;
         }
@@ -222,11 +243,22 @@ impl RedditChannel {
             reply_target,
             content: body.to_string(),
             channel: "reddit".to_string(),
+            channel_alias: None,
             timestamp,
             thread_ts: item.parent_id.clone(),
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         })
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for RedditChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(::zeroclaw_api::attribution::ChannelKind::Reddit)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -264,7 +296,7 @@ impl Channel for RedditChannel {
                     .text()
                     .await
                     .unwrap_or_else(|e| format!("<failed to read response: {e}>"));
-                bail!("Reddit comment reply failed ({status}): {body}");
+                bail!("comment reply failed ({status}): {body}");
             }
         } else {
             // Direct message
@@ -290,7 +322,7 @@ impl Channel for RedditChannel {
                     .text()
                     .await
                     .unwrap_or_else(|e| format!("<failed to read response: {e}>"));
-                bail!("Reddit DM failed ({status}): {body}");
+                bail!("DM failed ({status}): {body}");
             }
         }
 
@@ -301,13 +333,22 @@ impl Channel for RedditChannel {
         // Initial auth
         self.refresh_access_token().await?;
 
-        tracing::info!(
-            "Reddit channel listening as u/{} {}...",
-            self.username,
-            self.subreddit
-                .as_ref()
-                .map(|s| format!("in r/{s}"))
-                .unwrap_or_default()
+        let scope = if self.subreddits.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "in {}",
+                self.subreddits
+                    .iter()
+                    .map(|s| format!("r/{s}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("channel listening as u/{} {}...", self.username, scope)
         );
 
         loop {
@@ -316,7 +357,13 @@ impl Channel for RedditChannel {
             let items = match self.fetch_inbox().await {
                 Ok(items) => items,
                 Err(e) => {
-                    tracing::warn!("Reddit poll error: {e}");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "poll error"
+                    );
                     continue;
                 }
             };
@@ -334,7 +381,13 @@ impl Channel for RedditChannel {
             }
 
             if let Err(e) = self.mark_read(&read_ids).await {
-                tracing::warn!("Reddit mark_read error: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "mark_read error"
+                );
             }
         }
     }
@@ -350,21 +403,23 @@ mod tests {
 
     fn make_channel() -> RedditChannel {
         RedditChannel::new(
+            "testbot",
             "client_id".into(),
             "client_secret".into(),
             "refresh_token".into(),
             "testbot".into(),
-            None,
+            Vec::new(),
         )
     }
 
     fn make_channel_with_sub(sub: &str) -> RedditChannel {
         RedditChannel::new(
+            "testbot",
             "client_id".into(),
             "client_secret".into(),
             "refresh_token".into(),
             "testbot".into(),
-            Some(sub.into()),
+            vec![sub.into()],
         )
     }
 

@@ -4,6 +4,7 @@
 //! The directory path is configured via `gateway.web_dist_dir`.
 
 use axum::{
+    Json,
     extract::State,
     http::{StatusCode, Uri, header},
     response::{IntoResponse, Response},
@@ -11,6 +12,12 @@ use axum::{
 use std::path::PathBuf;
 
 use super::AppState;
+
+#[cfg(feature = "embedded-web")]
+use include_dir::{Dir, include_dir};
+
+#[cfg(feature = "embedded-web")]
+static EMBEDDED_WEB_DIST: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../web/dist");
 
 /// Serve static files from `/_app/*` path
 pub async fn handle_static(State(state): State<AppState>, uri: Uri) -> Response {
@@ -20,26 +27,34 @@ pub async fn handle_static(State(state): State<AppState>, uri: Uri) -> Response 
         .unwrap_or(uri.path())
         .trim_start_matches('/');
 
+    #[cfg(feature = "embedded-web")]
+    if let Some(resp) = serve_embedded_file(path) {
+        return resp;
+    }
+
     serve_fs_file(state.web_dist_dir.as_ref(), path).await
 }
 
 /// SPA fallback: serve index.html for any non-API, non-static GET request.
 /// Injects `window.__ZEROCLAW_BASE__` so the frontend knows the path prefix.
-pub async fn handle_spa_fallback(State(state): State<AppState>) -> Response {
-    let Some(ref dist_dir) = state.web_dist_dir else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Web dashboard not available. Set gateway.web_dist_dir in your config \
-             and build the frontend with: cd web && npm ci && npm run build",
-        )
-            .into_response();
-    };
+pub async fn handle_spa_fallback(State(state): State<AppState>, uri: Uri) -> Response {
+    if let Some(path) = api_fallback_path(uri.path(), &state.path_prefix) {
+        let body = serde_json::json!({
+            "error": "not_found",
+            "message": "No backend route matched this path.",
+            "path": path,
+        });
+        return (StatusCode::NOT_FOUND, Json(body)).into_response();
+    }
 
-    let index_path = dist_dir.join("index.html");
-    let Ok(bytes) = tokio::fs::read(&index_path).await else {
+    let Some(bytes) = load_index_html_bytes(state.web_dist_dir.as_ref()).await else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            "Web dashboard not available. Build it with: cd web && npm ci && npm run build",
+            "Web dashboard not available. Reinstall with the supported installer \
+             so the dashboard is built and placed where the gateway looks for it: \
+             `./install.sh --source` on Linux/macOS, or `setup.bat` on Windows. \
+             The daemon's API endpoints remain reachable independently of the \
+             dashboard.",
         )
             .into_response();
     };
@@ -68,6 +83,36 @@ pub async fn handle_spa_fallback(State(state): State<AppState>) -> Response {
         html,
     )
         .into_response()
+}
+
+fn api_fallback_path<'a>(path: &'a str, path_prefix: &str) -> Option<&'a str> {
+    let path = strip_path_prefix(path, path_prefix);
+    (path == "/api" || path.strip_prefix("/api/").is_some()).then_some(path)
+}
+
+fn strip_path_prefix<'a>(path: &'a str, path_prefix: &str) -> &'a str {
+    if path_prefix.is_empty() || path_prefix == "/" {
+        return path;
+    }
+
+    if path == path_prefix {
+        return "/";
+    }
+
+    path.strip_prefix(path_prefix)
+        .filter(|rest| rest.starts_with('/'))
+        .unwrap_or(path)
+}
+
+async fn load_index_html_bytes(dist_dir: Option<&PathBuf>) -> Option<Vec<u8>> {
+    #[cfg(feature = "embedded-web")]
+    if let Some(file) = EMBEDDED_WEB_DIST.get_file("index.html") {
+        return Some(file.contents().to_vec());
+    }
+
+    let dir = dist_dir?;
+    let index_path = dir.join("index.html");
+    tokio::fs::read(&index_path).await.ok()
 }
 
 async fn serve_fs_file(dist_dir: Option<&PathBuf>, path: &str) -> Response {
@@ -109,4 +154,30 @@ async fn serve_fs_file(dist_dir: Option<&PathBuf>, path: &str) -> Response {
         }
         Err(_) => (StatusCode::NOT_FOUND, "Not found").into_response(),
     }
+}
+
+#[cfg(feature = "embedded-web")]
+fn serve_embedded_file(path: &str) -> Option<Response> {
+    if path.contains("..") {
+        return Some((StatusCode::BAD_REQUEST, "Invalid path").into_response());
+    }
+
+    let file = EMBEDDED_WEB_DIST.get_file(path)?;
+    let mime = mime_guess::from_path(path)
+        .first_or_octet_stream()
+        .to_string();
+    let cache = if path.contains("assets/") {
+        "public, max-age=31536000, immutable".to_string()
+    } else {
+        "no-cache".to_string()
+    };
+
+    Some(
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, mime), (header::CACHE_CONTROL, cache)],
+            file.contents().to_vec(),
+        )
+            .into_response(),
+    )
 }

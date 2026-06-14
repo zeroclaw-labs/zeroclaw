@@ -4,7 +4,11 @@ use super::serial::SerialTransport;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
+use zeroclaw_api::attribution::ToolKind;
 use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool_attribution;
+
+tool_attribution!(HardwareCapabilitiesTool, ToolKind::Plugin);
 
 /// Tool: query device capabilities (GPIO pins, LED pin) from firmware.
 pub struct HardwareCapabilitiesTool {
@@ -56,12 +60,24 @@ impl Tool for HardwareCapabilitiesTool {
                         if let Ok(parsed) =
                             serde_json::from_str::<serde_json::Value>(&result.output)
                         {
-                            format!(
+                            // Surface gpio + led_pin + any pin_devices / description
+                            // the firmware reports (key for named device reasoning on ESP32 etc.)
+                            let mut s = format!(
                                 "{}: gpio {:?}, led_pin {:?}",
                                 board_name,
                                 parsed.get("gpio").unwrap_or(&json!([])),
                                 parsed.get("led_pin").unwrap_or(&json!(null))
-                            )
+                            );
+                            if let Some(desc) = parsed.get("description").and_then(|v| v.as_str()) {
+                                s.push_str(&format!("\n  description: {desc}"));
+                            }
+                            if let Some(devices) = parsed.get("pin_devices") {
+                                // Use pretty-printed JSON so LLMs can more easily parse the named device mapping.
+                                let pretty = serde_json::to_string_pretty(devices)
+                                    .unwrap_or_else(|_| devices.to_string());
+                                s.push_str(&format!("\n  pin_devices: {pretty}"));
+                            }
+                            s
                         } else {
                             format!("{}: {}", board_name, result.output)
                         }

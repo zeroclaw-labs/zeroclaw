@@ -2,8 +2,8 @@
 //! but are needed by the config schema. Moved here to break circular dependencies.
 
 use crate::traits::{ChannelConfig, HasPropKind, PropKind};
-#[cfg(feature = "schema-export")]
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 use zeroclaw_macros::Configurable;
 
@@ -39,7 +39,30 @@ impl ThinkingLevel {
             _ => None,
         }
     }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Max => "max",
+        }
+    }
+
+    pub fn default_budget_tokens(&self) -> Option<u32> {
+        match self {
+            Self::Off | Self::Minimal | Self::Low | Self::Medium => None,
+            Self::High => Some(10_000),
+            Self::Max => Some(50_000),
+        }
+    }
 }
+
+pub use zeroclaw_api::model_provider::{
+    MAX_BUDGET_TOKENS, MIN_BUDGET_TOKENS, NativeThinkingParams,
+};
 
 /// Configuration for thinking/reasoning level control.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
@@ -48,12 +71,57 @@ impl ThinkingLevel {
 pub struct ThinkingConfig {
     #[serde(default)]
     pub default_level: ThinkingLevel,
+    /// Opt-in flag for provider-native extended thinking. When `true`, the
+    /// provider sends a dedicated `thinking` parameter with `budget_tokens`
+    /// instead of relying solely on prompt-based reasoning. Defaults to
+    /// `false` so existing High/Max users keep their prior prompt-based
+    /// behavior (cost, latency, transport path) until they explicitly migrate.
+    #[serde(default)]
+    pub native_thinking: bool,
+    #[serde(default)]
+    pub budget_tokens: HashMap<String, u32>,
 }
 
 impl Default for ThinkingConfig {
     fn default() -> Self {
         Self {
             default_level: ThinkingLevel::Medium,
+            native_thinking: false,
+            budget_tokens: HashMap::new(),
+        }
+    }
+}
+
+impl ThinkingConfig {
+    /// Resolve the effective `budget_tokens` for a given level.
+    ///
+    /// Only levels with a built-in default (`High`, `Max`) are eligible for
+    /// native thinking. Config overrides for levels Off–Medium are ignored
+    /// to prevent accidentally forcing `temperature = 1.0` on low levels.
+    pub fn budget_tokens_for(&self, level: ThinkingLevel) -> Option<u32> {
+        // Guard: only levels that have a built-in budget can use native thinking.
+        let default = level.default_budget_tokens()?;
+        Some(
+            self.budget_tokens
+                .get(level.as_str())
+                .copied()
+                .unwrap_or(default),
+        )
+    }
+
+    pub fn warn_unknown_budget_keys(&self) {
+        use ThinkingLevel::{High, Low, Max, Medium, Minimal, Off};
+        const ALL_LEVELS: &[ThinkingLevel] = &[Off, Minimal, Low, Medium, High, Max];
+        for key in self.budget_tokens.keys() {
+            if !ALL_LEVELS.iter().any(|l| l.as_str() == key) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"key": key})),
+                    "Unknown thinking level in budget_tokens config; \
+                     valid levels are: off, minimal, low, medium, high, max"
+                );
+            }
         }
     }
 }
@@ -70,7 +138,7 @@ fn default_collapse() -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "agent.history-pruning"]
+#[prefix = "agent.history_pruning"]
 pub struct HistoryPrunerConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -99,7 +167,7 @@ fn default_cost_optimized_hint() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "agent.auto-classify"]
+#[prefix = "agent.auto_classify"]
 pub struct AutoClassifyConfig {
     #[serde(default)]
     pub simple_hint: Option<String>,
@@ -184,7 +252,7 @@ fn default_tool_result_retrim_chars() -> usize {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "agent.context-compression"]
+#[prefix = "agent.context_compression"]
 pub struct ContextCompressionConfig {
     #[serde(default = "default_cc_enabled")]
     pub enabled: bool,
@@ -231,6 +299,48 @@ impl Default for ContextCompressionConfig {
     }
 }
 
+fn default_precheck_enabled() -> bool {
+    true
+}
+fn default_precheck_timeout_secs() -> u64 {
+    5
+}
+
+/// Channel reply-intent precheck configuration.
+///
+/// The precheck runs a lightweight `REPLY` / `NO_REPLY` classifier before the
+/// main agent loop so group-chat messages that are not addressed to the
+/// assistant do not trigger a full tool-using turn.
+///
+/// In V3 multi-agent configs this block is configured inside each agent as
+/// `[agents.<alias>.precheck]`. Defaults preserve the current behavior: the
+/// classifier is enabled, model/provider selection follows the agent's
+/// `classifier_provider` ref when configured and otherwise reuses the active
+/// route model, and provider errors or timeouts fail open to REPLY.
+/// `timeout_secs` must be greater than zero.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "agent.precheck"]
+pub struct ChannelPrecheckConfig {
+    /// When false, the precheck is skipped entirely for this agent and every
+    /// accepted channel message triggers the full agent loop. Default: `true`.
+    #[serde(default = "default_precheck_enabled")]
+    pub enabled: bool,
+    /// Hard ceiling (seconds) on the precheck LLM call. On timeout the
+    /// precheck fails open to REPLY. Default: `5`.
+    #[serde(default = "default_precheck_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl Default for ChannelPrecheckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_precheck_enabled(),
+            timeout_secs: default_precheck_timeout_secs(),
+        }
+    }
+}
+
 // ── Tools config types ──────────────────────────────────────────
 
 fn default_browser_cli() -> String {
@@ -242,7 +352,7 @@ fn default_browser_task_timeout() -> u64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "browser-delegate"]
+#[prefix = "browser_delegate"]
 pub struct BrowserDelegateConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -331,20 +441,45 @@ fn default_imap_folder() -> String {
 fn default_idle_timeout() -> u64 {
     1740
 }
+fn default_poll_interval_secs() -> u64 {
+    60
+}
 fn default_true() -> bool {
     true
 }
 fn default_subject() -> String {
-    "ZeroClaw Message".into()
+    "Re: Message".into()
 }
 fn default_max_attachment_bytes() -> usize {
     25 * 1024 * 1024
+}
+
+/// OAuth2 settings for IMAP email authentication (XOAUTH2 / RFC 8628).
+/// Populate these to use OAuth2 bearer tokens instead of plain-password LOGIN.
+/// All major providers (Microsoft, Google) support this flow via device code.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct EmailOAuth2Config {
+    /// OAuth2 application client ID (public client; no secret required for device flow).
+    pub client_id: String,
+    /// Token endpoint for refresh and device-code polling
+    /// (e.g. `https://login.microsoftonline.com/consumers/oauth2/v2.0/token`).
+    pub token_url: String,
+    /// Device-code initiation endpoint
+    /// (e.g. `https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode`).
+    pub device_code_url: String,
+    /// OAuth2 scopes to request (must include `offline_access` for refresh tokens).
+    pub scopes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, zeroclaw_macros::Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.email"]
 pub struct EmailConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false` so an operator who pastes a partial
+    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
+    /// live before the rest of its config is filled in.
     #[serde(default)]
     pub enabled: bool,
     pub imap_host: String,
@@ -357,18 +492,51 @@ pub struct EmailConfig {
     pub smtp_port: u16,
     #[serde(default = "default_true")]
     pub smtp_tls: bool,
+    #[serde(default)]
+    pub smtp_username: Option<String>,
+    #[secret]
+    #[serde(default)]
+    pub smtp_password: Option<String>,
     pub username: String,
     #[secret]
     pub password: String,
     pub from_address: String,
-    #[serde(default = "default_idle_timeout", alias = "poll_interval_secs")]
+    #[serde(default = "default_idle_timeout")]
     pub idle_timeout_secs: u64,
-    #[serde(default)]
-    pub allowed_senders: Vec<String>,
+    /// Polling interval used when the IMAP server does not advertise the IDLE
+    /// capability (RFC 2177). Ignored when IDLE is available.
+    #[serde(default = "default_poll_interval_secs")]
+    pub poll_interval_secs: u64,
     #[serde(default = "default_subject")]
     pub default_subject: String,
     #[serde(default = "default_max_attachment_bytes")]
     pub max_attachment_bytes: usize,
+
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
+    /// When `true` (default), outbound emails are rendered as HTML via Markdown conversion.
+    /// Set to `false` to send plain-text emails instead.
+    #[serde(default = "default_true")]
+    pub html_body: bool,
+    /// OAuth2 settings for IMAP authentication. When present, IMAP uses
+    /// XOAUTH2 instead of plain LOGIN. Required for providers like
+    /// Outlook/Hotmail that have deprecated password auth.
+    #[serde(default)]
+    pub oauth2: Option<EmailOAuth2Config>,
+    /// When `true`, the daemon never modifies any IMAP flag: not on startup,
+    /// not on message receipt, not ever. It only processes emails that arrive
+    /// after startup (UID >= uid_next at connect time). Existing unread mail
+    /// stays unread; no `\Seen` is set implicitly via RFC822 or explicitly via
+    /// STORE. Think of it as a PA who reads your messages aloud but never
+    /// touches the read/unread indicator.
+    ///
+    /// When `false` (default), the daemon behaves as an active mailbox owner:
+    /// it drains UNSEEN messages on startup (RFC822 fetch, which implicitly
+    /// sets `\Seen`) and processes all new mail as it arrives.
+    #[serde(default)]
+    pub observer_mode: bool,
 }
 
 impl ChannelConfig for EmailConfig {
@@ -390,13 +558,19 @@ impl Default for EmailConfig {
             smtp_host: String::new(),
             smtp_port: default_smtp_port(),
             smtp_tls: true,
+            smtp_username: None,
+            smtp_password: None,
             username: String::new(),
             password: String::new(),
             from_address: String::new(),
             idle_timeout_secs: default_idle_timeout(),
-            allowed_senders: Vec::new(),
+            poll_interval_secs: default_poll_interval_secs(),
             default_subject: default_subject(),
             max_attachment_bytes: default_max_attachment_bytes(),
+            excluded_tools: Vec::new(),
+            html_body: true,
+            oauth2: None,
+            observer_mode: false,
         }
     }
 }
@@ -409,6 +583,10 @@ fn default_label_filter() -> Vec<String> {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.gmail"]
 pub struct GmailPushConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false` so an operator who pastes a partial
+    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
+    /// live before the rest of its config is filled in.
     #[serde(default)]
     pub enabled: bool,
     pub topic: String,
@@ -418,11 +596,14 @@ pub struct GmailPushConfig {
     #[secret]
     pub oauth_token: String,
     #[serde(default)]
-    pub allowed_senders: Vec<String>,
-    #[serde(default)]
     pub webhook_url: String,
     #[serde(default)]
     pub webhook_secret: String,
+
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
 }
 
 impl ChannelConfig for GmailPushConfig {
@@ -441,9 +622,9 @@ impl Default for GmailPushConfig {
             topic: String::new(),
             label_filter: default_label_filter(),
             oauth_token: String::new(),
-            allowed_senders: Vec::new(),
             webhook_url: String::new(),
             webhook_secret: String::new(),
+            excluded_tools: Vec::new(),
         }
     }
 }
@@ -452,6 +633,10 @@ impl Default for GmailPushConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.clawdtalk"]
 pub struct ClawdTalkConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false` so an operator who pastes a partial
+    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
+    /// live before the rest of its config is filled in.
     #[serde(default)]
     pub enabled: bool,
     #[secret]
@@ -463,6 +648,11 @@ pub struct ClawdTalkConfig {
     #[serde(default)]
     #[secret]
     pub webhook_secret: Option<String>,
+
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
 }
 
 impl ChannelConfig for ClawdTalkConfig {
@@ -474,7 +664,7 @@ impl ChannelConfig for ClawdTalkConfig {
     }
 }
 
-/// Which telephony provider to use.
+/// Which telephony model_provider to use.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
@@ -508,12 +698,16 @@ fn default_max_call_duration() -> u64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "channels.voice-call"]
+#[prefix = "channels.voice_call"]
 pub struct VoiceCallConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false` so an operator who pastes a partial
+    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
+    /// live before the rest of its config is filled in.
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
-    pub provider: VoiceProvider,
+    pub model_provider: VoiceProvider,
     pub account_id: String,
     pub auth_token: String,
     pub from_number: String,
@@ -529,13 +723,27 @@ pub struct VoiceCallConfig {
     pub max_call_duration_secs: u64,
     #[serde(default)]
     pub webhook_base_url: Option<String>,
+
+    /// Tools excluded from this channel's tool spec. When set, these tools
+    /// are not exposed to the model when responding via this channel.
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
+}
+
+impl crate::traits::ChannelConfig for VoiceCallConfig {
+    fn name() -> &'static str {
+        "Voice Call"
+    }
+    fn desc() -> &'static str {
+        "outbound voice call channel"
+    }
 }
 
 impl Default for VoiceCallConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            provider: VoiceProvider::default(),
+            model_provider: VoiceProvider::default(),
             account_id: String::new(),
             auth_token: String::new(),
             from_number: String::new(),
@@ -545,6 +753,7 @@ impl Default for VoiceCallConfig {
             tts_voice: None,
             max_call_duration_secs: default_max_call_duration(),
             webhook_base_url: None,
+            excluded_tools: Vec::new(),
         }
     }
 }

@@ -1,5 +1,5 @@
 use crate::security::SecurityPolicy;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, bail};
 use zeroclaw_config::schema::Config;
 
 mod schedule;
@@ -15,19 +15,40 @@ pub use schedule::{
 #[allow(unused_imports)]
 pub use store::{
     add_agent_job, all_overdue_jobs, due_jobs, get_job, list_jobs, list_runs, record_last_run,
-    record_run, remove_job, reschedule_after_run, sync_declarative_jobs, update_job,
+    record_last_run_with_status, record_run, remove_job, reschedule_after_run,
+    reschedule_after_run_with_status, skip_missed_run, sync_declarative_jobs, update_job,
 };
 pub use types::{
     CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
     deserialize_maybe_stringified,
 };
 
-/// Validate a shell command against the full security policy (allowlist + risk gate).
-///
-/// Returns `Ok(())` if the command passes all checks, or an error describing
-/// why it was blocked.
-pub fn validate_shell_command(config: &Config, command: &str, approved: bool) -> Result<()> {
-    let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+/// Channel names exposed by the cron tool schemas. Actual runtime delivery is
+/// provided by the registered channel delivery handler, not this static enum.
+pub(crate) const CRON_DELIVERY_SCHEMA_CHANNELS: &[&str] = &[
+    "telegram",
+    "discord",
+    "slack",
+    "mattermost",
+    "matrix",
+    "qq",
+    "webhook",
+    "lark",
+    "feishu",
+    "dingtalk",
+];
+
+/// Validate a shell command against an agent's security policy
+/// (allowlist + risk gate). `agent_alias` names the agent under whose
+/// risk profile the command will run. Returns `Ok(())` if the command
+/// passes all checks, or an error describing why it was blocked.
+pub fn validate_shell_command(
+    config: &Config,
+    agent_alias: &str,
+    command: &str,
+    approved: bool,
+) -> Result<()> {
+    let security = SecurityPolicy::for_agent(config, agent_alias)?;
     validate_shell_command_with_security(&security, command, approved)
 }
 
@@ -42,7 +63,16 @@ pub fn validate_shell_command_with_security(
     security
         .validate_command_execution(command, approved)
         .map(|_| ())
-        .map_err(|reason| anyhow!("blocked by security policy: {reason}"))
+        .map_err(|reason| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"reason": reason.to_string()})),
+                "cron shell command rejected by security policy"
+            );
+            anyhow::Error::msg(format!("blocked by security policy: {reason}"))
+        })
 }
 
 pub fn validate_delivery_config(delivery: Option<&DeliveryConfig>) -> Result<()> {
@@ -57,13 +87,15 @@ pub fn validate_delivery_config(delivery: Option<&DeliveryConfig>) -> Result<()>
         bail!("unsupported delivery mode: {}", delivery.mode);
     }
 
+    // Shape-only validation. Whether the named channel resolves to a
+    // configured `[channels.<type>.<alias>]` entry at the moment of add
+    // is checked separately and surfaced as a non-fatal warning, not a
+    // hard error — a cron job may be authored before its channel is
+    // provisioned, and the scheduler logs loudly on fire if the channel
+    // never materialises (see `process_due_jobs`).
     let channel = delivery.channel.as_deref().map(str::trim);
-    let Some(channel) = channel.filter(|value| !value.is_empty()) else {
+    if channel.filter(|value| !value.is_empty()).is_none() {
         bail!("delivery.channel is required for announce mode");
-    };
-    match channel.to_ascii_lowercase().as_str() {
-        "telegram" | "discord" | "slack" | "mattermost" | "signal" | "matrix" | "qq" => {}
-        other => bail!("unsupported delivery channel: {other}"),
     }
 
     let has_target = delivery
@@ -80,32 +112,37 @@ pub fn validate_delivery_config(delivery: Option<&DeliveryConfig>) -> Result<()>
 
 /// Create a validated shell job, enforcing security policy before persistence.
 ///
-/// All entrypoints that create shell cron jobs should route through this
-/// function to guarantee consistent policy enforcement.
+/// `agent_alias` names the agent under whose risk profile the command
+/// will be validated and executed. All entrypoints that create shell
+/// cron jobs should route through this function to guarantee consistent
+/// policy enforcement.
 pub fn add_shell_job_with_approval(
     config: &Config,
+    agent_alias: &str,
     name: Option<String>,
     schedule: Schedule,
     command: &str,
     delivery: Option<DeliveryConfig>,
     approved: bool,
 ) -> Result<CronJob> {
-    validate_shell_command(config, command, approved)?;
+    validate_shell_command(config, agent_alias, command, approved)?;
     validate_delivery_config(delivery.as_ref())?;
-    store::add_shell_job(config, name, schedule, command, delivery)
+    store::add_shell_job(config, agent_alias, name, schedule, command, delivery)
 }
 
 /// Update a shell job's command with security validation.
 ///
-/// Validates the new command (if changed) before persisting.
+/// Validates the new command (if changed) against the named agent's
+/// risk profile before persisting.
 pub fn update_shell_job_with_approval(
     config: &Config,
+    agent_alias: &str,
     job_id: &str,
     patch: CronJobPatch,
     approved: bool,
 ) -> Result<CronJob> {
     if let Some(command) = patch.command.as_deref() {
-        validate_shell_command(config, command, approved)?;
+        validate_shell_command(config, agent_alias, command, approved)?;
     }
     update_job(config, job_id, patch)
 }
@@ -113,56 +150,65 @@ pub fn update_shell_job_with_approval(
 /// Create a one-shot validated shell job from a delay string (e.g. "30m").
 pub fn add_once_validated(
     config: &Config,
+    agent_alias: &str,
     delay: &str,
     command: &str,
     approved: bool,
 ) -> Result<CronJob> {
     let duration = parse_delay(delay)?;
     let at = chrono::Utc::now() + duration;
-    add_once_at_validated(config, at, command, approved)
+    add_once_at_validated(config, agent_alias, at, command, approved)
 }
 
 /// Create a one-shot validated shell job at an absolute timestamp.
 pub fn add_once_at_validated(
     config: &Config,
+    agent_alias: &str,
     at: chrono::DateTime<chrono::Utc>,
     command: &str,
     approved: bool,
 ) -> Result<CronJob> {
     let schedule = Schedule::At { at };
-    add_shell_job_with_approval(config, None, schedule, command, None, approved)
+    add_shell_job_with_approval(config, agent_alias, None, schedule, command, None, approved)
 }
 
 // Convenience wrappers for CLI paths (default approved=false).
 
 pub fn add_shell_job(
     config: &Config,
+    agent_alias: &str,
     name: Option<String>,
     schedule: Schedule,
     command: &str,
 ) -> Result<CronJob> {
-    add_shell_job_with_approval(config, name, schedule, command, None, false)
+    add_shell_job_with_approval(config, agent_alias, name, schedule, command, None, false)
 }
 
-pub fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJob> {
+pub fn add_job(
+    config: &Config,
+    agent_alias: &str,
+    expression: &str,
+    command: &str,
+) -> Result<CronJob> {
     let schedule = Schedule::Cron {
         expr: expression.to_string(),
         tz: None,
     };
-    add_shell_job(config, None, schedule, command)
+    add_shell_job(config, agent_alias, None, schedule, command)
 }
 
 #[allow(clippy::needless_pass_by_value)]
-pub fn add_once(config: &Config, delay: &str, command: &str) -> Result<CronJob> {
-    add_once_validated(config, delay, command, false)
+pub fn add_once(config: &Config, agent_alias: &str, delay: &str, command: &str) -> Result<CronJob> {
+    add_once_validated(config, agent_alias, delay, command, false)
 }
 
 pub fn add_once_at(
     config: &Config,
+    agent_alias: &str,
     at: chrono::DateTime<chrono::Utc>,
     command: &str,
 ) -> Result<CronJob> {
-    add_once_at_validated(config, at, command, false)
+    add_once_at_validated(config, agent_alias, at, command, false)
 }
 
 pub fn pause_job(config: &Config, id: &str) -> Result<CronJob> {
@@ -215,11 +261,11 @@ mod tests {
 
     fn test_config(tmp: &TempDir) -> Config {
         let config = Config {
-            workspace_dir: tmp.path().join("workspace"),
+            data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        std::fs::create_dir_all(&config.data_dir).unwrap();
         config
     }
 
@@ -398,7 +444,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+        let security = SecurityPolicy::from_risk_profile(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            &config.data_dir,
+        );
         assert!(security.is_command_allowed("echo safe"));
     }
 
@@ -406,7 +455,11 @@ mod tests {
     fn add_shell_job_requires_explicit_approval_for_medium_risk() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
-        config.autonomy.allowed_commands = vec!["echo".into(), "touch".into()];
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into(), "touch".into()];
 
         let denied = add_shell_job(
             &config,
@@ -443,7 +496,11 @@ mod tests {
     fn update_requires_explicit_approval_for_medium_risk() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
-        config.autonomy.allowed_commands = vec!["echo".into(), "touch".into()];
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into(), "touch".into()];
         let job = make_job(&config, "*/5 * * * *", None, "echo original");
 
         let denied = update_shell_job_with_approval(
@@ -480,7 +537,11 @@ mod tests {
     fn cli_update_requires_explicit_approval_for_medium_risk() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
-        config.autonomy.allowed_commands = vec!["echo".into(), "touch".into()];
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into(), "touch".into()];
         let job = make_job(&config, "*/5 * * * *", None, "echo original");
 
         let result = run_update(
@@ -514,8 +575,16 @@ mod tests {
     fn add_once_validated_blocks_disallowed_command() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
-        config.autonomy.allowed_commands = vec!["echo".into()];
-        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .level = crate::security::AutonomyLevel::Supervised;
 
         let result = add_once_validated(&config, "1h", "curl https://example.com", false);
         assert!(result.is_err());
@@ -542,7 +611,11 @@ mod tests {
     fn add_once_at_validated_blocks_medium_risk_without_approval() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
-        config.autonomy.allowed_commands = vec!["echo".into(), "touch".into()];
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into(), "touch".into()];
         let at = chrono::Utc::now() + chrono::Duration::hours(1);
 
         let denied = add_once_at_validated(&config, at, "touch at-medium", false);
@@ -562,8 +635,16 @@ mod tests {
     fn gateway_api_path_validates_shell_command() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
-        config.autonomy.allowed_commands = vec!["echo".into()];
-        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .level = crate::security::AutonomyLevel::Supervised;
 
         // Simulate gateway API path: add_shell_job_with_approval(approved=false)
         let result = add_shell_job_with_approval(
@@ -590,10 +671,21 @@ mod tests {
     fn scheduler_path_validates_shell_command() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
-        config.autonomy.allowed_commands = vec!["echo".into()];
-        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .level = crate::security::AutonomyLevel::Supervised;
 
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+        let security = SecurityPolicy::from_risk_profile(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            &config.data_dir,
+        );
         // Simulate scheduler validation path
         let result =
             validate_shell_command_with_security(&security, "curl https://example.com", false);
@@ -636,8 +728,16 @@ mod tests {
     fn cli_agent_flag_bypasses_shell_security_validation() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
-        config.autonomy.allowed_commands = vec!["echo".into()];
-        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .level = crate::security::AutonomyLevel::Supervised;
 
         // Without --agent, a natural language string would be blocked by shell
         // security policy. With --agent, it routes to agent job and skips
@@ -742,5 +842,35 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].job_type, JobType::Shell);
         assert_eq!(jobs[0].command, "echo ok");
+    }
+}
+
+#[cfg(test)]
+mod validate_delivery_tests {
+    use super::*;
+    use crate::cron::types::DeliveryConfig;
+
+    #[test]
+    fn validate_delivery_accepts_webhook_with_thread_id() {
+        let delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("webhook".into()),
+            to: Some("user-42".into()),
+            thread_id: Some("conv-99".into()),
+            best_effort: true,
+        };
+        validate_delivery_config(Some(&delivery)).expect("webhook with thread_id must validate");
+    }
+
+    #[test]
+    fn validate_delivery_accepts_webhook_without_thread_id() {
+        let delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("webhook".into()),
+            to: Some("user-42".into()),
+            thread_id: None,
+            best_effort: true,
+        };
+        validate_delivery_config(Some(&delivery)).expect("webhook without thread_id must validate");
     }
 }

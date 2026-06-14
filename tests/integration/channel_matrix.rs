@@ -106,6 +106,17 @@ impl MatrixTestChannel {
     }
 }
 
+impl ::zeroclaw_api::attribution::Attributable for MatrixTestChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::Webhook,
+        )
+    }
+    fn alias(&self) -> &str {
+        "test"
+    }
+}
+
 #[async_trait]
 impl Channel for MatrixTestChannel {
     fn name(&self) -> &str {
@@ -127,13 +138,15 @@ impl Channel for MatrixTestChannel {
             reply_target: "matrix_target".into(),
             content: "matrix test message".into(),
             channel: self.channel_name.clone(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         })
         .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))
+        .map_err(|e| anyhow::Error::msg(e.to_string()))
     }
 
     async fn health_check(&self) -> bool {
@@ -623,10 +636,12 @@ fn channel_message_thread_ts_preserved_on_clone() {
         reply_target: "target".into(),
         content: "threaded".into(),
         channel: "slack".into(),
+        channel_alias: None,
         timestamp: 1700000000,
         thread_ts: Some("1700000000.000001".into()),
         interruption_scope_id: None,
         attachments: vec![],
+        subject: None,
     };
 
     let cloned = msg.clone();
@@ -641,10 +656,12 @@ fn channel_message_none_thread_ts_preserved() {
         reply_target: "target".into(),
         content: "non-threaded".into(),
         channel: "telegram".into(),
+        channel_alias: None,
         timestamp: 1700000000,
         thread_ts: None,
         interruption_scope_id: None,
         attachments: vec![],
+        subject: None,
     };
 
     assert!(msg.clone().thread_ts.is_none());
@@ -696,10 +713,12 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "123456789".into(),
             content: "hi".into(),
             channel: "telegram".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         },
         "discord" => ChannelMessage {
             id: "dc_1".into(),
@@ -707,10 +726,12 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "channel_111222333".into(),
             content: "hi".into(),
             channel: "discord".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         },
         "slack" => ChannelMessage {
             id: "sl_1".into(),
@@ -718,10 +739,12 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "C01CHANNEL".into(),
             content: "hi".into(),
             channel: "slack".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: Some("1700000000.000001".into()),
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         },
         "imessage" => ChannelMessage {
             id: "im_1".into(),
@@ -729,10 +752,12 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "+15551234567".into(),
             content: "hi".into(),
             channel: "imessage".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         },
         "irc" => ChannelMessage {
             id: "irc_1".into(),
@@ -740,10 +765,12 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "#zeroclaw".into(),
             content: "hi".into(),
             channel: "irc".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         },
         "email" => ChannelMessage {
             id: "email_1".into(),
@@ -751,10 +778,12 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "alice@example.com".into(),
             content: "hi".into(),
             channel: "email".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         },
         "signal" => ChannelMessage {
             id: "sig_1".into(),
@@ -762,10 +791,12 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "+15559876543".into(),
             content: "hi".into(),
             channel: "signal".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         },
         "mattermost" => ChannelMessage {
             id: "mm_1".into(),
@@ -773,10 +804,12 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "channel_xyz789".into(),
             content: "hi".into(),
             channel: "mattermost".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: Some("root_msg_id".into()),
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         },
         "whatsapp" => ChannelMessage {
             id: "wa_1".into(),
@@ -784,10 +817,12 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "+14155552671".into(),
             content: "hi".into(),
             channel: "whatsapp".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         },
         "nextcloud_talk" => ChannelMessage {
             id: "nc_1".into(),
@@ -795,10 +830,12 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "room-token-123".into(),
             content: "hi".into(),
             channel: "nextcloud_talk".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         },
         "wecom" => ChannelMessage {
             id: "wc_1".into(),
@@ -806,10 +843,12 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "wecom_user1".into(),
             content: "hi".into(),
             channel: "wecom".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         },
         "dingtalk" => ChannelMessage {
             id: "dt_1".into(),
@@ -817,10 +856,12 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "conversation_456".into(),
             content: "hi".into(),
             channel: "dingtalk".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         },
         "qq" => ChannelMessage {
             id: "qq_1".into(),
@@ -828,10 +869,12 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "qq_group_101".into(),
             content: "hi".into(),
             channel: "qq".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         },
         "linq" => ChannelMessage {
             id: "lq_1".into(),
@@ -839,10 +882,12 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "+15551112222".into(),
             content: "hi".into(),
             channel: "linq".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         },
         "wati" => ChannelMessage {
             id: "wt_1".into(),
@@ -850,10 +895,12 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "+15553334444".into(),
             content: "hi".into(),
             channel: "wati".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         },
         "cli" => ChannelMessage {
             id: "cli_1".into(),
@@ -861,10 +908,12 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             reply_target: "user".into(),
             content: "hi".into(),
             channel: "cli".into(),
+            channel_alias: None,
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         },
         _ => panic!("Unknown platform: {platform}"),
     }
@@ -1032,7 +1081,7 @@ async fn concurrent_sends_all_recorded() {
 
     for i in 0..20 {
         let ch = Arc::clone(&ch);
-        handles.push(tokio::spawn(async move {
+        handles.push(zeroclaw_spawn::spawn!(async move {
             ch.send(&SendMessage::new(format!("msg_{i}"), format!("user_{i}")))
                 .await
                 .unwrap();
@@ -1053,7 +1102,7 @@ async fn concurrent_typing_events_all_recorded() {
 
     for i in 0..10 {
         let ch = Arc::clone(&ch);
-        handles.push(tokio::spawn(async move {
+        handles.push(zeroclaw_spawn::spawn!(async move {
             ch.start_typing(&format!("user_{i}")).await.unwrap();
             ch.stop_typing(&format!("user_{i}")).await.unwrap();
         }));
@@ -1081,7 +1130,7 @@ async fn concurrent_reactions_all_recorded() {
     for (i, emoji) in emojis.iter().enumerate() {
         let ch = Arc::clone(&ch);
         let emoji = emoji.to_string();
-        handles.push(tokio::spawn(async move {
+        handles.push(zeroclaw_spawn::spawn!(async move {
             ch.add_reaction("chan_1", &format!("msg_{i}"), &emoji)
                 .await
                 .unwrap();
@@ -1164,10 +1213,12 @@ fn channel_message_zero_timestamp() {
         reply_target: "t".into(),
         content: "c".into(),
         channel: "ch".into(),
+        channel_alias: None,
         timestamp: 0,
         thread_ts: None,
         interruption_scope_id: None,
         attachments: vec![],
+        subject: None,
     };
     assert_eq!(msg.timestamp, 0);
 }
@@ -1180,10 +1231,12 @@ fn channel_message_max_timestamp() {
         reply_target: "t".into(),
         content: "c".into(),
         channel: "ch".into(),
+        channel_alias: None,
         timestamp: u64::MAX,
         thread_ts: None,
         interruption_scope_id: None,
         attachments: vec![],
+        subject: None,
     };
     assert_eq!(msg.timestamp, u64::MAX);
 }
@@ -1309,6 +1362,17 @@ async fn capability_matrix_spec() {
 
 /// Minimal channel with ONLY required methods — validates all defaults work.
 struct MinimalChannel;
+
+impl ::zeroclaw_api::attribution::Attributable for MinimalChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::Webhook,
+        )
+    }
+    fn alias(&self) -> &str {
+        "minimal"
+    }
+}
 
 #[async_trait]
 impl Channel for MinimalChannel {

@@ -19,17 +19,27 @@ enum LevelOfDetails {
     Changelog,
 }
 
-/// Tool for interacting with the Jira REST API v3.
+/// Tool for interacting with the Jira REST API.
 ///
-/// Supports five actions gated by `[jira].allowed_actions` in config:
-/// - `get_ticket`     — always in the default allowlist; read-only.
-/// - `search_tickets` — requires explicit opt-in; read-only.
-/// - `comment_ticket` — requires explicit opt-in; mutating (Act policy).
-/// - `list_projects`  — requires explicit opt-in; read-only.
-/// - `myself`         — requires explicit opt-in; read-only. Verifies credentials.
+/// When `email` is provided, uses **API v3** with HTTP Basic auth
+/// (`email:api_token`) — the standard Jira Cloud authentication model.
+///
+/// When `email` is `None`, uses **API v2** with Bearer token auth
+/// (`Authorization: Bearer <api_token>`) — the standard Jira Server /
+/// Data Center (self-hosted) authentication model.
+///
+/// Supports eight actions gated by `[jira].allowed_actions` in config:
+/// - `get_ticket`        — always in the default allowlist; read-only.
+/// - `search_tickets`    — requires explicit opt-in; read-only.
+/// - `comment_ticket`    — requires explicit opt-in; mutating (Act policy).
+/// - `list_projects`     — requires explicit opt-in; read-only.
+/// - `myself`            — requires explicit opt-in; read-only. Verifies credentials.
+/// - `list_transitions`  — requires explicit opt-in; read-only.
+/// - `transition_ticket` — requires explicit opt-in; mutating (Act policy).
+/// - `create_ticket`     — requires explicit opt-in; mutating (Act policy).
 pub struct JiraTool {
     base_url: String,
-    email: String,
+    email: Option<String>,
     api_token: String,
     allowed_actions: Vec<String>,
     http: Client,
@@ -40,7 +50,7 @@ pub struct JiraTool {
 impl JiraTool {
     pub fn new(
         base_url: String,
-        email: String,
+        email: Option<String>,
         api_token: String,
         allowed_actions: Vec<String>,
         security: Arc<SecurityPolicy>,
@@ -57,6 +67,25 @@ impl JiraTool {
         }
     }
 
+    /// `"3"` for Jira Cloud (email present), `"2"` for Server/DC (no email).
+    fn api_version(&self) -> &str {
+        if self.email.is_some() { "3" } else { "2" }
+    }
+
+    /// Returns an authenticated request builder.
+    /// Cloud: HTTP Basic (`email:token`). Server/DC: Bearer token.
+    fn authenticated(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.email {
+            Some(email) => req.basic_auth(email, Some(&self.api_token)),
+            None => req.bearer_auth(&self.api_token),
+        }
+    }
+
+    /// `true` when connected to Jira Cloud (API v3, email present).
+    fn is_cloud(&self) -> bool {
+        self.email.is_some()
+    }
+
     fn is_action_allowed(&self, action: &str) -> bool {
         self.allowed_actions.iter().any(|a| a == action)
     }
@@ -67,7 +96,8 @@ impl JiraTool {
         level: LevelOfDetails,
     ) -> anyhow::Result<ToolResult> {
         validate_issue_key(issue_key)?;
-        let url = format!("{}/rest/api/3/issue/{}", self.base_url, issue_key);
+        let ver = self.api_version();
+        let url = format!("{}/rest/api/{}/issue/{}", self.base_url, ver, issue_key);
 
         let query: Vec<(&str, &str)> = match &level {
             LevelOfDetails::Basic => vec![
@@ -93,15 +123,21 @@ impl JiraTool {
             LevelOfDetails::Changelog => vec![("expand", "changelog")],
         };
 
-        let resp = self
+        let req = self
             .http
             .get(&url)
-            .basic_auth(&self.email, Some(&self.api_token))
             .query(&query)
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Jira get_ticket request failed: {e}"))?;
+            .timeout(std::time::Duration::from_secs(self.timeout_secs));
+        let resp = self.authenticated(req).send().await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "jira: Jira get_ticket request failed"
+            );
+            anyhow::Error::msg(format!("Jira get_ticket request failed: {e}"))
+        })?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -112,10 +148,16 @@ impl JiraTool {
             );
         }
 
-        let raw: Value = resp
-            .json()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to parse Jira get_ticket response: {e}"))?;
+        let raw: Value = resp.json().await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "jira: Failed to parse Jira get_ticket response"
+            );
+            anyhow::Error::msg(format!("Failed to parse Jira get_ticket response: {e}"))
+        })?;
 
         let shaped = match level {
             LevelOfDetails::Basic => shape_basic(&raw),
@@ -137,15 +179,31 @@ impl JiraTool {
         jql: &str,
         max_results: Option<u32>,
     ) -> anyhow::Result<ToolResult> {
-        let url = format!("{}/rest/api/3/search/jql", self.base_url);
         let max_results = max_results.unwrap_or(25).clamp(1, 999);
 
+        let issues = if self.is_cloud() {
+            self.search_tickets_v3(jql, max_results).await?
+        } else {
+            self.search_tickets_v2(jql, max_results).await?
+        };
+
+        let output = json!(issues);
+        Ok(ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string()),
+            error: None,
+        })
+    }
+
+    /// Cloud (v3): `POST /rest/api/3/search/jql` with `nextPageToken` pagination.
+    #[allow(clippy::cast_possible_truncation)]
+    async fn search_tickets_v3(&self, jql: &str, max_results: u32) -> anyhow::Result<Vec<Value>> {
+        let url = format!("{}/rest/api/3/search/jql", self.base_url);
         let mut issues: Vec<Value> = Vec::new();
         let mut next_page_token: Option<String> = None;
 
         loop {
             let remaining = max_results.saturating_sub(issues.len() as u32);
-
             let page_size = remaining.min(JIRA_SEARCH_PAGE_SIZE);
 
             let mut body = json!({
@@ -158,15 +216,21 @@ impl JiraTool {
                 body["nextPageToken"] = json!(token);
             }
 
-            let resp = self
+            let req = self
                 .http
                 .post(&url)
-                .basic_auth(&self.email, Some(&self.api_token))
                 .json(&body)
-                .timeout(std::time::Duration::from_secs(self.timeout_secs))
-                .send()
-                .await
-                .map_err(|e| anyhow::anyhow!("Jira search_tickets request failed: {e}"))?;
+                .timeout(std::time::Duration::from_secs(self.timeout_secs));
+            let resp = self.authenticated(req).send().await.map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "jira: Jira search_tickets request failed"
+                );
+                anyhow::Error::msg(format!("Jira search_tickets request failed: {e}"))
+            })?;
 
             let status = resp.status();
             if !status.is_success() {
@@ -177,10 +241,16 @@ impl JiraTool {
                 );
             }
 
-            let raw: Value = resp
-                .json()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to parse Jira search response: {e}"))?;
+            let raw: Value = resp.json().await.map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "jira: Failed to parse Jira search response"
+                );
+                anyhow::Error::msg(format!("Failed to parse Jira search response: {e}"))
+            })?;
 
             if let Some(page) = raw["issues"].as_array() {
                 issues.extend(page.iter().map(shape_basic_search));
@@ -197,12 +267,77 @@ impl JiraTool {
             }
         }
 
-        let output = json!(issues);
-        Ok(ToolResult {
-            success: true,
-            output: serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string()),
-            error: None,
-        })
+        Ok(issues)
+    }
+
+    /// Server/DC (v2): `POST /rest/api/2/search` with `startAt` offset pagination.
+    #[allow(clippy::cast_possible_truncation)]
+    async fn search_tickets_v2(&self, jql: &str, max_results: u32) -> anyhow::Result<Vec<Value>> {
+        let url = format!("{}/rest/api/2/search", self.base_url);
+        let mut issues: Vec<Value> = Vec::new();
+        let mut start_at: u32 = 0;
+
+        loop {
+            let remaining = max_results.saturating_sub(issues.len() as u32);
+            let page_size = remaining.min(JIRA_SEARCH_PAGE_SIZE);
+
+            let body = json!({
+                "jql": jql,
+                "startAt": start_at,
+                "maxResults": page_size,
+                "fields": ["summary", "priority", "status", "assignee", "created", "updated"]
+            });
+
+            let req = self
+                .http
+                .post(&url)
+                .json(&body)
+                .timeout(std::time::Duration::from_secs(self.timeout_secs));
+            let resp = self.authenticated(req).send().await.map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "jira: Jira search_tickets request failed"
+                );
+                anyhow::Error::msg(format!("Jira search_tickets request failed: {e}"))
+            })?;
+
+            let status = resp.status();
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                anyhow::bail!(
+                    "Jira search_tickets failed ({status}): {}",
+                    crate::util_helpers::truncate_with_ellipsis(&text, MAX_ERROR_BODY_CHARS)
+                );
+            }
+
+            let raw: Value = resp.json().await.map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "jira: Failed to parse Jira search response"
+                );
+                anyhow::Error::msg(format!("Failed to parse Jira search response: {e}"))
+            })?;
+
+            let page = raw["issues"].as_array();
+            let page_len = page.map_or(0, |p| p.len());
+            if let Some(page) = page {
+                issues.extend(page.iter().map(shape_basic_search));
+            }
+
+            let total = raw["total"].as_u64().unwrap_or(0) as u32;
+            start_at += page_len as u32;
+            if page_len == 0 || start_at >= total || issues.len() as u32 >= max_results {
+                break;
+            }
+        }
+
+        Ok(issues)
     }
 
     async fn comment_ticket(
@@ -212,26 +347,41 @@ impl JiraTool {
     ) -> anyhow::Result<ToolResult> {
         validate_issue_key(issue_key)?;
 
-        let emails = extract_emails(comment_text);
-        let mut mentions: HashMap<String, (String, String)> = HashMap::new();
-        for email in emails {
-            if let Some(info) = self.resolve_email(&email).await {
-                mentions.insert(email, info);
+        let ver = self.api_version();
+        let url = format!(
+            "{}/rest/api/{}/issue/{}/comment",
+            self.base_url, ver, issue_key
+        );
+
+        let body = if self.is_cloud() {
+            let emails = extract_emails(comment_text);
+            let mut mentions: HashMap<String, (String, String)> = HashMap::new();
+            for email in emails {
+                if let Some(info) = self.resolve_email(&email).await {
+                    mentions.insert(email, info);
+                }
             }
-        }
+            let adf = build_adf(comment_text, &mentions);
+            json!({ "body": adf })
+        } else {
+            json!({ "body": comment_text })
+        };
 
-        let adf = build_adf(comment_text, &mentions);
-
-        let url = format!("{}/rest/api/3/issue/{}/comment", self.base_url, issue_key);
-        let resp = self
+        let req = self
             .http
             .post(&url)
-            .basic_auth(&self.email, Some(&self.api_token))
-            .json(&json!({ "body": adf }))
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Jira comment_ticket request failed: {e}"))?;
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(self.timeout_secs));
+        let resp = self.authenticated(req).send().await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "jira: Jira comment_ticket request failed"
+            );
+            anyhow::Error::msg(format!("Jira comment_ticket request failed: {e}"))
+        })?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -242,10 +392,16 @@ impl JiraTool {
             );
         }
 
-        let response: Value = resp
-            .json()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to parse Jira comment response: {e}"))?;
+        let response: Value = resp.json().await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "jira: Failed to parse Jira comment response"
+            );
+            anyhow::Error::msg(format!("Failed to parse Jira comment response: {e}"))
+        })?;
 
         let shaped = shape_comment_response(&response);
         Ok(ToolResult {
@@ -256,16 +412,23 @@ impl JiraTool {
     }
 
     async fn list_projects(&self) -> anyhow::Result<ToolResult> {
-        let url = format!("{}/rest/api/3/project", self.base_url);
+        let ver = self.api_version();
+        let url = format!("{}/rest/api/{}/project", self.base_url, ver);
 
-        let resp = self
+        let req = self
             .http
             .get(&url)
-            .basic_auth(&self.email, Some(&self.api_token))
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Jira list_projects request failed: {e}"))?;
+            .timeout(std::time::Duration::from_secs(self.timeout_secs));
+        let resp = self.authenticated(req).send().await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "jira: Jira list_projects request failed"
+            );
+            anyhow::Error::msg(format!("Jira list_projects request failed: {e}"))
+        })?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -276,10 +439,16 @@ impl JiraTool {
             );
         }
 
-        let projects: Vec<Value> = resp
-            .json()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to parse Jira list_projects response: {e}"))?;
+        let projects: Vec<Value> = resp.json().await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "jira: Failed to parse Jira list_projects response"
+            );
+            anyhow::Error::msg(format!("Failed to parse Jira list_projects response: {e}"))
+        })?;
 
         let keys: Vec<String> = projects
             .iter()
@@ -289,26 +458,41 @@ impl JiraTool {
         const STATUS_CONCURRENCY: usize = 5;
 
         let users_url = format!(
-            "{}/rest/api/3/user/assignable/multiProjectSearch",
-            self.base_url
+            "{}/rest/api/{}/user/assignable/multiProjectSearch",
+            self.base_url, ver
         );
 
-        let users_resp = self
+        let users_req = self
             .http
             .get(&users_url)
-            .basic_auth(&self.email, Some(&self.api_token))
             .query(&[
                 ("projectKeys", keys.join(",").as_str()),
                 ("maxResults", "50"),
             ])
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Jira list_projects users request failed: {e}"))?;
+            .timeout(std::time::Duration::from_secs(self.timeout_secs));
+        let users_resp = self.authenticated(users_req).send().await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "jira: Jira list_projects users request failed"
+            );
+            anyhow::Error::msg(format!("Jira list_projects users request failed: {e}"))
+        })?;
 
         let users: Vec<Value> = if users_resp.status().is_success() {
             users_resp.json().await.map_err(|e| {
-                anyhow::anyhow!("Failed to parse Jira list_projects users response: {e}")
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "jira: Failed to parse Jira list_projects users response"
+                );
+                anyhow::Error::msg(format!(
+                    "Failed to parse Jira list_projects users response: {e}"
+                ))
             })?
         } else {
             let status = users_resp.status();
@@ -324,11 +508,20 @@ impl JiraTool {
         let mut statuses_results = vec![json!([]); keys.len()];
 
         for (i, key) in keys.iter().enumerate() {
-            if set.len() >= STATUS_CONCURRENCY
-                && let Some(Ok((idx, result))) = set.join_next().await
-            {
-                statuses_results[idx] =
-                    result.map_err(|e| anyhow::anyhow!("Jira statuses failed: {e}"))?;
+            if set.len() >= STATUS_CONCURRENCY {
+                let Some(Ok((idx, result))) = set.join_next().await else {
+                    continue;
+                };
+                statuses_results[idx] = result.map_err(|e| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "jira: Jira statuses failed"
+                    );
+                    anyhow::Error::msg(format!("Jira statuses failed: {e}"))
+                })?;
             }
 
             let client = self.http.clone();
@@ -339,21 +532,44 @@ impl JiraTool {
 
             set.spawn(async move {
                 let result = async {
-                    let resp = client
+                    let req = client
                         .get(&request_url)
-                        .basic_auth(&email, Some(&token))
-                        .timeout(std::time::Duration::from_secs(timeout))
-                        .send()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("statuses request failed: {e}"))?;
+                        .timeout(std::time::Duration::from_secs(timeout));
+                    let req = match &email {
+                        Some(e) => req.basic_auth(e, Some(&token)),
+                        None => req.bearer_auth(&token),
+                    };
+                    let resp = req.send().await.map_err(|e| {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "jira: statuses request failed"
+                        );
+                        anyhow::Error::msg(format!("statuses request failed: {e}"))
+                    })?;
 
                     if !resp.status().is_success() {
                         anyhow::bail!("statuses request returned {}", resp.status());
                     }
 
-                    resp.json::<Value>()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("failed to parse statuses response: {e}"))
+                    resp.json::<Value>().await.map_err(|e| {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "jira: failed to parse statuses response"
+                        );
+                        anyhow::Error::msg(format!("failed to parse statuses response: {e}"))
+                    })
                 }
                 .await;
                 (i, result)
@@ -361,8 +577,16 @@ impl JiraTool {
         }
 
         while let Some(Ok((idx, result))) = set.join_next().await {
-            statuses_results[idx] =
-                result.map_err(|e| anyhow::anyhow!("Jira statuses failed: {e}"))?;
+            statuses_results[idx] = result.map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "jira: Jira statuses failed"
+                );
+                anyhow::Error::msg(format!("Jira statuses failed: {e}"))
+            })?;
         }
 
         let shaped_projects = shape_projects(&projects, &statuses_results);
@@ -384,16 +608,23 @@ impl JiraTool {
     }
 
     async fn get_myself(&self) -> anyhow::Result<ToolResult> {
-        let url = format!("{}/rest/api/3/myself", self.base_url);
+        let ver = self.api_version();
+        let url = format!("{}/rest/api/{}/myself", self.base_url, ver);
 
-        let resp = self
+        let req = self
             .http
             .get(&url)
-            .basic_auth(&self.email, Some(&self.api_token))
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("Jira myself request failed: {e}"))?;
+            .timeout(std::time::Duration::from_secs(self.timeout_secs));
+        let resp = self.authenticated(req).send().await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "jira: Jira myself request failed"
+            );
+            anyhow::Error::msg(format!("Jira myself request failed: {e}"))
+        })?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -404,10 +635,16 @@ impl JiraTool {
             );
         }
 
-        let raw: Value = resp
-            .json()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to parse Jira myself response: {e}"))?;
+        let raw: Value = resp.json().await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "jira: Failed to parse Jira myself response"
+            );
+            anyhow::Error::msg(format!("Failed to parse Jira myself response: {e}"))
+        })?;
 
         let shaped = json!({
             "accountId":    raw["accountId"],
@@ -424,13 +661,15 @@ impl JiraTool {
     }
 
     async fn resolve_email(&self, email: &str) -> Option<(String, String)> {
-        let url = format!("{}/rest/api/3/user/search", self.base_url);
-        let result = self
+        let ver = self.api_version();
+        let url = format!("{}/rest/api/{}/user/search", self.base_url, ver);
+        let req = self
             .http
             .get(&url)
-            .basic_auth(&self.email, Some(&self.api_token))
             .query(&[("query", email)])
-            .timeout(std::time::Duration::from_secs(self.timeout_secs))
+            .timeout(std::time::Duration::from_secs(self.timeout_secs));
+        let result = self
+            .authenticated(req)
             .send()
             .await
             .ok()?
@@ -450,6 +689,260 @@ impl JiraTool {
             }
         })
     }
+
+    /// Fetches the available transitions for an issue and returns a minimal
+    /// shape `{ transitions: [{ id, name, to_status }] }`.
+    async fn fetch_transitions(&self, issue_key: &str) -> anyhow::Result<Vec<Value>> {
+        validate_issue_key(issue_key)?;
+        let ver = self.api_version();
+        let url = format!(
+            "{}/rest/api/{}/issue/{}/transitions",
+            self.base_url, ver, issue_key
+        );
+
+        let req = self
+            .http
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(self.timeout_secs));
+        let resp = self.authenticated(req).send().await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "jira: Jira list_transitions request failed"
+            );
+            anyhow::Error::msg(format!("Jira list_transitions request failed: {e}"))
+        })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Jira list_transitions failed ({status}): {}",
+                crate::util_helpers::truncate_with_ellipsis(&text, MAX_ERROR_BODY_CHARS)
+            );
+        }
+
+        let raw: Value = resp.json().await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "jira: Failed to parse Jira transitions response"
+            );
+            anyhow::Error::msg(format!("Failed to parse Jira transitions response: {e}"))
+        })?;
+
+        Ok(shape_transitions(&raw))
+    }
+
+    async fn list_transitions(&self, issue_key: &str) -> anyhow::Result<ToolResult> {
+        let transitions = self.fetch_transitions(issue_key).await?;
+        let output = json!({ "transitions": transitions });
+        Ok(ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string()),
+            error: None,
+        })
+    }
+
+    async fn transition_ticket(
+        &self,
+        issue_key: &str,
+        transition_id: Option<&str>,
+        transition_name: Option<&str>,
+    ) -> anyhow::Result<ToolResult> {
+        validate_issue_key(issue_key)?;
+
+        // Resolve transition_name → id if needed.
+        let resolved_id: String = match (transition_id, transition_name) {
+            (Some(id), _) if !id.trim().is_empty() => id.to_string(),
+            (_, Some(name)) if !name.trim().is_empty() => {
+                let transitions = self.fetch_transitions(issue_key).await?;
+                let needle = name.trim().to_ascii_lowercase();
+                let found = transitions.iter().find_map(|t| {
+                    let n = t["name"].as_str()?;
+                    if n.eq_ignore_ascii_case(&needle) || n.to_ascii_lowercase() == needle {
+                        t["id"].as_str().map(String::from)
+                    } else {
+                        None
+                    }
+                });
+                match found {
+                    Some(id) => id,
+                    None => {
+                        let available: Vec<&str> = transitions
+                            .iter()
+                            .filter_map(|t| t["name"].as_str())
+                            .collect();
+                        anyhow::bail!(
+                            "Transition '{name}' not found for {issue_key}. Available: {}",
+                            available.join(", ")
+                        );
+                    }
+                }
+            }
+            _ => {
+                anyhow::bail!(
+                    "transition_ticket requires exactly one of transition_id or transition_name"
+                );
+            }
+        };
+
+        let ver = self.api_version();
+        let url = format!(
+            "{}/rest/api/{}/issue/{}/transitions",
+            self.base_url, ver, issue_key
+        );
+        let body = json!({ "transition": { "id": resolved_id } });
+
+        let req = self
+            .http
+            .post(&url)
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(self.timeout_secs));
+        let resp = self.authenticated(req).send().await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "jira: Jira transition_ticket request failed"
+            );
+            anyhow::Error::msg(format!("Jira transition_ticket request failed: {e}"))
+        })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Jira transition_ticket failed ({status}): {}",
+                crate::util_helpers::truncate_with_ellipsis(&text, MAX_ERROR_BODY_CHARS)
+            );
+        }
+
+        // Jira returns 204 No Content on a successful transition.
+        let output = json!({
+            "ok": true,
+            "issue_key": issue_key,
+            "transition_id": resolved_id,
+        });
+        Ok(ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string()),
+            error: None,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_ticket(
+        &self,
+        project_key: &str,
+        issue_type: &str,
+        summary: &str,
+        description: Option<&str>,
+        assignee: Option<&str>,
+        labels: Option<&[String]>,
+        parent_key: Option<&str>,
+    ) -> anyhow::Result<ToolResult> {
+        validate_project_key(project_key)?;
+        if summary.trim().is_empty() {
+            anyhow::bail!("create_ticket requires a non-empty summary");
+        }
+        if issue_type.trim().is_empty() {
+            anyhow::bail!("create_ticket requires a non-empty issue_type");
+        }
+        if let Some(parent) = parent_key {
+            validate_issue_key(parent)?;
+        }
+
+        let mut fields = serde_json::Map::new();
+        fields.insert("project".into(), json!({ "key": project_key }));
+        fields.insert("issuetype".into(), json!({ "name": issue_type }));
+        fields.insert("summary".into(), json!(summary));
+
+        if let Some(desc) = description {
+            let value = if self.is_cloud() {
+                build_adf(desc, &HashMap::new())
+            } else {
+                json!(desc)
+            };
+            fields.insert("description".into(), value);
+        }
+
+        if let Some(a) = assignee {
+            let value = if self.is_cloud() {
+                json!({ "accountId": a })
+            } else {
+                json!({ "name": a })
+            };
+            fields.insert("assignee".into(), value);
+        }
+
+        if let Some(ls) = labels {
+            fields.insert("labels".into(), json!(ls));
+        }
+
+        if let Some(parent) = parent_key {
+            fields.insert("parent".into(), json!({ "key": parent }));
+        }
+
+        let body = json!({ "fields": Value::Object(fields) });
+
+        let ver = self.api_version();
+        let url = format!("{}/rest/api/{}/issue", self.base_url, ver);
+
+        let req = self
+            .http
+            .post(&url)
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(self.timeout_secs));
+        let resp = self.authenticated(req).send().await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "jira: Jira create_ticket request failed"
+            );
+            anyhow::Error::msg(format!("Jira create_ticket request failed: {e}"))
+        })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Jira create_ticket failed ({status}): {}",
+                crate::util_helpers::truncate_with_ellipsis(&text, MAX_ERROR_BODY_CHARS)
+            );
+        }
+
+        let raw: Value = resp.json().await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "jira: Failed to parse Jira create_ticket response"
+            );
+            anyhow::Error::msg(format!("Failed to parse Jira create_ticket response: {e}"))
+        })?;
+
+        let key = raw["key"].as_str().unwrap_or("");
+        let output = json!({
+            "id":         raw["id"],
+            "key":        key,
+            "self_url":   raw["self"],
+            "browse_url": format!("{}/browse/{}", self.base_url, key),
+        });
+        Ok(ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string()),
+            error: None,
+        })
+    }
 }
 
 #[async_trait]
@@ -459,7 +952,7 @@ impl Tool for JiraTool {
     }
 
     fn description(&self) -> &str {
-        "Interact with Jira: get tickets with configurable detail level, search issues with JQL, add comments with mention and formatting support."
+        "Interact with Jira: read tickets, search with JQL, add comments, list projects and per-issue transitions, transition an issue through its workflow, and create new issues."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -468,12 +961,21 @@ impl Tool for JiraTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["get_ticket", "search_tickets", "comment_ticket", "list_projects", "myself"],
+                    "enum": [
+                        "get_ticket",
+                        "search_tickets",
+                        "comment_ticket",
+                        "list_projects",
+                        "myself",
+                        "list_transitions",
+                        "transition_ticket",
+                        "create_ticket"
+                    ],
                     "description": "The Jira action to perform. Enabled actions are configured in [jira].allowed_actions. Use 'myself' to verify that credentials are valid and the Jira connection is working."
                 },
                 "issue_key": {
                     "type": "string",
-                    "description": "Jira issue key, e.g. 'PROJ-123'. Required for get_ticket and comment_ticket."
+                    "description": "Jira issue key, e.g. 'PROJ-123'. Required for get_ticket, comment_ticket, list_transitions, and transition_ticket."
                 },
                 "level_of_details": {
                     "type": "string",
@@ -491,7 +993,44 @@ impl Tool for JiraTool {
                 },
                 "comment": {
                     "type": "string",
-                    "description": "Comment body for comment_ticket. Supports a limited markdown-like syntax converted to Atlassian Document Format (ADF). Mention a user with @user@domain.com — the leading @ is required (a bare email without @ prefix is treated as plain text). Bold with **text**. Bullet list items with a leading '- '. Newlines become line breaks. Everything else is plain text. Example: 'Hi @john@company.com, this is **important**.\n- Check the logs\n- Rerun the pipeline'"
+                    "description": "Comment body for comment_ticket. In Jira Cloud mode, supports a limited markdown-like syntax converted to Atlassian Document Format (ADF): mention a user with @user@domain.com (the leading @ is required; a bare email without @ prefix is treated as plain text), bold with **text**, bullet list items with a leading '- ', and newlines as line breaks. In Jira Server/Data Center mode, comments are posted as plain text with no ADF conversion or mention resolution. Example: 'Hi @john@company.com, this is **important**.\n- Check the logs\n- Rerun the pipeline'"
+                },
+                "transition_id": {
+                    "type": "string",
+                    "description": "Transition ID to apply for transition_ticket. Provide either transition_id or transition_name (not both). Use list_transitions to discover the IDs valid for an issue's current state."
+                },
+                "transition_name": {
+                    "type": "string",
+                    "description": "Transition name (case-insensitive) to apply for transition_ticket, e.g. 'In Progress' or 'Done'. Provide either transition_id or transition_name (not both). The tool resolves the name against the issue's available transitions and returns an error listing valid names if not found."
+                },
+                "project_key": {
+                    "type": "string",
+                    "description": "Jira project key, e.g. 'PROJ'. Required for create_ticket. Use list_projects to discover keys."
+                },
+                "issue_type": {
+                    "type": "string",
+                    "description": "Issue type name, e.g. 'Task', 'Bug', 'Story'. Required for create_ticket. Valid values per project are returned by list_projects."
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Ticket title. Required for create_ticket. Must be non-empty."
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Ticket description for create_ticket. Optional. In Jira Cloud mode, the same limited markdown-like syntax as 'comment' is supported and rendered to ADF (no mention resolution). In Server/Data Center mode, sent as plain text."
+                },
+                "assignee": {
+                    "type": "string",
+                    "description": "Assignee for create_ticket. Optional. In Jira Cloud, pass an accountId; in Server/Data Center, pass a username."
+                },
+                "labels": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Labels to attach to the new issue for create_ticket. Optional."
+                },
+                "parent_key": {
+                    "type": "string",
+                    "description": "Parent issue key for create_ticket. Optional. Used for sub-tasks or to set the parent epic (e.g. 'PROJ-100')."
                 }
             },
             "required": ["action"]
@@ -514,13 +1053,20 @@ impl Tool for JiraTool {
         // clear "unknown action" error rather than a misleading "not enabled" one.
         if !matches!(
             action,
-            "get_ticket" | "search_tickets" | "comment_ticket" | "list_projects" | "myself"
+            "get_ticket"
+                | "search_tickets"
+                | "comment_ticket"
+                | "list_projects"
+                | "myself"
+                | "list_transitions"
+                | "transition_ticket"
+                | "create_ticket"
         ) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Unknown action: '{action}'. Valid actions: get_ticket, search_tickets, comment_ticket, list_projects, myself"
+                    "Unknown action: '{action}'. Valid actions: get_ticket, search_tickets, comment_ticket, list_projects, myself, list_transitions, transition_ticket, create_ticket"
                 )),
             });
         }
@@ -538,8 +1084,10 @@ impl Tool for JiraTool {
         }
 
         let operation = match action {
-            "get_ticket" | "search_tickets" | "list_projects" | "myself" => ToolOperation::Read,
-            "comment_ticket" => ToolOperation::Act,
+            "get_ticket" | "search_tickets" | "list_projects" | "myself" | "list_transitions" => {
+                ToolOperation::Read
+            }
+            "comment_ticket" | "transition_ticket" | "create_ticket" => ToolOperation::Act,
             _ => unreachable!(),
         };
 
@@ -615,6 +1163,127 @@ impl Tool for JiraTool {
                 };
                 self.comment_ticket(issue_key, comment).await
             }
+            "list_transitions" => {
+                let issue_key = match args.get("issue_key").and_then(|v| v.as_str()) {
+                    Some(k) => k,
+                    None => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some("list_transitions requires issue_key parameter".into()),
+                        });
+                    }
+                };
+                self.list_transitions(issue_key).await
+            }
+            "transition_ticket" => {
+                let issue_key = match args.get("issue_key").and_then(|v| v.as_str()) {
+                    Some(k) => k,
+                    None => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some("transition_ticket requires issue_key parameter".into()),
+                        });
+                    }
+                };
+                let transition_id = args
+                    .get("transition_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty());
+                let transition_name = args
+                    .get("transition_name")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty());
+                if transition_id.is_none() && transition_name.is_none() {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(
+                            "transition_ticket requires either transition_id or transition_name"
+                                .into(),
+                        ),
+                    });
+                }
+                if transition_id.is_some() && transition_name.is_some() {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(
+                            "transition_ticket accepts only one of transition_id or transition_name, not both".into(),
+                        ),
+                    });
+                }
+                self.transition_ticket(issue_key, transition_id, transition_name)
+                    .await
+            }
+            "create_ticket" => {
+                let project_key = match args.get("project_key").and_then(|v| v.as_str()) {
+                    Some(k) if !k.trim().is_empty() => k,
+                    _ => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(
+                                "create_ticket requires a non-empty project_key parameter".into(),
+                            ),
+                        });
+                    }
+                };
+                let issue_type = match args.get("issue_type").and_then(|v| v.as_str()) {
+                    Some(t) if !t.trim().is_empty() => t,
+                    _ => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(
+                                "create_ticket requires a non-empty issue_type parameter".into(),
+                            ),
+                        });
+                    }
+                };
+                let summary = match args.get("summary").and_then(|v| v.as_str()) {
+                    Some(s) if !s.trim().is_empty() => s,
+                    _ => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(
+                                "create_ticket requires a non-empty summary parameter".into(),
+                            ),
+                        });
+                    }
+                };
+                let description = args
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty());
+                let assignee = args
+                    .get("assignee")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty());
+                let labels: Option<Vec<String>> = args.get("labels").and_then(|v| {
+                    v.as_array().map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
+                });
+                let parent_key = args
+                    .get("parent_key")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty());
+                self.create_ticket(
+                    project_key,
+                    issue_type,
+                    summary,
+                    description,
+                    assignee,
+                    labels.as_deref(),
+                    parent_key,
+                )
+                .await
+            }
             _ => unreachable!(),
         };
 
@@ -647,6 +1316,18 @@ fn validate_issue_key(key: &str) -> anyhow::Result<()> {
         anyhow::bail!(
             "Invalid issue key '{key}'. Expected format: PROJECT-123 (e.g. PROJ-42, proj-42)"
         )
+    }
+}
+
+/// Validates that `key` matches the Jira project key format. Same character
+/// class as the project portion of `validate_issue_key` so the two stay in
+/// step.
+fn validate_project_key(key: &str) -> anyhow::Result<()> {
+    let valid = !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric());
+    if valid {
+        Ok(())
+    } else {
+        anyhow::bail!("Invalid project key '{key}'. Expected ASCII alphanumeric, e.g. PROJ")
     }
 }
 
@@ -754,6 +1435,25 @@ fn shape_comment_response(raw: &Value) -> Value {
         "author":  raw["author"]["displayName"],
         "created": date_prefix(raw["created"].as_str().unwrap_or("")),
     })
+}
+
+/// Trims Jira's transitions response to `[{ id, name, to_status }]`, dropping
+/// icons, conditions, and other workflow-engine internals.
+fn shape_transitions(raw: &Value) -> Vec<Value> {
+    raw["transitions"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|t| {
+                    json!({
+                        "id":        t["id"],
+                        "name":      t["name"],
+                        "to_status": t["to"]["name"],
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn shape_projects(projects: &[Value], statuses_per_project: &[Value]) -> Vec<Value> {
@@ -958,24 +1658,301 @@ mod tests {
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
 
-    fn test_tool(allowed_actions: Vec<&str>) -> JiraTool {
-        let security = Arc::new(SecurityPolicy {
+    fn test_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             ..SecurityPolicy::default()
-        });
+        })
+    }
+
+    fn test_tool_with_base_url(
+        base_url: String,
+        email: Option<String>,
+        api_token: &str,
+        allowed_actions: Vec<&str>,
+    ) -> JiraTool {
         JiraTool::new(
-            "https://test.atlassian.net".into(),
-            "test@example.com".into(),
-            "test-token".into(),
+            base_url,
+            email,
+            api_token.into(),
             allowed_actions.into_iter().map(String::from).collect(),
-            security,
+            test_security(),
             30,
         )
+    }
+
+    /// Cloud mode helper (email present → API v3 + Basic auth).
+    fn test_tool(allowed_actions: Vec<&str>) -> JiraTool {
+        test_tool_with_base_url(
+            "https://test.atlassian.net".into(),
+            Some("test@example.com".into()),
+            "test-token",
+            allowed_actions,
+        )
+    }
+
+    /// Server/DC mode helper (no email → API v2 + Bearer auth).
+    fn test_tool_server(allowed_actions: Vec<&str>) -> JiraTool {
+        test_tool_with_base_url(
+            "https://internal-jira.company.com".into(),
+            None,
+            "pat-token-abc",
+            allowed_actions,
+        )
+    }
+
+    fn basic_auth_header(email: &str, token: &str) -> String {
+        use base64::Engine as _;
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{email}:{token}"));
+        format!("Basic {encoded}")
+    }
+
+    fn basic_search_issue(key: &str) -> Value {
+        json!({
+            "key": key,
+            "fields": {
+                "summary": "Fix bug",
+                "status": { "name": "In Progress" },
+                "priority": { "name": "High" },
+                "assignee": { "displayName": "Jane" },
+                "created": "2024-01-15T10:00:00.000Z",
+                "updated": "2024-03-01T12:00:00.000Z"
+            }
+        })
+    }
+
+    // ── API version / auth mode tests ───────────────────────────────────────
+
+    #[test]
+    fn cloud_tool_uses_api_v3() {
+        let tool = test_tool(vec!["get_ticket"]);
+        assert_eq!(tool.api_version(), "3");
+        assert!(tool.is_cloud());
+    }
+
+    #[test]
+    fn server_tool_uses_api_v2() {
+        let tool = test_tool_server(vec!["get_ticket"]);
+        assert_eq!(tool.api_version(), "2");
+        assert!(!tool.is_cloud());
     }
 
     #[test]
     fn tool_name_is_jira() {
         assert_eq!(test_tool(vec!["get_ticket"]).name(), "jira");
+    }
+
+    // ── Request shape tests ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn cloud_search_uses_basic_auth_v3_endpoint_and_next_page_token() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let auth = basic_auth_header("test@example.com", "test-token");
+        let fields = json!([
+            "summary", "priority", "status", "assignee", "created", "updated"
+        ]);
+
+        let first_body = json!({
+            "jql": "project = PROJ",
+            "maxResults": 2,
+            "fields": fields
+        });
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/search/jql"))
+            .and(header("authorization", auth.as_str()))
+            .and(body_json(&first_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issues": [basic_search_issue("PROJ-1")],
+                "isLast": false,
+                "nextPageToken": "page-2"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let second_body = json!({
+            "jql": "project = PROJ",
+            "maxResults": 1,
+            "fields": fields,
+            "nextPageToken": "page-2"
+        });
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/search/jql"))
+            .and(header("authorization", auth.as_str()))
+            .and(body_json(&second_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issues": [basic_search_issue("PROJ-2")],
+                "isLast": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tool = test_tool_with_base_url(
+            server.uri(),
+            Some("test@example.com".into()),
+            "test-token",
+            vec!["search_tickets"],
+        );
+        let result = tool
+            .execute(json!({
+                "action": "search_tickets",
+                "jql": "project = PROJ",
+                "max_results": 2
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output.as_array().unwrap().len(), 2);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn server_search_uses_bearer_auth_v2_endpoint_and_start_at() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let fields = json!([
+            "summary", "priority", "status", "assignee", "created", "updated"
+        ]);
+
+        let first_body = json!({
+            "jql": "project = PROJ",
+            "startAt": 0,
+            "maxResults": 2,
+            "fields": fields
+        });
+        Mock::given(method("POST"))
+            .and(path("/rest/api/2/search"))
+            .and(header("authorization", "Bearer pat-token-abc"))
+            .and(body_json(&first_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issues": [basic_search_issue("PROJ-1")],
+                "total": 2
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let second_body = json!({
+            "jql": "project = PROJ",
+            "startAt": 1,
+            "maxResults": 1,
+            "fields": fields
+        });
+        Mock::given(method("POST"))
+            .and(path("/rest/api/2/search"))
+            .and(header("authorization", "Bearer pat-token-abc"))
+            .and(body_json(&second_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issues": [basic_search_issue("PROJ-2")],
+                "total": 2
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tool =
+            test_tool_with_base_url(server.uri(), None, "pat-token-abc", vec!["search_tickets"]);
+        let result = tool
+            .execute(json!({
+                "action": "search_tickets",
+                "jql": "project = PROJ",
+                "max_results": 2
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output.as_array().unwrap().len(), 2);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn cloud_comment_posts_adf_body_to_v3_endpoint() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let comment = "This is **important**.\n- Check the logs";
+        let expected_body = json!({ "body": build_adf(comment, &HashMap::new()) });
+        let auth = basic_auth_header("test@example.com", "test-token");
+
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue/PROJ-1/comment"))
+            .and(header("authorization", auth.as_str()))
+            .and(body_json(&expected_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "10000",
+                "author": { "displayName": "Jane" },
+                "created": "2024-01-15T10:00:00.000Z"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tool = test_tool_with_base_url(
+            server.uri(),
+            Some("test@example.com".into()),
+            "test-token",
+            vec!["comment_ticket"],
+        );
+        let result = tool
+            .execute(json!({
+                "action": "comment_ticket",
+                "issue_key": "PROJ-1",
+                "comment": comment
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn server_comment_posts_plain_text_body_to_v2_endpoint() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let comment = "Hi @john@company.com, this is **important**.\n- Check the logs";
+        let expected_body = json!({ "body": comment });
+
+        Mock::given(method("POST"))
+            .and(path("/rest/api/2/issue/PROJ-1/comment"))
+            .and(header("authorization", "Bearer pat-token-abc"))
+            .and(body_json(&expected_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "10001",
+                "author": { "displayName": "Jane" },
+                "created": "2024-01-15T10:00:00.000Z"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tool =
+            test_tool_with_base_url(server.uri(), None, "pat-token-abc", vec!["comment_ticket"]);
+        let result = tool
+            .execute(json!({
+                "action": "comment_ticket",
+                "issue_key": "PROJ-1",
+                "comment": comment
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        server.verify().await;
     }
 
     #[test]
@@ -993,6 +1970,19 @@ mod tests {
         assert!(action_strs.contains(&"get_ticket"));
         assert!(action_strs.contains(&"search_tickets"));
         assert!(action_strs.contains(&"comment_ticket"));
+    }
+
+    #[test]
+    fn parameters_schema_describes_cloud_and_server_comment_modes() {
+        let schema = test_tool(vec!["comment_ticket"]).parameters_schema();
+        let description = schema["properties"]["comment"]["description"]
+            .as_str()
+            .unwrap();
+
+        assert!(description.contains("Jira Cloud mode"));
+        assert!(description.contains("Atlassian Document Format"));
+        assert!(description.contains("Jira Server/Data Center mode"));
+        assert!(description.contains("plain text"));
     }
 
     #[tokio::test]
@@ -1085,7 +2075,7 @@ mod tests {
         });
         let tool = JiraTool::new(
             "https://test.atlassian.net".into(),
-            "test@example.com".into(),
+            Some("test@example.com".into()),
             "token".into(),
             vec!["get_ticket".into(), "comment_ticket".into()],
             security,
@@ -1136,7 +2126,7 @@ mod tests {
         });
         let tool = JiraTool::new(
             "https://test.atlassian.net".into(),
-            "test@example.com".into(),
+            Some("test@example.com".into()),
             "token".into(),
             vec!["myself".into()],
             security,
@@ -1405,7 +2395,7 @@ mod tests {
         });
         let tool = JiraTool::new(
             "https://127.0.0.1:1".into(),
-            "test@example.com".into(),
+            Some("test@example.com".into()),
             "token".into(),
             vec!["list_projects".into()],
             security,
@@ -1520,5 +2510,674 @@ mod tests {
     fn shape_projects_empty_inputs() {
         let shaped = shape_projects(&[], &[]);
         assert_eq!(shaped.len(), 0);
+    }
+
+    // ── list_transitions / transition_ticket / create_ticket ─────────────────
+
+    #[test]
+    fn parameters_schema_includes_new_actions() {
+        let schema = test_tool(vec!["get_ticket"]).parameters_schema();
+        let actions = schema["properties"]["action"]["enum"].as_array().unwrap();
+        let action_strs: Vec<&str> = actions.iter().filter_map(|v| v.as_str()).collect();
+        assert!(action_strs.contains(&"list_transitions"));
+        assert!(action_strs.contains(&"transition_ticket"));
+        assert!(action_strs.contains(&"create_ticket"));
+    }
+
+    #[test]
+    fn parameters_schema_describes_transition_params() {
+        let schema = test_tool(vec!["transition_ticket"]).parameters_schema();
+        let props = &schema["properties"];
+        assert!(props["transition_id"].is_object());
+        assert!(props["transition_name"].is_object());
+    }
+
+    #[test]
+    fn parameters_schema_describes_create_params() {
+        let schema = test_tool(vec!["create_ticket"]).parameters_schema();
+        let props = &schema["properties"];
+        for key in [
+            "project_key",
+            "issue_type",
+            "summary",
+            "description",
+            "assignee",
+            "labels",
+            "parent_key",
+        ] {
+            assert!(props[key].is_object(), "missing schema property: {key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_list_transitions_disallowed_returns_error() {
+        let result = test_tool(vec!["get_ticket"])
+            .execute(json!({"action": "list_transitions", "issue_key": "PROJ-1"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap().contains("not enabled"));
+    }
+
+    #[tokio::test]
+    async fn execute_transition_ticket_blocked_in_readonly_mode() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        });
+        let tool = JiraTool::new(
+            "https://test.atlassian.net".into(),
+            Some("test@example.com".into()),
+            "token".into(),
+            vec!["transition_ticket".into()],
+            security,
+            30,
+        );
+        let result = tool
+            .execute(json!({
+                "action": "transition_ticket",
+                "issue_key": "PROJ-1",
+                "transition_id": "31"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap().contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn execute_create_ticket_blocked_in_readonly_mode() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        });
+        let tool = JiraTool::new(
+            "https://test.atlassian.net".into(),
+            Some("test@example.com".into()),
+            "token".into(),
+            vec!["create_ticket".into()],
+            security,
+            30,
+        );
+        let result = tool
+            .execute(json!({
+                "action": "create_ticket",
+                "project_key": "PROJ",
+                "issue_type": "Task",
+                "summary": "test"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap().contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn execute_list_transitions_not_blocked_in_readonly_mode() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        });
+        let tool = JiraTool::new(
+            "https://127.0.0.1:1".into(),
+            Some("test@example.com".into()),
+            "token".into(),
+            vec!["list_transitions".into()],
+            security,
+            30,
+        );
+        let result = tool
+            .execute(json!({"action": "list_transitions", "issue_key": "PROJ-1"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            !result.error.as_deref().unwrap_or("").contains("read-only"),
+            "list_transitions should be a Read op, but error mentioned read-only: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_list_transitions_missing_key_returns_error() {
+        let result = test_tool(vec!["list_transitions"])
+            .execute(json!({"action": "list_transitions"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap().contains("issue_key"));
+    }
+
+    #[tokio::test]
+    async fn execute_transition_ticket_missing_id_and_name_returns_error() {
+        let result = test_tool(vec!["transition_ticket"])
+            .execute(json!({"action": "transition_ticket", "issue_key": "PROJ-1"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(err.contains("transition_id") && err.contains("transition_name"));
+    }
+
+    #[tokio::test]
+    async fn execute_transition_ticket_both_id_and_name_returns_error() {
+        let result = test_tool(vec!["transition_ticket"])
+            .execute(json!({
+                "action": "transition_ticket",
+                "issue_key": "PROJ-1",
+                "transition_id": "31",
+                "transition_name": "In Progress"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap().contains("only one"));
+    }
+
+    #[tokio::test]
+    async fn execute_create_ticket_missing_required_fields_returns_error() {
+        let tool = test_tool(vec!["create_ticket"]);
+        // Missing project_key
+        let r1 = tool
+            .execute(json!({
+                "action": "create_ticket",
+                "issue_type": "Task",
+                "summary": "x"
+            }))
+            .await
+            .unwrap();
+        assert!(!r1.success);
+        assert!(r1.error.as_deref().unwrap().contains("project_key"));
+        // Missing issue_type
+        let r2 = tool
+            .execute(json!({
+                "action": "create_ticket",
+                "project_key": "PROJ",
+                "summary": "x"
+            }))
+            .await
+            .unwrap();
+        assert!(!r2.success);
+        assert!(r2.error.as_deref().unwrap().contains("issue_type"));
+        // Missing summary
+        let r3 = tool
+            .execute(json!({
+                "action": "create_ticket",
+                "project_key": "PROJ",
+                "issue_type": "Task"
+            }))
+            .await
+            .unwrap();
+        assert!(!r3.success);
+        assert!(r3.error.as_deref().unwrap().contains("summary"));
+    }
+
+    #[tokio::test]
+    async fn cloud_list_transitions_returns_shaped_response() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let auth = basic_auth_header("test@example.com", "test-token");
+
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1/transitions"))
+            .and(header("authorization", auth.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "transitions": [
+                    { "id": "11", "name": "To Do",       "to": { "name": "To Do" }, "isAvailable": true },
+                    { "id": "21", "name": "In Progress", "to": { "name": "In Progress" } },
+                    { "id": "31", "name": "Done",        "to": { "name": "Done" } }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tool = test_tool_with_base_url(
+            server.uri(),
+            Some("test@example.com".into()),
+            "test-token",
+            vec!["list_transitions"],
+        );
+        let result = tool
+            .execute(json!({"action": "list_transitions", "issue_key": "PROJ-1"}))
+            .await
+            .unwrap();
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        let arr = output["transitions"].as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[1]["id"], "21");
+        assert_eq!(arr[1]["name"], "In Progress");
+        assert_eq!(arr[1]["to_status"], "In Progress");
+        // Verbose Jira fields are dropped.
+        assert!(arr[0].get("isAvailable").is_none());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn cloud_transition_ticket_by_id_posts_expected_body() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let auth = basic_auth_header("test@example.com", "test-token");
+        let body = json!({ "transition": { "id": "31" } });
+
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue/PROJ-1/transitions"))
+            .and(header("authorization", auth.as_str()))
+            .and(body_json(&body))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tool = test_tool_with_base_url(
+            server.uri(),
+            Some("test@example.com".into()),
+            "test-token",
+            vec!["transition_ticket"],
+        );
+        let result = tool
+            .execute(json!({
+                "action": "transition_ticket",
+                "issue_key": "PROJ-1",
+                "transition_id": "31"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["ok"], true);
+        assert_eq!(output["transition_id"], "31");
+        assert_eq!(output["issue_key"], "PROJ-1");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn server_transition_ticket_by_name_resolves_then_posts_to_v2() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/rest/api/2/issue/PROJ-7/transitions"))
+            .and(header("authorization", "Bearer pat-token-abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "transitions": [
+                    { "id": "21", "name": "In Progress", "to": { "name": "In Progress" } },
+                    { "id": "31", "name": "Done", "to": { "name": "Done" } }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let post_body = json!({ "transition": { "id": "21" } });
+        Mock::given(method("POST"))
+            .and(path("/rest/api/2/issue/PROJ-7/transitions"))
+            .and(header("authorization", "Bearer pat-token-abc"))
+            .and(body_json(&post_body))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tool = test_tool_with_base_url(
+            server.uri(),
+            None,
+            "pat-token-abc",
+            vec!["transition_ticket"],
+        );
+        let result = tool
+            .execute(json!({
+                "action": "transition_ticket",
+                "issue_key": "PROJ-7",
+                "transition_name": "in progress"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["transition_id"], "21");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn transition_ticket_unknown_name_returns_error_with_available() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/rest/api/3/issue/PROJ-1/transitions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "transitions": [
+                    { "id": "21", "name": "In Progress", "to": { "name": "In Progress" } },
+                    { "id": "31", "name": "Done", "to": { "name": "Done" } }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // No POST mock — if the tool tried to POST, the test would fail with
+        // an unmocked request error from wiremock's verify().
+        let tool = test_tool_with_base_url(
+            server.uri(),
+            Some("test@example.com".into()),
+            "test-token",
+            vec!["transition_ticket"],
+        );
+        let result = tool
+            .execute(json!({
+                "action": "transition_ticket",
+                "issue_key": "PROJ-1",
+                "transition_name": "Reticulate Splines"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(err.contains("Reticulate Splines"));
+        assert!(err.contains("In Progress"));
+        assert!(err.contains("Done"));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn cloud_create_ticket_minimal_posts_expected_body() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let auth = basic_auth_header("test@example.com", "test-token");
+        let expected = json!({
+            "fields": {
+                "project":   { "key": "PROJ" },
+                "issuetype": { "name": "Task" },
+                "summary":   "My new task"
+            }
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue"))
+            .and(header("authorization", auth.as_str()))
+            .and(body_json(&expected))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id":   "10042",
+                "key":  "PROJ-99",
+                "self": "https://test.atlassian.net/rest/api/3/issue/10042"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tool = test_tool_with_base_url(
+            server.uri(),
+            Some("test@example.com".into()),
+            "test-token",
+            vec!["create_ticket"],
+        );
+        let result = tool
+            .execute(json!({
+                "action": "create_ticket",
+                "project_key": "PROJ",
+                "issue_type": "Task",
+                "summary": "My new task"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["key"], "PROJ-99");
+        assert_eq!(output["id"], "10042");
+        assert_eq!(
+            output["browse_url"].as_str().unwrap(),
+            format!("{}/browse/PROJ-99", server.uri())
+        );
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn cloud_create_ticket_with_description_uses_adf() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id": "1", "key": "PROJ-1", "self": "x"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tool = test_tool_with_base_url(
+            server.uri(),
+            Some("test@example.com".into()),
+            "test-token",
+            vec!["create_ticket"],
+        );
+        tool.execute(json!({
+            "action": "create_ticket",
+            "project_key": "PROJ",
+            "issue_type": "Task",
+            "summary": "s",
+            "description": "**bold** body"
+        }))
+        .await
+        .unwrap();
+
+        let received = &server.received_requests().await.unwrap();
+        let req: &Request = received.last().unwrap();
+        let body: Value = serde_json::from_slice(&req.body).unwrap();
+        let desc = &body["fields"]["description"];
+        assert_eq!(desc["type"], "doc", "description must be ADF in Cloud mode");
+        assert_eq!(desc["version"], 1);
+    }
+
+    #[tokio::test]
+    async fn server_create_ticket_with_description_uses_plain_string() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/rest/api/2/issue"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id": "1", "key": "PROJ-1", "self": "x"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tool =
+            test_tool_with_base_url(server.uri(), None, "pat-token-abc", vec!["create_ticket"]);
+        tool.execute(json!({
+            "action": "create_ticket",
+            "project_key": "PROJ",
+            "issue_type": "Task",
+            "summary": "s",
+            "description": "plain text"
+        }))
+        .await
+        .unwrap();
+
+        let received = &server.received_requests().await.unwrap();
+        let req: &Request = received.last().unwrap();
+        let body: Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(
+            body["fields"]["description"], "plain text",
+            "description must be a plain string in Server mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_create_ticket_with_assignee_uses_account_id() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id": "1", "key": "PROJ-1", "self": "x"
+            })))
+            .mount(&server)
+            .await;
+
+        let tool = test_tool_with_base_url(
+            server.uri(),
+            Some("test@example.com".into()),
+            "test-token",
+            vec!["create_ticket"],
+        );
+        tool.execute(json!({
+            "action": "create_ticket",
+            "project_key": "PROJ",
+            "issue_type": "Task",
+            "summary": "s",
+            "assignee": "acc-123"
+        }))
+        .await
+        .unwrap();
+
+        let req: Request = server
+            .received_requests()
+            .await
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap();
+        let body: Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(body["fields"]["assignee"]["accountId"], "acc-123");
+        assert!(body["fields"]["assignee"].get("name").is_none());
+    }
+
+    #[tokio::test]
+    async fn server_create_ticket_with_assignee_uses_username() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/2/issue"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id": "1", "key": "PROJ-1", "self": "x"
+            })))
+            .mount(&server)
+            .await;
+
+        let tool =
+            test_tool_with_base_url(server.uri(), None, "pat-token-abc", vec!["create_ticket"]);
+        tool.execute(json!({
+            "action": "create_ticket",
+            "project_key": "PROJ",
+            "issue_type": "Task",
+            "summary": "s",
+            "assignee": "jdoe"
+        }))
+        .await
+        .unwrap();
+
+        let req: Request = server
+            .received_requests()
+            .await
+            .unwrap()
+            .last()
+            .cloned()
+            .unwrap();
+        let body: Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(body["fields"]["assignee"]["name"], "jdoe");
+        assert!(body["fields"]["assignee"].get("accountId").is_none());
+    }
+
+    #[tokio::test]
+    async fn cloud_create_ticket_jira_error_surfaces_body() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/rest/api/3/issue"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_string(r#"{"errors":{"customfield_12345":"Field is required"}}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tool = test_tool_with_base_url(
+            server.uri(),
+            Some("test@example.com".into()),
+            "test-token",
+            vec!["create_ticket"],
+        );
+        let result = tool
+            .execute(json!({
+                "action": "create_ticket",
+                "project_key": "PROJ",
+                "issue_type": "Task",
+                "summary": "s"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(err.contains("400"));
+        assert!(err.contains("customfield_12345"));
+        server.verify().await;
+    }
+
+    #[test]
+    fn validate_project_key_accepts_valid_keys() {
+        assert!(validate_project_key("PROJ").is_ok());
+        assert!(validate_project_key("ABC123").is_ok());
+        assert!(validate_project_key("p1").is_ok());
+    }
+
+    #[test]
+    fn validate_project_key_rejects_invalid_keys() {
+        assert!(validate_project_key("").is_err());
+        assert!(validate_project_key("PROJ-1").is_err());
+        assert!(validate_project_key("../etc").is_err());
+        assert!(validate_project_key("PROJ ABC").is_err());
+    }
+
+    #[test]
+    fn shape_transitions_extracts_minimal_fields() {
+        let raw = json!({
+            "transitions": [
+                {
+                    "id": "11", "name": "To Do",
+                    "to": { "name": "To Do", "id": "10000", "self": "https://x" },
+                    "isAvailable": true
+                },
+                {
+                    "id": "21", "name": "In Progress",
+                    "to": { "name": "In Progress" }
+                }
+            ]
+        });
+        let shaped = shape_transitions(&raw);
+        assert_eq!(shaped.len(), 2);
+        assert_eq!(shaped[0]["id"], "11");
+        assert_eq!(shaped[0]["name"], "To Do");
+        assert_eq!(shaped[0]["to_status"], "To Do");
+        assert!(shaped[0].get("isAvailable").is_none());
+    }
+
+    #[test]
+    fn shape_transitions_handles_missing_array() {
+        assert!(shape_transitions(&json!({})).is_empty());
     }
 }

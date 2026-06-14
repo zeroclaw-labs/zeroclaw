@@ -1,0 +1,7 @@
+name = "image-gen-fal"
+version = "0.1.0"
+description = "Generate images from text prompts using fal.ai Flux models"
+author = "ZeroClaw Labs"
+wasm_path = "image_gen_fal.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "env_read"]

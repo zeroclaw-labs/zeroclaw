@@ -60,10 +60,16 @@ impl Tool for PdfReadTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let path = args
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'path' parameter"))?;
+        let path = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "path"})),
+                "pdf_read: missing path parameter"
+            );
+            anyhow::Error::msg("Missing 'path' parameter")
+        })?;
 
         let max_chars = args
             .get("max_chars")
@@ -75,36 +81,25 @@ impl Tool for PdfReadTool {
             })
             .unwrap_or(DEFAULT_MAX_CHARS);
 
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
-
-        if !self.security.is_path_allowed(path) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Path not allowed by security policy: {path}")),
-            });
-        }
-
-        // Record action before canonicalization so path-probing still consumes budget.
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
-        }
+        // Cross-cutting rate limiting and path-allowlist checks live in the
+        // RateLimitedTool + PathGuardedTool wrappers at registration time
+        // (see zeroclaw-runtime::tools::mod).  Successful reads consume one
+        // budget slot via the outer RateLimitedTool.
+        //
+        // Read-tool exception: post-`PathGuardedTool` canonicalize failures
+        // (probing nonexistent files) and post-canonicalization policy
+        // failures (`is_resolved_path_allowed`) also consume one budget slot,
+        // charged here, so that callers cannot probe path existence or
+        // resolved-path policy decisions for free.  The outer wrapper only
+        // records on `success: true`, so these explicit charges total
+        // exactly one slot per attempt — matching the pre-wrapper semantics.
 
         let full_path = self.security.resolve_tool_path(path);
 
         let resolved_path = match tokio::fs::canonicalize(&full_path).await {
             Ok(p) => p,
             Err(e) => {
+                let _ = self.security.record_action();
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -113,7 +108,7 @@ impl Tool for PdfReadTool {
             }
         };
 
-        if !self.security.is_resolved_path_allowed(&resolved_path) {
+        if !self.security.is_resolved_path_readable(&resolved_path) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -124,7 +119,11 @@ impl Tool for PdfReadTool {
             });
         }
 
-        tracing::debug!("Reading PDF: {}", resolved_path.display());
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("Reading PDF: {}", resolved_path.display())
+        );
 
         match tokio::fs::metadata(&resolved_path).await {
             Ok(meta) => {
@@ -231,6 +230,7 @@ impl Tool for PdfReadTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wrappers::{PathGuardedTool, RateLimitedTool};
     use tempfile::TempDir;
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
@@ -253,6 +253,17 @@ mod tests {
             max_actions_per_hour: max_actions,
             ..SecurityPolicy::default()
         })
+    }
+
+    /// Wraps `PdfReadTool` with the production `PathGuardedTool` + `RateLimitedTool`
+    /// stack, mirroring the registration in `zeroclaw-runtime::tools::mod`. Use this
+    /// in tests that exercise path-allowlist or rate-limit behavior.
+    fn wrapped_tool(workspace: std::path::PathBuf) -> Box<dyn Tool> {
+        let security = test_security(workspace);
+        Box::new(RateLimitedTool::new(
+            PathGuardedTool::new(PdfReadTool::new(security.clone()), security.clone()),
+            security,
+        ))
     }
 
     #[test]
@@ -295,22 +306,33 @@ mod tests {
 
     #[tokio::test]
     async fn absolute_path_is_blocked() {
-        let tool = PdfReadTool::new(test_security(std::env::temp_dir()));
-        let result = tool.execute(json!({"path": "/etc/passwd"})).await.unwrap();
+        let tool = wrapped_tool(std::env::temp_dir());
+
+        #[cfg(unix)]
+        let target = "/etc/passwd";
+        #[cfg(windows)]
+        let target = {
+            let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+            std::path::PathBuf::from(sysroot).join(r"System32\drivers\etc\hosts")
+        };
+
+        let result = tool.execute(json!({"path": target})).await.unwrap();
         assert!(!result.success);
         assert!(
             result
                 .error
                 .as_deref()
                 .unwrap_or("")
-                .contains("not allowed")
+                .contains("Path blocked"),
+            "expected 'Path blocked' error, got: {:?}",
+            result.error
         );
     }
 
     #[tokio::test]
     async fn path_traversal_is_blocked() {
         let tmp = TempDir::new().unwrap();
-        let tool = PdfReadTool::new(test_security(tmp.path().to_path_buf()));
+        let tool = wrapped_tool(tmp.path().to_path_buf());
         let result = tool
             .execute(json!({"path": "../../../etc/passwd"}))
             .await
@@ -321,7 +343,9 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or("")
-                .contains("not allowed")
+                .contains("Path blocked"),
+            "expected 'Path blocked' error, got: {:?}",
+            result.error
         );
     }
 
@@ -340,49 +364,6 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("Failed to resolve")
-        );
-    }
-
-    #[tokio::test]
-    async fn rate_limit_blocks_request() {
-        let tmp = TempDir::new().unwrap();
-        let tool = PdfReadTool::new(test_security_with_limit(tmp.path().to_path_buf(), 0));
-        let result = tool.execute(json!({"path": "any.pdf"})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("Rate limit"));
-    }
-
-    #[tokio::test]
-    async fn probing_nonexistent_consumes_rate_limit_budget() {
-        let tmp = TempDir::new().unwrap();
-        // Allow 2 actions; both will fail on missing file but must consume budget.
-        let tool = PdfReadTool::new(test_security_with_limit(tmp.path().to_path_buf(), 2));
-
-        let r1 = tool.execute(json!({"path": "a.pdf"})).await.unwrap();
-        assert!(!r1.success);
-        assert!(
-            r1.error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Failed to resolve")
-        );
-
-        let r2 = tool.execute(json!({"path": "b.pdf"})).await.unwrap();
-        assert!(!r2.success);
-        assert!(
-            r2.error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Failed to resolve")
-        );
-
-        // Third attempt must hit rate limit.
-        let r3 = tool.execute(json!({"path": "c.pdf"})).await.unwrap();
-        assert!(!r3.success);
-        assert!(
-            r3.error.as_deref().unwrap_or("").contains("Rate limit"),
-            "expected rate limit, got: {:?}",
-            r3.error
         );
     }
 
@@ -557,6 +538,40 @@ mod tests {
             result.error.as_deref().unwrap_or("").contains("rag-pdf"),
             "expected feature hint in error, got: {:?}",
             result.error
+        );
+    }
+
+    /// Anti-probing regression: a caller cannot probe PDF existence for free.
+    /// Each failed canonicalize must consume one action-budget slot via the
+    /// inner-tool charge, so repeated probes hit the rate limit.
+    #[tokio::test]
+    async fn probing_nonexistent_consumes_rate_limit_budget() {
+        let tmp = TempDir::new().unwrap();
+        let security = test_security_with_limit(tmp.path().to_path_buf(), 2);
+        let tool = PdfReadTool::new(security.clone());
+
+        let r1 = tool.execute(json!({"path": "a.pdf"})).await.unwrap();
+        assert!(!r1.success);
+        assert!(
+            r1.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Failed to resolve")
+        );
+
+        let r2 = tool.execute(json!({"path": "b.pdf"})).await.unwrap();
+        assert!(!r2.success);
+        assert!(
+            r2.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Failed to resolve")
+        );
+
+        // Budget must now be exhausted.
+        assert!(
+            !security.record_action(),
+            "budget must be exhausted after two failed probes"
         );
     }
 }

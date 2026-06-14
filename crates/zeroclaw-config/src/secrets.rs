@@ -25,6 +25,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, OsRng};
 use chacha20poly1305::{AeadCore, ChaCha20Poly1305, Key, Nonce};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// Length of the random encryption key in bytes (256-bit, matches `ChaCha20`).
 #[cfg(test)]
@@ -32,6 +33,8 @@ const KEY_LEN: usize = 32;
 
 /// ChaCha20-Poly1305 nonce length in bytes.
 const NONCE_LEN: usize = 12;
+
+const ONEPASSWORD_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Manages encrypted storage of secrets (API keys, tokens, etc.)
 #[derive(Debug, Clone)]
@@ -64,9 +67,16 @@ impl SecretStore {
         let cipher = ChaCha20Poly1305::new(key);
 
         let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let ciphertext = cipher
-            .encrypt(&nonce, plaintext.as_bytes())
-            .map_err(|e| anyhow::anyhow!("Encryption failed: {e}"))?;
+        let ciphertext = cipher.encrypt(&nonce, plaintext.as_bytes()).map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "ChaCha20-Poly1305 encryption failed"
+            );
+            anyhow::Error::msg(format!("Encryption failed: {e}"))
+        })?;
 
         // Prepend nonce to ciphertext for storage
         let mut blob = Vec::with_capacity(NONCE_LEN + ciphertext.len());
@@ -79,6 +89,7 @@ impl SecretStore {
     /// Decrypt a secret.
     /// - `enc2:` prefix → ChaCha20-Poly1305 (current format)
     /// - `enc:` prefix → legacy XOR cipher (backward compatibility for migration)
+    /// - `op://` prefix → resolved via 1Password CLI (`op read`)
     /// - No prefix → returned as-is (plaintext config)
     ///
     /// **Warning**: Legacy `enc:` values are insecure. Use `decrypt_and_migrate` to
@@ -88,6 +99,8 @@ impl SecretStore {
             self.decrypt_chacha20(hex_str)
         } else if let Some(hex_str) = value.strip_prefix("enc:") {
             self.decrypt_legacy_xor(hex_str)
+        } else if is_onepassword_ref(value) {
+            resolve_onepassword_ref(value)
         } else {
             Ok(value.to_string())
         }
@@ -106,7 +119,10 @@ impl SecretStore {
             Ok((plaintext, None))
         } else if let Some(hex_str) = value.strip_prefix("enc:") {
             // Legacy XOR cipher — decrypt and re-encrypt with ChaCha20-Poly1305
-            tracing::warn!(
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                 "Decrypting legacy XOR-encrypted secret (enc: prefix). \
                  This format is insecure and will be removed in a future release. \
                  The secret will be automatically migrated to enc2: (ChaCha20-Poly1305)."
@@ -114,6 +130,9 @@ impl SecretStore {
             let plaintext = self.decrypt_legacy_xor(hex_str)?;
             let migrated = self.encrypt(&plaintext)?;
             Ok((plaintext, Some(migrated)))
+        } else if is_onepassword_ref(value) {
+            let plaintext = resolve_onepassword_ref(value)?;
+            Ok((plaintext, None))
         } else {
             // Plaintext — no migration needed
             Ok((value.to_string(), None))
@@ -142,7 +161,14 @@ impl SecretStore {
 
         let plaintext_bytes = cipher
             .decrypt(nonce, ciphertext)
-            .map_err(|_| anyhow::anyhow!("Decryption failed — wrong key or tampered data"))?;
+            .map_err(|_| {
+                ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"key_path": self.key_path.display().to_string()})), "enc2: decryption failed. `.secret_key` is missing or does not match the key used to encrypt this value. \
+                     Common cause: volume wipe, container migration, or backup-restore where `.secret_key` was not preserved alongside `config.toml`. \
+                     Restore the original `.secret_key` from backup, or re-encrypt the affected secrets via `zeroclaw quickstart`.");
+                anyhow::Error::msg(
+                    "enc2: decryption failed (wrong `.secret_key` or tampered ciphertext)"
+                )
+            })?;
 
         String::from_utf8(plaintext_bytes)
             .context("Decrypted secret is not valid UTF-8 — corrupt data")
@@ -158,9 +184,14 @@ impl SecretStore {
             .context("Decrypted legacy secret is not valid UTF-8 — wrong key or corrupt data")
     }
 
-    /// Check if a value is already encrypted (current or legacy format).
+    /// Check if a value is already encrypted or externally resolved.
     pub fn is_encrypted(value: &str) -> bool {
-        value.starts_with("enc2:") || value.starts_with("enc:")
+        value.starts_with("enc2:") || value.starts_with("enc:") || is_onepassword_ref(value)
+    }
+
+    /// Check if a value is a 1Password external secret reference.
+    pub fn is_onepassword_ref(value: &str) -> bool {
+        is_onepassword_ref(value)
     }
 
     /// Check if a value uses the secure `enc2:` format.
@@ -201,7 +232,10 @@ impl SecretStore {
                     .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                     .unwrap_or_else(|| std::env::var("USERNAME").unwrap_or_default());
                 let Some(grant_arg) = build_windows_icacls_grant_arg(&username) else {
-                    tracing::warn!(
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                         "USERNAME environment variable is empty; \
                          cannot restrict key file permissions via icacls"
                     );
@@ -217,16 +251,40 @@ impl SecretStore {
                     .output()
                 {
                     Ok(o) if !o.status.success() => {
-                        tracing::warn!(
-                            "Failed to take ownership of key file via takeown (exit code {:?})",
-                            o.status.code()
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                            &format!(
+                                "Failed to take ownership of key file via takeown (exit code {:?})",
+                                o.status.code()
+                            )
                         );
                     }
                     Err(e) => {
-                        tracing::warn!("Could not take ownership of key file: {e}");
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "Could not take ownership of key file"
+                        );
                     }
                     _ => {
-                        tracing::debug!("Key file ownership set to current user via takeown");
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            "Key file ownership set to current user via takeown"
+                        );
                     }
                 }
 
@@ -237,16 +295,40 @@ impl SecretStore {
                     .output()
                 {
                     Ok(o) if !o.status.success() => {
-                        tracing::warn!(
-                            "Failed to set key file permissions via icacls (exit code {:?})",
-                            o.status.code()
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                            &format!(
+                                "Failed to set key file permissions via icacls (exit code {:?})",
+                                o.status.code()
+                            )
                         );
                     }
                     Err(e) => {
-                        tracing::warn!("Could not set key file permissions: {e}");
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "Could not set key file permissions"
+                        );
                     }
                     _ => {
-                        tracing::debug!("Key file permissions restricted via icacls");
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            "Key file permissions restricted via icacls"
+                        );
                     }
                 }
             }
@@ -306,15 +388,173 @@ fn hex_decode(hex: &str) -> Result<Vec<u8>> {
         .step_by(2)
         .map(|i| {
             u8::from_str_radix(&hex[i..i + 2], 16)
-                .map_err(|e| anyhow::anyhow!("Invalid hex at position {i}: {e}"))
+                .map_err(|e| anyhow::Error::msg(format!("Invalid hex at position {i}: {e}")))
         })
         .collect()
+}
+
+fn is_onepassword_ref(value: &str) -> bool {
+    value.starts_with("op://")
+}
+
+fn validate_onepassword_ref(reference: &str) -> Result<()> {
+    let path = reference.strip_prefix("op://").unwrap_or("");
+    let mut segments = path.split('/');
+    let has_required_segments = (0..3).all(|_| segments.next().is_some_and(|s| !s.is_empty()));
+    anyhow::ensure!(
+        has_required_segments && segments.all(|segment| !segment.is_empty()),
+        "Invalid 1Password reference \"{reference}\". Expected format: op://vault-name/item-name/field-name"
+    );
+    Ok(())
+}
+
+/// Resolve a 1Password secret reference by invoking the `op` CLI.
+fn resolve_onepassword_ref(reference: &str) -> Result<String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    validate_onepassword_ref(reference)?;
+
+    let mut child = Command::new("op")
+        .args(["read", reference])
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                "Failed to run 1Password CLI"
+            );
+            if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow::Error::msg(
+                    "1Password CLI (`op`) not found. Install it to use op:// secret references in config."
+                )
+            } else {
+                anyhow::Error::msg(format!("Failed to run 1Password CLI: {e}"))
+            }
+        })?;
+
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("Failed to capture 1Password CLI stdout")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("Failed to capture 1Password CLI stderr")?;
+    let stdout_handle = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        stdout.read_to_end(&mut output).map(|_| output)
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut output = Vec::new();
+        stderr.read_to_end(&mut output).map(|_| output)
+    });
+
+    let deadline = Instant::now() + ONEPASSWORD_READ_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("Failed to poll 1Password CLI process")?
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_handle.join();
+            let _ = stderr_handle.join();
+            anyhow::bail!(
+                "1Password CLI timed out resolving \"{reference}\" after {}s",
+                ONEPASSWORD_READ_TIMEOUT.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+
+    let stdout = stdout_handle
+        .join()
+        .map_err(|_| anyhow::Error::msg("1Password CLI stdout reader panicked"))?
+        .context("Failed to read 1Password CLI stdout")?;
+    let stderr = stderr_handle
+        .join()
+        .map_err(|_| anyhow::Error::msg("1Password CLI stderr reader panicked"))?
+        .context("Failed to read 1Password CLI stderr")?;
+
+    if !status.success() {
+        let stderr_text = String::from_utf8_lossy(&stderr);
+        let hint =
+            if stderr_text.contains("not signed in") || stderr_text.contains("session expired") {
+                " (hint: run `op signin` first)"
+            } else {
+                ""
+            };
+        anyhow::bail!(
+            "1Password CLI failed to resolve \"{reference}\": {}{hint}",
+            stderr_text.trim()
+        );
+    }
+
+    let secret = String::from_utf8(stdout)
+        .context("1Password CLI returned non-UTF-8 output")?
+        .trim_end_matches(&['\r', '\n'][..])
+        .to_string();
+
+    anyhow::ensure!(
+        !secret.is_empty(),
+        "1Password CLI returned empty value for \"{reference}\". Verify the vault/item/field path is correct."
+    );
+
+    Ok(secret)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use tempfile::TempDir;
+
+    struct EnvValueGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvValueGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: tests that mutate env vars serialize on env_test_lock().
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvValueGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests that mutate env vars serialize on env_test_lock().
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_fake_op(bin_dir: &Path, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let op_path = bin_dir.join("op");
+        fs::write(&op_path, script).expect("write fake op");
+        let mut perms = fs::metadata(&op_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&op_path, perms).unwrap();
+    }
 
     // ── SecretStore basics ─────────────────────────────────────
 
@@ -361,8 +601,68 @@ mod tests {
     fn is_encrypted_detects_prefix() {
         assert!(SecretStore::is_encrypted("enc2:aabbcc"));
         assert!(SecretStore::is_encrypted("enc:aabbcc")); // legacy
+        assert!(SecretStore::is_encrypted("op://vault/item/field"));
         assert!(!SecretStore::is_encrypted("sk-plaintext"));
         assert!(!SecretStore::is_encrypted(""));
+    }
+
+    #[test]
+    fn op_reference_invalid_format_fails_before_plaintext_passthrough() {
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+
+        let err = store.decrypt("op://vault-only").unwrap_err().to_string();
+
+        assert!(err.contains("Invalid 1Password reference"));
+    }
+
+    #[test]
+    fn op_reference_decrypt_and_migrate_does_not_migrate_or_pass_through() {
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+
+        let err = store
+            .decrypt_and_migrate("op://vault-only")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("Invalid 1Password reference"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn op_reference_drains_stderr_while_waiting() {
+        let _guard = crate::env_overrides::env_test_lock().await;
+        let tmp = TempDir::new().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        write_fake_op(
+            &bin_dir,
+            r#"#!/bin/sh
+if [ "$1" = "read" ] && [ "$2" = "op://vault/item/field" ]; then
+  yes diagnostic-line >&2 &
+  spam_pid=$!
+  sleep 1
+  kill "$spam_pid"
+  wait "$spam_pid" 2>/dev/null
+  printf '%s\n' 'secret-from-op'
+  exit 0
+fi
+exit 65
+"#,
+        );
+        let path = match std::env::var_os("PATH") {
+            Some(existing) if !existing.is_empty() => {
+                format!("{}:{}", bin_dir.display(), existing.to_string_lossy())
+            }
+            _ => bin_dir.display().to_string(),
+        };
+        let _path_guard = EnvValueGuard::set("PATH", path);
+        let store = SecretStore::new(tmp.path(), true);
+
+        let secret = store.decrypt("op://vault/item/field").unwrap();
+
+        assert_eq!(secret, "secret-from-op");
     }
 
     #[tokio::test]
@@ -469,6 +769,27 @@ mod tests {
         let encrypted = store1.encrypt("secret-for-store1").unwrap();
         let result = store2.decrypt(&encrypted);
         assert!(result.is_err(), "Decrypting with a different key must fail");
+    }
+
+    #[test]
+    fn decrypt_error_message_mentions_secret_key() {
+        // Operators hitting a missing or mismatched `.secret_key` (volume wipe,
+        // container migration, backup-restore without the key file) need the
+        // error message to point at the root cause. Otherwise the failure
+        // cascades into a misleading "All providers/models failed" message
+        // with no diagnostic for the underlying decrypt failure.
+        let tmp1 = TempDir::new().unwrap();
+        let tmp2 = TempDir::new().unwrap();
+        let store1 = SecretStore::new(tmp1.path(), true);
+        let store2 = SecretStore::new(tmp2.path(), true);
+
+        let encrypted = store1.encrypt("secret-for-store1").unwrap();
+        let err = store2.decrypt(&encrypted).expect_err("wrong key must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(".secret_key"),
+            "decrypt error must mention `.secret_key` so operators can diagnose missing/mismatched keys: got {msg:?}"
+        );
     }
 
     #[test]
@@ -884,7 +1205,7 @@ mod tests {
     ///
     /// Without `takeown`, the file owner may be an invalid SID, causing `icacls`
     /// grants to succeed against an unowned file that later becomes unreadable.
-    /// This test verifies the code structure expectation (see issue #4532).
+    /// This test verifies the code structure expectation.
     #[test]
     fn takeown_runs_before_icacls_on_windows() {
         // Read the source to confirm `takeown` appears before `icacls` in the

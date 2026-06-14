@@ -1,7 +1,8 @@
 [package]
 name = "zeroclaw-desktop"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "ZeroClaw Desktop — Tauri-powered system tray app"
 publish = false
 
@@ -15,9 +16,10 @@ tauri-plugin-store = "2.0"
 tauri-plugin-single-instance = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "sync", "time"] }
 anyhow = "1.0"
+base64 = "0.22"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

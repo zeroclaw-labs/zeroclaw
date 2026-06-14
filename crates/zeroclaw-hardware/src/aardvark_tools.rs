@@ -16,7 +16,15 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use zeroclaw_api::attribution::ToolKind;
 use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool_attribution;
+
+tool_attribution!(I2cScanTool, ToolKind::Plugin);
+tool_attribution!(I2cReadTool, ToolKind::Plugin);
+tool_attribution!(I2cWriteTool, ToolKind::Plugin);
+tool_attribution!(SpiTransferTool, ToolKind::Plugin);
+tool_attribution!(GpioAardvarkTool, ToolKind::Plugin);
 
 // ── Factory ───────────────────────────────────────────────────────────────────
 
@@ -570,5 +578,23 @@ impl Tool for GpioAardvarkTool {
                 error: Some(format!("transport error: {e}")),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::AARDVARK_TOOLS;
+
+    #[test]
+    fn aardvark_tool_names_match_catalog() {
+        let devices = Arc::new(RwLock::new(DeviceRegistry::new()));
+        let tools = aardvark_tools(devices);
+        let mut names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        names.push("datasheet");
+        names.sort_unstable();
+        let mut catalog: Vec<&str> = AARDVARK_TOOLS.to_vec();
+        catalog.sort_unstable();
+        assert_eq!(names, catalog);
     }
 }

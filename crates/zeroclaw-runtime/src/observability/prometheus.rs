@@ -2,6 +2,7 @@ use super::traits::{Observer, ObserverEvent, ObserverMetric};
 use prometheus::{
     Encoder, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounterVec, Registry, TextEncoder,
 };
+use std::sync::{Arc, OnceLock};
 
 /// Prometheus-backed observer — exposes metrics for scraping via `/metrics`.
 pub struct PrometheusObserver {
@@ -30,11 +31,6 @@ pub struct PrometheusObserver {
     active_sessions: GaugeVec,
     queue_depth: GaugeVec,
 
-    // Hands
-    hand_runs: IntCounterVec,
-    hand_duration: HistogramVec,
-    hand_findings: IntCounterVec,
-
     // DORA
     deployments_total: IntCounterVec,
     deployment_lead_time: Histogram,
@@ -57,19 +53,22 @@ impl PrometheusObserver {
 
         let agent_starts = IntCounterVec::new(
             prometheus::Opts::new("zeroclaw_agent_starts_total", "Total agent invocations"),
-            &["provider", "model"],
+            &["model_provider", "model"],
         )
         .expect("valid metric");
 
         let llm_requests = IntCounterVec::new(
-            prometheus::Opts::new("zeroclaw_llm_requests_total", "Total LLM provider requests"),
-            &["provider", "model", "success"],
+            prometheus::Opts::new(
+                "zeroclaw_llm_requests_total",
+                "Total LLM model_provider requests",
+            ),
+            &["model_provider", "model", "success"],
         )
         .expect("valid metric");
 
         let tokens_input_total = IntCounterVec::new(
             prometheus::Opts::new("zeroclaw_tokens_input_total", "Total input tokens consumed"),
-            &["provider", "model"],
+            &["model_provider", "model"],
         )
         .expect("valid metric");
 
@@ -78,7 +77,7 @@ impl PrometheusObserver {
                 "zeroclaw_tokens_output_total",
                 "Total output tokens consumed",
             ),
-            &["provider", "model"],
+            &["model_provider", "model"],
         )
         .expect("valid metric");
 
@@ -131,7 +130,7 @@ impl PrometheusObserver {
                 "Agent invocation duration in seconds",
             )
             .buckets(vec![0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]),
-            &["provider", "model"],
+            &["model_provider", "model"],
         )
         .expect("valid metric");
 
@@ -169,31 +168,6 @@ impl PrometheusObserver {
         let queue_depth = GaugeVec::new(
             prometheus::Opts::new("zeroclaw_queue_depth", "Message queue depth"),
             &[],
-        )
-        .expect("valid metric");
-
-        let hand_runs = IntCounterVec::new(
-            prometheus::Opts::new("zeroclaw_hand_runs_total", "Total hand runs by outcome"),
-            &["hand", "success"],
-        )
-        .expect("valid metric");
-
-        let hand_duration = HistogramVec::new(
-            HistogramOpts::new(
-                "zeroclaw_hand_duration_seconds",
-                "Hand run duration in seconds",
-            )
-            .buckets(vec![0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0]),
-            &["hand"],
-        )
-        .expect("valid metric");
-
-        let hand_findings = IntCounterVec::new(
-            prometheus::Opts::new(
-                "zeroclaw_hand_findings_total",
-                "Total findings produced by hand runs",
-            ),
-            &["hand"],
         )
         .expect("valid metric");
 
@@ -255,9 +229,6 @@ impl PrometheusObserver {
         registry.register(Box::new(tokens_used.clone())).ok();
         registry.register(Box::new(active_sessions.clone())).ok();
         registry.register(Box::new(queue_depth.clone())).ok();
-        registry.register(Box::new(hand_runs.clone())).ok();
-        registry.register(Box::new(hand_duration.clone())).ok();
-        registry.register(Box::new(hand_findings.clone())).ok();
         registry.register(Box::new(deployments_total.clone())).ok();
         registry
             .register(Box::new(deployment_lead_time.clone()))
@@ -287,9 +258,6 @@ impl PrometheusObserver {
             tokens_used,
             active_sessions,
             queue_depth,
-            hand_runs,
-            hand_duration,
-            hand_findings,
             deployments_total,
             deployment_lead_time,
             deployment_failure_rate,
@@ -308,33 +276,58 @@ impl PrometheusObserver {
         encoder.encode(&families, &mut buf).unwrap_or_default();
         String::from_utf8(buf).unwrap_or_default()
     }
+
+    /// Process-wide singleton handle. All call sites that obtain a Prometheus
+    /// observer through this function share the same `Registry` and the same
+    /// underlying counters, so events recorded by the channel orchestrator and
+    /// events recorded by the gateway accumulate into the same time series and
+    /// are visible on a single `/metrics` scrape.
+    ///
+    /// `PrometheusObserver::new()` still returns a fresh, isolated instance —
+    /// kept for tests so parallel test cases don't see each other's counts.
+    pub fn shared() -> Arc<Self> {
+        static SINGLETON: OnceLock<Arc<PrometheusObserver>> = OnceLock::new();
+        SINGLETON.get_or_init(|| Arc::new(Self::new())).clone()
+    }
 }
 
 impl Observer for PrometheusObserver {
     fn record_event(&self, event: &ObserverEvent) {
         match event {
-            ObserverEvent::AgentStart { provider, model } => {
+            ObserverEvent::AgentStart {
+                model_provider,
+                model,
+                channel: _,
+                agent_alias: _,
+                turn_id: _,
+            } => {
                 self.agent_starts
-                    .with_label_values(&[provider, model])
+                    .with_label_values(&[model_provider, model])
                     .inc();
             }
             ObserverEvent::AgentEnd {
-                provider,
+                model_provider,
                 model,
                 duration,
                 tokens_used,
                 cost_usd: _,
+                channel: _,
+                agent_alias: _,
+                turn_id: _,
             } => {
-                // Agent duration is recorded via the histogram with provider/model labels
+                // Agent duration is recorded via the histogram with model_provider/model labels
                 self.agent_duration
-                    .with_label_values(&[provider, model])
+                    .with_label_values(&[model_provider, model])
                     .observe(duration.as_secs_f64());
-                if let Some(t) = tokens_used {
-                    self.tokens_used.set(i64::try_from(*t).unwrap_or(i64::MAX));
+                if let Some(usage) = tokens_used {
+                    self.tokens_used.set(
+                        i64::try_from(usage.input_tokens.saturating_add(usage.output_tokens))
+                            .unwrap_or(i64::MAX),
+                    );
                 }
             }
             ObserverEvent::LlmResponse {
-                provider,
+                model_provider,
                 model,
                 success,
                 input_tokens,
@@ -343,16 +336,16 @@ impl Observer for PrometheusObserver {
             } => {
                 let success_str = if *success { "true" } else { "false" };
                 self.llm_requests
-                    .with_label_values(&[provider.as_str(), model.as_str(), success_str])
+                    .with_label_values(&[model_provider.as_str(), model.as_str(), success_str])
                     .inc();
                 if let Some(input) = input_tokens {
                     self.tokens_input_total
-                        .with_label_values(&[provider.as_str(), model.as_str()])
+                        .with_label_values(&[model_provider.as_str(), model.as_str()])
                         .inc_by(*input);
                 }
                 if let Some(output) = output_tokens {
                     self.tokens_output_total
-                        .with_label_values(&[provider.as_str(), model.as_str()])
+                        .with_label_values(&[model_provider.as_str(), model.as_str()])
                         .inc_by(*output);
                 }
             }
@@ -365,6 +358,7 @@ impl Observer for PrometheusObserver {
                 tool,
                 duration,
                 success,
+                ..
             } => {
                 let success_str = if *success { "true" } else { "false" };
                 self.tool_calls
@@ -399,38 +393,6 @@ impl Observer for PrometheusObserver {
                 message: _,
             } => {
                 self.errors.with_label_values(&[component]).inc();
-            }
-            ObserverEvent::HandStarted { hand_name } => {
-                self.hand_runs
-                    .with_label_values(&[hand_name.as_str(), "true"])
-                    .inc_by(0); // touch the series so it appears in output
-            }
-            ObserverEvent::HandCompleted {
-                hand_name,
-                duration_ms,
-                findings_count,
-            } => {
-                self.hand_runs
-                    .with_label_values(&[hand_name.as_str(), "true"])
-                    .inc();
-                self.hand_duration
-                    .with_label_values(&[hand_name.as_str()])
-                    .observe(*duration_ms as f64 / 1000.0);
-                self.hand_findings
-                    .with_label_values(&[hand_name.as_str()])
-                    .inc_by(*findings_count as u64);
-            }
-            ObserverEvent::HandFailed {
-                hand_name,
-                duration_ms,
-                ..
-            } => {
-                self.hand_runs
-                    .with_label_values(&[hand_name.as_str(), "false"])
-                    .inc();
-                self.hand_duration
-                    .with_label_values(&[hand_name.as_str()])
-                    .observe(*duration_ms as f64 / 1000.0);
             }
             ObserverEvent::DeploymentCompleted { .. } => {
                 self.deployments_total.with_label_values(&["success"]).inc();
@@ -481,25 +443,6 @@ impl Observer for PrometheusObserver {
                     .with_label_values(&[] as &[&str])
                     .set(*d as f64);
             }
-            ObserverMetric::HandRunDuration {
-                hand_name,
-                duration,
-            } => {
-                self.hand_duration
-                    .with_label_values(&[hand_name.as_str()])
-                    .observe(duration.as_secs_f64());
-            }
-            ObserverMetric::HandFindingsCount { hand_name, count } => {
-                self.hand_findings
-                    .with_label_values(&[hand_name.as_str()])
-                    .inc_by(*count);
-            }
-            ObserverMetric::HandSuccessRate { hand_name, success } => {
-                let success_str = if *success { "true" } else { "false" };
-                self.hand_runs
-                    .with_label_values(&[hand_name.as_str(), success_str])
-                    .inc();
-            }
             ObserverMetric::DeploymentLeadTime(d) => {
                 self.deployment_lead_time.observe(d.as_secs_f64());
             }
@@ -533,32 +476,56 @@ mod tests {
     fn records_all_events_without_panic() {
         let obs = PrometheusObserver::new();
         obs.record_event(&ObserverEvent::AgentStart {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(500),
-            tokens_used: Some(100),
+            tokens_used: Some(zeroclaw_api::observability_traits::TurnTokenUsage {
+                input_tokens: 100,
+                output_tokens: 0,
+            }),
             cost_usd: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::ZERO,
             tokens_used: None,
             cost_usd: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(10),
             success: true,
+            arguments: None,
+            result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "file_read".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(5),
             success: false,
+            arguments: None,
+            result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::ChannelMessage {
             channel: "telegram".into(),
@@ -566,7 +533,7 @@ mod tests {
         });
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.record_event(&ObserverEvent::Error {
-            component: "provider".into(),
+            component: "model_provider".into(),
             message: "timeout".into(),
         });
     }
@@ -585,13 +552,22 @@ mod tests {
     fn encode_produces_prometheus_text_format() {
         let obs = PrometheusObserver::new();
         obs.record_event(&ObserverEvent::AgentStart {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(100),
             success: true,
+            arguments: None,
+            result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.record_metric(&ObserverMetric::RequestLatency(Duration::from_millis(250)));
@@ -621,18 +597,36 @@ mod tests {
 
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(10),
             success: true,
+            arguments: None,
+            result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(10),
             success: true,
+            arguments: None,
+            result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(10),
             success: false,
+            arguments: None,
+            result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
 
         let output = obs.encode();
@@ -644,11 +638,11 @@ mod tests {
     fn errors_track_by_component() {
         let obs = PrometheusObserver::new();
         obs.record_event(&ObserverEvent::Error {
-            component: "provider".into(),
+            component: "model_provider".into(),
             message: "timeout".into(),
         });
         obs.record_event(&ObserverEvent::Error {
-            component: "provider".into(),
+            component: "model_provider".into(),
             message: "rate limit".into(),
         });
         obs.record_event(&ObserverEvent::Error {
@@ -657,7 +651,7 @@ mod tests {
         });
 
         let output = obs.encode();
-        assert!(output.contains(r#"zeroclaw_errors_total{component="provider"} 2"#));
+        assert!(output.contains(r#"zeroclaw_errors_total{component="model_provider"} 2"#));
         assert!(output.contains(r#"zeroclaw_errors_total{component="channels"} 1"#));
     }
 
@@ -676,89 +670,40 @@ mod tests {
         let obs = PrometheusObserver::new();
 
         obs.record_event(&ObserverEvent::LlmResponse {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(200),
             success: true,
             error_message: None,
             input_tokens: Some(100),
             output_tokens: Some(50),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
-            provider: "openrouter".into(),
+            model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(300),
             success: true,
             error_message: None,
             input_tokens: Some(200),
             output_tokens: Some(80),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
 
         let output = obs.encode();
         assert!(output.contains(
-            r#"zeroclaw_llm_requests_total{model="claude-sonnet",provider="openrouter",success="true"} 2"#
+            r#"zeroclaw_llm_requests_total{model="claude-sonnet",model_provider="openrouter",success="true"} 2"#
         ));
         assert!(output.contains(
-            r#"zeroclaw_tokens_input_total{model="claude-sonnet",provider="openrouter"} 300"#
+            r#"zeroclaw_tokens_input_total{model="claude-sonnet",model_provider="openrouter"} 300"#
         ));
         assert!(output.contains(
-            r#"zeroclaw_tokens_output_total{model="claude-sonnet",provider="openrouter"} 130"#
+            r#"zeroclaw_tokens_output_total{model="claude-sonnet",model_provider="openrouter"} 130"#
         ));
-    }
-
-    #[test]
-    fn hand_events_track_runs_and_duration() {
-        let obs = PrometheusObserver::new();
-
-        obs.record_event(&ObserverEvent::HandCompleted {
-            hand_name: "review".into(),
-            duration_ms: 1500,
-            findings_count: 3,
-        });
-        obs.record_event(&ObserverEvent::HandCompleted {
-            hand_name: "review".into(),
-            duration_ms: 2000,
-            findings_count: 1,
-        });
-        obs.record_event(&ObserverEvent::HandFailed {
-            hand_name: "review".into(),
-            error: "timeout".into(),
-            duration_ms: 5000,
-        });
-
-        let output = obs.encode();
-        assert!(output.contains(r#"zeroclaw_hand_runs_total{hand="review",success="true"} 2"#));
-        assert!(output.contains(r#"zeroclaw_hand_runs_total{hand="review",success="false"} 1"#));
-        assert!(output.contains(r#"zeroclaw_hand_findings_total{hand="review"} 4"#));
-        assert!(output.contains("zeroclaw_hand_duration_seconds"));
-    }
-
-    #[test]
-    fn hand_metrics_record_duration_and_findings() {
-        let obs = PrometheusObserver::new();
-
-        obs.record_metric(&ObserverMetric::HandRunDuration {
-            hand_name: "scan".into(),
-            duration: Duration::from_millis(800),
-        });
-        obs.record_metric(&ObserverMetric::HandFindingsCount {
-            hand_name: "scan".into(),
-            count: 5,
-        });
-        obs.record_metric(&ObserverMetric::HandSuccessRate {
-            hand_name: "scan".into(),
-            success: true,
-        });
-        obs.record_metric(&ObserverMetric::HandSuccessRate {
-            hand_name: "scan".into(),
-            success: false,
-        });
-
-        let output = obs.encode();
-        assert!(output.contains("zeroclaw_hand_duration_seconds"));
-        assert!(output.contains(r#"zeroclaw_hand_findings_total{hand="scan"} 5"#));
-        assert!(output.contains(r#"zeroclaw_hand_runs_total{hand="scan",success="true"} 1"#));
-        assert!(output.contains(r#"zeroclaw_hand_runs_total{hand="scan",success="false"} 1"#));
     }
 
     #[test]
@@ -766,18 +711,21 @@ mod tests {
         let obs = PrometheusObserver::new();
 
         obs.record_event(&ObserverEvent::LlmResponse {
-            provider: "ollama".into(),
+            model_provider: "ollama".into(),
             model: "llama3".into(),
             duration: Duration::from_millis(100),
             success: false,
             error_message: Some("timeout".into()),
             input_tokens: None,
             output_tokens: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
 
         let output = obs.encode();
         assert!(output.contains(
-            r#"zeroclaw_llm_requests_total{model="llama3",provider="ollama",success="false"} 1"#
+            r#"zeroclaw_llm_requests_total{model="llama3",model_provider="ollama",success="false"} 1"#
         ));
         // Token counters should not appear (no data recorded)
         assert!(!output.contains("zeroclaw_tokens_input_total{"));
@@ -849,5 +797,54 @@ mod tests {
         obs.record_event(&ObserverEvent::RecoveryCompleted {
             deploy_id: "d1".into(),
         });
+    }
+
+    #[test]
+    fn shared_returns_the_same_registry_across_calls() {
+        let a = PrometheusObserver::shared();
+        let b = PrometheusObserver::shared();
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "PrometheusObserver::shared() must hand out the same underlying \
+             instance to every caller, otherwise the gateway's /metrics scrape \
+             cannot see counters incremented by the channel orchestrator"
+        );
+    }
+
+    #[test]
+    fn arc_blanket_observer_impl_routes_to_inner() {
+        let shared_a = PrometheusObserver::shared();
+        let shared_b = PrometheusObserver::shared();
+
+        Observer::record_event(
+            &shared_a,
+            &ObserverEvent::ChannelMessage {
+                channel: "test-channel".into(),
+                direction: "inbound".into(),
+            },
+        );
+
+        let output = shared_b.encode();
+        assert!(
+            output.contains(
+                r#"zeroclaw_channel_messages_total{channel="test-channel",direction="inbound"} 1"#
+            ),
+            "an event recorded through one Arc handle must be visible when \
+             scraping through any other handle — output was: {output}"
+        );
+    }
+
+    #[test]
+    fn arc_blanket_observer_impl_preserves_downcast() {
+        let shared: Arc<PrometheusObserver> = PrometheusObserver::shared();
+        let observer: &dyn Observer = &shared;
+        assert!(
+            observer
+                .as_any()
+                .downcast_ref::<PrometheusObserver>()
+                .is_some(),
+            "the /metrics resolver downcasts through `as_any` — Arc<T> must \
+             surface the inner T, not the Arc wrapper"
+        );
     }
 }

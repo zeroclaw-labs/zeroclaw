@@ -7,11 +7,28 @@ use zeroclaw_config::policy::SecurityPolicy;
 /// Write file contents with path sandboxing
 pub struct FileWriteTool {
     security: Arc<SecurityPolicy>,
+    /// Whether writes to the workspace will persist on the host filesystem.
+    /// `false` when the runtime uses an ephemeral sandbox (e.g. Docker without
+    /// a workspace volume mount), in which case writes succeed inside the
+    /// container but are invisible on the host.
+    persistent_writes: bool,
 }
 
 impl FileWriteTool {
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
-        Self { security }
+        Self {
+            security,
+            persistent_writes: true,
+        }
+    }
+
+    /// Construct with an explicit persistence flag derived from the active
+    /// runtime adapter's `has_filesystem_access()`.
+    pub fn new_with_persistence(security: Arc<SecurityPolicy>, persistent_writes: bool) -> Self {
+        Self {
+            security,
+            persistent_writes,
+        }
     }
 }
 
@@ -22,7 +39,7 @@ impl Tool for FileWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Write contents to a file in the workspace"
+        "Write contents to a file in the workspace. Text by default; set encoding=\"base64\" to write binary files (e.g. .xlsx/.docx) by decoding base64 content into raw bytes."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -35,7 +52,12 @@ impl Tool for FileWriteTool {
                 },
                 "content": {
                     "type": "string",
-                    "description": "Content to write to the file"
+                    "description": "Content to write. UTF-8 text when encoding is 'utf8'; base64-encoded bytes when encoding is 'base64'."
+                },
+                "encoding": {
+                    "type": "string",
+                    "enum": ["utf8", "base64"],
+                    "description": "How to interpret 'content' before writing (default: 'utf8'). Use 'base64' for binary files."
                 }
             },
             "required": ["path", "content"]
@@ -43,15 +65,35 @@ impl Tool for FileWriteTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let path = args
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'path' parameter"))?;
+        let path = args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "path"})),
+                "file_write: missing path parameter"
+            );
+            anyhow::Error::msg("Missing 'path' parameter")
+        })?;
 
         let content = args
             .get("content")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'content' parameter"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"param": "content"})),
+                    "file_write: missing content parameter"
+                );
+                anyhow::Error::msg("Missing 'content' parameter")
+            })?;
+
+        let encoding = args
+            .get("encoding")
+            .and_then(|v| v.as_str())
+            .unwrap_or("utf8");
 
         if !self.security.can_act() {
             return Ok(ToolResult {
@@ -61,22 +103,54 @@ impl Tool for FileWriteTool {
             });
         }
 
-        if self.security.is_rate_limited() {
+        if !self.persistent_writes {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+                error: Some(
+                    "file_write is unavailable: the active runtime uses an ephemeral workspace \
+                     (tmpfs / no host volume mount). Files written here would not persist on the \
+                     host after the session ends. To fix this, set \
+                     `runtime.docker.mount_workspace = true` in your config and ensure the \
+                     workspace directory is bind-mounted into the container."
+                        .into(),
+                ),
             });
         }
 
-        // Security check: validate path is within workspace
-        if !self.security.is_path_allowed(path) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Path not allowed by security policy: {path}")),
-            });
-        }
+        // Validate the encoding and decode base64 BEFORE any write-side
+        // filesystem mutation (e.g. parent directory creation), so invalid
+        // input fails without touching the workspace. Path-sandbox checks
+        // below still run on the resolved target before the write.
+        let bytes = match encoding {
+            "utf8" => content.as_bytes().to_vec(),
+            "base64" => {
+                use base64::Engine;
+                match base64::engine::general_purpose::STANDARD.decode(content) {
+                    Ok(decoded) => decoded,
+                    Err(e) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!("Invalid base64 content: {e}")),
+                        });
+                    }
+                }
+            }
+            other => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Unsupported encoding '{other}' (expected 'utf8' or 'base64')"
+                    )),
+                });
+            }
+        };
+
+        // Rate limiting and path-allowlist checks are applied by the
+        // RateLimitedTool + PathGuardedTool wrappers at registration time
+        // (see zeroclaw-runtime::tools::mod).
 
         let full_path = self.security.resolve_tool_path(path);
 
@@ -88,10 +162,10 @@ impl Tool for FileWriteTool {
             });
         };
 
-        // Ensure parent directory exists
+        // Ensure parent directory exists before canonicalising.
         tokio::fs::create_dir_all(parent).await?;
 
-        // Resolve parent AFTER creation to block symlink escapes.
+        // Canonicalise parent AFTER creation to detect symlink escapes.
         let resolved_parent = match tokio::fs::canonicalize(parent).await {
             Ok(p) => p,
             Err(e) => {
@@ -149,18 +223,10 @@ impl Tool for FileWriteTool {
             });
         }
 
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
-        }
-
-        match tokio::fs::write(&resolved_target, content).await {
+        match tokio::fs::write(&resolved_target, &bytes).await {
             Ok(()) => Ok(ToolResult {
                 success: true,
-                output: format!("Written {} bytes to {path}", content.len()),
+                output: format!("Written {} bytes to {path}", bytes.len()),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
@@ -175,39 +241,66 @@ impl Tool for FileWriteTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wrappers::{PathGuardedTool, RateLimitedTool};
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
 
-    fn test_security(workspace: std::path::PathBuf) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
+    fn test_tool(workspace: std::path::PathBuf) -> FileWriteTool {
+        let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: workspace,
             ..SecurityPolicy::default()
-        })
+        });
+        FileWriteTool::new(security)
     }
 
-    fn test_security_with(
+    /// Wraps `FileWriteTool` with the production `PathGuardedTool` + `RateLimitedTool`
+    /// stack, mirroring the registration in `zeroclaw-runtime::tools::mod`. Use this
+    /// in tests that exercise path-allowlist or rate-limit behavior.
+    fn wrapped_tool(workspace: std::path::PathBuf) -> Box<dyn Tool> {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            ..SecurityPolicy::default()
+        });
+        Box::new(RateLimitedTool::new(
+            PathGuardedTool::new(FileWriteTool::new(security.clone()), security.clone()),
+            security,
+        ))
+    }
+
+    fn test_tool_with(
         workspace: std::path::PathBuf,
         autonomy: AutonomyLevel,
         max_actions_per_hour: u32,
-    ) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
+    ) -> FileWriteTool {
+        let security = Arc::new(SecurityPolicy {
             autonomy,
             workspace_dir: workspace,
             max_actions_per_hour,
             ..SecurityPolicy::default()
-        })
+        });
+        FileWriteTool::new(security)
+    }
+
+    fn ephemeral_tool(workspace: std::path::PathBuf) -> FileWriteTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            ..SecurityPolicy::default()
+        });
+        FileWriteTool::new_with_persistence(security, false)
     }
 
     #[test]
     fn file_write_name() {
-        let tool = FileWriteTool::new(test_security(std::env::temp_dir()));
+        let tool = test_tool(std::env::temp_dir());
         assert_eq!(tool.name(), "file_write");
     }
 
     #[test]
     fn file_write_schema_has_path_and_content() {
-        let tool = FileWriteTool::new(test_security(std::env::temp_dir()));
+        let tool = test_tool(std::env::temp_dir());
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["path"].is_object());
         assert!(schema["properties"]["content"].is_object());
@@ -222,7 +315,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileWriteTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({"path": "out.txt", "content": "written!"}))
             .await
@@ -244,7 +337,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileWriteTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({"path": "a/b/c/deep.txt", "content": "deep"}))
             .await
@@ -266,7 +359,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&root).await;
         tokio::fs::create_dir_all(&workspace).await.unwrap();
 
-        let tool = FileWriteTool::new(test_security(workspace.clone()));
+        let tool = test_tool(workspace.clone());
         let workspace_prefixed = workspace
             .strip_prefix(std::path::Path::new("/"))
             .unwrap()
@@ -298,7 +391,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tool = FileWriteTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({"path": "exist.txt", "content": "new"}))
             .await
@@ -319,40 +412,211 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileWriteTool::new(test_security(dir.clone()));
+        let tool = wrapped_tool(dir.clone());
         let result = tool
             .execute(json!({"path": "../../etc/evil", "content": "bad"}))
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("not allowed"));
+        assert!(
+            result.error.as_ref().unwrap().contains("Path blocked"),
+            "expected 'Path blocked' error, got: {:?}",
+            result.error
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
     async fn file_write_blocks_absolute_path() {
-        let tool = FileWriteTool::new(test_security(std::env::temp_dir()));
+        let tool = wrapped_tool(std::env::temp_dir());
         let result = tool
             .execute(json!({"path": "/etc/evil", "content": "bad"}))
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("not allowed"));
+        assert!(
+            result.error.as_ref().unwrap().contains("Path blocked"),
+            "expected 'Path blocked' error, got: {:?}",
+            result.error
+        );
     }
 
     #[tokio::test]
     async fn file_write_missing_path_param() {
-        let tool = FileWriteTool::new(test_security(std::env::temp_dir()));
+        let tool = test_tool(std::env::temp_dir());
         let result = tool.execute(json!({"content": "data"})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn file_write_missing_content_param() {
-        let tool = FileWriteTool::new(test_security(std::env::temp_dir()));
+        let tool = test_tool(std::env::temp_dir());
         let result = tool.execute(json!({"path": "file.txt"})).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn file_write_schema_has_encoding() {
+        let tool = test_tool(std::env::temp_dir());
+        let schema = tool.parameters_schema();
+        assert!(schema["properties"]["encoding"].is_object());
+    }
+
+    #[tokio::test]
+    async fn file_write_base64_writes_decoded_bytes() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_base64");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // Bytes that are NOT valid UTF-8 — proves we persist raw bytes, not text.
+        let raw: Vec<u8> = vec![0x00, 0x01, 0xFF, 0xFE, b'P', b'K', 0x03, 0x04];
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&raw);
+
+        let tool = test_tool(dir.clone());
+        let result = tool
+            .execute(json!({"path": "out.bin", "content": encoded, "encoding": "base64"}))
+            .await
+            .unwrap();
+        assert!(result.success, "error: {:?}", result.error);
+        assert!(result.output.contains(&format!("{} bytes", raw.len())));
+
+        let written = tokio::fs::read(dir.join("out.bin")).await.unwrap();
+        assert_eq!(written, raw, "base64 write must persist exact raw bytes");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_write_base64_invalid_content_errors() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_base64_invalid");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = test_tool(dir.clone());
+        let result = tool
+            .execute(
+                json!({"path": "out.bin", "content": "not!valid!base64!", "encoding": "base64"}),
+            )
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Invalid base64")
+        );
+        assert!(
+            !dir.join("out.bin").exists(),
+            "no file must be written on decode failure"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_write_unsupported_encoding_errors() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_bad_encoding");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = test_tool(dir.clone());
+        let result = tool
+            .execute(json!({"path": "out.txt", "content": "hi", "encoding": "hex"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Unsupported encoding")
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// Rejected writes (invalid base64 / unsupported encoding) targeting a
+    /// missing nested parent must fail WITHOUT mutating the workspace — no
+    /// file and, crucially, no parent directory may be created.
+    #[tokio::test]
+    async fn file_write_rejected_encoding_does_not_create_parent_dirs() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_no_dir_on_reject");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = test_tool(dir.clone());
+
+        // Invalid base64 into a missing nested parent.
+        let result = tool
+            .execute(json!({
+                "path": "nested/out.bin",
+                "content": "not!valid!base64!",
+                "encoding": "base64"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Invalid base64")
+        );
+        assert!(
+            !dir.join("nested").exists(),
+            "rejected base64 write must not create the parent directory"
+        );
+        assert!(!dir.join("nested/out.bin").exists());
+
+        // Unsupported encoding into a (different) missing nested parent.
+        let result = tool
+            .execute(json!({
+                "path": "nested2/out.txt",
+                "content": "hi",
+                "encoding": "hex"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Unsupported encoding")
+        );
+        assert!(
+            !dir.join("nested2").exists(),
+            "unsupported encoding must not create the parent directory"
+        );
+        assert!(!dir.join("nested2/out.txt").exists());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_write_base64_still_blocks_path_traversal() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_base64_traversal");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"bad");
+        let tool = wrapped_tool(dir.clone());
+        let result = tool
+            .execute(json!({"path": "../../etc/evil", "content": encoded, "encoding": "base64"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_ref().unwrap().contains("Path blocked"));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
@@ -361,7 +625,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileWriteTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({"path": "empty.txt", "content": ""}))
             .await
@@ -387,7 +651,7 @@ mod tests {
 
         symlink(&outside, workspace.join("escape_dir")).unwrap();
 
-        let tool = FileWriteTool::new(test_security(workspace.clone()));
+        let tool = test_tool(workspace.clone());
         let result = tool
             .execute(json!({"path": "escape_dir/hijack.txt", "content": "bad"}))
             .await
@@ -407,35 +671,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_write_blocks_readonly_mode() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_readonly");
+    async fn file_write_blocks_ephemeral_runtime() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_ephemeral");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileWriteTool::new(test_security_with(dir.clone(), AutonomyLevel::ReadOnly, 20));
-        let result = tool
-            .execute(json!({"path": "out.txt", "content": "should-block"}))
-            .await
-            .unwrap();
-
-        assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("read-only"));
-        assert!(!dir.join("out.txt").exists());
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-    }
-
-    #[tokio::test]
-    async fn file_write_blocks_when_rate_limited() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_rate_limited");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-
-        let tool = FileWriteTool::new(test_security_with(
-            dir.clone(),
-            AutonomyLevel::Supervised,
-            0,
-        ));
+        let tool = ephemeral_tool(dir.clone());
         let result = tool
             .execute(json!({"path": "out.txt", "content": "should-block"}))
             .await
@@ -447,14 +688,36 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or("")
-                .contains("Rate limit exceeded")
+                .contains("ephemeral workspace"),
+            "error should mention ephemeral workspace, got: {:?}",
+            result.error
         );
-        assert!(!dir.join("out.txt").exists());
+        assert!(
+            !dir.join("out.txt").exists(),
+            "no file should be written in ephemeral mode"
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    // ── §5.1 TOCTOU / symlink file write protection tests ────
+    #[tokio::test]
+    async fn file_write_blocks_readonly_mode() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_readonly");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = test_tool_with(dir.clone(), AutonomyLevel::ReadOnly, 20);
+        let result = tool
+            .execute(json!({"path": "out.txt", "content": "should-block"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap_or("").contains("read-only"));
+        assert!(!dir.join("out.txt").exists());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -469,13 +732,12 @@ mod tests {
         tokio::fs::create_dir_all(&workspace).await.unwrap();
         tokio::fs::create_dir_all(&outside).await.unwrap();
 
-        // Create a file outside and symlink to it inside workspace
         tokio::fs::write(outside.join("target.txt"), "original")
             .await
             .unwrap();
         symlink(outside.join("target.txt"), workspace.join("linked.txt")).unwrap();
 
-        let tool = FileWriteTool::new(test_security(workspace.clone()));
+        let tool = test_tool(workspace.clone());
         let result = tool
             .execute(json!({"path": "linked.txt", "content": "overwritten"}))
             .await
@@ -487,7 +749,6 @@ mod tests {
             "error should mention symlink"
         );
 
-        // Verify original file was not modified
         let content = tokio::fs::read_to_string(outside.join("target.txt"))
             .await
             .unwrap();
@@ -505,9 +766,8 @@ mod tests {
         // Canonicalize so the workspace dir matches resolved paths on macOS (/private/var/…)
         let dir = tokio::fs::canonicalize(&dir).await.unwrap();
 
-        let tool = FileWriteTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
 
-        // Pass an absolute path that is within the workspace
         let abs_path = dir.join("abs_test.txt");
         let result = tool
             .execute(
@@ -536,7 +796,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        let tool = FileWriteTool::new(test_security(dir.clone()));
+        let tool = test_tool(dir.clone());
         let result = tool
             .execute(json!({"path": "file\u{0000}.txt", "content": "bad"}))
             .await
@@ -547,37 +807,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_write_blocks_runtime_config_path() {
-        let root = std::env::temp_dir().join("zeroclaw_test_file_write_runtime_config");
+    async fn file_write_blocks_path_outside_workspace() {
+        let root = std::env::temp_dir().join("zeroclaw_test_file_write_outside_workspace");
         let workspace = root.join("workspace");
-        let config_path = root.join("config.toml");
+        let outside_file = root.join("outside.txt");
         let _ = tokio::fs::remove_dir_all(&root).await;
         tokio::fs::create_dir_all(&workspace).await.unwrap();
 
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            workspace_dir: workspace.clone(),
-            workspace_only: false,
-            allowed_roots: vec![root.clone()],
-            forbidden_paths: vec![],
-            ..SecurityPolicy::default()
-        });
-        let tool = FileWriteTool::new(security);
+        let tool = test_tool(workspace.clone());
         let result = tool
             .execute(json!({
-                "path": config_path.to_string_lossy(),
-                "content": "auto_approve = [\"cron_add\"]"
+                "path": outside_file.to_string_lossy(),
+                "content": "should-block"
             }))
             .await
             .unwrap();
 
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .unwrap_or_default()
-                .contains("runtime config/state file")
-        );
+        assert!(!outside_file.exists());
 
         let _ = tokio::fs::remove_dir_all(&root).await;
     }

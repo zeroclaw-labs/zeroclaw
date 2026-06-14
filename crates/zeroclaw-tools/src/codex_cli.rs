@@ -13,7 +13,7 @@ const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
-/// Delegates coding tasks to the Codex CLI (`codex -q`).
+/// Delegates coding tasks to the Codex CLI (`codex exec`).
 ///
 /// This creates a two-tier agent architecture: ZeroClaw orchestrates high-level
 /// tasks and delegates complex coding work to Codex, which has its own
@@ -39,7 +39,7 @@ impl Tool for CodexCliTool {
     }
 
     fn description(&self) -> &str {
-        "Delegate a coding task to Codex CLI (codex -q). Supports file editing and bash execution. Use for complex coding work that benefits from Codex's full agent loop."
+        "Delegate a coding task to Codex CLI (codex exec). Supports file editing and bash execution. Use for complex coding work that benefits from Codex's full agent loop."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -60,14 +60,8 @@ impl Tool for CodexCliTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        // Rate limit check
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
+        // Rate limiting is applied by the RateLimitedTool wrapper at
+        // registration time (see zeroclaw-runtime::tools::mod).
 
         // Enforce act policy
         if let Err(error) = self
@@ -82,10 +76,16 @@ impl Tool for CodexCliTool {
         }
 
         // Extract prompt (required)
-        let prompt = args
-            .get("prompt")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'prompt' parameter"))?;
+        let prompt = args.get("prompt").and_then(|v| v.as_str()).ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"param": "prompt"})),
+                "codex_cli: missing prompt parameter"
+            );
+            anyhow::Error::msg("Missing 'prompt' parameter")
+        })?;
 
         // Validate working directory — require both paths to exist (reject
         // non-existent paths instead of falling back to the raw value, which
@@ -136,23 +136,24 @@ impl Tool for CodexCliTool {
             self.security.workspace_dir.clone()
         };
 
-        // Record action budget
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
-        }
-
-        // Build CLI command
+        // Build CLI command: `codex exec [extra_args...] <prompt>`
         let codex_bin = if cfg!(target_os = "windows") {
             "codex.cmd"
         } else {
             "codex"
         };
         let mut cmd = Command::new(codex_bin);
-        cmd.arg("-q").arg(prompt);
+        cmd.arg("exec");
+
+        // Append user-configured extra arguments (e.g. --sandbox, --skip-git-repo-check)
+        for arg in &self.config.extra_args {
+            let trimmed = arg.trim();
+            if !trimmed.is_empty() {
+                cmd.arg(trimmed);
+            }
+        }
+
+        cmd.arg(prompt);
 
         // Environment: clear everything, pass only safe vars + configured passthrough.
         cmd.env_clear();
@@ -343,6 +344,15 @@ mod tests {
         assert!(
             config.env_passthrough.is_empty(),
             "env_passthrough should default to empty"
+        );
+    }
+
+    #[test]
+    fn codex_cli_extra_args_defaults() {
+        let config = CodexCliConfig::default();
+        assert!(
+            config.extra_args.is_empty(),
+            "extra_args should default to empty"
         );
     }
 

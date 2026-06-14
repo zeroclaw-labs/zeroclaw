@@ -1,199 +1,82 @@
+//! Binary-side config module. Pure re-export surface — the real types and
+//! helpers live in `zeroclaw-config`. Everything the binary needs (schema,
+//! traits, property helpers) is pulled through here so `crate::config::*`
+//! continues to resolve for callers that predate the crate split.
+
 pub use zeroclaw_config::migration;
 pub use zeroclaw_config::providers;
 pub mod schema;
 pub mod traits;
-pub mod workspace;
 
 pub use schema::{
-    AgentConfig, AssemblyAiSttConfig, AuditConfig, AutonomyConfig, BackupConfig,
-    BrowserComputerUseConfig, BrowserConfig, BuiltinHooksConfig, ChannelsConfig,
-    ClassificationRule, ClaudeCodeConfig, ClaudeCodeRunnerConfig, CloudOpsConfig, CodexCliConfig,
-    ComposioConfig, Config, ConversationalAiConfig, CostConfig, CronConfig, CronJobDecl,
-    CronScheduleDecl, DEFAULT_GWS_SERVICES, DataRetentionConfig, DeepgramSttConfig,
-    DelegateAgentConfig, DelegateToolConfig, DiscordConfig, DockerRuntimeConfig, EdgeTtsConfig,
-    ElevenLabsTtsConfig, EmbeddingRouteConfig, EstopConfig, FeishuConfig, GatewayConfig,
-    GeminiCliConfig, GoogleSttConfig, GoogleTtsConfig, GoogleWorkspaceAllowedOperation,
-    GoogleWorkspaceConfig, HardwareConfig, HardwareTransport, HeartbeatConfig, HooksConfig,
-    HttpRequestConfig, IMessageConfig, IdentityConfig, ImageGenConfig, ImageProviderDalleConfig,
-    ImageProviderFluxConfig, ImageProviderImagenConfig, ImageProviderStabilityConfig, JiraConfig,
-    KnowledgeConfig, LarkConfig, LinkEnricherConfig, LinkedInConfig, LinkedInContentConfig,
-    LinkedInImageConfig, LocalWhisperConfig, MatrixConfig, McpConfig, McpServerConfig,
-    McpTransport, MediaPipelineConfig, MemoryConfig, MemoryPolicyConfig, Microsoft365Config,
-    ModelRouteConfig, MqttConfig, MultimodalConfig, NextcloudTalkConfig, NodeTransportConfig,
-    NodesConfig, NotionConfig, ObservabilityConfig, OpenAiSttConfig, OpenAiTtsConfig,
-    OpenCodeCliConfig, OpenVpnTunnelConfig, OtpConfig, OtpMethod, PacingConfig,
-    PeripheralBoardConfig, PeripheralsConfig, PipelineConfig, PiperTtsConfig, PluginsConfig,
-    ProjectIntelConfig, ProxyConfig, ProxyScope, QdrantConfig, QueryClassificationConfig,
-    ReliabilityConfig, ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig,
+    AliasedAgentConfig, AssemblyAiSttConfig, AuditConfig, BackupConfig, BrowserComputerUseConfig,
+    BrowserConfig, BuiltinHooksConfig, ChannelsConfig, ClassificationRule, ClaudeCodeConfig,
+    ClaudeCodeRunnerConfig, CloudOpsConfig, CodexCliConfig, ComposioConfig, Config,
+    ConversationalAiConfig, CostConfig, CronJobDecl, CronScheduleDecl, DEFAULT_GWS_SERVICES,
+    DataRetentionConfig, DeepgramSttConfig, DelegateToolConfig, DiscordConfig, DockerRuntimeConfig,
+    EmbeddingRouteConfig, EstopConfig, GatewayConfig, GeminiCliConfig, GoogleSttConfig,
+    GoogleWorkspaceAllowedOperation, GoogleWorkspaceConfig, HardwareConfig, HardwareTransport,
+    HeartbeatConfig, HooksConfig, HttpRequestConfig, IMessageConfig, IdentityConfig,
+    ImageGenConfig, ImageProviderDalleConfig, ImageProviderFluxConfig, ImageProviderImagenConfig,
+    ImageProviderStabilityConfig, JiraConfig, KnowledgeConfig, LarkConfig, LinkEnricherConfig,
+    LinkedInConfig, LinkedInContentConfig, LinkedInImageConfig, LocalWhisperConfig, MatrixConfig,
+    McpConfig, McpServerConfig, McpTransport, MediaPipelineConfig, MemoryConfig,
+    MemoryPolicyConfig, Microsoft365Config, ModelRouteConfig, MqttConfig, MultimodalConfig,
+    NextcloudTalkConfig, NodeTransportConfig, NodesConfig, NotionConfig, ObservabilityConfig,
+    OpenAiSttConfig, OpenCodeCliConfig, OpenVpnTunnelConfig, OtpConfig, OtpMethod, PacingConfig,
+    PeripheralBoardConfig, PeripheralsConfig, PipelineConfig, PluginsConfig, PostgresStorageConfig,
+    ProjectIntelConfig, ProxyConfig, ProxyScope, QdrantStorageConfig, QueryClassificationConfig,
+    ReliabilityConfig, RiskProfileConfig, RuntimeConfig, SandboxBackend, SandboxConfig,
     SchedulerConfig, SearchMode, SecretsConfig, SecurityConfig, SecurityOpsConfig, ShellToolConfig,
     SkillCreationConfig, SkillImprovementConfig, SkillsConfig, SkillsPromptInjectionMode,
-    SlackConfig, SopConfig, StorageConfig, StorageProviderConfig, StorageProviderSection,
-    StreamMode, SwarmConfig, SwarmStrategy, TelegramConfig, TextBrowserConfig, ToolFilterGroup,
-    ToolFilterGroupMode, TranscriptionConfig, TtsConfig, TunnelConfig, VerifiableIntentConfig,
-    WebFetchConfig, WebSearchConfig, WebhookConfig, WhatsAppChatPolicy, WhatsAppWebMode,
-    WorkspaceConfig, apply_channel_proxy_to_builder, apply_runtime_proxy_to_builder,
-    build_channel_proxy_client, build_channel_proxy_client_with_timeouts,
-    build_runtime_proxy_client, build_runtime_proxy_client_with_timeouts, runtime_proxy_config,
-    set_runtime_proxy_config, ws_connect_with_proxy,
+    SlackConfig, SopConfig, SqliteStorageConfig, StorageConfig, StreamMode, TelegramConfig,
+    TextBrowserConfig, ToolFilterGroup, ToolFilterGroupMode, TranscriptionConfig, TtsConfig,
+    TtsProviderConfig, TunnelConfig, VerifiableIntentConfig, WebFetchConfig, WebSearchConfig,
+    WebhookConfig, WhatsAppChatPolicy, WhatsAppWebMode, apply_channel_proxy_to_builder,
+    apply_runtime_proxy_to_builder, build_channel_proxy_client,
+    build_channel_proxy_client_with_timeouts, build_runtime_proxy_client,
+    build_runtime_proxy_client_with_timeouts, runtime_proxy_config, set_runtime_proxy_config,
+    ws_connect_with_proxy,
 };
 
 pub use schema::ModelProviderConfig;
+// Per-family model model_provider configs (typed split — #6273). Re-exported here
+// so tests + downstream binary callers can construct typed family entries
+// without reaching into `zeroclaw_config::schema` directly.
+pub use schema::{
+    Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnthropicModelProviderConfig,
+    AnyscaleModelProviderConfig, AstraiModelProviderConfig, AvianModelProviderConfig,
+    AzureModelProviderConfig, BaichuanModelProviderConfig, BasetenModelProviderConfig,
+    BedrockModelProviderConfig, CerebrasModelProviderConfig, CloudflareModelProviderConfig,
+    CohereModelProviderConfig, CopilotModelProviderConfig, CustomModelProviderConfig,
+    DeepinfraModelProviderConfig, DeepmystModelProviderConfig, DeepseekModelProviderConfig,
+    DoubaoModelProviderConfig, FireworksModelProviderConfig, FriendliModelProviderConfig,
+    GeminiCliModelProviderConfig, GeminiModelProviderConfig, GlmModelProviderConfig,
+    GroqModelProviderConfig, HuggingfaceModelProviderConfig, HunyuanModelProviderConfig,
+    HyperbolicModelProviderConfig, KiloCliModelProviderConfig, LeptonModelProviderConfig,
+    LitellmModelProviderConfig, LlamacppModelProviderConfig, LmstudioModelProviderConfig,
+    MinimaxModelProviderConfig, MistralModelProviderConfig, MoonshotModelProviderConfig,
+    NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
+    NvidiaModelProviderConfig, OllamaModelProviderConfig, OpenAIModelProviderConfig,
+    OpenRouterModelProviderConfig, OpencodeModelProviderConfig, OsaurusModelProviderConfig,
+    OvhModelProviderConfig, PerplexityModelProviderConfig, QianfanModelProviderConfig,
+    QwenModelProviderConfig, RekaModelProviderConfig, SambanovaModelProviderConfig,
+    SglangModelProviderConfig, SiliconflowModelProviderConfig, StepfunModelProviderConfig,
+    SyntheticModelProviderConfig, TelnyxModelProviderConfig, TogetherModelProviderConfig,
+    VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
+    XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+};
 pub use traits::HasPropKind;
 pub use traits::PropFieldInfo;
 pub use traits::PropKind;
 pub use traits::SecretFieldInfo;
 
-/// Return a comma-separated string of valid enum variant names for display in error messages.
-///
-/// Uses the JSON schema generated by `schemars` to discover variant names.
-pub fn enum_variants<T: schemars::JsonSchema>() -> String {
-    let schema = schemars::schema_for!(T);
-    let json = match serde_json::to_value(&schema) {
-        Ok(v) => v,
-        Err(_) => return "(unknown variants)".to_string(),
-    };
-
-    // Try top-level `enum` array (simple string enums with rename_all)
-    if let Some(variants) = json.get("enum").and_then(|v| v.as_array()) {
-        let names: Vec<&str> = variants.iter().filter_map(|v| v.as_str()).collect();
-        if !names.is_empty() {
-            return names.join(", ");
-        }
-    }
-
-    // Try `oneOf` for tagged/complex enums
-    if let Some(one_of) = json.get("oneOf").and_then(|v| v.as_array()) {
-        let names: Vec<&str> = one_of
-            .iter()
-            .filter_map(|s| {
-                // Each variant may have a `const` or an `enum` with one entry
-                s.get("const").and_then(|v| v.as_str()).or_else(|| {
-                    s.get("enum")
-                        .and_then(|v| v.as_array())
-                        .and_then(|arr| arr.first())
-                        .and_then(|v| v.as_str())
-                })
-            })
-            .collect();
-        if !names.is_empty() {
-            return names.join(", ");
-        }
-    }
-
-    "(unknown variants)".to_string()
-}
-
-pub fn name_and_presence<T: traits::ChannelConfig>(channel: Option<&T>) -> (&'static str, bool) {
-    (T::name(), channel.is_some())
-}
-
-// ── Serde-based property helpers ──────────────────────────────────
-
-/// Build a `PropFieldInfo` by reading the display value from a serialized TOML table.
-pub fn make_prop_field(
-    table: Option<&toml::Table>,
-    name: &'static str,
-    serde_name: &str,
-    category: &'static str,
-    type_hint: &'static str,
-    kind: PropKind,
-    is_secret: bool,
-    enum_variants: Option<fn() -> Vec<String>>,
-) -> PropFieldInfo {
-    let display_value = if is_secret {
-        match table.and_then(|t| t.get(serde_name)) {
-            Some(toml::Value::String(s)) if !s.is_empty() => "****".to_string(),
-            _ => "<unset>".to_string(),
-        }
-    } else {
-        toml_value_to_display(table.and_then(|t| t.get(serde_name)))
-    };
-    PropFieldInfo {
-        name,
-        category,
-        display_value,
-        type_hint,
-        kind,
-        is_secret,
-        enum_variants,
-    }
-}
-
-/// Get a property value via serde serialization.
-pub fn serde_get_prop<T: serde::Serialize>(
-    target: &T,
-    prefix: &str,
-    name: &str,
-    is_secret: bool,
-) -> anyhow::Result<String> {
-    if is_secret {
-        return Ok("**** (encrypted)".to_string());
-    }
-    let serde_name = prop_name_to_serde_field(prefix, name)?;
-    let table = toml::Value::try_from(target)?;
-    Ok(toml_value_to_display(
-        table.as_table().and_then(|t| t.get(&serde_name)),
-    ))
-}
-
-/// Set a property value via serde roundtrip.
-pub fn serde_set_prop<T: serde::Serialize + serde::de::DeserializeOwned>(
-    target: &mut T,
-    prefix: &str,
-    name: &str,
-    value_str: &str,
-    kind: PropKind,
-    is_option: bool,
-) -> anyhow::Result<()> {
-    let serde_name = prop_name_to_serde_field(prefix, name)?;
-    let mut table: toml::Table = toml::from_str(&toml::to_string(target)?)?;
-    if value_str.is_empty() && is_option {
-        table.remove(&serde_name);
-    } else {
-        table.insert(serde_name, parse_prop_value(value_str, kind)?);
-    }
-    *target = toml::from_str(&toml::to_string(&table)?)?;
-    Ok(())
-}
-
-fn toml_value_to_display(value: Option<&toml::Value>) -> String {
-    match value {
-        None => "<unset>".to_string(),
-        Some(toml::Value::String(s)) => s.clone(),
-        Some(v) => v.to_string(),
-    }
-}
-
-fn prop_name_to_serde_field(prefix: &str, name: &str) -> anyhow::Result<String> {
-    let suffix = if prefix.is_empty() {
-        name
-    } else {
-        name.strip_prefix(prefix)
-            .and_then(|s| s.strip_prefix('.'))
-            .ok_or_else(|| anyhow::anyhow!("Unknown property '{name}'"))?
-    };
-    let field_part = suffix.split('.').next().unwrap_or(suffix);
-    Ok(field_part.replace('-', "_"))
-}
-
-fn parse_prop_value(value_str: &str, kind: PropKind) -> anyhow::Result<toml::Value> {
-    match kind {
-        PropKind::Bool => Ok(toml::Value::Boolean(value_str.parse().map_err(|_| {
-            anyhow::anyhow!("Invalid bool value '{value_str}' — expected 'true' or 'false'")
-        })?)),
-        PropKind::Integer => {
-            Ok(toml::Value::Integer(value_str.parse().map_err(|_| {
-                anyhow::anyhow!("Invalid integer value '{value_str}'")
-            })?))
-        }
-        PropKind::Float => {
-            Ok(toml::Value::Float(value_str.parse().map_err(|_| {
-                anyhow::anyhow!("Invalid float value '{value_str}'")
-            })?))
-        }
-        PropKind::String | PropKind::Enum => Ok(toml::Value::String(value_str.to_string())),
-    }
-}
+// Property helpers — single source of truth in zeroclaw-config.
+#[cfg(feature = "schema-export")]
+pub use zeroclaw_config::helpers::enum_variants;
+pub use zeroclaw_config::helpers::{
+    make_prop_field, route_hashmap_path, serde_get_prop, serde_set_prop,
+};
 
 #[cfg(test)]
 mod tests {
@@ -203,8 +86,7 @@ mod tests {
     fn reexported_config_default_is_constructible() {
         let config = Config::default();
 
-        // Config::default() no longer has provider cache fields; just verify providers is constructible
-        assert!(config.providers.fallback.is_none() || config.providers.fallback.is_some());
+        assert!(config.providers.models.is_empty());
     }
 
     #[test]
@@ -212,7 +94,6 @@ mod tests {
         let telegram = TelegramConfig {
             enabled: true,
             bot_token: "token".into(),
-            allowed_users: vec!["alice".into()],
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
@@ -220,13 +101,17 @@ mod tests {
             ack_reactions: None,
             proxy_url: None,
             approval_timeout_secs: 120,
+            excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
 
         let discord = DiscordConfig {
             enabled: true,
             bot_token: "token".into(),
-            guild_id: Some("123".into()),
-            allowed_users: vec![],
+            guild_ids: vec!["123".into()],
+            channel_ids: vec![],
+            archive: false,
             listen_to_bots: false,
             interrupt_on_new_message: false,
             mention_only: false,
@@ -235,6 +120,11 @@ mod tests {
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
+            intents_mask: None,
+            approval_timeout_secs: 300,
+            excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
 
         let lark = LarkConfig {
@@ -243,39 +133,32 @@ mod tests {
             app_secret: "app-secret".into(),
             encrypt_key: None,
             verification_token: None,
-            allowed_users: vec![],
             mention_only: false,
             use_feishu: false,
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
+            excluded_tools: vec![],
+            approval_timeout_secs: 300,
+            per_user_session: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
         };
-        let feishu = FeishuConfig {
-            enabled: true,
-            app_id: "app-id".into(),
-            app_secret: "app-secret".into(),
-            encrypt_key: None,
-            verification_token: None,
-            allowed_users: vec![],
-            receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
-            port: None,
-            proxy_url: None,
-        };
-
         let nextcloud_talk = NextcloudTalkConfig {
             enabled: true,
             base_url: "https://cloud.example.com".into(),
             app_token: "app-token".into(),
             webhook_secret: None,
-            allowed_users: vec!["*".into()],
             proxy_url: None,
             bot_name: None,
+            excluded_tools: vec![],
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
         };
 
-        assert_eq!(telegram.allowed_users.len(), 1);
-        assert_eq!(discord.guild_id.as_deref(), Some("123"));
+        assert_eq!(telegram.bot_token, "token");
+        assert_eq!(discord.guild_ids, vec!["123".to_string()]);
         assert_eq!(lark.app_id, "app-id");
-        assert_eq!(feishu.app_id, "app-id");
         assert_eq!(nextcloud_talk.base_url, "https://cloud.example.com");
     }
 }

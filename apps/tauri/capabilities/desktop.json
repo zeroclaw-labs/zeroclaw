@@ -1,7 +1,7 @@
 {
   "identifier": "desktop",
   "description": "Desktop-specific permissions for ZeroClaw",
-  "windows": ["main"],
+  "windows": ["main", "onboarding"],
   "permissions": [
     "core:default",
     "shell:allow-open",

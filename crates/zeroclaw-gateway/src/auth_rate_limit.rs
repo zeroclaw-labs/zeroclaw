@@ -62,7 +62,7 @@ impl AuthRateLimiter {
 
     /// Check whether the client identified by `key` is allowed to attempt auth.
     ///
-    /// Does **not** record a new attempt — call [`record_attempt`] after
+    /// Does **not** record a new attempt — call `record_attempt` after
     /// verifying the attempt actually happened (regardless of success/failure).
     pub fn check_rate_limit(&self, key: &str) -> Result<(), RateLimitError> {
         if Self::is_loopback(key) {

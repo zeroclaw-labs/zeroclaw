@@ -4,7 +4,11 @@
 - **What changed and why:** (2–5 bullets — the diff shows *what*, you explain *why*)
 - **Scope boundary:** (what this PR explicitly does NOT change)
 - **Blast radius:** (what other subsystems or consumers could be affected)
-- **Linked issue(s):** `Closes #`, `Related #`, `Depends on #` (stacked), `Supersedes #` (replacing older PR)
+- **Linked issue(s):** Use plain text outside backticks. Use `Closes #`,
+  `Fixes #`, or `Resolves #` only for issues this PR fully resolves. Use
+  `Related #`, `Depends on #`, or `Supersedes #` for non-closing relationships.
+- **Labels:** Snapshot the current GitHub labels after labels are applied, for
+  example `type: docs`, `risk: low`, `size: S`, `docs`.
 
 ## Validation Evidence (required)
 
@@ -55,17 +59,13 @@ Medium/high-risk PRs must fill:
 - `Co-authored-by` trailers added in commit messages for incorporated contributors? (`Yes/No`)
 - If `No`, why (inspiration-only, no direct code/design carry-over):
 
-## i18n Follow-Through (required only when docs or user-facing wording change)
-
-- Locale navigation parity updated in `README*`, `docs/README*`, and `docs/SUMMARY.md` for supported locales (`en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`)? (`Yes/No/N.A.`)
-- Localized runtime-contract docs updated where equivalents exist (minimum for `fr`/`vi`: `commands-reference`, `config-reference`, `troubleshooting`)? (`Yes/No/N.A.`)
-- Vietnamese canonical docs under `docs/i18n/vi/**` synced and compatibility shims under `docs/*.vi.md` validated? (`Yes/No/N.A.`)
-- If any `N.A.`, explain scope decision:
-
 ---
 
-**Labels** live in the GitHub label UI, not in the body. Set `risk:*`, `size:*`, and scope labels via the sidebar. Auto-label corrections: add `risk: manual` and the intended label.
+**Labels** live in the GitHub label UI, not in the body. Maintainers and reviewers with label permissions set `risk:*`, `size:*`, and any missing manual labels via the sidebar. The PR path labeler only owns path/scope labels from `.github/labeler.yml`. Contributors without label permission can note obvious label mismatches in a comment.
 
-**Commit trailers** capture AI-assisted collaboration (`Co-Authored-By: Claude ...`) — no separate section needed.
+**Do not add bot/AI attribution footers** such as `Co-authored-by: Claude ...`
+or `Created with Claude Code` to the PR body or commit-message tail. Human
+co-author trailers are appropriate only for incorporated contributor work under
+the supersede-attribution section and privacy contract.
 
-**Privacy contract** (`docs/contributing/pr-discipline.md`) is a merge gate. Never commit real identities, secrets, personal emails, or PII in diff, tests, fixtures, or docs.
+**Privacy contract** (`docs/book/src/contributing/privacy.md`) is a merge gate. Never commit real identities, secrets, personal emails, or PII in diff, tests, fixtures, or docs.
