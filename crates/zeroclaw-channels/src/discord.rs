@@ -38,6 +38,13 @@ pub struct DiscordChannel {
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     listen_to_bots: bool,
     mention_only: bool,
+    /// Raw IDENTIFY mask override (config `intents_mask`). `Some` wins over
+    /// everything `gateway_intents()` would derive — including `Some(0)`,
+    /// a legal IDENTIFY value. Intents are connection-scoped (sent once in
+    /// IDENTIFY), so a construction-time snapshot matches the connection
+    /// lifecycle exactly: config reloads rebuild channels, which re-derives
+    /// the mask.
+    intents_mask_override: Option<u64>,
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
@@ -123,6 +130,7 @@ impl DiscordChannel {
             peer_resolver,
             listen_to_bots,
             mention_only,
+            intents_mask_override: None,
             typing_handles: Mutex::new(HashMap::new()),
             proxy_url: None,
             transcription: None,
@@ -146,6 +154,23 @@ impl DiscordChannel {
     pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
         self.proxy_url = proxy_url;
         self
+    }
+
+    /// Send exactly `mask` in IDENTIFY when `Some`, ignoring the derived
+    /// mask entirely (including `Some(0)`, a legal IDENTIFY value). Operator
+    /// escape hatch (config `intents_mask`).
+    pub fn with_intents_mask(mut self, mask: Option<u64>) -> Self {
+        self.intents_mask_override = mask;
+        self
+    }
+
+    /// Gateway intent mask for IDENTIFY: the raw `intents_mask` override
+    /// when set, otherwise the fixed baseline.
+    fn gateway_intents(&self) -> u64 {
+        if let Some(mask) = self.intents_mask_override {
+            return mask;
+        }
+        BASELINE_INTENTS
     }
 
     pub fn with_approval_timeout_secs(mut self, secs: u64) -> Self {
@@ -222,6 +247,201 @@ impl DiscordChannel {
     pub fn with_archive_memory(mut self, mem: std::sync::Arc<dyn zeroclaw_memory::Memory>) -> Self {
         self.archive_memory = Some(mem);
         self
+    }
+
+    /// Keep archived messages in sync when Discord reports them edited or
+    /// deleted. Markers are appended rather than replacing content, so the
+    /// original text and the edit history stay searchable. Markers are
+    /// plain text in the entry body — the same in-band convention as the
+    /// create path's `[attachments: …]` marker. They are advisory context
+    /// for the agent, not tamper-proof provenance: message content can
+    /// imitate them.
+    ///
+    /// Only messages that were actually archived are touched — the `get`
+    /// on the `discord_{message_id}` key gates everything (a message that
+    /// failed any create-time filter was never stored). Edits additionally
+    /// re-run the author checks against the UPDATE payload: archive-time
+    /// authorization is not durable, and a peer removed from the allowlist
+    /// must not keep writing into the archive by editing old messages.
+    async fn sync_archive_for_message_event(
+        &self,
+        event_type: &str,
+        d: &serde_json::Value,
+        bot_user_id: &str,
+    ) {
+        let Some(archive_mem) = self.archive_memory.clone() else {
+            return;
+        };
+        match event_type {
+            "MESSAGE_UPDATE" => self.apply_archive_edit(&archive_mem, d, bot_user_id).await,
+            "MESSAGE_DELETE" => {
+                let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                if !message_id.is_empty() {
+                    self.apply_archive_tombstone(&archive_mem, message_id).await;
+                }
+            }
+            "MESSAGE_DELETE_BULK" => {
+                // Moderation bulk deletes carry `ids`, not `id` — and they
+                // are the highest-signal deletions an archive can record.
+                let ids = d
+                    .get("ids")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|i| i.as_str()).collect::<Vec<&str>>())
+                    .unwrap_or_default();
+                for id in ids {
+                    self.apply_archive_tombstone(&archive_mem, id).await;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Fetch the archived entry for a message id, or `None` (logging
+    /// lookup failures — a missed sync beats a silent one).
+    async fn archived_entry(
+        &self,
+        archive_mem: &std::sync::Arc<dyn zeroclaw_memory::Memory>,
+        key: &str,
+    ) -> Option<zeroclaw_memory::MemoryEntry> {
+        match archive_mem.get(key).await {
+            Ok(entry) => entry,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error": format!("{e}"),
+                            "key": key,
+                        })),
+                    "discord archive lookup failed for message event"
+                );
+                None
+            }
+        }
+    }
+
+    /// Re-store an entry preserving its category and session attribution.
+    async fn restore_archived_entry(
+        &self,
+        archive_mem: &std::sync::Arc<dyn zeroclaw_memory::Memory>,
+        key: &str,
+        content: &str,
+        existing: &zeroclaw_memory::MemoryEntry,
+    ) {
+        if let Err(e) = archive_mem
+            .store(
+                key,
+                content,
+                existing.category.clone(),
+                existing.session_id.as_deref(),
+            )
+            .await
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "error": format!("{e}"),
+                        "key": key,
+                    })),
+                "failed to sync discord archive for message event"
+            );
+        }
+    }
+
+    /// Append a deletion tombstone. Idempotent: gateway redelivery (and a
+    /// MESSAGE_DELETE racing a bulk delete) must not double-stamp.
+    async fn apply_archive_tombstone(
+        &self,
+        archive_mem: &std::sync::Arc<dyn zeroclaw_memory::Memory>,
+        message_id: &str,
+    ) {
+        let key = format!("discord_{message_id}");
+        let Some(existing) = self.archived_entry(archive_mem, &key).await else {
+            return;
+        };
+        if existing.content.contains("[deleted at ") {
+            return;
+        }
+        // Deletes carry no payload timestamp; receipt time is the best
+        // available.
+        let ts = chrono::Utc::now().to_rfc3339();
+        let updated = format!("{} [deleted at {ts}]", existing.content);
+        self.restore_archived_entry(archive_mem, &key, &updated, &existing)
+            .await;
+    }
+
+    /// Append an edit marker for a genuine content edit.
+    ///
+    /// Discord sends the full message object on every MESSAGE_UPDATE —
+    /// embed unfurls, pins, flag changes — with `content` present and
+    /// unchanged. Only real content edits set `edited_timestamp`, so that
+    /// field gates the append (and keys the idempotency check: redelivered
+    /// or duplicate events for the same edit are no-ops).
+    async fn apply_archive_edit(
+        &self,
+        archive_mem: &std::sync::Arc<dyn zeroclaw_memory::Memory>,
+        d: &serde_json::Value,
+        bot_user_id: &str,
+    ) {
+        let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
+        if message_id.is_empty() {
+            return;
+        }
+        let Some(edited_ts) = d.get("edited_timestamp").and_then(|t| t.as_str()) else {
+            return;
+        };
+        let new_content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        if new_content.is_empty() {
+            return;
+        }
+        // Author re-checks: same gates the create path applied, evaluated
+        // against *current* policy. A payload without an author cannot be
+        // attributed and is not recorded.
+        let author_id = d
+            .get("author")
+            .and_then(|a| a.get("id"))
+            .and_then(|i| i.as_str())
+            .unwrap_or("");
+        if author_id.is_empty() || author_id == bot_user_id {
+            return;
+        }
+        if !self.listen_to_bots
+            && d.get("author")
+                .and_then(|a| a.get("bot"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        {
+            return;
+        }
+        if !self.is_user_allowed(author_id) {
+            return;
+        }
+
+        let key = format!("discord_{message_id}");
+        let Some(existing) = self.archived_entry(archive_mem, &key).await else {
+            return;
+        };
+        let marker_key = format!(" [edited at {edited_ts}:");
+        if existing.content.contains(&marker_key) {
+            return;
+        }
+        let marker = format!(" [edited at {edited_ts}: {new_content}]");
+        // Edits are remote-controlled and unlimited; bound entry growth by
+        // dropping the middle of the history once it gets large — the
+        // original text and the latest edit are what the archive is for.
+        let mut base = existing.content.clone();
+        if base.len() + marker.len() > MAX_ARCHIVE_ENTRY_BYTES
+            && let Some(first_marker) = base.find(" [edited at ")
+        {
+            base.truncate(first_marker);
+            base.push_str(" [edit history truncated]");
+        }
+        let updated = format!("{base}{marker}");
+        self.restore_archived_entry(archive_mem, &key, &updated, &existing)
+            .await;
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -1188,6 +1408,10 @@ const BASE64_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstu
 ///
 /// Discord rejects longer payloads with `50035 Invalid Form Body`.
 const DISCORD_MAX_MESSAGE_LENGTH: usize = 2000;
+/// Upper bound for an archived message entry once edit markers accrue.
+/// Edits are remote-controlled and unlimited; past this size the middle of
+/// the edit history is dropped (original text and latest edit retained).
+const MAX_ARCHIVE_ENTRY_BYTES: usize = 16 * 1024;
 const DISCORD_ACK_REACTIONS: &[&str] = &["⚡️", "🦀", "🙌", "💪", "👌", "👀", "👣"];
 
 /// Split a message into chunks that respect Discord's 2000-character limit.
@@ -1449,6 +1673,75 @@ fn base64_decode(input: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+// Discord gateway intent bits (API v10) — the ones zeroclaw consumes or
+// exposes as opt-ins. https://discord.com/developers/docs/events/gateway#gateway-intents
+const INTENT_GUILDS: u64 = 1 << 0;
+const INTENT_GUILD_MEMBERS: u64 = 1 << 1; // privileged
+const INTENT_GUILD_PRESENCES: u64 = 1 << 8; // privileged
+const INTENT_GUILD_MESSAGES: u64 = 1 << 9;
+const INTENT_DIRECT_MESSAGES: u64 = 1 << 12;
+const INTENT_MESSAGE_CONTENT: u64 = 1 << 15; // privileged
+
+/// The intents every Discord channel needs: guild topology plus guild/DM
+/// messages with content. MESSAGE_CONTENT is privileged but always requested
+/// — without it the bot only sees text in DMs and @-mentions, which silently
+/// breaks `archive`, `listen_to_bots`, and mention-free channels.
+const BASELINE_INTENTS: u64 =
+    INTENT_GUILDS | INTENT_GUILD_MESSAGES | INTENT_DIRECT_MESSAGES | INTENT_MESSAGE_CONTENT;
+
+/// Human-readable names for a resolved intent mask, for connect logs and
+/// close-code diagnostics. Bits without a known name (possible via the raw
+/// `intents_mask` override) are reported as one hex remainder entry rather
+/// than silently dropped.
+fn intent_names(mask: u64) -> Vec<String> {
+    let known: [(u64, &str); 6] = [
+        (INTENT_GUILDS, "guilds"),
+        (INTENT_GUILD_MEMBERS, "guild_members"),
+        (INTENT_GUILD_PRESENCES, "guild_presences"),
+        (INTENT_GUILD_MESSAGES, "guild_messages"),
+        (INTENT_DIRECT_MESSAGES, "direct_messages"),
+        (INTENT_MESSAGE_CONTENT, "message_content"),
+    ];
+    let mut names = Vec::new();
+    let mut rest = mask;
+    for (bit, name) in known {
+        if mask & bit != 0 {
+            names.push(name.to_string());
+            rest &= !bit;
+        }
+    }
+    if rest != 0 {
+        names.push(format!("unknown({rest:#x})"));
+    }
+    names
+}
+
+/// Close 4014 means the Developer Portal doesn't grant a privileged intent
+/// we requested. Name the portal toggles so the operator knows exactly what
+/// to fix instead of staring at a bare close code.
+fn disallowed_intents_hint(mask: u64) -> String {
+    let mut requested = Vec::new();
+    if mask & INTENT_MESSAGE_CONTENT != 0 {
+        requested.push("Message Content".to_string());
+    }
+    if mask & INTENT_GUILD_MEMBERS != 0 {
+        requested.push("Server Members".to_string());
+    }
+    if mask & INTENT_GUILD_PRESENCES != 0 {
+        requested.push("Presence".to_string());
+    }
+    if requested.is_empty() {
+        // Reachable only via an `intents_mask` override with no privileged
+        // bits — name the raw mask so the operator has something to act on.
+        requested.push(format!("mask {mask:#x}"));
+    }
+    format!(
+        " — a privileged intent is not enabled for this bot in the Discord \
+         Developer Portal (Bot → Privileged Gateway Intents). Requested: {}",
+        requested.join(", ")
+    )
+}
+
 fn is_fatal_gateway_close_code(code: u16) -> bool {
     matches!(code, 4004 | 4010 | 4011 | 4012 | 4013 | 4014)
 }
@@ -1673,11 +1966,26 @@ impl Channel for DiscordChannel {
                 "sent Discord Resume"
             );
         } else {
+            let intents = self.gateway_intents();
+            if intents & BASELINE_INTENTS != BASELINE_INTENTS {
+                // Only reachable via the raw `intents_mask` override — the
+                // derived path always starts from the full baseline.
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "intents": intents,
+                            "missing": intent_names(BASELINE_INTENTS & !intents),
+                        })),
+                    "intents_mask drops baseline intents — message handling may go quiet"
+                );
+            }
             let identify = json!({
                 "op": 2,
                 "d": {
                     "token": self.bot_token,
-                    "intents": 37377,
+                    "intents": intents,
                     "properties": {
                         "os": "linux",
                         "browser": "zeroclaw",
@@ -1690,7 +1998,11 @@ impl Channel for DiscordChannel {
                 .await?;
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "intents": intents,
+                        "intent_names": intent_names(intents),
+                    })),
                 "sent Discord Identify"
             );
         }
@@ -1774,9 +2086,15 @@ impl Channel for DiscordChannel {
                                     session.sequence = None;
                                 }
                                 if is_fatal_gateway_close_code(code) {
-                                    return Err(Self::fatal_listener_error(format!(
+                                    let mut message = format!(
                                         "discord gateway closed with fatal code {code}: {reason}"
-                                    )));
+                                    );
+                                    if code == 4014 {
+                                        message.push_str(&disallowed_intents_hint(
+                                            self.gateway_intents(),
+                                        ));
+                                    }
+                                    return Err(Self::fatal_listener_error(message));
                                 }
                                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"code": code, "reason": reason, "had_ready": had_ready, "sequence": sequence})), "discord gateway closed; reconnecting");
                             }
@@ -1883,6 +2201,21 @@ impl Channel for DiscordChannel {
                             break;
                         }
                         _ => {}
+                    }
+
+                    // MESSAGE_UPDATE / MESSAGE_DELETE / MESSAGE_DELETE_BULK
+                    // keep the archive in sync. All three already arrive
+                    // under the GUILD_MESSAGES / DIRECT_MESSAGES intents;
+                    // agent routing stays MESSAGE_CREATE-only.
+                    if event_type == "MESSAGE_UPDATE"
+                        || event_type == "MESSAGE_DELETE"
+                        || event_type == "MESSAGE_DELETE_BULK"
+                    {
+                        if let Some(d) = event.get("d") {
+                            self.sync_archive_for_message_event(event_type, d, &bot_user_id)
+                                .await;
+                        }
+                        continue;
                     }
 
                     // Only handle MESSAGE_CREATE (opcode 0, type "MESSAGE_CREATE")
@@ -2678,6 +3011,361 @@ mod tests {
             mention_only,
         );
         assert_eq!(ch.name(), "discord");
+    }
+
+    /// (channel, archive) pair backed by a throwaway sqlite file, mirroring
+    /// the orchestrator's `with_archive_memory` wiring.
+    fn archived_test_channel() -> (
+        DiscordChannel,
+        std::sync::Arc<dyn zeroclaw_memory::Memory>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let mem: std::sync::Arc<dyn zeroclaw_memory::Memory> = std::sync::Arc::new(
+            zeroclaw_memory::SqliteMemory::new_named("sqlite", dir.path(), "discord").unwrap(),
+        );
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(|| vec!["*".to_string()]),
+            false,
+            false,
+        )
+        .with_archive_memory(std::sync::Arc::clone(&mem));
+        (ch, mem, dir)
+    }
+
+    async fn seed_archived_message(mem: &std::sync::Arc<dyn zeroclaw_memory::Memory>) {
+        mem.store(
+            "discord_111",
+            "@alice in #200 at t0: original text",
+            zeroclaw_memory::MemoryCategory::Custom("discord".to_string()),
+            Some("200"),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn message_update_appends_edit_marker_to_archived_entry() {
+        let (ch, mem, _dir) = archived_test_channel();
+        seed_archived_message(&mem).await;
+
+        let d = serde_json::json!({
+            "id": "111", "channel_id": "200", "content": "revised text",
+            "edited_timestamp": "2026-06-11T01:00:00Z",
+            "author": {"id": "u-alice", "bot": false}
+        });
+        ch.sync_archive_for_message_event("MESSAGE_UPDATE", &d, "botid")
+            .await;
+
+        let entry = mem.get("discord_111").await.unwrap().unwrap();
+        assert!(
+            entry
+                .content
+                .starts_with("@alice in #200 at t0: original text")
+        );
+        assert!(
+            entry
+                .content
+                .contains("[edited at 2026-06-11T01:00:00Z: revised text]")
+        );
+        // Session attribution survives the re-store.
+        assert_eq!(entry.session_id.as_deref(), Some("200"));
+    }
+
+    #[tokio::test]
+    async fn redelivered_update_is_idempotent() {
+        let (ch, mem, _dir) = archived_test_channel();
+        seed_archived_message(&mem).await;
+        let d = serde_json::json!({
+            "id": "111", "channel_id": "200", "content": "revised text",
+            "edited_timestamp": "2026-06-11T01:00:00Z",
+            "author": {"id": "u-alice", "bot": false}
+        });
+        ch.sync_archive_for_message_event("MESSAGE_UPDATE", &d, "botid")
+            .await;
+        ch.sync_archive_for_message_event("MESSAGE_UPDATE", &d, "botid")
+            .await;
+        let entry = mem.get("discord_111").await.unwrap().unwrap();
+        assert_eq!(entry.content.matches("[edited at ").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn full_object_update_without_edited_timestamp_is_not_an_edit() {
+        // Discord sends the complete message object (content included,
+        // unchanged) on embed unfurls, pins, and flag changes — only real
+        // edits carry edited_timestamp. No phantom markers.
+        let (ch, mem, _dir) = archived_test_channel();
+        seed_archived_message(&mem).await;
+        let d = serde_json::json!({
+            "id": "111", "channel_id": "200", "content": "original text",
+            "edited_timestamp": serde_json::Value::Null,
+            "author": {"id": "u-alice", "bot": false}
+        });
+        ch.sync_archive_for_message_event("MESSAGE_UPDATE", &d, "botid")
+            .await;
+        let entry = mem.get("discord_111").await.unwrap().unwrap();
+        assert_eq!(entry.content, "@alice in #200 at t0: original text");
+    }
+
+    #[tokio::test]
+    async fn deauthorized_author_cannot_write_via_edits() {
+        // Archive-time authorization is not durable: once a peer leaves
+        // the allowlist their edits must stop reaching the archive.
+        let dir = tempfile::tempdir().unwrap();
+        let mem: std::sync::Arc<dyn zeroclaw_memory::Memory> = std::sync::Arc::new(
+            zeroclaw_memory::SqliteMemory::new_named("sqlite", dir.path(), "discord").unwrap(),
+        );
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(|| vec!["someone-else".to_string()]),
+            false,
+            false,
+        )
+        .with_archive_memory(std::sync::Arc::clone(&mem));
+        seed_archived_message(&mem).await;
+
+        let d = serde_json::json!({
+            "id": "111", "channel_id": "200", "content": "injected",
+            "edited_timestamp": "2026-06-11T01:00:00Z",
+            "author": {"id": "u-alice", "bot": false}
+        });
+        ch.sync_archive_for_message_event("MESSAGE_UPDATE", &d, "botid")
+            .await;
+        let entry = mem.get("discord_111").await.unwrap().unwrap();
+        assert_eq!(entry.content, "@alice in #200 at t0: original text");
+    }
+
+    #[tokio::test]
+    async fn message_delete_appends_tombstone_once() {
+        let (ch, mem, _dir) = archived_test_channel();
+        seed_archived_message(&mem).await;
+
+        let d = serde_json::json!({"id": "111", "channel_id": "200"});
+        ch.sync_archive_for_message_event("MESSAGE_DELETE", &d, "botid")
+            .await;
+        // Redelivery must not double-stamp.
+        ch.sync_archive_for_message_event("MESSAGE_DELETE", &d, "botid")
+            .await;
+
+        let entry = mem.get("discord_111").await.unwrap().unwrap();
+        assert!(
+            entry
+                .content
+                .starts_with("@alice in #200 at t0: original text")
+        );
+        assert_eq!(entry.content.matches("[deleted at ").count(), 1);
+        assert_eq!(entry.session_id.as_deref(), Some("200"));
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_tombstones_every_archived_id() {
+        let (ch, mem, _dir) = archived_test_channel();
+        seed_archived_message(&mem).await;
+        mem.store(
+            "discord_112",
+            "@bob in #200 at t1: second message",
+            zeroclaw_memory::MemoryCategory::Custom("discord".to_string()),
+            Some("200"),
+        )
+        .await
+        .unwrap();
+
+        let d = serde_json::json!({"ids": ["111", "112", "999"], "channel_id": "200"});
+        ch.sync_archive_for_message_event("MESSAGE_DELETE_BULK", &d, "botid")
+            .await;
+
+        assert!(
+            mem.get("discord_111")
+                .await
+                .unwrap()
+                .unwrap()
+                .content
+                .contains("[deleted at ")
+        );
+        assert!(
+            mem.get("discord_112")
+                .await
+                .unwrap()
+                .unwrap()
+                .content
+                .contains("[deleted at ")
+        );
+        // Unarchived ids stay unarchived.
+        assert!(mem.get("discord_999").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn edit_then_delete_keeps_both_markers() {
+        let (ch, mem, _dir) = archived_test_channel();
+        seed_archived_message(&mem).await;
+        let edit = serde_json::json!({
+            "id": "111", "channel_id": "200", "content": "revised",
+            "edited_timestamp": "2026-06-11T01:00:00Z",
+            "author": {"id": "u-alice", "bot": false}
+        });
+        ch.sync_archive_for_message_event("MESSAGE_UPDATE", &edit, "botid")
+            .await;
+        let del = serde_json::json!({"id": "111", "channel_id": "200"});
+        ch.sync_archive_for_message_event("MESSAGE_DELETE", &del, "botid")
+            .await;
+        let entry = mem.get("discord_111").await.unwrap().unwrap();
+        assert!(entry.content.contains("[edited at "));
+        assert!(entry.content.contains("[deleted at "));
+    }
+
+    #[tokio::test]
+    async fn message_events_for_unarchived_messages_are_ignored() {
+        // A message that never passed the inbound filters was never stored;
+        // its edit/delete events must not conjure an archive entry.
+        let (ch, mem, _dir) = archived_test_channel();
+
+        let d = serde_json::json!({
+            "id": "999", "channel_id": "200", "content": "whatever",
+            "edited_timestamp": "2026-06-11T01:00:00Z",
+            "author": {"id": "u-alice", "bot": false}
+        });
+        ch.sync_archive_for_message_event("MESSAGE_UPDATE", &d, "botid")
+            .await;
+        ch.sync_archive_for_message_event("MESSAGE_DELETE", &d, "botid")
+            .await;
+
+        assert!(mem.get("discord_999").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn edit_history_growth_is_bounded() {
+        let (ch, mem, _dir) = archived_test_channel();
+        seed_archived_message(&mem).await;
+        let big = "z".repeat(4000);
+        for i in 0..10 {
+            let d = serde_json::json!({
+                "id": "111", "channel_id": "200",
+                "content": format!("{big}-{i}"),
+                "edited_timestamp": format!("2026-06-11T01:00:{i:02}Z"),
+                "author": {"id": "u-alice", "bot": false}
+            });
+            ch.sync_archive_for_message_event("MESSAGE_UPDATE", &d, "botid")
+                .await;
+        }
+        let entry = mem.get("discord_111").await.unwrap().unwrap();
+        // Bounded: cap plus at most one marker's overshoot.
+        assert!(entry.content.len() < MAX_ARCHIVE_ENTRY_BYTES + 5000);
+        assert!(entry.content.contains("[edit history truncated]"));
+        assert!(
+            entry
+                .content
+                .starts_with("@alice in #200 at t0: original text")
+        );
+        // The latest edit always survives.
+        assert!(entry.content.contains("01:00:09Z"));
+    }
+
+    #[test]
+    fn gateway_intents_default_matches_legacy_mask() {
+        // The pre-resolver IDENTIFY hardcoded 37377. A default-config channel
+        // must request exactly the same mask — no silent behavior change.
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        );
+        assert_eq!(ch.gateway_intents(), 37377);
+        assert_eq!(ch.gateway_intents(), BASELINE_INTENTS);
+    }
+
+    #[test]
+    fn intent_names_decode_the_mask() {
+        assert_eq!(
+            intent_names(BASELINE_INTENTS),
+            vec![
+                "guilds",
+                "guild_messages",
+                "direct_messages",
+                "message_content"
+            ]
+        );
+        assert_eq!(
+            intent_names(BASELINE_INTENTS | INTENT_GUILD_MEMBERS | INTENT_GUILD_PRESENCES),
+            vec![
+                "guilds",
+                "guild_members",
+                "guild_presences",
+                "guild_messages",
+                "direct_messages",
+                "message_content"
+            ]
+        );
+        // Bits with no known name (reachable via the raw override) are
+        // reported, not dropped.
+        assert_eq!(
+            intent_names(INTENT_GUILDS | (1 << 21)),
+            vec!["guilds".to_string(), format!("unknown({:#x})", 1u64 << 21)]
+        );
+    }
+
+    #[test]
+    fn disallowed_intents_hint_names_privileged_toggles() {
+        let hint = disallowed_intents_hint(BASELINE_INTENTS | INTENT_GUILD_MEMBERS);
+        assert!(hint.contains("Server Members"));
+        assert!(hint.contains("Message Content"));
+        assert!(!hint.contains("Presence,"));
+
+        let base_hint = disallowed_intents_hint(BASELINE_INTENTS);
+        assert!(base_hint.contains("Message Content"));
+        assert!(!base_hint.contains("Server Members"));
+
+        // An override mask with no privileged bits still produces an
+        // actionable message instead of a dangling empty list.
+        let bare = disallowed_intents_hint(INTENT_GUILDS);
+        assert!(bare.contains("mask 0x1"));
+    }
+
+    #[test]
+    fn intents_mask_override_wins_verbatim() {
+        // Operator escape hatch: a Some(_) intents_mask is sent exactly as
+        // configured, ignoring the derived baseline — including Some(0),
+        // which is a legal IDENTIFY value.
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        )
+        .with_intents_mask(Some(46593));
+        assert_eq!(ch.gateway_intents(), 46593);
+
+        let zero = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        )
+        .with_intents_mask(Some(0));
+        assert_eq!(zero.gateway_intents(), 0);
+
+        // None means "derive".
+        let derived = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        )
+        .with_intents_mask(None);
+        assert_eq!(derived.gateway_intents(), BASELINE_INTENTS);
     }
 
     #[test]

@@ -102,6 +102,37 @@ docker compose exec zeroclaw zeroclaw quickstart
 
 With the official image you can omit the {{#env-var-name gateway.allow_public_bind}} override entirely; it is already enabled in the baked config.
 
+### Rootless Compose with the Debian image
+
+For rootless Docker or Podman Compose deployments that need shell tools inside
+the container, use the current Debian image and bind a host data directory:
+
+```yaml
+services:
+  zeroclaw:
+    image: ghcr.io/zeroclaw-labs/zeroclaw:debian
+    container_name: zeroclaw
+    restart: unless-stopped
+    ports:
+      - "42617:42617"
+    volumes:
+      - ./data:/zeroclaw-data
+    healthcheck:
+      test: ["CMD", "zeroclaw", "status", "--format=exit-code"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+```
+
+The current Debian image carries the packaged dashboard outside
+`/zeroclaw-data`, so the bind mount does not hide it and no
+`gateway.web_dist_dir` override is needed. The official image also carries the
+container-friendly gateway bind defaults. Only add an `environment:` block if
+you bind-mount your own localhost-default config; use the schema-mirror env-var
+spelling shown by {{#env-var-name gateway.allow_public_bind}} rather than the
+legacy all-uppercase aliases.
+
 ## macOS: OrbStack vs Colima
 
 macOS has no native Linux kernel, so every option (Docker Desktop, Podman, OrbStack, Colima) runs the container inside a lightweight Linux VM. For a Mac dev box, the two mac-native VMs worth comparing are OrbStack and Colima, both run the container with the same `docker run`/Compose commands above.

@@ -126,3 +126,19 @@ If the Scalar bundle can't load from the CDN (offline / air-gapped install),
 the page degrades gracefully and points you at the raw spec at
 `/api/openapi.json` so you can use any compatible viewer
 (Insomnia, Postman, Swagger UI, etc.).
+
+## Event stream contract
+
+`GET /api/events` is a raw Server-Sent Events stream of observable runtime
+events. It is not a deduplicated one-row-per-turn lifecycle timeline.
+
+Gateway handlers, webhook handling, cron/heartbeat work, and agent-loop
+observers can all publish lifecycle-shaped events into the same broadcast path.
+Clients should treat the stream as an append-only observation log. If a
+dashboard wants a compact turn timeline, it should group or deduplicate by the
+identifiers present on the event payload rather than assuming each
+`agent_start`, `llm_request`, or `agent_end` frame appears only once.
+
+`GET /api/events/history` replays the retained recent events from the same
+buffer, oldest first. It is a reconnect window for subscribers, not a separate
+canonical lifecycle store.

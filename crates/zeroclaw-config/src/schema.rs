@@ -795,6 +795,12 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<serde_json::Value>,
+    /// Path to a PEM-encoded CA certificate for TLS connections to this provider.
+    /// Must be an absolute path; shell expansion (e.g. `~`) is not performed.
+    /// Leave unset to use the system's default trust store.
+    #[tab(Connection)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ca_cert_path: Option<String>,
 }
 
 // ── Per-family model model_provider configs ────────────────────────────
@@ -5034,30 +5040,55 @@ pub struct SkillInstallSuggestionsConfig {
     pub enabled: bool,
 }
 
-/// Skill self-improvement configuration (`[skills.auto_improve]` section).
+/// Skill self-improvement configuration (`[skills.skill-improvement]` section).
+///
+/// Controls the post-turn background review fork that may patch, expand, or
+/// archive skills based on what the conversation revealed. The fork runs in a
+/// restricted toolset (only `skills_list`, `skill_view`, `skill_manage`) and
+/// never touches the user-visible conversation.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "skills.skill_improvement"]
 pub struct SkillImprovementConfig {
-    /// Enable automatic skill improvement after successful skill usage.
-    /// Default: `true`.
-    #[serde(default = "default_true")]
+    /// Enable the background skill-review fork. Default: `false`.
+    /// Opt-in: users must explicitly enable this to allow post-turn skill
+    /// mutations.
+    #[serde(default)]
     pub enabled: bool,
-    /// Minimum interval (in seconds) between improvements for the same skill.
-    /// Default: `3600` (1 hour).
+    /// Minimum interval (in seconds) between reviews for the same skill.
+    /// Acts as a durable rate limit on patches to any one skill. Default: `3600`.
     #[serde(default = "default_skill_improvement_cooldown")]
     pub cooldown_secs: u64,
+    /// Spawn a review fork once at least this many tool-call iterations have
+    /// accumulated in the current run. `0` disables iteration-based triggering.
+    /// Default: `10`.
+    #[serde(default = "default_nudge_interval_iterations")]
+    pub nudge_interval_iterations: u32,
+    /// Maximum tool-call iterations the review fork itself is allowed to make.
+    /// Caps the fork's LLM cost. Default: `8`.
+    #[serde(default = "default_max_review_iterations")]
+    pub max_review_iterations: u32,
 }
 
 fn default_skill_improvement_cooldown() -> u64 {
     3600
 }
 
+fn default_nudge_interval_iterations() -> u32 {
+    10
+}
+
+fn default_max_review_iterations() -> u32 {
+    8
+}
+
 impl Default for SkillImprovementConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             cooldown_secs: 3600,
+            nudge_interval_iterations: 10,
+            max_review_iterations: 8,
         }
     }
 }
@@ -11377,6 +11408,17 @@ pub struct DiscordConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub stall_timeout_secs: u64,
+    /// Raw gateway intent mask override. When set, this exact value is sent
+    /// in IDENTIFY instead of the derived mask: an operator escape hatch
+    /// for downstream deployments that consume gateway events through
+    /// custom builds or forks. The operator owns the consequences:
+    /// privileged bits still need their Developer Portal toggles, and
+    /// dropping baseline bits silences message handling (a warning is
+    /// logged). Unset (default) = derive the mask from the channel's
+    /// feature config.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub intents_mask: Option<u64>,
     /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
     #[tab(Behavior)]
     #[serde(default = "default_channel_approval_timeout_secs")]
@@ -20337,6 +20379,7 @@ default_temperature = 0.7
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
+            intents_mask: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
@@ -20364,6 +20407,7 @@ default_temperature = 0.7
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
+            intents_mask: None,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
