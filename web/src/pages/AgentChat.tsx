@@ -498,7 +498,10 @@ const MessageItem = memo(function MessageItem({
   onCopy,
   onDelete,
 }: MessageItemProps) {
-  const cleanContent = stripServerTimestamp(msg.content);
+  // Locally-composed user input is verbatim and never carries the gateway's
+  // `[timestamp]` prefix, so don't strip it (that would clip a user message
+  // starting with a bracketed datetime). Only server-sourced messages can.
+  const cleanContent = msg.local ? msg.content : stripServerTimestamp(msg.content);
 
   return (
     <div

@@ -22,6 +22,12 @@ export interface ChatMessage {
   markdown?: boolean;
   toolCall?: ToolCallInfo;
   timestamp: Date;
+  /** True for messages composed locally in the web UI (verbatim user input).
+   *  Such content never carries the gateway's `[timestamp]` prefix, so the
+   *  bubble must NOT run stripServerTimestamp on it — otherwise a user message
+   *  that happens to start with a bracketed datetime would be clipped. Only
+   *  server-sourced messages (live stream + hydrated history) can be prefixed. */
+  local?: boolean;
 }
 
 interface AgentContextValue {
@@ -547,6 +553,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
           role: 'user',
           content,
           timestamp: new Date(),
+          local: true,
         },
       ]);
     } catch {
@@ -573,6 +580,9 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     const armWatchdog = () => {
       if (switchTimeoutRef.current) clearTimeout(switchTimeoutRef.current);
       switchTimeoutRef.current = setTimeout(() => {
+        // The timer has fired; null its ref so it honestly reflects
+        // "no watchdog armed" (a later clearTimeout on the dead id is a no-op).
+        switchTimeoutRef.current = null;
         if (pendingModelSwitchRef.current === model) {
           pendingModelSwitchRef.current = null;
           setModelLoading(false);

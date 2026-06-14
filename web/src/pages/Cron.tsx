@@ -390,7 +390,7 @@ export default function Cron() {
           // The gateway requires `agent` on every patch (it risk-gates a
           // command change); send the job's existing alias so a pure
           // name/schedule/prompt edit doesn't 422 with "missing field agent".
-          agent: (modalJob as CronJob).agent_alias,
+          agent: (modalJob as CronJob).agent_alias ?? '',
           name: formName.trim() || undefined,
           schedule: formSchedule.trim(),
         };
@@ -470,9 +470,10 @@ export default function Cron() {
     if (toggling === job.id) return;
     const desired = !job.enabled;
     setToggling(job.id);
+    setTriggerError(null);
     try {
       const updated = await patchCronJob(job.id, {
-        agent: job.agent_alias,
+        agent: job.agent_alias ?? '',
         enabled: desired,
       });
       setJobs((prev) => prev.map((j) => (j.id === job.id ? updated : j)));
@@ -495,6 +496,7 @@ export default function Cron() {
   const handleTrigger = async (id: string) => {
     setTriggering(id);
     setTriggerError(null);
+    setToggleError(null);
     try {
       const result = await triggerCronJob(id);
       // Refresh job list so last_run / last_status reflect the manual run.
@@ -962,7 +964,7 @@ export default function Cron() {
 
       {/* Inline trigger-error banner — keeps the cron table mounted on failed manual runs */}
       {triggerError && (
-        <div className="rounded-[var(--radius-md)] border border-status-error/25 bg-status-error/10 p-3 text-sm text-status-error flex items-start justify-between gap-3">
+        <div role="alert" className="rounded-[var(--radius-md)] border border-status-error/25 bg-status-error/10 p-3 text-sm text-status-error flex items-start justify-between gap-3">
           <span className="whitespace-pre-wrap break-words">{triggerError}</span>
           <Button variant="ghost" size="sm" className="shrink-0" onClick={() => setTriggerError(null)} aria-label={t('cron.dismiss')}>
             <X className="h-4 w-4" />
@@ -973,7 +975,7 @@ export default function Cron() {
       {/* Inline pause/resume-error banner — keeps the cron table mounted on a failed
           toggle or when the daemon silently ignores the `enabled` change */}
       {toggleError && (
-        <div className="rounded-[var(--radius-md)] border border-status-error/25 bg-status-error/10 p-3 text-sm text-status-error flex items-start justify-between gap-3">
+        <div role="alert" className="rounded-[var(--radius-md)] border border-status-error/25 bg-status-error/10 p-3 text-sm text-status-error flex items-start justify-between gap-3">
           <span className="whitespace-pre-wrap break-words">{toggleError}</span>
           <Button variant="ghost" size="sm" className="shrink-0" onClick={() => setToggleError(null)} aria-label={t('cron.dismiss')}>
             <X className="h-4 w-4" />
