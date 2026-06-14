@@ -1639,35 +1639,81 @@ impl RpcDispatcher {
         let merged = self
             .ctx
             .sessions
-            .set_overrides(&req.session_id, req.overrides)
+            .preview_overrides(&req.session_id, &req.overrides)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
         // A model_provider override needs a live provider-box rebuild, which
         // requires Config — held here, not in the session store. Resolve the
-        // model from the (already-merged) model override or the configured
-        // entry, build the box, and swap it onto the session's agent.
-        if let Some(ref model_provider_ref) = merged.model_provider {
+        // model from the prospective merged override or the configured entry,
+        // build the box, and only then commit the override to the session.
+        let built_model_provider = if let Some(ref model_provider_ref) = merged.model_provider {
+            let agent_alias = self
+                .ctx
+                .sessions
+                .get_agent_alias(&req.session_id)
+                .await
+                .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
             let built = {
                 let config = self.ctx.config.read();
-                crate::agent::agent::build_session_model_provider(
-                    &config,
-                    model_provider_ref,
-                    merged.model.as_deref(),
+                let agent_cfg = config
+                    .resolved_agent_config(&agent_alias)
+                    .or_else(|| config.agent(&agent_alias).cloned())
+                    .ok_or_else(|| {
+                        rpc_err(
+                            INVALID_PARAMS,
+                            format!("Agent `{agent_alias}` is not configured"),
+                        )
+                    })?;
+                let (model_provider, model_provider_name, model_name) =
+                    crate::agent::agent::build_session_model_provider(
+                        &config,
+                        model_provider_ref,
+                        merged.model.as_deref(),
+                    )
+                    .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?;
+                let tool_dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
+                    &agent_cfg,
+                    model_provider.as_ref(),
+                );
+                (
+                    model_provider,
+                    model_provider_name,
+                    model_name,
+                    tool_dispatcher,
                 )
-                .map_err(|e| rpc_err(INVALID_PARAMS, e.to_string()))?
             };
-            let (model_provider, model_provider_name, model_name) = built;
+            Some(built)
+        } else {
+            None
+        };
+
+        let merged = self
+            .ctx
+            .sessions
+            .set_overrides(&req.session_id, req.overrides)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+
+        if let Some((model_provider, model_provider_name, model_name, tool_dispatcher)) =
+            built_model_provider
+        {
             self.ctx
                 .sessions
-                .apply_model_provider(&req.session_id, model_provider, model_provider_name)
+                .apply_model_provider(
+                    &req.session_id,
+                    model_provider,
+                    model_provider_name,
+                    model_name,
+                    tool_dispatcher,
+                )
                 .await
                 .then_some(())
                 .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
-            // Keep the agent's model name aligned with the model_provider it now holds.
-            if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
-                agent.lock().await.set_model_name(model_name);
-            }
+        } else if let Some(ref model_name) = merged.model
+            && let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await
+        {
+            agent.lock().await.set_model_name(model_name.clone());
         }
 
         to_result(SessionConfigureResult {
@@ -2296,7 +2342,7 @@ impl RpcDispatcher {
                 continue;
             }
 
-            let (model_provider, model_provider_name, model_name, temperature) = {
+            let (model_provider, model_provider_name, model_name, tool_dispatcher, temperature) = {
                 let config = ctx.config.read();
                 let provider_temperature = model_provider_ref.split_once('.').and_then(
                     |(provider_type, provider_alias)| {
@@ -2307,17 +2353,41 @@ impl RpcDispatcher {
                             .and_then(|entry| entry.temperature)
                     },
                 );
+                let Some(agent_cfg) = config
+                    .resolved_agent_config(&agent_alias)
+                    .or_else(|| config.agent(&agent_alias).cloned())
+                else {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "session_id": session_id,
+                                "agent_alias": agent_alias,
+                                "model_provider": model_provider_ref,
+                            })),
+                        "config/set saved provider profile but live session refresh could not resolve agent config"
+                    );
+                    continue;
+                };
                 match crate::agent::agent::build_session_model_provider(
                     &config,
                     model_provider_ref,
                     overrides.model.as_deref(),
                 ) {
-                    Ok((model_provider, model_provider_name, model_name)) => (
-                        model_provider,
-                        model_provider_name,
-                        model_name,
-                        overrides.temperature.or(provider_temperature),
-                    ),
+                    Ok((model_provider, model_provider_name, model_name)) => {
+                        let tool_dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
+                            &agent_cfg,
+                            model_provider.as_ref(),
+                        );
+                        (
+                            model_provider,
+                            model_provider_name,
+                            model_name,
+                            tool_dispatcher,
+                            overrides.temperature.or(provider_temperature),
+                        )
+                    }
                     Err(e) => {
                         ::zeroclaw_log::record!(
                             WARN,
@@ -2340,12 +2410,17 @@ impl RpcDispatcher {
             };
             if ctx
                 .sessions
-                .apply_model_provider(&session_id, model_provider, model_provider_name)
+                .apply_model_provider(
+                    &session_id,
+                    model_provider,
+                    model_provider_name,
+                    model_name,
+                    tool_dispatcher,
+                )
                 .await
                 && let Some(agent) = ctx.sessions.get_agent(&session_id).await
             {
                 let mut agent = agent.lock().await;
-                agent.set_model_name(model_name);
                 agent.set_temperature(temperature);
             }
         }
@@ -4543,6 +4618,46 @@ mod tests {
             model_name_for_session(&dispatcher, &session_id).await,
             "old-model",
             "failed live refresh must leave the existing session provider intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_configure_invalid_provider_does_not_commit_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+
+        let res = dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": {
+                    "model_provider": "openai.missing"
+                }
+            }))
+            .await;
+        assert!(
+            res.is_err(),
+            "invalid provider switch must fail before mutating session overrides"
+        );
+
+        let overrides = dispatcher
+            .ctx
+            .sessions
+            .get_overrides(&session_id)
+            .await
+            .expect("session still exists");
+        assert_eq!(
+            overrides.model_provider, None,
+            "failed provider switch must not leave a stale override behind"
+        );
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model",
+            "failed provider switch must leave the live agent unchanged"
         );
     }
 

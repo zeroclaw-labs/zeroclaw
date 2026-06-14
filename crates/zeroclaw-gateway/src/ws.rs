@@ -1163,10 +1163,13 @@ async fn process_chat_message(
                             &error.new_messages,
                         );
                         if !has_assistant_chat_message(&error.new_messages) {
+                            let marker = zeroclaw_runtime::i18n::get_required_cli_string(
+                                "turn-interrupted-by-user",
+                            );
                             let truncated = if accumulated_text.is_empty() {
-                                "[interrupted by user]".to_string()
+                                marker
                             } else {
-                                format!("{accumulated_text}\n\n[interrupted by user]")
+                                format!("{accumulated_text}\n\n{marker}")
                             };
                             let assistant_msg =
                                 zeroclaw_providers::ChatMessage::assistant(&truncated);
@@ -1180,10 +1183,13 @@ async fn process_chat_message(
                         }
                     }
                     _ => {
+                        let marker = zeroclaw_runtime::i18n::get_required_cli_string(
+                            "turn-interrupted-by-user",
+                        );
                         let truncated = if accumulated_text.is_empty() {
-                            "[interrupted by user]".to_string()
+                            marker
                         } else {
-                            format!("{accumulated_text}\n\n[interrupted by user]")
+                            format!("{accumulated_text}\n\n{marker}")
                         };
                         let assistant_msg = zeroclaw_providers::ChatMessage::assistant(&truncated);
                         if backend.session_exists(session_key) {
