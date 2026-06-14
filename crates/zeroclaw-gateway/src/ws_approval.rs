@@ -143,3 +143,28 @@ impl Channel for WsApprovalChannel {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Regression test: WsApprovalChannel only implements structured
+    /// approval (request_approval).  Its generic send() is a no-op and
+    /// listen() returns immediately, so free-form ask_user / escalate
+    /// must fail fast instead of falling through to the misleading
+    /// "Channel closed before receiving a response" error.  This test
+    /// pins the capability bit so the trait default (true) cannot
+    /// silently regress during later channel cleanup.
+    #[test]
+    fn ws_approval_channel_declines_free_form_ask() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let pending = new_pending_approvals();
+        let channel = WsApprovalChannel::new(tx, pending, Duration::from_secs(30));
+        assert!(
+            !channel.supports_free_form_ask(),
+            "WsApprovalChannel must refuse free-form ask_user; \
+             its send() is a no-op and listen() drops immediately"
+        );
+    }
+}
