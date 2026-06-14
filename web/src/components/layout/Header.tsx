@@ -110,7 +110,7 @@ export default function Header({ onMenuToggle, onOpenPalette }: HeaderProps) {
             className="hidden sm:flex h-9 items-center gap-2 rounded-[var(--radius-md)] border border-pc-border bg-pc-input pl-2.5 pr-2 text-sm text-pc-text-muted transition-colors hover:border-pc-border-strong hover:text-pc-text-secondary hover:bg-[var(--pc-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-surface"
             aria-label={t('nav.cmdk.placeholder')}
           >
-            <Search className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+            <Search className="h-[18px] w-[18px] shrink-0" aria-hidden="true" />
             <span className="hidden md:inline w-32 text-left">{t('nav.cmdk.placeholder')}</span>
             <kbd className="ml-1 flex items-center gap-0.5 rounded-[var(--radius-sm)] border border-pc-border bg-pc-elevated px-1.5 py-0.5 text-[11px] font-mono text-pc-text-faint">
               <span className="text-[13px] leading-none">⌘</span>K
@@ -124,7 +124,7 @@ export default function Header({ onMenuToggle, onOpenPalette }: HeaderProps) {
             className="sm:hidden h-9 w-9 border-transparent px-0"
             aria-label={t('nav.cmdk.placeholder')}
           >
-            <Search className="h-3.5 w-3.5" />
+            <Search className="h-[18px] w-[18px]" />
           </Button>
 
           {/* Settings */}
@@ -134,7 +134,7 @@ export default function Header({ onMenuToggle, onOpenPalette }: HeaderProps) {
             className="h-9 w-9 border-transparent px-0"
             aria-label={t('settings.title')}
           >
-            <Settings className="h-3.5 w-3.5" />
+            <Settings className="h-[18px] w-[18px]" />
           </Button>
 
           {/* Language switcher dropdown */}
@@ -147,7 +147,7 @@ export default function Header({ onMenuToggle, onOpenPalette }: HeaderProps) {
               className="h-9 px-3 text-xs font-semibold gap-1.5"
               style={{ background: 'var(--pc-bg-elevated)' }}
             >
-              <Globe className="h-3.5 w-3.5" />
+              <Globe className="h-[18px] w-[18px]" />
               {locale.toUpperCase()}
               <ChevronDown className="h-3 w-3" style={{ transform: langOpen ? 'rotate(180deg)' : undefined, transition: 'transform 0.15s' }} />
             </Button>
@@ -206,7 +206,7 @@ export default function Header({ onMenuToggle, onOpenPalette }: HeaderProps) {
             className="h-9 px-3 text-xs gap-1.5 hover:text-status-error hover:border-status-error/25 hover:bg-status-error/10"
             aria-label={t('auth.logout')}
           >
-            <LogOut className="h-3.5 w-3.5" />
+            <LogOut className="h-[18px] w-[18px]" />
             <span className="hidden sm:inline">{t('auth.logout')}</span>
           </Button>
         </div>
