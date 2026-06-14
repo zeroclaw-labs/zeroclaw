@@ -43,7 +43,12 @@ impl EventBuffer {
 
     /// Return a snapshot of all buffered events (oldest first).
     pub fn snapshot(&self) -> Vec<serde_json::Value> {
-        self.inner.lock().expect("EventBuffer mutex not poisoned").iter().cloned().collect()
+        self.inner
+            .lock()
+            .expect("EventBuffer mutex not poisoned")
+            .iter()
+            .cloned()
+            .collect()
     }
 }
 
