@@ -248,7 +248,7 @@ export function AgentChatInner({
        Hoisting the opt-out to the outermost container covers all of them
        with a single ancestor. Static UI chrome here localizes through
        t() i18n, so losing browser translation on it is intentional. */
-    <div translate="no" className="notranslate flex flex-col h-[calc(100vh-3.5rem)]">
+    <div translate="no" className="notranslate flex flex-col h-full min-h-0">
       {/* Header with model selector */}
       <div className="flex items-center justify-between px-4 py-2 border-b border-pc-border bg-pc-surface">
         <div className="flex items-center gap-2">
