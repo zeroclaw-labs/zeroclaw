@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use zeroclaw_api::model_provider::ModelProvider;
+use zeroclaw_api::model_provider::{ChatRequest, ChatResponse, ModelProvider};
 
 /// Wraps a model provider so every call opens the correct
 /// `attribution_span!` automatically. See the module docs for the
@@ -31,6 +31,33 @@ impl ProviderDispatch {
     #[must_use]
     pub fn new(inner: Arc<dyn ModelProvider>) -> Self {
         Self { inner }
+    }
+
+    /// Open `attribution_span!(&*self.inner)` + `scope!(model: model)`
+    /// around the inner provider's `chat` call.
+    pub async fn chat(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<ChatResponse> {
+        use zeroclaw_log::Instrument;
+        let span = zeroclaw_log::attribution_span!(&*self.inner);
+        // Enter the attribution span first so the scope! macro's
+        // info_span! constructs with the attribution span as its parent.
+        // Without this nesting, the attribution span and the scope
+        // span would be siblings (both children of the caller's span),
+        // and the layer's leaf→root walk from the scope span would
+        // skip the attribution contribution entirely.
+        async move {
+            zeroclaw_log::scope!(
+                model: model,
+                => self.inner.chat(request, model, temperature)
+            )
+            .await
+        }
+        .instrument(span)
+        .await
     }
 }
 

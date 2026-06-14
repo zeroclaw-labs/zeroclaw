@@ -43,12 +43,12 @@ pub(crate) mod stream_guard;
 pub mod telnyx;
 pub mod traits;
 
+pub use dispatch::ProviderDispatch;
 #[allow(unused_imports)]
 pub use traits::{
     ChatMessage, ChatRequest, ChatResponse, ConversationMessage, ModelProvider,
     ProviderCapabilityError, ToolCall, ToolResultMessage,
 };
-pub use dispatch::ProviderDispatch;
 
 use reliable::ReliableModelProvider;
 use serde::Deserialize;
