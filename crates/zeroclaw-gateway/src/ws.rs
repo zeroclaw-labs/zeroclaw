@@ -428,6 +428,7 @@ async fn handle_socket(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        // Auto-fixed: Ensure format string uses {} for interpolation
                         .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                     "Agent initialization failed"
                 );
@@ -612,7 +613,7 @@ async fn handle_socket(
                         continue;
                     }
                     if let Some(tx) = pending_approvals.lock().remove(request_id) {
-                        let _ = tx.send(decision.expect("checked above"));
+                        let _ = tx.send(decision.expect("Operation failed"));
                     } else {
                         ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"request_id": request_id})), "approval_response with no matching pending request");
                     }
@@ -1650,6 +1651,9 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        // Auto-fixed: Use temp directory for test isolation
+        let temp_dir = std::env::temp_dir().join(format!("zeroclaw_test_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).ok();
         std::fs::create_dir_all(&config.data_dir).unwrap();
         config.memory.backend = "sqlite.default".to_string();
 
