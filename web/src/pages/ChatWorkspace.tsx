@@ -4,7 +4,6 @@ import { AgentChatInner, type AgentChatStatus } from '@/pages/AgentChat';
 import { ChatTabBar, type TabIndicator, type WorkspaceLayout } from '@/components/ChatTabBar';
 
 const STORAGE_KEY = 'zeroclaw-chat-workspace';
-const MD_BREAKPOINT = '(min-width: 768px)';
 
 interface PersistedState {
   openChats: string[];
@@ -73,19 +72,9 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
   const statusRef = useRef<Record<string, PaneStatus>>({});
   const [indicators, setIndicators] = useState<Record<string, TabIndicator>>({});
 
-  // Track viewport so we can force `tabs` layout on mobile (split doesn't fit).
-  const [isWide, setIsWide] = useState<boolean>(() => {
-    try { return window.matchMedia(MD_BREAKPOINT).matches; } catch { return true; }
-  });
-  useEffect(() => {
-    const mq = window.matchMedia(MD_BREAKPOINT);
-    const onChange = (e: MediaQueryListEvent) => setIsWide(e.matches);
-    mq.addEventListener('change', onChange);
-    return () => mq.removeEventListener('change', onChange);
-  }, []);
-
-  // Effective layout: never split on a narrow viewport.
-  const effectiveLayout: WorkspaceLayout = isWide ? layout : 'tabs';
+  // Effective layout. Split works on mobile too — the panes stack vertically
+  // there (top/bottom) instead of side-by-side; see the split container below.
+  const effectiveLayout: WorkspaceLayout = layout;
 
   // The two aliases shown in split. Default the second to the next open chat
   // after the active one (or the active itself if it's the only chat).
@@ -224,7 +213,7 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
   }, [activeAlias, openChats]);
 
   // Split is only offered when there are >= 2 chats and the viewport is wide.
-  const splitDisabled = !isWide || openChats.length < 2;
+  const splitDisabled = openChats.length < 2;
 
   return (
     <div translate="no" className="notranslate flex flex-col h-full min-h-0">
@@ -243,13 +232,13 @@ export default function ChatWorkspace({ initialAlias }: ChatWorkspaceProps) {
       {/* Content area. Every open chat is mounted here at all times; only CSS
           visibility changes between tab/layout switches, so background sockets
           stay alive. In split layout the two visible panes share the width. */}
-      <div className={effectiveLayout === 'split' ? 'flex flex-1 min-h-0 divide-x divide-pc-border' : 'flex-1 min-h-0'}>
+      <div className={effectiveLayout === 'split' ? 'flex flex-col md:flex-row flex-1 min-h-0 divide-y md:divide-y-0 md:divide-x divide-pc-border' : 'flex-1 min-h-0'}>
         {openChats.map((alias) => {
           const visible = visibleAliases.has(alias);
           // In split, each visible pane takes an equal share of the row.
           const paneClass = visible
             ? effectiveLayout === 'split'
-              ? 'flex flex-col flex-1 min-w-0 h-full'
+              ? 'flex flex-col flex-1 min-w-0 min-h-0'
               : 'flex flex-col h-full'
             : 'hidden';
           return (
