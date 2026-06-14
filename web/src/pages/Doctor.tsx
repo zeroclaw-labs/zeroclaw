@@ -24,19 +24,35 @@ const SEVERITY_TONE: Record<Severity, 'ok' | 'warn' | 'error'> = {
 };
 
 /**
- * Best-effort remediation route per diagnostic category. `DiagResult` carries
- * no per-finding target, so this maps the coarse `category` to the closest
- * page an operator can act on:
- *  - `config`    → /config  (edit the offending config)
- *  - `workspace` → /config  (closest actionable surface)
- *  - `daemon`    → null     (covered by the "Reload daemon" header action)
- *  - `environment`, `cli-tools` → null (system-level; nothing to open in the UI)
- * Returns `[href, label]`, or `null` when no in-app link is sensible.
+ * Best-effort remediation route for a diagnostic. `DiagResult` carries no
+ * per-finding target, so we first try to PARSE a config entity out of the
+ * message (config diagnostics are phrased "<type>.<alias>: <problem>", e.g.
+ * "openai.ss: no model configured", "discord.gnosis: …") and deep-link
+ * straight to that entity; otherwise we fall back to the coarse per-category
+ * route. Returns `[href, label]`, or `null` when no in-app link is sensible.
+ *  - parsed model finding   → /config/providers.models/<type>/<alias>
+ *  - parsed channel finding → /config/channels/<type>/<alias>
+ *  - other config/workspace → /config (the navigator)
+ *  - daemon → null (covered by the "Reload daemon" header action)
+ *  - environment, cli-tools → null (system-level; nothing to open in the UI)
  */
-function remediationLink(category: string): [string, string] | null {
-  switch (category) {
+function remediationLink(result: DiagResult): [string, string] | null {
+  if (result.severity === 'ok') return null;
+  const msg = result.message;
+  // Leading "<type>.<alias>" entity reference, if present.
+  const m = msg.match(/^\s*([a-z0-9_-]+)\.([a-z0-9_-]+)\b/i);
+  if (m && m[1] && m[2]) {
+    const type = encodeURIComponent(m[1]);
+    const alias = encodeURIComponent(m[2]);
+    if (/\bmodel\b|api[\s_-]?key|provider/i.test(msg)) {
+      return [`/config/providers.models/${type}/${alias}`, 'Open config'];
+    }
+    if (/\bchannel\b/i.test(msg)) {
+      return [`/config/channels/${type}/${alias}`, 'Open config'];
+    }
+  }
+  switch (result.category) {
     case 'config':
-      return ['/config', 'Open config'];
     case 'workspace':
       return ['/config', 'Open config'];
     default:
@@ -183,10 +199,7 @@ export default function Doctor() {
                 </h3>
                 <div className="space-y-2">
                   {items.map((result, idx) => {
-                    const link =
-                      result.severity !== 'ok'
-                        ? remediationLink(result.category)
-                        : null;
+                    const link = remediationLink(result);
                     return (
                       <Card
                         key={`${category}-${idx}`}

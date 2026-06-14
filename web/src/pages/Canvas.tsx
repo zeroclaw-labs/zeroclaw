@@ -26,7 +26,35 @@ export default function Canvas() {
   const [connected, setConnected] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [canvasList, setCanvasList] = useState<string[]>([]);
+  const [clearArmed, setClearArmed] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const armTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const errorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Surface an action failure inline; auto-clears after a few seconds.
+  const showActionError = useCallback((message: string) => {
+    setActionError(message);
+    if (errorTimerRef.current) clearTimeout(errorTimerRef.current);
+    errorTimerRef.current = setTimeout(() => setActionError(null), 5000);
+  }, []);
+
+  // Disarm the Clear confirm and cancel its pending timeout.
+  const disarmClear = useCallback(() => {
+    if (armTimerRef.current) {
+      clearTimeout(armTimerRef.current);
+      armTimerRef.current = null;
+    }
+    setClearArmed(false);
+  }, []);
+
+  // Cancel any pending timers on unmount.
+  useEffect(() => {
+    return () => {
+      if (armTimerRef.current) clearTimeout(armTimerRef.current);
+      if (errorTimerRef.current) clearTimeout(errorTimerRef.current);
+    };
+  }, []);
 
   // Build WebSocket URL for canvas
   const getWsUrl = useCallback((id: string) => {
@@ -170,22 +198,52 @@ export default function Canvas() {
   }, [currentFrame]);
 
   const handleSwitchCanvas = () => {
-    if (canvasIdInput.trim()) {
-      setCanvasId(canvasIdInput.trim());
+    const next = canvasIdInput.trim();
+    if (!next) return;
+    setActionError(null);
+    disarmClear();
+    try {
+      setCanvasId(next);
       setCurrentFrame(null);
       setHistory([]);
+    } catch (err) {
+      showActionError(`Failed to switch canvas: ${err instanceof Error ? err.message : 'unknown error'}`);
     }
   };
 
+  const handleReconnect = () => {
+    setActionError(null);
+    try {
+      connectWs(canvasId);
+    } catch (err) {
+      showActionError(`Failed to reconnect: ${err instanceof Error ? err.message : 'unknown error'}`);
+    }
+  };
+
+  // Armed two-click clear: the first click arms a danger "Confirm clear?"
+  // state that disarms itself after a short window; the second click within
+  // that window performs the destructive DELETE.
   const handleClear = async () => {
+    if (!clearArmed) {
+      setActionError(null);
+      setClearArmed(true);
+      if (armTimerRef.current) clearTimeout(armTimerRef.current);
+      armTimerRef.current = setTimeout(() => {
+        armTimerRef.current = null;
+        setClearArmed(false);
+      }, 4000);
+      return;
+    }
+
+    disarmClear();
     try {
       await apiFetch(`/api/canvas/${encodeURIComponent(canvasId)}`, {
         method: 'DELETE',
       });
       setCurrentFrame(null);
       setHistory([]);
-    } catch {
-      // ignore
+    } catch (err) {
+      showActionError(`Failed to clear canvas: ${err instanceof Error ? err.message : 'unknown error'}`);
     }
   };
 
@@ -218,17 +276,20 @@ export default function Canvas() {
               <History className="h-4 w-4" />
             </Button>
             <Button
-              variant="ghost"
+              variant={clearArmed ? 'danger' : 'ghost'}
               size="sm"
               onClick={handleClear}
-              title="Clear canvas"
+              onBlur={disarmClear}
+              title={clearArmed ? 'Confirm clear' : 'Clear canvas'}
+              aria-label={clearArmed ? 'Confirm clear canvas' : 'Clear canvas'}
             >
               <Trash2 className="h-4 w-4" />
+              {clearArmed && <span className="text-xs">Confirm clear?</span>}
             </Button>
             <Button
               variant="ghost"
               size="sm"
-              onClick={() => connectWs(canvasId)}
+              onClick={handleReconnect}
               title="Reconnect"
             >
               <RefreshCw className="h-4 w-4" />
@@ -236,6 +297,16 @@ export default function Canvas() {
           </>
         }
       />
+
+      {/* Inline action error — surfaces failures from clear / reconnect / switch */}
+      {actionError && (
+        <div
+          role="alert"
+          className="flex items-center gap-2 px-3 py-2 rounded-[var(--radius-md)] text-xs border border-status-error/25 bg-status-error/10 text-status-error"
+        >
+          {actionError}
+        </div>
+      )}
 
       {/* Canvas selector */}
       <div className="flex items-center gap-2 flex-wrap">

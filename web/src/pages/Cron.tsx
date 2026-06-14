@@ -20,7 +20,6 @@ import {
   AlertCircle,
   CheckCircle,
   ChevronDown,
-  ChevronRight,
   Clock,
   Pencil,
   Play,
@@ -360,7 +359,9 @@ export default function Cron() {
       setSubmitting(false);
       return;
     }
-    if (formDeliveryMode === 'announce') {
+    // Delivery is only sent (and editable) on the add path; patchCronJob does
+    // not accept it, so don't gate edits on the existing job's delivery config.
+    if (!isEditing && formDeliveryMode === 'announce') {
       if (!formDeliveryChannel.trim()) {
         setFormError('Delivery channel is required when announce mode is selected');
         setSubmitting(false);
@@ -613,31 +614,40 @@ export default function Cron() {
                   </div>
                 )}
               </div>
-              {!isEditing && (
-                <div>
-                  <label className="block text-[11px] font-medium mb-1.5 uppercase tracking-wider text-pc-text-faint">
-                    Agent <span className="text-status-error">*</span>
-                  </label>
-                  <select
-                    value={formAgent}
-                    onChange={(e) => setFormAgent(e.target.value)}
-                    className="rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-faint transition-colors focus:outline-none focus:border-pc-border-strong focus:ring-2 focus:ring-[var(--pc-focus)]/30 w-full px-3 py-2.5 text-sm appearance-none cursor-pointer"
-                  >
-                    {agentOptions.length === 0 ? (
-                      <option value="">no configured agents</option>
-                    ) : (
-                      agentOptions.map((alias) => (
-                        <option key={alias} value={alias}>
-                          agents.{alias}
-                        </option>
-                      ))
-                    )}
-                  </select>
-                  <p className="text-xs mt-1 text-pc-text-faint">
-                    Runs under this agent's risk profile, model provider, and channel bindings.
-                  </p>
-                </div>
-              )}
+              <div>
+                <label className="block text-[11px] font-medium mb-1.5 uppercase tracking-wider text-pc-text-faint">
+                  Agent {!isEditing && <span className="text-status-error">*</span>}
+                </label>
+                {isEditing ? (
+                  // patchCronJob does NOT accept `agent`, so on edit this is a
+                  // read-only display of the job's current agent — shown (not
+                  // hidden) so the operator can see which agent owns the job.
+                  <span className="inline-flex items-center px-3 py-2 rounded-[var(--radius-md)] text-sm font-medium border border-pc-border text-pc-text-secondary font-mono">
+                    agents.{formAgent || '-'}
+                  </span>
+                ) : (
+                  <>
+                    <select
+                      value={formAgent}
+                      onChange={(e) => setFormAgent(e.target.value)}
+                      className="rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-faint transition-colors focus:outline-none focus:border-pc-border-strong focus:ring-2 focus:ring-[var(--pc-focus)]/30 w-full px-3 py-2.5 text-sm appearance-none cursor-pointer"
+                    >
+                      {agentOptions.length === 0 ? (
+                        <option value="">no configured agents</option>
+                      ) : (
+                        agentOptions.map((alias) => (
+                          <option key={alias} value={alias}>
+                            agents.{alias}
+                          </option>
+                        ))
+                      )}
+                    </select>
+                    <p className="text-xs mt-1 text-pc-text-faint">
+                      Runs under this agent's risk profile, model provider, and channel bindings.
+                    </p>
+                  </>
+                )}
+              </div>
               <div>
                 <label className="block text-[11px] font-medium mb-1.5 uppercase tracking-wider text-pc-text-faint">
                   {t('cron.name_optional')}
@@ -685,7 +695,39 @@ export default function Cron() {
                       className="rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-faint transition-colors focus:outline-none focus:border-pc-border-strong focus:ring-2 focus:ring-[var(--pc-focus)]/30 w-full px-3 py-2.5 text-sm resize-y"
                     />
                   </div>
-                  {!isEditing && (
+                  {/* Model / session-target / allowed-tools. patchCronJob does
+                      NOT accept any of these, so on edit they render read-only
+                      (populated from the job) rather than being hidden — the
+                      operator can see the current config even though it's fixed
+                      after creation. */}
+                  {isEditing ? (
+                    <>
+                      <div>
+                        <label className="block text-[11px] font-medium mb-1.5 uppercase tracking-wider text-pc-text-faint">
+                          {t('cron.model_optional')}
+                        </label>
+                        <span className="inline-flex items-center px-3 py-2 rounded-[var(--radius-md)] text-sm font-medium border border-pc-border text-pc-text-secondary font-mono">
+                          {formModel.trim() || 'default'}
+                        </span>
+                      </div>
+                      <div>
+                        <label className="block text-[11px] font-medium mb-1.5 uppercase tracking-wider text-pc-text-faint">
+                          {t('cron.session_target')}
+                        </label>
+                        <span className="inline-flex items-center px-3 py-2 rounded-[var(--radius-md)] text-sm font-medium border border-pc-border text-pc-text-secondary">
+                          {t(formSessionTarget === 'main' ? 'cron.session_main' : 'cron.session_isolated')}
+                        </span>
+                      </div>
+                      <div>
+                        <label className="block text-[11px] font-medium mb-1.5 uppercase tracking-wider text-pc-text-faint">
+                          {t('cron.allowed_tools_optional')}
+                        </label>
+                        <span className="inline-flex items-center px-3 py-2 rounded-[var(--radius-md)] text-sm font-medium border border-pc-border text-pc-text-secondary font-mono break-all">
+                          {formAllowedTools.trim() || 'all tools'}
+                        </span>
+                      </div>
+                    </>
+                  ) : (
                     <>
                       <div>
                         <label className="block text-[11px] font-medium mb-1.5 uppercase tracking-wider text-pc-text-faint">
@@ -757,7 +799,45 @@ export default function Cron() {
                   which channel goes where. Dangling channel refs are
                   accepted on add; the scheduler logs loudly when a
                   dangling delivery fires. */}
-              {!isEditing && (
+              {isEditing ? (
+                // patchCronJob does NOT accept `delivery`, so on edit the
+                // delivery config renders read-only (populated from the job)
+                // instead of being hidden.
+                <div className="border-t border-pc-border pt-4">
+                  <label className="block text-[11px] font-medium mb-1.5 uppercase tracking-wider text-pc-text-faint">
+                    Delivery
+                  </label>
+                  {formDeliveryMode === 'announce' ? (
+                    <div className="space-y-1.5 text-sm">
+                      <div className="flex items-center gap-2">
+                        <span className="text-pc-text-faint text-xs uppercase tracking-wider">mode</span>
+                        <span className="text-pc-text-secondary font-medium">announce</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-pc-text-faint text-xs uppercase tracking-wider">channel</span>
+                        <span className="text-pc-text-secondary font-mono break-all">{formDeliveryChannel || '-'}</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-pc-text-faint text-xs uppercase tracking-wider">to</span>
+                        <span className="text-pc-text-secondary font-mono break-all">{formDeliveryTo || '-'}</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-pc-text-faint text-xs uppercase tracking-wider">best-effort</span>
+                        <span className="text-pc-text-secondary">{formDeliveryBestEffort ? 'yes' : 'no'}</span>
+                      </div>
+                    </div>
+                  ) : (
+                    <span className="inline-flex items-center px-3 py-2 rounded-[var(--radius-md)] text-sm font-medium border border-pc-border text-pc-text-secondary">
+                      none
+                    </span>
+                  )}
+                  <p className="text-xs mt-3 text-pc-text-faint">
+                    Agent, model, session target, allowed tools, and delivery are fixed after
+                    creation and can't be changed here — this endpoint only edits name, schedule,
+                    timezone, and the command/prompt. To change them, recreate the job.
+                  </p>
+                </div>
+              ) : (
                 <div className="border-t border-pc-border pt-4">
                   <label className="block text-[11px] font-medium mb-1.5 uppercase tracking-wider text-pc-text-faint">
                     Delivery
@@ -879,26 +959,33 @@ export default function Cron() {
               {jobs.map((job) => (
                 <React.Fragment key={job.id}>
                   <tr className="border-b border-pc-border/60 last:border-0">
-                    <td className="px-4 py-2.5 font-mono text-xs max-w-40">
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setExpandedJob((prev) =>
-                            prev === job.id ? null : job.id,
-                          )
-                        }
-                        className="flex min-w-0 items-center gap-1 max-w-full text-pc-text-secondary hover:text-pc-text transition-colors cursor-pointer"
-                        title="Toggle run history"
-                      >
-                        {expandedJob === job.id ? (
-                          <ChevronDown className="h-3.5 w-3.5 shrink-0" />
-                        ) : (
-                          <ChevronRight className="h-3.5 w-3.5 shrink-0" />
-                        )}
-                        <span className='min-w-0 truncate'>
+                    <td className="px-4 py-2.5 max-w-44">
+                      <div className="flex min-w-0 flex-col items-start gap-1.5">
+                        <span
+                          className="min-w-0 max-w-full truncate font-mono text-xs text-pc-text-secondary"
+                          title={job.id}
+                        >
                           {job.id}
                         </span>
-                      </button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() =>
+                            setExpandedJob((prev) =>
+                              prev === job.id ? null : job.id,
+                            )
+                          }
+                          aria-expanded={expandedJob === job.id}
+                          title="Show this job's recent runs"
+                        >
+                          <ChevronDown
+                            className={`h-3.5 w-3.5 shrink-0 transition-transform duration-150 ${
+                              expandedJob === job.id ? 'rotate-180' : ''
+                            }`}
+                          />
+                          Run history
+                        </Button>
+                      </div>
                     </td>
                     <td className="px-4 py-2.5 font-medium text-center text-pc-text">
                       {job.name ?? '-'}

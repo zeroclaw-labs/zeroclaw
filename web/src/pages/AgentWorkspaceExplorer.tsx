@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import {
   ArrowLeft,
@@ -21,8 +21,129 @@ import {
   type AgentWorkspaceFileRead,
   type BrowseEntry,
 } from '@/lib/api';
-import { Button, Card } from '@/components/ui';
+import { Button, Card, ConfirmDialog } from '@/components/ui';
 import { t } from '@/lib/i18n';
+
+/**
+ * Minimal in-app prompt modal — a token-themed, focus-trapped replacement for
+ * `window.prompt`. Mirrors the modal conventions in `AliasPromptDialog`.
+ */
+function PromptDialog({
+  open,
+  title,
+  message,
+  initialValue = '',
+  placeholder,
+  confirmLabel = 'Confirm',
+  onConfirm,
+  onClose,
+}: {
+  open: boolean;
+  title: string;
+  message?: string;
+  initialValue?: string;
+  placeholder?: string;
+  confirmLabel?: string;
+  onConfirm: (value: string) => void;
+  onClose: () => void;
+}) {
+  const panelRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [value, setValue] = useState(initialValue);
+  const titleId = useId();
+
+  // Reset the field to the supplied initial value each time the dialog opens.
+  useEffect(() => {
+    if (open) setValue(initialValue);
+  }, [open, initialValue]);
+
+  // Focus + select the input on open; restore focus to the trigger on close.
+  useEffect(() => {
+    if (!open) return;
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+    inputRef.current?.focus();
+    inputRef.current?.select();
+    return () => previouslyFocused?.focus?.();
+  }, [open]);
+
+  // Esc closes; Tab is trapped within the panel.
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        onClose();
+        return;
+      }
+      if (e.key !== 'Tab') return;
+      const panel = panelRef.current;
+      if (!panel) return;
+      const focusable = Array.from(
+        panel.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((el) => el.offsetParent !== null || el === document.activeElement);
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (!first || !last) return;
+      const active = document.activeElement;
+      if (e.shiftKey && active === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && active === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby={titleId}
+      className="fixed inset-0 z-50 flex items-center justify-center"
+      onClick={onClose}
+    >
+      <div className="absolute inset-0 bg-pc-base/70 backdrop-blur-sm" />
+      <div
+        ref={panelRef}
+        className="relative w-full max-w-sm mx-4 rounded-[var(--radius-xl)] border border-pc-border bg-pc-base shadow-[var(--pc-shadow-md)] animate-fade-in"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-6 pt-5 pb-4 flex flex-col gap-3">
+          <h2 id={titleId} className="text-sm font-semibold text-pc-text">
+            {title}
+          </h2>
+          {message && <p className="text-xs text-pc-text-muted">{message}</p>}
+          <input
+            ref={inputRef}
+            type="text"
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') onConfirm(value);
+            }}
+            placeholder={placeholder}
+            className="input-electric w-full px-3 py-2 text-sm"
+          />
+        </div>
+        <div className="flex items-center justify-end gap-2 px-6 py-4 border-t border-pc-border">
+          <Button variant="ghost" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="primary" onClick={() => onConfirm(value)}>
+            {confirmLabel}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -50,6 +171,12 @@ export default function AgentWorkspaceExplorer() {
   const [viewerLoading, setViewerLoading] = useState(false);
   const [viewerError, setViewerError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  // Path queued for deletion (opens the confirm dialog); kind tells the copy.
+  const [pendingDelete, setPendingDelete] = useState<{ name: string; kind: 'dir' | 'file' } | null>(null);
+  // Whether the "new folder" prompt is open.
+  const [creatingDir, setCreatingDir] = useState(false);
+  // Entry name queued for rename (opens the rename prompt).
+  const [renaming, setRenaming] = useState<string | null>(null);
 
   useEffect(() => {
     if (!alias) return;
@@ -94,17 +221,9 @@ export default function AgentWorkspaceExplorer() {
     }
   };
 
-  const deletePath = async (name: string, kind: 'dir' | 'file') => {
+  const deletePath = async (name: string) => {
     const full = cwd ? `${cwd}/${name}` : name;
-    if (
-      !window.confirm(
-        `Delete ${kind === 'dir' ? 'directory' : 'file'} "${full}" from ${alias}'s workspace? ${
-          kind === 'dir' ? 'Everything inside it goes too.' : ''
-        } This cannot be undone.`,
-      )
-    ) {
-      return;
-    }
+    setPendingDelete(null);
     setBusy(full);
     setError(null);
     try {
@@ -121,18 +240,18 @@ export default function AgentWorkspaceExplorer() {
     }
   };
 
-  const createDirectory = async () => {
-    const name = window.prompt(
-      `New folder name (under agents/${alias}/workspace/${cwd ? `${cwd}/` : ''}):`,
-      '',
-    );
-    if (!name) return;
+  const createDirectory = async (name: string) => {
     const trimmed = name.trim().replace(/^\/+|\/+$/g, '');
-    if (!trimmed) return;
+    if (!trimmed) {
+      setCreatingDir(false);
+      return;
+    }
     if (trimmed.includes('..')) {
+      setCreatingDir(false);
       setError("Folder name cannot contain '..'");
       return;
     }
+    setCreatingDir(false);
     const full = cwd ? `${cwd}/${trimmed}` : trimmed;
     setBusy(full);
     setError(null);
@@ -146,14 +265,18 @@ export default function AgentWorkspaceExplorer() {
     }
   };
 
-  const renamePath = async (name: string) => {
+  const renamePath = async (name: string, next: string) => {
     const from = cwd ? `${cwd}/${name}` : name;
-    const next = window.prompt(`Rename "${name}" to:`, name);
-    if (!next || next === name) return;
+    if (!next || next === name) {
+      setRenaming(null);
+      return;
+    }
     if (next.includes('..')) {
+      setRenaming(null);
       setError("Rename target cannot contain '..'");
       return;
     }
+    setRenaming(null);
     const to = cwd ? `${cwd}/${next}` : next;
     setBusy(from);
     setError(null);
@@ -187,7 +310,7 @@ export default function AgentWorkspaceExplorer() {
           <Button
             variant="ghost"
             size="sm"
-            onClick={() => void createDirectory()}
+            onClick={() => setCreatingDir(true)}
             title="Create a new folder in the current directory"
           >
             <FolderPlus className="h-4 w-4" />
@@ -276,7 +399,7 @@ export default function AgentWorkspaceExplorer() {
                         <>
                           <button
                             type="button"
-                            onClick={() => void renamePath(entry.name)}
+                            onClick={() => setRenaming(entry.name)}
                             disabled={busy === full}
                             title="Rename / move"
                             className="px-2 text-pc-text-muted hover:text-pc-text transition-colors disabled:opacity-30"
@@ -285,7 +408,7 @@ export default function AgentWorkspaceExplorer() {
                           </button>
                           <button
                             type="button"
-                            onClick={() => void deletePath(entry.name, entry.kind)}
+                            onClick={() => setPendingDelete({ name: entry.name, kind: entry.kind })}
                             disabled={busy === full}
                             title={t('common.delete')}
                             className="px-2 text-pc-text-muted hover:text-status-error transition-colors disabled:opacity-30"
@@ -348,6 +471,53 @@ export default function AgentWorkspaceExplorer() {
           )}
         </Card>
       </div>
+
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        danger
+        title={pendingDelete ? `Delete ${pendingDelete.name}?` : 'Delete?'}
+        message={
+          pendingDelete ? (
+            <>
+              This will delete{' '}
+              {pendingDelete.kind === 'dir' ? 'directory' : 'file'}{' '}
+              <span className="font-mono text-pc-text-secondary">
+                {cwd ? `${cwd}/${pendingDelete.name}` : pendingDelete.name}
+              </span>{' '}
+              from {alias}'s workspace.
+              {pendingDelete.kind === 'dir' && ' Everything inside it goes too.'} This
+              cannot be undone.
+            </>
+          ) : undefined
+        }
+        confirmLabel="Delete"
+        onConfirm={() => {
+          if (pendingDelete) void deletePath(pendingDelete.name);
+        }}
+        onClose={() => setPendingDelete(null)}
+      />
+
+      <PromptDialog
+        open={creatingDir}
+        title="New folder"
+        message={`Create a folder under agents/${alias}/workspace/${cwd ? `${cwd}/` : ''}`}
+        placeholder="folder-name"
+        confirmLabel="Create"
+        onConfirm={(value) => void createDirectory(value)}
+        onClose={() => setCreatingDir(false)}
+      />
+
+      <PromptDialog
+        open={renaming !== null}
+        title={renaming ? `Rename ${renaming}` : 'Rename'}
+        message="Enter a new name. Use a path to move it elsewhere in the workspace."
+        initialValue={renaming ?? ''}
+        confirmLabel="Rename"
+        onConfirm={(value) => {
+          if (renaming !== null) void renamePath(renaming, value.trim());
+        }}
+        onClose={() => setRenaming(null)}
+      />
     </div>
   );
 }

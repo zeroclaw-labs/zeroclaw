@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { Smartphone, Trash2, X } from 'lucide-react';
 import { getAdminPairCode } from '@/lib/api';
-import { Button, Card, PageHeader } from '@/components/ui';
+import { Button, Card, ConfirmDialog, PageHeader } from '@/components/ui';
 import { t } from '@/lib/i18n';
 
 interface Device {
@@ -18,6 +18,8 @@ export default function Pairing() {
   const [loading, setLoading] = useState(true);
   const [pairingCode, setPairingCode] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The device queued for revocation; non-null opens the confirm dialog.
+  const [pendingRevoke, setPendingRevoke] = useState<Device | null>(null);
 
   const token = localStorage.getItem('zeroclaw_token') || '';
 
@@ -82,6 +84,8 @@ export default function Pairing() {
       }
     } catch (err) {
       setError(t('pairing.revoke_error'));
+    } finally {
+      setPendingRevoke(null);
     }
   };
 
@@ -181,7 +185,7 @@ export default function Pairing() {
                       <Button
                         variant="danger"
                         size="sm"
-                        onClick={() => handleRevokeDevice(device.id)}
+                        onClick={() => setPendingRevoke(device)}
                         aria-label={t('pairing.actions')}
                       >
                         <Trash2 className="h-4 w-4" />
@@ -194,6 +198,26 @@ export default function Pairing() {
           </div>
         )}
       </Card>
+
+      <ConfirmDialog
+        open={pendingRevoke !== null}
+        danger
+        title="Revoke device?"
+        message={
+          <>
+            This will revoke{' '}
+            <span className="text-pc-text-secondary">
+              {pendingRevoke?.name || 'this device'}
+            </span>
+            's access. It will need to be paired again to reconnect.
+          </>
+        }
+        confirmLabel="Revoke"
+        onConfirm={() => {
+          if (pendingRevoke) void handleRevokeDevice(pendingRevoke.id);
+        }}
+        onClose={() => setPendingRevoke(null)}
+      />
     </div>
   );
 }

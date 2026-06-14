@@ -117,7 +117,23 @@ export default function Quickstart() {
     void (async () => {
       try {
         const s = await getQuickstartState();
-        if (!cancelled) setState(s);
+        if (!cancelled) {
+          setState(s);
+          // Default the runtime profile to the previously-hardcoded value
+          // ("unbounded") so behaviour is unchanged unless the user picks
+          // another preset. Fall back to the first preset if the daemon ever
+          // drops "unbounded" from the list. Don't clobber a user choice.
+          const defaultRuntime =
+            s.runtime_presets.find((p) => p.preset_name === "unbounded") ??
+            s.runtime_presets[0];
+          if (defaultRuntime) {
+            setForm((f) =>
+              f.runtime
+                ? f
+                : { ...f, runtime: { preset_name: defaultRuntime.preset_name } },
+            );
+          }
+        }
       } catch {
         /* surfaces empty pickers + error on submit */
       }
@@ -153,7 +169,10 @@ export default function Quickstart() {
     const res = await quickstartApply({
       model_provider: { mode: "fresh", value: form.provider! },
       risk_profile: { mode: "fresh", value: form.risk!.preset_name },
-      runtime_profile: { mode: "fresh", value: "unbounded" },
+      runtime_profile: {
+        mode: "fresh",
+        value: form.runtime?.preset_name ?? "unbounded",
+      },
       memory: { mode: "fresh", value: form.memory!.preset_name },
       channels: form.channels.map((c) =>
         c.mode === "existing"
@@ -210,9 +229,31 @@ export default function Quickstart() {
         title="Quickstart"
         description="Create one working agent end-to-end. Pick a provider, choose your profiles, and start chatting."
         actions={
-          <Badge tone={allDone ? "ok" : "neutral"}>
-            {completedCount}/{steps.length} required
-          </Badge>
+          <div className="flex items-center gap-3">
+            <Badge tone={allDone ? "ok" : "neutral"}>
+              {completedCount}/{steps.length} required
+            </Badge>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                // Treat an explicit exit like an abandon: record the dismissal
+                // so the daemon stops treating this run as in-flight, then leave
+                // to the dashboard. `submittedRef` short-circuits the duplicate
+                // dismiss the unmount/`beforeunload` handler would otherwise fire.
+                submittedRef.current = true;
+                quickstartDismiss({
+                  run_id: runIdRef.current,
+                  surface: "web",
+                  last_step: lastStepRef.current,
+                });
+                navigate("/");
+              }}
+              title="Leave setup and go to the dashboard"
+            >
+              Skip setup
+            </Button>
+          </div>
         }
       />
 
@@ -257,6 +298,21 @@ export default function Quickstart() {
         onChange={(v) => {
           setForm((f) => ({ ...f, risk: { preset_name: v } }));
           recordStep("risk_profile");
+        }}
+      />
+
+      <PresetSection
+        icon={<Cpu className="h-4 w-4" />}
+        title="Runtime profile"
+        rows={(state?.runtime_presets ?? []).map((p) => ({
+          value: p.preset_name,
+          label: p.label,
+          help: p.help,
+        }))}
+        value={form.runtime?.preset_name ?? ""}
+        onChange={(v) => {
+          setForm((f) => ({ ...f, runtime: { preset_name: v } }));
+          recordStep("runtime_profile");
         }}
       />
 
