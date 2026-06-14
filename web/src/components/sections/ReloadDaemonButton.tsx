@@ -18,6 +18,7 @@
 import { useState } from 'react';
 import { Loader2, RotateCw, X } from 'lucide-react';
 import { ApiError, reloadDaemon } from '../../lib/api';
+import { useReloadAvailable } from '../../lib/reloadAvailability';
 
 interface ReloadDaemonButtonProps {
   /** Called when /health answers post-reload (parent typically reloads its data). */
@@ -36,6 +37,14 @@ type State =
 
 export default function ReloadDaemonButton({ onReloaded, timeoutMs = 30_000 }: ReloadDaemonButtonProps) {
   const [state, setState] = useState<State>({ kind: 'idle' });
+  const reloadAvailable = useReloadAvailable();
+
+  // The gateway rejects /admin/reload from a remote host unless remote admin
+  // and pairing are enabled. When our proxy for that says it can't succeed,
+  // hide the whole control rather than offer a button that only errors.
+  if (!reloadAvailable) {
+    return null;
+  }
 
   const triggerReload = async () => {
     setState({ kind: 'reloading' });

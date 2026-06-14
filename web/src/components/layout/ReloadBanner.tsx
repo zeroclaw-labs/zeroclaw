@@ -3,6 +3,7 @@ import { useLocation } from 'react-router-dom';
 import { AlertTriangle, X } from 'lucide-react';
 import { getDrift, getReloadStatus, type DriftEntry } from '@/lib/api';
 import ReloadDaemonButton from '@/components/sections/ReloadDaemonButton';
+import { useReloadAvailable } from '@/lib/reloadAvailability';
 
 const POLL_INTERVAL_MS = 5_000;
 
@@ -31,6 +32,10 @@ export default function ReloadBanner() {
   // pending flips back on) because the recomputed signature won't match.
   const [dismissedSig, setDismissedSig] = useState<string | null>(null);
   const location = useLocation();
+  // Whether the in-UI reload action can actually succeed from this origin.
+  // When false (remote host, pairing off) we drop the dead button and reword
+  // the notice to point the operator at the CLI / a loopback session.
+  const reloadAvailable = useReloadAvailable();
 
   useEffect(() => {
     let cancelled = false;
@@ -116,8 +121,17 @@ export default function ReloadBanner() {
             )}
           </ul>
         )}
+        {!reloadAvailable && (
+          <p className="text-xs mt-1 text-pc-text-muted">
+            Reloading isn’t available from this remote session. Apply it with{' '}
+            <code className="font-mono">zeroclaw reload</code> on the host, or
+            from a loopback (localhost) session.
+          </p>
+        )}
       </div>
-      <ReloadDaemonButton onReloaded={() => setPollKey((k) => k + 1)} />
+      {reloadAvailable && (
+        <ReloadDaemonButton onReloaded={() => setPollKey((k) => k + 1)} />
+      )}
       <button
         type="button"
         onClick={() => setDismissedSig(sig)}
