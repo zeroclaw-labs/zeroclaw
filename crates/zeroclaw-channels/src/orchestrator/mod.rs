@@ -20420,8 +20420,7 @@ Done."#;
 
         let err = deliver_announcement(&config, "email.default", "user@example.com", None, "hi")
             .await
-            .err()
-            .expect("expected email.default to bail because channel is not configured");
+            .expect_err("expected email.default to bail because channel is not configured");
         let msg = format!("{err:#}");
         assert!(
             !msg.contains("unsupported delivery channel"),
