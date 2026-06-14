@@ -330,28 +330,33 @@ impl<'a> PickerModal<'a> {
         }
     }
 
-    /// Render the modal centered within `area`. No-op when there are no items.
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
-        if self.items.is_empty() {
-            return;
+    pub fn area_for(title: &str, items: &[String], area: Rect) -> Option<Rect> {
+        if items.is_empty() {
+            return None;
         }
 
-        // Width: longest item (clamped), plus borders/padding. Height: one row
-        // per item plus borders, clamped to the available area.
-        let longest = self
-            .items
+        // Keep this geometry in sync with `render` so mouse hit-testing lands
+        // on the same rows the user sees.
+        let longest = items
             .iter()
             .map(|s| s.chars().count())
             .max()
             .unwrap_or(0)
-            .max(self.title.chars().count());
+            .max(title.chars().count());
         let inner_w = longest + 2; // 1 col padding each side
         let box_w = (inner_w + 2).clamp(12, area.width as usize) as u16;
-        let box_h = (self.items.len() + 2).clamp(3, area.height as usize) as u16;
+        let box_h = (items.len() + 2).clamp(3, area.height as usize) as u16;
 
         let x = area.x + area.width.saturating_sub(box_w) / 2;
         let y = area.y + area.height.saturating_sub(box_h) / 2;
-        let modal_rect = Rect::new(x, y, box_w, box_h);
+        Some(Rect::new(x, y, box_w, box_h))
+    }
+
+    /// Render the modal centered within `area`. No-op when there are no items.
+    pub fn render(&self, frame: &mut Frame, area: Rect) {
+        let Some(modal_rect) = Self::area_for(self.title, self.items, area) else {
+            return;
+        };
 
         frame.render_widget(Clear, modal_rect);
 

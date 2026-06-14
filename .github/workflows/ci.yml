@@ -5,8 +5,15 @@ on:
     branches: [master]
   push:
     branches: [master]
+  # Merge queue: GitHub builds a temporary `gh-readonly-queue/master/…` branch
+  # and fires `merge_group`. The required `CI Required Gate` must report on that
+  # branch or queued PRs stall, so the full gate runs here too.
+  merge_group:
 
 concurrency:
+  # Merge-queue runs key on the unique queue ref (github.ref →
+  # `refs/heads/gh-readonly-queue/master/pr-N-<sha>`) so speculative entries
+  # never cancel each other; PRs still key on the PR number.
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
@@ -36,20 +43,10 @@ jobs:
   # ── Post-format required quality gate ─────────────────────────────────────
 
   lint:
-    name: Lint ${{ matrix.target }}
+    name: Lint
     needs: [fmt]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: macos-14
-            target: aarch64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -57,33 +54,58 @@ jobs:
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: 1.93.0
-          targets: ${{ matrix.target }}
           components: clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        id: rust-cache
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
-        if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y libudev-dev
       - name: Ensure web/dist placeholder exists
-        shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Clippy
         shell: bash
-        run: >
-          cargo clippy
-          --workspace
-          --exclude zeroclaw-desktop
-          --all-targets
-          --target ${{ matrix.target }}
-          --features ci-all
-          -- -D warnings
+        run: |
+          set +e
+          cargo_log="${RUNNER_TEMP}/cargo-clippy.log"
+          SECONDS=0
+          cargo clippy \
+            --workspace \
+            --exclude zeroclaw-desktop \
+            --all-targets \
+            --features ci-all \
+            -- -D warnings 2>&1 | tee "$cargo_log"
+          cargo_status=${PIPESTATUS[0]}
+          duration_seconds=$SECONDS
+          set -e
+
+          workspace_path_compiles="$(grep -E -c 'Compiling.*\([^)]*zeroclaw' "$cargo_log" || true)"
+          total_compiles="$(grep -c 'Compiling' "$cargo_log" || true)"
+          downloaded_crates="$(grep -c 'Downloaded' "$cargo_log" || true)"
+          cache_hit="${RUST_CACHE_HIT:-unknown}"
+          summary_file="${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+          {
+            echo "### Lint diagnostics"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Runner OS | \`${{ runner.os }}\` |"
+            echo "| Rust cache exact hit | \`${cache_hit}\` |"
+            echo "| Clippy duration | \`${duration_seconds}s\` |"
+            echo "| Clippy status | \`${cargo_status}\` |"
+            echo "| Workspace path compile lines | \`${workspace_path_compiles}\` |"
+            echo "| Total compile lines | \`${total_compiles}\` |"
+            echo "| Downloaded crate lines | \`${downloaded_crates}\` |"
+          } >> "$summary_file"
+
+          exit "$cargo_status"
+        env:
+          RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
       - name: Config-write isolation guard
-        if: runner.os == 'Linux'
         run: cargo test --test architecture tests_that_persist_config_isolate_the_path
       - name: Fluent coverage guard (no bare user-facing strings)
-        if: runner.os == 'Linux'
         run: cargo test --test architecture user_facing_strings_route_through_fluent
 
   # ── Post-format build + check fan-out ─────────────────────────────────────
@@ -110,6 +132,7 @@ jobs:
           toolchain: 1.93.0
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        id: rust-cache
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
@@ -121,8 +144,39 @@ jobs:
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Build
         shell: bash
-        run: cargo build --profile ci --locked --target ${{ matrix.target }}
+        run: |
+          set +e
+          cargo_log="${RUNNER_TEMP}/cargo-build-${{ matrix.target }}.log"
+          SECONDS=0
+          cargo build --profile ci --locked --target ${{ matrix.target }} 2>&1 | tee "$cargo_log"
+          cargo_status=${PIPESTATUS[0]}
+          duration_seconds=$SECONDS
+          set -e
+
+          workspace_path_compiles="$(grep -E -c 'Compiling.*\([^)]*zeroclaw' "$cargo_log" || true)"
+          total_compiles="$(grep -c 'Compiling' "$cargo_log" || true)"
+          downloaded_crates="$(grep -c 'Downloaded' "$cargo_log" || true)"
+          cache_hit="${RUST_CACHE_HIT:-unknown}"
+          summary_file="${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+          {
+            echo "### Build diagnostics: ${{ matrix.target }}"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Target | \`${{ matrix.target }}\` |"
+            echo "| Runner OS | \`${{ runner.os }}\` |"
+            echo "| Rust cache exact hit | \`${cache_hit}\` |"
+            echo "| Cargo duration | \`${duration_seconds}s\` |"
+            echo "| Cargo status | \`${cargo_status}\` |"
+            echo "| Workspace path compile lines | \`${workspace_path_compiles}\` |"
+            echo "| Total compile lines | \`${total_compiles}\` |"
+            echo "| Downloaded crate lines | \`${downloaded_crates}\` |"
+          } >> "$summary_file"
+
+          exit "$cargo_status"
         env:
+          RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 

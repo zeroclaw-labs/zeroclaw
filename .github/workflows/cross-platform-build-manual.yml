@@ -57,18 +57,18 @@ jobs:
             # CI gate (`ci.yml`) uses clang+mold for throughput optimization.
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            cross_compiler: gcc-aarch64-linux-gnu
+            cross_compiler: gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
             linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
             linker: aarch64-linux-gnu-gcc
           - os: ubuntu-latest
             target: armv7-unknown-linux-gnueabihf
-            cross_compiler: gcc-arm-linux-gnueabihf
+            cross_compiler: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
             linker_env: CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER
             linker: arm-linux-gnueabihf-gcc
             skip_prometheus: true
           - os: ubuntu-latest
             target: arm-unknown-linux-gnueabihf
-            cross_compiler: gcc-arm-linux-gnueabihf
+            cross_compiler: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
             linker_env: CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER
             linker: arm-linux-gnueabihf-gcc
             skip_prometheus: true
@@ -131,6 +131,7 @@ jobs:
             # Ubuntu 22.04's gcc-arm-linux-gnueabihf defaults to ARMv7+NEON,
             # which segfaults on ARMv6 devices (e.g., Raspberry Pi Zero W).
             export CFLAGS_arm_unknown_linux_gnueabihf="-march=armv6 -mfpu=vfp -mfloat-abi=hard"
+            export CXXFLAGS_arm_unknown_linux_gnueabihf="-march=armv6 -mfpu=vfp -mfloat-abi=hard"
             export CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS="-C target-feature=-neon"
           fi
           FEATURES="channel-matrix,channel-lark"

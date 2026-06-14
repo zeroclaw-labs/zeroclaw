@@ -567,7 +567,10 @@ mark {
 }
 .theme-popup .theme {
   border-radius: 0.5rem;
-  padding: 0.4rem 0.7rem 0.4rem 1.4rem;
+  font-size: 0.95rem;
+  line-height: 1.25;
+  min-height: 2.1rem;
+  padding: 0.55rem 0.85rem 0.55rem 1.55rem;
 }
 .theme-popup .theme:hover {
   background: var(--pc-hover-strong);
@@ -866,7 +869,7 @@ body,
 #mdbook-theme-list {
   max-height: 70vh;
   overflow-y: auto;
-  min-width: 13rem;
+  min-width: 16rem;
   padding: 0.4rem;
 }
 
@@ -874,10 +877,10 @@ body,
   list-style: none;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  font-size: 0.78rem;
+  font-size: 0.82rem;
   font-weight: 600;
   color: var(--pc-text-muted);
-  padding: 0.6rem 0.7rem 0.3rem;
+  padding: 0.75rem 0.85rem 0.35rem;
   pointer-events: none;
 }
 
@@ -885,7 +888,7 @@ body,
   /* mdBook's theme-list buttons default to display:block; force flex for the swatch + label row. */
   display: flex !important;
   align-items: center;
-  gap: 0.6rem;
+  gap: 0.7rem;
   width: 100%;
   text-align: left;
 }
@@ -894,8 +897,8 @@ body,
   display: inline-grid;
   grid-template-columns: 1fr 1fr;
   grid-template-rows: 1fr 1fr;
-  width: 1.1rem;
-  height: 1.1rem;
+  width: 1.25rem;
+  height: 1.25rem;
   border-radius: 0.3rem;
   overflow: hidden;
   flex-shrink: 0;
@@ -917,7 +920,7 @@ body,
 }
 
 .pc-theme-name {
-  font-size: 0.82rem;
+  font-size: 0.95rem;
   white-space: nowrap;
 }
 
