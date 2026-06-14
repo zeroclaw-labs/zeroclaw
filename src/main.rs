@@ -1480,6 +1480,9 @@ async fn run_quickstart_cli(
                     .with_prompt(format!("Alias for {}", chosen.display_name))
                     .default("default".to_string())
                     .allow_empty(false)
+                    .validate_with(|input: &String| {
+                        zeroclaw_config::helpers::validate_alias_key(input)
+                    })
                     .interact_text()
                 else {
                     continue;
@@ -1877,7 +1880,10 @@ async fn run_quickstart_cli(
                     .unwrap_or_default();
                 let mut input = Input::<String>::new()
                     .with_prompt("Agent alias")
-                    .allow_empty(false);
+                    .allow_empty(false)
+                    .validate_with(|input: &String| {
+                        zeroclaw_config::helpers::validate_alias_key(input)
+                    });
                 if !default_name.is_empty() {
                     input = input.default(default_name);
                 }
