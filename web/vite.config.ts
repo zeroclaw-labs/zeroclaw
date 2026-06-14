@@ -34,7 +34,11 @@ export default defineConfig(({ command }) => ({
       "/admin":          { target: gatewayTarget, changeOrigin: true },
       "/health":         { target: gatewayTarget, changeOrigin: true },
       "/metrics":        { target: gatewayTarget, changeOrigin: true },
-      "/pair":           { target: gatewayTarget, changeOrigin: true },
+      // Exact-match the gateway pairing endpoints (/pair, /pair/code) so the
+      // prefix doesn't swallow the client route /pairing — a bare "/pair" key
+      // proxies /pairing to the gateway, which serves its own built UI and
+      // breaks a refresh on the pairing page (same fix as the /acp regex above).
+      "^/pair(?:/code)?(?:\\?.*)?$": { target: gatewayTarget, changeOrigin: true },
       "/webhook":        { target: gatewayTarget, changeOrigin: true },
       "/whatsapp":       { target: gatewayTarget, changeOrigin: true },
       "/linq":           { target: gatewayTarget, changeOrigin: true },
