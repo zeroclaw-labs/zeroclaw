@@ -525,7 +525,7 @@ mod tests {
 
         // Same factory call site as `process_message` in the agent loop.
         let cfg = zeroclaw_config::schema::ObservabilityConfig {
-            backend: "noop".into(),
+            backend: zeroclaw_config::schema::ObservabilityBackend::None,
             ..Default::default()
         };
         let observer = zeroclaw_runtime::observability::create_observer(&cfg);

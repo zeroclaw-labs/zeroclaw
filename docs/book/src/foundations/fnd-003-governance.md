@@ -227,13 +227,13 @@ Use this split:
 | Surface | Owns | Does not own |
 |---|---|---|
 | Labels | durable classification: type, scope, risk, size, contributor tier, stale/triage policy | per-push review state, active CI status, personal task lists |
-| Project board | planning state: readiness, active owner or steward path, roadmap grouping, dependency/blocker state, stale-exemption reason when a field exists | authoritative PR review queue, mergeability, required checks |
+| Project board | planning state: readiness, routing evidence, roadmap grouping, dependency/blocker state, stale-exemption reason when a field exists | authoritative PR review queue, mergeability, required checks |
 | Native PR state | review decision, required checks, branch freshness, conflicts, mergeability, draft/ready state | long-term roadmap ownership |
 | Issues/RFCs | durable discussion record, acceptance state, user need, linked implementation trail | live replacement for maintainer docs after policy promotion |
 
 PR lanes, contributor-pickup labels, stale-exemption labels, and label migration are durable governance concepts, but their exact operational criteria live in maintainer docs. FND-003 owns the split: labels classify durable work, project boards plan work, native PR state owns live review and merge state, and issues/RFCs preserve decisions. The [Maintainer PR workflow](../maintainers/pr-workflow.md#pr-lanes) owns PR lane definitions, the [Labels guide](../maintainers/labels.md) owns exact label meanings and cleanup rules, and the [Reviewer playbook](../maintainers/reviewer-playbook.md#issue-triage) owns how reviewers apply those signals during triage and review. Treat live label migration as a separate maintainer-approved cleanup, not ordinary PR review.
 
-Stale exemptions are governance exceptions, not permanent label shields. The target policy is that `status:no-stale` is valid only when the lane's operational source records both why the issue is exempt and who owns the next movement. The maintainer docs define where those facts live and how stale automation or stale sweeps enforce the rule.
+Stale exemptions are governance exceptions, not permanent label shields. The target policy is that `status:no-stale` is valid only when the lane's operational source records why the issue is exempt and what visible routing evidence carries the next decision. The maintainer docs define where those facts live and how stale automation or stale sweeps enforce the rule.
 
 ---
 
@@ -243,7 +243,7 @@ Stale exemptions are governance exceptions, not permanent label shields. The tar
 
 Treat GitHub Discussions as a maintained community surface. Discussions are useful for questions, ideas, polls, announcements, showcases, project or integration demos, and exploratory threads that need more permanence than Discord but are not yet tracked work.
 
-Exact categories, category descriptions, and steward cadence are operational details. They belong in the contributor communication guide and maintainer stewardship docs, and they may evolve without revising this foundation document.
+Exact categories, category descriptions, and review cadence are operational details. They belong in the contributor communication guide and maintainer workflow docs, and they may evolve without revising this foundation document.
 
 ### 4.2 Promotion From Discussion To Tracked Work
 
@@ -915,7 +915,7 @@ This table records governance intent and historical taxonomy shape. For current 
 | `status:blocked` | `#b60205` Red | Waiting on a recorded unresolved external dependency, maintainer decision, or linked prerequisite |
 | `status:in-progress` | `#0075ca` Blue | Open PR is actively targeting the issue; verify live PR state during stale passes |
 | `status:stale` | `#e4e669` Yellow | No original-author activity for the stale threshold window |
-| `status:no-stale` | `#0e8a16` Green | Explicit stale exemption for accepted or otherwise long-lived work; target policy requires a recorded reason and active owner or steward path in the operational source |
+| `status:no-stale` | `#0e8a16` Green | Explicit stale exemption for accepted or otherwise long-lived work; target policy requires a recorded reason and visible routing evidence in the operational source |
 | `status:help-wanted` | `#059669` Green | Looking for a contributor |
 | `status:good-first-issue` | `#059669` Green | Suitable for new contributors |
 | `status:discussion` | `#a78bfa` Purple | Needs team discussion before work begins |
@@ -996,7 +996,7 @@ GitHub enforces CODEOWNERS automatically when the file exists and branch protect
 
 **Stale issue management (`.github/workflows/stale.yml`):**
 
-Issues with no activity for 45 days are labeled `status:stale` and a comment is posted asking if the issue is still relevant. Issues with no activity for 15 days after the stale label is applied are closed. This prevents the backlog from accumulating hundreds of issues that are months old and no longer relevant. Exclude `priority:p0`, `type:rfc`, issues with open linked PRs, and issues with `status:blocked` while a recorded blocker remains unresolved. The intended `status:no-stale` follow-up is to exclude it only while the operational source records both the stale-exemption reason and a contributor-visible active owner or steward path. The maintainer label guide and issue-triage protocol carry the current operational details.
+Issues with no activity for 45 days are labeled `status:stale` and a comment is posted asking if the issue is still relevant. Issues with no activity for 15 days after the stale label is applied are closed. This prevents the backlog from accumulating hundreds of issues that are months old and no longer relevant. Exclude `priority:p0`, `type:rfc`, issues with open linked PRs, and issues with `status:blocked` while a recorded blocker remains unresolved. The intended `status:no-stale` follow-up is to exclude it only while the operational source records both the stale-exemption reason and contributor-visible routing evidence. The maintainer label guide and issue-triage protocol carry the current operational details.
 
 **PR size labeling (`.github/workflows/pr-size.yml`):**
 
@@ -1026,7 +1026,7 @@ The minimum viable governance setup. Gets the team coordinating immediately.
 
 - [ ] Create the GitHub Project with Status, Type, Priority, and Milestone fields
 - [ ] Create the four Project views (Roadmap, Board, Backlog, My Work)
-- [ ] Enable GitHub Discussions with maintained categories documented in the contributor communication and maintainer stewardship docs
+- [ ] Enable GitHub Discussions with maintained categories documented in the contributor communication and maintainer workflow docs
 - [ ] Create the three RFC issues for the existing proposals (Section 8.4)
 - [ ] Add the six issue templates (Section 7)
 - [ ] Create the `CODEOWNERS` file (Section 6.1)

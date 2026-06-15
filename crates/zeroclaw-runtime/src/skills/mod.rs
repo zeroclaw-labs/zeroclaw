@@ -20,6 +20,7 @@ pub mod document;
 pub mod frontmatter;
 pub mod improver;
 pub mod reference;
+pub mod review;
 pub mod scaffold;
 pub mod service;
 mod suggestions;
