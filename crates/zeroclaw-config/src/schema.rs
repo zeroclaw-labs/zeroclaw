@@ -11535,6 +11535,67 @@ impl ChannelsConfig {
             || self.mqtt.values().any(|c| c.enabled)
             || self.amqp.values().any(|c| c.enabled)
     }
+
+    /// One `(canonical_name, configured)` row per channel in the registry.
+    /// Single source for name-addressed channel lookups so no surface has to
+    /// hardcode a subset of the channel list.
+    pub fn channel_presence(&self) -> [(&'static str, bool); 34] {
+        [
+            ("telegram", !self.telegram.is_empty()),
+            ("discord", !self.discord.is_empty()),
+            ("slack", !self.slack.is_empty()),
+            ("mattermost", !self.mattermost.is_empty()),
+            ("webhook", !self.webhook.is_empty()),
+            ("imessage", !self.imessage.is_empty()),
+            ("matrix", !self.matrix.is_empty()),
+            ("signal", !self.signal.is_empty()),
+            ("whatsapp", !self.whatsapp.is_empty()),
+            ("linq", !self.linq.is_empty()),
+            ("wati", !self.wati.is_empty()),
+            ("nextcloud_talk", !self.nextcloud_talk.is_empty()),
+            ("email", !self.email.is_empty()),
+            ("gmail_push", !self.gmail_push.is_empty()),
+            ("irc", !self.irc.is_empty()),
+            ("twitch", !self.twitch.is_empty()),
+            ("lark", !self.lark.is_empty()),
+            ("line", !self.line.is_empty()),
+            ("dingtalk", !self.dingtalk.is_empty()),
+            ("wecom", !self.wecom.is_empty()),
+            ("wecom_ws", !self.wecom_ws.is_empty()),
+            ("wechat", !self.wechat.is_empty()),
+            ("qq", !self.qq.is_empty()),
+            ("twitter", !self.twitter.is_empty()),
+            ("mochat", !self.mochat.is_empty()),
+            ("nostr", !self.nostr.is_empty()),
+            ("clawdtalk", !self.clawdtalk.is_empty()),
+            ("reddit", !self.reddit.is_empty()),
+            ("bluesky", !self.bluesky.is_empty()),
+            ("voice_call", !self.voice_call.is_empty()),
+            ("voice_wake", !self.voice_wake.is_empty()),
+            ("voice_duplex", !self.voice_duplex.is_empty()),
+            ("mqtt", !self.mqtt.is_empty()),
+            ("amqp", !self.amqp.is_empty()),
+        ]
+    }
+
+    /// Whether a channel named `name` (case-insensitive) is a known channel
+    /// with at least one configured instance. Used by name-addressed surfaces
+    /// (e.g. `heartbeat.target`) without hardcoding a subset of the registry.
+    pub fn is_channel_configured(&self, name: &str) -> bool {
+        let needle = name.to_ascii_lowercase();
+        self.channel_presence()
+            .iter()
+            .any(|(canonical, configured)| *configured && *canonical == needle)
+    }
+
+    /// Whether `name` (case-insensitive) names a channel in the registry,
+    /// regardless of whether it is configured.
+    pub fn is_known_channel(&self, name: &str) -> bool {
+        let needle = name.to_ascii_lowercase();
+        self.channel_presence()
+            .iter()
+            .any(|(canonical, _)| *canonical == needle)
+    }
 }
 
 fn default_channel_message_timeout_secs() -> u64 {

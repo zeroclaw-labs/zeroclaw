@@ -1362,38 +1362,14 @@ fn auto_detect_heartbeat_channel(config: &Config) -> Option<(String, String)> {
 }
 
 fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<()> {
-    match channel.to_ascii_lowercase().as_str() {
-        "telegram" => {
-            if config.channels.telegram.is_empty() {
-                anyhow::bail!(
-                    "heartbeat.target is set to telegram but channels.telegram is not configured"
-                );
-            }
-        }
-        "discord" => {
-            if config.channels.discord.is_empty() {
-                anyhow::bail!(
-                    "heartbeat.target is set to discord but channels.discord is not configured"
-                );
-            }
-        }
-        "slack" => {
-            if config.channels.slack.is_empty() {
-                anyhow::bail!(
-                    "heartbeat.target is set to slack but channels.slack is not configured"
-                );
-            }
-        }
-        "mattermost" => {
-            if config.channels.mattermost.is_empty() {
-                anyhow::bail!(
-                    "heartbeat.target is set to mattermost but channels.mattermost is not configured"
-                );
-            }
-        }
-        other => anyhow::bail!("unsupported heartbeat.target channel: {other}"),
+    if !config.channels.is_known_channel(channel) {
+        anyhow::bail!("unsupported heartbeat.target channel: {channel}");
     }
-
+    if !config.channels.is_channel_configured(channel) {
+        anyhow::bail!(
+            "heartbeat.target is set to {channel} but channels.{channel} is not configured"
+        );
+    }
     Ok(())
 }
 
@@ -1695,12 +1671,29 @@ mod tests {
     #[test]
     fn resolve_delivery_rejects_unsupported_channel() {
         let mut config = Config::default();
-        config.heartbeat.target = Some("email".into());
+        config.heartbeat.target = Some("carrier_pigeon".into());
         config.heartbeat.to = Some("ops@example.com".into());
         let err = resolve_heartbeat_delivery(&config).unwrap_err();
         assert!(
             err.to_string()
                 .contains("unsupported heartbeat.target channel")
+        );
+    }
+
+    #[test]
+    fn resolve_delivery_accepts_matrix_target() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("matrix".into());
+        config.heartbeat.to = Some("!room:example.org".into());
+        config
+            .channels
+            .matrix
+            .insert("default".to_string(), Default::default());
+
+        let target = resolve_heartbeat_delivery(&config).unwrap();
+        assert_eq!(
+            target,
+            Some(("matrix".to_string(), "!room:example.org".to_string()))
         );
     }
 
