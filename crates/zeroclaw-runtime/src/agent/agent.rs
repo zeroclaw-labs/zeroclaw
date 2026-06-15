@@ -6225,6 +6225,7 @@ mod tests {
                 .expect("memory creation should succeed with valid config"),
         );
 
+        let ws_dir = tmp.path().to_path_buf();
         let mut agent_a = Agent::builder()
             .model_provider(Box::new(MockModelProvider {
                 responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
@@ -6243,7 +6244,7 @@ mod tests {
             .observer(Arc::from(crate::observability::NoopObserver {}) as Arc<dyn Observer>)
             .response_cache(Some(cache.clone()))
             .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .workspace_dir(ws_dir.clone())
             .model_name("test-model".into())
             .temperature(Some(0.0))
             .build()
@@ -6267,7 +6268,7 @@ mod tests {
             .observer(observer)
             .response_cache(Some(cache))
             .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .workspace_dir(ws_dir)
             .model_name("test-model".into())
             .temperature(Some(0.0))
             .build()

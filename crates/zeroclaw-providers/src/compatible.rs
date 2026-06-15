@@ -74,6 +74,8 @@ pub struct OpenAiCompatibleModelProvider {
     /// Raw PEM bytes of a custom CA certificate for TLS connections.
     /// Loaded from disk once at construction; not refreshed across config reloads.
     tls_ca_cert_pem: Option<Vec<u8>>,
+    /// Extra JSON fields merged into every API request body.
+    extra_body: Option<serde_json::Value>,
 }
 
 /// How the model_provider expects the API key to be sent.
@@ -326,8 +328,17 @@ impl OpenAiCompatibleModelProvider {
             local_model_tool_sanitize: false,
             public_model_listing: false,
             tls_ca_cert_pem: None,
+            extra_body: None,
         }
     }
+    /// Inject extra JSON fields into every API request body.
+    /// Merged at the top level — use for provider-specific features like
+    /// `thinking: "off"` (Qwen3.5 on hipfire) or routing transforms.
+    pub fn with_extra_body(mut self, extra: serde_json::Value) -> Self {
+        self.extra_body = Some(extra);
+        self
+    }
+
     /// Opt this provider into per-model conservative tool-schema sanitization.
     /// Today the only trigger is the gemma-4 family on llama.cpp, where the
     /// upstream tool-call parser rejects empty-properties / non-string
@@ -1044,6 +1055,9 @@ struct NativeChatRequest {
     tool_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    /// Extra fields merged at the top level of the serialized JSON body.
+    #[serde(flatten)]
+    extra_body: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1799,6 +1813,7 @@ impl OpenAiCompatibleModelProvider {
             tools,
             tool_choice,
             max_tokens: self.max_tokens,
+            extra_body: self.extra_body.clone(),
         }
     }
 
@@ -2804,6 +2819,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     tools: tools.clone(),
                     tool_choice: tools.as_ref().map(|_| "auto".to_string()),
                     max_tokens: provider.max_tokens,
+                    extra_body: provider.extra_body.clone(),
                 })
             } else {
                 let messages = effective_messages
@@ -3286,6 +3302,7 @@ mod tests {
             tools: Some(vec![serde_json::json!({"name": "echo"})]),
             tool_choice: Some("auto".to_string()),
             max_tokens: None,
+            extra_body: None,
         };
         let value: serde_json::Value = serde_json::to_value(&req).unwrap();
         assert_eq!(
@@ -3315,11 +3332,39 @@ mod tests {
             tools: None,
             tool_choice: None,
             max_tokens: None,
+            extra_body: None,
         };
         let value: serde_json::Value = serde_json::to_value(&req).unwrap();
         assert!(
             value.get("stream_options").is_none(),
             "non-streaming NativeChatRequest must not emit a stream_options key"
+        );
+    }
+
+    #[test]
+    fn extra_body_flattens_into_request_top_level() {
+        let req = NativeChatRequest {
+            model: "qwen".to_string(),
+            messages: vec![],
+            temperature: None,
+            stream: None,
+            stream_options: None,
+            reasoning_effort: None,
+            tool_stream: None,
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+            extra_body: Some(serde_json::json!({"thinking": "off"})),
+        };
+        let value: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value.get("thinking").and_then(serde_json::Value::as_str),
+            Some("off"),
+            "extra_body fields must serialize at the top level, not nested"
+        );
+        assert!(
+            value.get("extra_body").is_none(),
+            "extra_body key itself must not appear in serialized JSON"
         );
     }
 
@@ -3942,6 +3987,7 @@ mod tests {
             })]),
             tool_choice: Some("auto".to_string()),
             max_tokens: None,
+            extra_body: None,
         };
 
         let value = serde_json::to_value(&req).unwrap();
