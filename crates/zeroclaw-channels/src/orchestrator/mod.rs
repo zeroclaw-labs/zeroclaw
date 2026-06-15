@@ -816,7 +816,12 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Structure longer answers with bold headers, not raw markdown ## headers\n\
              - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n\
-             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
+             - When a question needs current, real-time, or external information \
+               (prices, news, weather, web pages, lookups, etc.), use your tools — \
+               e.g. web_search_tool and web_fetch — to obtain it before answering; \
+               never guess or answer from memory alone when a tool can verify it.\n\
+             - Present the final answer to the latest user message directly from the \
+               tool results, without narrating delayed/internal tool-execution bookkeeping.",
         ),
         "qq" => Some(
             "When responding on QQ:\n\
@@ -5628,6 +5633,18 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
     Ok(false)
 }
 
+#[cfg(any(
+    test,
+    feature = "channel-discord",
+    feature = "channel-matrix",
+    feature = "channel-slack",
+    feature = "channel-telegram",
+    feature = "channel-wechat",
+))]
+fn one_shot_channel_workspace_dir(config: &Config, channel_type: &str, alias: &str) -> PathBuf {
+    config.channel_workspace_dir(&format!("{channel_type}.{alias}"))
+}
+
 /// Build a single channel instance by config section name (e.g. "telegram").
 fn build_channel_by_id(
     config_arc: &Arc<RwLock<Config>>,
@@ -5650,6 +5667,7 @@ fn build_channel_by_id(
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_external_peers("telegram", &alias))
             };
+            let workspace_dir = one_shot_channel_workspace_dir(&config, "telegram", &alias);
             Ok(Arc::new(
                 TelegramChannel::new(
                     tg.bot_token.clone(),
@@ -5663,7 +5681,7 @@ fn build_channel_by_id(
                 .with_transcription(config.transcription.clone())
                 .with_tts(&config)
                 .with_voice_peer_prefs(&config, "telegram", alias)
-                .with_workspace_dir(config.data_dir.clone())
+                .with_workspace_dir(workspace_dir)
                 .with_approval_timeout_secs(tg.approval_timeout_secs),
             ))
         }
@@ -5684,6 +5702,7 @@ fn build_channel_by_id(
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_external_peers("discord", &alias))
             };
+            let workspace_dir = one_shot_channel_workspace_dir(&config, "discord", &alias);
             Ok(Arc::new(
                 DiscordChannel::new(
                     dc.bot_token.clone(),
@@ -5694,7 +5713,7 @@ fn build_channel_by_id(
                     dc.mention_only,
                 )
                 .with_channel_ids(dc.channel_ids.clone())
-                .with_workspace_dir(config.data_dir.clone())
+                .with_workspace_dir(workspace_dir)
                 .with_streaming(
                     dc.stream_mode,
                     dc.draft_update_interval_ms,
@@ -5723,6 +5742,7 @@ fn build_channel_by_id(
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_external_peers("slack", &alias))
             };
+            let workspace_dir = one_shot_channel_workspace_dir(&config, "slack", &alias);
             Ok(Arc::new(
                 SlackChannel::new(
                     sl.bot_token.clone(),
@@ -5731,7 +5751,7 @@ fn build_channel_by_id(
                     alias,
                     peer_resolver,
                 )
-                .with_workspace_dir(config.data_dir.clone())
+                .with_workspace_dir(workspace_dir)
                 .with_markdown_blocks(sl.use_markdown_blocks)
                 .with_transcription(config.transcription.clone())
                 .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms)
@@ -5823,10 +5843,11 @@ fn build_channel_by_id(
                     Arc::new(move || cfg_arc.read().channel_external_peers("matrix", &alias))
                 };
                 let ack = mx.ack_reactions.unwrap_or(config.channels.ack_reactions);
+                let workspace_dir = one_shot_channel_workspace_dir(&config, "matrix", &alias);
                 Ok(Arc::new(
                     MatrixChannel::new(mx.clone(), alias, peer_resolver, state_dir)?
                         .with_transcription(config.transcription.clone())
-                        .with_workspace_dir(config.data_dir.clone())
+                        .with_workspace_dir(workspace_dir)
                         .with_ack_reactions(ack),
                 ))
             }
@@ -6026,6 +6047,7 @@ fn build_channel_by_id(
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_external_peers("wechat", &alias))
             };
+            let workspace_dir = one_shot_channel_workspace_dir(&config, "wechat", &alias);
             Ok(Arc::new(
                 WeChatChannel::new(
                     alias,
@@ -6035,7 +6057,7 @@ fn build_channel_by_id(
                     wc.state_dir.as_ref().map(|s| expand_tilde_in_path(s)),
                 )?
                 .with_persistence(config_arc.clone())
-                .with_workspace_dir(config.data_dir.clone()),
+                .with_workspace_dir(workspace_dir),
             ))
         }
         #[cfg(not(feature = "channel-wechat"))]
@@ -8196,6 +8218,8 @@ pub async fn start_channels(
     config: Config,
     canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
     cancel: tokio_util::sync::CancellationToken,
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 ) -> Result<()> {
     // Wrap into the canonical shared handle so channels and persistence
     // paths share one source of truth. The local `config` shadowing
@@ -8410,6 +8434,8 @@ pub async fn start_channels(
             canvas_store.clone(),
             false,
             None,
+            sop_engine.clone(),
+            sop_audit.clone(),
         );
         let mut built_tools = all_tools_result_ch.tools;
         let delegate_handle_ch = all_tools_result_ch.delegate_handle;
@@ -15444,6 +15470,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 args: HashMap::new(),
                 target: None,
                 locked_args: std::collections::HashMap::new(),
+                timeout_secs: None,
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
             location: None,
@@ -15484,6 +15511,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 args: HashMap::new(),
                 target: None,
                 locked_args: std::collections::HashMap::new(),
+                timeout_secs: None,
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
             location: None,
@@ -15534,6 +15562,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 args: HashMap::new(),
                 target: None,
                 locked_args: std::collections::HashMap::new(),
+                timeout_secs: None,
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
             location: None,
@@ -17304,6 +17333,44 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    // Regression guard for #6646: web_search_tool / web_fetch never fired via
+    // the Telegram channel because the delivery-instructions block told the
+    // model to "answer the latest user message directly" and to "use tool
+    // results silently". On a small OpenAI-compatible local model that reads as
+    // "answer from memory, do not call tools", so the agent hallucinated with
+    // zero tool activity — while the identical query worked via CLI and the web
+    // dashboard, which do not inject this Telegram-only block. The block must
+    // encourage tool use for real-time/external information and must not tell
+    // the model to answer directly *instead of* using tools.
+    #[test]
+    fn channel_delivery_instructions_for_telegram_encourage_tool_use() {
+        let block = channel_delivery_instructions("telegram")
+            .expect("telegram channel must have a delivery-instructions block");
+        assert!(
+            block.contains("When responding on Telegram:"),
+            "telegram block must identify itself"
+        );
+        // Positive: it must actively steer the model toward its tools for
+        // real-time/external information.
+        assert!(
+            block.contains("use your tools"),
+            "telegram block must instruct the model to use its tools"
+        );
+        assert!(
+            block.contains("web_search_tool") && block.contains("web_fetch"),
+            "telegram block must name the real-time tools so the model knows to reach for them"
+        );
+        assert!(
+            block.contains("never guess or answer from memory alone"),
+            "telegram block must forbid answering from memory when a tool can verify"
+        );
+        // Negative: the exact regressed phrasing must never come back.
+        assert!(
+            !block.contains("Use tool results silently: answer the latest user message directly"),
+            "telegram block must not tell the model to answer directly instead of using tools (#6646)"
+        );
+    }
+
     #[test]
     fn extract_tool_context_summary_collects_alias_and_native_tool_calls() {
         let history = vec![
@@ -18667,6 +18734,31 @@ This is an example JSON object for profile settings."#;
             }
             Ok(_) => panic!("should fail for unknown channel"),
         }
+    }
+
+    #[test]
+    fn one_shot_channel_workspace_dir_uses_owning_agent_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.agents.insert(
+            "alice".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![zeroclaw_config::providers::ChannelRef(
+                    "telegram.default".to_string(),
+                )],
+                ..Default::default()
+            },
+        );
+
+        let resolved = one_shot_channel_workspace_dir(&config, "telegram", "default");
+
+        assert_eq!(resolved, config.agent_workspace_dir("alice"));
+        assert_ne!(resolved, config.data_dir);
     }
 
     // ── Query classification in channel message processing ─────────

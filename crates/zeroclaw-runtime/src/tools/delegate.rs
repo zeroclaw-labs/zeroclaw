@@ -103,12 +103,11 @@ pub struct DelegateTool {
     skill_bundles: Arc<HashMap<String, SkillBundleConfig>>,
     /// Optional handle to the loaded root config used to resolve a
     /// per-target `SecurityPolicy` at delegate time. When set, every
-    /// delegation validates the target agent's policy as a subset of
-    /// the calling agent's via `ensure_no_escalation_beyond` and
-    /// inherits the caller's `PerSenderTracker` so action / cost
-    /// budgets are shared between caller and delegated runs. When
-    /// unset (legacy unit-test constructors), DelegateTool falls back
-    /// to using `self.security` for the spawned inner DelegateTool.
+    /// delegation requires the target agent to share the caller's risk
+    /// profile and inherits the caller's `PerSenderTracker` so action
+    /// / cost budgets are shared between caller and delegated runs.
+    /// When unset (legacy unit-test constructors), DelegateTool falls
+    /// back to using `self.security` for the spawned inner DelegateTool.
     root_config: Option<Arc<Config>>,
     /// Alias of the agent that owns this DelegateTool. Excluded from the
     /// advertised roster so an agent is never offered itself as a
@@ -297,9 +296,9 @@ impl DelegateTool {
     }
 
     /// Attach the loaded root config so DelegateTool can resolve a
-    /// per-target `SecurityPolicy` at delegate time, validate it as a
-    /// subset of the caller's policy, and share the caller's
-    /// `PerSenderTracker` with the delegated run.
+    /// per-target `SecurityPolicy` at delegate time, require the
+    /// target to share the caller's risk profile, and share the
+    /// caller's `PerSenderTracker` with the delegated run.
     pub fn with_root_config(mut self, config: Arc<Config>) -> Self {
         self.root_config = Some(config);
         self
@@ -578,15 +577,26 @@ impl DelegateTool {
         resolved
     }
 
-    /// Resolve allowed tools list from the named risk profile (authorization).
-    fn resolve_allowed_tools(&self, risk_profile: &str) -> Vec<String> {
+    /// Materialize the tool gate from the named risk profile.
+    fn resolve_tool_policy(&self, risk_profile: &str) -> Option<SecurityPolicy> {
         if risk_profile.is_empty() {
-            return Vec::new();
+            return None;
         }
-        self.risk_profiles
-            .get(risk_profile)
-            .map(|p| p.allowed_tools.clone())
-            .unwrap_or_default()
+
+        let profile = self.risk_profiles.get(risk_profile)?;
+        Some(SecurityPolicy {
+            allowed_tools: if profile.allowed_tools.is_empty() {
+                None
+            } else {
+                Some(profile.allowed_tools.clone())
+            },
+            excluded_tools: if profile.excluded_tools.is_empty() {
+                None
+            } else {
+                Some(profile.excluded_tools.clone())
+            },
+            ..SecurityPolicy::default()
+        })
     }
 
     /// Resolve every configured skill bundle alias to its directory.
@@ -1703,19 +1713,16 @@ impl DelegateTool {
         full_prompt: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ToolResult> {
-        let allowed_tools = self.resolve_allowed_tools(&agent_config.risk_profile);
-
-        // Empty `allowed_tools` means "inherit": the target is bounded by the
-        // caller's already-policy-filtered registry rather than a per-agent
-        // allowlist. A non-empty list intersects with that registry.
-        let inherit_all = allowed_tools.is_empty();
-
-        let allowed = allowed_tools
-            .iter()
-            .map(|name: &String| name.trim())
-            .filter(|name| !name.is_empty())
-            .collect::<std::collections::HashSet<_>>();
-        let tool_admitted = |name: &str| inherit_all || allowed.contains(name);
+        let Some(tool_policy) = self.resolve_tool_policy(&agent_config.risk_profile) else {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Agent '{agent_name}' is agentic but risk_profile '{}' is not configured",
+                    agent_config.risk_profile
+                )),
+            });
+        };
 
         let target_policy = match self.policy_for_target(agent_name) {
             Ok(policy) => policy,
@@ -1727,10 +1734,13 @@ impl DelegateTool {
                 });
             }
         };
-        let needs_memory_tools = inherit_all
-            || allowed
-                .iter()
-                .any(|name| zeroclaw_tools::MEMORY_TOOL_NAMES.contains(name));
+        let needs_memory_tools = {
+            let parent_tools = self.parent_tools.read();
+            parent_tools.iter().any(|tool| {
+                zeroclaw_tools::MEMORY_TOOL_NAMES.contains(&tool.name())
+                    && tool_policy.is_tool_allowed(tool.name())
+            })
+        };
         let mut target_memory_tools: HashMap<String, Box<dyn Tool>> = if needs_memory_tools {
             match self.memory_for_target_agent(agent_name).await {
                 Ok(Some(memory)) => Self::memory_tools_for_target(memory, target_policy)
@@ -1756,8 +1766,8 @@ impl DelegateTool {
             let parent_tools = self.parent_tools.read();
             parent_tools
                 .iter()
-                .filter(|tool| tool_admitted(tool.name()))
-                .filter(|tool| tool.name() != "delegate")
+                .filter(|tool| tool.name() != Self::NAME)
+                .filter(|tool| tool_policy.is_tool_allowed(tool.name()))
                 .map(|tool| {
                     target_memory_tools
                         .remove(tool.name())
@@ -1767,16 +1777,28 @@ impl DelegateTool {
         };
 
         if sub_tools.is_empty() {
-            let detail = if inherit_all {
-                "inherited from the caller's tool registry (empty allowed_tools), but the caller has no delegatable tools".to_string()
-            } else {
-                format!("filtering allowlist ({})", allowed_tools.join(", "))
+            let suffix = match (
+                tool_policy.allowed_tools.as_ref(),
+                tool_policy.excluded_tools.as_ref(),
+            ) {
+                (None, None) => "available from parent registry".to_string(),
+                (Some(allowed), None) => {
+                    format!("after filtering allowlist ({})", allowed.join(", "))
+                }
+                (None, Some(excluded)) => {
+                    format!("after filtering denylist ({})", excluded.join(", "))
+                }
+                (Some(allowed), Some(excluded)) => format!(
+                    "after filtering allowlist ({}) and denylist ({})",
+                    allowed.join(", "),
+                    excluded.join(", ")
+                ),
             };
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Agent '{agent_name}' has no executable tools after {detail}"
+                    "Agent '{agent_name}' has no executable tools {suffix}"
                 )),
             });
         }
@@ -1837,7 +1859,7 @@ impl DelegateTool {
                 None,
                 None,
                 &[],
-                &[],
+                tool_policy.excluded_tools.as_deref().unwrap_or(&[]),
                 None,
                 None,
                 &zeroclaw_config::schema::PacingConfig::default(),
@@ -2354,11 +2376,19 @@ mod tests {
     }
 
     fn agentic_risk_profiles(allowed_tools: Vec<String>) -> HashMap<String, RiskProfileConfig> {
+        agentic_risk_profiles_with_excluded(allowed_tools, Vec::new())
+    }
+
+    fn agentic_risk_profiles_with_excluded(
+        allowed_tools: Vec<String>,
+        excluded_tools: Vec<String>,
+    ) -> HashMap<String, RiskProfileConfig> {
         let mut profiles = HashMap::new();
         profiles.insert(
             "agentic_test".to_string(),
             RiskProfileConfig {
                 allowed_tools,
+                excluded_tools,
                 ..Default::default()
             },
         );
@@ -3178,7 +3208,10 @@ mod tests {
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
             .with_runtime_profiles(agentic_runtime_profiles(10))
             .with_risk_profiles(agentic_risk_profiles(Vec::new()))
-            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+            .with_parent_tools(Arc::new(RwLock::new(vec![
+                Arc::new(EchoTool),
+                Arc::new(DelegateTool::new(HashMap::new(), None, test_security())),
+            ])));
 
         let model_provider = OneToolThenFinalModelProvider;
         let result = tool
@@ -3194,7 +3227,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.success, "{:?}", result.error);
+        assert!(result.success, "got: {:?}", result.error);
+        assert!(result.output.contains("(openrouter/model-test, agentic)"));
         assert!(result.output.contains("done"));
     }
 
@@ -3218,9 +3252,62 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or("")
-                .contains("no executable tools"),
+                .contains("no executable tools available from parent registry"),
             "got: {:?}",
             result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn agentic_mode_empty_allowed_tools_respects_excluded_tools() {
+        let mut agents = HashMap::new();
+        agents.insert("agentic".to_string(), agentic_agent_config());
+
+        let tool = DelegateTool::new(agents, None, test_security())
+            .with_providers_models(agentic_providers_models())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles_with_excluded(
+                Vec::new(),
+                vec!["echo_tool".to_string()],
+            ))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+        let result = tool
+            .execute(json!({"agent": "agentic", "prompt": "test"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("no executable tools after filtering denylist (echo_tool)")
+        );
+    }
+
+    #[tokio::test]
+    async fn agentic_mode_padded_allowed_tool_name_remains_exact() {
+        let mut agents = HashMap::new();
+        agents.insert("agentic".to_string(), agentic_agent_config());
+
+        let tool = DelegateTool::new(agents, None, test_security())
+            .with_providers_models(agentic_providers_models())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec![" echo_tool ".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+        let result = tool
+            .execute(json!({"agent": "agentic", "prompt": "test"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("no executable tools after filtering allowlist")
         );
     }
 
@@ -3758,6 +3845,47 @@ mod tests {
         }
     }
 
+    struct FinalOnlyModelProvider;
+
+    #[async_trait]
+    impl ModelProvider for FinalOnlyModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("delegate saw tool".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("delegate saw tool".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for FinalOnlyModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "FinalOnlyModelProvider"
+        }
+    }
+
     #[tokio::test]
     async fn mcp_tools_included_in_subagent_tool_list() {
         // Build DelegateTool with NO parent tools initially
@@ -3789,6 +3917,79 @@ mod tests {
         assert!(
             result.output.contains("mcp done"),
             "Expected output containing 'mcp done', got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_mcp_activation_updates_delegate_parent_tools() {
+        let config = agentic_agent_config();
+        let parent_tools: Arc<RwLock<Vec<Arc<dyn Tool>>>> = Arc::new(RwLock::new(Vec::new()));
+        let delegate = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec![
+                "mcp_service_a__list_projects".to_string(),
+            ]))
+            .with_parent_tools(Arc::clone(&parent_tools));
+
+        let activated = Arc::new(std::sync::Mutex::new(crate::tools::ActivatedToolSet::new()));
+        let deferred = crate::tools::DeferredMcpToolSet {
+            stubs: vec![{
+                let def = zeroclaw_tools::mcp_protocol::McpToolDef {
+                    name: "list_projects".to_string(),
+                    description: Some("List projects".to_string()),
+                    input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                };
+                zeroclaw_tools::mcp_deferred::DeferredMcpToolStub::new(
+                    "mcp_service_a__list_projects".to_string(),
+                    def,
+                )
+            }],
+            registry: Arc::new(
+                zeroclaw_tools::mcp_client::McpRegistry::connect_all(&[])
+                    .await
+                    .unwrap(),
+            ),
+        };
+        let handle = Arc::clone(&parent_tools);
+        let tool_search = crate::tools::ToolSearchTool::new(deferred, Arc::clone(&activated))
+            .with_activation_hook(Arc::new(move |tool| {
+                let mut tools = handle.write();
+                if !tools.iter().any(|existing| existing.name() == tool.name()) {
+                    tools.push(tool);
+                }
+            }));
+
+        let search = tool_search
+            .execute(serde_json::json!({"query": "select:mcp_service_a__list_projects"}))
+            .await
+            .unwrap();
+        assert!(search.success);
+
+        {
+            let tools = parent_tools.read();
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].name(), "mcp_service_a__list_projects");
+        }
+
+        let model_provider = FinalOnlyModelProvider;
+        let result = delegate
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &model_provider,
+                "run mcp",
+                Some(0.2),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "Expected success, got: {:?}", result.error);
+        assert!(
+            result.output.contains("delegate saw tool"),
+            "Expected final output from delegate loop, got: {}",
             result.output
         );
     }
@@ -4501,8 +4702,7 @@ mod tests {
         };
         let mut config = Config::default();
         // The caller delegates from the `narrow` profile, so that profile must
-        // authorize the target alias; without it the delegation_policy gate
-        // rejects before the escalation/narrowing checks under test are reached.
+        // allow delegation before the same-profile gate under test is reached.
         config.risk_profiles.insert(
             "narrow".to_string(),
             RiskProfileConfig {

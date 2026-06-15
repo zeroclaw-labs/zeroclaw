@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 
 /// Resolve a `cli-*` Fluent key for CLI output. Routes through the runtime
@@ -1489,6 +1490,9 @@ async fn run_quickstart_cli(
                     .with_prompt(format!("Alias for {}", chosen.display_name))
                     .default("default".to_string())
                     .allow_empty(false)
+                    .validate_with(|input: &String| {
+                        zeroclaw_config::helpers::validate_alias_key(input)
+                    })
                     .interact_text()
                 else {
                     continue;
@@ -1886,7 +1890,10 @@ async fn run_quickstart_cli(
                     .unwrap_or_default();
                 let mut input = Input::<String>::new()
                     .with_prompt("Agent alias")
-                    .allow_empty(false);
+                    .allow_empty(false)
+                    .validate_with(|input: &String| {
+                        zeroclaw_config::helpers::validate_alias_key(input)
+                    });
                 if !default_name.is_empty() {
                     input = input.default(default_name);
                 }
@@ -2401,6 +2408,8 @@ enum PluginCommands {
         /// Plugin name
         name: String,
     },
+    /// Move plugins from legacy install directories into the configured one
+    Migrate,
 }
 
 #[derive(Subcommand, Debug)]
@@ -3667,10 +3676,34 @@ async fn main() -> Result<()> {
                 let canvas_store_for_channels = canvas_store_for_channels.clone();
                 let mut registry = daemon::DaemonRegistry::new();
 
+                // Build SOP engine + audit per iteration from current_config.
+                // This ensures reload picks up config changes (new sops_dir,
+                // changed path, or removed sops_dir).
+                let (sop_engine, sop_audit) = if current_config.sop.sops_dir.is_some() {
+                    let mem: Arc<dyn zeroclaw_memory::Memory> =
+                        Arc::from(zeroclaw_memory::create_memory(
+                            &current_config.memory,
+                            &current_config.data_dir,
+                            None,
+                        )?);
+                    let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
+                        current_config.sop.clone(),
+                        &current_config.data_dir,
+                        mem,
+                    );
+                    (Some(engine), Some(audit))
+                } else {
+                    (None, None)
+                };
+
                 #[cfg(feature = "gateway")]
-                registry.register_gateway(Box::new(
+                registry.register_gateway(Box::new({
+                    let sop_e = sop_engine.clone();
+                    let sop_a = sop_audit.clone();
                     move |host, port, config, tx, reload_tx, tui_registry| {
                         let canvas_store = canvas_store_for_gateway.clone();
+                        let sop_engine = sop_e.clone();
+                        let sop_audit = sop_a.clone();
                         Box::pin(async move {
                             Box::pin(zeroclaw_gateway::run_gateway(
                                 &host,
@@ -3680,50 +3713,63 @@ async fn main() -> Result<()> {
                                 reload_tx,
                                 tui_registry,
                                 Some(canvas_store),
+                                sop_engine,
+                                sop_audit,
                             ))
                             .await
                         })
-                    },
-                ));
+                    }
+                }));
 
-                registry.register_channels(Box::new(move |config, cancel| {
-                    let canvas_store = canvas_store_for_channels.clone();
-                    Box::pin(async move {
-                        Box::pin(zeroclaw_channels::orchestrator::start_channels(
-                            config,
-                            Some(canvas_store),
-                            cancel,
-                        ))
-                        .await
-                    })
+                registry.register_channels(Box::new({
+                    let sop_e = sop_engine.clone();
+                    let sop_a = sop_audit.clone();
+                    move |config, cancel| {
+                        let canvas_store = canvas_store_for_channels.clone();
+                        let sop_engine = sop_e.clone();
+                        let sop_audit = sop_a.clone();
+                        Box::pin(async move {
+                            Box::pin(zeroclaw_channels::orchestrator::start_channels(
+                                config,
+                                Some(canvas_store),
+                                cancel,
+                                sop_engine,
+                                sop_audit,
+                            ))
+                            .await
+                        })
+                    }
                 }));
 
                 #[cfg(feature = "channel-mqtt")]
                 registry.register_mqtt(Box::new({
-                    use std::sync::{Arc, Mutex};
-                    use zeroclaw_config::schema::SopConfig;
-                    use zeroclaw_memory::NoneMemory;
-                    use zeroclaw_runtime::sop::{SopAuditLogger, SopEngine};
-                    let sop_config = current_config.sop.clone();
-                    let workspace_dir = current_config.data_dir.clone();
+                    let engine = sop_engine.clone();
+                    let audit = sop_audit.clone();
                     move |mqtt_config| {
-                        let engine = if sop_config.sops_dir.is_some() {
-                            let mut e = SopEngine::new(sop_config.clone());
-                            e.reload(&workspace_dir);
-                            e
-                        } else {
-                            SopEngine::new(SopConfig::default())
-                        };
-                        let engine = Arc::new(Mutex::new(engine));
-                        let audit =
-                            Arc::new(SopAuditLogger::new(Arc::new(NoneMemory::new("none"))));
+                        let engine = engine.clone();
+                        let audit = audit.clone();
                         Box::pin(async move {
-                            zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
-                                &mqtt_config,
-                                engine,
-                                audit,
-                            )
-                            .await
+                            if let (Some(engine), Some(audit)) = (engine, audit) {
+                                zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
+                                    &mqtt_config,
+                                    engine,
+                                    audit,
+                                )
+                                .await
+                            } else {
+                                // No SOPs directory configured — this is a valid
+                                // user state, not a misconfiguration. Skip the
+                                // listener gracefully.
+                                ::zeroclaw_log::record!(
+                                    INFO,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Skip
+                                    ),
+                                    "MQTT SOP listener skipped — no SOPs directory configured"
+                                );
+                                Ok(())
+                            }
                         })
                     }
                 }));
@@ -3759,6 +3805,11 @@ async fn main() -> Result<()> {
                         .await
                     })
                 }));
+
+                // Pass the shared SOP engine through the registry so
+                // RpcContext (RPC/TUI agent sessions) can share it.
+                registry.set_sop_engine(sop_engine, sop_audit);
+
                 let exit = Box::pin(daemon::run(
                     current_config.clone(),
                     host.clone(),
@@ -3936,7 +3987,7 @@ async fn main() -> Result<()> {
                     "Runtime"
                 )
             );
-            if service::is_running() {
+            if service::is_running(&config) {
                 println!(
                     "{}",
                     t("cli-status-service-running", "🟢 Service:       running")
@@ -4218,7 +4269,23 @@ async fn main() -> Result<()> {
                 }));
 
                 let cancel = tokio_util::sync::CancellationToken::new();
-                Box::pin(channels::start_channels(config, None, cancel)).await
+                let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
+                    let mem: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
+                        zeroclaw_memory::create_memory(&config.memory, &config.data_dir, None)?,
+                    );
+                    let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
+                        config.sop.clone(),
+                        &config.data_dir,
+                        mem,
+                    );
+                    (Some(engine), Some(audit))
+                } else {
+                    (None, None)
+                };
+                Box::pin(channels::start_channels(
+                    config, None, cancel, sop_engine, sop_audit,
+                ))
+                .await
             }
             ChannelCommands::Doctor => Box::pin(channels::doctor_channels(config)).await,
             other => Box::pin(channels::handle_command(other, &config)).await,
@@ -5264,7 +5331,9 @@ async fn main() -> Result<()> {
         #[cfg(feature = "plugins-wasm")]
         Commands::Plugin { plugin_command } => match plugin_command {
             PluginCommands::List => {
-                let host = zeroclaw::plugins::host::PluginHost::new(&config.data_dir)?;
+                let host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(
+                    &config.plugins.resolved_plugins_dir(),
+                )?;
                 let plugins = host.list_plugins();
                 if plugins.is_empty() {
                     println!("{}", t("cli-plugins-none", "No plugins installed."));
@@ -5279,10 +5348,24 @@ async fn main() -> Result<()> {
                         );
                     }
                 }
+                let target = config.plugins.resolved_plugins_dir().display().to_string();
+                for legacy in crate::config::schema::legacy_plugin_dirs_with_entries(&config) {
+                    eprintln!(
+                        "{}",
+                        ta(
+                            "cli-plugin-legacy-detected",
+                            &[("path", &legacy.display().to_string()), ("target", &target)],
+                            "Note: plugins in a legacy location are not loaded by the agent — \
+                             run `zeroclaw plugin migrate` to move them.",
+                        )
+                    );
+                }
                 Ok(())
             }
             PluginCommands::Install { source } => {
-                let mut host = zeroclaw::plugins::host::PluginHost::new(&config.data_dir)?;
+                let mut host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(
+                    &config.plugins.resolved_plugins_dir(),
+                )?;
                 host.install(&source)?;
                 println!(
                     "{}",
@@ -5295,7 +5378,9 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             PluginCommands::Remove { name } => {
-                let mut host = zeroclaw::plugins::host::PluginHost::new(&config.data_dir)?;
+                let mut host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(
+                    &config.plugins.resolved_plugins_dir(),
+                )?;
                 host.remove(&name)?;
                 println!(
                     "{}",
@@ -5304,7 +5389,9 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             PluginCommands::Info { name } => {
-                let host = zeroclaw::plugins::host::PluginHost::new(&config.data_dir)?;
+                let host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(
+                    &config.plugins.resolved_plugins_dir(),
+                )?;
                 match host.get_plugin(&name) {
                     Some(info) => {
                         println!(
@@ -5360,6 +5447,34 @@ async fn main() -> Result<()> {
                             "Plugin not found"
                         )
                     ),
+                }
+                Ok(())
+            }
+            PluginCommands::Migrate => {
+                let target = config.plugins.resolved_plugins_dir();
+                let target_str = target.display().to_string();
+                let legacy_dirs = crate::config::schema::legacy_plugin_dirs_with_entries(&config);
+                let mut total = 0usize;
+                for legacy in &legacy_dirs {
+                    let moved = zeroclaw::plugins::host::migrate_plugins_dir(legacy, &target)?;
+                    if moved > 0 {
+                        println!(
+                            "{}",
+                            ta(
+                                "cli-plugin-migrated",
+                                &[
+                                    ("count", &moved.to_string()),
+                                    ("path", &legacy.display().to_string()),
+                                    ("target", &target_str),
+                                ],
+                                "Migrated plugins from a legacy location.",
+                            )
+                        );
+                    }
+                    total += moved;
+                }
+                if total == 0 {
+                    println!("{}", t("cli-plugin-migrate-none", "Nothing to migrate."));
                 }
                 Ok(())
             }
@@ -6357,7 +6472,7 @@ async fn run_gateway_if_enabled(
     // manually" message, None for tui_registry (no TUI socket), and None
     // for canvas_store so the gateway falls back to its own default.
     let result = Box::pin(gateway::run_gateway(
-        host, port, config, tx, None, None, None,
+        host, port, config, tx, None, None, None, None, None,
     ))
     .await;
     match result {

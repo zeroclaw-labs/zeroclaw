@@ -904,6 +904,19 @@ pub async fn run(
         } else {
             (None, None)
         };
+
+        // Build SOP engine when sops_dir is configured so SOP tools are
+        // available on this path (CLI agent run).
+        let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
+            let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
+                zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
+            let (engine, audit) =
+                crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, sop_mem);
+            (Some(engine), Some(audit))
+        } else {
+            (None, None)
+        };
+
         let all_tools_result = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
@@ -923,6 +936,8 @@ pub async fn run(
             None,
             is_subagent_caller,
             None,
+            sop_engine,
+            sop_audit,
         );
         let mut tools_registry = all_tools_result.tools;
         let delegate_handle = all_tools_result.delegate_handle;
@@ -1058,6 +1073,20 @@ pub async fn run(
                                 crate::tools::ToolSearchTool::new(deferred_set, activated);
                             if let Some(policy) = mcp_policy {
                                 tool_search = tool_search.with_access_policy(policy);
+                            }
+                            if let Some(ref handle) = delegate_handle {
+                                let delegate_tools = std::sync::Arc::clone(handle);
+                                tool_search = tool_search.with_activation_hook(
+                                    std::sync::Arc::new(move |tool| {
+                                        let mut tools = delegate_tools.write();
+                                        let already_registered = tools
+                                            .iter()
+                                            .any(|existing| existing.name() == tool.name());
+                                        if !already_registered {
+                                            tools.push(tool);
+                                        }
+                                    }),
+                                );
                             }
                             tools_registry.push(Box::new(tool_search));
                         }
@@ -2400,6 +2429,19 @@ pub async fn process_message(
         } else {
             (None, None)
         };
+
+        // Build SOP engine when sops_dir is configured so SOP tools are
+        // available on this path (process_message CLI agent).
+        let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
+            let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
+                zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
+            let (engine, audit) =
+                crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, sop_mem);
+            (Some(engine), Some(audit))
+        } else {
+            (None, None)
+        };
+
         let all_tools_result_pm = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
@@ -2421,6 +2463,8 @@ pub async fn process_message(
             None,
             false,
             None,
+            sop_engine,
+            sop_audit,
         );
         let mut tools_registry = all_tools_result_pm.tools;
         let delegate_handle_pm = all_tools_result_pm.delegate_handle;
@@ -2521,6 +2565,20 @@ pub async fn process_message(
                                 crate::tools::ToolSearchTool::new(deferred_set, activated);
                             if let Some(policy) = mcp_policy_pm {
                                 tool_search_pm = tool_search_pm.with_access_policy(policy);
+                            }
+                            if let Some(ref handle) = delegate_handle_pm {
+                                let delegate_tools = std::sync::Arc::clone(handle);
+                                tool_search_pm = tool_search_pm.with_activation_hook(
+                                    std::sync::Arc::new(move |tool| {
+                                        let mut tools = delegate_tools.write();
+                                        let already_registered = tools
+                                            .iter()
+                                            .any(|existing| existing.name() == tool.name());
+                                        if !already_registered {
+                                            tools.push(tool);
+                                        }
+                                    }),
+                                );
                             }
                             tools_registry.push(Box::new(tool_search_pm));
                         }
