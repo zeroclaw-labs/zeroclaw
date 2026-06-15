@@ -238,6 +238,45 @@ mime_guess = { version = "2", optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Installer/surface metadata: which `[features]` are internal aggregates or
+# meta toggles rather than user-selectable rows. This bit is NOT derivable from
+# the feature graph (e.g. `embedded-web` and `whatsapp-web` are structurally
+# identical single cross-crate refs but one is meta and one is a real row), so
+# it lives here in the canonical registry. install.sh and `cargo cmd convert`
+# both read this; neither shadows it with its own list.
+[package.metadata.zeroclaw]
+non_row_features = [
+    "default",
+    "default-channels",
+    "channels-full",
+    "ci-all",
+    "fantoccini",
+    "landlock",
+    "metrics",
+    "embedded-web",
+]
+# Heavyweight non-channel features excluded from the default binary
+# distribution (`Selection::Dist`): they pull large native/ML deps and would
+# bloat the single artifact for users who never use them. Still opt-in via
+# source `--features`, the docker `:all-features` tag, or a nix override. This
+# "too big for the default download" bit is not derivable from the feature
+# graph, so it lives here in the canonical registry; never shadowed.
+heavyweight_features = [
+    "hardware",
+    "browser-native",
+    "rag-pdf",
+    "voice-wake",
+]
+
+# Features whose build needs system C libraries or tooling the minimal static
+# container image (StageX, no system package manager) does not provide. Excluded
+# from the container kitchen-sink (Selection::All) so the all-features image
+# builds; still available via source --features or a nix override. Not derivable
+# from the feature graph, so it lives in the canonical registry.
+container_excluded_features = [
+    "voice-wake",
+]
+
 [features]
 default = [
     "agent-runtime",

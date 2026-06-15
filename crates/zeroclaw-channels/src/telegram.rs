@@ -863,7 +863,8 @@ impl TelegramChannel {
             anyhow::bail!("Cannot persist empty Telegram identity");
         }
         let group_name = format!("telegram_{}", self.alias);
-        let channel_ref = format!("telegram.{}", self.alias);
+        let channel_ref: zeroclaw_config::providers::ChannelRef =
+            format!("telegram.{}", self.alias).into();
         let snapshot = {
             let mut cfg = config.write();
             if !cfg.channels.telegram.contains_key(&self.alias) {
@@ -1870,7 +1871,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             sender: sender_identity,
             reply_target,
             content,
-            channel: "telegram".to_string(),
+            channel: "telegram".into(),
             channel_alias: Some(self.alias.clone()),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2039,7 +2040,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             sender: sender_identity,
             reply_target,
             content,
-            channel: "telegram".to_string(),
+            channel: "telegram".into(),
             channel_alias: Some(self.alias.clone()),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2309,7 +2310,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             sender: sender_identity,
             reply_target,
             content,
-            channel: "telegram".to_string(),
+            channel: "telegram".into(),
             channel_alias: Some(self.alias.clone()),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -4119,7 +4120,7 @@ mod tests {
         config.peer_groups.insert(
             "voicers".to_string(),
             PeerGroupConfig {
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 external_peers: vec![PeerUsername::new("@alice"), PeerUsername::new("@bob")],
                 output_modality: OutputModality::Voice,
                 ..Default::default()
@@ -4129,7 +4130,7 @@ mod tests {
         config.peer_groups.insert(
             "other".to_string(),
             PeerGroupConfig {
-                channel: "signal".to_string(),
+                channel: "signal".into(),
                 external_peers: vec![PeerUsername::new("@carol")],
                 output_modality: OutputModality::Voice,
                 ..Default::default()
@@ -4139,7 +4140,7 @@ mod tests {
         config.peer_groups.insert(
             "mirrorers".to_string(),
             PeerGroupConfig {
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 external_peers: vec![PeerUsername::new("@dave")],
                 output_modality: OutputModality::Mirror,
                 ..Default::default()
@@ -4183,7 +4184,7 @@ mod tests {
         config.peer_groups.insert(
             "voicers".to_string(),
             PeerGroupConfig {
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 external_peers: vec![PeerUsername::new("@alice")],
                 output_modality: OutputModality::Voice,
                 ..Default::default()

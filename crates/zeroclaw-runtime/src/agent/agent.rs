@@ -3432,7 +3432,7 @@ mod tests {
         );
         let agent_cfg = zeroclaw_config::schema::AliasedAgentConfig {
             model_provider: "custom.default".into(),
-            risk_profile: "test-profile".to_string(),
+            risk_profile: "test-profile".into(),
             ..zeroclaw_config::schema::AliasedAgentConfig::default()
         };
         config.agents.insert("test-agent".to_string(), agent_cfg);
@@ -3498,7 +3498,7 @@ mod tests {
             "test-agent".to_string(),
             AliasedAgentConfig {
                 model_provider: "openai.codex".into(),
-                risk_profile: "test-profile".to_string(),
+                risk_profile: "test-profile".into(),
                 ..AliasedAgentConfig::default()
             },
         );
