@@ -31,6 +31,7 @@ pub fn catalog_source_for(family: &str) -> Option<(Option<&'static str>, Option<
         "minimax" => (Some("minimax"), Some("minimax")),
         "lmstudio" => (Some("lmstudio"), None),
         "kilocli" => (Some("kilo"), None),
+        "kilo" => (Some("kilo"), None),
         "ovh" => (Some("ovhcloud"), None),
         // Compat families — mirrors the consts in CompatFamilySpec impls.
         "moonshot" => (Some("moonshotai"), Some("moonshotai")),
@@ -100,6 +101,84 @@ pub async fn list_models_for_family(family: &str) -> Result<Vec<String>> {
     anyhow::bail!("no public catalog for family {family:?}")
 }
 
+/// Sort a raw public model catalog for first-run chat/code setup.
+///
+/// This is a provisional catalog-level heuristic until per-model capabilities
+/// become explicit catalog data. Keeping it with the catalog source prevents
+/// every UI/client surface from growing its own model-name classifier.
+#[must_use]
+pub fn sort_model_catalog_for_chat(provider: &str, models: Vec<String>) -> Option<Vec<String>> {
+    let provider_l = provider.to_ascii_lowercase();
+    let mut ranked: Vec<(i32, String, String)> = models
+        .into_iter()
+        .filter_map(|model| {
+            let model_l = model.to_ascii_lowercase();
+            if is_non_chat_model_lower(&model_l) {
+                None
+            } else {
+                Some((chat_model_rank_lower(&provider_l, &model_l), model_l, model))
+            }
+        })
+        .collect();
+    if ranked.is_empty() {
+        return None;
+    }
+    ranked.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    Some(ranked.into_iter().map(|(_, _, model)| model).collect())
+}
+
+fn chat_model_rank_lower(provider: &str, model_l: &str) -> i32 {
+    let mut rank = 100;
+
+    if provider.starts_with("openai") {
+        if model_l.starts_with("gpt-5") {
+            rank -= 70;
+        } else if model_l.starts_with("gpt-4.1")
+            || model_l.starts_with("gpt-4o")
+            || model_l.starts_with("o3")
+            || model_l.starts_with("o4")
+        {
+            rank -= 55;
+        } else if model_l.starts_with("gpt-3.5") {
+            rank -= 10;
+        }
+    } else if contains_any(
+        model_l,
+        &[
+            "claude", "sonnet", "opus", "gpt", "gemini", "deepseek", "qwen", "kimi", "llama",
+            "mistral", "grok", "coder", "code", "reason", "r1", "o3", "o4",
+        ],
+    ) {
+        rank -= 45;
+    }
+
+    rank
+}
+
+fn is_non_chat_model_lower(model: &str) -> bool {
+    contains_any(
+        model,
+        &[
+            "image",
+            "audio",
+            "tts",
+            "transcribe",
+            "embedding",
+            "moderation",
+            "realtime",
+            "whisper",
+        ],
+    )
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,5 +240,49 @@ mod tests {
         let (md, or) = catalog_source_for("ai21").expect("ai21 is canonical");
         assert_eq!(md, None);
         assert_eq!(or, Some("ai21"));
+    }
+
+    #[test]
+    fn quickstart_sort_prefers_chat_and_coding_models() {
+        let sorted = sort_model_catalog_for_chat(
+            "openai",
+            vec![
+                "chatgpt-image-latest".into(),
+                "text-embedding-ada-002".into(),
+                "gpt-3.5-turbo".into(),
+                "gpt-5".into(),
+                "tts-1".into(),
+            ],
+        )
+        .expect("chat model catalog");
+
+        assert_eq!(sorted[0], "gpt-5");
+        assert!(!sorted.iter().any(|m| m == "chatgpt-image-latest"));
+        assert!(!sorted.iter().any(|m| m == "text-embedding-ada-002"));
+        assert!(!sorted.iter().any(|m| m == "tts-1"));
+
+        let sorted = sort_model_catalog_for_chat(
+            "openrouter",
+            vec![
+                "ai21/jamba-mini".into(),
+                "openai/gpt-4.1".into(),
+                "some/image-model".into(),
+                "anthropic/claude-sonnet-4".into(),
+            ],
+        )
+        .expect("chat model catalog");
+        assert_eq!(sorted[0], "anthropic/claude-sonnet-4");
+        assert_eq!(sorted[1], "openai/gpt-4.1");
+        assert!(!sorted.iter().any(|m| m == "some/image-model"));
+    }
+
+    #[test]
+    fn quickstart_sort_returns_none_when_only_non_chat_models_exist() {
+        let sorted = sort_model_catalog_for_chat(
+            "openai",
+            vec!["gpt-image-1.5".into(), "text-embedding-ada-002".into()],
+        );
+
+        assert!(sorted.is_none());
     }
 }

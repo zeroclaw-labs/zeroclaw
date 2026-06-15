@@ -39,7 +39,8 @@ use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use dialoguer::{Password, Select};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::fmt::Write as _;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 
@@ -268,8 +269,6 @@ mod platform;
 #[cfg(feature = "plugins-wasm")]
 mod plugins;
 mod providers;
-#[cfg(feature = "schema-export")]
-mod schema_markdown;
 #[cfg(feature = "agent-runtime")]
 mod security;
 #[cfg(feature = "agent-runtime")]
@@ -382,8 +381,8 @@ impl LogLevel {
 enum Commands {
     /// Quickstart — create one working agent end-to-end. Replaces the
     /// section-by-section onboarding flow with a single preset-driven
-    /// path. Non-interactive in this build: writes balanced defaults
-    /// for risk/runtime/memory and prints next-step instructions.
+    /// path. Interactive: the flags below pre-seed checklist selectors
+    /// but do not skip them; a terminal is required.
     Quickstart {
         /// Provider type (anthropic / openai / openrouter / ollama).
         #[arg(long)]
@@ -433,7 +432,7 @@ enum Commands {
         api_key: Option<String>,
 
         /// ModelProvider name. Used as the type key for the synthesized
-        /// `[model_providers.<type>.default]` entry.
+        /// `[providers.models.<type>.default]` entry.
         #[arg(long, hide = true)]
         model_provider: Option<String>,
 
@@ -1076,12 +1075,34 @@ async fn run_quickstart_cli(
     use dialoguer::{Confirm, Editor, FuzzySelect, Input, Password};
     use zeroclaw_config::presets::{
         AgentIdentity, BuilderSubmission, ChannelQuickStart, MemoryChoice, ModelProviderChoice,
-        RISK_PRESETS, RUNTIME_PRESETS, SelectorChoice,
+        RISK_PRESETS, SelectorChoice,
     };
     use zeroclaw_runtime::quickstart::{
         FieldSection, QuickstartTypeOption, Surface, apply_with_surface, field_shape,
         snapshot_state,
     };
+
+    // The checklist below is driven by dialoguer prompts, which read keys
+    // from stdin and render on `Term::stderr()`. If *either* end is not an
+    // interactive terminal the selector cannot make progress: with a
+    // non-TTY stdin or stderr `read_key()` yields `Key::Unknown`, which
+    // `FuzzySelect` does not treat as a terminal condition, so it redraws
+    // in a tight loop forever instead of failing (#7507 — e.g. piped stdin
+    // `echo "" | … quickstart`, or redirected stderr `… quickstart > log 2>&1`).
+    // Fail fast and point headless callers at the scriptable alternative.
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin())
+        || !std::io::IsTerminal::is_terminal(&std::io::stderr())
+    {
+        anyhow::bail!(
+            "{}",
+            t(
+                "cli-quickstart-needs-tty",
+                "Quickstart is interactive and needs a terminal on stdin and stderr. \
+                 Run it from an interactive shell, or use \
+                 `zeroclaw config set <path> <value>` for headless configuration."
+            )
+        );
+    }
 
     // ── Form state ──────────────────────────────────────────────
     //
@@ -1093,7 +1114,6 @@ async fn run_quickstart_cli(
     struct Form {
         provider: Option<ProviderChoice>,
         risk: Option<PresetChoice>,
-        runtime: Option<PresetChoice>,
         memory: Option<MemoryChoice>,
         channels: Vec<ChannelChoice>,
         // Tracks whether the user explicitly visited Channels and
@@ -1153,9 +1173,6 @@ async fn run_quickstart_cli(
         fn risk_done(&self) -> bool {
             self.risk.is_some()
         }
-        fn runtime_done(&self) -> bool {
-            self.runtime.is_some()
-        }
         fn memory_done(&self) -> bool {
             self.memory.is_some()
         }
@@ -1173,7 +1190,6 @@ async fn run_quickstart_cli(
         fn all_done(&self) -> bool {
             self.provider_done()
                 && self.risk_done()
-                && self.runtime_done()
                 && self.memory_done()
                 && self.channels_done()
                 && self.agent_done()
@@ -1212,7 +1228,10 @@ async fn run_quickstart_cli(
             let mut fields: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
             if let Some(key) = api_key.as_deref().filter(|s| !s.is_empty()) {
-                fields.insert("api-key".to_string(), key.to_string());
+                // Submission field keys are snake_case (`api_key`) — the apply
+                // path round-trips them verbatim into `set_prop_persistent`,
+                // which rejects kebab-case with "Unknown property".
+                fields.insert("api_key".to_string(), key.to_string());
             }
             form.provider = Some(ProviderChoice::Fresh {
                 kind: found.kind.clone(),
@@ -1239,7 +1258,6 @@ async fn run_quickstart_cli(
     enum Action {
         Provider,
         Risk,
-        Runtime,
         Memory,
         Channels,
         PeerGroups,
@@ -1331,11 +1349,6 @@ async fn run_quickstart_cli(
                 preset_summary(&form.risk)
             ),
             format!(
-                "{} Runtime profile    — {}",
-                glyph(form.runtime_done()),
-                preset_summary(&form.runtime)
-            ),
-            format!(
                 "{} Memory             — {memory_summary}",
                 glyph(form.memory_done())
             ),
@@ -1354,15 +1367,17 @@ async fn run_quickstart_cli(
         ];
         let create_enabled = form.all_done();
         labels.push(if create_enabled {
-            "── Create agent".to_string()
+            t("cli-quickstart-create-agent", "── Create agent")
         } else {
-            "── Create agent (locked — fill every selector first)".to_string()
+            t(
+                "cli-quickstart-create-agent-locked",
+                "── Create agent (locked — fill every selector first)",
+            )
         });
 
         let actions = [
             Action::Provider,
             Action::Risk,
-            Action::Runtime,
             Action::Memory,
             Action::Channels,
             Action::PeerGroups,
@@ -1371,7 +1386,10 @@ async fn run_quickstart_cli(
         ];
 
         let pick = FuzzySelect::new()
-            .with_prompt("Open a selector (Enter), or pick Create. Esc to quit.")
+            .with_prompt(t(
+                "cli-quickstart-open-selector-prompt",
+                "Open a selector (Enter), or pick Create. Esc to quit.",
+            ))
             .items(&labels)
             .default(0)
             .max_length(labels.len())
@@ -1411,16 +1429,16 @@ async fn run_quickstart_cli(
                 let mut mode_labels: Vec<String> = Vec::new();
                 let mut mode_kinds: Vec<&str> = Vec::new();
                 if !state.model_providers.is_empty() {
-                    mode_labels.push("Use existing".to_string());
+                    mode_labels.push(t("cli-quickstart-use-existing", "Use existing"));
                     mode_kinds.push("existing");
                 }
-                mode_labels.push("Create new".to_string());
+                mode_labels.push(t("cli-quickstart-create-new", "Create new"));
                 mode_kinds.push("fresh");
                 let mode = if mode_labels.len() == 1 {
                     Some(0)
                 } else {
                     FuzzySelect::new()
-                        .with_prompt("Model provider")
+                        .with_prompt(t("cli-quickstart-model-provider-prompt", "Model provider"))
                         .items(&mode_labels)
                         .default(0)
                         .max_length(mode_labels.len())
@@ -1430,7 +1448,10 @@ async fn run_quickstart_cli(
                 if mode_kinds[mi] == "existing" {
                     let labels: Vec<String> = state.model_providers.clone();
                     let Some(i) = FuzzySelect::new()
-                        .with_prompt("Pick a configured provider")
+                        .with_prompt(t(
+                            "cli-quickstart-pick-configured-provider",
+                            "Pick a configured provider",
+                        ))
                         .items(&labels)
                         .default(0)
                         .max_length(labels.len().max(1))
@@ -1485,7 +1506,7 @@ async fn run_quickstart_cli(
                     // leaves the descriptor unchanged → free-text fallback.
                     let upgraded;
                     let d_used = if d.key.eq_ignore_ascii_case("model") {
-                        let (models, live) =
+                        let (models, _pricing, live) =
                             zeroclaw_runtime::quickstart::model_catalog(&chosen.kind).await;
                         if live && !models.is_empty() {
                             upgraded = zeroclaw_runtime::quickstart::FieldDescriptor {
@@ -1558,22 +1579,6 @@ async fn run_quickstart_cli(
                 )?;
                 if let Some(c) = chosen {
                     form.risk = Some(match c {
-                        Ok(name) => PresetChoice::Fresh(name),
-                        Err(alias) => PresetChoice::Existing(alias),
-                    });
-                }
-            }
-            Action::Runtime => {
-                let chosen = pick_preset(
-                    "Runtime profile",
-                    RUNTIME_PRESETS
-                        .iter()
-                        .map(|p| (p.preset_name, p.label, p.help))
-                        .collect(),
-                    &state.runtime_profiles,
-                )?;
-                if let Some(c) = chosen {
-                    form.runtime = Some(match c {
                         Ok(name) => PresetChoice::Fresh(name),
                         Err(alias) => PresetChoice::Existing(alias),
                     });
@@ -2082,10 +2087,9 @@ async fn run_quickstart_cli(
         PresetChoice::Fresh(n) => SelectorChoice::Fresh(n.to_string()),
         PresetChoice::Existing(a) => SelectorChoice::Existing(a),
     };
-    let runtime_profile = match form.runtime.expect("runtime satisfied") {
-        PresetChoice::Fresh(n) => SelectorChoice::Fresh(n.to_string()),
-        PresetChoice::Existing(a) => SelectorChoice::Existing(a),
-    };
+    // Runtime profile picker removed from all surfaces; apply silently
+    // forces the `unbounded` preset. Submit it so the field stays well-formed.
+    let runtime_profile = SelectorChoice::Fresh("unbounded".to_string());
     let memory = SelectorChoice::Fresh(form.memory.expect("memory satisfied"));
     let channels = form
         .channels
@@ -2141,7 +2145,7 @@ async fn run_quickstart_cli(
             println!();
             println!("{}", t("cli-next-steps", "Next steps:"));
             println!(
-                "  zeroclaw agent {}  # chat with this agent in your terminal",
+                "  zeroclaw agent -a {}  # chat with this agent in your terminal",
                 applied.alias
             );
             if which_zerocode_on_path() {
@@ -2452,7 +2456,7 @@ enum ConfigCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Migrate config.toml to the current schema version on disk (preserves comments)
+    /// Migrate the on-disk config to the current schema version (preserves comments)
     Migrate {
         /// Emit a structured JSON envelope ({migrated, backup_path?, schema_version}) instead of plain text.
         #[arg(long)]
@@ -2939,7 +2943,10 @@ async fn main() -> Result<()> {
             #[cfg(feature = "schema-export")]
             {
                 let schema = schemars::schema_for!(config::Config);
-                print!("{}", schema_markdown::generate(&schema.to_value()));
+                print!(
+                    "{}",
+                    zeroclaw_config::schema_markdown::generate(&schema.to_value())
+                );
                 return Ok(());
             }
             #[cfg(not(feature = "schema-export"))]
@@ -3466,37 +3473,18 @@ async fn main() -> Result<()> {
                             );
                         }
                         Ok(PaircodeResult::NoCode { message }) => {
-                            if let Some(message) = message {
-                                println!("⚠️  {message}");
-                            } else if config.gateway.require_pairing {
-                                println!(
-                                    "🔐 Gateway pairing is enabled, but no active pairing code available."
-                                );
-                                println!(
-                                    "   The gateway may already be paired, or the code has been used."
-                                );
-                                println!(
-                                    "{}",
-                                    t(
-                                        "cli-pairing-restart",
-                                        "   Restart the gateway to generate a new pairing code."
-                                    )
-                                );
-                            } else {
-                                println!(
-                                    "{}",
-                                    t(
-                                        "cli-pairing-disabled",
-                                        "⚠️  Gateway pairing is disabled in config."
-                                    )
-                                );
-                                println!(
-                                    "   All requests will be accepted without authentication."
-                                );
-                                println!(
-                                    "   To enable pairing, set [gateway] require_pairing = true"
-                                );
-                            }
+                            println!(
+                                "{}",
+                                paircode_no_code_message(
+                                    &host,
+                                    port,
+                                    &config.gateway.host,
+                                    config.gateway.port,
+                                    &action,
+                                    config.gateway.require_pairing,
+                                    message.as_deref(),
+                                )
+                            );
                         }
                         Err(e) => {
                             println!(
@@ -3607,7 +3595,8 @@ async fn main() -> Result<()> {
                     .filter(|(_, a)| a.enabled)
                     .filter_map(|(alias, _)| config.risk_profile_for_agent(alias))
                     .any(|p| matches!(p.sandbox_config().backend, SandboxBackend::Docker));
-                let runtime_docker_mem = config.runtime.kind == "docker"
+                let runtime_docker_mem = config.runtime.kind
+                    == zeroclaw_config::schema::RuntimeKind::Docker
                     && config
                         .runtime
                         .docker
@@ -3676,109 +3665,105 @@ async fn main() -> Result<()> {
                 // first iteration; reload would otherwise see a moved value.
                 let canvas_store_for_gateway = canvas_store_for_gateway.clone();
                 let canvas_store_for_channels = canvas_store_for_channels.clone();
-                let subsystems = daemon::DaemonSubsystems {
-                    #[cfg(feature = "gateway")]
-                    gateway_start: Some(Box::new(
-                        move |host, port, config, tx, reload_tx, tui_registry| {
-                            let canvas_store = canvas_store_for_gateway.clone();
-                            Box::pin(async move {
-                                Box::pin(zeroclaw_gateway::run_gateway(
-                                    &host,
-                                    port,
-                                    config,
-                                    tx,
-                                    reload_tx,
-                                    tui_registry,
-                                    Some(canvas_store),
-                                ))
-                                .await
-                            })
-                        },
-                    )),
-                    #[cfg(not(feature = "gateway"))]
-                    gateway_start: None,
-                    channels_start: Some(Box::new(move |config, cancel| {
-                        let canvas_store = canvas_store_for_channels.clone();
+                let mut registry = daemon::DaemonRegistry::new();
+
+                #[cfg(feature = "gateway")]
+                registry.register_gateway(Box::new(
+                    move |host, port, config, tx, reload_tx, tui_registry| {
+                        let canvas_store = canvas_store_for_gateway.clone();
                         Box::pin(async move {
-                            Box::pin(zeroclaw_channels::orchestrator::start_channels(
+                            Box::pin(zeroclaw_gateway::run_gateway(
+                                &host,
+                                port,
                                 config,
+                                tx,
+                                reload_tx,
+                                tui_registry,
                                 Some(canvas_store),
-                                cancel,
                             ))
                             .await
                         })
-                    })),
-                    #[cfg(feature = "channel-mqtt")]
-                    mqtt_start: Some(Box::new({
-                        use std::sync::{Arc, Mutex};
-                        use zeroclaw_config::schema::SopConfig;
-                        use zeroclaw_memory::NoneMemory;
-                        use zeroclaw_runtime::sop::{SopAuditLogger, SopEngine};
-                        let sop_config = current_config.sop.clone();
-                        let workspace_dir = current_config.data_dir.clone();
-                        move |mqtt_config| {
-                            let engine = if sop_config.sops_dir.is_some() {
-                                let mut e = SopEngine::new(sop_config.clone());
-                                e.reload(&workspace_dir);
-                                e
-                            } else {
-                                SopEngine::new(SopConfig::default())
-                            };
-                            let engine = Arc::new(Mutex::new(engine));
-                            let audit =
-                                Arc::new(SopAuditLogger::new(Arc::new(NoneMemory::new("none"))));
-                            Box::pin(async move {
-                                zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
-                                    &mqtt_config,
-                                    engine,
-                                    audit,
-                                )
-                                .await
-                            })
-                        }
-                    })),
-                    socket_start: Some(Box::new(|ctx, cancel, client_count| {
+                    },
+                ));
+
+                registry.register_channels(Box::new(move |config, cancel| {
+                    let canvas_store = canvas_store_for_channels.clone();
+                    Box::pin(async move {
+                        Box::pin(zeroclaw_channels::orchestrator::start_channels(
+                            config,
+                            Some(canvas_store),
+                            cancel,
+                        ))
+                        .await
+                    })
+                }));
+
+                #[cfg(feature = "channel-mqtt")]
+                registry.register_mqtt(Box::new({
+                    use std::sync::{Arc, Mutex};
+                    use zeroclaw_config::schema::SopConfig;
+                    use zeroclaw_memory::NoneMemory;
+                    use zeroclaw_runtime::sop::{SopAuditLogger, SopEngine};
+                    let sop_config = current_config.sop.clone();
+                    let workspace_dir = current_config.data_dir.clone();
+                    move |mqtt_config| {
+                        let engine = if sop_config.sops_dir.is_some() {
+                            let mut e = SopEngine::new(sop_config.clone());
+                            e.reload(&workspace_dir);
+                            e
+                        } else {
+                            SopEngine::new(SopConfig::default())
+                        };
+                        let engine = Arc::new(Mutex::new(engine));
+                        let audit =
+                            Arc::new(SopAuditLogger::new(Arc::new(NoneMemory::new("none"))));
                         Box::pin(async move {
-                            Box::pin(zeroclaw_runtime::rpc::local::run_local_listener(
-                                ctx,
-                                cancel,
-                                client_count,
-                            ))
-                            .await
-                        })
-                    })),
-                    wss_start: Some(Box::new(|ctx, cancel, client_count| {
-                        Box::pin(async move {
-                            let wss_cfg = ctx.config.read().wss.clone();
-                            if !wss_cfg.enabled {
-                                // WSS disabled — park until cancelled.
-                                cancel.cancelled().await;
-                                return Ok(());
-                            }
-                            let tls_acceptor = zeroclaw_runtime::rpc::wss::build_tls_acceptor(
-                                &wss_cfg.cert_path,
-                                &wss_cfg.key_path,
-                            )?;
-                            let bind_addr: std::net::SocketAddr =
-                                format!("{}:{}", wss_cfg.bind, wss_cfg.port).parse()?;
-                            zeroclaw_runtime::rpc::wss::run_wss_listener(
-                                ctx,
-                                cancel,
-                                client_count,
-                                tls_acceptor,
-                                bind_addr,
+                            zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
+                                &mqtt_config,
+                                engine,
+                                audit,
                             )
                             .await
                         })
-                    })),
-                    #[cfg(not(feature = "channel-mqtt"))]
-                    mqtt_start: None,
-                };
+                    }
+                }));
+
+                registry.register_socket(Box::new(|ctx, cancel, client_count| {
+                    Box::pin(async move {
+                        zeroclaw_runtime::rpc::local::run_local_listener(ctx, cancel, client_count)
+                            .await
+                    })
+                }));
+
+                registry.register_wss(Box::new(|ctx, cancel, client_count| {
+                    Box::pin(async move {
+                        let wss_cfg = ctx.config.read().wss.clone();
+                        if !wss_cfg.enabled {
+                            // WSS disabled — park until cancelled.
+                            cancel.cancelled().await;
+                            return Ok(());
+                        }
+                        let tls_acceptor = zeroclaw_runtime::rpc::wss::build_tls_acceptor(
+                            &wss_cfg.cert_path,
+                            &wss_cfg.key_path,
+                        )?;
+                        let bind_addr: std::net::SocketAddr =
+                            format!("{}:{}", wss_cfg.bind, wss_cfg.port).parse()?;
+                        zeroclaw_runtime::rpc::wss::run_wss_listener(
+                            ctx,
+                            cancel,
+                            client_count,
+                            tls_acceptor,
+                            bind_addr,
+                        )
+                        .await
+                    })
+                }));
                 let exit = Box::pin(daemon::run(
                     current_config.clone(),
                     host.clone(),
                     port,
-                    subsystems,
+                    registry,
                     ephemeral,
                 ))
                 .await?;
@@ -3904,13 +3889,14 @@ async fn main() -> Result<()> {
                 "{}",
                 ta(
                     "cli-status-observability",
-                    &[("v", &config.observability.backend.to_string())],
+                    &[("v", config.observability.backend.as_wire())],
                     "Observability"
                 )
             );
             println!(
                 "🧾 Trace storage:  {} ({})",
-                config.observability.log_persistence, config.observability.log_persistence_path
+                config.observability.log_persistence.as_wire(),
+                config.observability.log_persistence_path
             );
             // Per-agent autonomy: each enabled agent picks its own
             // risk_profile, so list them rather than collapsing to one.
@@ -3946,7 +3932,7 @@ async fn main() -> Result<()> {
                 "{}",
                 ta(
                     "cli-status-runtime",
-                    &[("v", &config.runtime.kind.to_string())],
+                    &[("v", config.runtime.kind.as_wire())],
                     "Runtime"
                 )
             );
@@ -4170,15 +4156,25 @@ async fn main() -> Result<()> {
             );
             println!("  ID (use in config)  DESCRIPTION"); // i18n-exempt: literal command/identifier example
             println!("  ─────────────────── ───────────");
-            for p in &model_providers {
-                let is_configured = configured_types.contains(p.name);
-                let marker = if is_configured { " (configured)" } else { "" };
-                let local_tag = if p.local { " [local]" } else { "" };
-                println!("  {:<19} {}{}{}", p.name, p.display_name, local_tag, marker);
+            for category in zeroclaw_providers::ModelProviderCategory::all() {
+                let in_category: Vec<_> = model_providers
+                    .iter()
+                    .filter(|p| p.category == *category)
+                    .collect();
+                if in_category.is_empty() {
+                    continue;
+                }
+                println!("\n  {}:", category.as_str());
+                for p in in_category {
+                    let is_configured = configured_types.contains(p.name);
+                    let marker = if is_configured { " (configured)" } else { "" };
+                    let local_tag = if p.local { " [local]" } else { "" };
+                    println!("  {:<19} {}{}{}", p.name, p.display_name, local_tag, marker);
+                }
             }
             println!(
-                "\n  Set [model_providers.custom.<alias>] uri = \"<URL>\" for any \
-                 OpenAI-compatible endpoint, or [model_providers.anthropic.<alias>] \
+                "\n  Set [providers.models.custom.<alias>] uri = \"<URL>\" for any \
+                 OpenAI-compatible endpoint, or [providers.models.anthropic.<alias>] \
                  uri = \"<URL>\" for an Anthropic-compatible endpoint."
             );
             Ok(())
@@ -4214,6 +4210,13 @@ async fn main() -> Result<()> {
 
         Commands::Channel { channel_command } => match channel_command {
             ChannelCommands::Start => {
+                #[cfg(feature = "hardware")]
+                zeroclaw_runtime::agent::loop_::register_peripheral_tools_fn(Box::new(|config| {
+                    Box::pin(async move {
+                        zeroclaw_hardware::peripherals::create_peripheral_tools(&config).await
+                    })
+                }));
+
                 let cancel = tokio_util::sync::CancellationToken::new();
                 Box::pin(channels::start_channels(config, None, cancel)).await
             }
@@ -4685,7 +4688,7 @@ async fn main() -> Result<()> {
                     // hand. Falls back to free text on `live=false`
                     // (unknown provider, fetch failed, catalog empty).
                     use dialoguer::{FuzzySelect, Input};
-                    let (models, live) =
+                    let (models, _pricing, live) =
                         zeroclaw_runtime::quickstart::model_catalog(provider_type).await;
                     if live && !models.is_empty() {
                         let current = config.get_prop(&path).unwrap_or_default();
@@ -5859,6 +5862,131 @@ fn gateway_admin_url(host: &str, port: u16, path_prefix: Option<&str>, admin_pat
     format!("http://{host}:{port}{prefix}{admin_path}")
 }
 
+#[cfg(feature = "agent-runtime")]
+fn paircode_no_code_message(
+    host: &str,
+    port: u16,
+    default_host: &str,
+    default_port: u16,
+    action: &PaircodeAction,
+    require_pairing: bool,
+    gateway_message: Option<&str>,
+) -> String {
+    let mut lines = Vec::new();
+
+    if let Some(message) = gateway_message.filter(|m| !m.trim().is_empty()) {
+        lines.push(format!("⚠️  {message}"));
+    } else if require_pairing {
+        lines
+            .push("🔐 Gateway pairing is enabled, but no active pairing code is available.".into());
+    } else {
+        lines.push(t(
+            "cli-pairing-disabled",
+            "⚠️  Gateway pairing is disabled in config.",
+        ));
+        lines.push("All requests will be accepted without authentication.".into());
+        lines.push("To enable pairing, set [gateway] require_pairing = true.".into());
+        return indent_paircode_lines(lines);
+    }
+
+    lines.push(String::new());
+    match action {
+        PaircodeAction::Show => {
+            lines.push(
+                "`zeroclaw gateway get-paircode` only displays an existing active code; it does not mint a new one."
+                    .into(),
+            );
+            lines.push("To pair another device, run:".into());
+            lines.push(paircode_command(
+                host,
+                port,
+                default_host,
+                default_port,
+                Some("--new"),
+            ));
+            lines.push(String::new());
+            lines.push("To revoke existing pairings and mint a replacement code, run:".into());
+            lines.push(paircode_command(
+                host,
+                port,
+                default_host,
+                default_port,
+                Some("--rotate"),
+            ));
+        }
+        PaircodeAction::AddClient => {
+            lines.push(
+                "The gateway did not mint a new pairing code. A code may already be pending, or pairing may need a reset."
+                    .into(),
+            );
+            lines.push(
+                "Try again shortly, or revoke existing pairings and mint a replacement code:"
+                    .into(),
+            );
+            lines.push(paircode_command(
+                host,
+                port,
+                default_host,
+                default_port,
+                Some("--rotate"),
+            ));
+        }
+        PaircodeAction::RotateAll | PaircodeAction::RotateDevice(_) => {
+            lines.push("The rotate request completed without returning a replacement code.".into());
+            lines.push("Check whether pairing is enabled, then request a new device code:".into());
+            lines.push(paircode_command(
+                host,
+                port,
+                default_host,
+                default_port,
+                Some("--new"),
+            ));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("To inspect the running gateway:".into());
+    lines.push(format!("    open http://{host}:{port}"));
+    indent_paircode_lines(lines)
+}
+
+#[cfg(feature = "agent-runtime")]
+fn paircode_command(
+    host: &str,
+    port: u16,
+    default_host: &str,
+    default_port: u16,
+    flag: Option<&str>,
+) -> String {
+    let mut command = "    zeroclaw gateway get-paircode".to_string();
+    if let Some(flag) = flag {
+        command.push(' ');
+        command.push_str(flag);
+    }
+    if port != default_port {
+        write!(command, " --port {port}").expect("writing to String cannot fail");
+    }
+    if host != default_host {
+        write!(command, " --host {host}").expect("writing to String cannot fail");
+    }
+    command
+}
+
+#[cfg(feature = "agent-runtime")]
+fn indent_paircode_lines(lines: Vec<String>) -> String {
+    lines
+        .into_iter()
+        .map(|line| {
+            if line.starts_with("    ") || line.is_empty() {
+                line
+            } else {
+                format!("  {line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 // Interactive CLI input helpers used by `auth paste-token` /
 // `auth setup-token` / `auth paste-redirect`. The dialoguer dep belongs
 // to the binary; auth/mod.rs in zeroclaw-providers shouldn't pull it in,
@@ -6222,14 +6350,25 @@ async fn run_gateway_if_enabled(
     config: zeroclaw::config::Config,
     tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
 ) -> anyhow::Result<()> {
+    let default_host = config.gateway.host.clone();
+    let default_port = config.gateway.port;
     // Standalone gateway (no daemon supervisor): pass None for reload_tx so
     // /admin/reload returns 503 with a clear "no supervisor; restart
     // manually" message, None for tui_registry (no TUI socket), and None
     // for canvas_store so the gateway falls back to its own default.
-    Box::pin(gateway::run_gateway(
+    let result = Box::pin(gateway::run_gateway(
         host, port, config, tx, None, None, None,
     ))
-    .await
+    .await;
+    match result {
+        Err(err) if is_addr_in_use_error(&err) => {
+            anyhow::bail!(
+                "{}",
+                gateway_addr_in_use_message(host, port, &default_host, default_port)
+            );
+        }
+        other => other,
+    }
 }
 
 #[cfg(not(feature = "gateway"))]
@@ -6241,6 +6380,75 @@ async fn run_gateway_if_enabled(
     _tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
 ) -> anyhow::Result<()> {
     anyhow::bail!("Gateway feature is not enabled. Rebuild with --features gateway")
+}
+
+fn is_addr_in_use_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == ErrorKind::AddrInUse)
+    })
+}
+
+fn is_default_gateway_addr(host: &str, port: u16, default_host: &str, default_port: u16) -> bool {
+    host == default_host && port == default_port
+}
+
+fn gateway_addr_in_use_message(
+    host: &str,
+    port: u16,
+    default_host: &str,
+    default_port: u16,
+) -> String {
+    let mut lines = vec![
+        format!("Port {port} is already in use, so the gateway could not start."),
+        String::new(),
+        "A ZeroClaw daemon or another service may already be running on this port.".to_string(),
+        "Try one of:".to_string(),
+        String::new(),
+    ];
+
+    if is_default_gateway_addr(host, port, default_host, default_port) {
+        lines.push(format!("    open http://{host}:{port}"));
+    }
+
+    lines.push(gateway_paircode_recovery_command(
+        host,
+        port,
+        default_host,
+        default_port,
+    ));
+    lines.push(format!(
+        "    zeroclaw gateway start --port {}",
+        next_gateway_port(port)
+    ));
+    lines.extend([
+        String::new(),
+        "To inspect the listener:".to_string(),
+        format!("    lsof -nP -iTCP:{port} -sTCP:LISTEN"),
+    ]);
+    lines.join("\n")
+}
+
+fn gateway_paircode_recovery_command(
+    host: &str,
+    port: u16,
+    default_host: &str,
+    default_port: u16,
+) -> String {
+    if host == default_host && port == default_port {
+        return "    zeroclaw gateway get-paircode".to_string();
+    }
+
+    let mut command = format!("    zeroclaw gateway get-paircode --port {port}");
+    if host != default_host {
+        write!(command, " --host {host}").expect("writing to String cannot fail");
+    }
+    command
+}
+
+fn next_gateway_port(port: u16) -> u16 {
+    port.checked_add(1).unwrap_or(port)
 }
 
 #[cfg(test)]
@@ -6540,6 +6748,126 @@ mod tests {
             gateway_admin_url("192.168.1.20", 42617, Some("/gw"), "/admin/paircode"),
             "http://192.168.1.20:42617/gw/admin/paircode",
         );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn paircode_no_code_message_explains_bare_command_does_not_mint() {
+        let default = config::GatewayConfig::default();
+        let msg = paircode_no_code_message(
+            "127.0.0.1",
+            42617,
+            &default.host,
+            default.port,
+            &PaircodeAction::Show,
+            true,
+            Some("Pairing is active but no new code available (already paired or code expired)"),
+        );
+
+        assert!(msg.contains("only displays an existing active code; it does not mint"));
+        assert!(msg.contains("zeroclaw gateway get-paircode --new"));
+        assert!(msg.contains("zeroclaw gateway get-paircode --rotate"));
+        assert!(msg.contains("open http://127.0.0.1:42617"));
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn paircode_no_code_message_preserves_host_port_on_suggestions() {
+        let default = config::GatewayConfig::default();
+        let msg = paircode_no_code_message(
+            "192.168.1.20",
+            9001,
+            &default.host,
+            default.port,
+            &PaircodeAction::Show,
+            true,
+            None,
+        );
+
+        assert!(
+            msg.contains("zeroclaw gateway get-paircode --new --port 9001 --host 192.168.1.20")
+        );
+        assert!(
+            msg.contains("zeroclaw gateway get-paircode --rotate --port 9001 --host 192.168.1.20")
+        );
+        assert!(msg.contains("open http://192.168.1.20:9001"));
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn paircode_no_code_message_omits_configured_default_host_port() {
+        let msg = paircode_no_code_message(
+            "192.168.1.20",
+            9001,
+            "192.168.1.20",
+            9001,
+            &PaircodeAction::Show,
+            true,
+            None,
+        );
+
+        assert!(msg.contains("zeroclaw gateway get-paircode --new\n"));
+        assert!(msg.contains("zeroclaw gateway get-paircode --rotate\n"));
+        assert!(!msg.contains("--port 9001"));
+        assert!(!msg.contains("--host 192.168.1.20"));
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn paircode_no_code_message_for_new_suggests_rotate() {
+        let default = config::GatewayConfig::default();
+        let msg = paircode_no_code_message(
+            "127.0.0.1",
+            42617,
+            &default.host,
+            default.port,
+            &PaircodeAction::AddClient,
+            true,
+            Some("Pairing is active but no new code available (already paired or code expired)"),
+        );
+
+        assert!(msg.contains("did not mint a new pairing code"));
+        assert!(msg.contains("zeroclaw gateway get-paircode --rotate"));
+    }
+
+    #[test]
+    fn gateway_addr_in_use_message_guides_default_gateway_recovery() {
+        let default = config::GatewayConfig::default();
+        let msg = gateway_addr_in_use_message("127.0.0.1", 42617, &default.host, default.port);
+
+        assert!(msg.contains("Port 42617 is already in use"));
+        assert!(msg.contains("open http://127.0.0.1:42617"));
+        assert!(msg.contains("zeroclaw gateway get-paircode\n"));
+        assert!(msg.contains("zeroclaw gateway start --port 42618"));
+        assert!(msg.contains("lsof -nP -iTCP:42617 -sTCP:LISTEN"));
+    }
+
+    #[test]
+    fn gateway_addr_in_use_message_keeps_non_default_host_context() {
+        let default = config::GatewayConfig::default();
+        let msg = gateway_addr_in_use_message("192.168.1.20", 9001, &default.host, default.port);
+
+        assert!(!msg.contains("open http://127.0.0.1:42617"));
+        assert!(msg.contains("zeroclaw gateway get-paircode --port 9001 --host 192.168.1.20"));
+        assert!(msg.contains("zeroclaw gateway start --port 9002"));
+        assert!(msg.contains("lsof -nP -iTCP:9001 -sTCP:LISTEN"));
+    }
+
+    #[test]
+    fn gateway_addr_in_use_message_uses_configured_default_gateway_recovery() {
+        let msg = gateway_addr_in_use_message("192.168.1.20", 9001, "192.168.1.20", 9001);
+
+        assert!(msg.contains("open http://192.168.1.20:9001"));
+        assert!(msg.contains("zeroclaw gateway get-paircode\n"));
+        assert!(!msg.contains("get-paircode --port 9001"));
+    }
+
+    #[test]
+    fn gateway_addr_in_use_detector_recognizes_nested_io_error() {
+        let err = std::io::Error::from(ErrorKind::AddrInUse);
+        let err = anyhow::Error::new(err).context("gateway bind failed");
+
+        assert!(is_addr_in_use_error(&err));
     }
 
     #[test]

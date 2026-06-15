@@ -358,6 +358,95 @@ impl Chat {
         }
     }
 
+    async fn confirm_model_picker_selection(rpc: &Arc<RpcClient>, state: &mut ChatState) {
+        // Resolve the selection, then act. The final switch needs async + `rpc`,
+        // so extract owned values before replacing the overlay.
+        match &state.model_picker {
+            ModelPickerOverlay::Model(p) => {
+                let choice = p.selected().map(str::to_string);
+                state.model_picker = ModelPickerOverlay::None;
+                if let Some(model) = choice {
+                    Self::apply_session_override(
+                        rpc,
+                        state,
+                        crate::client::SessionOverrides {
+                            model: Some(model),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                }
+            }
+            ModelPickerOverlay::ConfiguredProviderStage(p) => {
+                let choice = p.selected().map(str::to_string);
+                state.model_picker = ModelPickerOverlay::None;
+                if let Some(model_provider) = choice {
+                    Self::apply_session_override(
+                        rpc,
+                        state,
+                        crate::client::SessionOverrides {
+                            model_provider: Some(model_provider),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                } else {
+                    state.mark_dirty_full();
+                }
+            }
+            ModelPickerOverlay::Loading | ModelPickerOverlay::None => {}
+        }
+    }
+
+    async fn restart_session_for_state(
+        rpc: &Arc<RpcClient>,
+        pane_kind: PaneKind,
+        state: &mut ChatState,
+    ) -> Option<ChatPhase> {
+        let alias = state.agent_alias.clone();
+        if pane_kind == PaneKind::Acp && rpc.transport() == crate::client::Transport::Wss {
+            // For WSS ACP, go through the CWD picker for new sessions too.
+            let _ = rpc.session_close(&state.session_id).await;
+            // Remote ACP picker must start from a path the daemon understands.
+            let start_dir = std::path::PathBuf::from("/");
+            return Some(ChatPhase::PickCwd {
+                agent_alias: alias,
+                explorer: FileExplorerState::new_dir_picker_remote(start_dir, Arc::clone(rpc)),
+            });
+        }
+
+        let local_cwd = if rpc.transport() == crate::client::Transport::Local {
+            std::env::current_dir().ok()
+        } else {
+            None
+        };
+        let cwd_str = local_cwd.as_deref().and_then(|p| p.to_str());
+        let new_session = if pane_kind == PaneKind::Acp {
+            rpc.session_new_acp(&alias, cwd_str, None).await
+        } else {
+            rpc.session_new(&alias, cwd_str).await
+        };
+        match new_session {
+            Ok(s) => {
+                let old_session_id = state.session_id.clone();
+                let _ = rpc.session_close(&old_session_id).await;
+                state.reset_for_session(s.session_id, None);
+                if pane_kind == PaneKind::Acp {
+                    state.cwd = s.workspace_dir;
+                }
+                Self::refresh_model_identity(rpc, state).await;
+                state.set_info_notice(crate::i18n::t("zc-chat-session-restarted"));
+            }
+            Err(e) => {
+                state.set_info_notice(crate::i18n::t_args(
+                    "zc-chat-session-restart-error",
+                    &[("error", &e.to_string())],
+                ));
+            }
+        }
+        None
+    }
+
     // ── Drain channels (called from draw) ────────────────────────
 
     fn drain_notifications(&mut self) {
@@ -699,47 +788,8 @@ impl Chat {
                     return false;
                 }
                 Some(ModalAction::Confirm) => {
-                    // Resolve the selection, then act. Stage transitions and the
-                    // final switch need async + `rpc`, so extract owned values
-                    // before releasing the overlay borrow.
                     let rpc = self.rpc.clone();
-                    match &state.model_picker {
-                        ModelPickerOverlay::Model(p) => {
-                            let choice = p.selected().map(str::to_string);
-                            state.model_picker = ModelPickerOverlay::None;
-                            if let Some(model) = choice {
-                                Self::apply_session_override(
-                                    &rpc,
-                                    state,
-                                    crate::client::SessionOverrides {
-                                        model: Some(model),
-                                        ..Default::default()
-                                    },
-                                )
-                                .await;
-                            }
-                            return false;
-                        }
-                        ModelPickerOverlay::ConfiguredProviderStage(p) => {
-                            let choice = p.selected().map(str::to_string);
-                            state.model_picker = ModelPickerOverlay::None;
-                            if let Some(model_provider) = choice {
-                                Self::apply_session_override(
-                                    &rpc,
-                                    state,
-                                    crate::client::SessionOverrides {
-                                        model_provider: Some(model_provider),
-                                        ..Default::default()
-                                    },
-                                )
-                                .await;
-                            } else {
-                                state.mark_dirty_full();
-                            }
-                            return false;
-                        }
-                        ModelPickerOverlay::Loading | ModelPickerOverlay::None => {}
-                    }
+                    Self::confirm_model_picker_selection(&rpc, state).await;
                     return false;
                 }
                 _ => {
@@ -937,6 +987,16 @@ impl Chat {
                     state.set_info_notice(notice);
                     return false;
                 }
+                InputBarAction::RestartSession => {
+                    let rpc = self.rpc.clone();
+                    let pane_kind = self.pane_kind;
+                    if let Some(next_phase) =
+                        Self::restart_session_for_state(&rpc, pane_kind, state).await
+                    {
+                        self.phase = next_phase;
+                    }
+                    return false;
+                }
                 InputBarAction::ResumeQueue => {
                     // Empty Enter: no message to enqueue, but still resume a
                     // paused queue and pump so any backlog dispatches.
@@ -1079,41 +1139,12 @@ impl Chat {
                 }
             }
             Some(ChatTabAction::NewSession) if !state.turn_in_flight => {
-                let alias = state.agent_alias.clone();
-                if self.pane_kind == PaneKind::Acp
-                    && self.rpc.transport() == crate::client::Transport::Wss
+                let rpc = self.rpc.clone();
+                let pane_kind = self.pane_kind;
+                if let Some(next_phase) =
+                    Self::restart_session_for_state(&rpc, pane_kind, state).await
                 {
-                    // For WSS ACP, go through the CWD picker for new sessions too.
-                    let _ = self.rpc.session_close(&state.session_id).await;
-                    // Remote ACP picker must start from a path the daemon understands.
-                    let start_dir = std::path::PathBuf::from("/");
-                    self.phase = ChatPhase::PickCwd {
-                        agent_alias: alias,
-                        explorer: FileExplorerState::new_dir_picker_remote(
-                            start_dir,
-                            Arc::clone(&self.rpc),
-                        ),
-                    };
-                } else {
-                    let local_cwd = if self.rpc.transport() == crate::client::Transport::Local {
-                        std::env::current_dir().ok()
-                    } else {
-                        None
-                    };
-                    let cwd_str = local_cwd.as_deref().and_then(|p| p.to_str());
-                    let new_session = if self.pane_kind == PaneKind::Acp {
-                        self.rpc.session_new_acp(&alias, cwd_str, None).await
-                    } else {
-                        self.rpc.session_new(&alias, cwd_str).await
-                    };
-                    if let Ok(s) = new_session {
-                        let _ = self.rpc.session_close(&state.session_id).await;
-                        state.reset_for_session(s.session_id, None);
-                        if self.pane_kind == PaneKind::Acp {
-                            state.cwd = s.workspace_dir;
-                        }
-                        Self::refresh_model_identity(&self.rpc, state).await;
-                    }
+                    self.phase = next_phase;
                 }
             }
             Some(ChatTabAction::SwitchSession) if !state.turn_in_flight => {
@@ -1228,6 +1259,50 @@ impl Chat {
             _ => {}
         }
         false
+    }
+
+    async fn handle_model_picker_mouse(
+        rpc: &Arc<RpcClient>,
+        mouse: MouseEvent,
+        area: Rect,
+        state: &mut ChatState,
+    ) {
+        let Some(modal_rect) = model_picker_overlay_area(&state.model_picker, area) else {
+            return;
+        };
+
+        let col = mouse.column;
+        let row = mouse.row;
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if !mouse::in_rect(col, row, modal_rect) {
+                    state.model_picker = ModelPickerOverlay::None;
+                    state.mark_dirty_full();
+                    return;
+                }
+
+                let item_count = state.model_picker.item_count();
+                if let Some(idx) = mouse::list_click_index(row, modal_rect, 0, item_count) {
+                    if let Some(picker) = state.model_picker.picker_mut() {
+                        picker.cursor = idx;
+                    }
+                    Self::confirm_model_picker_selection(rpc, state).await;
+                }
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                if mouse::in_rect(col, row, modal_rect) =>
+            {
+                if let Some(picker) = state.model_picker.picker_mut() {
+                    if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                        picker.move_up();
+                    } else {
+                        picker.move_down();
+                    }
+                    state.mark_dirty_full();
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Apply a session override (model and/or model_provider) to the active
@@ -1512,6 +1587,12 @@ impl Chat {
                 return;
             }
 
+            if state.model_picker.is_open() {
+                let rpc = self.rpc.clone();
+                Self::handle_model_picker_mouse(&rpc, mouse, area, state).await;
+                return;
+            }
+
             // Session list overlay intercepts all mouse events when open.
             if let SessionOverlay::List {
                 sessions,
@@ -1555,6 +1636,24 @@ impl Chat {
             use crossterm::event::KeyModifiers as KM;
             let col = mouse.column;
             let row = mouse.row;
+
+            if !state.model_picker.is_open()
+                && let MouseEventKind::Down(MouseButton::Left) = mouse.kind
+                && let Some(target) = state.title_hit_target_at(col, row)
+            {
+                match target {
+                    TitleHitTarget::ModelProvider => {
+                        let rpc = self.rpc.clone();
+                        Self::open_provider_picker(&rpc, state).await;
+                    }
+                    TitleHitTarget::Model => {
+                        let rpc = self.rpc.clone();
+                        let tx = self.model_fetch_tx.clone();
+                        Self::open_model_picker(&rpc, &tx, state).await;
+                    }
+                }
+                return;
+            }
 
             // Queue sidebar intercepts mouse events over its area before the
             // conversation handler, so clicks select queued items and the wheel
@@ -2089,6 +2188,29 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
     state.input_bar.render_explorer_overlay(f, area);
 }
 
+fn model_picker_overlay_area(model_picker: &ModelPickerOverlay, area: Rect) -> Option<Rect> {
+    match model_picker {
+        ModelPickerOverlay::Loading => {
+            let title = crate::i18n::t("zc-model-catalog-loading");
+            let placeholder = [String::new()];
+            crate::widgets::PickerModal::area_for(&title, &placeholder, area)
+        }
+        ModelPickerOverlay::Model(picker) => crate::widgets::PickerModal::area_for(
+            &crate::i18n::t("zc-model-picker-title"),
+            &picker.items,
+            area,
+        ),
+        ModelPickerOverlay::ConfiguredProviderStage(picker) => {
+            crate::widgets::PickerModal::area_for(
+                &crate::i18n::t("zc-model-provider-picker-title"),
+                &picker.items,
+                area,
+            )
+        }
+        ModelPickerOverlay::None => None,
+    }
+}
+
 fn resume_queue_chord_label() -> String {
     crate::keymap::ChatTabAction::PauseResumeQueue
         .default_chords()
@@ -2482,6 +2604,8 @@ fn borrow_line<'a>(line: &'a Line<'static>) -> Line<'a> {
 }
 
 fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
+    state.refresh_title_hit_rects(area);
+
     // Width must be computed before cache rebuild — table column budgets
     // depend on it, and a width change invalidates cached layouts.
     let inner_width = area.width.saturating_sub(2);
@@ -2957,7 +3081,7 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
                         ));
                     }
                 } else {
-                    let mut style = Style::default();
+                    let mut style = theme::body_style();
                     if let Some(level) = heading_level {
                         style = match level {
                             HeadingLevel::H1 | HeadingLevel::H2 => {
@@ -3003,7 +3127,10 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
 
     // Fallback: if parsing produced nothing, return raw text.
     if lines.is_empty() && !text.is_empty() {
-        lines.push(Line::from(Span::raw(text.to_string())));
+        lines.push(Line::from(Span::styled(
+            text.to_string(),
+            theme::body_style(),
+        )));
     }
 
     lines
@@ -3221,6 +3348,21 @@ impl ModelPickerOverlay {
     fn is_open(&self) -> bool {
         !matches!(self, Self::None)
     }
+
+    fn item_count(&self) -> usize {
+        match self {
+            Self::Model(p) | Self::ConfiguredProviderStage(p) => p.items.len(),
+            Self::Loading => 1,
+            Self::None => 0,
+        }
+    }
+
+    fn picker_mut(&mut self) -> Option<&mut crate::widgets::PickerState> {
+        match self {
+            Self::Model(p) | Self::ConfiguredProviderStage(p) => Some(p),
+            Self::Loading | Self::None => None,
+        }
+    }
 }
 
 /// Tracks what kind of update has invalidated the rendered lines cache.
@@ -3241,6 +3383,18 @@ enum LinesDirty {
 struct ScrollbarDrag {
     start_scroll: u16,
     start_row: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TitleHitTarget {
+    ModelProvider,
+    Model,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TitleHitRect {
+    target: TitleHitTarget,
+    rect: Rect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3303,6 +3457,8 @@ pub struct ChatState {
     browse_multi: std::collections::BTreeSet<usize>,
     /// Per-entry hit rects from the last draw.
     entry_rects: Vec<(usize, ratatui::layout::Rect)>,
+    /// Clickable provider/model title spans from the last draw.
+    title_hit_rects: Vec<TitleHitRect>,
     /// Scrollbar track rect from the last draw.
     scrollbar_track_rect: Option<ratatui::layout::Rect>,
     /// Active scrollbar drag anchor.
@@ -3387,6 +3543,7 @@ impl ChatState {
             browse_anchor: None,
             browse_multi: std::collections::BTreeSet::new(),
             entry_rects: Vec::new(),
+            title_hit_rects: Vec::new(),
             scrollbar_track_rect: None,
             scrollbar_drag: None,
             session_overlay: SessionOverlay::None,
@@ -3658,20 +3815,59 @@ impl ChatState {
     }
 
     pub fn title(&self) -> String {
+        self.title_parts()
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>()
+            .join("  ")
+    }
+
+    fn title_parts(&self) -> Vec<(Option<TitleHitTarget>, String)> {
         let short = self.session_id.get(..7).unwrap_or(self.session_id.as_str());
-        let mut parts: Vec<String> = Vec::with_capacity(4);
-        parts.push(self.agent_alias.clone());
+        let mut parts: Vec<(Option<TitleHitTarget>, String)> = Vec::with_capacity(5);
+        parts.push((None, self.agent_alias.clone()));
         if let Some(ref name) = self.session_name {
-            parts.push(format!("— {name}"));
+            parts.push((None, format!("— {name}")));
         }
-        parts.push(short.to_string());
+        parts.push((None, short.to_string()));
         if let Some(ref provider) = self.model_provider_ref {
-            parts.push(provider.clone());
+            parts.push((Some(TitleHitTarget::ModelProvider), provider.clone()));
         }
         if let Some(ref model) = self.model {
-            parts.push(model.clone());
+            parts.push((Some(TitleHitTarget::Model), model.clone()));
         }
-        parts.join("  ")
+        parts
+    }
+
+    fn refresh_title_hit_rects(&mut self, area: Rect) {
+        use unicode_width::UnicodeWidthStr;
+
+        self.title_hit_rects.clear();
+        let mut x = area.x.saturating_add(2);
+        let right = area.x.saturating_add(area.width);
+        for (idx, (target, text)) in self.title_parts().into_iter().enumerate() {
+            if idx > 0 {
+                x = x.saturating_add(2);
+            }
+            let width = UnicodeWidthStr::width(text.as_str()) as u16;
+            if let Some(target) = target
+                && width > 0
+                && x < right
+            {
+                self.title_hit_rects.push(TitleHitRect {
+                    target,
+                    rect: Rect::new(x, area.y, width.min(right.saturating_sub(x)), 1),
+                });
+            }
+            x = x.saturating_add(width);
+        }
+    }
+
+    fn title_hit_target_at(&self, col: u16, row: u16) -> Option<TitleHitTarget> {
+        self.title_hit_rects
+            .iter()
+            .find(|hit| mouse::in_rect(col, row, hit.rect))
+            .map(|hit| hit.target)
     }
 
     pub fn set_model_identity(&mut self, model_provider_ref: Option<&str>, model: Option<&str>) {
@@ -4390,7 +4586,11 @@ pub async fn open_editor_for_content(content: &str) -> String {
         .await;
 
     crossterm::terminal::enable_raw_mode().ok();
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen,);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+    );
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
         let _ = crossterm::execute!(
             std::io::stdout(),
@@ -4447,6 +4647,73 @@ mod tests {
         assert_eq!(
             s.title(),
             "ag  abcdef1  anthropic.personal_code  claude-opus-4-8"
+        );
+    }
+
+    #[test]
+    fn title_hit_rects_target_provider_and_model_segments() {
+        let mut s = ChatState::new("abcdef1234".to_string(), "ag".to_string());
+        s.set_model_identity(Some("openai.work"), Some("gpt-5"));
+        let area = Rect::new(10, 4, 80, 20);
+
+        s.refresh_title_hit_rects(area);
+
+        assert_eq!(
+            s.title_hit_target_at(25, 4),
+            Some(TitleHitTarget::ModelProvider)
+        );
+        assert_eq!(s.title_hit_target_at(38, 4), Some(TitleHitTarget::Model));
+        assert_eq!(s.title_hit_target_at(12, 4), None);
+        assert_eq!(s.title_hit_target_at(25, 5), None);
+    }
+
+    #[test]
+    fn title_hit_rects_are_empty_before_model_identity_resolves() {
+        let mut s = ChatState::new("abcdef1234".to_string(), "ag".to_string());
+
+        s.refresh_title_hit_rects(Rect::new(10, 4, 80, 20));
+
+        assert!(s.title_hit_rects.is_empty());
+        assert_eq!(s.title_hit_target_at(12, 4), None);
+    }
+
+    #[test]
+    fn title_hit_rects_clip_at_pane_edge() {
+        let mut s = ChatState::new("abcdef1234".to_string(), "ag".to_string());
+        s.set_model_identity(Some("openai.work"), Some("gpt-5"));
+
+        s.refresh_title_hit_rects(Rect::new(10, 4, 25, 20));
+
+        assert_eq!(
+            s.title_hit_target_at(33, 4),
+            Some(TitleHitTarget::ModelProvider)
+        );
+        assert_eq!(s.title_hit_target_at(35, 4), None);
+    }
+
+    #[test]
+    fn model_provider_picker_overlay_rows_are_hit_testable() {
+        let mut s = state();
+        s.model_picker =
+            ModelPickerOverlay::ConfiguredProviderStage(crate::widgets::PickerState::new(
+                vec!["openai.default".into(), "deepseek.default".into()],
+                None,
+            ));
+
+        let area = Rect::new(0, 0, 80, 20);
+        let modal = model_picker_overlay_area(&s.model_picker, area).unwrap();
+
+        assert_eq!(
+            mouse::list_click_index(modal.y + 1, modal, 0, s.model_picker.item_count()),
+            Some(0)
+        );
+        assert_eq!(
+            mouse::list_click_index(modal.y + 2, modal, 0, s.model_picker.item_count()),
+            Some(1)
+        );
+        assert_eq!(
+            mouse::list_click_index(modal.y, modal, 0, s.model_picker.item_count()),
+            None
         );
     }
 
@@ -4523,8 +4790,8 @@ mod tests {
             &id,
             Some(serde_json::json!({
                 "agents": [
-                    {"alias": "alpha", "enabled": true, "active_sessions": 0},
-                    {"alias": "beta", "enabled": true, "active_sessions": 0}
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0},
+                    {"alias": "beta", "enabled": true, "live_sessions": 0}
                 ]
             })),
             None,
@@ -4566,8 +4833,8 @@ mod tests {
             &id,
             Some(serde_json::json!({
                 "agents": [
-                    {"alias": "alpha", "enabled": true, "active_sessions": 0},
-                    {"alias": "beta", "enabled": true, "active_sessions": 1}
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0},
+                    {"alias": "beta", "enabled": true, "live_sessions": 1}
                 ]
             })),
             None,
@@ -4695,8 +4962,8 @@ mod tests {
             &id,
             Some(serde_json::json!({
                 "agents": [
-                    {"alias": "alpha", "enabled": true, "active_sessions": 0},
-                    {"alias": "beta", "enabled": true, "active_sessions": 0}
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0},
+                    {"alias": "beta", "enabled": true, "live_sessions": 0}
                 ]
             })),
             None,
@@ -5089,6 +5356,12 @@ mod tests {
         let out = rendered("# Title\n", 80);
         assert!(out.contains('\u{258C}'), "expected H1 gutter: {out}");
         assert!(out.contains("Title"));
+    }
+
+    #[test]
+    fn md_plain_text_uses_theme_body_style() {
+        let out = markdown_to_lines("plain assistant text\n", 80);
+        assert_eq!(out[0].spans[0].style, theme::body_style());
     }
 
     #[test]

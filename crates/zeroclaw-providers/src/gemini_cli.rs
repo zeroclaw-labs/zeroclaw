@@ -58,7 +58,7 @@ const TEMP_EPSILON: f64 = 1e-9;
 /// Each inference request spawns a fresh `gemini` process. This is the
 /// non-interactive approach: the process handles the prompt and exits.
 pub struct GeminiCliModelProvider {
-    /// `[model_providers.<family>.<alias>]` config-key alias.
+    /// `[providers.models.<family>.<alias>]` config-key alias.
     alias: String,
     /// Path to the `gemini` binary.
     binary_path: PathBuf,

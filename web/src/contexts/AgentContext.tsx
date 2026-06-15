@@ -4,6 +4,7 @@ import { WebSocketClient, getOrCreateSessionId } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
 import { t } from '@/lib/i18n';
 import { getProp, putProp, getStatus, getSessionMessages, abortSession, deleteSession } from '@/lib/api';
+import { primeModelProviderCatalog, modelProviderDisplayName } from '@/lib/modelProviders';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
 import {
   loadChatHistory,
@@ -58,19 +59,6 @@ export function useAgent() {
 }
 
 const MODEL_SWITCH_TIMEOUT_MS = 10_000;
-const LOCAL_PROVIDER_NAMES: Record<string, string> = {
-  atomic_chat: 'Atomic Chat',
-  gemini_cli: 'Gemini CLI',
-  kilocli: 'KiloCLI',
-  lmstudio: 'LM Studio',
-  llamacpp: 'llama.cpp server',
-  ollama: 'Ollama',
-  opencode: 'OpenCode',
-  osaurus: 'Osaurus',
-  sglang: 'SGLang',
-  synthetic: 'Synthetic',
-  vllm: 'vLLM',
-};
 
 function friendlyAgentError(message?: string): string {
   const raw = message?.trim() || t('agent.unknown_error');
@@ -81,7 +69,7 @@ function friendlyAgentError(message?: string): string {
     const provider = localConnectFailure[1] ?? '';
     const model = localConnectFailure[2] ?? 'the selected model';
     const url = localConnectFailure[3] ?? 'the configured endpoint';
-    const displayProvider = LOCAL_PROVIDER_NAMES[provider] ?? provider;
+    const displayProvider = modelProviderDisplayName(provider);
     return `${displayProvider} is unreachable at ${url}. Start the local provider service, confirm it serves ${model}, then try again.`;
   }
   return raw;
@@ -120,6 +108,12 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   const switchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsVersionRef = useRef(0);
   const localMessageMutationVersionRef = useRef(0);
+
+  // Prime the model-provider catalog once so error formatting can resolve
+  // display names from the backend registry rather than a local shadow list.
+  useEffect(() => {
+    void primeModelProviderCatalog();
+  }, []);
 
   // Hydrate chat from server (preferred) or localStorage fallback
   useEffect(() => {
@@ -217,7 +211,11 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
 
       case 'message':
       case 'done': {
-        const content = msg.full_response ?? msg.content ?? pendingContentRef.current;
+        const raw_content = msg.full_response ?? msg.content ?? pendingContentRef.current;
+        // Skip whitespace-only content (e.g. models that emit "\n\n"
+        // alongside tool_calls) to avoid accumulating blank lines in the
+        // assistant bubble. Ref: #6702.
+        const content = raw_content.trim();
         const thinking = capturedThinkingRef.current || pendingThinkingRef.current || undefined;
         if (content) {
           localMessageMutationVersionRef.current += 1;

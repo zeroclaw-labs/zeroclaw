@@ -12,7 +12,7 @@ use crate::traits::{
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use reqwest::{
-    Client,
+    Client, ClientBuilder,
     header::{HeaderMap, HeaderValue, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
@@ -69,7 +69,11 @@ pub struct OpenAiCompatibleModelProvider {
     /// Some OpenAI-compatible local servers, such as Ollama, expose `/models`
     /// without authentication. Keep the default credential-gated for hosted
     /// providers so missing credentials still fall through to catalog sources.
-    unauthenticated_model_listing: bool,
+    /// When `true`, the `/models` endpoint is treated as publicly accessible.
+    public_model_listing: bool,
+    /// Raw PEM bytes of a custom CA certificate for TLS connections.
+    /// Loaded from disk once at construction; not refreshed across config reloads.
+    tls_ca_cert_pem: Option<Vec<u8>>,
 }
 
 /// How the model_provider expects the API key to be sent.
@@ -151,6 +155,12 @@ struct ModelsResponse {
 #[derive(Deserialize)]
 struct ModelEntry {
     id: String,
+    /// Pricing data from the provider's `/models` endpoint.
+    /// Kilo Gateway: `{"pricing": {"prompt": "0", "completion": "0"}}`
+    /// OpenRouter: `{"pricing": {"prompt": "0.000003", "completion": "0.000015"}}`
+    /// Values are per-token rates (e.g. "0.000005" = $5/1M tokens).
+    #[serde(default)]
+    pricing: Option<zeroclaw_api::model_provider::ModelPricing>,
 }
 
 fn normalize_model_ids(body: ModelsResponse) -> Vec<String> {
@@ -162,6 +172,36 @@ fn normalize_model_ids(body: ModelsResponse) -> Vec<String> {
         .collect();
     ids.sort();
     ids
+}
+
+/// Extract model IDs with pricing from a ModelsResponse.
+/// Returns sorted list of `ModelInfo` with pricing data where available.
+fn normalize_models_with_pricing(
+    body: ModelsResponse,
+) -> Vec<zeroclaw_api::model_provider::ModelInfo> {
+    use zeroclaw_api::model_provider::ModelInfo;
+    let mut models: Vec<ModelInfo> = body
+        .data
+        .into_iter()
+        .filter(|e| !e.id.trim().is_empty())
+        .map(|e| ModelInfo {
+            id: e.id.trim().to_string(),
+            pricing: e.pricing,
+        })
+        .collect();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models
+}
+
+/// Convert models.dev IDs into `ModelInfo` entries without pricing.
+/// The models.dev catalog does not serve pricing data, so this function
+/// documents the intentional data-loss contract: callers should expect
+/// `pricing: None` on every returned entry.
+fn models_dev_to_model_info(ids: Vec<String>) -> Vec<zeroclaw_api::model_provider::ModelInfo> {
+    use zeroclaw_api::model_provider::ModelInfo;
+    ids.into_iter()
+        .map(|id| ModelInfo { id, pricing: None })
+        .collect()
 }
 
 impl OpenAiCompatibleModelProvider {
@@ -284,7 +324,8 @@ impl OpenAiCompatibleModelProvider {
             models_dev_key: None,
             openrouter_vendor_prefix: None,
             local_model_tool_sanitize: false,
-            unauthenticated_model_listing: false,
+            public_model_listing: false,
+            tls_ca_cert_pem: None,
         }
     }
     /// Opt this provider into per-model conservative tool-schema sanitization.
@@ -298,9 +339,44 @@ impl OpenAiCompatibleModelProvider {
         self
     }
 
-    pub fn with_unauthenticated_model_listing(mut self) -> Self {
-        self.unauthenticated_model_listing = true;
+    pub fn with_public_model_listing(mut self) -> Self {
+        self.public_model_listing = true;
         self
+    }
+
+    /// Set a custom CA certificate path for TLS connections.
+    /// Reads and stores the PEM bytes immediately so later HTTP clients
+    /// incur no per-request disk I/O.
+    pub fn with_tls_ca_cert_path(mut self, path: &str) -> Self {
+        match std::fs::read(path) {
+            Ok(bytes) => self.tls_ca_cert_pem = Some(bytes),
+            Err(e) => ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"path": path, "error": format!("{}", e)})),
+                "Failed to read CA certificate file — TLS will use system roots"
+            ),
+        }
+        self
+    }
+
+    /// Add the configured custom CA certificate to a reqwest builder.
+    /// The PEM bytes were loaded at construction, so this performs no disk I/O.
+    fn add_tls_cert_to_builder(&self, builder: ClientBuilder) -> ClientBuilder {
+        if let Some(ref pem) = self.tls_ca_cert_pem {
+            match reqwest::Certificate::from_pem(pem) {
+                Ok(cert) => return builder.add_root_certificate(cert),
+                Err(e) => ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "Failed to parse CA certificate — TLS will use system roots"
+                ),
+            }
+        }
+        builder
     }
 
     /// Disable native tool calling, forcing prompt-guided tool use instead.
@@ -416,8 +492,9 @@ impl OpenAiCompatibleModelProvider {
         let timeout = self.timeout_secs;
         let has_user_agent = self.user_agent.is_some();
         let has_extra_headers = !self.extra_headers.is_empty();
+        let has_tls_cert = self.tls_ca_cert_pem.is_some();
 
-        if has_user_agent || has_extra_headers {
+        if has_user_agent || has_extra_headers || has_tls_cert {
             let mut headers = HeaderMap::new();
             if let Some(ua) = self.user_agent.as_deref()
                 && let Ok(value) = HeaderValue::from_str(ua)
@@ -451,6 +528,7 @@ impl OpenAiCompatibleModelProvider {
                 .timeout(std::time::Duration::from_secs(timeout))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .default_headers(headers);
+            let builder = self.add_tls_cert_to_builder(builder);
             let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
                 builder,
                 "model_provider.compatible",
@@ -464,7 +542,7 @@ impl OpenAiCompatibleModelProvider {
                         .with_attrs(
                             ::serde_json::json!({"error": super::format_error_chain(&error)})
                         ),
-                    "Failed to build proxied timeout client with custom headers: "
+                    "Failed to build proxied timeout client with custom headers or TLS certificate: "
                 );
                 Client::new()
             });
@@ -483,8 +561,9 @@ impl OpenAiCompatibleModelProvider {
     fn streaming_http_client(&self) -> Client {
         let has_user_agent = self.user_agent.is_some();
         let has_extra_headers = !self.extra_headers.is_empty();
+        let has_tls_cert = self.tls_ca_cert_pem.is_some();
 
-        if has_user_agent || has_extra_headers {
+        if has_user_agent || has_extra_headers || has_tls_cert {
             let mut headers = HeaderMap::new();
             if let Some(ua) = self.user_agent.as_deref()
                 && let Ok(value) = HeaderValue::from_str(ua)
@@ -517,6 +596,7 @@ impl OpenAiCompatibleModelProvider {
             let builder = Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .default_headers(headers);
+            let builder = self.add_tls_cert_to_builder(builder);
             let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
                 builder,
                 "provider.compatible",
@@ -529,7 +609,7 @@ impl OpenAiCompatibleModelProvider {
                         .with_attrs(
                             ::serde_json::json!({"error": super::format_error_chain(&error)})
                         ),
-                    "Failed to build proxied streaming client with custom headers: "
+                    "Failed to build proxied streaming client with custom headers or TLS certificate: "
                 );
                 Client::new()
             });
@@ -2118,10 +2198,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         // When a credential is present, hit the model_provider's native /models endpoint
         // (OpenAI-compatible: GET {base_url}/models). Local OpenAI-compatible
-        // servers that explicitly allow unauthenticated listing use the same
-        // path without an Authorization header.
+        // servers with a public catalog use the same path without an Authorization header.
         let list_credential = self.credential.as_deref();
-        if list_credential.is_some() || self.unauthenticated_model_listing {
+        if list_credential.is_some() || self.public_model_listing {
             let url = format!("{}/models", self.base_url);
             let response = self
                 .apply_auth_header(self.http_client().get(&url), list_credential)
@@ -2184,6 +2263,81 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         match &self.openrouter_vendor_prefix {
             Some(prefix) => crate::openrouter_catalog::list_models_for_vendor(prefix).await,
             None => anyhow::bail!("live model listing is not supported for this model_provider"),
+        }
+    }
+
+    async fn list_models_with_pricing(
+        &self,
+    ) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ModelInfo>> {
+        // When a credential is present, hit the provider's native /models
+        // endpoint — this returns pricing data that we can capture.
+        let list_credential = self.credential.as_deref();
+        if list_credential.is_some() || self.public_model_listing {
+            let url = format!("{}/models", self.base_url);
+            let response = self
+                .apply_auth_header(self.http_client().get(&url), list_credential)
+                .send()
+                .await
+                .map_err(|e| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "model_provider": &self.name,
+                                "url": &url,
+                                "phase": "model_list_request",
+                                "error": super::format_error_chain(&e),
+                            })),
+                        "compatible: model list request failed"
+                    );
+                    anyhow::Error::msg(format!(
+                        "{} model list request failed: {url}: {e}",
+                        self.name
+                    ))
+                })?;
+            if !response.status().is_success() {
+                let status = response.status();
+                anyhow::bail!("{} model list failed at {url}: HTTP {status}", self.name);
+            }
+            let body: ModelsResponse = response.json().await.map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "model_provider": &self.name,
+                            "phase": "model_list_parse",
+                            "error": super::format_error_chain(&e),
+                        })),
+                    "compatible: model list returned invalid JSON"
+                );
+                anyhow::Error::msg(format!(
+                    "{} model list returned invalid JSON: {e}",
+                    self.name
+                ))
+            })?;
+            return Ok(normalize_models_with_pricing(body));
+        }
+        // No credential — try models.dev first (no pricing from that source),
+        // then fall back to OpenRouter which does include pricing.
+        if let Some(key) = &self.models_dev_key {
+            match crate::models_dev::list_models_for(key).await {
+                Ok(models) if !models.is_empty() => {
+                    return Ok(models_dev_to_model_info(models));
+                }
+                Ok(_) => {} // empty → fall through to openrouter
+                Err(_) if self.openrouter_vendor_prefix.is_none() => {
+                    return Ok(Vec::new());
+                }
+                Err(_) => {} // fall through to openrouter
+            }
+        }
+        match &self.openrouter_vendor_prefix {
+            Some(prefix) => {
+                crate::openrouter_catalog::list_models_for_vendor_with_pricing(prefix).await
+            }
+            None => Ok(Vec::new()),
         }
     }
 
@@ -3040,6 +3194,57 @@ mod tests {
     fn strips_trailing_slash() {
         let p = make_model_provider("test", "https://example.com/", None);
         assert_eq!(p.base_url, "https://example.com");
+    }
+
+    #[test]
+    fn with_tls_ca_cert_path_missing_file_leaves_pem_none() {
+        // Regression: a non-existent cert path must not panic or propagate an
+        // error — the provider falls back to system roots and logs a warning.
+        let p = make_model_provider("test", "https://example.com", None)
+            .with_tls_ca_cert_path("/nonexistent/path/to/ca.pem");
+        assert!(
+            p.tls_ca_cert_pem.is_none(),
+            "missing cert file must leave tls_ca_cert_pem as None (fall back to system roots)"
+        );
+    }
+
+    #[test]
+    fn with_tls_ca_cert_path_invalid_pem_stores_bytes_and_http_client_still_builds() {
+        // The path-read step stores raw bytes; PEM parsing happens in http_client().
+        // Writing invalid PEM to a temp file: read succeeds (bytes stored), then
+        // http_client() logs a WARN and falls back to system roots — no panic, no error.
+        let path = format!("/tmp/zeroclaw-test-invalid-pem-{}.pem", std::process::id());
+        std::fs::write(&path, b"not-a-valid-pem").unwrap();
+        let p =
+            make_model_provider("test", "https://example.com", None).with_tls_ca_cert_path(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            p.tls_ca_cert_pem.is_some(),
+            "readable file (even with bad PEM) must populate tls_ca_cert_pem bytes"
+        );
+        // http_client() must build cleanly even when PEM parse fails internally.
+        // The method returns Client directly (panics on builder error), so if we
+        // reach here without panic the fallback-to-system-roots path is working.
+        let _client = p.http_client();
+    }
+
+    #[test]
+    fn with_tls_ca_cert_path_invalid_pem_streaming_http_client_still_builds() {
+        // Streaming requests use a separate client builder, so the TLS override
+        // must degrade the same way there: warn, use system roots, and keep going.
+        let path = format!(
+            "/tmp/zeroclaw-test-invalid-pem-streaming-{}.pem",
+            std::process::id()
+        );
+        std::fs::write(&path, b"not-a-valid-pem").unwrap();
+        let p =
+            make_model_provider("test", "https://example.com", None).with_tls_ca_cert_path(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            p.tls_ca_cert_pem.is_some(),
+            "readable file (even with bad PEM) must populate tls_ca_cert_pem bytes"
+        );
+        let _client = p.streaming_http_client();
     }
 
     #[tokio::test]
@@ -5538,5 +5743,38 @@ mod tests {
             Some(0.5),
             "explicit temperature must be sent verbatim, got: {body}"
         );
+    }
+
+    #[test]
+    fn models_dev_to_model_info_returns_no_pricing() {
+        // The models.dev catalog does not serve pricing data; every entry
+        // must have `pricing: None`. This documents the intentional contract.
+        let ids = vec![
+            "openai/gpt-4o".to_string(),
+            "anthropic/claude-sonnet-4-6".to_string(),
+        ];
+        let models = models_dev_to_model_info(ids);
+        assert_eq!(models.len(), 2);
+        // Preserves input order (no sorting — caller decides).
+        assert_eq!(models[0].id, "openai/gpt-4o");
+        assert!(models[0].pricing.is_none());
+        assert_eq!(models[1].id, "anthropic/claude-sonnet-4-6");
+        assert!(models[1].pricing.is_none());
+    }
+
+    #[test]
+    fn public_model_listing_flag_defaults_false() {
+        // Providers without explicit public_model_listing must default to false,
+        // preserving existing behavior for all established providers.
+        let p = make_model_provider("test", "https://example.com", None);
+        assert!(!p.public_model_listing);
+    }
+
+    #[test]
+    fn public_model_listing_flag_can_be_set() {
+        // Verify the builder correctly enables public_model_listing.
+        let p =
+            make_model_provider("test", "https://example.com", None).with_public_model_listing();
+        assert!(p.public_model_listing);
     }
 }

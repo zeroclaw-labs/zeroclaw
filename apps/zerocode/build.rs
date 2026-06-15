@@ -5,7 +5,9 @@
 //! list.
 //!
 //! The web registry carries ~25 CSS custom properties per theme; the TUI needs
-//! nine `Theme` roles. The mapping below is the documented bridge. Two roles
+//! nine `Theme` roles. The mapping below is the documented bridge. Themes may
+//! optionally provide a `tui` object to preserve terminal-specific role choices
+//! that do not map cleanly onto the web/docs CSS token set. Otherwise two roles
 //! the `--pc-*` vars do not express (`warn`, `tool`) are taken from the theme's
 //! `preview` swatch array, which every registry entry provides as
 //! `[bg, accent, accent2, accent3, fg]`.
@@ -53,6 +55,7 @@ fn main() {
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(Value::as_str).collect())
             .unwrap_or_default();
+        let tui = t.get("tui").and_then(Value::as_object);
 
         let var = |key: &str| -> String {
             let v = vars
@@ -68,16 +71,15 @@ fn main() {
             rgb_literal(v)
                 .unwrap_or_else(|| panic!("theme {id} preview[{idx}] = {v:?} is not #rrggbb"))
         };
-
-        let title = var("--pc-accent");
-        let heading = var("--pc-accent-light");
-        let body = var("--pc-text-primary");
-        let dim = var("--pc-text-muted");
-        let accent = var("--pc-accent");
-        let warn = swatch(3, "warn");
-        let selection_bg = var("--pc-bg-elevated");
-        let tool = swatch(2, "tool");
-        let background = var("--pc-bg-base");
+        let title = role_literal(tui, id, "title", || var("--pc-accent"));
+        let heading = role_literal(tui, id, "heading", || var("--pc-accent-light"));
+        let body = role_literal(tui, id, "body", || var("--pc-text-primary"));
+        let dim = role_literal(tui, id, "dim", || var("--pc-text-muted"));
+        let accent = role_literal(tui, id, "accent", || var("--pc-accent"));
+        let warn = role_literal(tui, id, "warn", || swatch(3, "warn"));
+        let selection_bg = role_literal(tui, id, "selection_bg", || var("--pc-bg-elevated"));
+        let tool = role_literal(tui, id, "tool", || swatch(2, "tool"));
+        let background = role_literal(tui, id, "background", || var("--pc-bg-base"));
 
         out.push_str(&format!(
             "    (\"{name}\", Theme {{ title: {title}, heading: {heading}, body: {body}, \
@@ -96,6 +98,21 @@ fn main() {
 /// exclusively for theme names.
 fn snake_case(id: &str) -> String {
     id.chars().map(|c| if c == '-' { '_' } else { c }).collect()
+}
+
+fn role_literal<F>(
+    tui: Option<&serde_json::Map<String, Value>>,
+    id: &str,
+    key: &str,
+    fallback: F,
+) -> String
+where
+    F: FnOnce() -> String,
+{
+    let Some(v) = tui.and_then(|roles| roles.get(key)).and_then(Value::as_str) else {
+        return fallback();
+    };
+    rgb_literal(v).unwrap_or_else(|| panic!("theme {id} tui.{key} = {v:?} is not #rrggbb"))
 }
 
 /// Convert a `#rrggbb` hex string to a `Color::Rgb(r, g, b)` literal. Returns

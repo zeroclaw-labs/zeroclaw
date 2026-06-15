@@ -1,7 +1,7 @@
 use crate::cron::store::{RunCompletionAction, persist_run_completion_state, persist_run_result};
 use crate::cron::{
     CronJob, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs, due_jobs,
-    next_run_for_schedule, sync_declarative_jobs,
+    next_run_for_schedule, skip_missed_run, sync_declarative_jobs,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
@@ -194,6 +194,7 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             "Scheduler startup: catch-up disabled by config"
         );
+        skip_missed_jobs_on_startup(&config).await;
     }
 
     loop {
@@ -284,6 +285,80 @@ async fn catch_up_overdue_jobs(config: &Config, event_tx: &EventBroadcast) {
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
         "Scheduler startup: catch-up complete"
+    );
+}
+
+/// Advance `next_run` for all overdue jobs without executing them.
+///
+/// Called at scheduler startup when `catch_up_on_startup` is disabled so
+/// that the normal polling loop (which selects `next_run <= now`) doesn't
+/// pick up jobs that became overdue during daemon downtime.
+///
+/// - Recurring jobs: `next_run` is advanced to the next future occurrence.
+/// - One-shot `At` jobs: disabled with a `skipped` last status.
+async fn skip_missed_jobs_on_startup(config: &Config) {
+    let now = Utc::now();
+    let jobs = match all_overdue_jobs(config, now) {
+        Ok(jobs) => jobs,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "Scheduler startup skip: query failed",
+            );
+            return;
+        }
+    };
+
+    if jobs.is_empty() {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "Scheduler startup skip: no overdue jobs to advance",
+        );
+        return;
+    }
+
+    let mut skipped_recurring: u64 = 0;
+    let mut skipped_oneshot: u64 = 0;
+
+    for job in &jobs {
+        let is_oneshot = matches!(job.schedule, Schedule::At { .. });
+        match skip_missed_run(config, job, now) {
+            Ok(()) => {
+                if is_oneshot {
+                    skipped_oneshot += 1;
+                } else {
+                    skipped_recurring += 1;
+                }
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "job_id": job.id,
+                            "error": format!("{}", e),
+                        })),
+                    "Scheduler startup skip: failed to advance job",
+                );
+            }
+        }
+    }
+
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "total": jobs.len(),
+                "skipped_recurring": skipped_recurring,
+                "skipped_oneshot": skipped_oneshot,
+            })
+        ),
+        "Scheduler startup skip: advanced overdue jobs without executing",
     );
 }
 
@@ -1011,8 +1086,8 @@ mod tests {
             TEST_AGENT.to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: format!("openrouter.{TEST_AGENT}").into(),
-                risk_profile: TEST_AGENT.to_string(),
-                runtime_profile: TEST_AGENT.to_string(),
+                risk_profile: TEST_AGENT.into(),
+                runtime_profile: TEST_AGENT.into(),
                 ..Default::default()
             },
         );
