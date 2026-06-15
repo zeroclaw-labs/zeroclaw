@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolResult, with_ephemeral_workspace_warning};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 
@@ -17,6 +17,13 @@ pub struct ImageGenTool {
     workspace_dir: PathBuf,
     default_model: String,
     api_key_env: String,
+    /// Whether the saved image persists on the host filesystem. `false` on an
+    /// ephemeral runtime (Docker tmpfs / no volume mount), where the PNG is
+    /// written inside the container but invisible on the host and discarded at
+    /// session end. When `false`, a successful generation carries a loud
+    /// ephemeral-workspace warning. Mirrors
+    /// [`super::file_write::FileWriteTool`]. See issue #4627.
+    persistent_writes: bool,
 }
 
 impl ImageGenTool {
@@ -31,6 +38,26 @@ impl ImageGenTool {
             workspace_dir,
             default_model,
             api_key_env,
+            persistent_writes: true,
+        }
+    }
+
+    /// Construct with an explicit persistence flag derived from the active
+    /// runtime adapter's `has_filesystem_access()`. Mirrors
+    /// [`super::file_write::FileWriteTool::new_with_persistence`].
+    pub fn new_with_persistence(
+        security: Arc<SecurityPolicy>,
+        workspace_dir: PathBuf,
+        default_model: String,
+        api_key_env: String,
+        persistent_writes: bool,
+    ) -> Self {
+        Self {
+            security,
+            workspace_dir,
+            default_model,
+            api_key_env,
+            persistent_writes,
         }
     }
 
@@ -289,7 +316,13 @@ impl Tool for ImageGenTool {
             });
         }
 
-        self.generate(args).await
+        let mut result = self.generate(args).await?;
+        // A generated image saved to an ephemeral workspace never reaches the
+        // host and is lost at session end; warn loudly on success (issue #4627).
+        if !self.persistent_writes && result.success {
+            result.output = with_ephemeral_workspace_warning(&result.output);
+        }
+        Ok(result)
     }
 }
 

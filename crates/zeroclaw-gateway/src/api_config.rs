@@ -265,6 +265,7 @@ fn prop_kind_wire(kind: zeroclaw_config::traits::PropKind) -> &'static str {
         PropKind::Integer => "integer",
         PropKind::Float => "float",
         PropKind::Enum => "enum",
+        PropKind::AliasRef => "alias-ref",
         PropKind::StringArray => "string-array",
         PropKind::ObjectArray => "object-array",
         PropKind::Object => "object",
@@ -349,6 +350,26 @@ fn lookup_prop_field(
         .prop_fields()
         .into_iter()
         .find(|info| info.name == path)
+        .or_else(|| {
+            zeroclaw_config::schema::Config::prop_is_secret(path).then(|| {
+                zeroclaw_config::traits::PropFieldInfo {
+                    name: path.to_string(),
+                    category: "Secrets",
+                    display_value: zeroclaw_config::traits::UNSET_DISPLAY.to_string(),
+                    type_hint: "String",
+                    kind: zeroclaw_config::traits::PropKind::String,
+                    is_secret: true,
+                    enum_variants: None,
+                    description: "",
+                    derived_from_secret: false,
+                    credential_class: Some(
+                        zeroclaw_config::traits::CredentialSurfaceClass::EncryptedSecret,
+                    ),
+                    tab: zeroclaw_config::traits::ConfigTab::None,
+                    alias_source: None,
+                }
+            })
+        })
 }
 
 /// Save the config and refresh in-memory state. Captures a snapshot of the
@@ -775,7 +796,7 @@ pub async fn handle_list(
         .prop_fields()
         .into_iter()
         .filter(|info| match prefix {
-            Some(p) => info.name.starts_with(p),
+            Some(p) => field_visibility::path_matches_prefix(&info.name, p),
             None => true,
         })
         .filter(|info| !field_visibility::is_excluded(&info.name, &excluded))
@@ -917,6 +938,28 @@ pub async fn handle_templates(State(state): State<AppState>, headers: HeaderMap)
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct MapPathQuery {
     pub path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct AliasSourceQuery {
+    pub source: zeroclaw_config::traits::AliasSource,
+}
+
+/// `GET /api/config/resolve-alias-source?source=<source>` — list the configured
+/// alias values valid for an alias-reference field, resolved from the live
+/// config via the shared `Config::resolve_alias_source`.
+pub async fn handle_resolve_alias_source(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<AliasSourceQuery>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let cfg = state.config.read().clone();
+    let values = cfg.resolve_alias_source(q.source);
+    axum::Json(serde_json::json!({ "source": q.source, "values": values })).into_response()
 }
 
 /// `GET /api/config/map-keys?path=<section>` — list the current alias keys at
@@ -2212,6 +2255,20 @@ mod tests {
         assert!(!obj.contains_key("length"));
         assert!(!obj.contains_key("hash"));
         assert!(!obj.contains_key("masked"));
+    }
+
+    #[test]
+    fn lookup_prop_field_synthesizes_dynamic_http_request_secret_metadata() {
+        let cfg = zeroclaw_config::schema::Config::default();
+        let field = lookup_prop_field(&cfg, "http_request.secrets.api_token")
+            .expect("dynamic http_request secret metadata");
+
+        assert_eq!(field.kind, PropKind::String);
+        assert!(field.is_secret);
+        assert_eq!(
+            field.credential_class,
+            Some(zeroclaw_config::traits::CredentialSurfaceClass::EncryptedSecret)
+        );
     }
 
     #[test]

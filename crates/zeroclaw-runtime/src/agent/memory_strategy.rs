@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use zeroclaw_api::memory_traits::{Memory, MemoryStrategy};
 use zeroclaw_api::model_provider::ModelProvider;
+use zeroclaw_api::observability_traits::Observer;
 
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 
@@ -24,6 +25,22 @@ impl DefaultMemoryStrategy {
         memory_config: zeroclaw_config::schema::MemoryConfig,
         workspace_dir: impl Into<std::path::PathBuf>,
     ) -> Self {
+        // #6722: rerank_enabled is declared on the config schema but the
+        // retrieval-pipeline rerank stage was never landed (PR #4245 closed
+        // unmerged).  Emit a one-time warning so operators who set these
+        // fields know they currently have no effect.
+        if memory_config.rerank_enabled {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "rerank_enabled": true,
+                        "rerank_threshold": memory_config.rerank_threshold,
+                    })),
+                "memory.rerank_enabled is set but the rerank stage is not yet implemented; this setting currently has no effect"
+            );
+        }
         Self {
             memory,
             limit: 5,
@@ -60,10 +77,15 @@ impl DefaultMemoryStrategy {
 
 #[async_trait::async_trait]
 impl MemoryStrategy for DefaultMemoryStrategy {
-    async fn load_context(&self, query: &str, session_id: Option<&str>) -> anyhow::Result<String> {
+    async fn load_context(
+        &self,
+        observer: &dyn Observer,
+        query: &str,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<String> {
         let loader = DefaultMemoryLoader::new(self.limit, self.min_relevance_score);
         loader
-            .load_context(self.memory.as_ref(), query, session_id)
+            .load_context(self.memory.as_ref(), observer, query, session_id)
             .await
     }
 

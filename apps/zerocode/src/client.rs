@@ -59,6 +59,7 @@ pub mod method {
     pub const CONFIG_DELETE: &str = "config/delete";
     pub const CONFIG_RELOAD: &str = "config/reload";
     pub const CONFIG_MAP_KEYS: &str = "config/map-keys";
+    pub const CONFIG_RESOLVE_ALIAS_SOURCE: &str = "config/resolve-alias-source";
     pub const CONFIG_MAP_KEY_CREATE: &str = "config/map-key-create";
     pub const CONFIG_MAP_KEY_DELETE: &str = "config/map-key-delete";
     pub const CONFIG_TEMPLATES: &str = "config/templates";
@@ -475,7 +476,7 @@ impl RpcClient {
 
     /// Connect to the daemon via WebSocket Secure (WSS).
     ///
-    /// Same handshake and reconnect semantics as [`connect`] — pass
+    /// Same handshake and reconnect semantics as [`Self::connect`] — pass
     /// previous `tui_id`/`tui_sig` to reclaim identity on reconnect.
     ///
     /// When `tls_skip_verify` is true, certificate verification is
@@ -682,15 +683,27 @@ impl RpcClient {
     }
 
     pub async fn call<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
+        self.call_with_timeout(method, params, std::time::Duration::from_secs(5))
+            .await
+    }
+
+    pub async fn call_with_timeout<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: std::time::Duration,
+    ) -> Result<T> {
         // Timeout prevents indefinite hangs when the daemon dies between
         // the connection-state check and the actual RPC send/recv.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.rpc.request(method, params),
-        )
-        .await
-        .map_err(|_| anyhow::Error::msg(format!("RPC {method}: timed out after 5s")))?
-        .map_err(|e| anyhow::Error::msg(format!("RPC {method}: {} ({})", e.message, e.code)))?;
+        let result = tokio::time::timeout(timeout, self.rpc.request(method, params))
+            .await
+            .map_err(|_| {
+                anyhow::Error::msg(format!(
+                    "RPC {method}: timed out after {}s",
+                    timeout.as_secs()
+                ))
+            })?
+            .map_err(|e| anyhow::Error::msg(format!("RPC {method}: {} ({})", e.message, e.code)))?;
         serde_json::from_value(result).with_context(|| format!("deserializing {method} result"))
     }
 
@@ -796,6 +809,19 @@ impl RpcClient {
         Ok(result.keys)
     }
 
+    pub async fn config_resolve_alias_source(
+        &self,
+        source: crate::wire::AliasSource,
+    ) -> Result<Vec<String>> {
+        let result: ConfigResolveAliasSourceResult = self
+            .call(
+                method::CONFIG_RESOLVE_ALIAS_SOURCE,
+                serde_json::json!({ "source": source }),
+            )
+            .await?;
+        Ok(result.values)
+    }
+
     pub async fn config_map_key_create(&self, path: &str, key: &str) -> Result<()> {
         let _: Value = self
             .call(
@@ -824,9 +850,10 @@ impl RpcClient {
     }
 
     pub async fn catalog_models(&self, provider: &str) -> Result<CatalogModelsResult> {
-        self.call(
+        self.call_with_timeout(
             method::CONFIG_CATALOG_MODELS,
             serde_json::json!({ "model_provider": provider }),
+            std::time::Duration::from_secs(20),
         )
         .await
     }
@@ -992,7 +1019,7 @@ impl RpcClient {
         self.session_new_with_id(agent_alias, cwd, None).await
     }
 
-    /// Like [`session_new_with_id`] but sets `exclude_memory: true` so the
+    /// Like [`Self::session_new_with_id`] but sets `exclude_memory: true` so the
     /// daemon strips memory tools and uses a NoneMemory backend. Used by the
     /// ACP pane, which should never have access to persistent memory.
     pub async fn session_new_acp(
@@ -1308,6 +1335,12 @@ pub struct ConfigMapKeysResult {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub struct ConfigResolveAliasSourceResult {
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct ConfigSectionsResult {
     pub sections: Vec<ConfigSectionEntry>,
 }
@@ -1319,6 +1352,12 @@ pub struct ConfigSectionEntry {
     pub label: String,
     pub help: String,
     pub completed: bool,
+    /// Display group label (`"Foundation"`, `"Tools"`, …) from
+    /// `zeroclaw_config::sections::SectionGroup::label()`. Empty when
+    /// the daemon predates group plumbing — the sections pane falls
+    /// back to the flat ungrouped list.
+    #[serde(default)]
+    pub group: String,
     #[serde(default)]
     pub shape: Option<SectionShape>,
 }
@@ -1743,7 +1782,10 @@ pub struct SessionListResult {
 pub struct AgentStatusEntry {
     pub alias: String,
     pub enabled: bool,
-    pub active_sessions: usize,
+    #[serde(default)]
+    pub live_sessions: usize,
+    #[serde(default)]
+    pub persisted_sessions: usize,
     #[serde(default)]
     pub channels: Vec<String>,
 }

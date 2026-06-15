@@ -218,7 +218,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
             artifact: zeroclaw
             ext: tar.gz
-            cross_compiler: gcc-aarch64-linux-gnu
+            cross_compiler: gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
             linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
             linker: aarch64-linux-gnu-gcc
           - os: ubuntu-22.04
@@ -230,7 +230,7 @@ jobs:
             target: armv7-unknown-linux-gnueabihf
             artifact: zeroclaw
             ext: tar.gz
-            cross_compiler: gcc-arm-linux-gnueabihf
+            cross_compiler: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
             linker_env: CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER
             linker: arm-linux-gnueabihf-gcc
             skip_prometheus: true
@@ -238,7 +238,7 @@ jobs:
             target: arm-unknown-linux-gnueabihf
             artifact: zeroclaw
             ext: tar.gz
-            cross_compiler: gcc-arm-linux-gnueabihf
+            cross_compiler: gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
             linker_env: CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER
             linker: arm-linux-gnueabihf-gcc
             skip_prometheus: true
@@ -300,6 +300,7 @@ jobs:
           # which segfaults on ARMv6 devices (e.g. Raspberry Pi Zero W).
           if [ "${{ matrix.target }}" = "arm-unknown-linux-gnueabihf" ]; then
             export CFLAGS_arm_unknown_linux_gnueabihf="-march=armv6 -mfpu=vfp -mfloat-abi=hard"
+            export CXXFLAGS_arm_unknown_linux_gnueabihf="-march=armv6 -mfpu=vfp -mfloat-abi=hard"
             export CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS="-C target-feature=-neon"
           fi
           # Use matrix-level feature override if set, otherwise use global RELEASE_CARGO_FEATURES
@@ -551,27 +552,7 @@ jobs:
           path: artifacts/
 
       - name: Prepare Docker context with pre-built binaries
-        run: |
-          mkdir -p docker-ctx/bin/amd64 docker-ctx/bin/arm64
-          tar xzf artifacts/zeroclaw-x86_64-unknown-linux-gnu.tar.gz -C docker-ctx/bin/amd64
-          tar xzf artifacts/zeroclaw-aarch64-unknown-linux-gnu.tar.gz -C docker-ctx/bin/arm64
-
-          mkdir -p docker-ctx/zeroclaw-data/.zeroclaw docker-ctx/zeroclaw-data/data
-          printf '%s\n' \
-            'api_key = ""' \
-            'default_provider = "openrouter"' \
-            'default_model = "anthropic/claude-sonnet-4-20250514"' \
-            'default_temperature = 0.7' \
-            '' \
-            '[gateway]' \
-            'port = 42617' \
-            'host = "[::]"' \
-            'allow_public_bind = true' \
-            'web_dist_dir = "/usr/share/zeroclawlabs/web/dist"' \
-            > docker-ctx/zeroclaw-data/.zeroclaw/config.toml
-
-          cp Dockerfile.ci docker-ctx/Dockerfile
-          cp Dockerfile.debian.ci docker-ctx/Dockerfile.debian
+        run: bash scripts/ci/prepare_docker_context.sh from-artifacts docker-ctx artifacts
 
       - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 

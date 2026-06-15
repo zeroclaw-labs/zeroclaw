@@ -20,8 +20,11 @@ pub mod cli;
 pub mod link_enricher;
 pub mod transcription;
 pub mod tts;
+pub mod voice;
 
 // Feature-gated channels
+#[cfg(feature = "channel-amqp")]
+pub mod amqp;
 #[cfg(feature = "channel-bluesky")]
 pub mod bluesky;
 #[cfg(feature = "channel-clawdtalk")]
@@ -66,6 +69,8 @@ pub mod signal;
 pub mod slack;
 #[cfg(feature = "channel-telegram")]
 pub mod telegram;
+#[cfg(feature = "channel-twitch")]
+pub mod twitch;
 #[cfg(feature = "channel-twitter")]
 pub mod twitter;
 #[cfg(feature = "channel-voice-call")]

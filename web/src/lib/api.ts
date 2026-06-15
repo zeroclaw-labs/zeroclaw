@@ -197,8 +197,18 @@ export async function getPublicHealth(): Promise<{
 // Status / Health
 // ---------------------------------------------------------------------------
 
-export function getStatus(): Promise<StatusResponse> {
-  return apiFetch<StatusResponse>("/api/status");
+/**
+ * System status overview. Pass an `agent` alias to get the model, provider,
+ * temperature, and memory backend resolved for that specific agent — the
+ * gateway runs the same `resolved_model_provider_for_agent` logic it uses to
+ * build the Agent, so the returned `model` reflects that agent's configured
+ * provider entry. Omitting the alias returns the install-wide first-of-each
+ * summary (the gateway default model), which is NOT correct for any
+ * non-default agent.
+ */
+export function getStatus(agent?: string): Promise<StatusResponse> {
+  const qs = agent ? `?agent=${encodeURIComponent(agent)}` : "";
+  return apiFetch<StatusResponse>(`/api/status${qs}`);
 }
 
 export function getHealth(): Promise<HealthSnapshot> {
@@ -269,6 +279,8 @@ export interface ListResponseEntry {
   is_secret: boolean;
   /** Variants for `kind === 'enum'` fields (drives <select> options). */
   enum_variants?: string[];
+  /** Alias namespace for `kind === 'alias-ref'` fields (drives the resolved picker). */
+  alias_source?: string;
   section?: string;
   /** Tab grouping from `ConfigTab` enum. Absent when `ConfigTab::None`. */
   tab?: string;
@@ -993,9 +1005,18 @@ export function getCatalog(): Promise<CatalogResponse> {
   return apiFetch<CatalogResponse>("/api/config/catalog");
 }
 
+export interface ModelPricing {
+  prompt?: string;
+  completion?: string;
+  input_cache_read?: string;
+  input_cache_write?: string;
+}
+
 export interface ModelsResponse {
   model_provider: string;
   models: string[];
+  /** Optional pricing data keyed by model ID. */
+  pricing?: Record<string, ModelPricing>;
   /** True when the provider family is local according to the gateway catalog. */
   local: boolean;
   /** false when the upstream catalog fetch failed; form should fall back to free-text. */
@@ -1093,6 +1114,19 @@ export interface AgentOptionsResponse {
 
 export function getAgentOptions(): Promise<AgentOptionsResponse> {
   return apiFetch<AgentOptionsResponse>("/api/config/agent-options");
+}
+
+export interface ResolveAliasSourceResponse {
+  source: string;
+  values: string[];
+}
+
+export function resolveAliasSource(
+  source: string,
+): Promise<ResolveAliasSourceResponse> {
+  return apiFetch<ResolveAliasSourceResponse>(
+    `/api/config/resolve-alias-source?source=${encodeURIComponent(source)}`,
+  );
 }
 
 export interface PickerItem {

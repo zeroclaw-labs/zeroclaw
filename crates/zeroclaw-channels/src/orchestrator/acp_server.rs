@@ -108,6 +108,10 @@ pub struct AcpServer {
     /// that `/ws/canvas/:id` WebSocket subscribers read from.  `None` in
     /// standalone `zeroclaw acp` mode where no gateway is running.
     canvas_store: Option<CanvasStore>,
+    /// Shared SOP engine from the daemon. `None` in standalone mode — agents
+    /// build their own engine from config.
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 }
 
 impl AcpServer {
@@ -159,6 +163,8 @@ impl AcpServer {
             loading_sessions: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             store,
             canvas_store: None,
+            sop_engine: None,
+            sop_audit: None,
         }
     }
 
@@ -167,6 +173,18 @@ impl AcpServer {
     /// `/ws/canvas/:id` WebSocket endpoint serves.
     pub fn with_canvas_store(mut self, canvas_store: CanvasStore) -> Self {
         self.canvas_store = Some(canvas_store);
+        self
+    }
+
+    /// Attach the shared SOP engine from the daemon so that agents created by
+    /// this server share a single SOP engine with the rest of the daemon.
+    pub fn with_sop_engine(
+        mut self,
+        sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+        sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    ) -> Self {
+        self.sop_engine = sop_engine;
+        self.sop_audit = sop_audit;
         self
     }
 
@@ -561,6 +579,8 @@ impl AcpServer {
             Some(std::path::Path::new(&workspace_dir)),
             false,
             true,
+            self.sop_engine.clone(),
+            self.sop_audit.clone(),
         )
         .await
         .map_err(|e| RpcError {
@@ -771,6 +791,8 @@ impl AcpServer {
             Some(&workspace_dir),
             false,
             true,
+            self.sop_engine.clone(),
+            self.sop_audit.clone(),
         )
         .await
         .map_err(|e| RpcError {
@@ -970,6 +992,8 @@ impl AcpServer {
             Some(&workspace_dir),
             false,
             true,
+            self.sop_engine.clone(),
+            self.sop_audit.clone(),
         )
         .await
         .map_err(|e| RpcError {
@@ -1475,10 +1499,11 @@ impl AcpServer {
     }
 
     fn cancelled_prompt_result(session_id: String, accumulated_text: &str) -> Value {
+        let marker = zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
         let content = if accumulated_text.is_empty() {
-            "[interrupted by user]".to_string()
+            marker
         } else {
-            format!("{accumulated_text}\n\n[interrupted by user]")
+            format!("{accumulated_text}\n\n{marker}")
         };
         Self::prompt_result(session_id, "cancelled", content)
     }
@@ -2274,7 +2299,7 @@ mod tests {
             "test-agent".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "openrouter.default".into(),
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..Default::default()
             },
         );
@@ -2324,7 +2349,7 @@ mod tests {
             "only-agent".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "openrouter.default".into(),
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..Default::default()
             },
         );
@@ -2399,7 +2424,7 @@ mod tests {
             "agent-alpha".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "openrouter.default".into(),
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..Default::default()
             },
         );
@@ -2407,7 +2432,7 @@ mod tests {
             "agent-beta".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "openrouter.default".into(),
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..Default::default()
             },
         );
@@ -2457,7 +2482,7 @@ mod tests {
             "agent-alpha".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "openrouter.default".into(),
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..Default::default()
             },
         );
@@ -2465,7 +2490,7 @@ mod tests {
             "agent-beta".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "openrouter.default".into(),
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..Default::default()
             },
         );
@@ -2615,11 +2640,17 @@ mod tests {
         assert_eq!(with_partial["stopReason"], "cancelled");
         assert_eq!(
             with_partial["content"],
-            "partial text\n\n[interrupted by user]"
+            format!(
+                "partial text\n\n{}",
+                zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user")
+            )
         );
 
         let marker_only = AcpServer::cancelled_prompt_result("test-sid".to_string(), "");
-        assert_eq!(marker_only["content"], "[interrupted by user]");
+        assert_eq!(
+            marker_only["content"],
+            zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user")
+        );
     }
 
     #[test]
@@ -2867,7 +2898,7 @@ mod tests {
             "test-agent".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "anthropic.default".into(),
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..Default::default()
             },
         );
@@ -2983,7 +3014,7 @@ mod tests {
             "test-agent".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "anthropic.default".into(),
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..Default::default()
             },
         );

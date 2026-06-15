@@ -20,10 +20,34 @@ use std::sync::Arc;
 /// against the field's true type (e.g. a bool), which fails with
 /// "bool value with length 7".
 const UNSET_DISPLAY: &str = "<unset>";
+const MODEL_CATALOG_MAX_ATTEMPTS: u8 = 2;
+
+/// Upper bound on rendered secret-mask bullets. A pasted API key can be
+/// 100+ chars; one bullet per character wraps the masked value across
+/// rows and pushes later fields and the footer out of view. Beyond this
+/// the mask is clipped and a `(+N)` suffix reports the hidden length.
+const SECRET_MASK_MAX: usize = 24;
+
+/// Render a bounded secret mask. One bullet per character lets a pasted
+/// API key wrap across rows and shove later fields off-screen; past
+/// `SECRET_MASK_MAX` the mask is clipped and the hidden length reported
+/// as `(+N)` so the user still has feedback that input was captured.
+fn masked_secret(buf: &str) -> String {
+    let count = buf.chars().count();
+    if count > SECRET_MASK_MAX {
+        format!(
+            "{} (+{})",
+            "•".repeat(SECRET_MASK_MAX),
+            count - SECRET_MASK_MAX
+        )
+    } else {
+        "•".repeat(count)
+    }
+}
 
 use crate::client::{
-    QuickstartApplyResult, QuickstartError, QuickstartFieldDescriptor, QuickstartFieldSection,
-    QuickstartStateResult, QuickstartStep, QuickstartSurface, RpcClient,
+    AppliedAgent, QuickstartApplyResult, QuickstartError, QuickstartFieldDescriptor,
+    QuickstartFieldSection, QuickstartStateResult, QuickstartStep, QuickstartSurface, RpcClient,
 };
 use crate::theme;
 use crate::widgets::{HelpEntry, HelpNode};
@@ -45,10 +69,9 @@ enum Selector {
 }
 
 impl Selector {
-    const ALL: [Selector; 8] = [
+    const ALL: [Selector; 7] = [
         Selector::ModelProvider,
         Selector::RiskProfile,
-        Selector::RuntimeProfile,
         Selector::Memory,
         Selector::Channels,
         Selector::PeerGroups,
@@ -85,6 +108,22 @@ impl Selector {
             Selector::Submit => QuickstartStep::Agent,
         }
     }
+
+    /// Localised title for the selector that owns a validation step, so
+    /// a field error can name where the problem lives (e.g.
+    /// `Model provider / alias: …`) instead of only a count.
+    fn title_for_step(step: QuickstartStep) -> String {
+        let sel = match step {
+            QuickstartStep::ModelProvider => Selector::ModelProvider,
+            QuickstartStep::RiskProfile => Selector::RiskProfile,
+            QuickstartStep::RuntimeProfile => Selector::RuntimeProfile,
+            QuickstartStep::Memory => Selector::Memory,
+            QuickstartStep::Channels => Selector::Channels,
+            QuickstartStep::PeerGroups => Selector::PeerGroups,
+            QuickstartStep::Agent => Selector::Agent,
+        };
+        sel.title()
+    }
 }
 
 /// Drop validation errors for selectors the user hasn't filled yet.
@@ -113,6 +152,29 @@ fn retain_filled_selector_errors(
         .collect()
 }
 
+fn next_selector_index_after(sel: Selector) -> Option<usize> {
+    Selector::ALL
+        .iter()
+        .position(|s| *s == sel)
+        .map(|idx| (idx + 1).min(Selector::ALL.len().saturating_sub(1)))
+}
+
+fn apply_model_catalog_result(form: &mut FieldFormModal, models: Option<Vec<String>>) {
+    form.model_catalog_attempts = form.model_catalog_attempts.saturating_add(1);
+    match models {
+        Some(models) => {
+            apply_model_catalog_to_rows(&mut form.fields, Some(&models));
+            form.model_catalog_state = ModelCatalogState::Loaded;
+        }
+        None if form.model_catalog_attempts < MODEL_CATALOG_MAX_ATTEMPTS => {
+            form.model_catalog_state = ModelCatalogState::Retrying;
+        }
+        None => {
+            form.model_catalog_state = ModelCatalogState::Empty;
+        }
+    }
+}
+
 fn opt(value: &str, label: impl Into<String>, help: impl Into<String>) -> PickerOption {
     PickerOption {
         value: value.to_string(),
@@ -137,6 +199,25 @@ fn in_rect(col: u16, row: u16, r: Rect) -> bool {
 
 fn synth_enter() -> KeyEvent {
     KeyEvent::new(KeyCode::Enter, crossterm::event::KeyModifiers::NONE)
+}
+
+fn queue_apply_handoff(
+    reconnect_state: &crate::app::SharedReconnectState,
+    alias: String,
+    daemon_restarted: bool,
+) -> Option<String> {
+    let Ok(mut guard) = reconnect_state.lock() else {
+        return None;
+    };
+    if daemon_restarted {
+        guard.pending_quickstart_chat = Some(crate::app::PendingQuickstartChat::AfterReconnect(
+            alias.clone(),
+        ));
+        Some(alias)
+    } else {
+        guard.pending_quickstart_chat = Some(crate::app::PendingQuickstartChat::Immediate(alias));
+        None
+    }
 }
 
 /// The character a key press contributes to a free-text buffer (the
@@ -342,13 +423,7 @@ struct FormState {
     /// `Fresh`.
     memory_existing_alias: String,
     channels: Vec<ChannelDraft>,
-    /// `true` once the user has opened the Channels modal and
-    /// hit Done (channels are optional, but the user has to say
-    /// "I considered this and chose 0 / N" before the selector
-    /// counts as `[✓]`).
-    channels_visited: bool,
     peer_groups: Vec<crate::wire::QuickstartPeerGroup>,
-    peer_groups_visited: bool,
     agent_name: String,
     personality_files: Vec<crate::wire::QuickstartPersonalityFile>,
 }
@@ -370,9 +445,7 @@ impl FormState {
             memory_chosen: false,
             memory_existing_alias: String::new(),
             channels: Vec::new(),
-            channels_visited: false,
             peer_groups: Vec::new(),
-            peer_groups_visited: false,
             agent_name: String::new(),
             personality_files: Vec::new(),
         }
@@ -393,8 +466,11 @@ impl FormState {
             Selector::RiskProfile => !self.risk.is_empty(),
             Selector::RuntimeProfile => !self.runtime.is_empty(),
             Selector::Memory => self.memory_chosen,
-            Selector::Channels => self.channels_visited,
-            Selector::PeerGroups => self.peer_groups_visited,
+            // Optional rows should not block Submit when left empty,
+            // but they also should not render as completed unless the
+            // user actually configured something there.
+            Selector::Channels => !self.channels.is_empty(),
+            Selector::PeerGroups => !self.peer_groups.is_empty(),
             Selector::Agent => !self.agent_name.is_empty(),
             // Submit ticks when the daemon has accepted the submission;
             // until then it stays open so the user can tell it's the
@@ -410,7 +486,12 @@ impl FormState {
     fn all_selectors_satisfied(&self) -> bool {
         Selector::ALL
             .iter()
-            .filter(|s| !matches!(s, Selector::Submit))
+            .filter(|s| {
+                !matches!(
+                    s,
+                    Selector::Submit | Selector::Channels | Selector::PeerGroups
+                )
+            })
             .all(|s| self.is_satisfied(*s))
     }
 
@@ -473,10 +554,9 @@ impl FormState {
             SelectorMode::Fresh => SelectorChoice::Fresh(self.risk.clone()),
             SelectorMode::Existing => SelectorChoice::Existing(self.risk.clone()),
         };
-        let runtime_profile = match self.runtime_mode {
-            SelectorMode::Fresh => SelectorChoice::Fresh(self.runtime.clone()),
-            SelectorMode::Existing => SelectorChoice::Existing(self.runtime.clone()),
-        };
+        // Runtime profile picker removed from all surfaces; apply silently
+        // forces the `unbounded` preset. Submit it so the field is well-formed.
+        let runtime_profile = SelectorChoice::Fresh("unbounded".to_string());
         let memory = match self.memory_mode {
             SelectorMode::Fresh => SelectorChoice::Fresh(self.memory),
             SelectorMode::Existing => SelectorChoice::Existing(self.memory_existing_alias.clone()),
@@ -567,14 +647,40 @@ struct TextInputModal {
     peer_group_channel: Option<String>,
 }
 
+/// Lifecycle of the live model catalog for a ModelProvider FieldForm.
+/// The form opens immediately in `Pending` so the modal paints a
+/// loading row instead of the picker blocking on the catalog RPC; a
+/// later `tick` resolves it to `Loaded` (model row upgraded to an
+/// enum picker) or `Empty` (catalog unavailable → free-text fallback).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelCatalogState {
+    /// Section has no model row (channels) — nothing to load.
+    NotApplicable,
+    /// Catalog fetch not yet started or in flight.
+    Pending,
+    /// Catalog fetch failed once and is retrying before falling back.
+    Retrying,
+    /// Catalog returned variants; model row is a picker.
+    Loaded,
+    /// Catalog was empty or unavailable; model row is free-text.
+    Empty,
+}
+
 struct FieldFormModal {
     selector: Selector,
     /// Provider / channel type chosen in the preceding picker step.
     type_key: String,
     /// User-named alias for this entry. Pre-filled with `type_key`.
     alias: String,
+    model_catalog_state: ModelCatalogState,
+    model_catalog_attempts: u8,
     fields: Vec<FieldFormRow>,
     cursor: usize,
+}
+
+struct ModelCatalogFetchResult {
+    type_key: String,
+    models: Option<Vec<String>>,
 }
 
 struct FieldFormRow {
@@ -605,6 +711,142 @@ struct AgentModal {
     /// Canonical filenames the daemon reported in `state.personality_files`.
     /// Captured at modal open so the row order is stable across re-draws.
     filenames: Vec<String>,
+    /// In-pane file editor. Kept inside the Agent modal so Quickstart
+    /// never has to leave raw/alternate-screen mode for `$EDITOR`.
+    editor: Option<FileEditorState>,
+}
+
+struct FileEditorState {
+    filename: String,
+    lines: Vec<String>,
+    cursor_row: usize,
+    cursor_col: usize,
+}
+
+impl FileEditorState {
+    fn new(filename: String, content: String) -> Self {
+        let mut lines: Vec<String> = content.split('\n').map(str::to_string).collect();
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        Self {
+            filename,
+            lines,
+            cursor_row: 0,
+            cursor_col: 0,
+        }
+    }
+
+    fn content(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    fn insert_text(&mut self, text: &str) {
+        for c in text.chars() {
+            match c {
+                '\r' => {}
+                '\n' => self.insert_newline(),
+                c => self.insert_char(c),
+            }
+        }
+    }
+
+    fn insert_char(&mut self, c: char) {
+        self.ensure_cursor_in_bounds();
+        let idx = byte_index_at_char(&self.lines[self.cursor_row], self.cursor_col);
+        self.lines[self.cursor_row].insert(idx, c);
+        self.cursor_col += 1;
+    }
+
+    fn insert_newline(&mut self) {
+        self.ensure_cursor_in_bounds();
+        let idx = byte_index_at_char(&self.lines[self.cursor_row], self.cursor_col);
+        let tail = self.lines[self.cursor_row].split_off(idx);
+        self.cursor_row += 1;
+        self.cursor_col = 0;
+        self.lines.insert(self.cursor_row, tail);
+    }
+
+    fn backspace(&mut self) {
+        self.ensure_cursor_in_bounds();
+        if self.cursor_col > 0 {
+            let line = &mut self.lines[self.cursor_row];
+            let end = byte_index_at_char(line, self.cursor_col);
+            let start = byte_index_at_char(line, self.cursor_col - 1);
+            line.replace_range(start..end, "");
+            self.cursor_col -= 1;
+        } else if self.cursor_row > 0 {
+            let current = self.lines.remove(self.cursor_row);
+            self.cursor_row -= 1;
+            self.cursor_col = self.lines[self.cursor_row].chars().count();
+            self.lines[self.cursor_row].push_str(&current);
+        }
+    }
+
+    fn move_left(&mut self) {
+        self.ensure_cursor_in_bounds();
+        if self.cursor_col > 0 {
+            self.cursor_col -= 1;
+        } else if self.cursor_row > 0 {
+            self.cursor_row -= 1;
+            self.cursor_col = self.lines[self.cursor_row].chars().count();
+        }
+    }
+
+    fn move_right(&mut self) {
+        self.ensure_cursor_in_bounds();
+        if self.cursor_col < self.lines[self.cursor_row].chars().count() {
+            self.cursor_col += 1;
+        } else if self.cursor_row + 1 < self.lines.len() {
+            self.cursor_row += 1;
+            self.cursor_col = 0;
+        }
+    }
+
+    fn move_up(&mut self) {
+        if self.cursor_row > 0 {
+            self.cursor_row -= 1;
+            self.clamp_cursor_col();
+        }
+    }
+
+    fn move_down(&mut self) {
+        if self.cursor_row + 1 < self.lines.len() {
+            self.cursor_row += 1;
+            self.clamp_cursor_col();
+        }
+    }
+
+    fn scroll_lines(&mut self, delta: i32) {
+        if self.lines.is_empty() {
+            self.ensure_cursor_in_bounds();
+            return;
+        }
+        let max_row = self.lines.len().saturating_sub(1) as i32;
+        self.cursor_row = (self.cursor_row as i32 + delta).clamp(0, max_row) as usize;
+        self.clamp_cursor_col();
+    }
+
+    fn ensure_cursor_in_bounds(&mut self) {
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.cursor_row = self.cursor_row.min(self.lines.len().saturating_sub(1));
+        self.clamp_cursor_col();
+    }
+
+    fn clamp_cursor_col(&mut self) {
+        self.cursor_col = self
+            .cursor_col
+            .min(self.lines[self.cursor_row].chars().count());
+    }
+}
+
+fn byte_index_at_char(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(idx, _)| idx)
+        .unwrap_or(s.len())
 }
 
 #[derive(Clone)]
@@ -636,6 +878,11 @@ pub struct QuickstartPane {
     applied_alias: Option<String>,
     busy: bool,
     active_modal: Option<Modal>,
+    /// Source of truth for an in-flight model-catalog fetch. The
+    /// fetched model list itself is not cached here; successful results
+    /// are applied into the model field descriptor so the picker has one
+    /// canonical source.
+    model_catalog_rx: Option<tokio::sync::mpsc::UnboundedReceiver<ModelCatalogFetchResult>>,
     /// Rect of the modal body painted by the most recent `draw` call.
     /// `None` when no modal is up. Used by `handle_mouse` to detect
     /// clicks inside vs. outside the modal.
@@ -668,6 +915,7 @@ impl QuickstartPane {
             applied_alias: None,
             busy: false,
             active_modal: None,
+            model_catalog_rx: None,
             modal_rect: None,
             modal_row_rects: Vec::new(),
             selector_list_rect: None,
@@ -703,7 +951,15 @@ impl QuickstartPane {
     }
 
     pub fn wants_text_input(&self) -> bool {
-        false
+        match self.active_modal.as_ref() {
+            Some(Modal::TextInput(_)) => true,
+            Some(Modal::FieldForm(f)) => f
+                .fields
+                .get(f.cursor)
+                .is_some_and(|row| field_row_variants(row).is_none()),
+            Some(Modal::Agent(a)) => a.editor.is_some() || a.cursor == 0,
+            _ => false,
+        }
     }
 
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
@@ -810,7 +1066,9 @@ impl QuickstartPane {
                 }
             }
             Modal::Agent(a) => {
-                if a.cursor == 0 {
+                if let Some(editor) = a.editor.as_mut() {
+                    editor.insert_text(text);
+                } else if a.cursor == 0 {
                     a.name.push_str(text);
                 }
             }
@@ -908,6 +1166,12 @@ impl QuickstartPane {
         let Some(modal) = self.active_modal.as_mut() else {
             return;
         };
+        if let Modal::Agent(a) = modal
+            && let Some(editor) = a.editor.as_mut()
+        {
+            editor.scroll_lines(delta);
+            return;
+        }
         let (cur, len) = match modal {
             Modal::Picker(p) => (&mut p.cursor, p.options.len()),
             Modal::FieldForm(f) => (&mut f.cursor, f.fields.len()),
@@ -947,7 +1211,14 @@ impl QuickstartPane {
                 pl.cursor = idx;
             }
             Modal::Agent(a) => {
-                a.cursor = idx;
+                if let Some(editor) = a.editor.as_mut() {
+                    if idx < editor.lines.len() {
+                        editor.cursor_row = idx;
+                        editor.clamp_cursor_col();
+                    }
+                } else {
+                    a.cursor = idx;
+                }
             }
             Modal::TextInput(_) => {}
         }
@@ -958,6 +1229,12 @@ impl QuickstartPane {
         let current = self.list_state.selected().unwrap_or(0) as i32;
         let next = (current + delta).rem_euclid(len);
         self.list_state.select(Some(next as usize));
+    }
+
+    fn advance_after_completed(&mut self, sel: Selector) {
+        if let Some(next) = next_selector_index_after(sel) {
+            self.list_state.select(Some(next));
+        }
     }
 
     fn open_modal_for(&mut self, sel: Selector) {
@@ -984,6 +1261,7 @@ impl QuickstartPane {
                     name: self.form.agent_name.clone(),
                     files,
                     filenames,
+                    editor: None,
                 }));
             }
             Selector::ModelProvider => {
@@ -1094,11 +1372,13 @@ impl QuickstartPane {
                             self.apply_picker_choice(selector, chosen, use_existing);
                             self.active_modal = None;
                             self.revalidate().await;
+                            self.advance_after_completed(selector);
                         }
                         (PickerPurpose::ProviderType, true) => {
                             self.adopt_existing_provider(chosen);
                             self.active_modal = None;
                             self.revalidate().await;
+                            self.advance_after_completed(selector);
                         }
                         (PickerPurpose::ProviderType, false) => {
                             self.active_modal = None;
@@ -1113,6 +1393,7 @@ impl QuickstartPane {
                             self.adopt_existing_channel(chosen);
                             self.active_modal = None;
                             self.revalidate().await;
+                            self.advance_after_completed(selector);
                         }
                         (PickerPurpose::ChannelType, false) => {
                             self.active_modal = None;
@@ -1197,6 +1478,11 @@ impl QuickstartPane {
                     }
                 }
                 Some(QuickstartModalAction::Confirm) => {
+                    if f.cursor + 1 < f.fields.len() {
+                        f.cursor += 1;
+                        return;
+                    }
+                    let selector = f.selector;
                     if !self.commit_field_form() {
                         return;
                     }
@@ -1209,12 +1495,17 @@ impl QuickstartPane {
                             Some(Modal::ChannelList(ChannelListModal { cursor: 0 }));
                     } else {
                         self.active_modal = None;
+                        self.advance_after_completed(selector);
                     }
                     self.revalidate().await;
                 }
                 Some(QuickstartModalAction::Left) => {
-                    if let Some(row) = f.fields.get_mut(f.cursor)
-                        && let Some(variants) = row.descriptor.enum_variants.as_deref()
+                    let variants = f
+                        .fields
+                        .get(f.cursor)
+                        .and_then(field_row_variants)
+                        .map(|v| v.to_vec());
+                    if let (Some(row), Some(variants)) = (f.fields.get_mut(f.cursor), variants)
                         && !variants.is_empty()
                     {
                         let cur = variants.iter().position(|v| v == &row.buf).unwrap_or(0);
@@ -1227,8 +1518,12 @@ impl QuickstartPane {
                     }
                 }
                 Some(QuickstartModalAction::Right) => {
-                    if let Some(row) = f.fields.get_mut(f.cursor)
-                        && let Some(variants) = row.descriptor.enum_variants.as_deref()
+                    let variants = f
+                        .fields
+                        .get(f.cursor)
+                        .and_then(field_row_variants)
+                        .map(|v| v.to_vec());
+                    if let (Some(row), Some(variants)) = (f.fields.get_mut(f.cursor), variants)
                         && !variants.is_empty()
                     {
                         let cur = variants.iter().position(|v| v == &row.buf).unwrap_or(0);
@@ -1237,17 +1532,27 @@ impl QuickstartPane {
                     }
                 }
                 Some(QuickstartModalAction::Backspace) => {
+                    let is_enum = f
+                        .fields
+                        .get(f.cursor)
+                        .and_then(field_row_variants)
+                        .is_some();
                     if let Some(row) = f.fields.get_mut(f.cursor)
-                        && row.descriptor.enum_variants.is_none()
+                        && !is_enum
                     {
                         row.buf.pop();
                     }
                 }
                 _ => {
+                    let is_enum = f
+                        .fields
+                        .get(f.cursor)
+                        .and_then(field_row_variants)
+                        .is_some();
                     if let KeyCode::Char(c) = key.code
                         && !key.modifiers.contains(KeyModifiers::CONTROL)
                         && let Some(row) = f.fields.get_mut(f.cursor)
-                        && row.descriptor.enum_variants.is_none()
+                        && !is_enum
                     {
                         row.buf.push(c);
                     }
@@ -1288,8 +1593,8 @@ impl QuickstartPane {
                                 cursor: 0,
                             }));
                         } else if cl.cursor == drafts + 1 {
-                            self.form.channels_visited = true;
                             self.active_modal = None;
+                            self.advance_after_completed(Selector::Channels);
                         }
                     }
                     _ => {}
@@ -1327,14 +1632,39 @@ impl QuickstartPane {
                                 }));
                             }
                         } else if pl.cursor == drafts + 1 {
-                            self.form.peer_groups_visited = true;
                             self.active_modal = None;
+                            self.advance_after_completed(Selector::PeerGroups);
                         }
                     }
                     _ => {}
                 }
             }
             Modal::Agent(a) => {
+                if let Some(editor) = a.editor.as_mut() {
+                    match action {
+                        Some(QuickstartModalAction::Save) => {
+                            let filename = editor.filename.clone();
+                            let content = editor.content();
+                            a.files.insert(filename, content);
+                            a.editor = None;
+                        }
+                        Some(QuickstartModalAction::Cancel) => {
+                            a.editor = None;
+                        }
+                        Some(QuickstartModalAction::Backspace) => editor.backspace(),
+                        Some(QuickstartModalAction::Confirm) => editor.insert_newline(),
+                        Some(QuickstartModalAction::Up) => editor.move_up(),
+                        Some(QuickstartModalAction::Down) => editor.move_down(),
+                        Some(QuickstartModalAction::Left) => editor.move_left(),
+                        Some(QuickstartModalAction::Right) => editor.move_right(),
+                        _ => {
+                            if let Some(c) = typed_char(&key) {
+                                editor.insert_char(c);
+                            }
+                        }
+                    }
+                    return;
+                }
                 let row_count = a.filenames.len() + 2;
                 let last_row = row_count - 1;
                 let on_name = a.cursor == 0;
@@ -1350,6 +1680,7 @@ impl QuickstartPane {
                         self.commit_agent_modal();
                         self.active_modal = None;
                         self.revalidate().await;
+                        self.advance_after_completed(Selector::Agent);
                     }
                     Some(QuickstartModalAction::NextField) | Some(QuickstartModalAction::Down)
                         if a.cursor + 1 < row_count =>
@@ -1367,21 +1698,27 @@ impl QuickstartPane {
                     Some(QuickstartModalAction::EditWithEditor) if on_file => {
                         let filename = a.filenames[a.cursor - 1].clone();
                         let seed = a.files.get(&filename).cloned().unwrap_or_default();
-                        let edited = crate::chat::open_editor_for_content(&seed).await;
-                        if let Some(Modal::Agent(a)) = self.active_modal.as_mut() {
-                            a.files.insert(filename, edited);
-                        }
+                        a.editor = Some(FileEditorState::new(filename, seed));
                     }
                     Some(QuickstartModalAction::EditTemplate) if on_file => {
                         let filename = a.filenames[a.cursor - 1].clone();
-                        let templated = self.fetch_personality_template(&filename).await;
-                        if let (Some(content), Some(Modal::Agent(a))) =
-                            (templated, self.active_modal.as_mut())
-                        {
-                            a.files.insert(filename, content);
+                        let agent_name = a.name.trim().to_string();
+                        let templated = self
+                            .fetch_personality_template(&filename, Some(agent_name.as_str()))
+                            .await;
+                        match templated {
+                            Some(content) => {
+                                if let Some(Modal::Agent(a)) = self.active_modal.as_mut() {
+                                    a.files.insert(filename, content);
+                                }
+                                self.last_errors.clear();
+                            }
+                            None => {
+                                self.last_errors = vec![missing_template_error(&filename)];
+                            }
                         }
                     }
-                    Some(QuickstartModalAction::EditCopy) if on_file => {
+                    Some(QuickstartModalAction::ClearFile) if on_file => {
                         let filename = a.filenames[a.cursor - 1].clone();
                         a.files.insert(filename, String::new());
                     }
@@ -1422,8 +1759,12 @@ impl QuickstartPane {
             .collect();
     }
 
-    async fn fetch_personality_template(&self, filename: &str) -> Option<String> {
-        let res = self.rpc.personality_templates(None).await.ok()?;
+    async fn fetch_personality_template(
+        &self,
+        filename: &str,
+        agent: Option<&str>,
+    ) -> Option<String> {
+        let res = self.rpc.personality_templates(agent).await.ok()?;
         res.files
             .into_iter()
             .find(|f| f.filename == filename)
@@ -1533,70 +1874,19 @@ impl QuickstartPane {
                 return;
             }
         };
-        // For the model-provider section, upgrade the `model` row with
-        // live catalog options so it renders as a picker. Empty catalog
-        // → free-text fallback (descriptor unchanged).
-        let model_catalog: Option<Vec<String>> =
-            if matches!(section, QuickstartFieldSection::ModelProvider) {
-                match self.rpc.catalog_models(&type_key).await {
-                    Ok(res) if res.live && !res.models.is_empty() => Some(res.models),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-        let mut rows: Vec<FieldFormRow> = fields
-            .into_iter()
-            .map(|mut d| {
-                if let Some(ref models) = model_catalog
-                    && d.key.eq_ignore_ascii_case("model")
-                {
-                    d.kind = crate::client::QuickstartFieldKind::Enum;
-                    d.enum_variants = Some(models.clone());
-                }
-                // For enum fields, default the buffer to the first
-                // variant so the user lands on a valid value. ←/→
-                // cycles through the list. The daemon's `<unset>`
-                // placeholder for optional fields is treated as no
-                // value — seeding or submitting it would fail
-                // validation against the field's real type.
-                let default = d
-                    .default
-                    .clone()
-                    .filter(|v| v != UNSET_DISPLAY && !v.is_empty());
-                let buf = if let Some(variants) = d.enum_variants.as_deref()
-                    && !variants.is_empty()
-                {
-                    default
-                        .filter(|v| variants.contains(v))
-                        .unwrap_or_else(|| variants[0].clone())
-                } else {
-                    default.unwrap_or_default()
-                };
-                FieldFormRow { descriptor: d, buf }
-            })
-            .collect();
-        // Prepend an editable alias row for ModelProvider so users can
-        // choose a custom alias instead of the hardcoded "default".
-        if matches!(section, QuickstartFieldSection::ModelProvider) {
-            let default_alias = "default".to_string();
-            rows.insert(
-                0,
-                FieldFormRow {
-                    descriptor: QuickstartFieldDescriptor {
-                        key: "alias".to_string(),
-                        label: crate::i18n::t("zc-quickstart-field-label-alias"),
-                        help: crate::i18n::t("zc-quickstart-field-help-alias"),
-                        kind: crate::client::QuickstartFieldKind::String,
-                        is_secret: false,
-                        enum_variants: None,
-                        required: true,
-                        default: Some(default_alias.clone()),
-                    },
-                    buf: default_alias,
-                },
-            );
-        }
+        let is_model_provider = matches!(section, QuickstartFieldSection::ModelProvider);
+        // Open the form before loading the live model catalog. The next
+        // idle tick upgrades the model row to a picker or paints the
+        // free-text fallback, so users see progress instead of a
+        // frozen modal while the catalog RPC runs. The row builder also
+        // handles bool toggles, enum defaults, and the synthetic model
+        // provider alias row.
+        let rows = build_field_form_rows(section, fields, None);
+        let model_catalog_state = if is_model_provider {
+            ModelCatalogState::Pending
+        } else {
+            ModelCatalogState::NotApplicable
+        };
         let alias = match section {
             QuickstartFieldSection::ModelProvider => "default".to_string(),
             _ => type_key.clone(),
@@ -1605,9 +1895,73 @@ impl QuickstartPane {
             selector: sel,
             type_key,
             alias,
+            model_catalog_state,
+            model_catalog_attempts: 0,
             fields: rows,
             cursor: 0,
         }));
+        self.model_catalog_rx = None;
+    }
+
+    pub async fn tick(&mut self) {
+        let mut clear_rx = false;
+        let mut fetched = None;
+        if let Some(rx) = self.model_catalog_rx.as_mut() {
+            match rx.try_recv() {
+                Ok(result) => {
+                    fetched = Some(result);
+                    clear_rx = true;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    clear_rx = true;
+                }
+            }
+        }
+        if clear_rx {
+            self.model_catalog_rx = None;
+        }
+        if let Some(result) = fetched
+            && let Some(Modal::FieldForm(form)) = self.active_modal.as_mut()
+            && form.type_key == result.type_key
+            && matches!(
+                form.model_catalog_state,
+                ModelCatalogState::Pending | ModelCatalogState::Retrying
+            )
+        {
+            apply_model_catalog_result(form, result.models);
+        }
+
+        let pending_type = match self.active_modal.as_ref() {
+            Some(Modal::FieldForm(form))
+                if matches!(
+                    form.model_catalog_state,
+                    ModelCatalogState::Pending | ModelCatalogState::Retrying
+                ) =>
+            {
+                Some(form.type_key.clone())
+            }
+            _ => None,
+        };
+        let Some(type_key) = pending_type else {
+            return;
+        };
+        if self.model_catalog_rx.is_some() {
+            return;
+        }
+
+        let rpc = Arc::clone(&self.rpc);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.model_catalog_rx = Some(rx);
+        tokio::spawn(async move {
+            let models = match rpc.catalog_models(&type_key).await {
+                Ok(res) if res.live && !res.models.is_empty() => {
+                    sort_quickstart_models(&type_key, res.models)
+                }
+                _ => None,
+            };
+            let _ = tx.send(ModelCatalogFetchResult { type_key, models });
+        });
     }
 
     /// Commit the active FieldFormModal into [`FormState`]. Returns
@@ -1750,17 +2104,11 @@ impl QuickstartPane {
         self.last_errors.clear();
         let submission = self.form.to_submission();
         match self.rpc.quickstart_apply(&submission).await {
-            Ok(QuickstartApplyResult::Applied { agent, .. }) => {
-                // Arm the Stage-2 hand-off **before** the daemon reload
-                // kicks in. The socket dies shortly after this returns,
-                // the TUI freezes during the disconnect, and the next
-                // `app::run` iteration reads this back to route the
-                // user into the new agent's Chat tab automatically.
-                if let Ok(mut guard) = self.reconnect_state.lock() {
-                    guard.start_chat_with = Some(agent.alias.clone());
-                }
-                self.applied_alias = Some(agent.alias);
-                self.last_errors.clear();
+            Ok(QuickstartApplyResult::Applied {
+                agent,
+                daemon_restarted,
+            }) => {
+                self.handle_apply_success(agent, daemon_restarted);
             }
             Ok(QuickstartApplyResult::Errors { errors }) => {
                 self.last_errors = errors;
@@ -1774,6 +2122,22 @@ impl QuickstartPane {
             }
         }
         self.busy = false;
+    }
+
+    fn handle_apply_success(&mut self, agent: AppliedAgent, daemon_restarted: bool) {
+        // Arm the Stage-2 hand-off **before** any daemon reload can kick
+        // in. When reload is signalled the socket dies shortly after
+        // this returns, the TUI waits during the disconnect, and the
+        // next `app::run` pane rebuild consumes the pending reconnect
+        // chat handoff.
+        //
+        // Test/standalone daemons can report `daemon_restarted = false`.
+        // In that case no disconnect is coming, so freezing Quickstart
+        // behind `applied_alias` strands the user. Queue an immediate
+        // connected-client handoff instead.
+        self.applied_alias =
+            queue_apply_handoff(&self.reconnect_state, agent.alias, daemon_restarted);
+        self.last_errors.clear();
     }
 
     fn draw_title(&self, frame: &mut Frame, area: Rect) {
@@ -1834,10 +2198,34 @@ impl QuickstartPane {
             crate::i18n::t("zc-quickstart-status-submitting")
         } else if let Some(alias) = &self.applied_alias {
             crate::i18n::t_args("zc-quickstart-status-created", &[("alias", alias.as_str())])
-        } else if !self.last_errors.is_empty() {
+        } else if let Some(first) = self.last_errors.first() {
+            // Name the first actionable field error so the user knows
+            // which field is invalid, instead of only a count. The
+            // daemon's message often already carries the specifics
+            // (e.g. "alias openai.default already exists").
+            let where_ = Selector::title_for_step(first.step);
+            let field_part = if first.field.is_empty() {
+                String::new()
+            } else {
+                format!(" / {}", first.field)
+            };
+            let more = self.last_errors.len().saturating_sub(1);
+            let suffix = if more > 0 {
+                crate::i18n::t_args(
+                    "zc-quickstart-status-more-errors",
+                    &[("count", &more.to_string())],
+                )
+            } else {
+                String::new()
+            };
             crate::i18n::t_args(
-                "zc-quickstart-status-errors",
-                &[("count", &self.last_errors.len().to_string())],
+                "zc-quickstart-status-first-error",
+                &[
+                    ("where", where_.trim()),
+                    ("field", &field_part),
+                    ("message", first.message.trim()),
+                    ("more", &suffix),
+                ],
             )
         } else if can_create {
             crate::i18n::t_args("zc-quickstart-status-can-create", &[("chord", "c")])
@@ -1899,6 +2287,111 @@ fn wrapped_total(lines: &[Line], width: u16) -> u16 {
     wrapped_row_heights(lines, width).iter().copied().sum()
 }
 
+fn apply_model_catalog_to_rows(rows: &mut [FieldFormRow], model_catalog: Option<&[String]>) {
+    let Some(models) = model_catalog else {
+        return;
+    };
+    if models.is_empty() {
+        return;
+    }
+    for row in rows {
+        if is_model_field(&row.descriptor) {
+            row.descriptor.kind = crate::client::QuickstartFieldKind::Enum;
+            row.descriptor.enum_variants = Some(models.to_vec());
+            if !models.contains(&row.buf) {
+                row.buf = models[0].clone();
+            }
+        }
+    }
+}
+
+fn is_model_field(field: &QuickstartFieldDescriptor) -> bool {
+    field.key.eq_ignore_ascii_case("model") || field.label.eq_ignore_ascii_case("model")
+}
+
+fn sort_quickstart_models(provider: &str, models: Vec<String>) -> Option<Vec<String>> {
+    zeroclaw_providers::catalog::sort_model_catalog_for_chat(provider, models)
+}
+
+fn build_field_form_rows(
+    section: QuickstartFieldSection,
+    fields: Vec<QuickstartFieldDescriptor>,
+    model_catalog: Option<&[String]>,
+) -> Vec<FieldFormRow> {
+    let mut rows: Vec<FieldFormRow> = fields
+        .into_iter()
+        .map(|mut d| {
+            if matches!(d.kind, crate::client::QuickstartFieldKind::Bool) {
+                d.enum_variants = Some(vec!["false".to_string(), "true".to_string()]);
+            }
+            // For enum fields, default the buffer to the first variant
+            // so the user lands on a valid value. ←/→ cycles through the
+            // list. The daemon's `<unset>` placeholder for optional
+            // fields is treated as no value — seeding or submitting it
+            // would fail validation against the field's real type.
+            let default = d
+                .default
+                .clone()
+                .filter(|v| v != UNSET_DISPLAY && !v.is_empty());
+            let buf = if let Some(variants) = d.enum_variants.as_deref()
+                && !variants.is_empty()
+            {
+                default
+                    .filter(|v| variants.contains(v))
+                    .unwrap_or_else(|| variants[0].clone())
+            } else {
+                default.unwrap_or_default()
+            };
+            FieldFormRow { descriptor: d, buf }
+        })
+        .collect();
+    // Prepend an editable alias row for ModelProvider so users can
+    // choose a custom alias instead of the hardcoded "default".
+    if matches!(section, QuickstartFieldSection::ModelProvider) {
+        rows.insert(0, model_provider_alias_row());
+    }
+    apply_model_catalog_to_rows(&mut rows, model_catalog);
+    rows
+}
+
+fn model_provider_alias_row() -> FieldFormRow {
+    let default_alias = "default".to_string();
+    FieldFormRow {
+        descriptor: QuickstartFieldDescriptor {
+            key: "alias".to_string(),
+            label: crate::i18n::t("zc-quickstart-field-label-alias"),
+            help: crate::i18n::t("zc-quickstart-field-help-alias"),
+            kind: crate::client::QuickstartFieldKind::String,
+            is_secret: false,
+            enum_variants: None,
+            required: true,
+            // The edit buffer starts as `default`, but this synthetic
+            // row must not also use `default` as ghost text. Otherwise
+            // Backspace clears the buffer and the same word immediately
+            // reappears as non-editable placeholder text.
+            default: None,
+        },
+        buf: default_alias,
+    }
+}
+
+fn field_row_variants(row: &FieldFormRow) -> Option<&[String]> {
+    if let Some(variants) = row.descriptor.enum_variants.as_deref()
+        && !variants.is_empty()
+    {
+        return Some(variants);
+    }
+    None
+}
+
+fn missing_template_error(filename: &str) -> QuickstartError {
+    QuickstartError {
+        step: QuickstartStep::Agent,
+        field: filename.to_string(),
+        message: crate::i18n::t_args("zc-quickstart-no-template", &[("filename", filename)]),
+    }
+}
+
 /// Paint the modal and return `(inner_rect, row_to_cursor)` so the
 /// pane's mouse handler can resolve a click to a cursor index. The
 /// `row_to_cursor` vec maps each body row (top → bottom) to either
@@ -1956,7 +2449,7 @@ fn draw_modal(
         }
         Modal::TextInput(t) => {
             let display = if t.is_secret {
-                "•".repeat(t.buf.chars().count())
+                masked_secret(&t.buf)
             } else {
                 t.buf.clone()
             };
@@ -2001,23 +2494,60 @@ fn draw_modal(
                 } else {
                     theme::body_style()
                 };
+                let is_enum = field_row_variants(row).is_some();
+                let is_model_row = is_model_field(&row.descriptor);
+                // Secret fields render a bounded mask so a pasted,
+                // realistic-length API key cannot wrap across rows and
+                // push later fields and the footer out of view.
                 let raw_display = if row.descriptor.is_secret {
-                    "•".repeat(row.buf.chars().count())
+                    masked_secret(&row.buf)
                 } else {
                     row.buf.clone()
                 };
-                let is_ghost = raw_display.is_empty();
-                let display = if is_ghost {
-                    row.descriptor.default.clone().unwrap_or_default()
+                let is_empty_buf = raw_display.is_empty();
+                // Ghost text (the field default) is a placeholder for an
+                // empty buffer, but only when the row is NOT focused.
+                // Showing it on the focused row makes the default look
+                // like real, editable text the user cannot Backspace
+                // away — the alias `default` ghost-state defect. The
+                // focused empty row renders empty so the cursor sits
+                // where typing lands.
+                let show_ghost = is_empty_buf && !is_cursor && !is_enum;
+                let (display, value_style) = if is_model_row
+                    && matches!(
+                        f.model_catalog_state,
+                        ModelCatalogState::Pending | ModelCatalogState::Retrying
+                    ) {
+                    (
+                        if f.model_catalog_state == ModelCatalogState::Retrying {
+                            crate::i18n::t_args(
+                                "zc-quickstart-model-retrying",
+                                &[("provider", f.type_key.as_str())],
+                            )
+                        } else {
+                            crate::i18n::t_args(
+                                "zc-quickstart-model-loading",
+                                &[("provider", f.type_key.as_str())],
+                            )
+                        },
+                        theme::dim_style().add_modifier(Modifier::ITALIC),
+                    )
+                } else if is_model_row
+                    && f.model_catalog_state == ModelCatalogState::Empty
+                    && is_empty_buf
+                {
+                    (
+                        crate::i18n::t("zc-quickstart-model-catalog-empty"),
+                        theme::dim_style().add_modifier(Modifier::ITALIC),
+                    )
+                } else if show_ghost {
+                    (
+                        row.descriptor.default.clone().unwrap_or_default(),
+                        theme::dim_style().add_modifier(Modifier::ITALIC),
+                    )
                 } else {
-                    raw_display
+                    (raw_display, theme::dim_style())
                 };
-                let value_style = if is_ghost {
-                    theme::dim_style().add_modifier(Modifier::ITALIC)
-                } else {
-                    theme::dim_style()
-                };
-                let is_enum = row.descriptor.enum_variants.is_some();
                 lines.push(Line::from(vec![
                     Span::styled(glyph, theme::accent_style()),
                     Span::styled(format!("{:14}", row.descriptor.label), label_style),
@@ -2025,7 +2555,7 @@ fn draw_modal(
                     Span::styled(if is_enum { "‹ " } else { "" }, theme::accent_style()),
                     Span::styled(display, value_style),
                     Span::styled(if is_enum { " ›" } else { "" }, theme::accent_style()),
-                    if is_cursor {
+                    if is_cursor && !is_enum {
                         Span::styled("█", theme::accent_style())
                     } else {
                         Span::raw("")
@@ -2189,89 +2719,128 @@ fn draw_modal(
             )
         }
         Modal::Agent(a) => {
-            let mut lines: Vec<Line> = Vec::new();
-            let mut cursor_lines: Vec<usize> = Vec::new();
-
-            // Row 0: agent name.
-            cursor_lines.push(lines.len());
-            let on_name = a.cursor == 0;
-            let name_style = if on_name {
-                theme::accent_style()
+            if let Some(editor) = &a.editor {
+                let mut cursor_lines = Vec::with_capacity(editor.lines.len());
+                let mut lines = Vec::with_capacity(editor.lines.len().max(1));
+                for (i, line) in editor.lines.iter().enumerate() {
+                    cursor_lines.push(lines.len());
+                    if i == editor.cursor_row {
+                        let split = byte_index_at_char(line, editor.cursor_col);
+                        let (before, after) = line.split_at(split);
+                        lines.push(Line::from(vec![
+                            Span::styled(before.to_string(), theme::body_style()),
+                            Span::styled("█", theme::accent_style()),
+                            Span::styled(after.to_string(), theme::body_style()),
+                        ]));
+                    } else {
+                        lines.push(Line::from(Span::styled(
+                            line.to_string(),
+                            theme::body_style(),
+                        )));
+                    }
+                }
+                if lines.is_empty() {
+                    cursor_lines.push(0);
+                    lines.push(Line::from(Span::styled("█", theme::accent_style())));
+                }
+                (
+                    format!(" Edit {} ", editor.filename),
+                    Vec::new(),
+                    lines,
+                    "Ctrl+S save & close   Esc cancel/quit".to_string(),
+                    cursor_lines,
+                )
             } else {
-                theme::body_style()
-            };
-            let glyph = if on_name { " › " } else { "   " };
-            let display = if a.name.is_empty() {
-                "<unset>".to_string()
-            } else {
-                a.name.clone()
-            };
-            lines.push(Line::from(vec![
-                Span::styled(glyph, theme::accent_style()),
-                Span::styled(format!("{:14}", "name"), name_style),
-                Span::styled("  ", Style::default()),
-                Span::styled(display, theme::dim_style()),
-                if on_name {
-                    Span::styled("█", theme::accent_style())
-                } else {
-                    Span::raw("")
-                },
-            ]));
+                let mut lines: Vec<Line> = Vec::new();
+                let mut cursor_lines: Vec<usize> = Vec::new();
 
-            if !a.filenames.is_empty() {
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    crate::i18n::t("zc-quickstart-personality-help"),
-                    theme::dim_style(),
-                )));
-            }
-
-            for (i, filename) in a.filenames.iter().enumerate() {
+                // Row 0: agent name.
                 cursor_lines.push(lines.len());
-                let row_cursor = i + 1;
-                let is_cursor = a.cursor == row_cursor;
-                let glyph = if is_cursor { " › " } else { "   " };
-                let label_style = if is_cursor {
+                let on_name = a.cursor == 0;
+                let name_style = if on_name {
                     theme::accent_style()
                 } else {
                     theme::body_style()
                 };
-                let content = a.files.get(filename).cloned().unwrap_or_default();
-                let status = if content.trim().is_empty() {
-                    "—".to_string()
+                let glyph = if on_name { " › " } else { "   " };
+                let display = if a.name.is_empty() {
+                    "<unset>".to_string()
                 } else {
-                    format!("{} bytes", content.len())
+                    a.name.clone()
                 };
                 lines.push(Line::from(vec![
                     Span::styled(glyph, theme::accent_style()),
-                    Span::styled(format!("{filename:14}"), label_style),
+                    Span::styled(
+                        format!("{:14}", crate::i18n::t("zc-quickstart-agent-name-field")),
+                        name_style,
+                    ),
                     Span::styled("  ", Style::default()),
-                    Span::styled(status, theme::dim_style()),
+                    Span::styled(display, theme::dim_style()),
+                    if on_name {
+                        Span::styled("█", theme::accent_style())
+                    } else {
+                        Span::raw("")
+                    },
                 ]));
+
+                if !a.filenames.is_empty() {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        crate::i18n::t("zc-quickstart-personality-help"),
+                        theme::dim_style(),
+                    )));
+                }
+
+                for (i, filename) in a.filenames.iter().enumerate() {
+                    cursor_lines.push(lines.len());
+                    let row_cursor = i + 1;
+                    let is_cursor = a.cursor == row_cursor;
+                    let glyph = if is_cursor { " › " } else { "   " };
+                    let label_style = if is_cursor {
+                        theme::accent_style()
+                    } else {
+                        theme::body_style()
+                    };
+                    let content = a.files.get(filename).map(String::as_str).unwrap_or("");
+                    let status = if content.trim().is_empty() {
+                        "—".to_string()
+                    } else {
+                        crate::i18n::t_args(
+                            "zc-quickstart-file-bytes",
+                            &[("bytes", &content.len().to_string())],
+                        )
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(glyph, theme::accent_style()),
+                        Span::styled(format!("{filename:14}"), label_style),
+                        Span::styled("  ", Style::default()),
+                        Span::styled(status, theme::dim_style()),
+                    ]));
+                }
+
+                lines.push(Line::from(""));
+                cursor_lines.push(lines.len());
+                let last_row = a.filenames.len() + 1;
+                let on_save = a.cursor == last_row;
+                lines.push(action_row_line(
+                    &crate::i18n::t("zc-quickstart-save-and-close"),
+                    on_save,
+                ));
+
+                (
+                    format!(" {} ", crate::i18n::t("zc-quickstart-block-agent")),
+                    Vec::new(),
+                    lines,
+                    format!(
+                        "↑/↓ {move_v}   {edit_name}   e/t/c {on_files}   Esc {save}",
+                        move_v = crate::i18n::t("zc-quickstart-modal-action-move"),
+                        edit_name = crate::i18n::t("zc-quickstart-modal-action-edit-name"),
+                        on_files = crate::i18n::t("zc-quickstart-modal-action-on-file-rows"),
+                        save = crate::i18n::t("zc-quickstart-modal-action-save"),
+                    ),
+                    cursor_lines,
+                )
             }
-
-            lines.push(Line::from(""));
-            cursor_lines.push(lines.len());
-            let last_row = a.filenames.len() + 1;
-            let on_save = a.cursor == last_row;
-            lines.push(action_row_line(
-                &crate::i18n::t("zc-quickstart-save-and-close"),
-                on_save,
-            ));
-
-            (
-                format!(" {} ", crate::i18n::t("zc-quickstart-block-agent")),
-                Vec::new(),
-                lines,
-                format!(
-                    "↑/↓ {move_v}   {edit_name}   e/t/c {on_files}   Esc {save}",
-                    move_v = crate::i18n::t("zc-quickstart-modal-action-move"),
-                    edit_name = crate::i18n::t("zc-quickstart-modal-action-edit-name"),
-                    on_files = crate::i18n::t("zc-quickstart-modal-action-on-file-rows"),
-                    save = crate::i18n::t("zc-quickstart-modal-action-save"),
-                ),
-                cursor_lines,
-            )
         }
     };
 
@@ -2336,7 +2905,13 @@ fn draw_modal(
         Modal::FieldForm(f) => cursor_lines.get(f.cursor).copied(),
         Modal::ChannelList(cl) => cursor_lines.get(cl.cursor).copied(),
         Modal::PeerGroupList(pl) => cursor_lines.get(pl.cursor).copied(),
-        Modal::Agent(a) => cursor_lines.get(a.cursor).copied(),
+        Modal::Agent(a) => {
+            if let Some(editor) = &a.editor {
+                cursor_lines.get(editor.cursor_row).copied()
+            } else {
+                cursor_lines.get(a.cursor).copied()
+            }
+        }
         Modal::TextInput(_) => None,
     };
     let scroll_offset: u16 = if body_rows > body_h && body_h > 0 {
@@ -2428,8 +3003,6 @@ mod tests {
         f.risk = "balanced".into();
         f.runtime = "balanced".into();
         f.memory_chosen = true;
-        f.channels_visited = true;
-        f.peer_groups_visited = true;
         f.agent_name = "bob".into();
         f
     }
@@ -2455,6 +3028,361 @@ mod tests {
         let mut f = complete_form();
         f.agent_name.clear();
         assert!(!f.all_selectors_satisfied());
+    }
+
+    #[test]
+    fn optional_channel_and_peer_group_rows_do_not_block_submit() {
+        // Regression: Channels and Peer groups are labelled optional,
+        // but the checklist stayed incomplete until the user opened
+        // each row and explicitly confirmed "none". They still render
+        // as incomplete when empty so optional "skipped" is not
+        // confused with "completed".
+        let f = complete_form();
+        assert!(f.channels.is_empty());
+        assert!(f.peer_groups.is_empty());
+        assert!(!f.is_satisfied(Selector::Channels));
+        assert!(!f.is_satisfied(Selector::PeerGroups));
+        assert!(f.all_selectors_satisfied());
+    }
+
+    #[test]
+    fn optional_rows_complete_only_when_configured() {
+        let mut f = complete_form();
+
+        assert!(!f.is_satisfied(Selector::Channels));
+        assert!(!f.is_satisfied(Selector::PeerGroups));
+
+        f.channels.push(ChannelDraft {
+            channel_type: "telegram".into(),
+            alias: "chat".into(),
+            token: None,
+            mode: SelectorMode::Fresh,
+        });
+        f.peer_groups.push(crate::wire::QuickstartPeerGroup {
+            name: "crew".into(),
+            channel: "telegram.chat".into(),
+            external_peers: vec!["123".into()],
+            ignore: Vec::new(),
+        });
+
+        assert!(f.is_satisfied(Selector::Channels));
+        assert!(f.is_satisfied(Selector::PeerGroups));
+        assert!(f.all_selectors_satisfied());
+    }
+
+    #[test]
+    fn apply_handoff_starts_chat_and_preserves_reconnect_when_reload_was_signalled() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::app::CrossReconnectState::default(),
+        ));
+
+        let applied_alias = queue_apply_handoff(&state, "agent-a".into(), true);
+        let guard = state.lock().unwrap();
+
+        assert_eq!(applied_alias.as_deref(), Some("agent-a"));
+        assert_eq!(
+            guard.pending_quickstart_chat,
+            Some(crate::app::PendingQuickstartChat::AfterReconnect(
+                "agent-a".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn apply_handoff_starts_chat_immediately_without_reload_signal() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::app::CrossReconnectState::default(),
+        ));
+
+        let applied_alias = queue_apply_handoff(&state, "agent-a".into(), false);
+        let guard = state.lock().unwrap();
+
+        assert!(applied_alias.is_none());
+        assert_eq!(
+            guard.pending_quickstart_chat,
+            Some(crate::app::PendingQuickstartChat::Immediate(
+                "agent-a".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn live_model_catalog_turns_model_row_into_picker() {
+        let mut rows = vec![
+            model_provider_alias_row(),
+            FieldFormRow {
+                descriptor: QuickstartFieldDescriptor {
+                    key: "model".into(),
+                    label: "model".into(),
+                    help: String::new(),
+                    kind: crate::client::QuickstartFieldKind::String,
+                    is_secret: false,
+                    enum_variants: None,
+                    required: true,
+                    default: None,
+                },
+                buf: String::new(),
+            },
+            FieldFormRow {
+                descriptor: QuickstartFieldDescriptor {
+                    key: "api_key".into(),
+                    label: "api_key".into(),
+                    help: String::new(),
+                    kind: crate::client::QuickstartFieldKind::String,
+                    is_secret: true,
+                    enum_variants: None,
+                    required: false,
+                    default: None,
+                },
+                buf: String::new(),
+            },
+        ];
+        let models = vec!["gpt-5".to_string(), "gpt-5.1".to_string()];
+
+        apply_model_catalog_to_rows(&mut rows, Some(&models));
+
+        assert_eq!(
+            rows[1].descriptor.kind,
+            crate::client::QuickstartFieldKind::Enum
+        );
+        assert_eq!(
+            rows[1].descriptor.enum_variants.as_deref(),
+            Some(models.as_slice())
+        );
+        assert_eq!(
+            rows[2].descriptor.kind,
+            crate::client::QuickstartFieldKind::String
+        );
+        assert!(rows[2].descriptor.enum_variants.is_none());
+    }
+
+    #[test]
+    fn model_provider_rows_use_live_catalog_for_model_picker() {
+        let fields = vec![
+            QuickstartFieldDescriptor {
+                key: "model".into(),
+                label: "model".into(),
+                help: String::new(),
+                kind: crate::client::QuickstartFieldKind::String,
+                is_secret: false,
+                enum_variants: None,
+                required: true,
+                default: None,
+            },
+            QuickstartFieldDescriptor {
+                key: "api_key".into(),
+                label: "api_key".into(),
+                help: String::new(),
+                kind: crate::client::QuickstartFieldKind::String,
+                is_secret: true,
+                enum_variants: None,
+                required: false,
+                default: None,
+            },
+        ];
+        let models = vec!["gpt-5".to_string(), "gpt-5.1".to_string()];
+
+        let rows =
+            build_field_form_rows(QuickstartFieldSection::ModelProvider, fields, Some(&models));
+
+        assert_eq!(rows[0].descriptor.key, "alias");
+        assert_eq!(rows[1].descriptor.key, "model");
+        assert_eq!(
+            rows[1].descriptor.kind,
+            crate::client::QuickstartFieldKind::Enum
+        );
+        assert_eq!(
+            rows[1].descriptor.enum_variants.as_deref(),
+            Some(models.as_slice())
+        );
+        assert_eq!(rows[1].buf, "gpt-5");
+    }
+
+    #[test]
+    fn transient_model_catalog_miss_retries_before_manual_fallback() {
+        let mut form = FieldFormModal {
+            selector: Selector::ModelProvider,
+            type_key: "openai".into(),
+            alias: "default".into(),
+            model_catalog_state: ModelCatalogState::Pending,
+            model_catalog_attempts: 0,
+            fields: build_field_form_rows(
+                QuickstartFieldSection::ModelProvider,
+                vec![QuickstartFieldDescriptor {
+                    key: "model".into(),
+                    label: "model".into(),
+                    help: String::new(),
+                    kind: crate::client::QuickstartFieldKind::String,
+                    is_secret: false,
+                    enum_variants: None,
+                    required: true,
+                    default: None,
+                }],
+                None,
+            ),
+            cursor: 0,
+        };
+
+        apply_model_catalog_result(&mut form, None);
+        assert_eq!(form.model_catalog_state, ModelCatalogState::Retrying);
+
+        apply_model_catalog_result(&mut form, None);
+        assert_eq!(form.model_catalog_state, ModelCatalogState::Empty);
+    }
+
+    #[test]
+    fn successful_catalog_retry_still_turns_model_row_into_picker() {
+        let mut form = FieldFormModal {
+            selector: Selector::ModelProvider,
+            type_key: "openai".into(),
+            alias: "default".into(),
+            model_catalog_state: ModelCatalogState::Retrying,
+            model_catalog_attempts: 1,
+            fields: build_field_form_rows(
+                QuickstartFieldSection::ModelProvider,
+                vec![QuickstartFieldDescriptor {
+                    key: "model".into(),
+                    label: "model".into(),
+                    help: String::new(),
+                    kind: crate::client::QuickstartFieldKind::String,
+                    is_secret: false,
+                    enum_variants: None,
+                    required: true,
+                    default: None,
+                }],
+                None,
+            ),
+            cursor: 0,
+        };
+        let models = vec!["gpt-5".to_string(), "gpt-5.1".to_string()];
+
+        apply_model_catalog_result(&mut form, Some(models.clone()));
+
+        assert_eq!(form.model_catalog_state, ModelCatalogState::Loaded);
+        let model = form
+            .fields
+            .iter()
+            .find(|row| row.descriptor.key == "model")
+            .expect("model row");
+        assert_eq!(
+            model.descriptor.enum_variants.as_deref(),
+            Some(models.as_slice())
+        );
+        assert_eq!(model.buf, "gpt-5");
+    }
+
+    #[test]
+    fn completed_selector_advances_to_next_row() {
+        assert_eq!(next_selector_index_after(Selector::ModelProvider), Some(1));
+        assert_eq!(Selector::ALL[1], Selector::RiskProfile);
+        let submit_index = Selector::ALL.len() - 1;
+        assert_eq!(
+            next_selector_index_after(Selector::Agent),
+            Some(submit_index)
+        );
+        assert_eq!(Selector::ALL[submit_index], Selector::Submit);
+        assert_eq!(
+            next_selector_index_after(Selector::Submit),
+            Some(submit_index)
+        );
+    }
+
+    #[test]
+    fn bool_fields_render_as_enum_toggles() {
+        let rows = build_field_form_rows(
+            QuickstartFieldSection::ModelProvider,
+            vec![QuickstartFieldDescriptor {
+                key: "requires_openai_auth".into(),
+                label: "requires_openai_auth".into(),
+                help: String::new(),
+                kind: crate::client::QuickstartFieldKind::Bool,
+                is_secret: false,
+                enum_variants: None,
+                required: false,
+                default: None,
+            }],
+            None,
+        );
+
+        let row = rows
+            .iter()
+            .find(|row| row.descriptor.key == "requires_openai_auth")
+            .expect("bool field row");
+        assert_eq!(
+            row.descriptor.enum_variants.as_deref(),
+            Some(["false".to_string(), "true".to_string()].as_slice())
+        );
+        assert_eq!(row.buf, "false");
+    }
+
+    #[test]
+    fn quickstart_model_sort_prefers_chat_and_coding_models() {
+        let sorted = sort_quickstart_models(
+            "openai",
+            vec![
+                "chatgpt-image-latest".into(),
+                "text-embedding-ada-002".into(),
+                "gpt-3.5-turbo".into(),
+                "gpt-5".into(),
+                "tts-1".into(),
+            ],
+        )
+        .expect("chat model catalog");
+
+        assert_eq!(sorted[0], "gpt-5");
+        assert!(!sorted.iter().any(|m| m == "chatgpt-image-latest"));
+        assert!(!sorted.iter().any(|m| m == "text-embedding-ada-002"));
+        assert!(!sorted.iter().any(|m| m == "tts-1"));
+
+        let sorted = sort_quickstart_models(
+            "openrouter",
+            vec![
+                "ai21/jamba-mini".into(),
+                "openai/gpt-4.1".into(),
+                "some/image-model".into(),
+                "anthropic/claude-sonnet-4".into(),
+            ],
+        )
+        .expect("chat model catalog");
+        assert_eq!(sorted[0], "anthropic/claude-sonnet-4");
+        assert_eq!(sorted[1], "openai/gpt-4.1");
+        assert!(!sorted.iter().any(|m| m == "some/image-model"));
+    }
+
+    #[test]
+    fn quickstart_model_sort_returns_none_when_only_non_chat_models_exist() {
+        let sorted = sort_quickstart_models(
+            "openai",
+            vec!["gpt-image-1.5".into(), "text-embedding-ada-002".into()],
+        );
+
+        assert!(sorted.is_none());
+    }
+
+    #[test]
+    fn model_provider_alias_prefill_is_not_ghost_text() {
+        let mut row = model_provider_alias_row();
+
+        assert_eq!(row.buf, "default");
+        assert_eq!(row.descriptor.key, "alias");
+        assert!(row.descriptor.required);
+        assert_eq!(row.descriptor.default, None);
+
+        row.buf.clear();
+        let ghost_display = row.descriptor.default.clone().unwrap_or_default();
+        assert!(
+            ghost_display.is_empty(),
+            "clearing alias must not redraw `default` as non-editable ghost text"
+        );
+    }
+
+    #[test]
+    fn missing_personality_template_reports_selected_file() {
+        let err = missing_template_error("MEMORY.md");
+
+        assert_eq!(err.step, QuickstartStep::Agent);
+        assert_eq!(err.field, "MEMORY.md");
+        assert!(err.message.contains("MEMORY.md"));
     }
 
     fn err(step: QuickstartStep) -> QuickstartError {
@@ -2539,6 +3467,82 @@ mod tests {
             .filter(|v| v != UNSET_DISPLAY && !v.is_empty())
             .unwrap_or_default();
         assert!(seeded.is_empty());
+    }
+
+    #[test]
+    fn file_editor_edits_and_saves_multiline_content() {
+        let mut editor = FileEditorState::new("TOOLS.md".into(), "one".into());
+
+        editor.move_right();
+        editor.move_right();
+        editor.move_right();
+        editor.insert_newline();
+        editor.insert_text("two");
+
+        assert_eq!(editor.content(), "one\ntwo");
+        assert_eq!(editor.cursor_row, 1);
+        assert_eq!(editor.cursor_col, 3);
+    }
+
+    #[test]
+    fn file_editor_backspace_joins_lines() {
+        let mut editor = FileEditorState::new("TOOLS.md".into(), "one\ntwo".into());
+        editor.cursor_row = 1;
+        editor.cursor_col = 0;
+
+        editor.backspace();
+
+        assert_eq!(editor.content(), "onetwo");
+        assert_eq!(editor.cursor_row, 0);
+        assert_eq!(editor.cursor_col, 3);
+    }
+
+    #[test]
+    fn file_editor_scroll_clamps_at_edges() {
+        let mut editor = FileEditorState::new("TOOLS.md".into(), "one\ntwo\nthree".into());
+
+        editor.scroll_lines(-1);
+        assert_eq!(editor.cursor_row, 0);
+
+        editor.scroll_lines(10);
+        assert_eq!(editor.cursor_row, 2);
+
+        editor.scroll_lines(1);
+        assert_eq!(editor.cursor_row, 2);
+    }
+
+    #[test]
+    fn secret_mask_is_bounded() {
+        // A short secret masks one bullet per char; a realistic-length
+        // key clips at the cap and reports the hidden remainder so it
+        // can never wrap across rows and hide later fields/footer.
+        assert_eq!(masked_secret("abc"), "•••");
+        assert_eq!(masked_secret(""), "");
+        let long = "x".repeat(100);
+        let masked = masked_secret(&long);
+        assert_eq!(
+            masked.chars().filter(|&c| c == '•').count(),
+            SECRET_MASK_MAX
+        );
+        assert!(masked.ends_with(&format!("(+{})", 100 - SECRET_MASK_MAX)));
+    }
+
+    #[test]
+    fn step_titles_round_trip_through_selector() {
+        // Every validation step must resolve to its owning selector's
+        // title so a field error can name where the problem lives. A
+        // dropped arm would panic the title lookup or mislabel an error.
+        for step in [
+            QuickstartStep::ModelProvider,
+            QuickstartStep::RiskProfile,
+            QuickstartStep::RuntimeProfile,
+            QuickstartStep::Memory,
+            QuickstartStep::Channels,
+            QuickstartStep::PeerGroups,
+            QuickstartStep::Agent,
+        ] {
+            assert!(!Selector::title_for_step(step).is_empty());
+        }
     }
 
     #[test]

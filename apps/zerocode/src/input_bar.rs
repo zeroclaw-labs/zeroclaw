@@ -39,6 +39,9 @@ const SLASH_COMMANDS: &[&str] = &[
     "/detach",
     "/model",
     "/model-provider",
+    "/new",
+    "/new-session",
+    "/restart-session",
     "/toggle-thinking",
 ];
 
@@ -62,6 +65,9 @@ pub(crate) enum InputBarAction {
     /// a deliberate keystroke — the parent uses it to resume a paused queue so
     /// a silent pause can never trap the user.
     ResumeQueue,
+    /// User typed `/restart-session`, `/new-session`, or `/new` — parent should close
+    /// the current session and open a fresh one for the same agent/workspace.
+    RestartSession,
     /// User typed `/clear-queue [N]`. The input bar doesn't own the queue, so
     /// it hands removal up to the parent. None = clear all; Some(N) = the
     /// 1-based queue position (Some(0) is an invalid-index sentinel).
@@ -105,6 +111,7 @@ enum SlashCommand<'a> {
     ModelProvider(&'a str),
     /// `/model-provider` (no arg) — open the two-stage model_provider picker.
     ModelProviderPicker,
+    RestartSession,
     NotACommand,
 }
 
@@ -126,6 +133,8 @@ fn parse_slash_command(input: &str) -> SlashCommand<'_> {
         SlashCommand::ClearQueue(None)
     } else if trimmed == "/attachments" {
         SlashCommand::ListAttachments
+    } else if trimmed == "/restart-session" || trimmed == "/new-session" || trimmed == "/new" {
+        SlashCommand::RestartSession
     } else if trimmed == "/toggle-thinking" {
         SlashCommand::ToggleThinking
     } else if let Some(name) = trimmed.strip_prefix("/model-provider ") {
@@ -887,7 +896,7 @@ impl InputBarState {
     // ── Key handling ─────────────────────────────────────────
 
     /// Process a key event. Returns an action for the parent pane.
-    pub fn handle_key(&mut self, key: KeyEvent, turn_in_flight: bool) -> InputBarAction {
+    pub fn handle_key(&mut self, key: KeyEvent) -> InputBarAction {
         // File explorer overlay intercepts all keys when open.
         if let Some(explorer) = &mut self.file_explorer {
             match explorer.handle_key(key) {
@@ -922,11 +931,6 @@ impl InputBarState {
                 ExplorerAction::None => {}
             }
             return InputBarAction::Consumed;
-        }
-
-        // Don't handle input while agent is responding.
-        if turn_in_flight {
-            return InputBarAction::NotHandled;
         }
 
         use crate::keymap::{GlobalAction, InputBarAction as IbWidgetAction};
@@ -1228,6 +1232,7 @@ impl InputBarState {
                     }
                 }
                 SlashCommand::ClearQueue(idx) => InputBarAction::ClearQueue(idx),
+                SlashCommand::RestartSession => InputBarAction::RestartSession,
                 SlashCommand::ToggleThinking => InputBarAction::ToggleThinking,
                 SlashCommand::Model(name) => InputBarAction::SetModel(name.to_string()),
                 SlashCommand::ModelPicker => InputBarAction::OpenModelPicker,
@@ -1345,6 +1350,7 @@ impl InputBarState {
         let sel_style = Style::default()
             .bg(theme::selection_bg())
             .fg(theme::fg_primary());
+        let input_style = theme::input_style();
 
         let visual = wrap_visual_lines(&self.input, width);
 
@@ -1362,20 +1368,23 @@ impl InputBarState {
 
                 if overlap_start < overlap_end {
                     if overlap_start > seg_start {
-                        spans.push(Span::raw(&self.input[seg_start..overlap_start]));
+                        spans.push(Span::styled(
+                            &self.input[seg_start..overlap_start],
+                            input_style,
+                        ));
                     }
                     spans.push(Span::styled(
                         &self.input[overlap_start..overlap_end],
                         sel_style,
                     ));
                     if overlap_end < seg_end {
-                        spans.push(Span::raw(&self.input[overlap_end..seg_end]));
+                        spans.push(Span::styled(&self.input[overlap_end..seg_end], input_style));
                     }
                 } else {
-                    spans.push(Span::raw(&self.input[seg_start..seg_end]));
+                    spans.push(Span::styled(&self.input[seg_start..seg_end], input_style));
                 }
             } else {
-                spans.push(Span::raw(&self.input[seg_start..seg_end]));
+                spans.push(Span::styled(&self.input[seg_start..seg_end], input_style));
             }
 
             lines.push(Line::from(spans));
@@ -1583,11 +1592,13 @@ impl InputBarState {
             })
             .collect();
 
-        let list = List::new(items).block(
+        let fill = theme::fill_style();
+        let list = List::new(items).style(fill).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(theme::dim_style())
-                .title(" Commands "),
+                .style(fill)
+                .title(Span::styled(" Commands ", theme::heading_style())),
         );
         f.render_widget(list, popup_rect);
     }
@@ -1818,6 +1829,18 @@ mod tests {
             SlashCommand::ClearQueue(Some(0))
         ));
         assert!(matches!(
+            parse_slash_command("/restart-session"),
+            SlashCommand::RestartSession
+        ));
+        assert!(matches!(
+            parse_slash_command("/new-session"),
+            SlashCommand::RestartSession
+        ));
+        assert!(matches!(
+            parse_slash_command("/new"),
+            SlashCommand::RestartSession
+        ));
+        assert!(matches!(
             parse_slash_command("/toggle-thinking"),
             SlashCommand::ToggleThinking
         ));
@@ -1940,7 +1963,7 @@ mod tests {
         );
         bar.insert_text("/model ");
         assert!(bar.autocomplete_active);
-        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter), false);
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter));
         // First catalog entry is accepted and the line is submitted in one
         // keystroke — no picker modal.
         assert!(matches!(action, InputBarAction::SetModel(m) if m == "claude-opus-4-8"));
@@ -1952,7 +1975,7 @@ mod tests {
         let mut bar = InputBarState::new();
         bar.insert_text("/mod");
         assert!(bar.autocomplete_active);
-        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter), false);
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter));
         // `/model` still needs an argument: accept-and-fill, do not open the
         // picker or submit.
         assert!(matches!(action, InputBarAction::Consumed));
@@ -1965,7 +1988,7 @@ mod tests {
         bar.set_provider_catalog(vec!["openai".into(), "openrouter".into()]);
         bar.insert_text("/model-provider open");
         assert!(bar.autocomplete_active);
-        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter), false);
+        let action = bar.handle_key(KeyEvent::from(KeyCode::Enter));
         assert!(matches!(action, InputBarAction::SetModelProvider(p) if p == "openai"));
         assert!(!bar.autocomplete_active);
     }
@@ -2221,12 +2244,51 @@ mod tests {
     }
 
     #[test]
+    fn autocomplete_restart_session_prefix() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("/restart");
+        assert!(bar.autocomplete_active);
+        assert!(
+            bar.autocomplete_matches
+                .iter()
+                .any(|s| s == "/restart-session")
+        );
+    }
+
+    #[test]
+    fn autocomplete_new_session_alias() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("/ne");
+        assert!(bar.autocomplete_active);
+        assert!(bar.autocomplete_matches.iter().any(|s| s == "/new"));
+        assert!(bar.autocomplete_matches.iter().any(|s| s == "/new-session"));
+    }
+
+    #[test]
     fn slash_toggle_thinking_returns_action() {
         let mut bar = InputBarState::new();
         bar.insert_text("/toggle-thinking");
         let action = bar.handle_enter();
         assert!(matches!(action, InputBarAction::ToggleThinking));
         // Input should be cleared after submission.
+        assert_eq!(bar.input(), "");
+    }
+
+    #[test]
+    fn slash_restart_session_returns_action() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("/restart-session");
+        let action = bar.handle_enter();
+        assert!(matches!(action, InputBarAction::RestartSession));
+        assert_eq!(bar.input(), "");
+    }
+
+    #[test]
+    fn slash_new_alias_returns_restart_session_action() {
+        let mut bar = InputBarState::new();
+        bar.insert_text("/new");
+        let action = bar.handle_enter();
+        assert!(matches!(action, InputBarAction::RestartSession));
         assert_eq!(bar.input(), "");
     }
 
