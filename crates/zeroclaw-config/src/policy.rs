@@ -2821,6 +2821,29 @@ mod tests {
     }
 
     #[test]
+    fn from_profiles_empty_allowed_tools_means_unrestricted_not_deny_all() {
+        use crate::schema::RiskProfileConfig;
+        use std::path::Path;
+
+        let risk = RiskProfileConfig {
+            allowed_tools: Vec::new(),
+            ..RiskProfileConfig::default()
+        };
+
+        let policy = SecurityPolicy::from_profiles(&risk, None, Path::new("/ws"));
+
+        assert!(
+            policy.allowed_tools.is_none(),
+            "RiskProfileConfig cannot distinguish an omitted allowed_tools field \
+             from allowed_tools = []; both map to no authorization constraint"
+        );
+        assert!(
+            policy.is_tool_allowed("filesystem__write_file"),
+            "empty risk-profile allowed_tools is unrestricted, not deny-all"
+        );
+    }
+
+    #[test]
     fn from_profiles_with_runtime_profile_propagates_budget_caps() {
         use crate::schema::RuntimeProfileConfig;
         use std::path::Path;
