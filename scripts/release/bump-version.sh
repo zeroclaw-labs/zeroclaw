@@ -191,7 +191,9 @@ done
 # docs-deploy workflow reads this to resolve the "Stable (latest release)"
 # selector entry and the root redirect, with no numeric guessing and no duplicate
 # stable/ tree. Running bump-version IS the declaration that this version is
-# the new stable; a change to this file also triggers a docs deploy.
+# the new stable; landing this change on master refreshes the stable metadata
+# (root redirect and selector entry resolve to this release's existing version
+# dir). It does not rebuild or republish the release tag's docs.
 echo "Docs stable-version pointer..."
 STABLE_PTR="$REPO_ROOT/docs/book/stable-version.txt"
 if [[ -f "$STABLE_PTR" ]]; then

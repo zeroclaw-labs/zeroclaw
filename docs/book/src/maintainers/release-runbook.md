@@ -325,7 +325,7 @@ ZeroClaw docs use a versioned structure on the `gh-pages` branch. When a tag is 
 ### What happens automatically
 
 - Pushing a tag (e.g., `v0.8.0`) triggers a build that lands in `/v0.8.0/`.
-- "Stable" is a pointer, not a copy. `bump-version.sh` writes the released version to `docs/book/stable-version.txt`; landing that change on master deploys that release's docs and makes it the Stable target. The root `/` redirect and the version-selector's "Stable (latest release)" entry both resolve to that version dir. There is no duplicate `/stable/` tree.
+- "Stable" is a pointer, not a copy. The release tag deploy (e.g., `v0.8.0`) is what builds and publishes that version's docs directory. `bump-version.sh` writes the released version to `docs/book/stable-version.txt`; landing that change on master refreshes the stable metadata only. The master deploy does not rebuild or republish the release tag's docs; it copies `stable-version.txt` to the `gh-pages` root and regenerates the root `/` redirect and the version-selector's "Stable (latest release)" entry so both resolve to that release's already-published version dir. The deploy fails loudly if the named version dir is not present on `gh-pages`. There is no duplicate `/stable/` tree.
 - `gh-pages` is ephemeral: every deploy force-pushes a single orphan commit (no accumulating history) and enforces retention via `DOCS_KEEP_VERSIONS` (master plus the newest N final releases; pre-releases and older finals are pruned). This keeps clone size bounded.
 - The `_shared/` directory (containing UI CSS, JS, and favicons) is updated from the build so the theme cascades to all deployed versions.
 
