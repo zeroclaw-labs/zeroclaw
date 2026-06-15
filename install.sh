@@ -225,17 +225,28 @@ shell_export_syntax() {
 
 # ── Platform / target triple detection ───────────────────────────
 
+detect_libc() {
+  if [ -e /lib/ld-musl-*.so.1 ] 2>/dev/null || \
+     ldd --version 2>&1 | grep -qi musl || \
+     { [ -r /etc/os-release ] && grep -qiE 'alpine|postmarket' /etc/os-release; }; then
+    echo "musl"
+  else
+    echo "gnu"
+  fi
+}
+
 detect_target_triple() {
-  local os arch
+  local os arch libc
   os=$(uname -s)
   arch=$(uname -m)
 
   case "$os" in
   Darwin) echo "aarch64-apple-darwin" ;; # presume M-series
   Linux)
+    libc=$(detect_libc)
     case "$arch" in
-    x86_64) echo "x86_64-unknown-linux-gnu" ;;
-    aarch64 | arm64) echo "aarch64-unknown-linux-gnu" ;;
+    x86_64) echo "x86_64-unknown-linux-${libc}" ;;
+    aarch64 | arm64) echo "aarch64-unknown-linux-${libc}" ;;
     armv7l) echo "armv7-unknown-linux-gnueabihf" ;;
     armv6l | arm*) echo "arm-unknown-linux-gnueabihf" ;;
     *) echo "" ;;
@@ -1036,6 +1047,7 @@ See all available features:
   fi
   echo
 
+  # >>> generated:source-cargo-install by `cargo generate installers` - do not edit <<<
   if [ "$DRY_RUN" = true ]; then
     # shellcheck disable=SC2086
     info "[dry-run] Would run: cargo install --path . --locked --force $CARGO_FLAGS"
@@ -1043,6 +1055,7 @@ See all available features:
     # shellcheck disable=SC2086
     cargo install --path . --locked --force $CARGO_FLAGS
   fi
+  # >>> end generated:source-cargo-install <<<
 
   # ── Web dashboard (gateway feature only) ──────────────────────────
   # When the install includes the `gateway` feature, build `web/dist` so

@@ -16,6 +16,8 @@ use zeroclaw_api::tool::{Tool, ToolResult};
 /// Default maximum number of search results.
 const DEFAULT_MAX_RESULTS: usize = 5;
 
+type ActivationHook = Arc<dyn Fn(Arc<dyn Tool>) + Send + Sync>;
+
 /// Tool-level access policy applied at discovery time.
 ///
 /// When set on `ToolSearchTool`, deferred tools that fail this check are
@@ -91,6 +93,7 @@ pub struct ToolSearchTool {
     deferred: DeferredMcpToolSet,
     activated: Arc<Mutex<ActivatedToolSet>>,
     access_policy: Option<ToolAccessPolicy>,
+    activation_hook: Option<ActivationHook>,
 }
 
 impl ToolSearchTool {
@@ -99,6 +102,7 @@ impl ToolSearchTool {
             deferred,
             activated,
             access_policy: None,
+            activation_hook: None,
         }
     }
 
@@ -107,10 +111,23 @@ impl ToolSearchTool {
         self
     }
 
+    pub fn with_activation_hook(mut self, hook: ActivationHook) -> Self {
+        self.activation_hook = Some(hook);
+        self
+    }
+
     fn is_allowed(&self, tool_name: &str) -> bool {
         self.access_policy
             .as_ref()
             .is_none_or(|p| p.is_tool_allowed(tool_name))
+    }
+
+    fn notify_activated(&self, tools: Vec<Arc<dyn Tool>>) {
+        if let Some(hook) = &self.activation_hook {
+            for tool in tools {
+                hook(tool);
+            }
+        }
     }
 }
 
@@ -192,6 +209,7 @@ impl Tool for ToolSearchTool {
         let mut output = String::from("<functions>\n");
         let mut activated_count = 0;
         let mut returned_count = 0;
+        let mut newly_activated = Vec::new();
         let mut guard = self.activated.lock().unwrap();
 
         for stub in &results {
@@ -213,7 +231,9 @@ impl Tool for ToolSearchTool {
                 if !guard.is_activated(&stub.prefixed_name)
                     && let Some(tool) = self.deferred.activate(&stub.prefixed_name)
                 {
-                    guard.activate(stub.prefixed_name.clone(), Arc::from(tool));
+                    let tool: Arc<dyn Tool> = Arc::from(tool);
+                    guard.activate(stub.prefixed_name.clone(), Arc::clone(&tool));
+                    newly_activated.push(tool);
                     activated_count += 1;
                 }
                 let _ = writeln!(
@@ -229,6 +249,7 @@ impl Tool for ToolSearchTool {
 
         output.push_str("</functions>\n");
         drop(guard);
+        self.notify_activated(newly_activated);
 
         ::zeroclaw_log::record!(
             DEBUG,
@@ -252,6 +273,7 @@ impl ToolSearchTool {
         let mut output = String::from("<functions>\n");
         let mut not_found = Vec::new();
         let mut activated_count = 0;
+        let mut newly_activated = Vec::new();
         let mut guard = self.activated.lock().unwrap();
 
         for name in names {
@@ -272,7 +294,9 @@ impl ToolSearchTool {
                     if !guard.is_activated(name)
                         && let Some(tool) = self.deferred.activate(name)
                     {
-                        guard.activate(String::from(*name), Arc::from(tool));
+                        let tool: Arc<dyn Tool> = Arc::from(tool);
+                        guard.activate(String::from(*name), Arc::clone(&tool));
+                        newly_activated.push(tool);
                         activated_count += 1;
                     }
                     let _ = writeln!(
@@ -291,6 +315,7 @@ impl ToolSearchTool {
 
         output.push_str("</functions>\n");
         drop(guard);
+        self.notify_activated(newly_activated);
 
         if !not_found.is_empty() {
             let _ = write!(output, "\nNot found: {}", not_found.join(", "));
@@ -487,6 +512,29 @@ mod tests {
             .unwrap();
 
         assert_eq!(activated.lock().unwrap().tool_specs().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn activation_hook_receives_newly_activated_tools_once() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_hook = Arc::clone(&seen);
+        let tool = ToolSearchTool::new(
+            make_deferred_set(vec![make_stub("srv__tool", "A tool")]).await,
+            Arc::clone(&activated),
+        )
+        .with_activation_hook(Arc::new(move |tool| {
+            seen_hook.lock().unwrap().push(tool.name().to_string());
+        }));
+
+        tool.execute(serde_json::json!({"query": "select:srv__tool"}))
+            .await
+            .unwrap();
+        tool.execute(serde_json::json!({"query": "select:srv__tool"}))
+            .await
+            .unwrap();
+
+        assert_eq!(seen.lock().unwrap().as_slice(), ["srv__tool"]);
     }
 
     #[test]

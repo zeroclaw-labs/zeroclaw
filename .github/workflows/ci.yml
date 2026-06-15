@@ -138,7 +138,11 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install mold linker
         if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y mold
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
+            /etc/apt/sources.list.d/azure-cli.list
+          sudo apt-get update -qq
+          sudo apt-get install -y mold
       - name: Ensure web/dist placeholder exists
         shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
@@ -272,7 +276,11 @@ jobs:
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Install mold linker
-        run: sudo apt-get update -qq && sudo apt-get install -y mold
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
+            /etc/apt/sources.list.d/azure-cli.list
+          sudo apt-get update -qq
+          sudo apt-get install -y mold
       - name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
       - name: Run tests
@@ -333,6 +341,20 @@ jobs:
           BASE_SHA: ${{ steps.base.outputs.sha }}
         run: bash scripts/ci/docs_quality_gate.sh
 
+  installer-drift:
+    name: Installer Drift
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.93.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Check generated install surfaces are in sync with the spec
+        run: cargo generate installers --check
+
   # ── Required gate ─────────────────────────────────────────────────────────
   # Branch protection requires only this single job — internal structure
   # can change without touching branch protection settings.
@@ -340,7 +362,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, lint, build, check, check-32bit, bench, test, security, nix-eval, docs-style]
+    needs: [fmt, lint, build, check, check-32bit, bench, test, security, nix-eval, docs-style, installer-drift]
     runs-on: ubuntu-latest
     steps:
       - name: Check results

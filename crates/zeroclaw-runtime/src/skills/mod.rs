@@ -20,6 +20,7 @@ pub mod document;
 pub mod frontmatter;
 pub mod improver;
 pub mod reference;
+pub mod review;
 pub mod scaffold;
 pub mod service;
 mod suggestions;
@@ -103,6 +104,12 @@ pub struct SkillTool {
     /// action). Accepts the legacy key `default_args` for compatibility.
     #[serde(default, alias = "default_args")]
     pub locked_args: HashMap<String, String>,
+    /// For `kind = "shell"` / `kind = "script"`: maximum execution time in
+    /// seconds before the command is killed. Unset falls back to the built-in
+    /// `SKILL_SHELL_TIMEOUT_SECS` (60s) default; long-running skills (e.g. a
+    /// build pipeline) raise it via `timeout_secs` in SKILL.toml.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 /// Skill manifest parsed from SKILL.toml
@@ -1331,7 +1338,10 @@ pub fn skills_to_prompt_with_mode(
                         &mut prompt,
                         8,
                         "name",
-                        &format!("{}__{}", skill.name, tool.name),
+                        // Must match the registered tool spec's name exactly
+                        // (same sanitizer), or the model is told to call a name
+                        // that no tool exposes (#6678).
+                        &crate::tools::skill_tool::composed_tool_name(&skill.name, &tool.name),
                     );
                     write_xml_text_element(&mut prompt, 8, "description", &tool.description);
                     let _ = writeln!(prompt, "      </tool>");
@@ -2167,19 +2177,15 @@ pub fn load_plugin_skills_from_config(config: &zeroclaw_config::schema::Config) 
         return Vec::new();
     }
 
-    let plugins_dir = expand_plugins_dir(&config.plugins.plugins_dir);
-    let parent = match plugins_dir.parent() {
-        Some(p) => p.to_path_buf(),
-        None => return Vec::new(),
-    };
+    let plugins_dir = config.plugins.resolved_plugins_dir();
 
     let signature_mode = zeroclaw_plugins::host::PluginHost::parse_signature_mode(
         &config.plugins.security.signature_mode,
     );
     let trusted_keys = config.plugins.security.trusted_publisher_keys.clone();
 
-    let host = match zeroclaw_plugins::host::PluginHost::with_security(
-        &parent,
+    let host = match zeroclaw_plugins::host::PluginHost::from_plugins_dir_with_security(
+        &plugins_dir,
         signature_mode,
         trusted_keys,
     ) {
@@ -2204,16 +2210,6 @@ pub fn load_plugin_skills_from_config(config: &zeroclaw_config::schema::Config) 
         }
     }
     skills
-}
-
-#[cfg(feature = "plugins-wasm")]
-fn expand_plugins_dir(plugins_dir: &str) -> PathBuf {
-    if let Some(rest) = plugins_dir.strip_prefix("~/")
-        && let Some(dirs) = UserDirs::new()
-    {
-        return dirs.home_dir().join(rest);
-    }
-    PathBuf::from(plugins_dir)
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -2824,6 +2820,61 @@ description = "fine"
         assert!(
             !names.contains(&"bad-open"),
             "bad open-skill must be skipped, not silently accepted; got: {names:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod prompt_callable_name_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn tool(name: &str, kind: &str) -> SkillTool {
+        SkillTool {
+            name: name.to_string(),
+            description: "desc".to_string(),
+            kind: kind.to_string(),
+            command: "echo hi".to_string(),
+            args: HashMap::new(),
+            target: None,
+            locked_args: HashMap::new(),
+            timeout_secs: None,
+        }
+    }
+
+    /// The skills prompt must advertise the exact same callable name the tool
+    /// spec registers (both via `composed_tool_name`). A plugin-namespaced skill
+    /// with a dotted tool name would otherwise render a raw `skill__tool` the
+    /// model cannot invoke, which is the prompt half of #6678.
+    #[test]
+    fn prompt_callable_name_matches_registered_tool_name() {
+        let skill = Skill {
+            name: "pr-review-toolkit:code-reviewer".to_string(),
+            description: "review".to_string(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![tool("run.lint", "shell")],
+            prompts: Vec::new(),
+            location: None,
+        };
+
+        let prompt = skills_to_prompt_with_mode(
+            std::slice::from_ref(&skill),
+            Path::new("/tmp"),
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+        );
+
+        let registered =
+            crate::tools::skill_tool::composed_tool_name(&skill.name, &skill.tools[0].name);
+        assert!(
+            prompt.contains(&format!("<name>{registered}</name>")),
+            "prompt is missing the sanitized callable name `{registered}`:\n{prompt}",
+        );
+        // The raw, provider-invalid composed name must never reach the prompt.
+        assert!(
+            !prompt.contains("pr-review-toolkit:code-reviewer__run.lint"),
+            "prompt advertised the raw, unsanitized composed name:\n{prompt}",
         );
     }
 }
