@@ -1285,6 +1285,20 @@ dependencies = [
 
 [[package]]
 name = "cargo_metadata"
+version = "0.18.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d886547e41f740c616ae73108f6eb70afe6d940c7bc697cb30f13daec073037"
+dependencies = [
+ "camino",
+ "cargo-platform",
+ "semver",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "cargo_metadata"
 version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd5eb614ed4c27c5d706420e4320fbe3216ab31fa1c33cd8246ac36dae4479ba"
@@ -10108,7 +10122,7 @@ checksum = "092379df9a707631978e6c56b1bc2401d387f01e2d4a3c123360d167bbb9aa95"
 dependencies = [
  "anyhow",
  "brotli",
- "cargo_metadata",
+ "cargo_metadata 0.19.2",
  "ctor",
  "dom_query",
  "dunce",
@@ -13447,6 +13461,7 @@ version = "0.8.0"
 dependencies = [
  "anyhow",
  "axum",
+ "cargo_metadata 0.18.1",
  "clap",
  "fluent-syntax",
  "reqwest 0.12.28",
@@ -14094,21 +14109,26 @@ name = "zeroclaw-tools"
 version = "0.8.0"
 dependencies = [
  "anyhow",
+ "async-imap",
  "async-trait",
  "base64 0.22.1",
  "chrono",
  "directories",
  "fantoccini",
+ "fluent",
  "futures-util",
  "glob",
  "hex",
  "infer",
+ "mail-parser",
  "nanohtml2text",
  "parking_lot",
  "pdf-extract",
  "probe-rs",
  "regex",
  "reqwest 0.12.28",
+ "rustls",
+ "rustls-pki-types",
  "scopeguard",
  "serde",
  "serde_json",
@@ -14116,6 +14136,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tokio-test",
  "tokio-tungstenite 0.29.0",
@@ -14123,6 +14144,7 @@ dependencies = [
  "toml 1.1.2+spec-1.1.0",
  "urlencoding",
  "uuid",
+ "webpki-roots 1.0.7",
  "which",
  "wiremock",
  "zeroclaw-api",
