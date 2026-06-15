@@ -10,6 +10,9 @@ name: Deploy mdBook docs to Pages
 
 env:
   DOCS_MIN_VERSION: v0.7.5
+  # gh-pages is ephemeral: keep master, stable, and the newest N final
+  # releases. Lower this to shrink clone size; raise to keep more pinned docs.
+  DOCS_KEEP_VERSIONS: "3"
 
 on:
   push:
@@ -43,6 +46,35 @@ jobs:
   deploy:
     runs-on: ubuntu-24.04-arm
     steps:
+      # A push to master that changes the stable pointer must deploy the docs
+      # for the version it now names (so that release becomes the Stable target),
+      # not master. Detect that here via the compare API (no checkout needed yet):
+      # if stable-version.txt changed in this push, read its new value as the tag
+      # to build. Tag pushes and dispatch are unaffected.
+      - name: Detect stable-pointer change
+        id: stableptr
+        if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          PTR="docs/book/stable-version.txt"
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            echo "No before-SHA (new branch); skipping stable-pointer detection."
+            exit 0
+          fi
+          FILES=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${BEFORE}...${AFTER}" \
+            --jq '.files[].filename' 2>/dev/null || true)
+          if ! printf '%s\n' "$FILES" | grep -qx "$PTR"; then
+            echo "Stable pointer unchanged in this push."
+            exit 0
+          fi
+          PTR_TAG=$(gh api "repos/${GITHUB_REPOSITORY}/contents/${PTR}?ref=${AFTER}" \
+            --jq '.content' | base64 -d | tr -d '[:space:]')
+          echo "Stable pointer changed -> deploying $PTR_TAG"
+          echo "tag=$PTR_TAG" >> "$GITHUB_OUTPUT"
+
       - name: Determine version tag
         id: version
         run: |
@@ -55,6 +87,9 @@ jobs:
             fi
           elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
             TAG="${{ github.ref_name }}"
+          elif [ -n "${{ steps.stableptr.outputs.tag }}" ]; then
+            # Stable pointer moved on master: deploy the named release tag.
+            TAG="${{ steps.stableptr.outputs.tag }}"
           else
             TAG="master"
           fi
@@ -71,12 +106,13 @@ jobs:
           echo "TAG=$TAG" >> $GITHUB_OUTPUT
           echo "Building docs for TAG=$TAG"
 
-      # Checks out the version being built. For workflow_dispatch with an old
-      # release tag, this replaces the workspace with that tag's source tree,
-      # which may predate the deploy helpers introduced in this PR.
+      # Checks out the version being built. TAG is 'master', a release tag from
+      # a tag push / dispatch, or the stable-pointer's named release. For an old
+      # release tag this replaces the workspace with that tag's source tree,
+      # which may predate the deploy helpers (fetched separately below).
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ steps.version.outputs.TAG }}
           fetch-depth: 1
 
       # Always fetch the deploy-helper scripts from the commit that triggered
@@ -154,6 +190,7 @@ jobs:
           GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.version.outputs.TAG }}
+          DOCS_KEEP_VERSIONS: ${{ env.DOCS_KEEP_VERSIONS }}
         run: |
           set -euo pipefail
           REPO="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
@@ -189,126 +226,92 @@ jobs:
             rsync -a "$BUILD_ROOT/" "$TAG_SRC/"
           fi
 
-          # Copy built tag docs into gh-pages under '<tag>/'
-          mkdir -p "$CLONE_DIR/$TAG"
-          rsync -a --delete "$TAG_SRC/" "$CLONE_DIR/$TAG/"
-
-          # If this is a stable release (no pre-release suffix), also copy to /stable/
-          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            mkdir -p "$CLONE_DIR/stable"
-            rsync -a --delete "$CLONE_DIR/$TAG/" "$CLONE_DIR/stable/"
-          fi
-
-          # Generate versions.json by scanning gh-pages root for version directories
           pushd "$CLONE_DIR" > /dev/null
 
-          # Persist custom domain — must be present on every push to gh-pages
-          # or GitHub Pages will remove it (re-introduced fix from #6142).
-          echo "docs.zeroclawlabs.ai" > CNAME
+          MDBOOK_XTASK="cargo run --manifest-path ${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml -p xtask --bin mdbook --"
 
-          # Disable Jekyll. Pages runs Jekyll by default, which drops every
-          # top-level underscore-prefixed dir (`_shared/`) from the served
-          # site — so the shared chrome (CSS/JS/favicons) 404s on every page
-          # while non-underscore paths serve fine. Re-assert each deploy, same
-          # as CNAME, so a tree rewrite can never silently re-enable Jekyll.
-          touch .nojekyll
+          # apply_run_slice re-applies THIS run's deliverables onto whatever tree
+          # is currently checked out (initial clone or a retry re-clone), then
+          # runs every idempotent finalizer. Single source of truth for both the
+          # first push and the concurrent-retry path so the two can never drift.
+          apply_run_slice() {
+            # Copy built tag docs into '<tag>/'.
+            mkdir -p "$TAG"
+            rsync -a --delete "$TAG_SRC/" "$TAG/"
 
-          SCRIPTS="${GITHUB_WORKSPACE}/.workflow-scripts/.github/scripts"
-
-          # Shared chrome (_shared/) is owned by master only. Every deployed
-          # version's pages reference /_shared/, so letting an older tag's build
-          # overwrite it would regress the chrome (CSS/JS) for ALL versions —
-          # the beta-2-clobbers-master bug. Tag deploys sync their own <tag>/
-          # dir but leave _shared untouched; master is the single writer.
-          if [ "$TAG" = "master" ]; then
-            if [ -d "${GITHUB_WORKSPACE}/docs/book/book/_shared" ]; then
-              mkdir -p "$CLONE_DIR/_shared"
-              rsync -a --delete "${GITHUB_WORKSPACE}/docs/book/book/_shared/" "$CLONE_DIR/_shared/"
-            else
-              # master build predates the _shared layout: extract chrome from it.
-              cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- extract-chrome "$CLONE_DIR/$TAG" "$CLONE_DIR/_shared"
+            # No stable/ tree: Stable is a pointer to a real version dir, never a
+            # duplicate copy. The committed pointer (docs/book/stable-version.txt)
+            # is published to the gh-pages root as stable-version.txt; gen-versions
+            # and gen-root-index read it. A master deploy refreshes it from the
+            # build; tag deploys leave whatever the last pointer-bearing build set.
+            if [ -f "${GITHUB_WORKSPACE}/docs/book/stable-version.txt" ]; then
+              cp "${GITHUB_WORKSPACE}/docs/book/stable-version.txt" stable-version.txt
             fi
-          elif [ ! -d "$CLONE_DIR/_shared" ]; then
-            # Bootstrap only: a tag is the very first deploy and no master has
-            # populated _shared yet. Seed it from this tag so its pages aren't
-            # broken; the next master deploy takes ownership and overwrites it.
-            cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- extract-chrome "$CLONE_DIR/$TAG" "$CLONE_DIR/_shared"
-          fi
 
-          cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- gen-versions > versions.json
+            # Shared chrome (_shared/) is owned by master: every version's pages
+            # reference /_shared/, so an older tag overwriting it would regress
+            # the chrome for ALL versions. master is the single writer; a tag
+            # only seeds _shared when bootstrapping the very first deploy.
+            if [ "$TAG" = "master" ]; then
+              if [ -d "${GITHUB_WORKSPACE}/docs/book/book/_shared" ]; then
+                mkdir -p _shared
+                rsync -a --delete "${GITHUB_WORKSPACE}/docs/book/book/_shared/" "_shared/"
+              else
+                $MDBOOK_XTASK extract-chrome "$TAG" "_shared"
+              fi
+            elif [ ! -d "_shared" ]; then
+              $MDBOOK_XTASK extract-chrome "$TAG" "_shared"
+            fi
 
-          # Remove orphaned root entries left by the pre-versioned layout
-          # (top-level en/, fr/, api/, ...). Keeps version dirs, _shared, and
-          # the allowlisted root files. Single source of truth: is_version_dir.
-          cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- prune-root
+            # Persist custom domain (#6142) and disable Jekyll on every push, or
+            # Pages drops the CNAME and 404s every underscore-prefixed path.
+            echo "docs.zeroclawlabs.ai" > CNAME
+            touch .nojekyll
 
-          # Retrofit the version-selector into any deployed version whose pages
-          # predate the selector (e.g. tags cut before it shipped). Idempotent.
-          cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- retrofit-selector
+            # Drop pre-versioned orphan dirs (including any legacy stable/), then
+            # enforce retention (master + newest DOCS_KEEP_VERSIONS finals).
+            # gen-versions runs AFTER pruning so versions.json never lists a
+            # dropped version; gen-root-index points / at the stable pointer
+            # target (or master when no stable is resolvable).
+            $MDBOOK_XTASK prune-root
+            $MDBOOK_XTASK prune-versions
+            $MDBOOK_XTASK gen-versions > versions.json
+            $MDBOOK_XTASK retrofit-selector
+            $MDBOOK_XTASK gen-root-index > index.html
+          }
 
-          # Ensure root index.html points to /stable/en/ if stable docs exist, otherwise /master/en/
-          if [ -d "stable" ]; then
-            bash "${SCRIPTS}/gen-index-stable.sh"
-          else
-            bash "${SCRIPTS}/gen-index-master.sh"
-          fi
+          # gh-pages is ephemeral: it must never accumulate history, or every
+          # superseded build artifact (per-locale searchindex, old version
+          # trees) stays reachable forever and bloats every clone. Each deploy
+          # collapses the finalized tree into a SINGLE orphan commit and
+          # force-pushes it. There is no history to rewrite later; retention and
+          # cleanup are just "don't copy it into the next deploy's tree".
+          flatten_and_push() {
+            git checkout --orphan ghp-flat
+            git add --all
+            git -c user.name="$GIT_AUTHOR_NAME" -c user.email="$GIT_AUTHOR_EMAIL" \
+              commit -m "docs: publish site for $TAG (from $GITHUB_SHA)"
+            git push --force "$REPO" ghp-flat:gh-pages
+          }
 
-          git add --all
-          git -c user.name="$GIT_AUTHOR_NAME" -c user.email="$GIT_AUTHOR_EMAIL" commit -m "docs: update docs for $TAG (from $GITHUB_SHA)" || true
+          apply_run_slice
 
-          # Concurrent deploy runs each clone, mutate, and push gh-pages. A run
-          # that cloned before a sibling's push would otherwise clobber it (or
-          # be rejected). The clone is shallow (--depth 1), so rebasing onto the
-          # remote tip can't rely on shared ancestry. On rejection: hard-reset
-          # onto the latest remote tip (adopting every sibling's version dirs),
-          # re-apply only THIS run's own deliverables (its <tag>/, and _shared
-          # when master), re-run the finalizers (idempotent), and commit fresh.
-          # This merges by tree, not by history, so it works regardless of how
-          # far gh-pages advanced or whether it was rebuilt via the orphan path.
+          # Concurrency is serialized by the workflow `concurrency: gh-pages`
+          # group, so a force-push race is unlikely; the retry exists only to
+          # absorb the rare overlap. On rejection: re-clone the latest tip
+          # (adopting sibling runs' retained version dirs), re-apply this run's
+          # slice + finalizers, and force-push a fresh orphan again.
           push_attempts=0
-          until git push "$REPO" gh-pages; do
+          until flatten_and_push; do
             push_attempts=$((push_attempts + 1))
             if [ "$push_attempts" -ge 5 ]; then
               echo "::error::gh-pages push failed after ${push_attempts} attempts"
               exit 1
             fi
-            echo "Push rejected (attempt ${push_attempts}); resetting onto latest gh-pages and retrying"
-            git fetch --depth=1 "$REPO" gh-pages
-            # Adopt the remote tree wholesale so sibling runs' version dirs are
-            # preserved exactly as they pushed them — never carry our stale view.
-            git reset --hard FETCH_HEAD
-            git clean -fd
-
-            # Re-apply this run's own version dir from the normalized build
-            # source (TAG_SRC), so old-layout tags re-apply the same wrapped
-            # `$TAG/` tree the initial sync used instead of failing here.
-            mkdir -p "$TAG"
-            rsync -a --delete "$TAG_SRC/" "$TAG/"
-            if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              mkdir -p stable
-              rsync -a --delete "$TAG/" "stable/"
-            fi
-            # Re-assert master-owned _shared (same ownership rule as above).
-            if [ "$TAG" = "master" ] && [ -d "${GITHUB_WORKSPACE}/docs/book/book/_shared" ]; then
-              mkdir -p _shared
-              rsync -a --delete "${GITHUB_WORKSPACE}/docs/book/book/_shared/" "_shared/"
-            elif [ ! -d "_shared" ]; then
-              cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- extract-chrome "$TAG" "_shared"
-            fi
-
-            echo "docs.zeroclawlabs.ai" > CNAME
-            touch .nojekyll
-            cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- gen-versions > versions.json
-            cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- prune-root
-            cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- retrofit-selector
-            if [ -d "stable" ]; then
-              bash "${SCRIPTS}/gen-index-stable.sh"
-            else
-              bash "${SCRIPTS}/gen-index-master.sh"
-            fi
-            git add --all
-            # Nothing to commit means the remote already matches our tree.
-            git -c user.name="$GIT_AUTHOR_NAME" -c user.email="$GIT_AUTHOR_EMAIL" \
-              commit -m "docs: update docs for $TAG (from $GITHUB_SHA)" || true
+            echo "Push rejected (attempt ${push_attempts}); re-cloning latest gh-pages and retrying"
+            RETRY_DIR=$(mktemp -d)
+            git clone --depth 1 --branch gh-pages "$REPO" "$RETRY_DIR"
+            pushd "$RETRY_DIR" > /dev/null
+            apply_run_slice
           done
           popd >/dev/null
