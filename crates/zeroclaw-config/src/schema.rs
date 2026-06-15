@@ -3448,7 +3448,7 @@ pub struct ChannelAliasInfo {
 }
 
 impl Config {
-    /// Resolve the configured alias values valid for an [`AliasSource`].
+    /// Resolve the configured alias values valid for an [`crate::traits::AliasSource`].
     /// Two-tier sources return dotted `<type>.<alias>` keys; flat sources
     /// return bare alias keys. The single resolver every surface uses for
     /// `PropKind::AliasRef` pickers and validation.
