@@ -82,15 +82,16 @@ mod tests {
         bundles: HashMap<String, McpBundleConfig>,
         agents: HashMap<String, AliasedAgentConfig>,
     ) -> Config {
-        let mut config = Config::default();
-        config.mcp = McpConfig {
-            servers,
-            enabled: true,
+        Config {
+            mcp: McpConfig {
+                servers,
+                enabled: true,
+                ..Default::default()
+            },
+            mcp_bundles: bundles,
+            agents,
             ..Default::default()
-        };
-        config.mcp_bundles = bundles;
-        config.agents = agents;
-        config
+        }
     }
 
     fn make_agent(bundles: Vec<&str>) -> AliasedAgentConfig {
