@@ -421,12 +421,53 @@ async fn check_memory_roundtrip(config: &crate::config::Config) -> CheckResult {
 
 #[cfg(feature = "gateway")]
 async fn check_websocket_handshake(config: &crate::config::Config) -> CheckResult {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::header;
+
     let port = config.gateway.port;
     let (probe_host, _) = resolve_probe_host(&config.gateway.host);
-    let probe_url = format!("ws://{probe_host}:{port}/ws/chat");
+    let agent_alias = config
+        .agents
+        .keys()
+        .next()
+        .cloned()
+        .unwrap_or_else(|| "default".to_string());
+    let mut probe_url = format!("ws://{probe_host}:{port}/ws/chat?agent={agent_alias}");
     let display_url = format_probe_url("ws", &config.gateway.host, port, "/ws/chat");
 
-    match tokio_tungstenite::connect_async(&probe_url).await {
+    if config.gateway.require_pairing {
+        if let Some(token) = resolve_gateway_bearer_token(config) {
+            probe_url.push_str(&format!("&token={token}"));
+        } else {
+            return CheckResult::fail(
+                "websocket",
+                format!(
+                    "pairing required but no bearer token available for self-test \
+                     (set ZEROCLAW_GATEWAY_TOKEN or keep a plaintext zc_* entry in \
+                     gateway.paired_tokens): {display_url}"
+                ),
+            );
+        }
+    }
+
+    let request = match probe_url.as_str().into_client_request() {
+        Ok(mut req) => {
+            if let Some(token) = resolve_gateway_bearer_token(config) {
+                if let Ok(value) = header::HeaderValue::from_str(&format!("Bearer {token}")) {
+                    req.headers_mut().insert(header::AUTHORIZATION, value);
+                }
+            }
+            req
+        }
+        Err(e) => {
+            return CheckResult::fail(
+                "websocket",
+                format!("failed to build websocket request for {display_url}: {e}"),
+            );
+        }
+    };
+
+    match tokio_tungstenite::connect_async(request).await {
         Ok((_, _)) => CheckResult::pass("websocket", format!("handshake OK at {display_url}")),
         Err(e) => CheckResult::fail(
             "websocket",
@@ -435,9 +476,36 @@ async fn check_websocket_handshake(config: &crate::config::Config) -> CheckResul
     }
 }
 
+/// Resolve a plaintext gateway bearer token for local diagnostics.
+///
+/// Precedence: `ZEROCLAW_GATEWAY_TOKEN`, then `ZEROCLAW_ACP_BRIDGE_TOKEN`,
+/// then the first plaintext (`zc_*`) entry in `gateway.paired_tokens`.
+#[cfg(feature = "gateway")]
+fn resolve_gateway_bearer_token(config: &crate::config::Config) -> Option<String> {
+    for key in ["ZEROCLAW_GATEWAY_TOKEN", "ZEROCLAW_ACP_BRIDGE_TOKEN"] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    config
+        .gateway
+        .paired_tokens
+        .iter()
+        .map(|t| t.trim())
+        .find(|t| t.starts_with("zc_"))
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "gateway")]
+    use super::resolve_gateway_bearer_token;
     use super::{format_probe_url, resolve_probe_host, web_dist_dir_expansion_reason_key};
+    #[cfg(feature = "gateway")]
+    use zeroclaw_config::schema::Config;
 
     #[test]
     fn web_dist_dir_with_tilde_resolves_to_tilde_reason_key() {
@@ -584,5 +652,24 @@ mod tests {
             format_probe_url("ws", "127.0.0.1", 42617, "/ws/chat"),
             "ws://127.0.0.1:42617/ws/chat"
         );
+    }
+
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn resolve_gateway_bearer_token_reads_plaintext_paired_token() {
+        let mut config = Config::default();
+        config.gateway.paired_tokens = vec!["zc_test".into()];
+        assert_eq!(
+            resolve_gateway_bearer_token(&config).as_deref(),
+            Some("zc_test")
+        );
+    }
+
+    #[cfg(feature = "gateway")]
+    #[test]
+    fn resolve_gateway_bearer_token_ignores_hashed_paired_tokens() {
+        let mut config = Config::default();
+        config.gateway.paired_tokens = vec!["a".repeat(64)];
+        assert!(resolve_gateway_bearer_token(&config).is_none());
     }
 }
