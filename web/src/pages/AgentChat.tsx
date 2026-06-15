@@ -339,9 +339,11 @@ function AgentChatInner({ agentAlias }: { agentAlias: string }) {
         </div>
       )}
 
-      {/* Messages area. */}
+      {/* Messages area — translate="no" prevents browser auto-translation
+          from rewriting React-managed text nodes (see #7057). */}
       <div
         className={`flex-1 overflow-y-auto p-4 ${compact ? 'space-y-1.5' : 'space-y-4'}`}
+        translate="no"
       >
         {messages.length === 0 && (
           <div className="flex flex-col items-center justify-center h-full text-center animate-fade-in" style={{ color: 'var(--pc-text-muted)' }}>
