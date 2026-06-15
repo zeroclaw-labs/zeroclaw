@@ -5924,6 +5924,7 @@ mod tests {
                     args: std::collections::HashMap::new(),
                     target: None,
                     locked_args: std::collections::HashMap::new(),
+                    timeout_secs: None,
                 })
                 .collect(),
             prompts: vec![],
@@ -6012,6 +6013,7 @@ mod tests {
                 args: std::collections::HashMap::new(),
                 target: Some("shell".to_string()),
                 locked_args: std::collections::HashMap::new(),
+                timeout_secs: None,
             }],
             prompts: vec![],
             location: None,
