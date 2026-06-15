@@ -178,6 +178,7 @@ mod tests {
             args,
             target: None,
             locked_args: HashMap::new(),
+            timeout_secs: None,
         }
     }
 
@@ -229,6 +230,7 @@ mod tests {
             args: HashMap::new(),
             target: None,
             locked_args: HashMap::new(),
+            timeout_secs: None,
         };
         let tool = SkillHttpTool::new("s", &st);
         let schema = tool.parameters_schema();

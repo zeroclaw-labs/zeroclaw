@@ -14,7 +14,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolResult};
 
-/// Maximum execution time for a skill shell command (seconds).
+/// Default execution time for a skill shell command when the manifest does not
+/// set `timeout_secs` (seconds). A skill may raise this via `timeout_secs` in
+/// its SKILL.toml `[[tools]]` entry.
 const SKILL_SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1 MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
@@ -26,6 +28,9 @@ pub struct SkillShellTool {
     command_template: String,
     args: HashMap<String, String>,
     security: Arc<SecurityPolicy>,
+    /// Resolved per-command timeout in seconds (manifest `timeout_secs`, or the
+    /// `SKILL_SHELL_TIMEOUT_SECS` default), clamped to a minimum of 1.
+    timeout_secs: u64,
 }
 
 impl SkillShellTool {
@@ -44,6 +49,7 @@ impl SkillShellTool {
             command_template: tool.command.clone(),
             args: tool.args.clone(),
             security,
+            timeout_secs: tool.timeout_secs.unwrap_or(SKILL_SHELL_TIMEOUT_SECS).max(1),
         }
     }
 
@@ -144,7 +150,7 @@ impl Tool for SkillShellTool {
         }
 
         let result =
-            tokio::time::timeout(Duration::from_secs(SKILL_SHELL_TIMEOUT_SECS), cmd.output()).await;
+            tokio::time::timeout(Duration::from_secs(self.timeout_secs), cmd.output()).await;
 
         match result {
             Ok(Ok(output)) => {
@@ -187,7 +193,8 @@ impl Tool for SkillShellTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Command timed out after {SKILL_SHELL_TIMEOUT_SECS}s and was killed"
+                    "Command timed out after {}s and was killed",
+                    self.timeout_secs
                 )),
             }),
         }
@@ -355,6 +362,7 @@ mod tests {
             args,
             target: None,
             locked_args: HashMap::new(),
+            timeout_secs: None,
         }
     }
 
@@ -415,6 +423,7 @@ mod tests {
             args: HashMap::new(),
             target: None,
             locked_args: HashMap::new(),
+            timeout_secs: None,
         };
         let tool = SkillShellTool::new("s", &st, test_security());
         let schema = tool.parameters_schema();
@@ -433,11 +442,61 @@ mod tests {
             args: HashMap::new(),
             target: None,
             locked_args: HashMap::new(),
+            timeout_secs: None,
         };
         let tool = SkillShellTool::new("test", &st, test_security());
         let result = tool.execute(serde_json::json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("hello-skill"));
+    }
+
+    #[test]
+    fn skill_shell_tool_uses_default_timeout_when_unset() {
+        // `timeout_secs = None` in the manifest falls back to the 60s default.
+        let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security());
+        assert_eq!(tool.timeout_secs, SKILL_SHELL_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn skill_shell_tool_honors_manifest_timeout() {
+        // A manifest `timeout_secs` overrides the default — the fix for
+        // long-running skills that were killed at the 60s default.
+        let mut st = sample_skill_tool();
+        st.timeout_secs = Some(3600);
+        let tool = SkillShellTool::new("my_skill", &st, test_security());
+        assert_eq!(tool.timeout_secs, 3600);
+    }
+
+    #[test]
+    fn skill_shell_tool_clamps_zero_timeout_to_one() {
+        // A zero timeout would fire instantly and kill every command; clamp it.
+        let mut st = sample_skill_tool();
+        st.timeout_secs = Some(0);
+        let tool = SkillShellTool::new("my_skill", &st, test_security());
+        assert_eq!(tool.timeout_secs, 1);
+    }
+
+    #[test]
+    fn skill_tool_serde_parses_timeout_secs() {
+        // The manifest field deserializes; absent it defaults to None.
+        let with = r#"
+            name = "deploy"
+            description = "Deploy"
+            kind = "shell"
+            command = "deploy"
+            timeout_secs = 3600
+        "#;
+        let st: SkillTool = toml::from_str(with).unwrap();
+        assert_eq!(st.timeout_secs, Some(3600));
+
+        let without = r#"
+            name = "deploy"
+            description = "Deploy"
+            kind = "shell"
+            command = "deploy"
+        "#;
+        let st: SkillTool = toml::from_str(without).unwrap();
+        assert_eq!(st.timeout_secs, None);
     }
 
     #[test]
@@ -509,6 +568,7 @@ mod tests {
             args: HashMap::new(),
             target: Some("shell".to_string()),
             locked_args: HashMap::new(),
+            timeout_secs: None,
         }
     }
 
@@ -661,6 +721,7 @@ mod tests {
             args: HashMap::new(),
             target: Some("composio".to_string()),
             locked_args: locked.clone(),
+            timeout_secs: None,
         };
         let tool = SkillBuiltinTool::new("my_skill", &st, target, locked);
         // Caller passes only "input"; locked args provide action_name + app.
@@ -726,6 +787,7 @@ mod tests {
             args: HashMap::new(),
             target: Some(target.to_string()),
             locked_args: locked,
+            timeout_secs: None,
         }
     }
 
@@ -865,6 +927,7 @@ mod tests {
                 args: HashMap::new(),
                 target: Some("shell".to_string()),
                 locked_args: HashMap::new(),
+                timeout_secs: None,
             }],
             prompts: vec![],
             location: None,
