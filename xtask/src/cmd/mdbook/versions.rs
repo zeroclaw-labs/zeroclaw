@@ -99,8 +99,8 @@ pub fn prune_root() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Default number of stable releases to retain on gh-pages, in addition to
-/// `master` and `stable`. Overridable via `DOCS_KEEP_VERSIONS`.
+/// Default number of final releases to retain on gh-pages, in addition to
+/// `master` and the stable-pointer target. Overridable via `DOCS_KEEP_VERSIONS`.
 const DEFAULT_KEEP_VERSIONS: usize = 3;
 
 fn keep_versions_limit() -> usize {
@@ -110,17 +110,25 @@ fn keep_versions_limit() -> usize {
         .unwrap_or(DEFAULT_KEEP_VERSIONS)
 }
 
-/// Decide which version dirs survive a retention pass. `master` and `stable`
-/// are always kept. Among `vX.Y.Z` tag dirs, the newest `keep` final releases
-/// (no pre-release suffix) survive; every pre-release and every older final
-/// release is dropped. Pure decision over names so it is unit-testable without
-/// touching the filesystem.
-fn retained_versions(present: &[String], keep: usize) -> Vec<String> {
+/// Decide which version dirs survive a retention pass. `master` and the stable
+/// pointer target (when present) are always kept, regardless of recency, so the
+/// root redirect and "Stable (latest release)" entry can never point at a pruned
+/// dir. Among the remaining `vX.Y.Z` final releases, the newest `keep` survive;
+/// every pre-release and every older final is dropped. Pure decision over names
+/// so it is unit-testable without touching the filesystem.
+fn retained_versions(present: &[String], keep: usize, stable: Option<&str>) -> Vec<String> {
     let mut kept: Vec<String> = present
         .iter()
         .filter(|n| n.as_str() == "master")
         .cloned()
         .collect();
+
+    if let Some(s) = stable
+        && present.iter().any(|n| n == s)
+        && !kept.iter().any(|n| n == s)
+    {
+        kept.push(s.to_string());
+    }
 
     let mut finals: Vec<Version> = present
         .iter()
@@ -128,15 +136,20 @@ fn retained_versions(present: &[String], keep: usize) -> Vec<String> {
         .filter(|v| v.pre.is_none())
         .collect();
     finals.sort_by(|a, b| b.cmp(a));
-    kept.extend(finals.into_iter().take(keep).map(|v| v.tag));
+    for v in finals.into_iter().take(keep) {
+        if !kept.contains(&v.tag) {
+            kept.push(v.tag);
+        }
+    }
     kept
 }
 
-/// Retention pass for the ephemeral gh-pages tree: keep `master`, `stable`, and
-/// the newest `DOCS_KEEP_VERSIONS` final releases; remove every other version
-/// dir (all pre-releases and older finals). Non-version root entries are left to
-/// `prune_root`. Operates on the gh-pages clone root. Every clone pays a roughly
-/// linear packed cost per retained version, so capping the set caps clone size.
+/// Retention pass for the ephemeral gh-pages tree: keep `master`, the stable
+/// pointer target, and the newest `DOCS_KEEP_VERSIONS` final releases; remove
+/// every other version dir (other pre-releases and older finals). Non-version
+/// root entries are left to `prune_root`. Operates on the gh-pages clone root.
+/// Every clone pays a roughly linear packed cost per retained version, so
+/// capping the set caps clone size.
 pub fn prune_versions() -> anyhow::Result<()> {
     let keep = keep_versions_limit();
     let mut present = Vec::new();
@@ -150,7 +163,8 @@ pub fn prune_versions() -> anyhow::Result<()> {
         }
     }
 
-    let retained = retained_versions(&present, keep);
+    let stable = resolve_stable(&present);
+    let retained = retained_versions(&present, keep, stable.as_deref());
     for name in &present {
         if retained.contains(name) {
             continue;
@@ -408,7 +422,7 @@ mod tests {
             "v0.8.0-beta-1".to_string(),
             "v0.8.0-beta-2".to_string(),
         ];
-        let kept = retained_versions(&present, 2);
+        let kept = retained_versions(&present, 2, None);
         assert!(kept.contains(&"master".to_string()));
         assert!(kept.contains(&"v0.8.0".to_string()));
         assert!(kept.contains(&"v0.7.5".to_string()));
@@ -430,15 +444,49 @@ mod tests {
             "v0.9.0-beta-1".to_string(),
             "v0.9.0-beta-2".to_string(),
         ];
-        let kept = retained_versions(&present, 3);
+        let kept = retained_versions(&present, 3, None);
         assert_eq!(kept, vec!["master".to_string()]);
     }
 
     #[test]
     fn retained_keep_zero_keeps_only_master() {
         let present = vec!["master".to_string(), "v1.0.0".to_string()];
-        let kept = retained_versions(&present, 0);
+        let kept = retained_versions(&present, 0, None);
         assert_eq!(kept, vec!["master".to_string()]);
+    }
+
+    #[test]
+    fn retained_always_keeps_stable_pointer_even_when_outside_window() {
+        // Pointer names an older final that the recency window would drop.
+        let present = vec![
+            "master".to_string(),
+            "v0.9.0".to_string(),
+            "v0.8.5".to_string(),
+            "v0.8.1".to_string(),
+        ];
+        let kept = retained_versions(&present, 2, Some("v0.8.1"));
+        assert!(kept.contains(&"master".to_string()));
+        assert!(kept.contains(&"v0.9.0".to_string()));
+        assert!(kept.contains(&"v0.8.5".to_string()));
+        assert!(
+            kept.contains(&"v0.8.1".to_string()),
+            "stable pointer target must survive retention"
+        );
+    }
+
+    #[test]
+    fn retained_no_duplicate_when_stable_within_window() {
+        let present = vec!["master".to_string(), "v0.9.0".to_string()];
+        let kept = retained_versions(&present, 3, Some("v0.9.0"));
+        let count = kept.iter().filter(|n| n.as_str() == "v0.9.0").count();
+        assert_eq!(count, 1, "stable in window must not be listed twice");
+    }
+
+    #[test]
+    fn retained_ignores_stable_pointer_not_present() {
+        let present = vec!["master".to_string(), "v0.9.0".to_string()];
+        let kept = retained_versions(&present, 1, Some("v0.8.1"));
+        assert!(!kept.contains(&"v0.8.1".to_string()));
     }
 
     #[test]
