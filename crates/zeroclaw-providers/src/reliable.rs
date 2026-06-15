@@ -325,7 +325,7 @@ fn sanitized_url_endpoint(mut url: reqwest::Url) -> String {
     let _ = url.set_password(None);
     url.set_query(None);
     url.set_fragment(None);
-    url.to_string()
+    super::sanitize_api_error(url.as_ref())
 }
 
 fn endpoint_from_error_text(text: &str) -> Option<String> {
@@ -337,7 +337,7 @@ fn endpoint_from_error_text(text: &str) -> Option<String> {
     let url = reqwest::Url::parse(raw)
         .or_else(|_| reqwest::Url::parse(raw.trim_end_matches([':', '.'])))
         .ok()?;
-    Some(super::sanitize_api_error(&sanitized_url_endpoint(url)))
+    Some(sanitized_url_endpoint(url))
 }
 
 fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
@@ -2272,6 +2272,20 @@ mod tests {
         );
 
         assert_eq!(endpoint.as_deref(), Some("https://inference.host/v1"));
+    }
+
+    #[test]
+    fn sanitized_url_endpoint_scrubs_secret_like_path_segments() {
+        let endpoint = sanitized_url_endpoint(
+            reqwest::Url::parse(
+                "https://user:hunter2@inference.host/v1/sk-secretvalue123/chat?token=hunter2#debug",
+            )
+            .expect("test URL parses"),
+        );
+
+        assert_eq!(endpoint, "https://inference.host/v1/[REDACTED]/chat");
+        assert!(!endpoint.contains("secretvalue123"));
+        assert!(!endpoint.contains("hunter2"));
     }
 
     #[test]
