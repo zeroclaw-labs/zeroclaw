@@ -543,11 +543,9 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
     // after a restart; otherwise hydration loads sessions under the on-disk
     // (sanitized) name while lookup keeps producing the un-sanitized form.
     let thread_scope = match msg.thread_ts.as_deref() {
-        // Matrix root events can be self-anchored when `reply_in_thread`
-        // is enabled so outbound replies open a thread. That anchor is a
-        // delivery detail, not a conversation-history boundary; otherwise
-        // every top-level Matrix message becomes a fresh session.
-        Some(tid) if is_matrix_channel_name(&msg.channel) && tid == msg.id => None,
+        // Matrix thread_ts is a delivery anchor, not a topic boundary: root
+        // and follow-ups must share one sender+room session. See #7700.
+        Some(_) if is_matrix_channel_name(&msg.channel) => None,
         other => other,
     };
     let raw = match thread_scope {
@@ -15982,12 +15980,12 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn matrix_thread_conversation_history_key_uses_thread_root() {
-        let msg = zeroclaw_api::channel::ChannelMessage {
-            id: "$reply:server".into(),
+    fn matrix_thread_follow_up_shares_root_session_key() {
+        let root = zeroclaw_api::channel::ChannelMessage {
+            id: "$root:server".into(),
             sender: "@alice:server".into(),
             reply_target: "!room:server".into(),
-            content: "thread reply".into(),
+            content: "open the thread".into(),
             channel: "matrix".into(),
             channel_alias: None,
             timestamp: 1,
@@ -15996,10 +15994,19 @@ BTC is currently around $65,000 based on latest tool output."#
             attachments: vec![],
             subject: None,
         };
+        let follow_up = zeroclaw_api::channel::ChannelMessage {
+            id: "$reply:server".into(),
+            content: "thread reply".into(),
+            timestamp: 2,
+            thread_ts: Some("$root:server".into()),
+            interruption_scope_id: Some("$root:server".into()),
+            ..root.clone()
+        };
 
-        let key = conversation_history_key(&msg);
-        assert!(key.contains("_root_server"));
-        assert!(!key.contains("_reply_server"));
+        let root_key = conversation_history_key(&root);
+        assert_eq!(root_key, conversation_history_key(&follow_up));
+        assert!(!root_key.contains("$root:server"));
+        assert!(!root_key.contains("$reply:server"));
     }
 
     #[test]
