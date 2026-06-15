@@ -24,6 +24,34 @@ use zeroclaw_api::session_keys::sanitize_session_key;
 /// Maximum allowed connect timeout (seconds) to avoid unreasonable waits.
 const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
 
+/// Drops its inner value on a background OS thread.
+///
+/// `postgres::Client::drop` calls `Runtime::block_on` internally to send a
+/// clean-shutdown message. That panics if called from inside an existing Tokio
+/// runtime. Wrapping the `Arc<Mutex<Client>>` in this type ensures the final
+/// drop always happens on a plain OS thread.
+struct DropOnThread<T: Send + 'static>(Option<T>);
+
+impl<T: Send + 'static> DropOnThread<T> {
+    fn new(value: T) -> Self {
+        Self(Some(value))
+    }
+    fn get(&self) -> &T {
+        self.0.as_ref().expect("DropOnThread value already taken")
+    }
+}
+
+impl<T: Send + 'static> Drop for DropOnThread<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.0.take() {
+            std::thread::Builder::new()
+                .name("postgres-client-drop".to_string())
+                .spawn(move || drop(value))
+                .ok();
+        }
+    }
+}
+
 /// PostgreSQL-backed persistent memory.
 ///
 /// Reliable CRUD and keyword recall via SQL. Hybrid keyword + vector recall
@@ -32,7 +60,7 @@ const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
 /// warning at construction.
 pub struct PostgresMemory {
     alias: String,
-    client: Arc<Mutex<Client>>,
+    client: DropOnThread<Arc<Mutex<Client>>>,
     qualified_table: String,
     qualified_agents: String,
 }
@@ -81,14 +109,14 @@ impl PostgresMemory {
             }
             Ok(Self {
                 alias: alias.to_string(),
-                client: client_ref,
+                client: DropOnThread::new(client_ref),
                 qualified_table,
                 qualified_agents,
             })
         } else {
             Ok(Self {
                 alias: alias.to_string(),
-                client: Arc::new(Mutex::new(client)),
+                client: DropOnThread::new(Arc::new(Mutex::new(client))),
                 qualified_table,
                 qualified_agents,
             })
@@ -375,7 +403,7 @@ impl Memory for PostgresMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        let client = self.client.clone();
+        let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
         let query = normalize_recent_recall_query(query).trim().to_string();
@@ -435,7 +463,7 @@ impl Memory for PostgresMemory {
     }
 
     async fn get(&self, key: &str) -> Result<Option<MemoryEntry>> {
-        let client = self.client.clone();
+        let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
         let key = key.to_string();
@@ -459,7 +487,7 @@ impl Memory for PostgresMemory {
     }
 
     async fn get_for_agent(&self, key: &str, agent_id: &str) -> Result<Option<MemoryEntry>> {
-        let client = self.client.clone();
+        let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
         let key = key.to_string();
@@ -488,7 +516,7 @@ impl Memory for PostgresMemory {
         category: Option<&MemoryCategory>,
         session_id: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        let client = self.client.clone();
+        let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
         let category = category.map(Self::category_to_str);
@@ -518,7 +546,7 @@ impl Memory for PostgresMemory {
     }
 
     async fn forget(&self, key: &str) -> Result<bool> {
-        let client = self.client.clone();
+        let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
         let key = key.to_string();
 
@@ -532,7 +560,7 @@ impl Memory for PostgresMemory {
     }
 
     async fn forget_for_agent(&self, key: &str, agent_id: &str) -> Result<bool> {
-        let client = self.client.clone();
+        let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
         let key = key.to_string();
         let agent_id = agent_id.to_string();
@@ -547,7 +575,7 @@ impl Memory for PostgresMemory {
     }
 
     async fn purge_session_for_agent(&self, session_id: &str, agent_id: &str) -> Result<usize> {
-        let client = self.client.clone();
+        let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
         let session_id = session_id.to_string();
         let agent_id = agent_id.to_string();
@@ -563,7 +591,7 @@ impl Memory for PostgresMemory {
     }
 
     async fn count(&self) -> Result<usize> {
-        let client = self.client.clone();
+        let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
 
         run_on_os_thread(move || -> Result<usize> {
@@ -578,7 +606,7 @@ impl Memory for PostgresMemory {
     }
 
     async fn health_check(&self) -> bool {
-        let client = self.client.clone();
+        let client = self.client.get().clone();
         run_on_os_thread(move || Ok(client.lock().simple_query("SELECT 1").is_ok()))
             .await
             .unwrap_or(false)
@@ -594,7 +622,7 @@ impl Memory for PostgresMemory {
         _importance: Option<f64>,
         agent_id: Option<&str>,
     ) -> Result<()> {
-        let client = self.client.clone();
+        let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
         let key = key.to_string();
@@ -652,7 +680,7 @@ impl Memory for PostgresMemory {
             return self.recall(query, limit, session_id, since, until).await;
         }
 
-        let client = self.client.clone();
+        let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();
         let qualified_agents = self.qualified_agents.clone();
         let q = normalize_recent_recall_query(query).trim().to_string();
@@ -722,7 +750,7 @@ impl Memory for PostgresMemory {
     }
 
     async fn ensure_agent_uuid(&self, alias: &str) -> Result<String> {
-        let client = self.client.clone();
+        let client = self.client.get().clone();
         let qualified_agents = self.qualified_agents.clone();
         let alias = alias.to_string();
         run_on_os_thread(move || -> Result<String> {
