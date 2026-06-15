@@ -35,12 +35,10 @@ pub struct ProviderDispatch {
 /// just to gain attribution. Same surface, same on-disk shape; the
 /// only difference is the storage discipline.
 ///
-/// Streaming note: `stream_chat` on this borrowed variant is
-/// intentionally **not** provided. `stream_chat` returns a
-/// `BoxStream<'static, …>` that must outlive the dispatcher; only
-/// `Arc<dyn ModelProvider>` can satisfy that lifetime. Callers that
-/// stream must hold the provider as an `Arc` and use
-/// [`ProviderDispatch`].
+/// `stream_chat` is supported because the inner provider's
+/// `stream_chat` already returns a `BoxStream<'static, …>`; the
+/// returned stream owns its span guards (not borrowed from `self`),
+/// so the dispatcher's lifetime does not bound the stream.
 pub struct ProviderDispatchRef<'a> {
     inner: &'a dyn ModelProvider,
 }
@@ -55,8 +53,7 @@ impl ProviderDispatch {
 
     /// Wrap a borrowed `&dyn ModelProvider`. Returns a
     /// [`ProviderDispatchRef`] for ergonomic chaining at call sites
-    /// that don't hold an `Arc`. See [`ProviderDispatchRef`] for the
-    /// streaming caveat.
+    /// that don't hold an `Arc`.
     #[must_use]
     pub fn from_ref(inner: &dyn ModelProvider) -> ProviderDispatchRef<'_> {
         ProviderDispatchRef { inner }
@@ -268,6 +265,36 @@ impl<'a> ProviderDispatchRef<'a> {
         }
         .instrument(span)
         .await
+    }
+
+    /// Wrap the inner provider's `stream_chat`. Same span-parenting
+    /// trick as [`ProviderDispatch::stream_chat`]; the returned
+    /// `BoxStream<'static, …>` is independent of `self`'s lifetime
+    /// because the inner provider's `stream_chat` already returns
+    /// `'static` (the spans are owned by the closure, not borrowed
+    /// from `self`).
+    pub fn stream_chat(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        let attribution = zeroclaw_log::attribution_span!(self.inner);
+        let _attribution_enter = attribution.enter();
+        let model_scope = zeroclaw_log::info_span!(
+            target: "zeroclaw_log_internal_scope",
+            "zeroclaw_scope",
+            model = %model,
+        );
+        let inner_stream = self.inner.stream_chat(request, model, temperature, options);
+        drop(_attribution_enter);
+        let mut inner_stream = inner_stream;
+        stream::poll_fn(move |cx| {
+            let _enter = model_scope.enter();
+            inner_stream.as_mut().poll_next(cx)
+        })
+        .boxed()
     }
 
     /// Wrap the inner provider's `simple_chat`. Dispatched through
