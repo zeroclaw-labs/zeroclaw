@@ -65,8 +65,11 @@ pub struct PrunedOrphans {
     pub orphan_tool_call_ids: Vec<String>,
 }
 
+pub const HISTORY_PRUNER_MARKER_PREFIX: &str = "[history-pruner: collapsed ";
+
 fn is_tool_exchange_summary(content: &str) -> bool {
-    content.starts_with("[Tool exchange:") && content.contains("results collapsed]")
+    content.starts_with(HISTORY_PRUNER_MARKER_PREFIX)
+        && content.contains("results dropped from context]")
 }
 
 fn assistant_tool_calls_have_immediate_results(
@@ -292,8 +295,9 @@ pub fn prune_history(messages: &mut Vec<ChatMessage>, config: &HistoryPrunerConf
                     tool_count += 1;
                 }
                 if tool_count > 0 && !any_tool_protected {
-                    let summary =
-                        format!("[Tool exchange: {tool_count} tool call(s) — results collapsed]");
+                    let summary = format!(
+                        "[history-pruner: collapsed {tool_count} tool call(s); results dropped from context]"
+                    );
                     messages[i] = ChatMessage {
                         role: "assistant".to_string(),
                         content: summary,
@@ -810,7 +814,7 @@ mod tests {
             msg("system", "sys"),
             msg(
                 "assistant",
-                "[Tool exchange: 1 tool call(s) — results collapsed]",
+                "[history-pruner: collapsed 1 tool call(s); results dropped from context]",
             ),
             msg(
                 "assistant",

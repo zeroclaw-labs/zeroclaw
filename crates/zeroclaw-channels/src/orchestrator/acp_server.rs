@@ -36,6 +36,7 @@ use zeroclaw_api::model_provider::ConversationMessage;
 use zeroclaw_config::schema::Config;
 use zeroclaw_infra::acp_session_store::AcpSessionStore;
 use zeroclaw_runtime::agent::agent::{Agent, TurnEvent};
+use zeroclaw_runtime::agent::history_pruner::HISTORY_PRUNER_MARKER_PREFIX;
 use zeroclaw_runtime::tools::CanvasStore;
 
 use crate::acp_channel::AcpChannel;
@@ -1367,6 +1368,8 @@ impl AcpServer {
                     })),
                 "ACP session/prompt turn cancelled"
             );
+            self.write_notification(&Self::turn_cancelled_notification(&session_id))
+                .await;
             return Ok(Self::cancelled_prompt_result(session_id, &accumulated_text));
         }
 
@@ -1482,6 +1485,29 @@ impl AcpServer {
             format!("{accumulated_text}\n\n{marker}")
         };
         Self::prompt_result(session_id, "cancelled", content)
+    }
+
+    fn turn_cancelled_notification(session_id: &str) -> JsonRpcNotification {
+        let marker = zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
+        JsonRpcNotification {
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: serde_json::json!({
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": format!("turn-cancelled-{session_id}"),
+                    "name": "turn-cancelled",
+                    "title": "turn-cancelled",
+                    "kind": "think",
+                    "status": "completed",
+                    "content": [{
+                        "type": "content",
+                        "content": { "type": "text", "text": marker }
+                    }]
+                }
+            }),
+        }
     }
 
     fn parse_prompt(params: &Value) -> std::result::Result<String, RpcError> {
@@ -1979,6 +2005,27 @@ fn history_notifications_for_message(
 ) -> Vec<JsonRpcNotification> {
     match msg {
         ConversationMessage::Chat(chat) => {
+            if chat.role == "assistant" && chat.content.starts_with(HISTORY_PRUNER_MARKER_PREFIX) {
+                return vec![JsonRpcNotification {
+                    jsonrpc: "2.0",
+                    method: "session/update",
+                    params: serde_json::json!({
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "tool_call",
+                            "toolCallId": format!("history-pruner-{session_id}"),
+                            "name": "history-pruner",
+                            "title": "history-pruner",
+                            "kind": "think",
+                            "status": "completed",
+                            "content": [{
+                                "type": "content",
+                                "content": { "type": "text", "text": &chat.content }
+                            }]
+                        }
+                    }),
+                }];
+            }
             let update_type = match chat.role.as_str() {
                 "user" => "user_message_chunk",
                 "assistant" => "agent_message_chunk",
@@ -3302,6 +3349,41 @@ mod tests {
             .expect_err("session/load for active session must fail");
 
         assert_eq!(err.code, INVALID_PARAMS);
+    }
+
+    #[test]
+    fn turn_cancelled_notification_is_styled_tool_call() {
+        let note = AcpServer::turn_cancelled_notification("sess-c");
+        let update = &note.params["update"];
+        assert_eq!(update["sessionUpdate"], "tool_call");
+        assert_eq!(update["name"], "turn-cancelled");
+        assert_eq!(update["status"], "completed");
+        assert!(
+            update["content"][0]["content"]["text"]
+                .as_str()
+                .is_some_and(|t| !t.is_empty())
+        );
+    }
+
+    #[test]
+    fn history_pruner_marker_replays_as_tool_call_not_agent_message() {
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+        let marker =
+            format!("{HISTORY_PRUNER_MARKER_PREFIX}3 tool call(s); results dropped from context]");
+        let msg = ConversationMessage::Chat(ChatMessage::assistant(&marker));
+        let notes = history_notifications_for_message("sess-x", &msg);
+        assert_eq!(notes.len(), 1);
+        let update = &notes[0].params["update"];
+        assert_eq!(update["sessionUpdate"], "tool_call");
+        assert_eq!(update["name"], "history-pruner");
+        assert_eq!(update["content"][0]["content"]["text"], marker);
+
+        let plain = ConversationMessage::Chat(ChatMessage::assistant("normal reply"));
+        let plain_notes = history_notifications_for_message("sess-x", &plain);
+        assert_eq!(
+            plain_notes[0].params["update"]["sessionUpdate"],
+            "agent_message_chunk"
+        );
     }
 
     #[tokio::test]
