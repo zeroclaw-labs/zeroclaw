@@ -269,10 +269,14 @@ jobs:
 
             # No stable/ tree: Stable is a pointer to a real version dir, never a
             # duplicate copy. The committed pointer (docs/book/stable-version.txt)
-            # is published to the gh-pages root as stable-version.txt; gen-versions
-            # and gen-root-index read it. A master deploy refreshes it from the
-            # build; tag deploys leave whatever the last pointer-bearing build set.
-            if [ -f "${GITHUB_WORKSPACE}/docs/book/stable-version.txt" ]; then
+            # is published to the gh-pages root as stable-version.txt; gen-versions,
+            # gen-root-index, and prune-versions read it. The pointer is GLOBAL
+            # state for the whole site, so only master writes it. An old release
+            # tag carries whatever pointer was committed at that tag and must not
+            # regress the live pointer (same hazard as _shared below). master is
+            # the single writer; tag deploys leave the existing gh-pages pointer
+            # untouched so the version it names keeps resolving and survives prune.
+            if [ "$TAG" = "master" ] && [ -f "${GITHUB_WORKSPACE}/docs/book/stable-version.txt" ]; then
               cp "${GITHUB_WORKSPACE}/docs/book/stable-version.txt" stable-version.txt
             fi
 
@@ -310,11 +314,16 @@ jobs:
             # Guard: if a pointer is set but its version dir is absent, the root
             # would silently redirect to /master/. Fail loudly instead. (Absent
             # only when the release tag's deploy never landed its dir on gh-pages.)
+            # Use exit, not return: this function is invoked bare and inside the
+            # retry `until` loop body, and bash suppresses errexit for commands in
+            # a tested context, so a `return 1` could be swallowed and the broken
+            # tree pushed anyway. A missing pointer target is fatal and must abort
+            # the whole step regardless of call context, retry would not help.
             if [ -s stable-version.txt ]; then
               WANT="$(tr -d '[:space:]' < stable-version.txt)"
               if [ -n "$WANT" ] && [ ! -d "$WANT" ]; then
                 echo "::error::stable pointer '${WANT}' has no version dir on gh-pages. Deploy ${WANT} (push its tag) before it can be Stable."
-                return 1
+                exit 1
               fi
             fi
           }
