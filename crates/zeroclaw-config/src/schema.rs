@@ -11536,45 +11536,49 @@ impl ChannelsConfig {
             || self.amqp.values().any(|c| c.enabled)
     }
 
-    /// One `(canonical_name, configured)` row per channel in the registry.
-    /// Single source for name-addressed channel lookups so no surface has to
-    /// hardcode a subset of the channel list.
-    pub fn channel_presence(&self) -> [(&'static str, bool); 34] {
+    /// One `(canonical_name, configured, deliverable)` row per channel in the
+    /// registry. Single source for name-addressed channel lookups so no surface
+    /// has to hardcode a subset of the channel list. `deliverable` is `false`
+    /// for input-only transports whose `Channel::send` is a no-op (mqtt and
+    /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
+    /// outbound surface such as `heartbeat.target` can refuse them at validation
+    /// instead of accepting a target the delivery layer silently drops.
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 34] {
         [
-            ("telegram", !self.telegram.is_empty()),
-            ("discord", !self.discord.is_empty()),
-            ("slack", !self.slack.is_empty()),
-            ("mattermost", !self.mattermost.is_empty()),
-            ("webhook", !self.webhook.is_empty()),
-            ("imessage", !self.imessage.is_empty()),
-            ("matrix", !self.matrix.is_empty()),
-            ("signal", !self.signal.is_empty()),
-            ("whatsapp", !self.whatsapp.is_empty()),
-            ("linq", !self.linq.is_empty()),
-            ("wati", !self.wati.is_empty()),
-            ("nextcloud_talk", !self.nextcloud_talk.is_empty()),
-            ("email", !self.email.is_empty()),
-            ("gmail_push", !self.gmail_push.is_empty()),
-            ("irc", !self.irc.is_empty()),
-            ("twitch", !self.twitch.is_empty()),
-            ("lark", !self.lark.is_empty()),
-            ("line", !self.line.is_empty()),
-            ("dingtalk", !self.dingtalk.is_empty()),
-            ("wecom", !self.wecom.is_empty()),
-            ("wecom_ws", !self.wecom_ws.is_empty()),
-            ("wechat", !self.wechat.is_empty()),
-            ("qq", !self.qq.is_empty()),
-            ("twitter", !self.twitter.is_empty()),
-            ("mochat", !self.mochat.is_empty()),
-            ("nostr", !self.nostr.is_empty()),
-            ("clawdtalk", !self.clawdtalk.is_empty()),
-            ("reddit", !self.reddit.is_empty()),
-            ("bluesky", !self.bluesky.is_empty()),
-            ("voice_call", !self.voice_call.is_empty()),
-            ("voice_wake", !self.voice_wake.is_empty()),
-            ("voice_duplex", !self.voice_duplex.is_empty()),
-            ("mqtt", !self.mqtt.is_empty()),
-            ("amqp", !self.amqp.is_empty()),
+            ("telegram", !self.telegram.is_empty(), true),
+            ("discord", !self.discord.is_empty(), true),
+            ("slack", !self.slack.is_empty(), true),
+            ("mattermost", !self.mattermost.is_empty(), true),
+            ("webhook", !self.webhook.is_empty(), true),
+            ("imessage", !self.imessage.is_empty(), true),
+            ("matrix", !self.matrix.is_empty(), true),
+            ("signal", !self.signal.is_empty(), true),
+            ("whatsapp", !self.whatsapp.is_empty(), true),
+            ("linq", !self.linq.is_empty(), true),
+            ("wati", !self.wati.is_empty(), true),
+            ("nextcloud_talk", !self.nextcloud_talk.is_empty(), true),
+            ("email", !self.email.is_empty(), true),
+            ("gmail_push", !self.gmail_push.is_empty(), true),
+            ("irc", !self.irc.is_empty(), true),
+            ("twitch", !self.twitch.is_empty(), true),
+            ("lark", !self.lark.is_empty(), true),
+            ("line", !self.line.is_empty(), true),
+            ("dingtalk", !self.dingtalk.is_empty(), true),
+            ("wecom", !self.wecom.is_empty(), true),
+            ("wecom_ws", !self.wecom_ws.is_empty(), true),
+            ("wechat", !self.wechat.is_empty(), true),
+            ("qq", !self.qq.is_empty(), true),
+            ("twitter", !self.twitter.is_empty(), true),
+            ("mochat", !self.mochat.is_empty(), true),
+            ("nostr", !self.nostr.is_empty(), true),
+            ("clawdtalk", !self.clawdtalk.is_empty(), true),
+            ("reddit", !self.reddit.is_empty(), true),
+            ("bluesky", !self.bluesky.is_empty(), true),
+            ("voice_call", !self.voice_call.is_empty(), true),
+            ("voice_wake", !self.voice_wake.is_empty(), false),
+            ("voice_duplex", !self.voice_duplex.is_empty(), true),
+            ("mqtt", !self.mqtt.is_empty(), false),
+            ("amqp", !self.amqp.is_empty(), false),
         ]
     }
 
@@ -11585,7 +11589,7 @@ impl ChannelsConfig {
         let needle = name.to_ascii_lowercase();
         self.channel_presence()
             .iter()
-            .any(|(canonical, configured)| *configured && *canonical == needle)
+            .any(|(canonical, configured, _)| *configured && *canonical == needle)
     }
 
     /// Whether `name` (case-insensitive) names a channel in the registry,
@@ -11594,7 +11598,18 @@ impl ChannelsConfig {
         let needle = name.to_ascii_lowercase();
         self.channel_presence()
             .iter()
-            .any(|(canonical, _)| *canonical == needle)
+            .any(|(canonical, _, _)| *canonical == needle)
+    }
+
+    /// Whether `name` (case-insensitive) names a channel that can actually
+    /// deliver an outbound message. Input-only transports (mqtt, amqp,
+    /// voice_wake) are known and may be configured, but their `Channel::send`
+    /// is a no-op, so they are not valid outbound targets.
+    pub fn is_channel_deliverable(&self, name: &str) -> bool {
+        let needle = name.to_ascii_lowercase();
+        self.channel_presence()
+            .iter()
+            .any(|(canonical, _, deliverable)| *deliverable && *canonical == needle)
     }
 }
 
