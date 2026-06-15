@@ -1488,7 +1488,7 @@ impl AcpServer {
     }
 
     fn turn_cancelled_notification(session_id: &str) -> JsonRpcNotification {
-        let marker = zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
+        let marker = zeroclaw_runtime::i18n::get_required_cli_string("turn-cancelled-client-rpc");
         JsonRpcNotification {
             jsonrpc: "2.0",
             method: "session/update",

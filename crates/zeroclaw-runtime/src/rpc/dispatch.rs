@@ -1557,13 +1557,19 @@ impl RpcDispatcher {
             }
             Ok(TurnOutcome::Cancelled { partial_text, .. }) => {
                 let cancel_message = match cancel_cause {
-                    Some(crate::rpc::session::CancelCause::ClientRpc) => {
-                        format!("turn cancelled by user in RPC_SESSION {}", req.session_id)
-                    }
                     Some(cause) => {
-                        format!("turn cancelled by daemon: {}", cause.as_str())
+                        format!(
+                            "turn cancelled via {} in RPC_SESSION {}",
+                            cause.as_str(),
+                            req.session_id
+                        )
                     }
-                    None => "turn cancelled by daemon: unattributed".to_string(),
+                    None => {
+                        format!(
+                            "turn cancelled (cause unattributed) in RPC_SESSION {}",
+                            req.session_id
+                        )
+                    }
                 };
                 ::zeroclaw_log::record!(
                     INFO,

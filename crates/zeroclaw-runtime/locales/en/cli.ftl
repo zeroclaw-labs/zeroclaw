@@ -645,6 +645,10 @@ cli-channels-configure-hint = To configure:      zeroclaw config set channels.<n
 # Appended to (or persisted as) assistant output when a turn is cut short;
 # shown to end users across every transport (channels, WS, RPC, ACP, CLI).
 turn-interrupted-by-user = [interrupted by user]
+# Shown when a turn ends because the client RPC channel cancelled it. The actor
+# is not verified: human interrupt and programmatic client cancels both arrive
+# on this path, so the wording names the channel, not a user.
+turn-cancelled-client-rpc = [turn cancelled via client]
 turn-stream-interrupted = [stream interrupted]
 turn-tool-interrupted-before-result = [interrupted by user before this tool produced a result]
 # Safe reply delivered when the model repeatedly emits malformed internal
