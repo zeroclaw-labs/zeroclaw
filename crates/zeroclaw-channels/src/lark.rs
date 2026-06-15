@@ -662,6 +662,10 @@ pub struct LarkChannel {
     /// orchestrator from `[channels.lark.<alias>].draft_update_interval_ms`
     /// via [`Self::with_streaming`].
     draft_update_interval_ms: u64,
+    /// Whether to send ack reactions (👀, ✅, ⚠️) on incoming messages.
+    /// Defaults to `true`. Set from `[channels].ack_reactions` or the
+    /// per-channel override via [`Self::with_ack_reactions`].
+    ack_reactions: bool,
     /// Per-`message_id` timestamp of the last successful PATCH. Reads /
     /// writes are guarded by an async mutex so concurrent token streams
     /// cooperate on the same draft without racing the rate-limit window.
@@ -734,6 +738,7 @@ impl LarkChannel {
             reaction_ids: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: 1000,
+            ack_reactions: true,
             last_draft_edit: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             #[cfg(test)]
             api_base_override: None,
