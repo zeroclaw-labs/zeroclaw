@@ -384,6 +384,9 @@ struct ChannelDraft {
     alias: String,
     token: Option<String>,
     mode: SelectorMode,
+    /// Extra channel-specific fields collected from the field form
+    /// (e.g. `port` for webhook channels).
+    fields: std::collections::HashMap<String, String>,
 }
 
 /// Per-selector choice mode. Maps to `SelectorChoice<T>` at submit
@@ -574,7 +577,7 @@ impl FormState {
                         channel_type: c.channel_type.clone(),
                         alias: c.alias.clone(),
                         token: c.token.clone(),
-                        fields: std::collections::HashMap::new(),
+                        fields: c.fields.clone(),
                     }),
                     SelectorMode::Existing => {
                         SelectorChoice::Existing(format!("{}.{}", c.channel_type, c.alias))
@@ -1793,6 +1796,7 @@ impl QuickstartPane {
                 alias: alias.to_string(),
                 token: None,
                 mode: SelectorMode::Existing,
+                fields: std::collections::HashMap::new(),
             });
         }
     }
@@ -2047,11 +2051,25 @@ impl QuickstartPane {
                         Some(v)
                     }
                 };
+                let mut channel_fields = std::collections::HashMap::new();
+                for row in &f.fields {
+                    if row.descriptor.key == "bot-token"
+                        || row.descriptor.key == "token"
+                        || row.descriptor.key == "access-token"
+                    {
+                        continue;
+                    }
+                    let value = row.buf.trim();
+                    if !value.is_empty() && value != UNSET_DISPLAY {
+                        channel_fields.insert(row.descriptor.key.clone(), value.to_string());
+                    }
+                }
                 self.form.channels.push(ChannelDraft {
                     channel_type: f.type_key.clone(),
                     alias: f.alias.clone(),
                     token,
                     mode: SelectorMode::Fresh,
+                    fields: channel_fields,
                 });
             }
             _ => {}
@@ -3058,6 +3076,7 @@ mod tests {
             alias: "chat".into(),
             token: None,
             mode: SelectorMode::Fresh,
+            fields: std::collections::HashMap::new(),
         });
         f.peer_groups.push(crate::wire::QuickstartPeerGroup {
             name: "crew".into(),
