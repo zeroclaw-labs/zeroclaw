@@ -57,15 +57,22 @@ bash scripts/release/bump-version.sh X.Y.Z
 
 </div>
 
-This updates README badges, the Tauri config, and
-workflow description examples. Commit everything together:
+This updates README badges, the Tauri config, and workflow description
+examples, then regenerates every spec-driven install surface via
+`cargo generate installers`: setup.bat, `dist/aur/PKGBUILD`,
+`dist/scoop/zeroclaw.json`, `flake.nix`, the Dockerfile/Containerfile feature
+sets, and `dev/ci/docker-tags.toml`. Those surfaces derive their version and
+feature lists from the canonical install spec (`Cargo.toml` plus
+`[package.metadata.zeroclaw]`), so the bump keeps them in step automatically;
+never hand-edit a generated region. Commit everything together:
 
 ```text
 chore: bump version to vX.Y.Z
 ```
 
 Open a PR. Label it `chore`, `size: XS`. Get one maintainer review. Merge when
-CI is green.
+CI is green. The **Installer Drift** gate in CI fails the PR if a generated
+surface is out of sync with the spec, so a missed regeneration cannot land.
 
 **Confirm the merge landed correctly:**
 

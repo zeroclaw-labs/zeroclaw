@@ -77,7 +77,7 @@ jobs:
             printf 'Review `deny.toml` for the current ignore list. If this advisory is a known\n'
             printf 'acceptable risk, add an entry with a `reason` field. If it requires a\n'
             printf 'dependency update, open a tracking issue and link it here.\n\n'
-            printf 'cc @JordanTheJet @theonlyhennygod\n'
+            printf 'cc @JordanTheJet @Audacity88 @singlerider\n'
           } > /tmp/issue-body.md
 
           issue_url=$(gh issue create \

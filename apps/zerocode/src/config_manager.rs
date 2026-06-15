@@ -274,6 +274,15 @@ pub(crate) struct App {
     last_section_pane_area: Rect,
     last_section_list_area: Rect,
     last_list_offset: usize,
+    /// Draw-time map of section-pane display rows to `sections` indices.
+    /// `None` rows are group headers; mouse clicks resolve through this
+    /// so headers are dead zones instead of off-by-N selections.
+    last_section_rows: Vec<Option<usize>>,
+    /// Scroll offset of the section-pane list at last draw. Dedicated to
+    /// the sections pane (not the shared `last_list_offset`, which the
+    /// right-pane draws overwrite) so a click on a scrolled section list
+    /// maps to the right row in any screen.
+    last_section_list_offset: usize,
     last_tab_area: Option<Rect>,
     double_click: crate::mouse::DoubleClickTracker,
 }
@@ -327,6 +336,8 @@ impl App {
             last_section_pane_area: Rect::default(),
             last_section_list_area: Rect::default(),
             last_list_offset: 0,
+            last_section_rows: Vec::new(),
+            last_section_list_offset: 0,
             last_tab_area: None,
             double_click: crate::mouse::DoubleClickTracker::new(),
         }
@@ -335,6 +346,12 @@ impl App {
     /// Load initial data from the daemon. Call once before draw/handle_key.
     pub(crate) async fn init(&mut self) -> Result<()> {
         self.sections = self.rpc.config_sections().await?;
+        // Group the section list for display: stable sort by group rank
+        // keeps the canonical (dependency-correct) order within each
+        // group. Daemons that predate group plumbing send "" for every
+        // entry — all ranks tie, the sort is a no-op, and the pane
+        // renders the flat list exactly as before.
+        self.sections.sort_by_key(|s| Self::group_rank(&s.group));
         self.templates = self.rpc.config_templates().await?;
         // Eagerly load the first section so the right pane previews content on
         // first paint, matching the zerocode Config tab.
@@ -649,17 +666,16 @@ impl App {
                 }
 
                 // Section pane click: select the clicked section, return focus to
-                // the left pane, and preview that section on the right.
+                // the left pane, and preview that section on the right. Display
+                // rows resolve through the draw-time `last_section_rows` map so
+                // group headers are dead zones rather than off-by-N selections.
                 if mouse::in_rect(mouse.column, mouse.row, self.last_section_pane_area) {
-                    let labels: Vec<String> =
-                        self.sections.iter().map(|s| s.label.clone()).collect();
-                    let visible = self.filtered_indices(&labels);
                     if let Some(pos) = mouse::list_click_index(
                         mouse.row,
                         self.last_section_list_area,
-                        0,
-                        visible.len(),
-                    ) && let Some(&orig) = visible.get(pos)
+                        self.last_section_list_offset,
+                        self.last_section_rows.len(),
+                    ) && let Some(&Some(orig)) = self.last_section_rows.get(pos)
                     {
                         self.section_cursor = orig;
                     }
@@ -2299,50 +2315,23 @@ impl App {
             }
         }
 
-        // `risk_profile` / `runtime_profile` inside an agent alias →
-        // present a picker populated from the matching map's aliases.
-        // agents.<alias>.risk_profile     → list keys of risk_profiles.*
-        // agents.<alias>.runtime_profile  → list keys of runtime_profiles.*
-        if field_path.starts_with("agents.") {
-            let segs: Vec<&str> = field_path.split('.').collect();
-            // Expect agents.<alias>.<field>
-            if segs.len() == 3 {
-                let map_path = match segs[2] {
-                    "risk_profile" => Some("risk_profiles"),
-                    "runtime_profile" => Some("runtime_profiles"),
-                    _ => None,
-                };
-                if let Some(map_path) = map_path {
-                    self.status_msg = Some(format!("Loading {map_path}..."));
-                    let _ = self.draw(term);
-                    match self.rpc.config_list(Some(map_path)).await {
-                        Ok(entries) => {
-                            let prefix = format!("{map_path}.");
-                            let mut aliases: Vec<String> = entries
-                                .iter()
-                                .filter_map(|e| e.path.strip_prefix(&prefix))
-                                .filter_map(|rest| rest.split('.').next())
-                                .map(|s| s.to_string())
-                                .collect();
-                            aliases.sort();
-                            aliases.dedup();
-                            if !aliases.is_empty() {
-                                self.select_cursor = aliases
-                                    .iter()
-                                    .position(|v| v == &field_current)
-                                    .unwrap_or(0);
-                                self.select_items = aliases;
-                                self.status_msg = None;
-                            } else {
-                                self.status_msg =
-                                    Some(format!("No {map_path} defined — enter manually"));
-                            }
-                        }
-                        Err(_) => {
-                            self.status_msg =
-                                Some(format!("{map_path} fetch failed — enter manually"));
-                        }
-                    }
+        // Alias-reference fields resolve their picker list generically from
+        // the field's `alias_source` — no per-path special-casing.
+        if let Some(source) = self.fields[idx].alias_source {
+            self.status_msg = Some(crate::i18n::t("zc-config-status-loading-aliases"));
+            let _ = self.draw(term);
+            match self.rpc.config_resolve_alias_source(source).await {
+                Ok(values) if !values.is_empty() => {
+                    self.select_cursor =
+                        values.iter().position(|v| v == &field_current).unwrap_or(0);
+                    self.select_items = values;
+                    self.status_msg = None;
+                }
+                Ok(_) => {
+                    self.status_msg = Some(crate::i18n::t("zc-config-status-no-aliases"));
+                }
+                Err(_) => {
+                    self.status_msg = Some(crate::i18n::t("zc-config-status-alias-fetch-failed"));
                 }
             }
         }
@@ -2708,6 +2697,30 @@ impl App {
     /// Persistent left pane: the section list. `active` is true while the
     /// SectionList screen holds focus (bright highlight); once a section is
     /// entered the list dims to a "you are here" marker.
+    /// Display rank of a section-group label. Mirror of
+    /// `zeroclaw_config::sections::SECTION_GROUPS` — zerocode talks to
+    /// remote daemons over the wire, so like the dashboard's
+    /// `GROUP_ORDER` (web/src/pages/Config.tsx) it carries its own copy
+    /// of the order instead of linking the config crate. Unknown and
+    /// empty labels rank with "Other" so nothing ever vanishes.
+    fn group_rank(label: &str) -> usize {
+        const ORDER: &[&str] = &[
+            "Foundation",
+            "Agent",
+            "Multi-agent",
+            "Tools",
+            "Integrations",
+            "Network",
+            "Storage",
+            "Operations",
+            "Other",
+        ];
+        ORDER
+            .iter()
+            .position(|g| *g == label)
+            .unwrap_or(ORDER.len() - 1)
+    }
+
     fn draw_sections_pane(&mut self, frame: &mut Frame, area: Rect, active: bool) {
         use ratatui::layout::{Constraint, Direction, Layout};
         // Reserve one line at the top for the filter bar when filtering.
@@ -2731,24 +2744,48 @@ impl App {
         let labels: Vec<String> = self.sections.iter().map(|s| s.label.clone()).collect();
         let visible = self.filtered_indices(&labels);
 
-        let items: Vec<ListItem> = visible
-            .iter()
-            .map(|&i| {
-                let s = &self.sections[i];
-                let badge = if s.completed { " ✓" } else { "" };
-                ListItem::new(Line::from(Span::styled(
-                    format!("{}{badge}", s.label),
-                    theme::body_style(),
-                )))
-            })
-            .collect();
+        // Grouped display: dim header rows between groups, sections
+        // beneath. Active only when the daemon sent group labels and no
+        // filter narrows the list — filtering and old daemons render the
+        // flat all-sections list unchanged. `row_map` records what each
+        // display row is so the cursor and mouse hit-testing resolve
+        // through it instead of assuming row == section position.
+        let grouped = self.filter.is_none() && self.sections.iter().any(|s| !s.group.is_empty());
+        let mut row_map: Vec<Option<usize>> = Vec::with_capacity(visible.len());
+        let mut items: Vec<ListItem> = Vec::with_capacity(visible.len());
+        let mut last_group: Option<&str> = None;
+        for &i in &visible {
+            let s = &self.sections[i];
+            if grouped {
+                let group = if s.group.is_empty() {
+                    "Other"
+                } else {
+                    s.group.as_str()
+                };
+                if last_group != Some(group) {
+                    items.push(ListItem::new(Line::from(Span::styled(
+                        group.to_string(),
+                        theme::dim_style().add_modifier(Modifier::BOLD),
+                    ))));
+                    row_map.push(None);
+                    last_group = Some(group);
+                }
+            }
+            let badge = if s.completed { " ✓" } else { "" };
+            let indent = if grouped { " " } else { "" };
+            items.push(ListItem::new(Line::from(Span::styled(
+                format!("{indent}{}{badge}", s.label),
+                theme::body_style(),
+            ))));
+            row_map.push(Some(i));
+        }
 
         let cursor = if self.filter.is_some() {
             self.filter_cursor
         } else {
-            visible
+            row_map
                 .iter()
-                .position(|&i| i == self.section_cursor)
+                .position(|r| *r == Some(self.section_cursor))
                 .unwrap_or(0)
         };
 
@@ -2773,7 +2810,9 @@ impl App {
         );
         self.last_main_area = list_area;
         self.last_section_list_area = list_area;
+        self.last_section_rows = row_map;
         self.last_list_offset = state.offset();
+        self.last_section_list_offset = state.offset();
         self.last_tab_area = None;
     }
 
@@ -3411,7 +3450,7 @@ impl App {
 
             let title = match field.kind {
                 PropKind::Bool => format!(" {short_name} (toggle) "),
-                PropKind::Enum => format!(" {short_name} (select) "),
+                PropKind::Enum | PropKind::AliasRef => format!(" {short_name} (select) "),
                 _ => format!(" {short_name} "),
             };
 
