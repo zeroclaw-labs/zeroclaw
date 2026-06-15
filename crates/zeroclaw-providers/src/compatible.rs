@@ -4874,31 +4874,33 @@ mod tests {
     // ----------------------------------------------------------
 
     #[test]
-    fn reasoning_content_fallback_when_content_empty() {
-        // Reasoning models (Qwen3, GLM-4) return content: "" with reasoning_content populated
+    fn reasoning_content_does_not_leak_when_content_empty() {
+        // reasoning_content must NOT leak into effective_content —
+        // it is preserved separately in ChatResponse.reasoning_content
         let json = r#"{"choices":[{"message":{"content":"","reasoning_content":"Thinking output here"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
-        assert_eq!(msg.effective_content(), "Thinking output here");
+        assert_eq!(msg.effective_content(), "");
+        assert_eq!(msg.reasoning_content.as_deref(), Some("Thinking output here"));
     }
 
     #[test]
-    fn reasoning_content_fallback_when_content_null() {
-        // Some models may return content: null with reasoning_content
+    fn reasoning_content_does_not_leak_when_content_null() {
         let json =
             r#"{"choices":[{"message":{"content":null,"reasoning_content":"Fallback text"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
-        assert_eq!(msg.effective_content(), "Fallback text");
+        assert_eq!(msg.effective_content(), "");
+        assert_eq!(msg.reasoning_content.as_deref(), Some("Fallback text"));
     }
 
     #[test]
-    fn reasoning_content_fallback_when_content_missing() {
-        // content field absent entirely, reasoning_content present
+    fn reasoning_content_does_not_leak_when_content_missing() {
         let json = r#"{"choices":[{"message":{"reasoning_content":"Only reasoning"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
-        assert_eq!(msg.effective_content(), "Only reasoning");
+        assert_eq!(msg.effective_content(), "");
+        assert_eq!(msg.reasoning_content.as_deref(), Some("Only reasoning"));
     }
 
     #[test]
