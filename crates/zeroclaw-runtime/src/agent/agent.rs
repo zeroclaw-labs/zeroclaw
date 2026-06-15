@@ -5,6 +5,7 @@ use crate::approval::ApprovalManager;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::SecurityPolicy;
+use crate::sop::{SopAuditLogger, SopEngine};
 use crate::tools::{self, Tool};
 use anyhow::{Context, Result};
 use chrono::{Datelike, Timelike};
@@ -798,12 +799,17 @@ impl Agent {
     ) {
         let context = self
             .memory_strategy
-            .load_context(user_message, self.memory_session_id.as_deref())
+            .load_context(
+                &*self.observer,
+                user_message,
+                self.memory_session_id.as_deref(),
+            )
             .await
             .unwrap_or_default();
 
         if self.auto_save {
-            let _ = self
+            let store_start = std::time::Instant::now();
+            let store_result = self
                 .memory
                 .store(
                     "user_msg",
@@ -812,6 +818,12 @@ impl Agent {
                     self.memory_session_id.as_deref(),
                 )
                 .await;
+            self.observer.record_event(&ObserverEvent::MemoryStore {
+                category: MemoryCategory::Conversation.to_string(),
+                backend: self.memory.name().to_string(),
+                duration: store_start.elapsed(),
+                success: store_result.is_ok(),
+            });
         }
 
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
@@ -947,6 +959,8 @@ impl Agent {
             false,
             false,
             None,
+            None,
+            None,
         )
         .await
     }
@@ -957,12 +971,18 @@ impl Agent {
     /// When `exclude_memory` is `true`, the agent is constructed without
     /// persistent memory: `NoneMemory` backend, auto-save off, and all
     /// `memory_*` tools stripped. ACP sessions pass `true`.
+    ///
+    /// `sop_engine` and `sop_audit` are optional shared handles from the daemon.
+    /// When `Some`, the agent session uses the daemon's unified SOP engine.
+    /// When `None`, the agent builds its own engine from config (CLI/standalone).
     pub async fn from_config_with_session_cwd_and_mcp_backchannel(
         config: &Config,
         agent_alias: &str,
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
         exclude_memory: bool,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
     ) -> Result<Self> {
         Self::from_config_with_session_cwd_and_mcp_approval_mode(
             config,
@@ -972,6 +992,8 @@ impl Agent {
             true,
             exclude_memory,
             None,
+            sop_engine,
+            sop_audit,
         )
         .await
     }
@@ -987,6 +1009,8 @@ impl Agent {
         initialize_mcp: bool,
         exclude_memory: bool,
         tui_env: Option<std::collections::HashMap<String, String>>,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
     ) -> Result<Self> {
         Self::from_config_with_session_cwd_and_mcp_approval_mode(
             config,
@@ -996,6 +1020,8 @@ impl Agent {
             true,
             exclude_memory,
             tui_env,
+            sop_engine,
+            sop_audit,
         )
         .await
     }
@@ -1008,6 +1034,8 @@ impl Agent {
         approval_backchannel: bool,
         exclude_memory: bool,
         tui_env: Option<std::collections::HashMap<String, String>>,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
     ) -> Result<Self> {
         let agent_cfg = config
             .agent(agent_alias)
@@ -1100,6 +1128,22 @@ impl Agent {
             None
         };
 
+        // Build SOP engine when sops_dir is configured so SOP tools are
+        // available on this path (WebSocket/daemon sessions).
+        // If caller provided an engine (daemon path), use it; otherwise
+        // build our own (CLI/standalone path).
+        let (sop_engine, sop_audit) = match (sop_engine, sop_audit) {
+            (Some(engine), Some(audit)) => (Some(engine), Some(audit)),
+            (None, None) if config.sop.sops_dir.is_some() => {
+                let mem: Arc<dyn zeroclaw_memory::Memory> =
+                    zeroclaw_memory::create_memory_for_agent(config, agent_alias, None).await?;
+                let (engine, audit) =
+                    crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, mem);
+                (Some(engine), Some(audit))
+            }
+            _ => (None, None),
+        };
+
         let all_tools_result = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
@@ -1119,6 +1163,8 @@ impl Agent {
             None,
             false,
             tui_env,
+            sop_engine,
+            sop_audit,
         );
         let mut tools = all_tools_result.tools;
         let delegate_handle = all_tools_result.delegate_handle;
@@ -1772,12 +1818,17 @@ impl Agent {
 
         let context = self
             .memory_strategy
-            .load_context(user_message, self.memory_session_id.as_deref())
+            .load_context(
+                &*self.observer,
+                user_message,
+                self.memory_session_id.as_deref(),
+            )
             .await
             .unwrap_or_default();
 
         if self.auto_save {
-            let _ = self
+            let store_start = std::time::Instant::now();
+            let store_result = self
                 .memory
                 .store(
                     "user_msg",
@@ -1786,6 +1837,12 @@ impl Agent {
                     self.memory_session_id.as_deref(),
                 )
                 .await;
+            self.observer.record_event(&ObserverEvent::MemoryStore {
+                category: MemoryCategory::Conversation.to_string(),
+                backend: self.memory.name().to_string(),
+                duration: store_start.elapsed(),
+                success: store_result.is_ok(),
+            });
         }
 
         let now = chrono::Local::now();

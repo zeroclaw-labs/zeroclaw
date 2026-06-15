@@ -4556,13 +4556,13 @@ fn labelled_clipboard_text(entry: &ChatEntry) -> String {
     }
 }
 
-/// Suspend the TUI, open `$EDITOR` with `content`, return the edited text.
+/// Suspend the TUI, open `$VISUAL` / `$EDITOR` with `content`, return the edited text.
 /// Restores raw mode and alternate screen before returning.
-/// Falls back to `content` unchanged if `$EDITOR` is unset or the process fails.
+/// Falls back to `content` unchanged if no editor is available or the process fails.
 pub async fn open_editor_for_content(content: &str) -> String {
-    let editor = std::env::var("EDITOR")
-        .or_else(|_| std::env::var("VISUAL"))
-        .unwrap_or_else(|_| "vi".to_string());
+    let Some(editor) = crate::editor::editor_from_env_or_path() else {
+        return content.to_string();
+    };
 
     let tmp = match tempfile::NamedTempFile::new() {
         Ok(f) => f,

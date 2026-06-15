@@ -197,8 +197,18 @@ export async function getPublicHealth(): Promise<{
 // Status / Health
 // ---------------------------------------------------------------------------
 
-export function getStatus(): Promise<StatusResponse> {
-  return apiFetch<StatusResponse>("/api/status");
+/**
+ * System status overview. Pass an `agent` alias to get the model, provider,
+ * temperature, and memory backend resolved for that specific agent — the
+ * gateway runs the same `resolved_model_provider_for_agent` logic it uses to
+ * build the Agent, so the returned `model` reflects that agent's configured
+ * provider entry. Omitting the alias returns the install-wide first-of-each
+ * summary (the gateway default model), which is NOT correct for any
+ * non-default agent.
+ */
+export function getStatus(agent?: string): Promise<StatusResponse> {
+  const qs = agent ? `?agent=${encodeURIComponent(agent)}` : "";
+  return apiFetch<StatusResponse>(`/api/status${qs}`);
 }
 
 export function getHealth(): Promise<HealthSnapshot> {

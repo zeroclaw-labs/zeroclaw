@@ -276,6 +276,9 @@ pub async fn run(
     let socket_client_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let need_rpc_ctx = registry.has_socket_start() || registry.has_wss_start();
 
+    // Extract shared SOP engine from registry for RpcContext.
+    let (sop_engine, sop_audit) = registry.take_sop_engine();
+
     let rpc_ctx = if need_rpc_ctx {
         use crate::rpc::context::RpcContext;
         use crate::rpc::session::SessionStore;
@@ -382,6 +385,8 @@ pub async fn run(
             ),
             tui_registry,
             acp_session_store,
+            sop_engine,
+            sop_audit,
         }))
     } else {
         None
@@ -1502,7 +1507,9 @@ mod tests {
                 draft_update_interval_ms: 0,
                 multi_message_delay_ms: 0,
                 stall_timeout_secs: 0,
+                slash_commands: false,
                 intents_mask: None,
+                reaction_notifications: zeroclaw_config::schema::DiscordReactionScope::Off,
                 interrupt_on_new_message: false,
                 archive: false,
                 approval_timeout_secs: 0,
@@ -1525,7 +1532,9 @@ mod tests {
                 draft_update_interval_ms: 0,
                 multi_message_delay_ms: 0,
                 stall_timeout_secs: 0,
+                slash_commands: false,
                 intents_mask: None,
+                reaction_notifications: zeroclaw_config::schema::DiscordReactionScope::Off,
                 interrupt_on_new_message: false,
                 archive: false,
                 approval_timeout_secs: 0,
