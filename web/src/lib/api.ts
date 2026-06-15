@@ -269,6 +269,8 @@ export interface ListResponseEntry {
   is_secret: boolean;
   /** Variants for `kind === 'enum'` fields (drives <select> options). */
   enum_variants?: string[];
+  /** Alias namespace for `kind === 'alias-ref'` fields (drives the resolved picker). */
+  alias_source?: string;
   section?: string;
   /** Tab grouping from `ConfigTab` enum. Absent when `ConfigTab::None`. */
   tab?: string;
@@ -1102,6 +1104,19 @@ export interface AgentOptionsResponse {
 
 export function getAgentOptions(): Promise<AgentOptionsResponse> {
   return apiFetch<AgentOptionsResponse>("/api/config/agent-options");
+}
+
+export interface ResolveAliasSourceResponse {
+  source: string;
+  values: string[];
+}
+
+export function resolveAliasSource(
+  source: string,
+): Promise<ResolveAliasSourceResponse> {
+  return apiFetch<ResolveAliasSourceResponse>(
+    `/api/config/resolve-alias-source?source=${encodeURIComponent(source)}`,
+  );
 }
 
 export interface PickerItem {

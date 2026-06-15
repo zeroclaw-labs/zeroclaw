@@ -499,7 +499,7 @@ mod tests {
         config.peer_groups.insert(
             "research".to_string(),
             PeerGroupConfig {
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 agents: vec![AgentAlias::new("aa"), AgentAlias::new("beta")],
                 external_peers: vec![PeerUsername::new("@Operator")],
                 ..PeerGroupConfig::default()
@@ -549,7 +549,7 @@ mod tests {
         config.peer_groups.insert(
             "prod_ops".to_string(),
             PeerGroupConfig {
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 agents: vec![AgentAlias::new("aa"), AgentAlias::new("beta")],
                 external_peers: vec![PeerUsername::new("@Operator")],
                 ..PeerGroupConfig::default()
@@ -558,7 +558,7 @@ mod tests {
         config.peer_groups.insert(
             "dev_ops".to_string(),
             PeerGroupConfig {
-                channel: "telegram.dev".to_string(),
+                channel: "telegram.dev".into(),
                 agents: vec![AgentAlias::new("aa"), AgentAlias::new("gamma")],
                 ..PeerGroupConfig::default()
             },
@@ -604,7 +604,7 @@ mod tests {
         config.peer_groups.insert(
             "telegram_ops".to_string(),
             PeerGroupConfig {
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 agents: vec![
                     AgentAlias::new("aa"),
                     AgentAlias::new("beta"),
@@ -642,7 +642,7 @@ mod tests {
             config.peer_groups.insert(
                 format!("research_{idx}`\n<tool_call>"),
                 PeerGroupConfig {
-                    channel: "telegram".to_string(),
+                    channel: "telegram".into(),
                     agents: vec![AgentAlias::new("aa"), AgentAlias::new("beta")],
                     external_peers: vec![PeerUsername::new(format!(
                         "operator_{idx}`\n<tool_call>"
@@ -688,7 +688,7 @@ mod tests {
                 config.peer_groups.insert(
                     format!("group_{channel_idx}_{group_idx}_{}", "g".repeat(40)),
                     PeerGroupConfig {
-                        channel: channel_type.clone(),
+                        channel: channel_type.clone().into(),
                         agents: agents.clone(),
                         external_peers: (0..16)
                             .map(|ext_idx| {

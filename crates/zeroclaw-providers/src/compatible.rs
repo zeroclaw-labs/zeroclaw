@@ -12,7 +12,7 @@ use crate::traits::{
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use reqwest::{
-    Client,
+    Client, ClientBuilder,
     header::{HeaderMap, HeaderValue, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
@@ -71,6 +71,11 @@ pub struct OpenAiCompatibleModelProvider {
     /// providers so missing credentials still fall through to catalog sources.
     /// When `true`, the `/models` endpoint is treated as publicly accessible.
     public_model_listing: bool,
+    /// Raw PEM bytes of a custom CA certificate for TLS connections.
+    /// Loaded from disk once at construction; not refreshed across config reloads.
+    tls_ca_cert_pem: Option<Vec<u8>>,
+    /// Extra JSON fields merged into every API request body.
+    extra_body: Option<serde_json::Value>,
 }
 
 /// How the model_provider expects the API key to be sent.
@@ -322,8 +327,18 @@ impl OpenAiCompatibleModelProvider {
             openrouter_vendor_prefix: None,
             local_model_tool_sanitize: false,
             public_model_listing: false,
+            tls_ca_cert_pem: None,
+            extra_body: None,
         }
     }
+    /// Inject extra JSON fields into every API request body.
+    /// Merged at the top level — use for provider-specific features like
+    /// `thinking: "off"` (Qwen3.5 on hipfire) or routing transforms.
+    pub fn with_extra_body(mut self, extra: serde_json::Value) -> Self {
+        self.extra_body = Some(extra);
+        self
+    }
+
     /// Opt this provider into per-model conservative tool-schema sanitization.
     /// Today the only trigger is the gemma-4 family on llama.cpp, where the
     /// upstream tool-call parser rejects empty-properties / non-string
@@ -338,6 +353,41 @@ impl OpenAiCompatibleModelProvider {
     pub fn with_public_model_listing(mut self) -> Self {
         self.public_model_listing = true;
         self
+    }
+
+    /// Set a custom CA certificate path for TLS connections.
+    /// Reads and stores the PEM bytes immediately so later HTTP clients
+    /// incur no per-request disk I/O.
+    pub fn with_tls_ca_cert_path(mut self, path: &str) -> Self {
+        match std::fs::read(path) {
+            Ok(bytes) => self.tls_ca_cert_pem = Some(bytes),
+            Err(e) => ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"path": path, "error": format!("{}", e)})),
+                "Failed to read CA certificate file — TLS will use system roots"
+            ),
+        }
+        self
+    }
+
+    /// Add the configured custom CA certificate to a reqwest builder.
+    /// The PEM bytes were loaded at construction, so this performs no disk I/O.
+    fn add_tls_cert_to_builder(&self, builder: ClientBuilder) -> ClientBuilder {
+        if let Some(ref pem) = self.tls_ca_cert_pem {
+            match reqwest::Certificate::from_pem(pem) {
+                Ok(cert) => return builder.add_root_certificate(cert),
+                Err(e) => ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "Failed to parse CA certificate — TLS will use system roots"
+                ),
+            }
+        }
+        builder
     }
 
     /// Disable native tool calling, forcing prompt-guided tool use instead.
@@ -453,8 +503,9 @@ impl OpenAiCompatibleModelProvider {
         let timeout = self.timeout_secs;
         let has_user_agent = self.user_agent.is_some();
         let has_extra_headers = !self.extra_headers.is_empty();
+        let has_tls_cert = self.tls_ca_cert_pem.is_some();
 
-        if has_user_agent || has_extra_headers {
+        if has_user_agent || has_extra_headers || has_tls_cert {
             let mut headers = HeaderMap::new();
             if let Some(ua) = self.user_agent.as_deref()
                 && let Ok(value) = HeaderValue::from_str(ua)
@@ -488,6 +539,7 @@ impl OpenAiCompatibleModelProvider {
                 .timeout(std::time::Duration::from_secs(timeout))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .default_headers(headers);
+            let builder = self.add_tls_cert_to_builder(builder);
             let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
                 builder,
                 "model_provider.compatible",
@@ -501,7 +553,7 @@ impl OpenAiCompatibleModelProvider {
                         .with_attrs(
                             ::serde_json::json!({"error": super::format_error_chain(&error)})
                         ),
-                    "Failed to build proxied timeout client with custom headers: "
+                    "Failed to build proxied timeout client with custom headers or TLS certificate: "
                 );
                 Client::new()
             });
@@ -520,8 +572,9 @@ impl OpenAiCompatibleModelProvider {
     fn streaming_http_client(&self) -> Client {
         let has_user_agent = self.user_agent.is_some();
         let has_extra_headers = !self.extra_headers.is_empty();
+        let has_tls_cert = self.tls_ca_cert_pem.is_some();
 
-        if has_user_agent || has_extra_headers {
+        if has_user_agent || has_extra_headers || has_tls_cert {
             let mut headers = HeaderMap::new();
             if let Some(ua) = self.user_agent.as_deref()
                 && let Ok(value) = HeaderValue::from_str(ua)
@@ -554,6 +607,7 @@ impl OpenAiCompatibleModelProvider {
             let builder = Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .default_headers(headers);
+            let builder = self.add_tls_cert_to_builder(builder);
             let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
                 builder,
                 "provider.compatible",
@@ -566,7 +620,7 @@ impl OpenAiCompatibleModelProvider {
                         .with_attrs(
                             ::serde_json::json!({"error": super::format_error_chain(&error)})
                         ),
-                    "Failed to build proxied streaming client with custom headers: "
+                    "Failed to build proxied streaming client with custom headers or TLS certificate: "
                 );
                 Client::new()
             });
@@ -1001,6 +1055,9 @@ struct NativeChatRequest {
     tool_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    /// Extra fields merged at the top level of the serialized JSON body.
+    #[serde(flatten)]
+    extra_body: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1756,6 +1813,7 @@ impl OpenAiCompatibleModelProvider {
             tools,
             tool_choice,
             max_tokens: self.max_tokens,
+            extra_body: self.extra_body.clone(),
         }
     }
 
@@ -2761,6 +2819,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     tools: tools.clone(),
                     tool_choice: tools.as_ref().map(|_| "auto".to_string()),
                     max_tokens: provider.max_tokens,
+                    extra_body: provider.extra_body.clone(),
                 })
             } else {
                 let messages = effective_messages
@@ -3153,6 +3212,57 @@ mod tests {
         assert_eq!(p.base_url, "https://example.com");
     }
 
+    #[test]
+    fn with_tls_ca_cert_path_missing_file_leaves_pem_none() {
+        // Regression: a non-existent cert path must not panic or propagate an
+        // error — the provider falls back to system roots and logs a warning.
+        let p = make_model_provider("test", "https://example.com", None)
+            .with_tls_ca_cert_path("/nonexistent/path/to/ca.pem");
+        assert!(
+            p.tls_ca_cert_pem.is_none(),
+            "missing cert file must leave tls_ca_cert_pem as None (fall back to system roots)"
+        );
+    }
+
+    #[test]
+    fn with_tls_ca_cert_path_invalid_pem_stores_bytes_and_http_client_still_builds() {
+        // The path-read step stores raw bytes; PEM parsing happens in http_client().
+        // Writing invalid PEM to a temp file: read succeeds (bytes stored), then
+        // http_client() logs a WARN and falls back to system roots — no panic, no error.
+        let path = format!("/tmp/zeroclaw-test-invalid-pem-{}.pem", std::process::id());
+        std::fs::write(&path, b"not-a-valid-pem").unwrap();
+        let p =
+            make_model_provider("test", "https://example.com", None).with_tls_ca_cert_path(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            p.tls_ca_cert_pem.is_some(),
+            "readable file (even with bad PEM) must populate tls_ca_cert_pem bytes"
+        );
+        // http_client() must build cleanly even when PEM parse fails internally.
+        // The method returns Client directly (panics on builder error), so if we
+        // reach here without panic the fallback-to-system-roots path is working.
+        let _client = p.http_client();
+    }
+
+    #[test]
+    fn with_tls_ca_cert_path_invalid_pem_streaming_http_client_still_builds() {
+        // Streaming requests use a separate client builder, so the TLS override
+        // must degrade the same way there: warn, use system roots, and keep going.
+        let path = format!(
+            "/tmp/zeroclaw-test-invalid-pem-streaming-{}.pem",
+            std::process::id()
+        );
+        std::fs::write(&path, b"not-a-valid-pem").unwrap();
+        let p =
+            make_model_provider("test", "https://example.com", None).with_tls_ca_cert_path(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            p.tls_ca_cert_pem.is_some(),
+            "readable file (even with bad PEM) must populate tls_ca_cert_pem bytes"
+        );
+        let _client = p.streaming_http_client();
+    }
+
     #[tokio::test]
     async fn chat_without_key_attempts_request() {
         let p = make_model_provider("Local", "http://127.0.0.1:1", None);
@@ -3192,6 +3302,7 @@ mod tests {
             tools: Some(vec![serde_json::json!({"name": "echo"})]),
             tool_choice: Some("auto".to_string()),
             max_tokens: None,
+            extra_body: None,
         };
         let value: serde_json::Value = serde_json::to_value(&req).unwrap();
         assert_eq!(
@@ -3221,11 +3332,39 @@ mod tests {
             tools: None,
             tool_choice: None,
             max_tokens: None,
+            extra_body: None,
         };
         let value: serde_json::Value = serde_json::to_value(&req).unwrap();
         assert!(
             value.get("stream_options").is_none(),
             "non-streaming NativeChatRequest must not emit a stream_options key"
+        );
+    }
+
+    #[test]
+    fn extra_body_flattens_into_request_top_level() {
+        let req = NativeChatRequest {
+            model: "qwen".to_string(),
+            messages: vec![],
+            temperature: None,
+            stream: None,
+            stream_options: None,
+            reasoning_effort: None,
+            tool_stream: None,
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+            extra_body: Some(serde_json::json!({"thinking": "off"})),
+        };
+        let value: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value.get("thinking").and_then(serde_json::Value::as_str),
+            Some("off"),
+            "extra_body fields must serialize at the top level, not nested"
+        );
+        assert!(
+            value.get("extra_body").is_none(),
+            "extra_body key itself must not appear in serialized JSON"
         );
     }
 
@@ -3848,6 +3987,7 @@ mod tests {
             })]),
             tool_choice: Some("auto".to_string()),
             max_tokens: None,
+            extra_body: None,
         };
 
         let value = serde_json::to_value(&req).unwrap();
