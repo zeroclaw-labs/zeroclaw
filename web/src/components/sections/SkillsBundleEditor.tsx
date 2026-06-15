@@ -158,6 +158,20 @@ export default function SkillsBundleEditor({ bundle }: Props) {
     );
   };
 
+  const setTags = (tags: string[]) => {
+    setBuffer((prev) =>
+      prev
+        ? {
+            ...prev,
+            draft: {
+              ...prev.draft,
+              frontmatter: { ...prev.draft.frontmatter, tags },
+            },
+          }
+        : prev,
+    );
+  };
+
   return (
     <div className="flex flex-col gap-3">
       <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
@@ -280,6 +294,7 @@ export default function SkillsBundleEditor({ bundle }: Props) {
           <FrontmatterForm
             value={buffer.draft.frontmatter}
             onChange={setFrontmatterField}
+            onTagsChange={setTags}
           />
           <div
             className="rounded-xl border overflow-hidden"
@@ -361,9 +376,10 @@ export default function SkillsBundleEditor({ bundle }: Props) {
 interface FrontmatterFormProps {
   value: SkillFrontmatter;
   onChange: (field: keyof SkillFrontmatter, value: string) => void;
+  onTagsChange: (tags: string[]) => void;
 }
 
-function FrontmatterForm({ value, onChange }: FrontmatterFormProps) {
+function FrontmatterForm({ value, onChange, onTagsChange }: FrontmatterFormProps) {
   return (
     <div
       className="rounded-xl border p-4 grid gap-3 md:grid-cols-2"
@@ -405,6 +421,107 @@ function FrontmatterForm({ value, onChange }: FrontmatterFormProps) {
         onChange={(v) => onChange('category', v)}
         placeholder="coding, ops, …"
       />
+      <TagsField tags={value.tags ?? []} onTagsChange={onTagsChange} />
+    </div>
+  );
+}
+
+interface TagsFieldProps {
+  tags: string[];
+  onTagsChange: (tags: string[]) => void;
+}
+
+/**
+ * Tags editor + the slash-command opt-in. The `slash` tag is surfaced as a
+ * boolean toggle (it makes the skill a Discord slash command — see
+ * zeroclaw-labs/zeroclaw#7490); `open-skills` is loader-managed and shown
+ * read-only. Everything else is an editable badge. The full tag list (including
+ * `slash`/`open-skills`) is preserved on save.
+ */
+function TagsField({ tags, onTagsChange }: TagsFieldProps) {
+  const [tagInput, setTagInput] = useState('');
+  const slashOn = tags.includes('slash');
+  const isOpenSkills = tags.includes('open-skills');
+  const editableTags = tags.filter((t) => t !== 'slash' && t !== 'open-skills');
+
+  const setSlash = (on: boolean) =>
+    onTagsChange(on ? [...tags, 'slash'] : tags.filter((t) => t !== 'slash'));
+  const removeTag = (tag: string) => onTagsChange(tags.filter((t) => t !== tag));
+  const addTag = () => {
+    const next = tagInput.trim().toLowerCase();
+    setTagInput('');
+    if (!next || next === 'slash' || next === 'open-skills' || tags.includes(next)) return;
+    onTagsChange([...tags, next]);
+  };
+
+  return (
+    <div
+      className="md:col-span-2 flex flex-col gap-2 border-t pt-3"
+      style={{ borderColor: 'var(--pc-border)' }}
+    >
+      <label className="flex items-center gap-2 cursor-pointer select-none">
+        <input
+          type="checkbox"
+          checked={slashOn}
+          onChange={(e) => setSlash(e.target.checked)}
+        />
+        <span className="text-sm" style={{ color: 'var(--pc-text-secondary)' }}>
+          Slash command
+        </span>
+        <span className="text-xs" style={{ color: 'var(--pc-text-faint)' }}>
+          — expose this skill as a <code>/command</code> in Discord (adds the{' '}
+          <code>slash</code> tag)
+        </span>
+      </label>
+      <div className="flex flex-col gap-1">
+        <label className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
+          Tags
+        </label>
+        <div className="flex flex-wrap items-center gap-1.5">
+          {editableTags.map((tag) => (
+            <span
+              key={tag}
+              className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-md border"
+              style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-secondary)' }}
+            >
+              {tag}
+              <button
+                type="button"
+                onClick={() => removeTag(tag)}
+                aria-label={`Remove tag ${tag}`}
+                className="leading-none"
+                style={{ color: 'var(--pc-text-muted)' }}
+              >
+                ×
+              </button>
+            </span>
+          ))}
+          {isOpenSkills && (
+            <span
+              className="inline-flex items-center text-xs px-2 py-0.5 rounded-md border opacity-60"
+              title="Loader-managed: community-synced skill (open-skills)"
+              style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-faint)' }}
+            >
+              open-skills
+            </span>
+          )}
+          <input
+            type="text"
+            value={tagInput}
+            onChange={(e) => setTagInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                addTag();
+              }
+            }}
+            placeholder="add tag…"
+            aria-label="Add tag"
+            className="text-xs bg-transparent border rounded-md px-2 py-0.5 w-24"
+            style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text)' }}
+          />
+        </div>
+      </div>
     </div>
   );
 }
