@@ -11174,10 +11174,85 @@ Let me check the result."#;
             !super::eager_mcp_tool_allowed("slack__post", access_policy.as_ref()),
             "policy excluded_tools must block eager MCP registration"
         );
-        // github__search contains "__" → auto-admitted even though not in caller list
+        // `github__search` is in the caller list AND its `__` prefix triggers
+        // the risk-profile MCP auto-admit, so both independent gates pass it.
         assert!(
             super::eager_mcp_tool_allowed("github__search", access_policy.as_ref()),
-            "runtime-discovered MCP tools are auto-admitted (subject only to excluded_tools)"
+            "name auto-admitted by risk-profile MCP exception and listed by \
+             the caller must be registered eagerly"
+        );
+    }
+
+    /// PR #7547 review (Audacity88 / singlerider) — second-round blocking:
+    /// the MCP `<server>__<tool>` auto-admit exception must apply only to
+    /// the risk-profile gate. A caller-supplied per-run `allowed_tools`
+    /// list (cron job, narrowed delegate invocation, …) must still narrow
+    /// the visible set strictly, even when the risk-profile auto-admit
+    /// would otherwise pass an MCP name.
+    ///
+    /// Concrete scenario from the review: a cron job narrows
+    /// `allowed_tools = ["cron_add"]`. The risk profile is broader and
+    /// includes `cron_add` (so the cron tool itself survives both gates),
+    /// but the risk-profile MCP exception would happily admit
+    /// `filesystem__write_file` — the caller list does not include it,
+    /// so eager MCP registration must reject it.
+    #[test]
+    fn eager_mcp_policy_caller_per_run_list_does_not_leak_mcp_auto_admit() {
+        // Risk profile is permissive enough that the MCP auto-admit
+        // fires on its own gate (a non-empty list activates the `__`
+        // exception). It also covers `cron_add` so the per-run narrowing
+        // can pin that tool through both gates.
+        let policy = TestPolicy {
+            allowed_tools: Some(vec!["cron_add".into(), "fs__read_file".into()]),
+            ..TestPolicy::default()
+        };
+        // Caller-supplied per-run list narrows to a single non-MCP tool.
+        let caller = vec!["cron_add".to_string()];
+        let access_policy = super::mcp_tool_access_policy(&policy, Some(&caller));
+
+        assert!(
+            super::eager_mcp_tool_allowed("cron_add", access_policy.as_ref()),
+            "explicitly-narrowed tool must be admitted by both gates"
+        );
+        assert!(
+            !super::eager_mcp_tool_allowed("filesystem__write_file", access_policy.as_ref()),
+            "MCP wrapper outside the caller-supplied per-run list must be \
+             rejected — the per-run gate does not honor the risk-profile \
+             MCP auto-admit exception (PR #7547 review regression)"
+        );
+        assert!(
+            !super::eager_mcp_tool_allowed("fs__read_file", access_policy.as_ref()),
+            "even risk-profile-listed MCP names are rejected when the \
+             caller-supplied per-run list does not include them"
+        );
+    }
+
+    /// Same scenario as above, but proving the deferred (`tool_search`)
+    /// path also honors the per-run narrowing. `mcp_allowed_tool_count`
+    /// is what guards the `tool_search` registration: if it returns 0
+    /// the deferred-MCP `tool_search` tool is not even added to the
+    /// agent's tool list, so the LLM cannot ask for the MCP wrapper.
+    #[test]
+    fn deferred_mcp_caller_per_run_list_does_not_leak_mcp_auto_admit() {
+        let policy = TestPolicy {
+            allowed_tools: Some(vec!["cron_add".into(), "fs__read_file".into()]),
+            ..TestPolicy::default()
+        };
+        let caller = vec!["cron_add".to_string()];
+        let access_policy = super::mcp_tool_access_policy(&policy, Some(&caller));
+
+        // The two stubs are MCP-shaped wrappers that the risk-profile
+        // auto-admit would otherwise pass, but the caller-supplied
+        // per-run list does not include either of them.
+        assert_eq!(
+            super::mcp_allowed_tool_count(
+                ["filesystem__write_file", "github__search"],
+                access_policy.as_ref()
+            ),
+            0,
+            "deferred MCP `tool_search` must not be registered when the \
+             caller-supplied per-run list admits no MCP stub (PR #7547 \
+             review regression)"
         );
     }
 

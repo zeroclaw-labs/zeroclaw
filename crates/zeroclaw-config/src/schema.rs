@@ -10078,6 +10078,14 @@ pub struct RiskProfileConfig {
     /// explicit allow-list. Block individual MCP tools via `excluded_tools`.
     /// An explicit empty list (`allowed_tools = []`) still denies everything,
     /// including MCP tools.
+    ///
+    /// Scope of the exception: the `__` auto-admit applies only to this
+    /// risk-profile allow-list, **not** to caller-supplied per-run
+    /// `allowed_tools` (cron job `allowed_tools`, narrowed delegate
+    /// invocations, etc.). Per-run lists are still strict explicit-list
+    /// intersections, so a job that narrows `allowed_tools = ["cron_add"]`
+    /// will not see runtime-discovered MCP tools unless it names them.
+    /// See PR #7547 review for the rationale.
     pub allowed_tools: Vec<String>,
     /// Tools excluded from non-CLI channels under this profile.
     ///
