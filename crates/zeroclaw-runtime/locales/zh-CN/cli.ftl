@@ -354,6 +354,13 @@ onboard-openai-auth-codex = Codex 订阅
 onboard-openai-codex-followup =
     Codex 订阅身份验证使用您的 ChatGPT 账户。
     在启动代理之前，运行 `zeroclaw auth login --provider openai-codex` 进行身份验证。
+cli-web-dist-dir-reason-tilde = 以不会被展开的 `~` 开头
+cli-web-dist-dir-reason-dollar = 包含不会被展开的 `$`
+cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" — {$reason}；gateway.web_dist_dir 按原样读取，请自行展开该值（例如使用绝对路径）
+cli-self-test-web-dist-dir-name = web_dist_dir
+cli-self-test-web-dist-dir-pass-unset = 未设置（使用自动检测）
+cli-self-test-web-dist-dir-pass-literal = {$path}（字面路径）
+cli-self-test-web-dist-dir-fail-expansion = 警告：{$path} — {$reason}；gateway.web_dist_dir 按原样读取，请自行展开该值（例如使用绝对路径）
 cli-peripherals-none = 未配置外设。
 cli-peripherals-add-hint = 使用以下命令添加: zeroclaw peripheral add <board> <path>
 cli-peripherals-add-example = {"  "}示例: zeroclaw peripheral add nucleo-f401re <serial-path>
@@ -436,6 +443,13 @@ cli-press-enter = 按 Enter 退出...
 cli-quickstart-title = Quickstart — 端到端创建一个可用的 agent。
 cli-quickstart-cancelled = 已取消 quickstart。未写入配置。
 cli-quickstart-incomplete = {"  "}尚未填写所有选择器。
+cli-quickstart-create-agent = ── 创建 agent
+cli-quickstart-create-agent-locked = ── 创建 agent（已锁定 — 请先填写所有选择器）
+cli-quickstart-open-selector-prompt = 打开选择器（Enter），或选择创建。Esc 退出。
+cli-quickstart-use-existing = 使用已有项
+cli-quickstart-create-new = 新建
+cli-quickstart-model-provider-prompt = 模型提供方
+cli-quickstart-pick-configured-provider = 选择已配置的提供方
 cli-no-channels-compiled = {"  "}此二进制文件中未编译任何通道类型。
 cli-quickstart-complete = Quickstart 完成。已创建 agent `{$alias}`。
 cli-next-steps = 后续步骤：
@@ -541,4 +555,4 @@ cli-channels-cli-always = {"  "}✅ CLI（始终可用）
 cli-channels-notion = {"  "}{$status} Notion
 cli-channels-start-hint = 启动渠道：zeroclaw channel start
 cli-channels-doctor-hint = 检查健康状况：    zeroclaw channel doctor
-cli-channels-configure-hint = 配置方法：      zeroclaw onboard
+cli-channels-configure-hint = 配置方法：      zeroclaw config set channels.<name>.<field>=<value>

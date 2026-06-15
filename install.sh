@@ -276,17 +276,7 @@ install_prebuilt() {
   echo
 
   # Resolve platform-correct web data directory to match gateway auto-detect
-  case "$(uname -s)" in
-  Darwin)
-    web_data_dir="${HOME}/Library/Application Support/zeroclaw/web/dist"
-    ;;
-  MINGW* | CYGWIN* | MSYS*)
-    web_data_dir="${LOCALAPPDATA}/zeroclaw/web/dist"
-    ;;
-  *)
-    web_data_dir="${XDG_DATA_HOME:-${PREFIX}/.local/share}/zeroclaw/web/dist"
-    ;;
-  esac
+  web_data_dir=$(resolve_web_data_dir)
 
   if [ "$DRY_RUN" = true ]; then
     info "[dry-run] Would download $asset_url"
@@ -377,7 +367,7 @@ Options:
   --prefix PATH        Install everything under PATH (default: \$HOME)
                        Sets CARGO_HOME, RUSTUP_HOME, source checkout, config
   --dry-run            Show what would happen without building or installing
-  --skip-onboard       Skip the post-install onboarding prompt
+  --skip-quickstart       Skip the post-install quickstart prompt
   --uninstall          Remove ZeroClaw binary and optionally config/data
   -h, --help           Show this help
   -V, --version        Show version from Cargo.toml
@@ -388,8 +378,8 @@ Examples:
   $0 --source                                  # always build from source
   $0 --source --minimal                        # smallest possible binary
   $0 --source --features agent-runtime,channel-discord  # custom feature set
-  $0 --skip-onboard                            # install only, configure later
-  $0 --prefix /tmp/zc-test --skip-onboard      # isolated test install
+  $0 --skip-quickstart                            # install only, configure later
+  $0 --prefix /tmp/zc-test --skip-quickstart      # isolated test install
   $0 --dry-run --prebuilt                      # preview without installing
   $0 --uninstall                               # remove ZeroClaw
 
@@ -456,22 +446,22 @@ do_uninstall() {
   exit 0
 }
 
-# ── Onboarding-needed status check ───────────────────────────────
+# ── Quickstart-needed status check ───────────────────────────────
 #
-# Detect whether the operator already has a completed onboarding so the
-# 3-way "how would you like to onboard?" prompt can skip silently on a
-# re-install. We treat onboarding as complete when a config file exists at
-# the expected path AND it contains at least one `[providers.models.*]` or
-# `[providers.fallback]` line — i.e. some provider is configured. Empty or
-# default config files still trigger the prompt.
-onboarding_needed() {
+# Detect whether the operator already has a configured ZeroClaw so the
+# 3-way "how would you like to complete setup?" prompt can skip silently
+# on a re-install. We treat setup as complete when a config file exists
+# at the expected path AND it contains at least one `[providers.models.*]`
+# or `[providers.fallback]` line — i.e. some provider is configured.
+# Empty or default config files still trigger the prompt.
+quickstart_needed() {
   cfg="$PREFIX/.zeroclaw/config.toml"
-  [ -f "$cfg" ] || return 0 # no config → onboard
+  [ -f "$cfg" ] || return 0 # no config → run quickstart
   # Already-configured signal: any of these patterns means a provider was set.
   if grep -qE '^\[providers\.models\.|^fallback *=|^default_provider *=' "$cfg" 2>/dev/null; then
     return 1 # configured → skip
   fi
-  return 0 # config exists but empty → onboard
+  return 0 # config exists but empty → run quickstart
 }
 
 # ── Interactive feature picker ───────────────────────────────────
@@ -587,14 +577,49 @@ interactive_feature_picker() {
   PICKED_APPS=$(printf '%s' "$selected_apps" | tr ' ' ',')
 }
 
+# Resolve the platform data directory the gateway auto-detects for the
+# dashboard bundle. Single source of truth so the prebuilt and source
+# install paths cannot drift.
+resolve_web_data_dir() {
+  case "$(uname -s)" in
+  Darwin)
+    printf '%s' "${HOME}/Library/Application Support/zeroclaw/web/dist"
+    ;;
+  MINGW* | CYGWIN* | MSYS*)
+    printf '%s' "${LOCALAPPDATA}/zeroclaw/web/dist"
+    ;;
+  *)
+    printf '%s' "${XDG_DATA_HOME:-${PREFIX}/.local/share}/zeroclaw/web/dist"
+    ;;
+  esac
+}
+
+# Copy a built web/dist into the gateway data directory so a
+# systemd-launched daemon finds it regardless of CWD.
+install_web_dist() {
+  src_dist="$1"
+  if [ ! -f "$src_dist/index.html" ]; then
+    return 0
+  fi
+  web_data_dir=$(resolve_web_data_dir)
+  if [ "$DRY_RUN" = true ]; then
+    info "[dry-run] Would install web dashboard to $web_data_dir"
+    return 0
+  fi
+  mkdir -p "$web_data_dir"
+  cp -r "$src_dist/." "$web_data_dir/"
+  info "Web dashboard installed to $web_data_dir"
+}
+
 # ── Web dashboard build for source installs ──────────────────────
 #
 # When a source build includes the `gateway` feature, the dashboard
 # (`web/dist`) needs to be built so the gateway can serve it. If Node.js
 # is on PATH we run `cargo web build` from the source root so the
-# generated API client is refreshed before TypeScript compiles. Without
-# Node.js we warn — the gateway still starts but the dashboard route
-# returns 404 until `web/dist` is populated.
+# generated API client is refreshed before TypeScript compiles, then the
+# built bundle is copied into the gateway data directory. Without Node.js
+# we warn and tell the user to re-run the installer once Node.js is
+# present — never to run cargo by hand.
 build_web_dashboard() {
   src_dir="$1"
   if [ ! -d "$src_dir/web" ]; then
@@ -603,8 +628,8 @@ build_web_dashboard() {
   fi
   if ! command -v npm >/dev/null 2>&1; then
     warn "npm not found — skipping dashboard build. The gateway will run"
-    warn "  in API-only mode until you build the dashboard:"
-    warn "  cd $src_dir && cargo web build"
+    warn "  in API-only mode. Install Node.js (npm) and re-run ./install.sh"
+    warn "  --source to build and install the dashboard."
     return 0
   fi
   # Always rebuild — a stale dist from a prior revision serves outdated
@@ -616,6 +641,7 @@ build_web_dashboard() {
     return 0
   }
   info "Web dashboard built at $src_dir/web/dist"
+  install_web_dist "$src_dir/web/dist"
 }
 
 # ── Low-memory build heuristic ────────────────────────────────────
@@ -648,7 +674,7 @@ apply_low_mem_lto_default() {
 
 MINIMAL=false
 USER_FEATURES=""
-SKIP_ONBOARD=false
+SKIP_QUICKSTART=false
 LIST_FEATURES=false
 UNINSTALL=false
 DRY_RUN=false
@@ -707,7 +733,7 @@ while [ $# -gt 0 ]; do
     PREFIX=$(echo "$1" | sed 's|/*$||')
     ;;
   --dry-run) DRY_RUN=true ;;
-  --skip-onboard) SKIP_ONBOARD=true ;;
+  --skip-quickstart) SKIP_QUICKSTART=true ;;
   --prebuilt) INSTALL_MODE="prebuilt" ;;
   --source) INSTALL_MODE="source" ;;
   --uninstall) UNINSTALL=true ;;
@@ -815,7 +841,7 @@ fi
 # ── Locate source ─────────────────────────────────────────────────
 
 [ "${PREBUILT_OK:-false}" = true ] && {
-  # Jump past the source build to PATH + onboard
+  # Jump past the source build to PATH + quickstart
   SOURCE_SKIPPED=true
 }
 
@@ -1010,6 +1036,7 @@ See all available features:
   fi
   echo
 
+  # >>> generated:source-cargo-install by `cargo generate installers` - do not edit <<<
   if [ "$DRY_RUN" = true ]; then
     # shellcheck disable=SC2086
     info "[dry-run] Would run: cargo install --path . --locked --force $CARGO_FLAGS"
@@ -1017,6 +1044,7 @@ See all available features:
     # shellcheck disable=SC2086
     cargo install --path . --locked --force $CARGO_FLAGS
   fi
+  # >>> end generated:source-cargo-install <<<
 
   # ── Web dashboard (gateway feature only) ──────────────────────────
   # When the install includes the `gateway` feature, build `web/dist` so
@@ -1141,12 +1169,12 @@ if [ "$SHOW_PATH_HELP" = true ]; then
   echo
 fi
 
-# ── Onboard ───────────────────────────────────────────────────────
+# ── Quickstart prompt ─────────────────────────────────────────────
 
-if [ "$SKIP_ONBOARD" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; then
+if [ "$SKIP_QUICKSTART" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; then
   # Skip the prompt entirely when the operator already has a configured
   # ZeroClaw — re-installs should not re-prompt.
-  if ! onboarding_needed; then
+  if ! quickstart_needed; then
     info "Existing ZeroClaw config detected at $PREFIX/.zeroclaw/config.toml — skipping setup prompt."
     info "Run 'zeroclaw quickstart' to reconfigure."
   elif [ -t 0 ]; then
@@ -1160,8 +1188,8 @@ if [ "$SKIP_ONBOARD" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; then
     printf "  [2] Open gateway in browser (zeroclaw daemon + dashboard)\n"
     printf "  [3] Skip for now\n"
     printf "  Choice [1-3, default 1]: "
-    read -r onboard_choice
-    case "${onboard_choice:-1}" in
+    read -r quickstart_choice
+    case "${quickstart_choice:-1}" in
     1 | "")
       echo
       "$BIN" quickstart || warn "Quickstart exited with an error — run 'zeroclaw quickstart' manually"
@@ -1177,7 +1205,7 @@ if [ "$SKIP_ONBOARD" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; then
       info "Skipped setup. Run 'zeroclaw quickstart' (CLI) or 'zeroclaw daemon' (browser) when ready."
       ;;
     *)
-      warn "Unknown choice '$onboard_choice' — skipping. Run 'zeroclaw quickstart' to configure."
+      warn "Unknown choice '$quickstart_choice' — skipping. Run 'zeroclaw quickstart' to configure."
       ;;
     esac
   else

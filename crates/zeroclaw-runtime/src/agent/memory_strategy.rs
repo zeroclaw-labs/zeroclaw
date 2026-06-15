@@ -24,6 +24,22 @@ impl DefaultMemoryStrategy {
         memory_config: zeroclaw_config::schema::MemoryConfig,
         workspace_dir: impl Into<std::path::PathBuf>,
     ) -> Self {
+        // #6722: rerank_enabled is declared on the config schema but the
+        // retrieval-pipeline rerank stage was never landed (PR #4245 closed
+        // unmerged).  Emit a one-time warning so operators who set these
+        // fields know they currently have no effect.
+        if memory_config.rerank_enabled {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "rerank_enabled": true,
+                        "rerank_threshold": memory_config.rerank_threshold,
+                    })),
+                "memory.rerank_enabled is set but the rerank stage is not yet implemented; this setting currently has no effect"
+            );
+        }
         Self {
             memory,
             limit: 5,
@@ -42,6 +58,19 @@ impl DefaultMemoryStrategy {
         workspace_dir: impl Into<std::path::PathBuf>,
     ) -> Self {
         Self::new(memory, memory_config, workspace_dir)
+    }
+
+    /// Build a strategy using the effective per-agent recall limit resolved by
+    /// the caller while preserving the rest of the live memory configuration.
+    pub fn with_config_and_limit(
+        memory: Arc<dyn Memory>,
+        memory_config: zeroclaw_config::schema::MemoryConfig,
+        workspace_dir: impl Into<std::path::PathBuf>,
+        limit: usize,
+    ) -> Self {
+        let mut strategy = Self::new(memory, memory_config, workspace_dir);
+        strategy.limit = limit.max(1);
+        strategy
     }
 }
 

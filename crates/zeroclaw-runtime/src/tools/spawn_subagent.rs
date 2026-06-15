@@ -6,6 +6,8 @@
 //! tracing-span shape, and audit attribution stay uniform.
 
 use crate::agent::loop_::AgentRunOverrides;
+use crate::security::SecurityPolicy;
+use crate::security::policy::ToolOperation;
 use crate::subagent::{SubAgentOverrides, SubAgentSpawn};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -20,6 +22,19 @@ use zeroclaw_log::scope;
 pub struct SpawnSubagentTool {
     config: Arc<Config>,
     parent_alias: String,
+    /// The caller's live policy (the same `Arc` the agent loop and the
+    /// other acting tools share). Each launch attempt consumes one slot
+    /// from its action budget via `enforce_tool_operation(Act, ..)`,
+    /// mirroring `DelegateTool`, so the dedup exemption for re-entrant
+    /// agent tools cannot turn one model turn into unbounded child
+    /// agent starts.
+    ///
+    /// Also carries session-scoped policy fields — most importantly
+    /// `workspace_dir`, which IDE/ACP clients pin to the session cwd —
+    /// into the SubAgent context via `SubAgentSpawn::for_agent_with_policy`,
+    /// so child file/shell tools jail to the same boundary as the
+    /// parent rather than the per-agent install dir (issue #7263).
+    security: Arc<SecurityPolicy>,
     /// `true` when this tool is registered inside a run that is itself
     /// a SubAgent. Triggers a depth-1 cap refusal in `execute` before
     /// any spawn work happens. Set by the agent loop from
@@ -28,10 +43,19 @@ pub struct SpawnSubagentTool {
 }
 
 impl SpawnSubagentTool {
-    pub fn new(config: Arc<Config>, parent_alias: impl Into<String>) -> Self {
+    /// Canonical tool name. Referenced by `REENTRANT_AGENT_TOOLS` so a
+    /// rename cannot desync the two.
+    pub const NAME: &'static str = "spawn_subagent";
+
+    pub fn new(
+        config: Arc<Config>,
+        parent_alias: impl Into<String>,
+        security: Arc<SecurityPolicy>,
+    ) -> Self {
         Self {
             config,
             parent_alias: parent_alias.into(),
+            security,
             is_subagent_caller: false,
         }
     }
@@ -49,7 +73,7 @@ impl SpawnSubagentTool {
 #[async_trait]
 impl Tool for SpawnSubagentTool {
     fn name(&self) -> &str {
-        "spawn_subagent"
+        Self::NAME
     }
 
     fn description(&self) -> &str {
@@ -135,8 +159,32 @@ impl Tool for SpawnSubagentTool {
             }
         };
 
-        let subagent_ctx = match SubAgentSpawn::for_agent(&self.config, &self.parent_alias)
-            .and_then(|spawn| spawn.build(SubAgentOverrides::default()))
+        // Launch-side budget gate: every spawn attempt past validation
+        // consumes one slot from the caller's shared action budget,
+        // mirroring DelegateTool (which validates target + depth, then
+        // calls enforce_tool_operation before spawning). The re-entrant
+        // dedup exemption means identical calls are not collapsed
+        // per-turn, so without this gate a single model turn could
+        // request unbounded child launches; with it, fan-out is bounded
+        // by `max_actions_per_hour` at launch time, not merely by work
+        // performed downstream.
+        if let Err(error) = self
+            .security
+            .enforce_tool_operation(ToolOperation::Act, Self::NAME)
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(error),
+            });
+        }
+
+        let subagent_ctx = match SubAgentSpawn::for_agent_with_policy(
+            &self.config,
+            &self.parent_alias,
+            Arc::clone(&self.security),
+        )
+        .and_then(|spawn| spawn.build(SubAgentOverrides::default()))
         {
             Ok(ctx) => ctx,
             Err(e) => {
@@ -219,7 +267,7 @@ mod tests {
         config.agents.insert(
             alias.to_string(),
             AliasedAgentConfig {
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..AliasedAgentConfig::default()
             },
         );
@@ -228,7 +276,11 @@ mod tests {
 
     #[tokio::test]
     async fn empty_or_missing_prompt_is_rejected() {
-        let tool = SpawnSubagentTool::new(Arc::new(config_with_agent("alpha")), "alpha");
+        let tool = SpawnSubagentTool::new(
+            Arc::new(config_with_agent("alpha")),
+            "alpha",
+            Arc::new(SecurityPolicy::default()),
+        );
         for args in [json!({}), json!({ "prompt": "   " })] {
             let result = tool
                 .execute(args)
@@ -249,10 +301,14 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_parent_alias_surfaces_spawn_failure() {
-        // Parent alias that is not configured: SubAgentSpawn::for_agent
+        // Parent alias that is not configured: SubAgentSpawn::for_agent_with_policy
         // returns Err, the tool reports a structured spawn failure
         // (no panic, no recursion attempt).
-        let tool = SpawnSubagentTool::new(Arc::new(Config::default()), "missing-alpha");
+        let tool = SpawnSubagentTool::new(
+            Arc::new(Config::default()),
+            "missing-alpha",
+            Arc::new(SecurityPolicy::default()),
+        );
         let result = tool
             .execute(json!({ "prompt": "hello" }))
             .await
@@ -273,8 +329,12 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_recursive_spawn_when_caller_is_subagent() {
-        let tool = SpawnSubagentTool::new(Arc::new(config_with_agent("alpha")), "alpha")
-            .with_subagent_caller(true);
+        let tool = SpawnSubagentTool::new(
+            Arc::new(config_with_agent("alpha")),
+            "alpha",
+            Arc::new(SecurityPolicy::default()),
+        )
+        .with_subagent_caller(true);
         let result = tool
             .execute(json!({ "prompt": "hello" }))
             .await
@@ -293,8 +353,12 @@ mod tests {
         // (e.g. no model provider configured in this minimal harness),
         // but it MUST NOT trip the depth-cap refusal. Pin that the
         // depth-cap error is absent.
-        let tool = SpawnSubagentTool::new(Arc::new(config_with_agent("alpha")), "alpha")
-            .with_subagent_caller(false);
+        let tool = SpawnSubagentTool::new(
+            Arc::new(config_with_agent("alpha")),
+            "alpha",
+            Arc::new(SecurityPolicy::default()),
+        )
+        .with_subagent_caller(false);
         let result = tool
             .execute(json!({ "prompt": "hello" }))
             .await
@@ -320,7 +384,7 @@ mod tests {
         config.agents.insert(
             alias.to_string(),
             AliasedAgentConfig {
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..AliasedAgentConfig::default()
             },
         );
@@ -333,7 +397,11 @@ mod tests {
         // the tool itself refuses pre-spawn so the dispatch-site filter
         // doesn't have to be the only line of defense.
         let config = config_with_allowed_tools("alpha", vec!["shell".into()]);
-        let tool = SpawnSubagentTool::new(Arc::new(config), "alpha");
+        let tool = SpawnSubagentTool::new(
+            Arc::new(config),
+            "alpha",
+            Arc::new(SecurityPolicy::default()),
+        );
         let result = tool
             .execute(json!({ "prompt": "hello" }))
             .await
@@ -354,7 +422,11 @@ mod tests {
         // the gate refusal is absent.
         let config =
             config_with_allowed_tools("alpha", vec!["spawn_subagent".into(), "shell".into()]);
-        let tool = SpawnSubagentTool::new(Arc::new(config), "alpha");
+        let tool = SpawnSubagentTool::new(
+            Arc::new(config),
+            "alpha",
+            Arc::new(SecurityPolicy::default()),
+        );
         let result = tool
             .execute(json!({ "prompt": "hello" }))
             .await
@@ -363,6 +435,95 @@ mod tests {
         assert!(
             !(err.contains("risk_profile") && err.contains("spawn_subagent")),
             "spawn_subagent in allowed_tools must not trigger the gate refusal, got: {err:?}"
+        );
+    }
+
+    // ── Launch-side fan-out bound: shared action budget ──
+
+    #[tokio::test]
+    async fn repeated_spawns_blocked_once_action_budget_is_exhausted() {
+        // The dedup exemption lets identical spawn_subagent calls all
+        // reach execute(); the launch-side budget gate must be what
+        // bounds them. With a budget of 2, the 3rd validated launch
+        // attempt is refused before any spawn work, regardless of
+        // whether the spawns themselves succeed.
+        let security = Arc::new(SecurityPolicy {
+            max_actions_per_hour: 2,
+            ..SecurityPolicy::default()
+        });
+        let tool = SpawnSubagentTool::new(
+            Arc::new(config_with_agent("alpha")),
+            "alpha",
+            Arc::clone(&security),
+        );
+
+        for attempt in 1..=2 {
+            let result = tool
+                .execute(json!({ "prompt": "same fan-out prompt" }))
+                .await
+                .expect("execute returns Ok");
+            let err = result.error.as_deref().unwrap_or_default();
+            assert!(
+                !err.contains("Rate limit exceeded"),
+                "attempt {attempt} within budget must not be rate-limited, got: {err:?}"
+            );
+        }
+
+        let result = tool
+            .execute(json!({ "prompt": "same fan-out prompt" }))
+            .await
+            .expect("execute returns Ok with structured failure");
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Rate limit exceeded"),
+            "3rd launch attempt past a budget of 2 must be refused, got: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn validation_failures_do_not_consume_launch_budget() {
+        // The budget gate sits after prompt validation: malformed calls
+        // must not burn launch slots (matching RateLimitedTool's
+        // only-work-consumes-budget semantics).
+        let security = Arc::new(SecurityPolicy {
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        });
+        let tool = SpawnSubagentTool::new(
+            Arc::new(config_with_agent("alpha")),
+            "alpha",
+            Arc::clone(&security),
+        );
+
+        for _ in 0..3 {
+            let result = tool
+                .execute(json!({ "prompt": "   " }))
+                .await
+                .expect("execute returns Ok with structured failure");
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("prompt"),
+                "invalid-prompt refusal expected, got: {:?}",
+                result.error
+            );
+        }
+
+        let result = tool
+            .execute(json!({ "prompt": "valid" }))
+            .await
+            .expect("execute returns Ok");
+        let err = result.error.as_deref().unwrap_or_default();
+        assert!(
+            !err.contains("Rate limit exceeded"),
+            "validation failures must not have consumed the budget, got: {err:?}"
         );
     }
 
@@ -402,6 +563,7 @@ mod tests {
         let tool: Box<dyn Tool> = Box::new(SpawnSubagentTool::new(
             Arc::new(config_with_agent("alpha")),
             "alpha",
+            Arc::new(SecurityPolicy::default()),
         ));
         assert_eq!(
             Attributable::role(tool.as_ref()),

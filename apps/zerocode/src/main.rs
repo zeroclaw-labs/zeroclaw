@@ -23,6 +23,7 @@ mod attachment;
 mod chat;
 mod client;
 mod clipboard;
+mod color_depth;
 mod config;
 mod config_manager;
 mod dashboard;
@@ -83,21 +84,21 @@ struct Cli {
 }
 
 /// Where zerocode should connect.
-enum ConnectTarget {
+pub(crate) enum ConnectTarget {
     LocalSocket(PathBuf),
     Wss { url: String, skip_verify: bool },
 }
 
 impl ConnectTarget {
     /// Human-readable label for the dashboard Status box.
-    fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         match self {
             Self::LocalSocket(p) => format!("local:{}", p.display()),
             Self::Wss { url, .. } => url.clone(),
         }
     }
 
-    fn insecure_tls(&self) -> bool {
+    pub(crate) fn insecure_tls(&self) -> bool {
         matches!(
             self,
             Self::Wss {
@@ -105,6 +106,25 @@ impl ConnectTarget {
                 ..
             }
         )
+    }
+
+    /// Connect to this target, reclaiming a prior TUI identity when
+    /// `prev_id`/`prev_sig` are supplied. Single source of truth for the
+    /// per-transport connect call — used by initial startup and in-loop
+    /// reconnection alike.
+    pub(crate) async fn connect(
+        &self,
+        prev_id: Option<&str>,
+        prev_sig: Option<&str>,
+    ) -> anyhow::Result<client::RpcClient> {
+        match self {
+            Self::LocalSocket(socket) => {
+                client::RpcClient::connect(socket, prev_id, prev_sig).await
+            }
+            Self::Wss { url, skip_verify } => {
+                client::RpcClient::connect_wss(url, prev_id, prev_sig, *skip_verify).await
+            }
+        }
     }
 }
 
@@ -246,6 +266,10 @@ async fn run() -> anyhow::Result<()> {
     };
 
     // Initial connection (before the terminal is initialized).
+    // `owns_ephemeral` records whether THIS process spawned the daemon
+    // (initial connect failed → we started one). Only an owned ephemeral
+    // daemon may be respawned on disconnect, and then exactly once.
+    let mut owns_ephemeral = false;
     let rpc = match &target {
         ConnectTarget::LocalSocket(socket) => {
             match client::RpcClient::connect(socket, None, None).await {
@@ -253,6 +277,7 @@ async fn run() -> anyhow::Result<()> {
                 Err(_) => {
                     let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
                     spawn_ephemeral_daemon(&config_dir)?;
+                    owns_ephemeral = true;
                     await_daemon_ready(socket).await?
                 }
             }
@@ -276,114 +301,67 @@ async fn run() -> anyhow::Result<()> {
     let mut term = config_manager::init_terminal()?;
     TERMINAL_ACTIVE.store(true, Ordering::Relaxed);
 
-    let result = run_until_exit(Arc::new(rpc), &mut term, &target, &local_config_dir).await;
+    let result = run_until_exit(
+        Arc::new(rpc),
+        &mut term,
+        &target,
+        &local_config_dir,
+        owns_ephemeral,
+    )
+    .await;
 
     TERMINAL_ACTIVE.store(false, Ordering::Relaxed);
     config_manager::restore_terminal(&mut term)?;
     result
 }
 
-/// Wraps the reconnect loop with a SIGTERM handler so the TUI exits
-/// cleanly (terminal restored) instead of dying mid-draw.
+/// Runs the TUI under a SIGTERM handler so the terminal is restored on
+/// signal instead of dying mid-draw. `app::run` owns the full session
+/// lifecycle — including in-loop reconnection and recovery — and returns
+/// only when the user quits.
 async fn run_until_exit(
     rpc: Arc<client::RpcClient>,
     term: &mut config_manager::Term,
     target: &ConnectTarget,
     config_dir: &std::path::Path,
+    owns_ephemeral: bool,
 ) -> anyhow::Result<()> {
-    // Shared state that survives the reconnect cycle. Quickstart's
-    // Stage 2 writes the new agent's alias here so the next
-    // `app::run` iteration drops the user into Chat once the daemon
-    // is back up.
+    // Shared state that survives a reconnect. Quickstart's Stage 2 writes
+    // the new agent's alias here so the recovering `app::run` loop drops
+    // the user into Chat once the daemon is back up.
     let reconnect_state: app::SharedReconnectState =
         Arc::new(std::sync::Mutex::new(app::CrossReconnectState::default()));
+
+    let label = target.label();
+    let insecure_tls = target.insecure_tls();
 
     #[cfg(unix)]
     {
         let mut sigterm =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::select! {
-            r = run_with_reconnect(Arc::clone(&rpc), term, target, Arc::clone(&reconnect_state), config_dir) => r,
+            r = app::run(rpc, term, &label, insecure_tls, reconnect_state, config_dir, target, owns_ephemeral) => r.map(|_| ()),
             _ = sigterm.recv() => Ok(()),
         }
     }
     #[cfg(not(unix))]
     {
-        run_with_reconnect(
-            Arc::clone(&rpc),
-            term,
-            target,
-            Arc::clone(&reconnect_state),
-            config_dir,
-        )
-        .await
-    }
-}
-
-async fn run_with_reconnect(
-    rpc: Arc<client::RpcClient>,
-    term: &mut config_manager::Term,
-    target: &ConnectTarget,
-    reconnect_state: app::SharedReconnectState,
-    config_dir: &std::path::Path,
-) -> anyhow::Result<()> {
-    loop {
-        let label = target.label();
-        let should_reconnect = match app::run(
-            Arc::clone(&rpc),
+        app::run(
+            rpc,
             term,
             &label,
-            target.insecure_tls(),
-            Arc::clone(&reconnect_state),
+            insecure_tls,
+            reconnect_state,
             config_dir,
+            target,
+            owns_ephemeral,
         )
         .await
-        {
-            Ok(reconnect) => reconnect,
-            Err(_) if rpc.is_disconnected() => {
-                // RPC error caused by a dead connection — treat as
-                // disconnect and enter the reconnect loop instead of
-                // propagating a fatal error.
-                true
-            }
-            Err(e) => return Err(e),
-        };
-        if !should_reconnect {
-            return Ok(());
-        }
-        // Preserve TUI identity across reconnects so the daemon can
-        // reclaim the same UID via HMAC signature verification.
-        let prev_id = rpc.tui_id().map(String::from);
-        let prev_sig = rpc.tui_sig().map(String::from);
-        // Retry connecting. We do NOT spawn a new daemon here — multiple
-        // TUIs reconnecting simultaneously would each spawn their own,
-        // causing a stampede. The daemon is managed externally (service
-        // manager, manual restart, or the initial startup path in run()).
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let result = match target {
-                ConnectTarget::LocalSocket(socket) => {
-                    client::RpcClient::connect(socket, prev_id.as_deref(), prev_sig.as_deref())
-                        .await
-                }
-                ConnectTarget::Wss { url, skip_verify } => {
-                    client::RpcClient::connect_wss(
-                        url,
-                        prev_id.as_deref(),
-                        prev_sig.as_deref(),
-                        *skip_verify,
-                    )
-                    .await
-                }
-            };
-            if let Ok(_c) = result {
-                break;
-            }
-        }
+        .map(|_| ())
     }
 }
 
-fn spawn_ephemeral_daemon(config_dir: &std::path::Path) -> anyhow::Result<()> {
+pub(crate) fn spawn_ephemeral_daemon(config_dir: &std::path::Path) -> anyhow::Result<()> {
     let exe = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("zeroclaw")))

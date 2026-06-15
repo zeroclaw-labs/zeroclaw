@@ -1,15 +1,15 @@
-# FND-004: Engineering Infrastructure — CI/CD Pipeline and Release Automation
-### Supporting v0.7.0 → v1.0.0 · Type: Architecture · Rev. 1
+# FND-004: Engineering Infrastructure: CI/CD Pipeline and Release Automation
 
+> Supporting v0.7.0 → v1.0.0 · Type: Architecture · Rev. 1
+>
 > **Canonical reference** · Ratified by the team · Rev. 1
 > Discussion thread and full revision history: [#5579](https://github.com/zeroclaw-labs/zeroclaw/issues/5579)
-
 
 ---
 
 > **A note to the team before you read this.**
 >
-> This document is about the scaffolding around the code — the automation that builds it, tests it, audits it, and ships it. That scaffolding is invisible when it works well and painful when it does not. Most teams do not think about it until it is painful, and by then it has grown into something nobody fully understands. This RFC is an attempt to get ahead of that. If you have never thought deeply about CI/CD before, this is a good place to start. If you have, you will recognise the patterns. Either way, the goal is the same: a pipeline that gives the team confidence without getting in the way.
+> This document is about the scaffolding around the code: the automation that builds it, tests it, audits it, and ships it. That scaffolding is invisible when it works well and painful when it does not. Most teams do not think about it until it is painful, and by then it has grown into something nobody fully understands. This RFC is an attempt to get ahead of that. If you have never thought deeply about CI/CD before, this is a good place to start. If you have, you will recognise the patterns. Either way, the goal is the same: a pipeline that gives the team confidence without getting in the way.
 
 ---
 
@@ -36,11 +36,11 @@
 
 ## 1. Context: Pipelines Are Architecture
 
-The architecture RFC (#5574) established a principle: *dependencies flow inward, and structure is enforced by the compiler.* The same principle applies to the pipeline that surrounds the code. A pipeline is not just automation — it is a set of architectural decisions about what you trust, what you verify, when you verify it, and how you ship.
+The architecture RFC (#5574) established a principle: *dependencies flow inward, and structure is enforced by the compiler.* The same principle applies to the pipeline that surrounds the code. A pipeline is not just automation: it is a set of architectural decisions about what you trust, what you verify, when you verify it, and how you ship.
 
 Those decisions have consequences. A pipeline that was designed for a monolith will actively resist a microkernel. A security gate that has no triage process will either block everything or get bypassed. A release workflow built around one binary will not survive a distribution model with five artifact types. These are not configuration problems. They are design problems, and they deserve the same intentional treatment as the code architecture.
 
-The current pipeline grew reactively, the same way `loop_.rs` grew to 9,500 lines. Nobody chose the current state. It accumulated. PR #5559 — the first major step of the microkernel transition — exposed several places where the pipeline's assumptions no longer hold. That is a useful signal. It means now is exactly the right moment to stop, assess, and design intentionally.
+The current pipeline grew reactively, the same way `loop_.rs` grew to 9,500 lines. Nobody chose the current state. It accumulated. PR #5559, the first major step of the microkernel transition, exposed several places where the pipeline's assumptions no longer hold. That is a useful signal. It means now is exactly the right moment to stop, assess, and design intentionally.
 
 This RFC does for the pipeline what the architecture RFC does for the codebase: names what exists, identifies the structural problems, and proposes a path forward that is consistent with where the project is going.
 
@@ -54,8 +54,8 @@ This section is not criticism. It is a diagnosis. The current pipeline reflects 
 
 The repository currently has two separate workflows that run on pull requests against `master`:
 
-- `checks-on-pr.yml` — branded as "Quality Gate"
-- `ci-run.yml` — branded as "CI"
+- `checks-on-pr.yml`, branded as "Quality Gate"
+- `ci-run.yml`, branded as "CI"
 
 Both run Lint, Build, Test, and Security jobs independently on every PR. This means every PR triggers two full pipeline runs in parallel. For a monolith with a single compilation unit, this was expensive but manageable. For a multi-crate workspace, it doubles an already significant CI budget with no additional signal.
 
@@ -63,9 +63,9 @@ The duplication has a subtler cost beyond compute minutes: when a check fails in
 
 ### 2.2 Single-Binary Assumptions Are Baked In Everywhere
 
-The release automation — `release-stable-manual.yml`, `release-beta-on-push.yml`, `publish-crates.yml`, `pub-aur.yml`, `pub-homebrew-core.yml`, `pub-scoop.yml`, `discord-release.yml`, `tweet-release.yml` — was designed around the assumption that a release is one binary. You build it, sign it, push it to package managers, and announce it.
+The release automation, `release-stable-manual.yml`, `release-beta-on-push.yml`, `publish-crates.yml`, `pub-aur.yml`, `pub-homebrew-core.yml`, `pub-scoop.yml`, `discord-release.yml`, `tweet-release.yml`, was designed around the assumption that a release is one binary. You build it, sign it, push it to package managers, and announce it.
 
-The architecture RFC defines a distribution model with five distinct artifact types: the kernel binary (multiple platform targets), the hardware-variant kernel binary, the gateway binary, WASM plugin files, and the Tauri desktop installer. None of the current release workflows account for this structure. When the architecture transition reaches Phase 3 and Phase 4, every one of these workflows will need to change — unless they are redesigned now with that model in mind.
+The architecture RFC defines a distribution model with five distinct artifact types: the kernel binary (multiple platform targets), the hardware-variant kernel binary, the gateway binary, WASM plugin files, and the Tauri desktop installer. None of the current release workflows account for this structure. When the architecture transition reaches Phase 3 and Phase 4, every one of these workflows will need to change, unless they are redesigned now with that model in mind.
 
 ### 2.3 Security Scanning Without a Lifecycle
 
@@ -84,9 +84,9 @@ PR #5559 surfaced twelve RUSTSEC-2026 advisories simultaneously. Without tooling
 
 ### 2.4 The Strict Delta Lint Script
 
-`ci-run.yml` includes a job that runs `scripts/ci/rust_strict_delta_gate.sh` — a custom script that compares clippy output against the base SHA of the PR. The concept is sound: you want to know whether this PR introduced new warnings, not just whether warnings exist in the codebase. The implementation works well for small, focused PRs against a monolithic crate.
+`ci-run.yml` includes a job that runs `scripts/ci/rust_strict_delta_gate.sh`, a custom script that compares clippy output against the base SHA of the PR. The concept is sound: you want to know whether this PR introduced new warnings, not just whether warnings exist in the codebase. The implementation works well for small, focused PRs against a monolithic crate.
 
-A PR that moves 260,000 lines of code across 10 new crates, touching hundreds of files, puts this script in territory it was not designed for. The changed-file surface is too large for an incremental comparison to produce a meaningful signal. The script needs to understand workspace structure — specifically that a change to a file in `crates/zeroclaw-channels/` should be evaluated in the context of that crate, not the root.
+A PR that moves 260,000 lines of code across 10 new crates, touching hundreds of files, puts this script in territory it was not designed for. The changed-file surface is too large for an incremental comparison to produce a meaningful signal. The script needs to understand workspace structure: specifically that a change to a file in `crates/zeroclaw-channels/` should be evaluated in the context of that crate, not the root.
 
 ### 2.5 No Workspace-Aware Caching or Scoping
 
@@ -94,9 +94,9 @@ The current Rust cache configuration (`Swatinem/rust-cache`) is adequate for a s
 
 More significantly, there is no mechanism for running CI only against the crates affected by a given change. A PR that fixes a typo in `zeroclaw-tool-call-parser` does not need to rebuild and retest the gateway. As the workspace grows toward the 30+ crate model the architecture RFC envisions, the cost of running the full pipeline on every PR becomes a meaningful obstacle to contribution.
 
-### 2.6 Action Pinning Is Good — But Undocumented
+### 2.6 Action Pinning Is Good: But Undocumented
 
-The existing workflows do pin actions to full commit SHAs, which is correct security practice and worth acknowledging. But there is no documented policy explaining why, no process for reviewing when those SHAs should be updated, and no automation for keeping them current. Good behaviour without a policy is fragile — the next contributor to add a workflow step may not know why SHA pinning matters and will use a mutable tag instead.
+The existing workflows do pin actions to full commit SHAs, which is correct security practice and worth acknowledging. But there is no documented policy explaining why, no process for reviewing when those SHAs should be updated, and no automation for keeping them current. Good behaviour without a policy is fragile: the next contributor to add a workflow step may not know why SHA pinning matters and will use a mutable tag instead.
 
 ---
 
@@ -104,46 +104,54 @@ The existing workflows do pin actions to full commit SHAs, which is correct secu
 
 ### 3.1 One Pipeline, One Source of Truth
 
-The two parallel workflows should be consolidated into a single, well-structured pipeline. The distinction between "Quality Gate" and "CI" is not meaningful to contributors — both are checks a PR must pass. The consolidation creates one place to find check results, one place to update when behaviour changes, and one place to document what each check is doing and why.
+The two parallel workflows should be consolidated into a single, well-structured pipeline. The distinction between "Quality Gate" and "CI" is not meaningful to contributors: both are checks a PR must pass. The consolidation creates one place to find check results, one place to update when behaviour changes, and one place to document what each check is doing and why.
 
-The consolidated pipeline follows a staged structure where fast, cheap checks run first and gate slower, more expensive ones:
+The consolidated pipeline follows a staged structure where a very cheap formatting check runs first, then Rust-heavy jobs fan out in parallel. Lint remains required, but it should not unnecessarily hold the build and test cache warm-up hostage when the goal is to shorten the green critical path:
 
 ```
-Stage 1: Format + Lint (2–5 min)
+Stage 1: Format (cheap serial gate)
   └── cargo fmt --check
+
+Post-format quality gate (parallel, required)
   └── cargo clippy --workspace --all-targets -- -D warnings
   └── Docs quality gate
 
-Stage 2: Build + Check (parallel, 5–15 min)
+Post-format Build + Check (parallel, 5–15 min)
   └── Build matrix (Linux x86_64, macOS ARM, Windows)
   └── cargo check --features ci-all
   └── cargo check --no-default-features (kernel profile)
   └── cargo check --target i686 (32-bit)
 
-Stage 3: Test (10–30 min, gated on Stage 1)
+Post-format Test (parallel, 10–30 min)
   └── cargo nextest run --workspace
 
-Stage 4: Security (parallel with Stage 3)
+Post-format Security (parallel)
   └── cargo deny check (licenses, sources, advisories)
   └── Advisory triage gate (see §4)
 
-Stage 5: Required Gate
+Required Gate
   └── Composite status — branch protection requires only this job
 ```
 
-Stages 2, 3, and 4 run in parallel after Stage 1 passes. This means a formatting error fails fast without burning compute on a build that will be thrown away. The Required Gate job aggregates all results so branch protection needs to track only one job name — a pattern already present in both current workflows.
+The post-format jobs run in parallel after formatting passes. This means a formatting error fails fast without burning compute on a build that will be thrown away, while clippy, build, test, and security can make progress together on cleanly formatted PRs. The Required Gate job aggregates all results so branch protection needs to track only one job name, a pattern already present in both current workflows.
 
 ### 3.2 Workspace-Aware Clippy
 
 The current clippy invocation runs against the default feature set of the root crate. The correct invocation for a multi-crate workspace is:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+</div>
+
 The `--workspace` flag ensures every crate in the workspace is linted, not just the root. The `--all-targets` flag includes tests, benchmarks, and examples. Combined with `--features ci-all` for the feature-gated check, this gives a complete picture.
 
-The strict delta lint concept — checking whether this PR introduced new warnings rather than whether warnings exist at all — is worth preserving. The implementation should move from a shell script comparing diff output to a proper workspace-aware invocation that evaluates each affected crate independently. A simpler and more reliable approach: require `--workspace -D warnings` to pass clean at all times, making the delta concept implicit. If the baseline is always clean, any PR that introduces a warning fails. This removes the need for a custom comparison script entirely.
+The strict delta lint concept, checking whether this PR introduced new warnings rather than whether warnings exist at all, is worth preserving. The implementation should move from a shell script comparing diff output to a proper workspace-aware invocation that evaluates each affected crate independently. A simpler and more reliable approach: require `--workspace -D warnings` to pass clean at all times, making the delta concept implicit. If the baseline is always clean, any PR that introduces a warning fails. This removes the need for a custom comparison script entirely.
 
 ### 3.3 Changed-Crate Detection
 
@@ -180,7 +188,11 @@ This is implemented using `cargo metadata` to extract the dependency graph and a
     save-if: ${{ github.ref == 'refs/heads/master' }}
 ```
 
-The `save-if` condition means cache is only written on `master` pushes, not on every PR. PRs read from the cache but do not write competing versions. This avoids cache thrashing when multiple PRs are open simultaneously.
+Because cache saves are limited to `refs/heads/master`, the workflow must run on
+trusted `master` pushes. PRs read the master-seeded cache but do not write
+competing branch artifacts. This avoids cache thrashing when multiple PRs are
+open simultaneously, while still letting post-merge runs warm Linux, macOS, and
+Windows build caches for the next review loop.
 
 ---
 
@@ -190,9 +202,9 @@ The `save-if` condition means cache is only written on `master` pushes, not on e
 
 A security gate that blocks on any advisory, without context, trains the team to treat security failures as noise. That is the opposite of the intended effect. The goal is a gate that is:
 
-- **High signal** — failures mean something real that this PR affected
-- **Actionable** — the contributor knows what to do and why
-- **Sustainable** — the gate can be maintained without constant manual intervention
+- **High signal**: failures mean something real that this PR affected
+- **Actionable**: the contributor knows what to do and why
+- **Sustainable**: the gate can be maintained without constant manual intervention
 
 `cargo audit` alone does not achieve this. `cargo deny` does.
 
@@ -200,33 +212,16 @@ A security gate that blocks on any advisory, without context, trains the team to
 
 `cargo deny` is a more capable successor to `cargo audit` for project-level dependency policy. It enforces:
 
-- **Advisories** — RUSTSEC database, with the ability to deny, warn, or explicitly ignore specific advisories with a documented justification
-- **Licenses** — ensures all dependencies use acceptable licenses (important as the workspace grows and new contributors add deps)
-- **Sources** — ensures dependencies come only from approved registries (crates.io, path, git with specific hosts)
-- **Duplicates** — warns when multiple versions of the same crate appear in the dependency tree
+- **Advisories**: RUSTSEC database, with the ability to deny, warn, or explicitly ignore specific advisories with a documented justification
+- **Licenses**: ensures all dependencies use acceptable licenses (important as the workspace grows and new contributors add deps)
+- **Sources**: ensures dependencies come only from approved registries (crates.io, path, git with specific hosts)
+- **Duplicates**: warns when multiple versions of the same crate appear in the dependency tree
 
-The key capability is the `[advisories]` section of `deny.toml`, which allows explicit ignores:
-
-```toml
-[advisories]
-db-urls = ["https://github.com/rustsec/advisory-db"]
-vulnerability = "deny"
-unmaintained = "warn"
-unsound = "deny"
-notice = "warn"
-
-ignore = [
-    # RUSTSEC-2024-0388: `derivative` unmaintained — pulled in transitively
-    # through matrix-sdk; no direct usage, no active exploit. Tracked in #XXXX.
-    { id = "RUSTSEC-2024-0388", reason = "Transitive dep via matrix-sdk; no direct usage" },
-]
-```
-
-This approach transforms security scanning from a binary pass/fail into a documented, auditable policy. Every ignored advisory has a written justification and a tracking issue. Reviewers can see exactly which advisories are being suppressed and why. When a suppressed advisory escalates (a new exploit is found, a fix is available), the tracking issue is the reminder.
+The key capability is the `[advisories]` section of `deny.toml`, which allows explicit, justified ignores. This approach transforms security scanning from a binary pass/fail into a documented, auditable policy. Every ignored advisory has a written justification and a tracking issue. Reviewers can see exactly which advisories are being suppressed and why. When a suppressed advisory escalates (a new exploit is found, a fix is available), the tracking issue is the reminder.
 
 ### 4.3 Advisory Triage Process
 
-When a new advisory appears in the dependency tree — whether from a PR or from the daily advisory database update — the process is:
+When a new advisory appears in the dependency tree, whether from a PR or from the daily advisory database update, the process is:
 
 1. **Classify the advisory**: Is the affected crate a direct dependency or transitive? Does ZeroClaw call the vulnerable code path? Is there a fixed version available?
 2. **Determine the response**:
@@ -266,7 +261,7 @@ The architecture RFC §4.4.2 defines the following release artifacts:
 | WASM plugin files | wasm32-wasip1 | Plugin registry |
 | Desktop installer | x86_64 + aarch64, macOS/Windows/Linux | GitHub Releases, platform stores |
 
-The current release workflows know about exactly one of these: the standard binary. The rest do not exist in the automation yet. This is appropriate for now — the plugin system is not yet complete. But the release workflows should be designed with this model in mind so they do not need to be rewritten as each new artifact type is introduced.
+The current release workflows know about exactly one of these: the standard binary. The rest do not exist in the automation yet. This is appropriate for now: the plugin system is not yet complete. But the release workflows should be designed with this model in mind so they do not need to be rewritten as each new artifact type is introduced.
 
 ### 5.2 A Release Pipeline Structure
 
@@ -332,7 +327,7 @@ SLSA (Supply-chain Levels for Software Artifacts, pronounced "salsa") is a frame
 
 For ZeroClaw's current scale and team size, **SLSA Level 2** is the appropriate target:
 
-- Builds run on a hosted CI platform (already true — GitHub Actions)
+- Builds run on a hosted CI platform (already true, GitHub Actions)
 - Build scripts are version-controlled (already true)
 - Build provenance is generated and attached to release artifacts (the step to add)
 
@@ -340,7 +335,7 @@ SLSA Level 2 provenance means each release artifact ships with a cryptographical
 
 GitHub Actions supports SLSA Level 2 provenance generation natively through the `actions/attest-build-provenance` action. The cost to add it is one step per build job.
 
-### 6.2 Conventional Commits (Already Implied — Formalise It)
+### 6.2 Conventional Commits (Already Implied, Formalise It)
 
 The architecture RFC's versioning policy and release-plz integration both depend on conventional commit format for changelog generation. The governance RFC already references PR title conventions. This RFC formalises the connection: conventional commit format in commit messages and PR titles is a requirement, not a suggestion, because it is the input that drives automated changelog generation.
 
@@ -360,7 +355,7 @@ CI enforces this with a PR title lint job that validates the title matches the c
 
 ### 6.3 Reusable Workflows
 
-As the number of crates and artifact types grows, workflow duplication becomes a maintenance problem. GitHub Actions supports reusable workflows — a workflow that can be called from another workflow like a function. The build matrix, the security scan, and the test runner should each be extracted as reusable workflows.
+As the number of crates and artifact types grows, workflow duplication becomes a maintenance problem. GitHub Actions supports reusable workflows: a workflow that can be called from another workflow like a function. The build matrix, the security scan, and the test runner should each be extracted as reusable workflows.
 
 ```
 .github/
@@ -397,33 +392,33 @@ The pipeline migration follows the same Strangler Fig approach as the code migra
 
 ---
 
-### Phase 1 · v0.7.0 — "Rationalise"
+### Phase 1 · v0.7.0: "Rationalise"
 
 **Theme:** One pipeline, clean signal, no duplication.
 
 **Why this phase:** The architectural transition is already underway. The pipeline needs to stop fighting it before it makes implementation work harder than it needs to be.
 
-#### Deliverables
+#### Phase 1 Deliverables
 
-**D1: Consolidate `checks-on-pr.yml` and `ci-run.yml` into a single workflow**
+##### D1: Consolidate `checks-on-pr.yml` and `ci-run.yml` into a single workflow
 
 Merge the two PR workflows into one. The consolidated workflow keeps the staged structure defined in §3.1. The `Quality Gate` and `CI` naming distinction disappears. There is one workflow, one set of results, one place to look.
 
 The composite gate job (`CI Required Gate`) is preserved. Branch protection continues to require only that single job. This means the internal structure of the pipeline can change without requiring branch protection rule updates.
 
-**D2: Replace `cargo audit` with `cargo deny`**
+##### D2: Replace `cargo audit` with `cargo deny`
 
 Add `deny.toml` to the repository root. Configure the `[advisories]`, `[licenses]`, and `[sources]` sections. Triage all current RUSTSEC advisories on `master`: update what can be updated, document what cannot with justification and tracking issues. The security gate passes clean on `master` before this phase is complete.
 
-**D3: Fix workspace-aware clippy invocation**
+##### D3: Fix workspace-aware clippy invocation
 
-Change `cargo clippy --all-targets -- -D warnings` to `cargo clippy --workspace --all-targets -- -D warnings` in the consolidated workflow. Remove the `rust_strict_delta_gate.sh` script — with `--workspace -D warnings` always enforced clean, the delta concept is implicit.
+Change `cargo clippy --all-targets -- -D warnings` to `cargo clippy --workspace --all-targets -- -D warnings` in the consolidated workflow. Remove the `rust_strict_delta_gate.sh` script: with `--workspace -D warnings` always enforced clean, the delta concept is implicit.
 
-**D4: Formalise action pinning policy**
+##### D4: Formalise action pinning policy
 
 Add a `SECURITY.md` note and a CI check that validates all `uses:` references in workflow files are SHA-pinned. Add `dependabot` configuration for GitHub Actions updates.
 
-**D5: Add daily advisory scan workflow**
+##### D5: Add daily advisory scan workflow
 
 Add `daily-audit.yml` as a scheduled workflow running `cargo deny check advisories` against `master` at 09:00 UTC. On failure, open a GitHub Issue with the advisory details using `gh issue create`.
 
@@ -437,27 +432,27 @@ Add `daily-audit.yml` as a scheduled workflow running `cargo deny check advisori
 
 ---
 
-### Phase 2 · v0.8.0 — "Workspace-Aware"
+### Phase 2 · v0.8.0: "Workspace-Aware"
 
 **Theme:** The pipeline understands the workspace. Fast feedback for focused changes.
 
 **Why this phase:** By v0.8.0 the workspace will have grown further. Running the full pipeline on every PR will be increasingly expensive. Contributors to `zeroclaw-tool-call-parser` should not wait 30 minutes for a gateway rebuild.
 
-#### Deliverables
+#### Phase 2 Deliverables
 
-**D1: Changed-crate detection**
+##### D1: Changed-crate detection
 
 Add a `scripts/ci/affected_crates.sh` script that uses `cargo metadata` to build the dependency graph and returns the set of crates affected by the PR's changed files. The CI workflow uses this output to scope test execution.
 
-**D2: Per-crate test scoping**
+##### D2: Per-crate test scoping
 
 Add `--package` flags to `cargo nextest` based on the affected-crate output. Full workspace tests continue to run on `master` pushes and nightly. PRs run the affected subset.
 
-**D3: Workspace-aware cache configuration**
+##### D3: Workspace-aware cache configuration
 
 Update `Swatinem/rust-cache` configuration with explicit workspace scoping and `save-if: ${{ github.ref == 'refs/heads/master' }}` to prevent cache thrashing from concurrent PRs.
 
-**D4: Extract reusable workflow definitions**
+##### D4: Extract reusable workflow definitions
 
 Extract the build, test, and security jobs into reusable workflow files under `.github/_workflows/`. Update `ci.yml` and the new `release.yml` skeleton to call them.
 
@@ -469,27 +464,27 @@ Extract the build, test, and security jobs into reusable workflow files under `.
 
 ---
 
-### Phase 3 · v0.9.0 — "Release Pipeline"
+### Phase 3 · v0.9.0: "Release Pipeline"
 
 **Theme:** Release automation that matches the distribution model.
 
 **Why this phase:** Phase 3 of the architecture RFC extracts `zeroclaw-gw` as a separate binary. The first multi-artifact release happens here. The release pipeline must be ready before it is needed.
 
-#### Deliverables
+#### Phase 3 Deliverables
 
-**D1: Introduce `release-plz` and remove `version-sync.yml`**
+##### D1: Introduce `release-plz` and remove `version-sync.yml`
 
 Configure `release-plz` for the workspace. Workspace application crates use `version.workspace = true`. `zeroclaw-api` and hardware library crates are configured with independent release settings. The `version-sync.yml` workflow is retired.
 
-**D2: Build the structured release pipeline in `release.yml`**
+##### D2: Build the structured release pipeline in `release.yml`
 
-Implement the directed release graph from §5.2: `build-kernel-standard`, `build-kernel-hardware`, `build-gateway`, with downstream publish jobs. Plugin build jobs are stubbed — they succeed with no-op until Phase 4.
+Implement the directed release graph from §5.2: `build-kernel-standard`, `build-kernel-hardware`, `build-gateway`, with downstream publish jobs. Plugin build jobs are stubbed: they succeed with no-op until Phase 4.
 
-**D3: Add SLSA Level 2 provenance**
+##### D3: Add SLSA Level 2 provenance
 
 Add `actions/attest-build-provenance` to each build job. Provenance attestations are attached to GitHub Release assets. Document verification instructions in `SECURITY.md`.
 
-**D4: Retire redundant release workflows**
+##### D4: Retire redundant release workflows
 
 Consolidate `release-stable-manual.yml`, `release-beta-on-push.yml`, `pub-aur.yml`, `pub-homebrew-core.yml`, `pub-scoop.yml`, `discord-release.yml`, `tweet-release.yml` into the structured `release.yml` pipeline. These workflows grew independently; the structured pipeline replaces them with a single, auditable flow.
 
@@ -502,37 +497,43 @@ Consolidate `release-stable-manual.yml`, `release-beta-on-push.yml`, `pub-aur.ym
 
 ---
 
-### Phase 4 · v1.0.0 — "Platform Pipeline"
+### Phase 4 · v1.0.0: "Platform Pipeline"
 
 **Theme:** The pipeline ships the platform, not just the binary.
 
 **Why this phase:** v1.0.0 is when WASM plugins become publishable. The pipeline must handle plugin publishing, registry upload, and the Tauri desktop installer as first-class release artifacts.
 
-#### Deliverables
+#### Phase 4 Deliverables
 
-**D1: Activate WASM plugin build jobs**
+##### D1: Activate WASM plugin build jobs
 
 Implement `build-plugins-wasm` in the release pipeline. Each plugin crate builds to `wasm32-wasip1` in a dedicated job. Plugin manifests are generated and signed. The `publish-plugin-registry` job uploads signed WASM files to the plugin registry.
 
-**D2: Desktop installer build and publish**
+##### D2: Desktop installer build and publish
 
 Complete the Tauri build jobs for macOS, Windows, and Linux. The installer bundles the kernel and gateway binaries. Code signing credentials for macOS and Windows are documented as required repository secrets with a setup guide.
 
-**D3: Publish the CI/CD standards to `docs/book/src/maintainers/ci-and-actions.md`**
+##### D3: Publish the CI/CD standards to `docs/book/src/maintainers/ci-and-actions.md`
 
 The action pinning policy, advisory triage process, conventional commit requirements, and release pipeline structure defined in this RFC are extracted to `docs/book/src/maintainers/ci-and-actions.md` as a standing reference. This RFC remains the historical record of the decisions; the extracted document is what contributors look up day-to-day.
 
-**D4: Contributor onboarding for the pipeline**
+##### D4: Contributor onboarding for the pipeline
 
 Add a `Running CI Locally` section to the contributing documentation that shows contributors how to replicate the CI checks on their own machine before pushing:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # What CI runs — run these before pushing
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo nextest run --workspace
 cargo deny check
 ```
+
+</div>
 
 #### Success Metrics for Phase 4
 
@@ -547,9 +548,9 @@ cargo deny check
 
 ### For contributors opening PRs
 
-The consolidated pipeline means one place to look for results. Stage 1 (format and lint) fails fast — if you have a formatting error, you know in two minutes without waiting for a build. If Stage 1 passes, the build and test stages run in parallel and you have a full result in under 30 minutes for most changes.
+The consolidated pipeline means one place to look for results. Stage 1 (format and lint) fails fast: if you have a formatting error, you know in two minutes without waiting for a build. If Stage 1 passes, the build and test stages run in parallel and you have a full result in under 30 minutes for most changes.
 
-The conventional commit requirement on PR titles is enforced by CI. If your title does not match the format, the lint job fails immediately with a clear message. This is not bureaucracy — it is the input that generates the changelog automatically, which means releases happen faster and with less manual work.
+The conventional commit requirement on PR titles is enforced by CI. If your title does not match the format, the lint job fails immediately with a clear message. This is not bureaucracy: it is the input that generates the changelog automatically, which means releases happen faster and with less manual work.
 
 ### For contributors adding dependencies
 
@@ -564,7 +565,7 @@ New workflow files follow three rules without exception:
 2. New jobs are extracted as reusable workflows if they duplicate logic from an existing job
 3. New release-related jobs are added to `release.yml`, not as new workflow files
 
-When in doubt, ask before adding. Workflow files are high-risk changes — they run with elevated permissions on CI infrastructure and can affect supply chain security. They deserve the same review standard as `src/security/`.
+When in doubt, ask before adding. Workflow files are high-risk changes: they run with elevated permissions on CI infrastructure and can affect supply chain security. They deserve the same review standard as `src/security/`.
 
 ### For maintainers
 
@@ -574,35 +575,34 @@ The Release PR from `release-plz` is the release review checkpoint. Before anyth
 
 ---
 
-
 ## Appendix A: Glossary
 
-**SLSA (Supply-chain Levels for Software Artifacts)** — A security framework that defines levels of build integrity, from basic provenance to fully hermetic builds. Developed by Google and adopted by the OpenSSF. Level 2 is the practical target for most open-source projects: hosted build platform, version-controlled build scripts, signed provenance attached to artifacts.
+**SLSA (Supply-chain Levels for Software Artifacts)**: A security framework that defines levels of build integrity, from basic provenance to fully hermetic builds. Developed by Google and adopted by the OpenSSF. Level 2 is the practical target for most open-source projects: hosted build platform, version-controlled build scripts, signed provenance attached to artifacts.
 
-**Provenance** — A cryptographically signed record of where a build artifact came from: which source commit, which workflow, which platform. Allows users and package managers to verify that a binary was produced from the claimed source by the claimed process.
+**Provenance**: A cryptographically signed record of where a build artifact came from: which source commit, which workflow, which platform. Allows users and package managers to verify that a binary was produced from the claimed source by the claimed process.
 
-**`cargo deny`** — A Cargo plugin that enforces dependency policy across three dimensions: security advisories (from the RustSec database), software licenses (against a defined allowlist), and source registries (ensuring deps come only from approved locations). More configurable than `cargo audit` and better suited to policy management at scale.
+**`cargo deny`**: A Cargo plugin that enforces dependency policy across three dimensions: security advisories (from the RustSec database), software licenses (against a defined allowlist), and source registries (ensuring deps come only from approved locations). More configurable than `cargo audit` and better suited to policy management at scale.
 
-**`release-plz`** — A Rust-ecosystem release automation tool that creates "Release PRs" on push to the default branch, bumping versions and generating changelogs from conventional commit history. Workspace-aware; understands which crates changed and which need new versions.
+**`release-plz`**: A Rust-ecosystem release automation tool that creates "Release PRs" on push to the default branch, bumping versions and generating changelogs from conventional commit history. Workspace-aware; understands which crates changed and which need new versions.
 
-**Reusable workflow** — A GitHub Actions workflow that can be called as a job from another workflow, with parameters. Allows build, test, and security logic to be defined once and called from both the PR pipeline and the release pipeline.
+**Reusable workflow**: A GitHub Actions workflow that can be called as a job from another workflow, with parameters. Allows build, test, and security logic to be defined once and called from both the PR pipeline and the release pipeline.
 
-**Conventional commits** — A commit message convention (`feat:`, `fix:`, `chore:`, etc.) that enables automated changelog generation and version determination. The input that tools like `release-plz` use to decide whether a release is a patch, minor, or major bump.
+**Conventional commits**: A commit message convention (`feat:`, `fix:`, `chore:`, etc.) that enables automated changelog generation and version determination. The input that tools like `release-plz` use to decide whether a release is a patch, minor, or major bump.
 
-**Strangler Fig (in pipeline context)** — The same migration strategy applied to workflows: build the new pipeline structure alongside the existing one, migrate jobs one at a time, retire the old files only when the new structure is complete and verified.
+**Strangler Fig (in pipeline context)**: The same migration strategy applied to workflows: build the new pipeline structure alongside the existing one, migrate jobs one at a time, retire the old files only when the new structure is complete and verified.
 
 ---
 
 ## Appendix B: Further Reading
 
-- **SLSA Framework** — https://slsa.dev — The full specification and implementation guides for supply chain security levels.
+- [SLSA Framework](https://slsa.dev): The full specification and implementation guides for supply chain security levels.
 
-- **`cargo deny` documentation** — https://embarkstudios.github.io/cargo-deny/ — Configuration reference for the `deny.toml` policy file, including all advisory, license, and source options.
+- [`cargo deny` documentation](https://embarkstudios.github.io/cargo-deny/): Configuration reference for the `deny.toml` policy file, including all advisory, license, and source options.
 
-- **`release-plz` documentation** — https://release-plz.eplant.org — Workspace configuration, changelog format customisation, and GitHub Actions integration guide.
+- [`release-plz` documentation](https://release-plz.eplant.org): Workspace configuration, changelog format customisation, and GitHub Actions integration guide.
 
-- **GitHub Actions security hardening** — https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions — Official guidance on SHA pinning, token permissions, and supply chain risk in Actions workflows.
+- [GitHub Actions security hardening](https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions): Official guidance on SHA pinning, token permissions, and supply chain risk in Actions workflows.
 
-- **Conventional Commits specification** — https://www.conventionalcommits.org — The full specification for commit message format and its relationship to semantic versioning.
+- [Conventional Commits specification](https://www.conventionalcommits.org): The full specification for commit message format and its relationship to semantic versioning.
 
-- **OpenSSF Scorecard** — https://securityscorecards.dev — An automated tool that scores open-source projects on security practices including dependency pinning, branch protection, code review requirements, and more. Useful as a baseline assessment and ongoing health metric.
+- [OpenSSF Scorecard](https://securityscorecards.dev): An automated tool that scores open-source projects on security practices including dependency pinning, branch protection, code review requirements, and more. Useful as a baseline assessment and ongoing health metric.

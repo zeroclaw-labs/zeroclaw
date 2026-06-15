@@ -673,8 +673,8 @@ mod tests {
             "zeroclaw-x86_64-unknown-linux-gnu.tar.gz",
             "zeroclaw-x86_64-apple-darwin.tar.gz",
             "zeroclaw-aarch64-apple-darwin.tar.gz",
-            "zeroclaw-x86_64-pc-windows-msvc.zip",
-            "zeroclaw-aarch64-pc-windows-msvc.zip",
+            "zeroclaw-x86_64-pc-windows-msvc.tar.gz",
+            "zeroclaw-aarch64-pc-windows-msvc.tar.gz",
         ]);
 
         let url = find_asset_url(&release);
