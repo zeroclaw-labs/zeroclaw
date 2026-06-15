@@ -54,6 +54,8 @@
   - [Streaming](./providers/streaming.md)
   - [Routing](./providers/routing.md)
   - [Custom providers](./providers/custom.md)
+  - [OpenAI Codex (subscription)](./providers/openai-codex-subscription.md)
+
 - [Channels & Integrations](./channels/overview.md)
   - [Peer Groups](./channels/peer-groups.md)
   - [Matrix](./channels/matrix.md)

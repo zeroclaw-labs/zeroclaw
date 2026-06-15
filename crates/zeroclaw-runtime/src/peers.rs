@@ -112,7 +112,7 @@ pub fn resolve_peer_set(config: &Config, agent_alias: &str) -> ResolvedPeers {
             continue;
         }
 
-        let channel = group.channel.clone();
+        let channel = group.channel.to_string();
         let agent_set = resolved.agent_peers.entry(channel.clone()).or_default();
         // Aliases are stored case-folded so the lookup side
         // (`is_known_peer` / `allows_inbound`) can normalize without
@@ -181,7 +181,7 @@ mod tests {
         config.peer_groups.insert(
             "ops".to_string(),
             PeerGroupConfig {
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 agents: vec![AgentAlias::new("aa")],
                 external_peers: vec![PeerUsername::new("@Operator")],
                 ..PeerGroupConfig::default()
