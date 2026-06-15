@@ -9427,9 +9427,15 @@ pub struct MemoryConfig {
     /// Delete archived files permanently after this many days. Set high if you need long-term history; set low for privacy / disk-space reasons.
     #[serde(default = "default_purge_after_days")]
     pub purge_after_days: u32,
-    /// For the sqlite backend only — drop conversation rows older than this many days to keep the DB lean. Doesn't touch core memories or notes.
+    /// Delete conversation rows older than this many days from the DB (sqlite backend only). Age is measured by `updated_at` (last write time). 0 = keep forever.
     #[serde(default = "default_conversation_retention_days")]
     pub conversation_retention_days: u32,
+    /// Delete daily memory rows older than this many days from the DB. Age is measured by `updated_at` (last write time). 0 = keep forever.
+    #[serde(default = "default_zero_retention")]
+    pub daily_retention_days: u32,
+    /// Delete core memory rows older than this many days from the DB. Age is measured by `created_at` (first-write time), not `updated_at`, so frequently-recalled memories are not protected from pruning — only rewrites refresh the clock. Set this to a generously large window for durable core memories. 0 = keep forever.
+    #[serde(default = "default_zero_retention")]
+    pub core_retention_days: u32,
     /// Source of embedding vectors for semantic search. `none` = keyword-only retrieval (no API calls, no vector cost); `openai` = OpenAI's embedding API; `custom:URL` = any OpenAI-compatible embedding endpoint (LiteLLM, local gateway, etc.).
     #[serde(default = "default_embedding_provider")]
     pub embedding_provider: String,
@@ -9588,6 +9594,9 @@ fn default_purge_after_days() -> u32 {
 fn default_conversation_retention_days() -> u32 {
     30
 }
+fn default_zero_retention() -> u32 {
+    0
+}
 fn default_embedding_model() -> String {
     "text-embedding-3-small".into()
 }
@@ -9629,6 +9638,8 @@ impl Default for MemoryConfig {
             archive_after_days: default_archive_after_days(),
             purge_after_days: default_purge_after_days(),
             conversation_retention_days: default_conversation_retention_days(),
+            daily_retention_days: default_zero_retention(),
+            core_retention_days: default_zero_retention(),
             embedding_provider: default_embedding_provider(),
             embedding_model: default_embedding_model(),
             embedding_dimensions: default_embedding_dims(),
