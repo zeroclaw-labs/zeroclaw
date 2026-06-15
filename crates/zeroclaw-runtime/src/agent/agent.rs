@@ -947,6 +947,7 @@ impl Agent {
             false,
             false,
             None,
+            None,
         )
         .await
     }
@@ -963,6 +964,7 @@ impl Agent {
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
         exclude_memory: bool,
+        canvas_store: Option<tools::CanvasStore>,
     ) -> Result<Self> {
         Self::from_config_with_session_cwd_and_mcp_approval_mode(
             config,
@@ -972,6 +974,7 @@ impl Agent {
             true,
             exclude_memory,
             None,
+            canvas_store,
         )
         .await
     }
@@ -996,6 +999,7 @@ impl Agent {
             true,
             exclude_memory,
             tui_env,
+            None,
         )
         .await
     }
@@ -1008,6 +1012,7 @@ impl Agent {
         approval_backchannel: bool,
         exclude_memory: bool,
         tui_env: Option<std::collections::HashMap<String, String>>,
+        canvas_store: Option<tools::CanvasStore>,
     ) -> Result<Self> {
         let agent_cfg = config
             .agent(agent_alias)
@@ -1116,7 +1121,7 @@ impl Agent {
             &config.agents,
             agent_model_provider.and_then(|e| e.api_key.as_deref()),
             config,
-            None,
+            canvas_store,
             false,
             tui_env,
         );

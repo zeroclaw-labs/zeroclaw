@@ -561,6 +561,7 @@ impl AcpServer {
             Some(std::path::Path::new(&workspace_dir)),
             false,
             true,
+            self.canvas_store.clone(),
         )
         .await
         .map_err(|e| RpcError {
@@ -771,6 +772,7 @@ impl AcpServer {
             Some(&workspace_dir),
             false,
             true,
+            self.canvas_store.clone(),
         )
         .await
         .map_err(|e| RpcError {
@@ -970,6 +972,7 @@ impl AcpServer {
             Some(&workspace_dir),
             false,
             true,
+            self.canvas_store.clone(),
         )
         .await
         .map_err(|e| RpcError {
