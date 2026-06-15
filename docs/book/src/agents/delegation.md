@@ -131,6 +131,17 @@ This is a thin signal for the agent-loop spawn path. A dedicated "subagent start
 
 Because reachability is gated by the shared risk profile, the advertised roster (the `agent` parameter's enum in the tool schema) lists only the configured agents that share the caller's risk profile, minus the caller itself, and only when `delegation_policy.mode = "allow"`. There is no separate per-agent allow-list: the shared profile *is* the allow-list.
 
+#### Agentic target tool policy
+
+If the target agent's `[runtime_profiles.<target>].agentic = true`, `delegate` builds the target sub-loop's tool registry from the parent's available tools. The target risk profile then filters that inherited registry:
+
+1. A configured empty `[risk_profiles.<target_profile>].allowed_tools` list leaves the inherited parent registry unrestricted.
+2. A non-empty `allowed_tools` list keeps only exact matching tool names.
+3. `[risk_profiles.<target_profile>].excluded_tools` always subtracts from the result.
+4. `delegate` is always removed from the child registry so agentic delegation cannot recurse through another `delegate` call.
+
+This policy lives on the target, not the caller, but gate 2 requires caller and target to share a risk profile. In practice, the shared profile decides which tools the agentic target can inherit. A missing target risk profile refuses before the sub-loop starts; a configured profile that filters the inherited registry down to zero executable tools refuses with the output strings below.
+
 ### `delegate`: output strings the model sees
 
 Exact, sourced from `crates/zeroclaw-runtime/src/tools/delegate.rs`.
@@ -150,6 +161,12 @@ Exact, sourced from `crates/zeroclaw-runtime/src/tools/delegate.rs`.
 7. Unknown target agent: error is `Unknown agent '<target>'. Available agents: <comma-separated list>`.
 8. Depth exceeded (controlled by the parent's `runtime_profile.max_delegation_depth`, default 3): error is `Delegation depth limit reached (<depth>/<max>).`
 9. Unknown action: error is `Unknown action '<value>'. Use delegate/check_result/list_results/cancel_task.`
+10. Agentic target with a missing target risk profile: error is `Agent '<target>' is agentic but risk_profile '<target_profile>' is not configured`.
+11. Agentic target with no executable child tools: error begins with `Agent '<target>' has no executable tools`, then names the filtering case:
+    - `available from parent registry` when no allowlist or denylist applies but no non-`delegate` parent tools are available.
+    - `after filtering allowlist (<comma-separated names>)` when a non-empty `allowed_tools` list leaves no executable tools.
+    - `after filtering denylist (<comma-separated names>)` when `excluded_tools` removes every inherited executable tool.
+    - `after filtering allowlist (<comma-separated names>) and denylist (<comma-separated names>)` when both gates combine to leave no executable tools.
 
 ### `delegate`: how to verify it actually fired
 
