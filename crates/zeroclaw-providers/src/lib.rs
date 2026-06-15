@@ -633,6 +633,8 @@ pub struct ModelProviderRuntimeOptions {
     pub think: Option<bool>,
     /// Passed verbatim as `chat_template_kwargs` to the llamacpp provider.
     pub chat_template_kwargs: Option<serde_json::Value>,
+    /// Path to a custom CA certificate file for TLS connections.
+    pub tls_ca_cert_path: Option<String>,
 }
 
 impl Default for ModelProviderRuntimeOptions {
@@ -655,6 +657,7 @@ impl Default for ModelProviderRuntimeOptions {
             wire_api: None,
             think: None,
             chat_template_kwargs: None,
+            tls_ca_cert_path: None,
         }
     }
 }
@@ -697,6 +700,8 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         .map(|p| p.merge_system_into_user)
         .unwrap_or(false);
 
+    let tls_ca_cert_path = entry.and_then(|e| e.tls_ca_cert_path.clone());
+
     ModelProviderRuntimeOptions {
         auth_profile_override: None,
         provider_kind: entry.and_then(|e| {
@@ -721,6 +726,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         wire_api: entry.and_then(|e| e.wire_api.map(|w| w.as_str().to_string())),
         think: entry.and_then(|e| e.think),
         chat_template_kwargs: entry.and_then(|e| e.chat_template_kwargs.clone()),
+        tls_ca_cert_path,
     }
 }
 
@@ -2523,6 +2529,32 @@ mod tests {
             options.native_tools,
             Some(true),
             "native_tools must propagate from the active model_provider entry to runtime options"
+        );
+    }
+
+    #[test]
+    fn provider_runtime_options_from_config_propagates_tls_ca_cert_path() {
+        // Regression guard: tls_ca_cert_path on a ModelProviderConfig entry must
+        // reach ModelProviderRuntimeOptions so apply_compat_options can call
+        // with_tls_ca_cert_path on the provider. Same pattern as native_tools above.
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.openai.insert(
+            "corp".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    tls_ca_cert_path: Some("/tmp/example-ca.pem".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let entry = config.providers.models.find("openai", "corp");
+        let options = model_provider_runtime_options_from_model_provider_entry(&config, entry);
+        assert_eq!(
+            options.tls_ca_cert_path.as_deref(),
+            Some("/tmp/example-ca.pem"),
+            "tls_ca_cert_path must propagate from ModelProviderConfig to ModelProviderRuntimeOptions"
         );
     }
 

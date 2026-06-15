@@ -1,4 +1,4 @@
-use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalRequirement, ApprovalResponse};
+use crate::approval::ApprovalManager;
 
 /// CLI channel factory, injected by the binary. Returns a `Box<dyn Channel>` for interactive mode.
 pub static CLI_CHANNEL_FN: std::sync::OnceLock<
@@ -56,15 +56,6 @@ type ChannelMapFn = Box<
 /// Channel map factory, injected by the binary.
 static CHANNEL_MAP_FN: std::sync::OnceLock<ChannelMapFn> = std::sync::OnceLock::new();
 
-const AUTO_DELIVERY_DEFAULT_CHANNELS: &[&str] = &[
-    "telegram",
-    "discord",
-    "slack",
-    "mattermost",
-    "matrix",
-    "dingtalk",
-];
-
 /// Register the channel map factory. Called once at startup by the binary.
 pub fn register_channel_map_fn(f: ChannelMapFn) {
     let _ = CHANNEL_MAP_FN.set(f);
@@ -113,48 +104,33 @@ pub(crate) fn seed_channel_handles(
     }
     count
 }
-use crate::cost::types::BudgetCheck;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::{AutonomyLevel, SecurityPolicy};
 use crate::tools::{self, Tool};
-use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
-use futures_util::StreamExt;
-use regex::Regex;
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_api::channel::Channel;
-use zeroclaw_api::model_provider::StreamEvent;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{
     self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory, MemoryCategory, decay,
 };
-use zeroclaw_providers::multimodal;
-use zeroclaw_providers::{
-    self, ChatMessage, ChatRequest, ModelProvider, ProviderCapabilityError, ToolCall,
-};
+use zeroclaw_providers::{self, ChatMessage, ModelProvider};
+#[cfg(test)]
+use zeroclaw_providers::{ChatRequest, ToolCall};
 
 // Cost tracking moved to `super::cost`.
 pub use super::cost::{
     TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, TurnUsage,
     check_tool_loop_budget, record_tool_loop_cost_usage,
 };
-
-/// Minimum characters per chunk when relaying LLM text to a streaming draft.
-const STREAM_CHUNK_MIN_CHARS: usize = 80;
-/// Maximum malformed internal tool-protocol retries before returning a safe fallback.
-const MAX_MALFORMED_TOOL_PROTOCOL_RETRIES: usize = 2;
-
-/// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
-/// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
-const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
 // History management moved to `super::history`.
 pub use super::history::{
@@ -167,10 +143,6 @@ pub use super::history::{
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
-
-/// Callback type for checking if model has been switched during tool execution.
-/// Returns Some((model_provider, model)) if a switch was requested, None otherwise.
-pub type ModelSwitchCallback = Arc<Mutex<Option<(String, String)>>>;
 
 /// Global model switch request state - used for runtime model switching via model_switch tool.
 /// This is set by the model_switch tool and checked by the agent loop.
@@ -429,75 +401,6 @@ fn compute_excluded_mcp_tools(
         .collect()
 }
 
-static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\.]{8,}))"#).unwrap()
-});
-
-/// Scrub credentials from tool output to prevent accidental exfiltration.
-/// Replaces known credential patterns with a redacted placeholder while preserving
-/// a small prefix for context.
-pub fn scrub_credentials(input: &str) -> String {
-    SENSITIVE_KV_REGEX
-        .replace_all(input, |caps: &regex::Captures| {
-            let full_match = &caps[0];
-            let key = &caps[1];
-            let val = caps
-                .get(2)
-                .or(caps.get(3))
-                .or(caps.get(4))
-                .map(|m| m.as_str())
-                .unwrap_or("");
-
-            // Preserve first 4 chars for context, then redact.
-            // Use char_indices to find the byte offset of the 4th character
-            // so we never slice in the middle of a multi-byte UTF-8 sequence.
-            let prefix = if val.len() > 4 {
-                val.char_indices()
-                    .nth(4)
-                    .map(|(byte_idx, _)| &val[..byte_idx])
-                    .unwrap_or(val)
-            } else {
-                ""
-            };
-
-            if full_match.contains(':') {
-                if full_match.contains('"') {
-                    format!("\"{}\": \"{}*[REDACTED]\"", key, prefix)
-                } else {
-                    format!("{}: {}*[REDACTED]", key, prefix)
-                }
-            } else if full_match.contains('=') {
-                if full_match.contains('"') {
-                    format!("{}=\"{}*[REDACTED]\"", key, prefix)
-                } else {
-                    format!("{}={}*[REDACTED]", key, prefix)
-                }
-            } else {
-                format!("{}: {}*[REDACTED]", key, prefix)
-            }
-        })
-        .to_string()
-}
-
-/// Default trigger for auto-compaction when non-system message count exceeds this threshold.
-/// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
-/// used when callers omit the parameter.
-/// Minimum interval between progress sends to avoid flooding the draft channel.
-pub const PROGRESS_MIN_INTERVAL_MS: u64 = 500;
-
-/// Delta sent from the agent loop to the channel's draft updater.
-/// Append-only — no clear/reset variant exists by design.
-#[derive(Debug, Clone)]
-pub enum StreamDelta {
-    /// Response text to append to the message buffer.
-    Text(String),
-    /// Ephemeral tool progress (not part of the response body).
-    Status(String),
-}
-
-/// Backwards-compatible alias while callers are migrated.
-pub type DraftEvent = StreamDelta;
-
 pub use zeroclaw_api::TOOL_CHOICE_OVERRIDE;
 
 /// Convert a tool registry to OpenAI function-calling format for native tool support.
@@ -645,727 +548,6 @@ pub use super::tool_execution::{
     should_execute_tools_in_parallel,
 };
 
-/// Build assistant history entry in JSON format for native tool-call APIs.
-/// `convert_messages` in the OpenRouter model_provider parses this JSON to reconstruct
-/// the proper `NativeMessage` with structured `tool_calls`.
-fn build_native_assistant_history(
-    text: &str,
-    tool_calls: &[ToolCall],
-    reasoning_content: Option<&str>,
-) -> String {
-    let calls_json: Vec<serde_json::Value> = tool_calls
-        .iter()
-        .map(|tc| {
-            serde_json::json!({
-                "id": tc.id,
-                "name": tc.name,
-                "arguments": tc.arguments,
-            })
-        })
-        .collect();
-
-    let content = if text.trim().is_empty() {
-        serde_json::Value::Null
-    } else {
-        serde_json::Value::String(text.trim().to_string())
-    };
-
-    let mut obj = serde_json::json!({
-        "content": content,
-        "tool_calls": calls_json,
-    });
-
-    if let Some(rc) = reasoning_content {
-        obj.as_object_mut().unwrap().insert(
-            "reasoning_content".to_string(),
-            serde_json::Value::String(rc.to_string()),
-        );
-    }
-
-    obj.to_string()
-}
-
-fn resolve_display_text(
-    response_text: &str,
-    parsed_text: &str,
-    has_tool_calls: bool,
-    has_native_tool_calls: bool,
-) -> String {
-    if has_tool_calls {
-        if !parsed_text.is_empty() {
-            return parsed_text.to_string();
-        }
-        if has_native_tool_calls {
-            return response_text.to_string();
-        }
-        return String::new();
-    }
-
-    if parsed_text.is_empty() {
-        response_text.to_string()
-    } else {
-        parsed_text.to_string()
-    }
-}
-
-#[derive(Debug)]
-pub struct ToolLoopCancelled;
-
-impl std::fmt::Display for ToolLoopCancelled {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("tool loop cancelled")
-    }
-}
-
-impl std::error::Error for ToolLoopCancelled {}
-
-pub fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
-    err.chain().any(|source| source.is::<ToolLoopCancelled>())
-}
-
-#[derive(Debug)]
-pub struct ModelSwitchRequested {
-    pub model_provider: String,
-    pub model: String,
-}
-
-impl std::fmt::Display for ModelSwitchRequested {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "model switch requested to {} {}",
-            self.model_provider, self.model
-        )
-    }
-}
-
-impl std::error::Error for ModelSwitchRequested {}
-
-pub fn is_model_switch_requested(err: &anyhow::Error) -> Option<(String, String)> {
-    err.chain()
-        .filter_map(|source| source.downcast_ref::<ModelSwitchRequested>())
-        .map(|e| (e.model_provider.clone(), e.model.clone()))
-        .next()
-}
-
-#[derive(Debug, Default)]
-struct StreamedChatOutcome {
-    response_text: String,
-    /// Accumulated reasoning/thinking content from streaming deltas.
-    ///
-    /// Captured separately from `response_text` so it can be threaded into
-    /// `ChatResponse.reasoning_content` and ultimately persisted on the
-    /// `AssistantToolCalls` history entry. Required for model_providers like
-    /// DeepSeek V4 that reject follow-up requests when the assistant's
-    /// prior `reasoning_content` is missing from replayed tool-call turns
-    ///.
-    reasoning_content: String,
-    tool_calls: Vec<ToolCall>,
-    forwarded_live_deltas: bool,
-    suppressed_protocol: bool,
-    usage: Option<zeroclaw_providers::traits::TokenUsage>,
-}
-
-#[derive(Debug, Default)]
-struct StreamTextGuard {
-    // Suspicious leading chunks can split `"toolcalls"` / `<tool_call>` across
-    // deltas. Buffer just that prefix until it is clearly protocol or normal JSON.
-    pending: String,
-    pending_candidate_start: Option<usize>,
-    known_tool_names: HashSet<String>,
-    has_active_tools: bool,
-    suppress_forwarding: bool,
-    suppressed_protocol: bool,
-}
-
-impl StreamTextGuard {
-    fn new(available_tools: Option<&[crate::tools::ToolSpec]>) -> Self {
-        let available_tools = available_tools.unwrap_or(&[]);
-        let known_tool_names = available_tools
-            .iter()
-            .map(|tool| tool.name.to_ascii_lowercase())
-            .collect();
-        Self {
-            known_tool_names,
-            has_active_tools: !available_tools.is_empty(),
-            ..Self::default()
-        }
-    }
-
-    fn push(&mut self, chunk: &str) -> Option<String> {
-        if self.suppress_forwarding || chunk.is_empty() {
-            return None;
-        }
-
-        if self.pending.is_empty() && !starts_suspicious_protocol_prefix(chunk) {
-            if let Some(start) = find_embedded_protocol_candidate_start(chunk) {
-                self.pending_candidate_start = Some(start);
-                self.pending.push_str(&chunk[start..]);
-                return if self.should_suppress_protocol_candidate(&self.pending) {
-                    self.suppress_protocol();
-                    None
-                } else {
-                    self.pending.insert_str(0, &chunk[..start]);
-                    self.evaluate_pending(false)
-                };
-            }
-            if let Some(start) = find_incomplete_protocol_candidate_start(chunk) {
-                self.pending_candidate_start = Some(start);
-                self.pending.push_str(chunk);
-                return None;
-            }
-            return Some(chunk.to_string());
-        }
-
-        self.pending.push_str(chunk);
-        self.evaluate_pending(false)
-    }
-
-    fn finish(&mut self) -> Option<String> {
-        if self.suppress_forwarding || self.pending.is_empty() {
-            return None;
-        }
-        if let Some(release) = self.evaluate_pending(true) {
-            return Some(release);
-        }
-        if self.suppressed_protocol || self.pending.is_empty() {
-            return None;
-        }
-        if looks_like_malformed_tool_protocol_envelope_for_known_tools(
-            &self.pending,
-            &self.known_tool_names,
-        ) {
-            self.suppress_protocol();
-            return None;
-        }
-        Some(std::mem::take(&mut self.pending))
-    }
-
-    fn evaluate_pending(&mut self, finalizing: bool) -> Option<String> {
-        let candidate = self
-            .pending_candidate_start
-            .and_then(|start| self.pending.get(start..))
-            .unwrap_or(&self.pending);
-
-        if !finalizing && starts_suspicious_tag_or_fence_prefix(candidate) {
-            return None;
-        }
-
-        if self.should_suppress_protocol_candidate(candidate) {
-            self.suppress_protocol();
-            return None;
-        }
-
-        if let Some(is_protocol) =
-            complete_json_fence_protocol_state(candidate, &self.known_tool_names)
-        {
-            if is_protocol && self.has_active_tools {
-                self.suppress_protocol();
-                return None;
-            }
-            self.pending_candidate_start = None;
-            return Some(std::mem::take(&mut self.pending));
-        }
-
-        if complete_non_protocol_json(candidate, &self.known_tool_names) {
-            self.pending_candidate_start = None;
-            return Some(std::mem::take(&mut self.pending));
-        }
-
-        None
-    }
-
-    fn suppress_protocol(&mut self) {
-        self.pending.clear();
-        self.pending_candidate_start = None;
-        self.suppress_forwarding = true;
-        self.suppressed_protocol = true;
-    }
-
-    fn looks_like_active_tool_json(&self, text: &str) -> bool {
-        if self.known_tool_names.is_empty() {
-            return false;
-        }
-
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
-            return false;
-        };
-
-        match value {
-            serde_json::Value::Array(items) => {
-                !items.is_empty() && items.iter().all(|item| self.is_known_tool_payload(item))
-            }
-            serde_json::Value::Object(_) => self.is_known_tool_payload(&value),
-            _ => false,
-        }
-    }
-
-    fn is_known_tool_payload(&self, value: &serde_json::Value) -> bool {
-        let Some(object) = value.as_object() else {
-            return false;
-        };
-
-        let (name, has_args) =
-            if let Some(function) = object.get("function").and_then(|value| value.as_object()) {
-                (
-                    function
-                        .get("name")
-                        .and_then(serde_json::Value::as_str)
-                        .or_else(|| object.get("name").and_then(serde_json::Value::as_str)),
-                    function.contains_key("arguments")
-                        || function.contains_key("parameters")
-                        || object.contains_key("arguments")
-                        || object.contains_key("parameters"),
-                )
-            } else {
-                (
-                    object.get("name").and_then(serde_json::Value::as_str),
-                    object.contains_key("arguments") || object.contains_key("parameters"),
-                )
-            };
-
-        let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) else {
-            return false;
-        };
-
-        has_args && self.known_tool_names.contains(&name.to_ascii_lowercase())
-    }
-
-    fn should_suppress_protocol_candidate(&self, text: &str) -> bool {
-        if looks_like_tool_protocol_example(text) {
-            return false;
-        }
-
-        if looks_like_malformed_tool_protocol_envelope_for_known_tools(text, &self.known_tool_names)
-            || contains_tool_protocol_tag_call(text)
-        {
-            return true;
-        }
-
-        if let Some(kind) = classify_tool_protocol_envelope(text) {
-            return matches!(kind, ToolProtocolEnvelopeKind::TaggedToolCall)
-                || (self.has_active_tools
-                    && (matches!(kind, ToolProtocolEnvelopeKind::ToolResult)
-                        || tool_protocol_envelope_mentions_known_tool(
-                            text,
-                            &self.known_tool_names,
-                        )));
-        }
-
-        // Parsed JSON that carries protocol-only fields but cannot yield a valid
-        // tool call is an internal protocol failure, not user-facing text.
-        if looks_like_tool_protocol_envelope(text) {
-            return true;
-        }
-
-        self.looks_like_active_tool_json(text)
-    }
-}
-
-#[derive(Debug, Default)]
-struct StreamThinkTagStripper {
-    pending: String,
-    in_think: bool,
-}
-
-impl StreamThinkTagStripper {
-    const START_TAG: &'static str = "<think>";
-    const END_TAG: &'static str = "</think>";
-
-    fn push(&mut self, chunk: &str) -> String {
-        if chunk.is_empty() {
-            return String::new();
-        }
-
-        let mut input = std::mem::take(&mut self.pending);
-        input.push_str(chunk);
-        let mut visible = String::new();
-
-        loop {
-            if self.in_think {
-                if let Some(end) = input.find(Self::END_TAG) {
-                    input = input[end + Self::END_TAG.len()..].to_string();
-                    self.in_think = false;
-                    continue;
-                }
-
-                let keep_len = longest_suffix_matching_prefix(&input, Self::END_TAG);
-                if keep_len > 0 {
-                    self.pending = input[input.len() - keep_len..].to_string();
-                }
-                return visible;
-            }
-
-            if let Some(start) = input.find(Self::START_TAG) {
-                visible.push_str(&input[..start]);
-                input = input[start + Self::START_TAG.len()..].to_string();
-                self.in_think = true;
-                continue;
-            }
-
-            let keep_len = longest_suffix_matching_prefix(&input, Self::START_TAG);
-            if keep_len > 0 {
-                let emit_len = input.len() - keep_len;
-                visible.push_str(&input[..emit_len]);
-                self.pending = input[emit_len..].to_string();
-            } else {
-                visible.push_str(&input);
-            }
-            return visible;
-        }
-    }
-
-    fn finish(&mut self) -> String {
-        if self.in_think {
-            self.pending.clear();
-            return String::new();
-        }
-        std::mem::take(&mut self.pending)
-    }
-}
-
-fn longest_suffix_matching_prefix(text: &str, pattern: &str) -> usize {
-    (1..pattern.len())
-        .rev()
-        .find(|&len| text.ends_with(&pattern[..len]))
-        .unwrap_or(0)
-}
-
-fn find_embedded_protocol_candidate_start(text: &str) -> Option<usize> {
-    let lower = text.to_ascii_lowercase();
-    let mut earliest: Option<usize> = None;
-
-    for pattern in [
-        "<tool_call",
-        "<toolcall",
-        "<tool-call",
-        "<invoke",
-        "<function",
-        "```tool",
-        "```invoke",
-        "```json",
-    ] {
-        if let Some(idx) = lower.find(pattern) {
-            earliest = Some(earliest.map_or(idx, |current| current.min(idx)));
-        }
-    }
-
-    for key in ["\"tool_calls\"", "\"toolcalls\"", "\"function_call\""] {
-        if let Some(key_idx) = lower.find(key)
-            && let Some(json_start) = text[..key_idx].rfind(['{', '['])
-        {
-            earliest = Some(earliest.map_or(json_start, |current| current.min(json_start)));
-        }
-    }
-
-    earliest
-}
-
-fn find_incomplete_protocol_candidate_start(text: &str) -> Option<usize> {
-    let lower = text.to_ascii_lowercase();
-    let mut earliest: Option<usize> = None;
-
-    for pattern in [
-        "<tool",
-        "<invoke",
-        "<function",
-        "```tool",
-        "```invoke",
-        "```json",
-    ] {
-        if let Some(idx) = lower.rfind(pattern) {
-            earliest = Some(earliest.map_or(idx, |current| current.min(idx)));
-        }
-    }
-
-    for delimiter in ['{', '['] {
-        if let Some(idx) = text.rfind(delimiter) {
-            let tail = &lower[idx..];
-            if tail.contains("\"tool")
-                || tail.contains("\"function")
-                || tail.contains("\"call")
-                || tail.len() <= 16
-            {
-                earliest = Some(earliest.map_or(idx, |current| current.min(idx)));
-            }
-        }
-    }
-
-    earliest
-}
-
-fn starts_suspicious_protocol_prefix(text: &str) -> bool {
-    let trimmed = text.trim_start();
-    if trimmed.is_empty() {
-        return false;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    lower.starts_with('{')
-        || lower.starts_with('[')
-        || lower.starts_with("<tool")
-        || lower.starts_with("<invoke")
-        || lower.starts_with("<function")
-        || lower.starts_with("```tool")
-        || lower.starts_with("```invoke")
-        || lower.starts_with("```json")
-}
-
-fn starts_suspicious_tag_or_fence_prefix(text: &str) -> bool {
-    let lower = text.trim_start().to_ascii_lowercase();
-    lower.starts_with("<tool")
-        || lower.starts_with("<invoke")
-        || lower.starts_with("<function")
-        || lower.starts_with("```tool")
-        || lower.starts_with("```invoke")
-        || lower.starts_with("```json")
-        || lower.starts_with("[tool_call]")
-}
-
-fn complete_non_protocol_json(text: &str, known_tool_names: &HashSet<String>) -> bool {
-    let trimmed = text.trim();
-    (trimmed.starts_with('{') || trimmed.starts_with('['))
-        && serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
-        && (!looks_like_tool_protocol_envelope(trimmed)
-            || !tool_protocol_envelope_mentions_known_tool(trimmed, known_tool_names))
-}
-
-fn complete_json_fence_protocol_state(
-    text: &str,
-    known_tool_names: &HashSet<String>,
-) -> Option<bool> {
-    let trimmed = text.trim();
-    let body = json_fence_body(trimmed)?;
-    Some(
-        looks_like_tool_protocol_envelope(body)
-            && tool_protocol_envelope_mentions_known_tool(body, known_tool_names),
-    )
-}
-
-fn detect_internal_protocol_without_tools(response: &str) -> Option<String> {
-    let trimmed = response.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if looks_like_tool_protocol_example(trimmed) {
-        return None;
-    }
-
-    (looks_like_malformed_tool_protocol_envelope(trimmed)
-        || contains_tool_protocol_tag_call(trimmed)
-        || classify_tool_protocol_envelope(trimmed)
-            .is_some_and(|kind| matches!(kind, ToolProtocolEnvelopeKind::TaggedToolCall))
-        || (classify_tool_protocol_envelope(trimmed).is_none()
-            && looks_like_tool_protocol_envelope(trimmed)))
-    .then(|| {
-        "response resembled an internal tool protocol envelope but no tools were enabled".into()
-    })
-}
-
-fn detect_tool_call_parse_issue_for_known_tools(
-    response: &str,
-    parsed_calls: &[ParsedToolCall],
-    known_tool_names: &HashSet<String>,
-) -> Option<String> {
-    if !parsed_calls.is_empty() {
-        return None;
-    }
-
-    let trimmed = response.trim();
-    if trimmed.is_empty() || looks_like_tool_protocol_example(trimmed) {
-        return None;
-    }
-
-    let message = "response resembled an internal tool protocol envelope but no valid tool call could be parsed";
-
-    if looks_like_malformed_tool_protocol_envelope_for_known_tools(trimmed, known_tool_names)
-        || contains_tool_protocol_tag_call(trimmed)
-    {
-        return Some(message.into());
-    }
-
-    if let Some(kind) = classify_tool_protocol_envelope(trimmed) {
-        return (matches!(
-            kind,
-            ToolProtocolEnvelopeKind::TaggedToolCall | ToolProtocolEnvelopeKind::ToolResult
-        ) || tool_protocol_envelope_mentions_known_tool(trimmed, known_tool_names))
-        .then(|| message.into());
-    }
-
-    looks_like_tool_protocol_envelope(trimmed).then(|| message.into())
-}
-
-fn json_fence_body(trimmed: &str) -> Option<&str> {
-    let rest = trimmed.strip_prefix("```")?;
-    let first_newline = rest.find('\n')?;
-    let language = rest[..first_newline].trim().trim_end_matches('\r');
-    if !language.eq_ignore_ascii_case("json") {
-        return None;
-    }
-
-    let body_with_close = &rest[first_newline + 1..];
-    let close_start = body_with_close.rfind("```")?;
-    if !body_with_close[close_start + 3..].trim().is_empty() {
-        return None;
-    }
-    Some(body_with_close[..close_start].trim())
-}
-
-async fn consume_provider_streaming_response(
-    model_provider: &dyn ModelProvider,
-    messages: &[ChatMessage],
-    request_tools: Option<&[crate::tools::ToolSpec]>,
-    model: &str,
-    temperature: Option<f64>,
-    cancellation_token: Option<&CancellationToken>,
-    on_delta: Option<&tokio::sync::mpsc::Sender<DraftEvent>>,
-    strict_tool_parsing: bool,
-) -> Result<StreamedChatOutcome> {
-    let mut provider_stream = model_provider.stream_chat(
-        ChatRequest {
-            messages,
-            tools: request_tools,
-            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                .try_with(Clone::clone)
-                .ok()
-                .flatten(),
-        },
-        model,
-        temperature,
-        zeroclaw_providers::traits::StreamOptions::new(true),
-    );
-    let mut outcome = StreamedChatOutcome::default();
-    let mut delta_sender = on_delta;
-    let mut suppress_forwarding = false;
-    let mut text_guard = StreamTextGuard::new(request_tools);
-    let mut think_stripper = StreamThinkTagStripper::default();
-
-    loop {
-        let next_chunk = if let Some(token) = cancellation_token {
-            tokio::select! {
-                () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                chunk = provider_stream.next() => chunk,
-            }
-        } else {
-            provider_stream.next().await
-        };
-
-        let Some(event_result) = next_chunk else {
-            break;
-        };
-
-        let event = event_result.map_err(|err| {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
-                "model_provider stream emitted an error event"
-            );
-            anyhow::Error::msg(format!("model_provider stream error: {err}"))
-        })?;
-        match event {
-            StreamEvent::Final => break,
-            StreamEvent::Usage(usage) => {
-                outcome.usage = Some(usage);
-            }
-            StreamEvent::ToolCall(tool_call) => {
-                outcome.tool_calls.push(tool_call);
-                suppress_forwarding = true;
-                text_guard.suppress_forwarding = true;
-            }
-            StreamEvent::PreExecutedToolCall { .. } | StreamEvent::PreExecutedToolResult { .. } => {
-                // Pre-executed tool events are for observability only.
-                // They are forwarded to the gateway via turn_streamed but
-                // do not affect the agent's tool dispatch loop.
-            }
-            StreamEvent::TextDelta(chunk) => {
-                // Reasoning/thinking deltas arrive on the same `TextDelta`
-                // event as plain text but populate `chunk.reasoning` instead
-                // of `chunk.delta`. They must be captured into the outcome
-                // even when `chunk.delta` is empty — otherwise model_providers
-                // that require reasoning to round-trip on subsequent turns
-                // (DeepSeek V4 thinking mode; see #6059) reject the next
-                // request with a 400. Reasoning is never forwarded as a
-                // visible response delta — it is the model's internal
-                // monologue, kept for replay only.
-                if let Some(reasoning) = chunk.reasoning.as_deref()
-                    && !reasoning.is_empty()
-                {
-                    outcome.reasoning_content.push_str(reasoning);
-                }
-
-                if chunk.delta.is_empty() {
-                    continue;
-                }
-
-                let sanitized_delta = think_stripper.push(&chunk.delta);
-                if sanitized_delta.is_empty() {
-                    continue;
-                }
-
-                outcome.response_text.push_str(&sanitized_delta);
-
-                if suppress_forwarding {
-                    continue;
-                }
-
-                if strict_tool_parsing {
-                    if let Some(tx) = delta_sender {
-                        outcome.forwarded_live_deltas = true;
-                        if tx.send(StreamDelta::Text(sanitized_delta)).await.is_err() {
-                            delta_sender = None;
-                        }
-                    }
-                    continue;
-                }
-
-                let Some(forward_text) = text_guard.push(&sanitized_delta) else {
-                    continue;
-                };
-
-                if let Some(tx) = delta_sender {
-                    outcome.forwarded_live_deltas = true;
-                    if tx.send(StreamDelta::Text(forward_text)).await.is_err() {
-                        delta_sender = None;
-                    }
-                }
-            }
-        }
-    }
-
-    let trailing_delta = think_stripper.finish();
-    if !trailing_delta.is_empty() {
-        outcome.response_text.push_str(&trailing_delta);
-        if !suppress_forwarding {
-            if strict_tool_parsing {
-                if let Some(tx) = delta_sender {
-                    outcome.forwarded_live_deltas = true;
-                    if tx.send(StreamDelta::Text(trailing_delta)).await.is_err() {
-                        delta_sender = None;
-                    }
-                }
-            } else if let Some(forward_text) = text_guard.push(&trailing_delta)
-                && let Some(tx) = delta_sender
-            {
-                outcome.forwarded_live_deltas = true;
-                if tx.send(StreamDelta::Text(forward_text)).await.is_err() {
-                    delta_sender = None;
-                }
-            }
-        }
-    }
-
-    if let Some(forward_text) = text_guard.finish()
-        && let Some(tx) = delta_sender
-    {
-        outcome.forwarded_live_deltas = true;
-        let _ = tx.send(StreamDelta::Text(forward_text)).await;
-    }
-    outcome.suppressed_protocol = text_guard.suppressed_protocol;
-
-    Ok(outcome)
-}
-
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 /// When `silent` is true, suppresses stdout (for channel use).
@@ -1422,1744 +604,31 @@ pub async fn agent_turn(
         channel,
         None, // receipt_generator
         None, // collected_receipts
+        None, // event_tx
+        None, // steering
+        None, // new_messages_out
+        &LoopKnobs::default(),
+        None,
     )
     .await
 }
 
-fn maybe_inject_channel_delivery_defaults(
-    tool_name: &str,
-    tool_args: &mut serde_json::Value,
-    channel_name: &str,
-    channel_reply_target: Option<&str>,
-) {
-    if tool_name != "cron_add" {
-        return;
-    }
-
-    if !AUTO_DELIVERY_DEFAULT_CHANNELS.contains(&channel_name) {
-        return;
-    }
-
-    let Some(reply_target) = channel_reply_target
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return;
-    };
-
-    let Some(args) = tool_args.as_object_mut() else {
-        return;
-    };
-
-    let is_agent_job = args
-        .get("job_type")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|job_type| job_type.eq_ignore_ascii_case("agent"))
-        || args
-            .get("prompt")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|prompt| !prompt.trim().is_empty());
-    if !is_agent_job {
-        return;
-    }
-
-    let default_delivery = || {
-        serde_json::json!({
-            "mode": "announce",
-            "channel": channel_name,
-            "to": reply_target,
-        })
-    };
-
-    match args.get_mut("delivery") {
-        None => {
-            args.insert("delivery".to_string(), default_delivery());
-        }
-        Some(serde_json::Value::Null) => {
-            *args.get_mut("delivery").expect("delivery key exists") = default_delivery();
-        }
-        Some(serde_json::Value::Object(delivery)) => {
-            if delivery
-                .get("mode")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|mode| mode.eq_ignore_ascii_case("none"))
-            {
-                return;
-            }
-
-            delivery
-                .entry("mode".to_string())
-                .or_insert_with(|| serde_json::Value::String("announce".to_string()));
-
-            let needs_channel = delivery
-                .get("channel")
-                .and_then(serde_json::Value::as_str)
-                .is_none_or(|value| value.trim().is_empty());
-            if needs_channel {
-                delivery.insert(
-                    "channel".to_string(),
-                    serde_json::Value::String(channel_name.to_string()),
-                );
-            }
-
-            let needs_target = delivery
-                .get("to")
-                .and_then(serde_json::Value::as_str)
-                .is_none_or(|value| value.trim().is_empty());
-            if needs_target {
-                delivery.insert(
-                    "to".to_string(),
-                    serde_json::Value::String(reply_target.to_string()),
-                );
-            }
-        }
-        Some(_) => {}
-    }
-}
-
 // ── Agent Tool-Call Loop ──────────────────────────────────────────────────
-// Core agentic iteration: send conversation to the LLM, parse any tool
-// calls from the response, execute them, append results to history, and
-// repeat until the LLM produces a final text-only answer.
-//
-// Loop invariant: at the start of each iteration, `history` contains the
-// full conversation so far (system prompt + user messages + prior tool
-// results). The loop exits when:
-//   • the LLM returns no tool calls (final answer), or
-//   • max_iterations is reached (runaway safety), or
-//   • the cancellation token fires (external abort).
-
-/// Append a receipt footer to the response text if any receipts were collected.
-/// Execute a single turn of the agent loop: send messages, parse tool calls,
-/// execute tools, and loop until the LLM produces a final text response.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_tool_call_loop(
-    model_provider: &dyn ModelProvider,
-    history: &mut Vec<ChatMessage>,
-    tools_registry: &[Box<dyn Tool>],
-    observer: &dyn Observer,
-    provider_name: &str,
-    model: &str,
-    temperature: Option<f64>,
-    silent: bool,
-    approval: Option<&ApprovalManager>,
-    channel_name: &str,
-    channel_reply_target: Option<&str>,
-    multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
-    max_tool_iterations: usize,
-    cancellation_token: Option<CancellationToken>,
-    on_delta: Option<tokio::sync::mpsc::Sender<DraftEvent>>,
-    hooks: Option<&crate::hooks::HookRunner>,
-    excluded_tools: &[String],
-    dedup_exempt_tools: &[String],
-    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
-    model_switch_callback: Option<ModelSwitchCallback>,
-    pacing: &zeroclaw_config::schema::PacingConfig,
-    strict_tool_parsing: bool,
-    parallel_tools: bool,
-    max_tool_result_chars: usize,
-    context_token_budget: usize,
-    shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
-    channel: Option<&dyn Channel>,
-    receipt_generator: Option<&crate::agent::tool_receipts::ReceiptGenerator>,
-    collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
-) -> Result<String> {
-    let max_iterations = if max_tool_iterations == 0 {
-        DEFAULT_MAX_TOOL_ITERATIONS
-    } else {
-        max_tool_iterations
-    };
-
-    let turn_id = Uuid::new_v4().to_string();
-    let loop_started_at = Instant::now();
-    let loop_ignore_tools: HashSet<&str> = pacing
-        .loop_ignore_tools
-        .iter()
-        .map(String::as_str)
-        .collect();
-    let mut consecutive_identical_outputs: usize = 0;
-    let mut last_tool_output_hash: Option<u64> = None;
-
-    let mut loop_detector = crate::agent::loop_detector::LoopDetector::new(
-        crate::agent::loop_detector::LoopDetectorConfig {
-            enabled: pacing.loop_detection_enabled,
-            window_size: pacing.loop_detection_window_size,
-            max_repeats: pacing.loop_detection_max_repeats,
-        },
-    );
-
-    // Accumulated display text across all tool-loop calls.
-    let mut accumulated_display_text = String::new();
-    let mut malformed_tool_protocol_retries: usize = 0;
-
-    for iteration in 0..max_iterations {
-        let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
-
-        if cancellation_token
-            .as_ref()
-            .is_some_and(CancellationToken::is_cancelled)
-        {
-            return Err(ToolLoopCancelled.into());
-        }
-
-        // Shared iteration budget: parent + subagents share a global counter
-        if let Some(ref budget) = shared_budget {
-            let remaining = budget.load(std::sync::atomic::Ordering::Relaxed);
-            if remaining == 0 {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"iteration": iteration})),
-                    "Shared iteration budget exhausted at iteration "
-                );
-                break;
-            }
-            budget.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        // Preemptive context management: trim history before it overflows
-        if context_token_budget > 0 {
-            let estimated = estimate_history_tokens(history);
-            if estimated > context_token_budget {
-                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"estimated": estimated, "budget": context_token_budget, "iteration": iteration + 1})), "Preemptive context trim: estimated tokens exceed budget");
-                let chars_saved = fast_trim_tool_results(history, 4);
-                if chars_saved > 0 {
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({"chars_saved": chars_saved})),
-                        "Preemptive fast-trim applied"
-                    );
-                }
-                // If still over budget, use the history pruner for deeper cleanup
-                let recheck = estimate_history_tokens(history);
-                if recheck > context_token_budget {
-                    let stats = crate::agent::history_pruner::prune_history(
-                        history,
-                        &crate::agent::history_pruner::HistoryPrunerConfig {
-                            enabled: true,
-                            max_tokens: context_token_budget,
-                            keep_recent: 4,
-                            collapse_tool_results: true,
-                        },
-                    );
-                    if stats.dropped_messages > 0 || stats.collapsed_pairs > 0 {
-                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"collapsed": stats.collapsed_pairs, "dropped": stats.dropped_messages})), "Preemptive history prune applied");
-                    }
-                }
-            }
-        }
-
-        // Remove orphaned tool-role messages whose assistant (tool_calls)
-        // counterpart was dropped by proactive trimming, context compression,
-        // or session history reloading.  Without this, model_providers like MiniMax
-        // reject the request with "tool result's tool id not found" (bug #5743).
-        let pruned_in_loop = crate::agent::history_pruner::remove_orphaned_tool_messages(history);
-        if !pruned_in_loop.is_empty() {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "removed": pruned_in_loop.removed,
-                        "orphan_tool_call_ids": pruned_in_loop.orphan_tool_call_ids,
-                    })),
-                "remove_orphaned_tool_messages fired inside run_tool_call_loop: \
-                 assistant tool_use blocks and/or tool_results were stripped from \
-                 the live history. If this fires mid-conversation the model loses \
-                 the in-flight tool work and acts like it just woke up."
-            );
-        }
-        normalize_system_messages(history);
-
-        // Check if model switch was requested via model_switch tool
-        if let Some(ref callback) = model_switch_callback
-            && let Ok(guard) = callback.lock()
-            && let Some((new_model_provider, new_model)) = guard.as_ref()
-            && (new_model_provider != provider_name || new_model != model)
-        {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                &format!(
-                    "Model switch detected: {} {} -> {} {}",
-                    provider_name, model, new_model_provider, new_model
-                )
-            );
-            return Err(ModelSwitchRequested {
-                model_provider: new_model_provider.clone(),
-                model: new_model.clone(),
-            }
-            .into());
-        }
-
-        // Rebuild tool_specs each iteration so newly activated deferred tools appear.
-        let mut tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
-            .iter()
-            .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
-            .map(|tool| tool.spec())
-            .collect();
-        if let Some(at) = activated_tools {
-            for spec in at.lock().unwrap().tool_specs() {
-                if !excluded_tools.iter().any(|ex| ex == &spec.name) {
-                    tool_specs.push(spec);
-                }
-            }
-        }
-        let known_tool_names: HashSet<String> = tool_specs
-            .iter()
-            .map(|tool| tool.name.to_ascii_lowercase())
-            .collect();
-        let use_native_tools = model_provider.supports_native_tools() && !tool_specs.is_empty();
-
-        let image_marker_count = multimodal::count_image_markers(history);
-        // Image markers that came from the user (inbound attachments), as
-        // opposed to tool results. A missing vision capability is handled
-        // differently for the two: a user image must surface an error (we
-        // cannot silently ignore what the user sent), while a tool-result
-        // image may degrade to text-only.
-        let user_image_marker_count = multimodal::count_user_image_markers(history);
-
-        // ── Vision model_provider routing ──────────────────────────
-        // When the default model_provider lacks vision support but a dedicated
-        // vision_model_provider is configured, create it on demand and use it
-        // for this iteration. When no vision route exists at all, either
-        // surface a capability error (the user sent an image) or degrade
-        // gracefully (the markers came only from tool results) — see the
-        // no-vision-route branch below and `degrade_strip_images`.
-        let mut degrade_strip_images = false;
-        let vision_model_provider_box: Option<Box<dyn ModelProvider>> = if image_marker_count > 0
-            && !model_provider.supports_vision()
-        {
-            if let Some(ref vp) = multimodal_config.vision_model_provider {
-                let vp_instance =
-                    zeroclaw_providers::create_model_provider(vp, None).map_err(|e| {
-                        ::zeroclaw_log::record!(
-                            ERROR,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Fail
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "vision_provider": vp,
-                                "error": format!("{}", e),
-                            })),
-                            "vision model_provider construction failed"
-                        );
-                        anyhow::Error::msg(format!(
-                            "failed to create vision model_provider '{vp}': {e}"
-                        ))
-                    })?;
-                if !vp_instance.supports_vision() {
-                    // Operator misconfiguration (named a non-vision provider as
-                    // the vision route) — surface it loudly rather than silently
-                    // degrading.
-                    return Err(ProviderCapabilityError {
-                        model_provider: vp.clone(),
-                        capability: "vision".to_string(),
-                        message: format!(
-                            "configured vision_model_provider '{vp}' does not support vision input"
-                        ),
-                    }
-                    .into());
-                }
-                Some(vp_instance)
-            } else if user_image_marker_count > 0 {
-                // The user sent an image we cannot see. Surface a capability
-                // error so the attachment is not silently ignored — channels
-                // render this back to the user (e.g. "⚠️ Error … does not
-                // support vision"). Configuring a `vision_model_provider`
-                // routes around it.
-                return Err(ProviderCapabilityError {
-                        model_provider: provider_name.to_string(),
-                        capability: "vision".to_string(),
-                        message: format!(
-                            "received {image_marker_count} image marker(s), but this model_provider does not support vision input"
-                        ),
-                    }
-                    .into());
-            } else {
-                // Markers came only from tool results (e.g. `image_info`,
-                // `screenshot`, `image_gen`). Previously this aborted the
-                // entire turn with a capability error, which turned an
-                // otherwise successful tool call (e.g. `image_info`, which
-                // always returns useful metadata text alongside its `[IMAGE:]`
-                // marker) into a hard failure. Instead, degrade: strip the
-                // image markers from the messages sent to the text-only
-                // provider while preserving the surrounding text, so the
-                // conversation continues and the model still receives any
-                // accompanying metadata/caption.
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "model_provider": provider_name,
-                            "image_marker_count": image_marker_count,
-                        })),
-                    "no vision route for tool-result image marker(s); degrading to text-only (markers stripped)"
-                );
-                degrade_strip_images = true;
-                None
-            }
-        } else {
-            None
-        };
-
-        let (active_model_provider, active_model_provider_name, active_model): (
-            &dyn ModelProvider,
-            &str,
-            &str,
-        ) = if let Some(ref vp_box) = vision_model_provider_box {
-            let vp_name = multimodal_config
-                .vision_model_provider
-                .as_deref()
-                .unwrap_or(provider_name);
-            let vm = multimodal_config.vision_model.as_deref().unwrap_or(model);
-            (vp_box.as_ref(), vp_name, vm)
-        } else {
-            (model_provider, provider_name, model)
-        };
-
-        let prepared_messages = if degrade_strip_images {
-            // Text-only fallback: replace every media marker with a
-            // `[media attachment]` placeholder so no filesystem path or data
-            // URI reaches the text-only provider, while surrounding text
-            // (captions, tool metadata) survives.
-            let stripped: Vec<ChatMessage> = history
-                .iter()
-                .map(|m| ChatMessage {
-                    role: m.role.clone(),
-                    content: multimodal::strip_media_markers(&m.content),
-                })
-                .collect();
-            multimodal::prepare_messages_for_provider(&stripped, multimodal_config).await?
-        } else {
-            multimodal::prepare_messages_for_provider(history, multimodal_config).await?
-        };
-
-        // ── Progress: LLM thinking ────────────────────────────
-        if let Some(ref tx) = on_delta {
-            let phase = if iteration == 0 {
-                "\u{1f914} Thinking...\n".to_string()
-            } else {
-                format!("\u{1f914} Thinking (round {})...\n", iteration + 1)
-            };
-            let _ = tx.send(StreamDelta::Status(phase)).await;
-        }
-
-        observer.record_event(&ObserverEvent::LlmRequest {
-            model_provider: active_model_provider_name.to_string(),
-            model: active_model.to_string(),
-            messages_count: history.len(),
-            channel: None,
-            agent_alias: None,
-            turn_id: None,
-        });
-        {
-            let _provider_guard =
-                ::zeroclaw_log::attribution_span!(active_model_provider).entered();
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
-                    .with_attrs(::serde_json::json!({
-                        "iteration": iteration + 1,
-                        "messages_count": history.len(),
-                        "model": active_model,
-                        "trace_id": turn_id,
-                    })),
-                "llm_request"
-            );
-        }
-
-        let llm_started_at = Instant::now();
-
-        // Fire void hook before LLM call
-        if let Some(hooks) = hooks {
-            hooks.fire_llm_input(history, model).await;
-        }
-
-        // Budget enforcement — block if limit exceeded (no-op when not scoped)
-        if let Some(BudgetCheck::Exceeded {
-            current_usd,
-            limit_usd,
-            period,
-        }) = check_tool_loop_budget()
-        {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "current_usd": current_usd,
-                        "limit_usd": limit_usd,
-                        "period": format!("{period:?}"),
-                    })),
-                "tool-call loop budget exceeded"
-            );
-            anyhow::bail!(
-                "Budget exceeded: ${:.4} of ${:.2} {:?} limit. Cannot make further API calls until the budget resets.",
-                current_usd,
-                limit_usd,
-                period
-            );
-        }
-
-        // Unified path via ModelProvider::chat so provider-specific native tool logic
-        // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
-        let request_tools = if use_native_tools {
-            Some(tool_specs.as_slice())
-        } else {
-            None
-        };
-        let should_consume_provider_stream = on_delta.is_some()
-            && model_provider.supports_streaming()
-            && (request_tools.is_none() || model_provider.supports_streaming_tool_events());
-        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"has_on_delta": on_delta.is_some(), "supports_streaming": model_provider.supports_streaming(), "should_consume_provider_stream": should_consume_provider_stream})), &format!("Streaming decision for iteration {}", iteration + 1));
-        let mut streamed_live_deltas = false;
-        let mut streamed_protocol_suppressed = false;
-
-        let chat_result = if should_consume_provider_stream {
-            use ::zeroclaw_log::Instrument;
-            let provider_span = ::zeroclaw_log::attribution_span!(active_model_provider);
-            let stream_future = ::zeroclaw_log::scope!(
-                model: active_model,
-                =>
-                consume_provider_streaming_response(
-                    active_model_provider,
-                    &prepared_messages.messages,
-                    request_tools,
-                    active_model,
-                    temperature,
-                    cancellation_token.as_ref(),
-                    on_delta.as_ref(),
-                    strict_tool_parsing,
-                )
-            )
-            .instrument(provider_span);
-            match stream_future.await {
-                Ok(streamed) => {
-                    streamed_live_deltas = streamed.forwarded_live_deltas;
-                    streamed_protocol_suppressed = streamed.suppressed_protocol;
-                    let reasoning_content = if streamed.reasoning_content.is_empty() {
-                        None
-                    } else {
-                        Some(streamed.reasoning_content)
-                    };
-                    Ok(zeroclaw_providers::ChatResponse {
-                        text: Some(streamed.response_text),
-                        tool_calls: streamed.tool_calls,
-                        usage: streamed.usage,
-                        reasoning_content,
-                    })
-                }
-                Err(stream_err) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "model": active_model,
-                                "iteration": iteration + 1,
-                                "error": scrub_credentials(&stream_err.to_string()),
-                                "trace_id": turn_id,
-                            })),
-                        "llm_stream_fallback: provider stream failed, falling back to non-streaming chat"
-                    );
-                    {
-                        use ::zeroclaw_log::Instrument;
-                        let provider_span =
-                            ::zeroclaw_log::attribution_span!(active_model_provider);
-                        let chat_future = ::zeroclaw_log::scope!(
-                            model: active_model,
-                            =>
-                            active_model_provider.chat(
-                                ChatRequest {
-                                    messages: &prepared_messages.messages,
-                                    tools: request_tools,
-                                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                                        .try_with(Clone::clone)
-                                        .ok()
-                                        .flatten(),
-                                },
-                                active_model,
-                                temperature,
-                            )
-                        )
-                        .instrument(provider_span);
-                        if let Some(token) = cancellation_token.as_ref() {
-                            tokio::select! {
-                                () = token.cancelled() => Err(ToolLoopCancelled.into()),
-                                result = chat_future => result,
-                            }
-                        } else {
-                            chat_future.await
-                        }
-                    }
-                }
-            }
-        } else {
-            // Non-streaming path: wrap with optional per-step timeout from
-            // pacing config to catch hung model responses.
-            use ::zeroclaw_log::Instrument;
-            let provider_span = ::zeroclaw_log::attribution_span!(active_model_provider);
-            let chat_future = ::zeroclaw_log::scope!(
-                model: active_model,
-                =>
-                active_model_provider.chat(
-                    ChatRequest {
-                        messages: &prepared_messages.messages,
-                        tools: request_tools,
-                        thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                            .try_with(Clone::clone)
-                            .ok()
-                            .flatten(),
-                    },
-                    active_model,
-                    temperature,
-                )
-            )
-            .instrument(provider_span);
-
-            match pacing.step_timeout_secs {
-                Some(step_secs) if step_secs > 0 => {
-                    let step_timeout = Duration::from_secs(step_secs);
-                    if let Some(token) = cancellation_token.as_ref() {
-                        tokio::select! {
-                            () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                            result = tokio::time::timeout(step_timeout, chat_future) => {
-                                match result {
-                                    Ok(inner) => inner,
-                                    Err(_) => anyhow::bail!(
-                                        "LLM inference step timed out after {step_secs}s (step_timeout_secs)"
-                                    ),
-                                }
-                            },
-                        }
-                    } else {
-                        match tokio::time::timeout(step_timeout, chat_future).await {
-                            Ok(inner) => inner,
-                            Err(_) => anyhow::bail!(
-                                "LLM inference step timed out after {step_secs}s (step_timeout_secs)"
-                            ),
-                        }
-                    }
-                }
-                _ => {
-                    if let Some(token) = cancellation_token.as_ref() {
-                        tokio::select! {
-                            () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                            result = chat_future => result,
-                        }
-                    } else {
-                        chat_future.await
-                    }
-                }
-            }
-        };
-
-        let (
-            response_text,
-            parsed_text,
-            tool_calls,
-            assistant_history_content,
-            native_tool_calls,
-            parse_issue_detected,
-            protocol_suppressed,
-            response_streamed_live,
-        ) = match chat_result {
-            Ok(resp) => {
-                let (resp_input_tokens, resp_output_tokens) = resp
-                    .usage
-                    .as_ref()
-                    .map(|u| (u.input_tokens, u.output_tokens))
-                    .unwrap_or((None, None));
-
-                observer.record_event(&ObserverEvent::LlmResponse {
-                    model_provider: provider_name.to_string(),
-                    model: model.to_string(),
-                    duration: llm_started_at.elapsed(),
-                    success: true,
-                    error_message: None,
-                    input_tokens: resp_input_tokens,
-                    output_tokens: resp_output_tokens,
-                    channel: None,
-                    agent_alias: None,
-                    turn_id: None,
-                });
-
-                // Record cost via task-local tracker (no-op when not scoped)
-                let _ = resp
-                    .usage
-                    .as_ref()
-                    .and_then(|usage| record_tool_loop_cost_usage(provider_name, model, usage));
-
-                let response_text = strip_think_tags(resp.text_or_empty());
-                // First try native structured tool calls (OpenAI-format).
-                // Fall back to text-based parsing (XML tags, markdown blocks,
-                // GLM format) only if the model_provider returned no native calls —
-                // this ensures we support both native and prompt-guided models.
-                let mut calls: Vec<ParsedToolCall> = if tool_specs.is_empty() {
-                    Vec::new()
-                } else {
-                    resp.tool_calls
-                        .iter()
-                        .map(|call| ParsedToolCall {
-                            name: call.name.clone(),
-                            arguments: serde_json::from_str::<serde_json::Value>(&call.arguments)
-                                .unwrap_or_else(|_| {
-                                    serde_json::Value::Object(serde_json::Map::new())
-                                }),
-                            tool_call_id: Some(call.id.clone()),
-                        })
-                        .collect()
-                };
-                let mut parsed_text = String::new();
-
-                if calls.is_empty()
-                    && !tool_specs.is_empty()
-                    && !strict_tool_parsing
-                    && !looks_like_tool_protocol_example(&response_text)
-                {
-                    let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
-                    let filtered_calls: Vec<ParsedToolCall> = fallback_calls
-                        .into_iter()
-                        .filter(|call| known_tool_names.contains(&call.name.to_ascii_lowercase()))
-                        .collect();
-                    if !fallback_text.is_empty() && !filtered_calls.is_empty() {
-                        parsed_text = fallback_text;
-                    }
-                    calls = filtered_calls;
-                }
-
-                let parse_issue = if strict_tool_parsing {
-                    None
-                } else if tool_specs.is_empty() {
-                    detect_internal_protocol_without_tools(&response_text).or_else(|| {
-                        streamed_protocol_suppressed.then(|| {
-                            "streaming text guard suppressed an internal tool protocol envelope"
-                                .to_string()
-                        })
-                    })
-                } else {
-                    detect_tool_call_parse_issue_for_known_tools(
-                        &response_text,
-                        &calls,
-                        &known_tool_names,
-                    )
-                    .or_else(|| {
-                        streamed_protocol_suppressed.then(|| {
-                            "streaming text guard suppressed an internal tool protocol envelope"
-                                .to_string()
-                        })
-                    })
-                };
-                if let Some(ref issue) = parse_issue {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "model": model,
-                                "iteration": iteration + 1,
-                                "issue": issue.as_str(),
-                                "response": scrub_credentials(&response_text),
-                                "trace_id": turn_id,
-                            })),
-                        "tool_call_parse_issue"
-                    );
-                }
-
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Receive)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                        .with_duration(
-                            u64::try_from(llm_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
-                        )
-                        .with_attrs(::serde_json::json!({
-                            "model": model,
-                            "iteration": iteration + 1,
-                            "input_tokens": resp_input_tokens,
-                            "output_tokens": resp_output_tokens,
-                            "raw_response": scrub_credentials(&response_text),
-                            "native_tool_calls": resp.tool_calls.len(),
-                            "parsed_tool_calls": calls.len(),
-                            "trace_id": turn_id,
-                        })),
-                    "llm_response"
-                );
-
-                // Preserve native tool call IDs in assistant history so role=tool
-                // follow-up messages can reference the exact call id.
-                let reasoning_content = resp.reasoning_content.clone();
-                let assistant_history_content = if resp.tool_calls.is_empty() {
-                    if use_native_tools {
-                        build_native_assistant_history_from_parsed_calls(
-                            &response_text,
-                            &calls,
-                            reasoning_content.as_deref(),
-                        )
-                        .unwrap_or_else(|| response_text.clone())
-                    } else {
-                        response_text.clone()
-                    }
-                } else {
-                    build_native_assistant_history(
-                        &response_text,
-                        &resp.tool_calls,
-                        reasoning_content.as_deref(),
-                    )
-                };
-
-                let native_calls = resp.tool_calls;
-                (
-                    response_text,
-                    parsed_text,
-                    calls,
-                    assistant_history_content,
-                    native_calls,
-                    parse_issue.is_some(),
-                    streamed_protocol_suppressed,
-                    streamed_live_deltas,
-                )
-            }
-            Err(e) => {
-                let safe_error = zeroclaw_providers::sanitize_api_error(&e.to_string());
-                observer.record_event(&ObserverEvent::LlmResponse {
-                    model_provider: provider_name.to_string(),
-                    model: model.to_string(),
-                    duration: llm_started_at.elapsed(),
-                    success: false,
-                    error_message: Some(safe_error.clone()),
-                    input_tokens: None,
-                    output_tokens: None,
-                    channel: None,
-                    agent_alias: None,
-                    turn_id: None,
-                });
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_duration(
-                            u64::try_from(llm_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
-                        )
-                        .with_attrs(::serde_json::json!({
-                            "model": model,
-                            "iteration": iteration + 1,
-                            "error": safe_error,
-                            "trace_id": turn_id,
-                        })),
-                    "llm_response"
-                );
-
-                // Context overflow recovery: trim history and retry
-                if zeroclaw_providers::reliable::is_context_window_exceeded(&e) {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"iteration": iteration + 1})),
-                        "Context window exceeded, attempting in-loop recovery"
-                    );
-
-                    // Step 1: fast-trim old tool results (cheap)
-                    let chars_saved = fast_trim_tool_results(history, 4);
-                    if chars_saved > 0 {
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({"chars_saved": chars_saved})),
-                            "Context recovery: trimmed old tool results, retrying"
-                        );
-                        continue;
-                    }
-
-                    // Step 2: emergency drop oldest non-system messages
-                    let dropped = emergency_history_trim(history, 4);
-                    if dropped > 0 {
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({"dropped": dropped})),
-                            "Context recovery: dropped old messages, retrying"
-                        );
-                        continue;
-                    }
-
-                    // Nothing left to trim — truly unrecoverable
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                        "Context overflow unrecoverable: no trimmable messages"
-                    );
-                }
-
-                return Err(e);
-            }
-        };
-
-        let display_text = resolve_display_text(
-            &response_text,
-            &parsed_text,
-            !tool_calls.is_empty(),
-            !native_tool_calls.is_empty(),
-        );
-
-        // Native provider tool_calls are converted into parsed `tool_calls`
-        // above; if this branch is reached there is no valid native call to run.
-        if tool_calls.is_empty() && parse_issue_detected {
-            malformed_tool_protocol_retries += 1;
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(serde_json::json!({
-                        "channel": channel_name,
-                        "model_provider": provider_name,
-                        "model": model,
-                        "trace_id": turn_id,
-                        "error": "malformed internal tool protocol omitted from channel output",
-                    })),
-                "tool_call_parse_feedback"
-            );
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(serde_json::json!({
-                    "iteration": iteration + 1,
-                    "retry": malformed_tool_protocol_retries,
-                    "max_retries": MAX_MALFORMED_TOOL_PROTOCOL_RETRIES,
-                    "response_excerpt": truncate_with_ellipsis(
-                        &scrub_credentials(&response_text),
-                        600
-                    ),
-                    })),
-                "tool_call_parse_feedback_details"
-            );
-
-            if malformed_tool_protocol_retries <= MAX_MALFORMED_TOOL_PROTOCOL_RETRIES {
-                // This is model feedback, not a tool result: malformed protocol
-                // output has no valid tool_call_id to attach a role=tool message to.
-                history.push(ChatMessage::user(
-                    "[Tool call parse error]\n\
-                     Your previous response looked like an internal tool-call protocol payload, \
-                     but ZeroClaw could not parse it into a valid tool call. Use the supported \
-                     tool-call schema, or answer in natural language if no tool is needed."
-                        .to_string(),
-                ));
-                continue;
-            }
-
-            let fallback =
-                crate::i18n::get_required_cli_string("channel-runtime-malformed-tool-output");
-            accumulated_display_text.push_str(&fallback);
-            if let Some(ref tx) = on_delta {
-                let _ = tx.send(StreamDelta::Text(fallback.to_string())).await;
-            }
-            history.push(ChatMessage::assistant(fallback.to_string()));
-            return Ok(accumulated_display_text);
-        }
-
-        // ── Progress: LLM responded ─────────────────────────────
-        if let Some(ref tx) = on_delta {
-            let llm_secs = llm_started_at.elapsed().as_secs();
-            if !tool_calls.is_empty() {
-                let _ = tx
-                    .send(StreamDelta::Status(format!(
-                        "\u{1f4ac} Got {} tool call(s) ({llm_secs}s)\n",
-                        tool_calls.len()
-                    )))
-                    .await;
-            }
-        }
-
-        if tool_calls.is_empty() {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                    .with_attrs(::serde_json::json!({
-                        "model": model,
-                        "iteration": iteration + 1,
-                        "text": scrub_credentials(&display_text),
-                        "trace_id": turn_id,
-                    })),
-                "turn_final_response"
-            );
-            // No tool calls — this is the final response.
-            accumulated_display_text.push_str(&display_text);
-
-            // If text wasn't streamed live, send it now via post-hoc chunking.
-            // When streamed live, the channel already received the deltas.
-            if let Some(ref tx) = on_delta
-                && !response_streamed_live
-                && !protocol_suppressed
-            {
-                let mut chunk = String::new();
-                for word in display_text.split_inclusive(char::is_whitespace) {
-                    if cancellation_token
-                        .as_ref()
-                        .is_some_and(CancellationToken::is_cancelled)
-                    {
-                        return Err(ToolLoopCancelled.into());
-                    }
-                    chunk.push_str(word);
-                    if chunk.len() >= STREAM_CHUNK_MIN_CHARS
-                        && tx
-                            .send(StreamDelta::Text(std::mem::take(&mut chunk)))
-                            .await
-                            .is_err()
-                    {
-                        break;
-                    }
-                }
-                if !chunk.is_empty() {
-                    let _ = tx.send(StreamDelta::Text(chunk)).await;
-                }
-            }
-
-            history.push(ChatMessage::assistant(response_text.clone()));
-            return Ok(accumulated_display_text);
-        }
-
-        // Do not accumulate intermediate-turn display text into the final
-        // channel response. Native tool-call providers may emit narration or
-        // scratchpad-like text alongside tool calls; draft-capable channels
-        // can still see it live through `on_delta` below, but the final
-        // delivered response must only contain the final assistant turn.
-
-        // Native tool-call model_providers can return assistant text separately from
-        // the structured call payload; relay it to draft-capable channels.
-        if !display_text.is_empty() {
-            if !native_tool_calls.is_empty()
-                && let Some(ref tx) = on_delta
-            {
-                let mut narration = display_text.clone();
-                if !narration.ends_with('\n') {
-                    narration.push('\n');
-                }
-                let _ = tx.send(StreamDelta::Text(narration)).await;
-            }
-            if !silent {
-                print!("{display_text}");
-                let _ = std::io::stdout().flush();
-            }
-        }
-
-        // Execute tool calls and build results. `individual_results` tracks per-call output so
-        // native-mode history can emit one role=tool message per tool call with the correct ID.
-        //
-        // When multiple tool calls are present and interactive CLI approval is not needed, run
-        // tool executions concurrently for lower wall-clock latency.
-        let mut tool_results = String::new();
-        let mut individual_results: Vec<(Option<String>, String)> = Vec::new();
-        let mut ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>> =
-            (0..tool_calls.len()).map(|_| None).collect();
-        let allow_parallel_execution =
-            parallel_tools && should_execute_tools_in_parallel(&tool_calls, approval);
-        let mut executable_indices: Vec<usize> = Vec::new();
-        let mut executable_calls: Vec<ParsedToolCall> = Vec::new();
-
-        for (idx, call) in tool_calls.iter().enumerate() {
-            // ── Hook: before_tool_call (modifying) ──────────
-            let mut tool_name = call.name.clone();
-            let mut tool_args = call.arguments.clone();
-            if let Some(hooks) = hooks {
-                match hooks
-                    .run_before_tool_call(tool_name.clone(), tool_args.clone())
-                    .await
-                {
-                    crate::hooks::HookResult::Cancel(reason) => {
-                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"tool": call.name, "reason": reason.to_string()})), "tool call cancelled by hook");
-                        let cancelled = format!("Cancelled by hook: {reason}");
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Cancel
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "model": model,
-                                "iteration": iteration + 1,
-                                "tool": call.name,
-                                "arguments": scrub_credentials(&tool_args.to_string()),
-                                "result": cancelled,
-                                "trace_id": turn_id,
-                            })),
-                            "tool_call_result"
-                        );
-                        if let Some(ref tx) = on_delta {
-                            let _ = tx
-                                .send(StreamDelta::Status(format!(
-                                    "\u{274c} {}: {}\n",
-                                    call.name,
-                                    truncate_with_ellipsis(&scrub_credentials(&cancelled), 200)
-                                )))
-                                .await;
-                        }
-                        ordered_results[idx] = Some((
-                            call.name.clone(),
-                            call.tool_call_id.clone(),
-                            ToolExecutionOutcome {
-                                output: cancelled,
-                                success: false,
-                                error_reason: Some(scrub_credentials(&reason)),
-                                duration: Duration::ZERO,
-                                receipt: None,
-                            },
-                        ));
-                        continue;
-                    }
-                    crate::hooks::HookResult::Continue((name, args)) => {
-                        tool_name = name;
-                        tool_args = args;
-                    }
-                }
-            }
-
-            maybe_inject_channel_delivery_defaults(
-                &tool_name,
-                &mut tool_args,
-                channel_name,
-                channel_reply_target,
-            );
-
-            super::set_runtime_approved_arg(&tool_name, &mut tool_args, false);
-
-            // ── Approval hook ────────────────────────────────
-            let mut approval_requirement = approval
-                .map(|mgr| mgr.approval_requirement(&tool_name))
-                .unwrap_or(ApprovalRequirement::NotRequired);
-            if let Some(mgr) = approval
-                && approval_requirement == ApprovalRequirement::Prompt
-            {
-                let request = ApprovalRequest {
-                    tool_name: tool_name.clone(),
-                    arguments: tool_args.clone(),
-                };
-
-                // Interactive CLI: prompt the operator.
-                // Non-interactive (channels): try the channel's inline
-                // approval (e.g. Telegram inline keyboard) before falling
-                // back to auto-deny.
-                let decision = if mgr.is_non_interactive() {
-                    let channel_decision = if let Some(ch) = channel {
-                        let ch_request = zeroclaw_api::channel::ChannelApprovalRequest {
-                            tool_name: request.tool_name.clone(),
-                            arguments_summary: crate::approval::summarize_args(&request.arguments),
-                            raw_arguments: Some(request.arguments.clone()),
-                        };
-                        let recipient = channel_reply_target.unwrap_or_default();
-                        match ch.request_approval(recipient, &ch_request).await {
-                            Ok(Some(r)) => Some(r),
-                            Ok(None) => None,
-                            Err(e) => {
-                                ::zeroclaw_log::record!(
-                                    WARN,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Note
-                                    )
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                                    "Channel approval request failed"
-                                );
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    match channel_decision {
-                        Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve) => {
-                            ApprovalResponse::Yes
-                        }
-                        Some(zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove) => {
-                            ApprovalResponse::Always
-                        }
-                        Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny) => {
-                            ApprovalResponse::No
-                        }
-                        Some(zeroclaw_api::channel::ChannelApprovalResponse::DenyWithEdit {
-                            replacement,
-                        }) => ApprovalResponse::ReplaceWith(replacement),
-                        // Channel doesn't support approval — auto-deny.
-                        None => ApprovalResponse::No,
-                    }
-                } else {
-                    mgr.prompt_cli(&request)
-                };
-
-                mgr.record_decision(&tool_name, &tool_args, &decision, channel_name);
-
-                if decision == ApprovalResponse::No {
-                    let denied = "Denied by user.".to_string();
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "model": model,
-                                "iteration": iteration + 1,
-                                "tool": tool_name.clone(),
-                                "arguments": scrub_credentials(&tool_args.to_string()),
-                                "result": denied,
-                                "trace_id": turn_id,
-                            })),
-                        "tool_call_result"
-                    );
-                    if let Some(ref tx) = on_delta {
-                        let _ = tx
-                            .send(StreamDelta::Status(format!(
-                                "\u{274c} {}: {}\n",
-                                tool_name, denied
-                            )))
-                            .await;
-                    }
-                    ordered_results[idx] = Some((
-                        tool_name.clone(),
-                        call.tool_call_id.clone(),
-                        ToolExecutionOutcome {
-                            output: denied.clone(),
-                            success: false,
-                            error_reason: Some(denied),
-                            duration: Duration::ZERO,
-                            receipt: None,
-                        },
-                    ));
-                    continue;
-                }
-
-                if let ApprovalResponse::ReplaceWith(replacement) = &decision {
-                    if let Some(ref tx) = on_delta {
-                        let _ = tx
-                            .send(StreamDelta::Status(format!(
-                                "\u{270f} {}: replaced by user\n",
-                                tool_name
-                            )))
-                            .await;
-                    }
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                            .with_attrs(::serde_json::json!({
-                                "model": model,
-                                "iteration": iteration + 1,
-                                "tool": tool_name.clone(),
-                                "arguments": scrub_credentials(&tool_args.to_string()),
-                                "replaced": true,
-                                "output": scrub_credentials(replacement),
-                                "trace_id": turn_id,
-                            })),
-                        "tool_call_result"
-                    );
-                    ordered_results[idx] = Some((
-                        tool_name.clone(),
-                        call.tool_call_id.clone(),
-                        ToolExecutionOutcome {
-                            output: crate::approval::sanitize_tool_replacement(replacement),
-                            success: true,
-                            error_reason: None,
-                            duration: Duration::ZERO,
-                            receipt: None,
-                        },
-                    ));
-                    continue;
-                }
-
-                if matches!(decision, ApprovalResponse::Yes | ApprovalResponse::Always) {
-                    approval_requirement = ApprovalRequirement::Approved;
-                }
-            }
-            super::set_runtime_approved_arg(
-                &tool_name,
-                &mut tool_args,
-                approval_requirement == ApprovalRequirement::Approved,
-            );
-
-            let signature = {
-                let canonical_args = canonicalize_json_for_tool_signature(&tool_args);
-                let args_json =
-                    serde_json::to_string(&canonical_args).unwrap_or_else(|_| "{}".to_string());
-                (tool_name.trim().to_ascii_lowercase(), args_json)
-            };
-            let dedup_exempt = dedup_exempt_tools.iter().any(|e| e == &tool_name)
-                || crate::tools::REENTRANT_AGENT_TOOLS.contains(&tool_name.as_str());
-            if !dedup_exempt && !seen_tool_signatures.insert(signature) {
-                let duplicate = format!(
-                    "Skipped duplicate tool call '{tool_name}' with identical arguments in this turn."
-                );
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "model": model,
-                            "iteration": iteration + 1,
-                            "tool": tool_name.clone(),
-                            "arguments": scrub_credentials(&tool_args.to_string()),
-                            "result": duplicate,
-                            "deduplicated": true,
-                            "trace_id": turn_id,
-                        })),
-                    "tool_call_result"
-                );
-                if let Some(ref tx) = on_delta {
-                    let _ = tx
-                        .send(StreamDelta::Status(format!(
-                            "\u{274c} {}: {}\n",
-                            tool_name, duplicate
-                        )))
-                        .await;
-                }
-                ordered_results[idx] = Some((
-                    tool_name.clone(),
-                    call.tool_call_id.clone(),
-                    ToolExecutionOutcome {
-                        output: duplicate.clone(),
-                        success: false,
-                        error_reason: Some(duplicate),
-                        duration: Duration::ZERO,
-                        receipt: None,
-                    },
-                ));
-                continue;
-            }
-
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
-                    .with_attrs(::serde_json::json!({
-                        "model": model,
-                        "iteration": iteration + 1,
-                        "tool": tool_name.clone(),
-                        "arguments": scrub_credentials(&tool_args.to_string()),
-                        "trace_id": turn_id,
-                    })),
-                "tool_call_start"
-            );
-
-            // ── Progress: tool start ────────────────────────────
-            if let Some(ref tx) = on_delta {
-                let hint = {
-                    let raw = match tool_name.as_str() {
-                        "shell" => tool_args.get("command").and_then(|v| v.as_str()),
-                        "file_read" | "file_write" => {
-                            tool_args.get("path").and_then(|v| v.as_str())
-                        }
-                        _ => tool_args
-                            .get("action")
-                            .and_then(|v| v.as_str())
-                            .or_else(|| tool_args.get("query").and_then(|v| v.as_str())),
-                    };
-                    match raw {
-                        Some(s) => truncate_with_ellipsis(s, 60),
-                        None => String::new(),
-                    }
-                };
-                let progress = if hint.is_empty() {
-                    format!("\u{23f3} {}\n", tool_name)
-                } else {
-                    format!("\u{23f3} {}: {hint}\n", tool_name)
-                };
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"tool": tool_name})),
-                    "Sending progress start to draft"
-                );
-                let _ = tx.send(StreamDelta::Status(progress)).await;
-            }
-
-            executable_indices.push(idx);
-            executable_calls.push(ParsedToolCall {
-                name: tool_name,
-                arguments: tool_args,
-                tool_call_id: call.tool_call_id.clone(),
-            });
-        }
-
-        let executed_outcomes = if allow_parallel_execution && executable_calls.len() > 1 {
-            execute_tools_parallel(
-                &executable_calls,
-                tools_registry,
-                activated_tools,
-                observer,
-                cancellation_token.as_ref(),
-                receipt_generator,
-            )
-            .await?
-        } else {
-            execute_tools_sequential(
-                &executable_calls,
-                tools_registry,
-                activated_tools,
-                observer,
-                cancellation_token.as_ref(),
-                receipt_generator,
-            )
-            .await?
-        };
-
-        for ((idx, call), outcome) in executable_indices
-            .iter()
-            .zip(executable_calls.iter())
-            .zip(executed_outcomes)
-        {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
-                    .with_outcome(if outcome.success {
-                        ::zeroclaw_log::EventOutcome::Success
-                    } else {
-                        ::zeroclaw_log::EventOutcome::Failure
-                    })
-                    .with_duration(u64::try_from(outcome.duration.as_millis()).unwrap_or(u64::MAX),)
-                    .with_attrs(::serde_json::json!({
-                        "model": model,
-                        "iteration": iteration + 1,
-                        "tool": call.name.clone(),
-                        "error_reason": outcome.error_reason,
-                        "output": scrub_credentials(&outcome.output),
-                        "trace_id": turn_id,
-                    })),
-                "tool_call_result"
-            );
-
-            // ── Hook: after_tool_call (void) ─────────────────
-            if let Some(hooks) = hooks {
-                let tool_result_obj = crate::tools::ToolResult {
-                    success: outcome.success,
-                    output: outcome.output.clone(),
-                    error: None,
-                };
-                hooks
-                    .fire_after_tool_call(&call.name, &tool_result_obj, outcome.duration)
-                    .await;
-            }
-
-            // ── Progress: tool completion ───────────────────────
-            if let Some(ref tx) = on_delta {
-                let secs = outcome.duration.as_secs();
-                let progress_msg = if outcome.success {
-                    format!("\u{2705} {} ({secs}s)\n", call.name)
-                } else if let Some(ref reason) = outcome.error_reason {
-                    format!(
-                        "\u{274c} {} ({secs}s): {}\n",
-                        call.name,
-                        truncate_with_ellipsis(reason, 200)
-                    )
-                } else {
-                    format!("\u{274c} {} ({secs}s)\n", call.name)
-                };
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"tool": call.name, "secs": secs})),
-                    "Sending progress complete to draft"
-                );
-                let _ = tx.send(StreamDelta::Status(progress_msg)).await;
-            }
-
-            ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
-        }
-
-        // Collect tool results and build per-tool output for loop detection.
-        // Only non-ignored tool outputs contribute to the identical-output hash.
-        let mut detection_relevant_output = String::new();
-        // Use enumerate *before* filter_map so result_index stays aligned with
-        // tool_calls even when some ordered_results entries are None.
-        for (result_index, (tool_name, tool_call_id, outcome)) in ordered_results
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, opt)| opt.map(|v| (i, v)))
-        {
-            if !loop_ignore_tools.contains(tool_name.as_str()) {
-                detection_relevant_output.push_str(&outcome.output);
-
-                // Feed the pattern-based loop detector with name + args + result.
-                let args = tool_calls
-                    .get(result_index)
-                    .map(|c| &c.arguments)
-                    .unwrap_or(&serde_json::Value::Null);
-                let det_result = loop_detector.record(&tool_name, args, &outcome.output);
-                match det_result {
-                    crate::agent::loop_detector::LoopDetectionResult::Ok => {}
-                    crate::agent::loop_detector::LoopDetectionResult::Warning(ref msg) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(
-                                ::serde_json::json!({"tool": tool_name, "msg": msg.to_string()})
-                            ),
-                            "loop detector warning"
-                        );
-                        append_or_merge_system_message(history, format!("[Loop Detection] {msg}"));
-                    }
-                    crate::agent::loop_detector::LoopDetectionResult::Block(ref msg) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(
-                                ::serde_json::json!({"tool": tool_name, "msg": msg.to_string()})
-                            ),
-                            "loop detector blocked tool call"
-                        );
-                        // Replace the tool output with the block message.
-                        // We still continue the loop so the LLM sees the block feedback.
-                        append_or_merge_system_message(
-                            history,
-                            format!("[Loop Detection — BLOCKED] {msg}"),
-                        );
-                    }
-                    crate::agent::loop_detector::LoopDetectionResult::Break(msg) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Fail
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "model": model,
-                                "iteration": iteration + 1,
-                                "tool": tool_name,
-                                "message": msg,
-                                "trace_id": turn_id,
-                            })),
-                            "loop_detector_circuit_breaker"
-                        );
-                        anyhow::bail!("Agent loop aborted by loop detector: {msg}");
-                    }
-                }
-            }
-            let canonical_output = canonicalize_tool_result_media_markers(&outcome.output);
-            let mut result_output = truncate_tool_result(&canonical_output, max_tool_result_chars);
-            // Append HMAC receipt to tool result when receipts are enabled
-            if let Some(ref receipt) = outcome.receipt {
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"tool": tool_name, "receipt": receipt})),
-                    "Tool receipt generated"
-                );
-                result_output = format!("{result_output}\n\n[receipt: {receipt}]");
-                if let Some(store) = collected_receipts
-                    && let Ok(mut v) = store.lock()
-                {
-                    v.push(format!("{tool_name}: {receipt}"));
-                }
-            }
-            individual_results.push((tool_call_id, result_output.clone()));
-            let _ = writeln!(
-                tool_results,
-                "<tool_result name=\"{}\">\n{}\n</tool_result>",
-                tool_name, result_output
-            );
-        }
-
-        // ── Time-gated loop detection ──────────────────────────
-        // When pacing.loop_detection_min_elapsed_secs is set, identical-output
-        // loop detection activates after the task has been running that long.
-        // This avoids false-positive aborts on long-running browser/research
-        // workflows while keeping aggressive protection for quick tasks.
-        // When not configured, identical-output detection is disabled (preserving
-        // existing behavior where only max_iterations prevents runaway loops).
-        let loop_detection_active = match pacing.loop_detection_min_elapsed_secs {
-            Some(min_secs) => loop_started_at.elapsed() >= Duration::from_secs(min_secs),
-            None => false, // disabled when not configured (backwards compatible)
-        };
-
-        if loop_detection_active && !detection_relevant_output.is_empty() {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            detection_relevant_output.hash(&mut hasher);
-            let current_hash = hasher.finish();
-
-            if last_tool_output_hash == Some(current_hash) {
-                consecutive_identical_outputs += 1;
-            } else {
-                consecutive_identical_outputs = 0;
-                last_tool_output_hash = Some(current_hash);
-            }
-
-            // Bail if we see 3+ consecutive identical tool outputs (clear runaway).
-            if consecutive_identical_outputs >= 3 {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "model": model,
-                            "iteration": iteration + 1,
-                            "consecutive_identical": consecutive_identical_outputs,
-                            "trace_id": turn_id,
-                        })),
-                    "tool_loop_identical_output_abort"
-                );
-                anyhow::bail!(
-                    "Agent loop aborted: identical tool output detected {} consecutive times",
-                    consecutive_identical_outputs
-                );
-            }
-        }
-
-        // Add assistant message with tool calls + tool results to history.
-        // Native mode: use JSON-structured messages so convert_messages() can
-        // reconstruct proper OpenAI-format tool_calls and tool result messages.
-        // Prompt mode: use XML-based text format as before.
-        history.push(ChatMessage::assistant(assistant_history_content));
-        if native_tool_calls.is_empty() {
-            let all_results_have_ids = use_native_tools
-                && !individual_results.is_empty()
-                && individual_results
-                    .iter()
-                    .all(|(tool_call_id, _)| tool_call_id.is_some());
-            if all_results_have_ids {
-                for (tool_call_id, result) in &individual_results {
-                    let tool_msg = serde_json::json!({
-                        "tool_call_id": tool_call_id,
-                        "content": result,
-                    });
-                    history.push(ChatMessage::tool(tool_msg.to_string()));
-                }
-            } else {
-                history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
-            }
-        } else {
-            // `zip` would drop trailing results on any length divergence,
-            // leaving a native tool_use id with no matching tool_result.
-            // Pair on each result's own id instead.
-            for (idx, (tool_call_id, result)) in individual_results.iter().enumerate() {
-                let resolved_id = tool_call_id
-                    .clone()
-                    .or_else(|| native_tool_calls.get(idx).map(|call| call.id.clone()));
-                let tool_msg = serde_json::json!({
-                    "tool_call_id": resolved_id,
-                    "content": result,
-                });
-                history.push(ChatMessage::tool(tool_msg.to_string()));
-            }
-        }
-    }
-
-    ::zeroclaw_log::record!(
-        WARN,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-            .with_attrs(::serde_json::json!({
-                "model": model,
-                "max_iterations": max_iterations,
-                "trace_id": turn_id,
-            })),
-        "tool_loop_exhausted"
-    );
-
-    // Graceful shutdown: ask the LLM for a final summary without tools
-    ::zeroclaw_log::record!(
-        WARN,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-            .with_attrs(::serde_json::json!({"max_iterations": max_iterations})),
-        "Max iterations reached, requesting final summary"
-    );
-    history.push(ChatMessage::user(
-        "You have reached the maximum number of tool iterations. \
-         Please provide your best answer based on the work completed so far. \
-         Summarize what you accomplished and what remains to be done."
-            .to_string(),
-    ));
-
-    let summary_request = zeroclaw_providers::ChatRequest {
-        messages: history,
-        tools: None, // No tools — force a text response
-        thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-            .try_with(Clone::clone)
-            .ok()
-            .flatten(),
-    };
-    let summary_future = model_provider.chat(summary_request, model, temperature);
-    let summary_call = match pacing.step_timeout_secs {
-        Some(step_secs) if step_secs > 0 => {
-            let step_timeout = Duration::from_secs(step_secs);
-            if let Some(token) = cancellation_token.as_ref() {
-                tokio::select! {
-                    () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                    result = tokio::time::timeout(step_timeout, summary_future) => match result {
-                        Ok(inner) => inner,
-                        Err(_) => anyhow::bail!(
-                            "Final summary LLM call timed out after {step_secs}s (step_timeout_secs)"
-                        ),
-                    },
-                }
-            } else {
-                match tokio::time::timeout(step_timeout, summary_future).await {
-                    Ok(inner) => inner,
-                    Err(_) => anyhow::bail!(
-                        "Final summary LLM call timed out after {step_secs}s (step_timeout_secs)"
-                    ),
-                }
-            }
-        }
-        _ => {
-            if let Some(token) = cancellation_token.as_ref() {
-                tokio::select! {
-                    () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                    result = summary_future => result,
-                }
-            } else {
-                summary_future.await
-            }
-        }
-    };
-    match summary_call {
-        Ok(resp) => {
-            let text = resp.text.unwrap_or_default();
-            if text.is_empty() {
-                anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
-            }
-            accumulated_display_text.push_str(&text);
-            Ok(accumulated_display_text)
-        }
-        Err(e) => {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "model": model,
-                        "provider": provider_name,
-                        "max_iterations": max_iterations,
-                        "trace_id": turn_id,
-                        "error": format!("{e}"),
-                    })),
-                "final summary LLM call failed after iteration exhaustion; bailing"
-            );
-            anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
-        }
-    }
-}
+// The turn engine lives in `super::turn` — `run_tool_call_loop` plus one
+// file per step (run sheet in agent/turn/mod.rs). `crate::agent::loop_`
+// stays the canonical public path via these re-exports.
+pub(crate) use super::turn::StreamCancelledAfterOutput;
+#[cfg(test)]
+pub(crate) use super::turn::{
+    DEFAULT_MAX_TOOL_ITERATIONS, MAX_MALFORMED_TOOL_PROTOCOL_RETRIES,
+    build_native_assistant_history, consume_provider_streaming_response,
+    maybe_inject_channel_delivery_defaults, resolve_display_text,
+};
+pub use super::turn::{
+    DraftEvent, LoopKnobs, MaxIterationBehavior, ModelSwitchCallback, ModelSwitchRequested,
+    PROGRESS_MIN_INTERVAL_MS, StreamDelta, ToolLoopCancelled, drain_steering_messages,
+    is_model_switch_requested, is_tool_loop_cancelled, run_tool_call_loop, scrub_credentials,
+};
 
 /// Build the tool instruction block for the system prompt so the LLM knows
 /// how to invoke tools.
@@ -4018,9 +1487,14 @@ pub async fn run(
                 system_prompt = format!("{prefix}\n\n{system_prompt}");
             }
 
+            let runtime_capability_names = tools_registry
+                .iter()
+                .map(|tool| tool.name())
+                .collect::<Vec<_>>();
             if let Some(suggestion) = crate::skills::render_missing_skill_install_suggestion(
                 &effective_msg,
                 &skills,
+                &runtime_capability_names,
                 &config.data_dir,
                 config.skills.install_suggestions.enabled,
             ) {
@@ -4133,6 +1607,11 @@ pub async fn run(
                                 None, // channel: CLI mode — uses prompt_cli
                                 None, // receipt_generator
                                 None, // collected_receipts
+                                None, // event_tx
+                                None, // steering
+                                None, // new_messages_out
+                                &LoopKnobs::default(),
+                                None,
                             ),
                         ),
                     )
@@ -4244,9 +1723,54 @@ pub async fn run(
                     }
                 }
             }
+            // Emit the user-visible response before any background work so the
+            // skill-review fork can never delay the user's answer.
             final_output = response;
             println!("{final_output}");
             observer.record_event(&ObserverEvent::TurnComplete);
+
+            // Background skill review fork — post-turn, opt-in
+            // (`skills.skill-improvement.enabled`, default false). Runs a forked
+            // agent with a restricted toolset (skills_list, skill_view,
+            // skill_manage) over a snapshot of the conversation and decides
+            // whether to patch SKILL.md, add a support file, or do nothing.
+            //
+            // Scoped under TOOL_LOOP_COST_TRACKING_CONTEXT with the same
+            // `cost_tracking_context` as the parent turn, so the fork's provider
+            // calls are recorded against — and bounded by — the same cost
+            // tracker and budget (the scope wrapping the parent turn's
+            // `run_tool_call_loop` has already exited by this point).
+            // See `crate::skills::review::maybe_run_skill_review`.
+            if config.skills.skill_improvement.enabled {
+                let review_workspace = config.agent_workspace_dir(agent_alias);
+                let review_config = config.skills.skill_improvement.clone();
+                let failed_slugs: Vec<String> =
+                    crate::skills::improver::extract_skill_executions_from_history(&history)
+                        .into_iter()
+                        .filter_map(|(slug, ok)| if ok { None } else { Some(slug) })
+                        .collect();
+                TOOL_LOOP_COST_TRACKING_CONTEXT
+                    .scope(
+                        cost_tracking_context.clone(),
+                        crate::skills::review::maybe_run_skill_review(
+                            review_workspace,
+                            review_config,
+                            config.skills.allow_scripts,
+                            history.clone(),
+                            failed_slugs,
+                            model_provider.as_ref(),
+                            &provider_name,
+                            &model_name,
+                            observer.as_ref(),
+                            &config.multimodal,
+                            &config.pacing,
+                            agent.resolved.max_tool_result_chars,
+                            agent.resolved.max_context_tokens,
+                            None, // cancellation_token — no parent token in single-shot run
+                        ),
+                    )
+                    .await;
+            }
         } else {
             println!("🦀 ZeroClaw Interactive Mode");
             println!("Type /help for commands.\n");
@@ -4388,9 +1912,14 @@ pub async fn run(
                     }
                 }
 
+                let runtime_capability_names = tools_registry
+                    .iter()
+                    .map(|tool| tool.name())
+                    .collect::<Vec<_>>();
                 if let Some(suggestion) = crate::skills::render_missing_skill_install_suggestion(
                     &effective_input,
                     &skills,
+                    &runtime_capability_names,
                     &config.data_dir,
                     config.skills.install_suggestions.enabled,
                 ) {
@@ -4541,6 +2070,11 @@ pub async fn run(
                                     None, // channel: interactive CLI — uses prompt_cli
                                     None, // receipt_generator
                                     None, // collected_receipts
+                                    None, // event_tx
+                                    None, // steering
+                                    None, // new_messages_out
+                                    &LoopKnobs::default(),
+                                    None,
                                 ),
                             ),
                         )
@@ -5283,9 +2817,14 @@ pub async fn process_message(
         }
 
         let effective_msg_ref = effective_message.as_str();
+        let runtime_capability_names = tools_registry
+            .iter()
+            .map(|tool| tool.name())
+            .collect::<Vec<_>>();
         if let Some(suggestion) = crate::skills::render_missing_skill_install_suggestion(
             effective_msg_ref,
             &skills,
+            &runtime_capability_names,
             &config.data_dir,
             config.skills.install_suggestions.enabled,
         ) {
@@ -6757,7 +4296,6 @@ mod tests {
     }
 
     impl FailingTool {
-        #[allow(dead_code)]
         fn new(name: &str, error_reason: &str) -> Self {
             Self {
                 tool_name: name.to_string(),
@@ -6844,6 +4382,11 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect_err("user image on a non-vision provider should error");
@@ -6902,6 +4445,11 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("oversized payload should be skipped and continue as text-only");
@@ -6964,6 +4512,11 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -7025,6 +4578,11 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("text-only fallback should succeed, not abort the turn");
@@ -7086,6 +4644,11 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect_err("should fail when vision model_provider cannot be created");
@@ -7147,6 +4710,11 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("text-only messages should succeed with default model_provider");
@@ -7208,6 +4776,11 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect_err("should fail due to nonexistent vision model_provider");
@@ -7268,6 +4841,11 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("empty image markers should not trigger vision routing");
@@ -7327,6 +4905,11 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect_err("should attempt vision model_provider creation for multiple images");
@@ -7470,6 +5053,11 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("parallel execution should complete");
@@ -7580,6 +5168,11 @@ mod tests {
             None,
             None,
             None,
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("native parallel execution should complete");
@@ -7658,6 +5251,11 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("cron_add delivery defaults should be injected");
@@ -7732,6 +5330,11 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("explicit delivery mode should be preserved");
@@ -7745,6 +5348,164 @@ mod tests {
             .lock()
             .expect("recorded args lock should be valid");
         assert_eq!(recorded[0]["delivery"], serde_json::json!({"mode": "none"}));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_injects_channel_delivery_defaults_for_lark() {
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"cron_add","arguments":{"job_type":"agent","prompt":"remind me later","schedule":{"kind":"every","every_ms":60000}}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let recorded_args = Arc::new(Mutex::new(Vec::new()));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingArgsTool::new(
+            "cron_add",
+            Arc::clone(&recorded_args),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("schedule a reminder"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &model_provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "lark",
+            Some("chat-99"),
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            false,
+            false, // parallel_tools
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
+        )
+        .await
+        .expect("lark cron_add delivery defaults should be injected");
+
+        assert!(
+            result.ends_with("done"),
+            "result should end with 'done', got: {result}"
+        );
+
+        let recorded = recorded_args
+            .lock()
+            .expect("recorded args lock should be valid");
+        let delivery = recorded[0]["delivery"].clone();
+        assert_eq!(
+            delivery,
+            serde_json::json!({
+                "mode": "announce",
+                "channel": "lark",
+                "to": "chat-99",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_injects_channel_delivery_defaults_for_feishu() {
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"cron_add","arguments":{"job_type":"agent","prompt":"feishu reminder","schedule":{"kind":"every","every_ms":60000}}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let recorded_args = Arc::new(Mutex::new(Vec::new()));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingArgsTool::new(
+            "cron_add",
+            Arc::clone(&recorded_args),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("schedule a feishu reminder"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &model_provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "feishu",
+            Some("chat-77"),
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            false,
+            false, // parallel_tools
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
+        )
+        .await
+        .expect("feishu cron_add delivery defaults should be injected");
+
+        assert!(
+            result.ends_with("done"),
+            "result should end with 'done', got: {result}"
+        );
+
+        let recorded = recorded_args
+            .lock()
+            .expect("recorded args lock should be valid");
+        let delivery = recorded[0]["delivery"].clone();
+        assert_eq!(
+            delivery,
+            serde_json::json!({
+                "mode": "announce",
+                "channel": "feishu",
+                "to": "chat-77",
+            })
+        );
     }
 
     #[tokio::test]
@@ -7801,6 +5562,11 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -7883,6 +5649,11 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("non-interactive shell should succeed for low-risk command");
@@ -7955,6 +5726,11 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -8036,6 +5812,11 @@ mod tests {
             None,
             None,
             None,
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("loop should finish running both identical subagent calls");
@@ -8116,6 +5897,11 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("loop should complete");
@@ -8182,6 +5968,11 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("native fallback id flow should complete");
@@ -8252,6 +6043,11 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("malformed tool protocol should retry and recover");
@@ -8317,6 +6113,11 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("business JSON should be returned as normal text");
@@ -8380,6 +6181,11 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("unknown business JSON should be returned as normal text");
@@ -8446,6 +6252,11 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("malformed tool protocol should return a safe fallback");
@@ -8509,6 +6320,11 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("toolcalls reference JSON should remain visible without tools");
@@ -8571,6 +6387,11 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("toolcalls reference JSON should remain visible without tools");
@@ -8625,6 +6446,11 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("schema JSON should remain visible without tools");
@@ -8680,6 +6506,11 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("audit JSON should remain visible without tools");
@@ -8735,6 +6566,11 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("reference JSON should remain visible without tools");
@@ -8792,6 +6628,11 @@ This is an example, not an invocation."#;
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("tool_call tag examples should remain visible without tools");
@@ -8854,6 +6695,11 @@ This is an example, not an invocation."#;
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("registered tool_call fenced examples should remain visible");
@@ -8928,6 +6774,11 @@ This is an example, not an invocation."#;
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("registered tool_call tag examples should remain visible");
@@ -8985,6 +6836,11 @@ Done."#;
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("tagged tool protocol with trailing text should retry and recover");
@@ -9045,6 +6901,11 @@ Done."#;
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("embedded fenced tool protocol should retry and recover");
@@ -9103,6 +6964,11 @@ Done."#;
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("standalone tool_call fence should retry and recover without tools");
@@ -9162,6 +7028,11 @@ This is an example, not an invocation."#;
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("tool_call fenced examples should remain visible without tools");
@@ -9278,6 +7149,11 @@ This is an example, not an invocation."#;
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("split tool_call fenced examples should remain visible without tools");
@@ -9345,6 +7221,11 @@ This is an example, not an invocation."#;
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("JSON-fenced tool protocol examples should remain visible without tools");
@@ -9416,6 +7297,11 @@ This is an example, not an invocation."#;
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("streamed fenced tool call should execute and continue");
@@ -9510,6 +7396,11 @@ This is an example, not an invocation."#;
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("native tool-call text should be relayed through on_delta");
@@ -9609,6 +7500,11 @@ This is an example, not an invocation."#;
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("streaming model_provider should complete");
@@ -9682,6 +7578,11 @@ This is an example, not an invocation."#;
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("streaming tool loop should execute tool and finish");
@@ -9776,6 +7677,7 @@ This is an example, not an invocation."#;
             Some(0.0),
             None,
             Some(&tx),
+            None, // event_tx
             false,
         )
         .await
@@ -9861,6 +7763,7 @@ This is an example, not an invocation."#;
             Some(0.0),
             None,
             Some(&tx),
+            None, // event_tx
             false,
         )
         .await
@@ -9897,6 +7800,7 @@ This is an example, not an invocation."#;
             Some(0.0),
             None,
             Some(&tx),
+            None, // event_tx
             false,
         )
         .await
@@ -9936,6 +7840,7 @@ This is an example, not an invocation."#;
             Some(0.0),
             None,
             Some(&tx),
+            None, // event_tx
             false,
         )
         .await
@@ -9975,6 +7880,7 @@ This is an example, not an invocation."#;
             Some(0.0),
             None,
             Some(&tx),
+            None, // event_tx
             false,
         )
         .await
@@ -10058,6 +7964,7 @@ This is an example, not an invocation."#;
             Some(0.0),
             None,
             Some(&tx),
+            None, // event_tx
             false,
         )
         .await
@@ -10139,6 +8046,7 @@ This is an example, not an invocation."#;
             Some(0.0),
             None,
             Some(&tx),
+            None, // event_tx
             false,
         )
         .await
@@ -10223,6 +8131,7 @@ This is an example, not an invocation."#;
             Some(0.0),
             None,
             Some(&tx),
+            None, // event_tx
             false,
         )
         .await
@@ -10310,6 +8219,7 @@ This is an example, not an invocation."#;
             Some(0.0),
             None,
             Some(&tx),
+            None, // event_tx
             false,
         )
         .await
@@ -10392,6 +8302,7 @@ This is an example, not an invocation."#;
             Some(0.0),
             None,
             Some(&tx),
+            None, // event_tx
             false,
         )
         .await
@@ -10477,6 +8388,7 @@ This is an example, not an invocation."#;
             Some(0.0),
             None,
             Some(&tx),
+            None, // event_tx
             false,
         )
         .await
@@ -10550,6 +8462,11 @@ This is an example, not an invocation."#;
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("native streaming events should preserve tool loop semantics");
@@ -10604,6 +8521,7 @@ This is an example, not an invocation."#;
             Some(0.0),
             None,
             Some(&tx),
+            None, // event_tx
             true,
         )
         .await
@@ -10690,6 +8608,11 @@ This is an example, not an invocation."#;
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("routed streaming model_provider should complete");
@@ -11835,6 +9758,7 @@ Let me check the result."#;
             Some(0.2),
             None,
             None,
+            None, // event_tx
             false,
         )
         .await
@@ -11928,6 +9852,7 @@ Let me check the result."#;
             Some(0.2),
             None,
             None,
+            None, // event_tx
             false,
         )
         .await
@@ -12138,6 +10063,11 @@ Let me check the result."#;
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("tool loop should complete");
@@ -12296,6 +10226,11 @@ Let me check the result."#;
                     None, // channel
                     None, // receipt_generator
                     None, // collected_receipts
+                    None, // event_tx
+                    None, // steering
+                    None, // new_messages_out
+                    &LoopKnobs::default(),
+                    None,
                 ),
             )
             .await
@@ -12353,6 +10288,11 @@ Let me check the result."#;
             None,
             None,
             None,
+            None,
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
             None,
         )
         .await
@@ -12450,6 +10390,11 @@ Let me check the result."#;
                     None, // channel
                     None, // receipt_generator
                     None, // collected_receipts
+                    None, // event_tx
+                    None, // steering
+                    None, // new_messages_out
+                    &LoopKnobs::default(),
+                    None,
                 ),
             )
             .await
@@ -12513,11 +10458,198 @@ Let me check the result."#;
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
         )
         .await
         .expect("should succeed without cost scope");
 
         assert_eq!(result, "ok");
+    }
+
+    // ── Skill review fork cost-accounting tests ──
+    //
+    // The post-turn skill-review fork (`crate::skills::review::maybe_run_skill_review`)
+    // runs AFTER the parent turn's `TOOL_LOOP_COST_TRACKING_CONTEXT.scope(...)`
+    // has exited, so `agent::loop_::run` re-scopes it under the SAME
+    // `cost_tracking_context` as the parent turn. These tests pin that wiring:
+    // the fork's provider calls must be recorded against — and bounded by — the
+    // same tracker/budget as the parent.
+
+    fn review_test_pricing() -> crate::agent::cost::ModelProviderPricing {
+        use std::collections::HashMap;
+        let mut model_pricing: HashMap<String, f64> = HashMap::new();
+        model_pricing.insert("mock-model.input".to_string(), 3.0);
+        model_pricing.insert("mock-model.output".to_string(), 15.0);
+        let mut pricing: crate::agent::cost::ModelProviderPricing = HashMap::new();
+        pricing.insert("mock-provider".to_string(), model_pricing);
+        pricing
+    }
+
+    fn review_test_history() -> Vec<ChatMessage> {
+        // One completed tool call so `should_trigger` (threshold 1) fires.
+        vec![
+            ChatMessage::system("test"),
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("..."),
+            ChatMessage {
+                role: "tool".to_string(),
+                content: "ok".to_string(),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn skill_review_fork_records_cost_usage_under_parent_scope() {
+        use super::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
+        use crate::cost::CostTracker;
+        use crate::observability::noop::NoopObserver;
+
+        // Fork's single provider turn returns "Nothing to save." with usage —
+        // no tool calls, so the fork ends after one recorded provider call.
+        let model_provider = ScriptedModelProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                text: Some("Nothing to save.".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(800),
+                    output_tokens: Some(120),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            }]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+        let observer = NoopObserver;
+        let workspace = tempfile::TempDir::new().unwrap();
+        let cost_config = zeroclaw_config::schema::CostConfig {
+            enabled: true,
+            ..zeroclaw_config::schema::CostConfig::default()
+        };
+        let tracker = Arc::new(CostTracker::new(cost_config, workspace.path()).unwrap());
+        let ctx =
+            ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(review_test_pricing()));
+
+        let review_config = zeroclaw_config::schema::SkillImprovementConfig {
+            enabled: true,
+            cooldown_secs: 0,
+            nudge_interval_iterations: 1,
+            max_review_iterations: 2,
+        };
+
+        TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(ctx),
+                crate::skills::review::maybe_run_skill_review(
+                    workspace.path().to_path_buf(),
+                    review_config,
+                    false,
+                    review_test_history(),
+                    Vec::new(),
+                    &model_provider,
+                    "mock-provider",
+                    "mock-model",
+                    &observer,
+                    &zeroclaw_config::schema::MultimodalConfig::default(),
+                    &zeroclaw_config::schema::PacingConfig::default(),
+                    0,
+                    0,
+                    None,
+                ),
+            )
+            .await;
+
+        let summary = tracker.get_summary().unwrap();
+        assert_eq!(
+            summary.request_count, 1,
+            "review fork must record its provider call under the parent cost scope"
+        );
+        assert_eq!(summary.total_tokens, 920);
+        assert!(summary.session_cost_usd > 0.0);
+    }
+
+    #[tokio::test]
+    async fn skill_review_fork_respects_budget_under_parent_scope() {
+        use super::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
+        use crate::cost::CostTracker;
+        use crate::observability::noop::NoopObserver;
+
+        // Provider that WOULD record usage if reached — but the pre-exceeded
+        // budget must block the call before it happens.
+        let model_provider = ScriptedModelProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                text: Some("should not be reached".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(800),
+                    output_tokens: Some(120),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            }]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+        let observer = NoopObserver;
+        let workspace = tempfile::TempDir::new().unwrap();
+        let cost_config = zeroclaw_config::schema::CostConfig {
+            enabled: true,
+            daily_limit_usd: 0.001, // very low limit
+            ..zeroclaw_config::schema::CostConfig::default()
+        };
+        let tracker = Arc::new(CostTracker::new(cost_config, workspace.path()).unwrap());
+        // Record usage that already exceeds the daily limit.
+        tracker
+            .record_usage(crate::cost::types::TokenUsage::new(
+                "mock-model",
+                100_000,
+                50_000,
+                0,
+                1.0,
+                1.0,
+                0.0,
+            ))
+            .unwrap();
+        let before = tracker.get_summary().unwrap().request_count;
+
+        let ctx =
+            ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(review_test_pricing()));
+        let review_config = zeroclaw_config::schema::SkillImprovementConfig {
+            enabled: true,
+            cooldown_secs: 0,
+            nudge_interval_iterations: 1,
+            max_review_iterations: 2,
+        };
+
+        TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(ctx),
+                crate::skills::review::maybe_run_skill_review(
+                    workspace.path().to_path_buf(),
+                    review_config,
+                    false,
+                    review_test_history(),
+                    Vec::new(),
+                    &model_provider,
+                    "mock-provider",
+                    "mock-model",
+                    &observer,
+                    &zeroclaw_config::schema::MultimodalConfig::default(),
+                    &zeroclaw_config::schema::PacingConfig::default(),
+                    0,
+                    0,
+                    None,
+                ),
+            )
+            .await;
+
+        let after = tracker.get_summary().unwrap().request_count;
+        assert_eq!(
+            after, before,
+            "budget-exceeded fork must not make a recorded provider call"
+        );
     }
 
     // ── apply_policy_tool_filter coverage ─────────────────────

@@ -19,6 +19,7 @@ pub mod system_prompt;
 pub mod thinking;
 pub mod tool_execution;
 pub mod tool_receipts;
+pub(crate) mod turn;
 
 pub(crate) fn is_runtime_approved_arg_tool(tool_name: &str) -> bool {
     matches!(

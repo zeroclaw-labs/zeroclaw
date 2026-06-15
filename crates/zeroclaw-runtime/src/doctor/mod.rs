@@ -832,25 +832,43 @@ fn check_workspace(config: &Config, items: &mut Vec<DiagItem>) {
         }
     }
 
-    // Key workspace files
-    check_file_exists(ws, "SOUL.md", false, cat, items);
-    check_file_exists(ws, "AGENTS.md", false, cat, items);
+    // Per-agent personality files. These are resolved per agent from
+    // `<install>/agents/<alias>/workspace/` (or an explicit
+    // `[agents.<alias>.workspace.path]` override) — never from `data_dir`.
+    // Iterate every enabled agent so multi-agent installs each get checked,
+    // and name the alias in the result so the report is unambiguous. Sorted
+    // for deterministic output (HashMap iteration order is unspecified).
+    let mut agent_aliases: Vec<&String> = config.agents.keys().collect();
+    agent_aliases.sort();
+    for alias in agent_aliases {
+        let agent = config.agents.get(alias).expect("alias from keys()");
+        if !agent.enabled {
+            continue;
+        }
+        let agent_ws = config.agent_workspace_dir(alias);
+        check_agent_file(&agent_ws, "SOUL.md", alias, cat, items);
+        check_agent_file(&agent_ws, "AGENTS.md", alias, cat, items);
+    }
 }
 
-fn check_file_exists(
-    base: &Path,
+/// Existence check for an optional per-agent workspace file. Prefixes the
+/// owning agent alias as `[alias]` so a multi-agent report stays legible and
+/// `(optional)` keeps its single, consistent meaning as the severity hint
+/// (e.g. `[default] SOUL.md present`, `[default] AGENTS.md not found (optional)`).
+fn check_agent_file(
+    workspace_dir: &Path,
     name: &str,
-    required: bool,
+    alias: &str,
     cat: &'static str,
     items: &mut Vec<DiagItem>,
 ) {
-    let path = base.join(name);
-    if path.is_file() {
-        items.push(DiagItem::ok(cat, format!("{name} present")));
-    } else if required {
-        items.push(DiagItem::error(cat, format!("{name} missing")));
+    if workspace_dir.join(name).is_file() {
+        items.push(DiagItem::ok(cat, format!("[{alias}] {name} present")));
     } else {
-        items.push(DiagItem::warn(cat, format!("{name} not found (optional)")));
+        items.push(DiagItem::warn(
+            cat,
+            format!("[{alias}] {name} not found (optional)"),
+        ));
     }
 }
 
@@ -1250,7 +1268,7 @@ mod tests {
             "broken".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "totally-fake.default".into(),
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..Default::default()
             },
         );
@@ -1389,6 +1407,120 @@ mod tests {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with(".zeroclaw_doctor_probe_"))
         );
+    }
+
+    /// Build a Config whose install root is `root`, with an existing
+    /// `data_dir` (so `check_workspace` doesn't early-return) and no agents.
+    /// `config_path` anchors `install_root_dir()` → `agent_workspace_dir()`.
+    fn workspace_test_config(root: &Path) -> Config {
+        let mut config = Config {
+            config_path: root.join("config.toml"),
+            data_dir: root.join("data"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.agents.clear();
+        config
+    }
+
+    fn add_enabled_agent(config: &mut Config, alias: &str) {
+        config.agents.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn check_workspace_finds_soul_in_agent_workspace_not_data_dir() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = workspace_test_config(tmp.path());
+        add_enabled_agent(&mut config, "default");
+
+        // SOUL.md lives in the agent workspace — the real load location.
+        let ws = config.agent_workspace_dir("default");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("SOUL.md"), b"# soul").unwrap();
+        // A decoy in data_dir must NOT satisfy the check (proves we don't
+        // probe data_dir for personality files).
+        std::fs::write(config.data_dir.join("SOUL.md"), b"# decoy").unwrap();
+
+        let mut items = Vec::new();
+        check_workspace(&config, &mut items);
+
+        let soul = items
+            .iter()
+            .find(|i| i.message.contains("SOUL.md"))
+            .expect("SOUL.md diagnostic present");
+        assert_eq!(soul.severity, Severity::Ok);
+        assert_eq!(soul.message, "[default] SOUL.md present");
+        // No bare data_dir-style message ever surfaces.
+        assert!(
+            !items.iter().any(|i| i.message == "SOUL.md present"),
+            "doctor must not report SOUL.md from data_dir"
+        );
+    }
+
+    #[test]
+    fn check_workspace_warns_when_agent_soul_missing() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = workspace_test_config(tmp.path());
+        add_enabled_agent(&mut config, "default");
+        // Workspace dir need not exist; the file simply isn't there.
+
+        let mut items = Vec::new();
+        check_workspace(&config, &mut items);
+
+        let soul = items
+            .iter()
+            .find(|i| i.message.contains("SOUL.md"))
+            .expect("SOUL.md diagnostic present");
+        assert_eq!(soul.severity, Severity::Warn);
+        assert_eq!(soul.message, "[default] SOUL.md not found (optional)");
+    }
+
+    #[test]
+    fn check_workspace_skips_disabled_agents() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = workspace_test_config(tmp.path());
+        config.agents.insert(
+            "dormant".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+
+        let mut items = Vec::new();
+        check_workspace(&config, &mut items);
+
+        assert!(
+            !items.iter().any(|i| i.message.contains("dormant")),
+            "disabled agents must not produce workspace-file diagnostics"
+        );
+    }
+
+    #[test]
+    fn check_workspace_checks_each_enabled_agent() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = workspace_test_config(tmp.path());
+        add_enabled_agent(&mut config, "alpha");
+        add_enabled_agent(&mut config, "zeta");
+
+        let mut items = Vec::new();
+        check_workspace(&config, &mut items);
+
+        // Each enabled agent gets its own SOUL.md + AGENTS.md probe, named.
+        let messages: Vec<&str> = items.iter().map(|i| i.message.as_str()).collect();
+        for alias in ["alpha", "zeta"] {
+            let expected = format!("[{alias}] SOUL.md not found (optional)");
+            assert!(
+                messages.contains(&expected.as_str()),
+                "expected per-agent SOUL.md diagnostic for {alias}; got {messages:?}"
+            );
+        }
     }
 
     #[test]

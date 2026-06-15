@@ -406,13 +406,13 @@ pub struct BuilderSubmission {
 }
 
 /// Peer-group entry staged in the Quickstart. Maps 1:1 to a
-/// `[peer-groups.<name>]` table written at apply time. The `channel`
+/// `[peer_groups.<name>]` table written at apply time. The `channel`
 /// field carries a `<type>.<alias>` ref pointing at either a staged
 /// channel from the same submission or a pre-existing one.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct QuickstartPeerGroup {
-    /// Map key written to `peer-groups.<name>`. Synthesized by surfaces
+    /// Map key written to `peer_groups.<name>`. Synthesized by surfaces
     /// from the channel ref so no `match` table is involved.
     pub name: String,
     /// Channel ref (`<type>.<alias>`) the peer group authorizes.
