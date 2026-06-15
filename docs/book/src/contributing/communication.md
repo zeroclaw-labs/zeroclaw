@@ -49,7 +49,7 @@ Use this split when choosing a surface:
 | RFC issues | Architecture, governance, lifecycle, compatibility, or process decisions that need formal review | The RFC is accepted, rejected, superseded, or split into implementation issues |
 | PR comments | Review feedback and implementation details for an active change | The detail becomes durable policy, reusable docs, a follow-up issue, or release note |
 
-Discussion categories should make the expected outcome obvious. Use Q&A for answerable questions, Ideas for proposals that need community shaping, Show and tell for project-related demos or integrations, Polls for community votes, Announcements for maintainer updates, and General for broad searchable conversation or early architecture exploration before an RFC exists.
+Discussion categories should make the expected outcome obvious. Use Q&A for answerable questions, Ideas for proposals that need community shaping, Show and tell for project-related demos, integrations, or downstream forks people want to share, Polls for community votes, Announcements for maintainer updates, and General for broad searchable conversation, early architecture exploration, or downstream/fork/enterprise collaboration that is not yet tracked work. If downstream collaboration becomes recurring enough to need its own stewarded lane, maintainers can add a dedicated category later.
 
 Close the loop when a Discussion moves. Add a short summary and link to the issue, RFC, PR, or doc that now owns the outcome. If the category supports accepted answers, mark the summary or tracked-work link as the answer when that accurately reflects the result.
 
