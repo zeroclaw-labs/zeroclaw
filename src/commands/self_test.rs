@@ -421,6 +421,7 @@ async fn check_memory_roundtrip(config: &crate::config::Config) -> CheckResult {
 
 #[cfg(feature = "gateway")]
 async fn check_websocket_handshake(config: &crate::config::Config) -> CheckResult {
+    use std::fmt::Write as _;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::http::header;
 
@@ -437,7 +438,7 @@ async fn check_websocket_handshake(config: &crate::config::Config) -> CheckResul
 
     if config.gateway.require_pairing {
         if let Some(token) = resolve_gateway_bearer_token(config) {
-            probe_url.push_str(&format!("&token={token}"));
+            write!(probe_url, "&token={token}").expect("writing to String cannot fail");
         } else {
             return CheckResult::fail(
                 "websocket",
