@@ -1177,6 +1177,10 @@ mod tests {
             channel_enum.iter().any(|value| value == "webhook"),
             "delivery.channel enum must include webhook"
         );
+        assert!(
+            channel_enum.iter().any(|value| value == "whatsapp"),
+            "delivery.channel enum must include whatsapp"
+        );
 
         let delivery_props = schema["properties"]["delivery"]["properties"]
             .as_object()

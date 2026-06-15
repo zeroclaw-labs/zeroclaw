@@ -799,6 +799,12 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<serde_json::Value>,
+    /// Path to a PEM-encoded CA certificate for TLS connections to this provider.
+    /// Must be an absolute path; shell expansion (e.g. `~`) is not performed.
+    /// Leave unset to use the system's default trust store.
+    #[tab(Connection)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ca_cert_path: Option<String>,
 }
 
 // ── Per-family model model_provider configs ────────────────────────────
@@ -3275,6 +3281,26 @@ pub struct AliasedAgentConfig {
     #[serde(default)]
     pub classifier_provider: crate::providers::ModelProviderRef,
 
+    /// Auto-allow delegation to every agent sharing this agent's risk
+    /// profile. Default `true` preserves the historical reach where any
+    /// same-profile peer is a delegation target. Set `false` to opt this
+    /// agent out so only the explicit `delegates` list is reachable.
+    /// Gating (whether delegation is permitted at all) still lives on the
+    /// risk profile's `delegation_policy.mode`; this only narrows reach.
+    #[tab(General)]
+    #[serde(default = "default_true")]
+    pub delegate_same_risk_profile: bool,
+
+    /// Explicit delegate roster: additional agent aliases this agent may
+    /// delegate to, beyond same-profile peers. Possibly empty. Entries
+    /// may name agents on a different risk profile; such cross-profile
+    /// targets run under the target's own resolved policy and tool
+    /// registry. `Config::validate()` fails loud on a dangling alias or a
+    /// self-reference.
+    #[tab(General)]
+    #[serde(default)]
+    pub delegates: Vec<String>,
+
     // ── Resolved runtime tunables (populated by `resolved_agent_config`
     // from the runtime profile; not config-settable on the agent). ──
     #[serde(skip)]
@@ -3325,6 +3351,8 @@ impl Default for AliasedAgentConfig {
             tts_provider: crate::providers::TtsProviderRef::default(),
             transcription_provider: crate::providers::TranscriptionProviderRef::default(),
             classifier_provider: crate::providers::ModelProviderRef::default(),
+            delegate_same_risk_profile: true,
+            delegates: Vec::new(),
             resolved: ResolvedRuntime::default(),
             workspace: crate::multi_agent::AgentWorkspaceConfig::default(),
             memory: crate::multi_agent::AgentMemoryConfig::default(),
@@ -3430,6 +3458,47 @@ impl Config {
             return None;
         }
         self.risk_profiles.get(profile_alias)
+    }
+
+    /// Resolve the set of agent aliases `caller_alias` may delegate to:
+    /// same-profile peers when `delegate_same_risk_profile` is set, unioned
+    /// with the explicit `delegates` roster, minus the caller. Single
+    /// source of truth for delegate reach; gating (`delegation_policy`)
+    /// is enforced separately by the caller. Deduped, sorted; unknown
+    /// caller yields empty. Disabled targets are never reachable.
+    #[must_use]
+    pub fn reachable_delegate_targets(&self, caller_alias: &str) -> Vec<String> {
+        let Some(caller) = self.agents.get(caller_alias) else {
+            return Vec::new();
+        };
+
+        let mut targets: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+        if caller.delegate_same_risk_profile {
+            let caller_profile = caller.risk_profile.trim();
+            if !caller_profile.is_empty() {
+                for (alias, agent) in &self.agents {
+                    if alias.as_str() != caller_alias
+                        && agent.enabled
+                        && agent.risk_profile.trim() == caller_profile
+                    {
+                        targets.insert(alias.clone());
+                    }
+                }
+            }
+        }
+
+        for explicit in &caller.delegates {
+            let trimmed = explicit.trim();
+            if trimmed.is_empty() || trimmed == caller_alias {
+                continue;
+            }
+            if self.agents.get(trimmed).is_some_and(|agent| agent.enabled) {
+                targets.insert(trimmed.to_string());
+            }
+        }
+
+        targets.into_iter().collect()
     }
 
     /// Resolve the `[runtime_profiles.<alias>]` entry owned by an agent
@@ -5189,30 +5258,55 @@ pub struct SkillInstallSuggestionsConfig {
     pub enabled: bool,
 }
 
-/// Skill self-improvement configuration (`[skills.auto_improve]` section).
+/// Skill self-improvement configuration (`[skills.skill-improvement]` section).
+///
+/// Controls the post-turn background review fork that may patch, expand, or
+/// archive skills based on what the conversation revealed. The fork runs in a
+/// restricted toolset (only `skills_list`, `skill_view`, `skill_manage`) and
+/// never touches the user-visible conversation.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "skills.skill_improvement"]
 pub struct SkillImprovementConfig {
-    /// Enable automatic skill improvement after successful skill usage.
-    /// Default: `true`.
-    #[serde(default = "default_true")]
+    /// Enable the background skill-review fork. Default: `false`.
+    /// Opt-in: users must explicitly enable this to allow post-turn skill
+    /// mutations.
+    #[serde(default)]
     pub enabled: bool,
-    /// Minimum interval (in seconds) between improvements for the same skill.
-    /// Default: `3600` (1 hour).
+    /// Minimum interval (in seconds) between reviews for the same skill.
+    /// Acts as a durable rate limit on patches to any one skill. Default: `3600`.
     #[serde(default = "default_skill_improvement_cooldown")]
     pub cooldown_secs: u64,
+    /// Spawn a review fork once at least this many tool-call iterations have
+    /// accumulated in the current run. `0` disables iteration-based triggering.
+    /// Default: `10`.
+    #[serde(default = "default_nudge_interval_iterations")]
+    pub nudge_interval_iterations: u32,
+    /// Maximum tool-call iterations the review fork itself is allowed to make.
+    /// Caps the fork's LLM cost. Default: `8`.
+    #[serde(default = "default_max_review_iterations")]
+    pub max_review_iterations: u32,
 }
 
 fn default_skill_improvement_cooldown() -> u64 {
     3600
 }
 
+fn default_nudge_interval_iterations() -> u32 {
+    10
+}
+
+fn default_max_review_iterations() -> u32 {
+    8
+}
+
 impl Default for SkillImprovementConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             cooldown_secs: 3600,
+            nudge_interval_iterations: 10,
+            max_review_iterations: 8,
         }
     }
 }
@@ -12567,14 +12661,16 @@ impl ChannelConfig for NextcloudTalkConfig {
 
 impl WhatsAppConfig {
     /// Detect which backend to use based on config fields.
-    /// Returns "cloud" if phone_number_id is set, "web" if session_path is set.
+    /// Cloud API when `phone_number_id` is set; otherwise Web when any
+    /// Web-only selector (`session_path`, `pair_phone`, `pair_code`,
+    /// `ws_url`, or `mode = personal`) is present. Falls back to Cloud
+    /// for an otherwise-empty config (env-injected Cloud credentials).
     pub fn backend_type(&self) -> &'static str {
         if self.phone_number_id.is_some() {
             "cloud"
-        } else if self.session_path.is_some() {
+        } else if self.has_web_selector() {
             "web"
         } else {
-            // Default to Cloud API for backward compatibility
             "cloud"
         }
     }
@@ -12584,16 +12680,29 @@ impl WhatsAppConfig {
         self.phone_number_id.is_some() && self.access_token.is_some() && self.verify_token.is_some()
     }
 
-    /// Check if this is a valid Web config
-    pub fn is_web_config(&self) -> bool {
+    /// Any Web-only selector that signals WhatsApp Web intent. `mode`
+    /// defaults to `Business` on every config, so only a non-default
+    /// `Personal` mode counts; the rest are `Option` fields absent by
+    /// default.
+    pub fn has_web_selector(&self) -> bool {
         self.session_path.is_some()
+            || self.pair_phone.is_some()
+            || self.pair_code.is_some()
+            || self.ws_url.is_some()
+            || self.mode == WhatsAppWebMode::Personal
+    }
+
+    /// Check if this is a valid Web config. The Web client defaults a
+    /// missing `session_path`, so any Web selector is sufficient.
+    pub fn is_web_config(&self) -> bool {
+        self.has_web_selector()
     }
 
     /// Returns true when both Cloud and Web selectors are present.
     ///
     /// Runtime currently prefers Cloud mode in this case for backward compatibility.
     pub fn is_ambiguous_config(&self) -> bool {
-        self.phone_number_id.is_some() && self.session_path.is_some()
+        self.phone_number_id.is_some() && self.has_web_selector()
     }
 }
 
@@ -16973,6 +17082,35 @@ impl Config {
                 );
             }
 
+            // delegates: explicit roster entries must point at OTHER
+            // configured agents, never self. Cross-profile targets are
+            // permitted (they run under the target's own policy), so no
+            // profile match is required here.
+            for (i, target) in agent.delegates.iter().enumerate() {
+                let target_str = target.trim();
+                if target_str.is_empty() {
+                    validation_bail!(
+                        RequiredFieldEmpty,
+                        format!("agents.{alias}.delegates[{i}]"),
+                        "agents.{alias}.delegates[{i}] is empty; remove it or name a configured agent",
+                    );
+                }
+                if target_str == alias.as_str() {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.delegates[{i}]"),
+                        "agents.{alias}.delegates[{i}] = {target_str:?} names this agent itself; an agent cannot delegate to itself",
+                    );
+                }
+                if !self.agents.contains_key(target_str) {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("agents.{alias}.delegates[{i}]"),
+                        "agents.{alias}.delegates[{i}] = {target_str:?} but agents.{target_str} is not configured",
+                    );
+                }
+            }
+
             // workspace.access: keys must point at OTHER agents, never
             // self, and every target must be a configured agent.
             for (target, mode) in &agent.workspace.access {
@@ -21251,6 +21389,41 @@ allowed_numbers = ["+1", "+2"]
         };
         assert!(!wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "web");
+    }
+
+    #[test]
+    async fn whatsapp_config_backend_type_web_from_personal_pairing() {
+        let wc = WhatsAppConfig {
+            enabled: true,
+            mode: WhatsAppWebMode::Personal,
+            pair_phone: Some("+10000000000".into()),
+            ..Default::default()
+        };
+        assert_eq!(wc.backend_type(), "web");
+        assert!(wc.is_web_config());
+        assert!(!wc.is_cloud_config());
+
+        let pair_only = WhatsAppConfig {
+            enabled: true,
+            pair_phone: Some("+10000000000".into()),
+            ..Default::default()
+        };
+        assert_eq!(pair_only.backend_type(), "web");
+
+        let empty = WhatsAppConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert_eq!(empty.backend_type(), "cloud");
+
+        let cloud_plus_pairing = WhatsAppConfig {
+            enabled: true,
+            phone_number_id: Some("123".into()),
+            pair_phone: Some("+10000000000".into()),
+            ..Default::default()
+        };
+        assert_eq!(cloud_plus_pairing.backend_type(), "cloud");
+        assert!(cloud_plus_pairing.is_ambiguous_config());
     }
 
     #[test]
@@ -27809,5 +27982,127 @@ allowed_users = []
             .insert("primary".to_string(), entry);
 
         assert!(config.collect_warnings().is_empty());
+    }
+
+    fn delegate_roster_config() -> Config {
+        let mut cfg = Config::default();
+        cfg.providers.models.ollama.insert(
+            "default".to_string(),
+            crate::schema::OllamaModelProviderConfig::default(),
+        );
+        cfg.risk_profiles
+            .insert("shared".to_string(), RiskProfileConfig::default());
+        cfg.risk_profiles
+            .insert("lore".to_string(), RiskProfileConfig::default());
+        for (alias, profile) in [
+            ("aaa", "shared"),
+            ("aaatools", "shared"),
+            ("aaalore", "lore"),
+        ] {
+            cfg.agents.insert(
+                alias.to_string(),
+                AliasedAgentConfig {
+                    risk_profile: profile.into(),
+                    model_provider: "ollama.default".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
+        cfg
+    }
+
+    #[test]
+    async fn reachable_targets_auto_allows_same_profile_peers() {
+        let cfg = delegate_roster_config();
+        assert_eq!(cfg.reachable_delegate_targets("aaa"), vec!["aaatools"]);
+    }
+
+    #[test]
+    async fn reachable_targets_excludes_self() {
+        let cfg = delegate_roster_config();
+        assert!(
+            !cfg.reachable_delegate_targets("aaa")
+                .iter()
+                .any(|a| a == "aaa")
+        );
+    }
+
+    #[test]
+    async fn reachable_targets_opt_out_hides_peers_keeps_explicit() {
+        let mut cfg = delegate_roster_config();
+        let aaa = cfg.agents.get_mut("aaa").unwrap();
+        aaa.delegate_same_risk_profile = false;
+        aaa.delegates = vec!["aaalore".to_string()];
+        assert_eq!(cfg.reachable_delegate_targets("aaa"), vec!["aaalore"]);
+    }
+
+    #[test]
+    async fn reachable_targets_unions_peers_and_explicit_cross_profile() {
+        let mut cfg = delegate_roster_config();
+        cfg.agents.get_mut("aaa").unwrap().delegates = vec!["aaalore".to_string()];
+        assert_eq!(
+            cfg.reachable_delegate_targets("aaa"),
+            vec!["aaalore", "aaatools"]
+        );
+    }
+
+    #[test]
+    async fn reachable_targets_unknown_caller_is_empty() {
+        let cfg = delegate_roster_config();
+        assert!(cfg.reachable_delegate_targets("nope").is_empty());
+    }
+
+    #[test]
+    async fn reachable_targets_excludes_disabled_same_profile_peer() {
+        let mut cfg = delegate_roster_config();
+        cfg.agents.get_mut("aaatools").unwrap().enabled = false;
+        assert!(
+            cfg.reachable_delegate_targets("aaa").is_empty(),
+            "disabled same-profile peer must not be reachable"
+        );
+    }
+
+    #[test]
+    async fn reachable_targets_excludes_disabled_explicit_delegate() {
+        let mut cfg = delegate_roster_config();
+        cfg.agents
+            .get_mut("aaa")
+            .unwrap()
+            .delegate_same_risk_profile = false;
+        cfg.agents.get_mut("aaa").unwrap().delegates = vec!["aaalore".to_string()];
+        cfg.agents.get_mut("aaalore").unwrap().enabled = false;
+        assert!(
+            cfg.reachable_delegate_targets("aaa").is_empty(),
+            "disabled explicit delegate must not be reachable"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_dangling_delegate_target() {
+        let mut cfg = delegate_roster_config();
+        cfg.agents.get_mut("aaa").unwrap().delegates = vec!["ghost".to_string()];
+        let err = cfg.validate().expect_err("dangling delegate must fail");
+        assert!(format!("{err:#}").contains("delegates"), "{err:#}");
+    }
+
+    #[test]
+    async fn validate_rejects_self_delegate() {
+        let mut cfg = delegate_roster_config();
+        cfg.agents.get_mut("aaa").unwrap().delegates = vec!["aaa".to_string()];
+        let err = cfg.validate().expect_err("self-delegate must fail");
+        assert!(format!("{err:#}").contains("itself"), "{err:#}");
+    }
+
+    #[test]
+    async fn delegate_fields_default_for_legacy_config_roundtrip() {
+        let toml_src = "\
+[agents.legacy]
+risk_profile = \"shared\"
+model_provider = \"ollama.default\"
+";
+        let cfg: Config = toml::from_str(toml_src).expect("legacy config parses");
+        let agent = cfg.agents.get("legacy").expect("agent present");
+        assert!(agent.delegate_same_risk_profile, "default must be true");
+        assert!(agent.delegates.is_empty(), "default must be empty");
     }
 }
