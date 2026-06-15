@@ -15,6 +15,9 @@
 //! To add a new tool, implement [`Tool`] in a new submodule and register it in
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
+pub mod mcp_bundle;
+pub use mcp_bundle::resolve_mcp_servers_for_agent;
+
 pub mod attribution;
 pub mod cron_add;
 pub(crate) mod cron_common;

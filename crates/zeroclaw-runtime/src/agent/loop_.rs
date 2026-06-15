@@ -1084,16 +1084,17 @@ pub async fn run(
         > = None;
         // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
         let mut mcp_elevation_arcs: Vec<std::sync::Arc<dyn Tool>> = Vec::new();
-        if config.mcp.enabled && !config.mcp.servers.is_empty() {
+        let agent_mcp_servers = crate::tools::resolve_mcp_servers_for_agent(&config, agent_alias);
+        if config.mcp.enabled && !agent_mcp_servers.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 &format!(
                     "Initializing MCP client — {} server(s) configured",
-                    config.mcp.servers.len()
+                    agent_mcp_servers.len()
                 )
             );
-            match crate::tools::McpRegistry::connect_all(&config.mcp.servers).await {
+            match crate::tools::McpRegistry::connect_all(&agent_mcp_servers).await {
                 Ok(registry) => {
                     let registry = std::sync::Arc::new(registry);
                     mcp_elevation_arcs = crate::tools::collect_mcp_elevation_arcs(&registry).await;
@@ -2604,16 +2605,18 @@ pub async fn process_message(
         > = None;
         // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
         let mut mcp_elevation_arcs: Vec<std::sync::Arc<dyn Tool>> = Vec::new();
-        if config.mcp.enabled && !config.mcp.servers.is_empty() {
+        let agent_mcp_servers_pm =
+            crate::tools::resolve_mcp_servers_for_agent(&config, agent_alias);
+        if config.mcp.enabled && !agent_mcp_servers_pm.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 &format!(
                     "Initializing MCP client — {} server(s) configured",
-                    config.mcp.servers.len()
+                    agent_mcp_servers_pm.len()
                 )
             );
-            match crate::tools::McpRegistry::connect_all(&config.mcp.servers).await {
+            match crate::tools::McpRegistry::connect_all(&agent_mcp_servers_pm).await {
                 Ok(registry) => {
                     let registry = std::sync::Arc::new(registry);
                     mcp_elevation_arcs = crate::tools::collect_mcp_elevation_arcs(&registry).await;
