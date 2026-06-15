@@ -138,7 +138,11 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install mold linker
         if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y mold
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
+            /etc/apt/sources.list.d/azure-cli.list
+          sudo apt-get update -qq
+          sudo apt-get install -y mold
       - name: Ensure web/dist placeholder exists
         shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
@@ -272,7 +276,11 @@ jobs:
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Install mold linker
-        run: sudo apt-get update -qq && sudo apt-get install -y mold
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
+            /etc/apt/sources.list.d/azure-cli.list
+          sudo apt-get update -qq
+          sudo apt-get install -y mold
       - name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
       - name: Run tests
