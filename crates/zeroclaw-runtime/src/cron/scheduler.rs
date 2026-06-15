@@ -399,7 +399,7 @@ fn cron_agent_run_security_policy(base: &SecurityPolicy, job: &CronJob) -> Secur
     policy
 }
 
-fn cron_agent_session_path(target: SessionTarget, run_session_id: &str) -> std::path::PathBuf {
+fn cron_agent_session_path(target: &SessionTarget, run_session_id: &str) -> std::path::PathBuf {
     match target {
         SessionTarget::Main => std::path::PathBuf::from("main"),
         SessionTarget::Isolated => std::path::PathBuf::from(format!("cron-{run_session_id}")),
@@ -629,7 +629,7 @@ async fn run_agent_job(
     // Main-target jobs reuse the stable `main` session path documented in
     // `session_target`.
     let run_session_id = uuid::Uuid::new_v4().to_string();
-    let session_path = cron_agent_session_path(job.session_target, &run_session_id);
+    let session_path = cron_agent_session_path(&job.session_target, &run_session_id);
 
     let subagent_span = zeroclaw_log::info_span!(
         "subagent",
@@ -1210,11 +1210,11 @@ mod tests {
     #[test]
     fn cron_agent_session_path_main_is_stable() {
         assert_eq!(
-            cron_agent_session_path(SessionTarget::Main, "ignored"),
+            cron_agent_session_path(&SessionTarget::Main, "ignored"),
             std::path::PathBuf::from("main")
         );
         assert_eq!(
-            cron_agent_session_path(SessionTarget::Isolated, "abc").to_string_lossy(),
+            cron_agent_session_path(&SessionTarget::Isolated, "abc").to_string_lossy(),
             "cron-abc"
         );
     }
