@@ -8724,7 +8724,7 @@ pub async fn start_channels(
             agent.resolved.compact_context,
             agent.resolved.max_system_prompt_chars,
             true,
-            ctx.show_tool_calls,
+            config.channels.show_tool_calls,
         );
         if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
