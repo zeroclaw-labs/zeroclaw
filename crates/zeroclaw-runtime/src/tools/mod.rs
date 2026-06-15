@@ -1350,20 +1350,10 @@ pub fn all_tools_with_runtime(
     // ── WASM plugin tools (requires plugins-wasm feature) ──
     #[cfg(feature = "plugins-wasm")]
     {
-        let plugin_dir = config.plugins.plugins_dir.clone();
-        let plugin_path = if plugin_dir.starts_with("~/") {
-            let home = directories::UserDirs::new()
-                .map(|u| u.home_dir().to_path_buf())
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
-            home.join(plugin_dir.strip_prefix("~/").unwrap())
-        } else {
-            std::path::PathBuf::from(&plugin_dir)
-        };
+        let plugin_path = config.plugins.resolved_plugins_dir();
 
         if plugin_path.exists() && config.plugins.enabled {
-            match zeroclaw_plugins::host::PluginHost::new(
-                plugin_path.parent().unwrap_or(&plugin_path),
-            ) {
+            match zeroclaw_plugins::host::PluginHost::from_plugins_dir(&plugin_path) {
                 Ok(host) => {
                     let details = host.tool_plugin_details();
                     let count = details.len();
@@ -1391,6 +1381,22 @@ pub fn all_tools_with_runtime(
                         "Failed to load WASM plugins"
                     );
                 }
+            }
+        }
+
+        // Surface plugins stranded in a legacy install dir so they aren't
+        // silently ignored — the user can relocate them with `plugin migrate`.
+        if config.plugins.enabled {
+            for legacy in zeroclaw_config::schema::legacy_plugin_dirs_with_entries(&config) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "legacy_dir": legacy.display().to_string()
+                        })),
+                    "Plugins in a legacy directory are not loaded; run `zeroclaw plugin migrate`"
+                );
             }
         }
     }

@@ -2402,6 +2402,8 @@ enum PluginCommands {
         /// Plugin name
         name: String,
     },
+    /// Move plugins from legacy install directories into the configured one
+    Migrate,
 }
 
 #[derive(Subcommand, Debug)]
@@ -5323,7 +5325,9 @@ async fn main() -> Result<()> {
         #[cfg(feature = "plugins-wasm")]
         Commands::Plugin { plugin_command } => match plugin_command {
             PluginCommands::List => {
-                let host = zeroclaw::plugins::host::PluginHost::new(&config.data_dir)?;
+                let host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(
+                    &config.plugins.resolved_plugins_dir(),
+                )?;
                 let plugins = host.list_plugins();
                 if plugins.is_empty() {
                     println!("{}", t("cli-plugins-none", "No plugins installed."));
@@ -5338,10 +5342,24 @@ async fn main() -> Result<()> {
                         );
                     }
                 }
+                let target = config.plugins.resolved_plugins_dir().display().to_string();
+                for legacy in crate::config::schema::legacy_plugin_dirs_with_entries(&config) {
+                    eprintln!(
+                        "{}",
+                        ta(
+                            "cli-plugin-legacy-detected",
+                            &[("path", &legacy.display().to_string()), ("target", &target)],
+                            "Note: plugins in a legacy location are not loaded by the agent — \
+                             run `zeroclaw plugin migrate` to move them.",
+                        )
+                    );
+                }
                 Ok(())
             }
             PluginCommands::Install { source } => {
-                let mut host = zeroclaw::plugins::host::PluginHost::new(&config.data_dir)?;
+                let mut host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(
+                    &config.plugins.resolved_plugins_dir(),
+                )?;
                 host.install(&source)?;
                 println!(
                     "{}",
@@ -5354,7 +5372,9 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             PluginCommands::Remove { name } => {
-                let mut host = zeroclaw::plugins::host::PluginHost::new(&config.data_dir)?;
+                let mut host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(
+                    &config.plugins.resolved_plugins_dir(),
+                )?;
                 host.remove(&name)?;
                 println!(
                     "{}",
@@ -5363,7 +5383,9 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             PluginCommands::Info { name } => {
-                let host = zeroclaw::plugins::host::PluginHost::new(&config.data_dir)?;
+                let host = zeroclaw::plugins::host::PluginHost::from_plugins_dir(
+                    &config.plugins.resolved_plugins_dir(),
+                )?;
                 match host.get_plugin(&name) {
                     Some(info) => {
                         println!(
@@ -5419,6 +5441,34 @@ async fn main() -> Result<()> {
                             "Plugin not found"
                         )
                     ),
+                }
+                Ok(())
+            }
+            PluginCommands::Migrate => {
+                let target = config.plugins.resolved_plugins_dir();
+                let target_str = target.display().to_string();
+                let legacy_dirs = crate::config::schema::legacy_plugin_dirs_with_entries(&config);
+                let mut total = 0usize;
+                for legacy in &legacy_dirs {
+                    let moved = zeroclaw::plugins::host::migrate_plugins_dir(legacy, &target)?;
+                    if moved > 0 {
+                        println!(
+                            "{}",
+                            ta(
+                                "cli-plugin-migrated",
+                                &[
+                                    ("count", &moved.to_string()),
+                                    ("path", &legacy.display().to_string()),
+                                    ("target", &target_str),
+                                ],
+                                "Migrated plugins from a legacy location.",
+                            )
+                        );
+                    }
+                    total += moved;
+                }
+                if total == 0 {
+                    println!("{}", t("cli-plugin-migrate-none", "Nothing to migrate."));
                 }
                 Ok(())
             }
