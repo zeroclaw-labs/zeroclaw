@@ -6,7 +6,7 @@ When a maintainer-authored PR replaces a contributor's open PR, attribution and 
 
 Superseding is the heaviest option. Before you open one, try in this order:
 
-1. **Push fixups to the contributor's branch.** If the PR has `maintainerCanModify: true` (the default for PRs from personal forks — confirm with `gh pr view <number> --json maintainerCanModify`), push your fixups directly and merge the contributor's PR. Attribution stays clean in `git log`, `git blame`, and the contributor's GitHub profile. Coordinate with the contributor first if your fix isn't trivial — pushing while they have unpushed work creates conflicts they have to resolve.
+1. **Push fixups to the contributor's branch.** If the PR has `maintainerCanModify: true` (the default for PRs from personal forks; confirm with `gh pr view <number> --json maintainerCanModify`), push your fixups directly and merge the contributor's PR. Attribution stays clean in `git log`, `git blame`, and the contributor's GitHub profile. Coordinate with the contributor first if your fix isn't trivial; pushing while they have unpushed work creates conflicts they have to resolve.
 
 2. **Leave a review with specific requested changes.** If the contributor is responsive and the fix is within their original scope (a clippy lint, an edge case, a test addition), request the change and let them push the fixup. Single-line fixes are almost always better as a requested change than a supersede.
 
@@ -23,10 +23,10 @@ Supersede only when one of these applies:
 
 When you do supersede and you carry forward substantive code or design decisions, preserve authorship explicitly:
 
-- Add one `Co-authored-by: Name <email>` trailer per superseded contributor whose work was materially incorporated. Use a GitHub-recognized email — either the contributor's `<login@users.noreply.github.com>` form or their verified commit email.
+- Add one `Co-authored-by: Name <email>` trailer per superseded contributor whose work was materially incorporated. Use a GitHub-recognized email: either the contributor's `<login@users.noreply.github.com>` form or their verified commit email.
 - Trailers go on their own lines after a blank line at the end of the commit message. Never encode them as escaped `\n` text.
 - In the PR body, list the superseded PR links and briefly state what was incorporated from each.
-- If no actual code or design was incorporated (only inspiration), don't use `Co-authored-by` — give credit in the PR notes section instead.
+- If no actual code or design was incorporated (only inspiration), don't use `Co-authored-by`, give credit in the PR notes section instead.
 
 These trailers route GitHub's contributor recognition correctly. Without them, the original author shows up as "Closed" on their PR with no record of the carry-forward.
 

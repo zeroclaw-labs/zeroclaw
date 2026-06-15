@@ -10,18 +10,18 @@ A plain-language walkthrough of every piece and how they connect.
 ┌──────────────────────────────────────────────────────────────┐
 │                        STARTUP (boot)                        │
 │                                                              │
-│  1. Ask aardvark-sys: "any adapters plugged in?"            │
+│  1. Ask aardvark-sys: "any adapters plugged in?"             │
 │  2. For each one found → register a device + transport       │
 │  3. Load tools only if hardware was found                    │
 └──────────────────────────────────────────┬───────────────────┘
                                            │
-                    ┌──────────────────────▼──────────────────────┐
+                    ┌──────────────────────▼───────────────────────┐
                     │              RUNTIME (agent loop)            │
                     │                                              │
                     │  User: "scan i2c bus"                        │
                     │     → agent calls i2c_scan tool              │
                     │     → tool builds a ZcCommand                │
-                    │     → AardvarkTransport sends to hardware     │
+                    │     → AardvarkTransport sends to hardware    │
                     │     → response flows back as text            │
                     └──────────────────────────────────────────────┘
 ```
@@ -30,7 +30,7 @@ A plain-language walkthrough of every piece and how they connect.
 
 ## Layer by Layer
 
-### Layer 1 — `aardvark-sys` (the USB talker)
+### Layer 1: `aardvark-sys` (the USB talker)
 
 **File:** `crates/aardvark-sys/src/lib.rs`
 
@@ -81,7 +81,7 @@ Drop(handle)
 
 ---
 
-### Layer 2 — `AardvarkTransport` (the bridge)
+### Layer 2: `AardvarkTransport` (the bridge)
 
 **File:** `crates/zeroclaw-hardware/src/aardvark.rs`
 
@@ -127,11 +127,11 @@ send(ZcCommand) → ZcResponse
   on any AardvarkError → return ZcResponse{ error: "..." }
 ```
 
-**Key design choice — lazy open:** The handle is opened fresh for every command and dropped at the end. This means no held connection, no state to clean up, and no "is it still open?" logic anywhere.
+**Key design choice: lazy open:** The handle is opened fresh for every command and dropped at the end. This means no held connection, no state to clean up, and no "is it still open?" logic anywhere.
 
 ---
 
-### Layer 3 — Tools (what the agent calls)
+### Layer 3: Tools (what the agent calls)
 
 **File:** `crates/zeroclaw-hardware/src/aardvark_tools.rs`
 
@@ -181,7 +181,7 @@ DatasheetTool.call(args)
 
 ---
 
-### Layer 4 — Device Registry (the address book)
+### Layer 4: Device Registry (the address book)
 
 **File:** `crates/zeroclaw-hardware/src/device.rs`
 
@@ -209,7 +209,7 @@ resolve_aardvark_device(args)
 
 ---
 
-### Layer 5 — `boot()` (startup wiring)
+### Layer 5: `boot()` (startup wiring)
 
 **File:** `crates/zeroclaw-hardware/src/lib.rs`
 
@@ -234,7 +234,7 @@ boot()
 
 ---
 
-### Layer 6 — Tool Registry (the loader)
+### Layer 6: Tool Registry (the loader)
 
 **File:** `crates/zeroclaw-hardware/src/tool_registry.rs`
 
@@ -244,15 +244,16 @@ only the relevant tools:
 ```
 ToolRegistry::load(devices)
 
-  # always loaded (Pico / GPIO)
-  register: gpio_write, gpio_read, gpio_toggle, pico_flash, device_list, device_status
+  # always loaded (base hardware tools — see catalog::BASE_TOOLS)
+  register: gpio_read, gpio_write, pico_flash,
+            device_read_code, device_write_code, device_exec
 
-  # only loaded if an Aardvark was found at boot
+  # only loaded if an Aardvark was found at boot (catalog::AARDVARK_TOOLS)
   if devices.has_aardvark():
     register: i2c_scan, i2c_read, i2c_write, spi_transfer, gpio_aardvark, datasheet
 ```
 
-This is why the `hardware_feature_registers_all_six_tools` test still passes in stub mode — `has_aardvark()` returns false, 0 extra tools load, count stays at 6.
+This is why the `hardware_feature_registers_catalog_base_tools` test still passes in stub mode: `has_aardvark()` returns false, 0 extra tools load, count stays at the base set.
 
 ---
 
@@ -274,7 +275,7 @@ This is why the `hardware_feature_registers_all_six_tools` test still passes in 
                        │                ▼
                        │         ToolRegistry::load()
                        │           has_aardvark() == true
-                       │           → load 6 aardvark tools
+                       │           → load aardvark tools
                        │
 ─────────────────────────────────────────────────────────────────
 
@@ -316,10 +317,10 @@ This is why the `hardware_feature_registers_all_six_tools` test still passes in 
 | `find_devices()` | returns `[]` | returns `[0]` |
 | `open_port(0)` | `Err(NotFound)` | opens USB, returns handle |
 | `i2c_scan()` | `[]` | probes bus, returns addresses |
-| tools loaded | only the 6 Pico tools | 6 Pico + 6 Aardvark tools |
+| tools loaded | only the base hardware tools | base tools + Aardvark tools |
 | `has_aardvark()` | `false` | `true` |
 | SDK needed | no | yes (`vendor/aardvark.h` + `.so`) |
 
 The only code that changes when you plug in real hardware is inside
-`crates/aardvark-sys/src/lib.rs` — every other layer is already wired up
+`crates/aardvark-sys/src/lib.rs`: every other layer is already wired up
 and waiting.

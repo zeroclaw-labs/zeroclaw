@@ -15,12 +15,12 @@
     "maintenance": "manual_or_future_automation",
     "examples": [
       "issue_readiness",
-      "active_owner",
+      "routing_evidence",
       "roadmap_group",
       "dependency_state",
       "stale_exemption_reason"
     ],
-    "guidance": "Use for slower planning questions such as readiness, ownership, roadmap grouping, dependencies, and explicit stale-exemption rationale."
+    "guidance": "Use for slower planning questions such as readiness, routing evidence, roadmap grouping, dependencies, and explicit stale-exemption rationale. Routing evidence records the next decision or revisit surface; the stale-exemption reason remains a separate fact."
   },
   "derived_github_pr_signals": {
     "owner": "github_pr",
@@ -54,7 +54,7 @@
       "status",
       "stale_exemption"
     ],
-    "guidance": "Use labels for portable classification across issues and PRs."
+    "guidance": "Use labels for portable classification across issues and PRs. Labels can suggest the likely area, but they are not routing evidence by themselves."
   },
   "non_goals": [
     "active GitHub Project integration",

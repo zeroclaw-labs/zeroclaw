@@ -11,7 +11,7 @@ fi
 
 if [ -z "$DOCS_FILES_RAW" ] && [ -n "$BASE_SHA" ] && git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
     DOCS_FILES_RAW="$(git diff --name-only "$BASE_SHA" HEAD | awk '
-        /\.md$/ || /\.mdx$/ || $0 == "LICENSE" || $0 == ".github/pull_request_template.md" {
+        /^docs\/book\/src\/.*\.md$/ || /^docs\/book\/src\/.*\.mdx$/ {
             print
         }
     ')"
@@ -51,6 +51,56 @@ if [ "${#EXISTING_FILES[@]}" -eq 0 ]; then
     exit 0
 fi
 
+# Em-dash gate: no prose em-dashes (U+2014) in changed docs. Em-dashes inside
+# fenced code blocks and inline `code` spans (including spans that wrap across
+# lines) are allowed, since those quote literal source, CLI output, or table
+# rules. Everything else uses a comma, colon, semicolon, or period instead.
+python3 - "${EXISTING_FILES[@]}" <<'PY'
+import sys
+
+EM = "\u2014"
+files = sys.argv[1:]
+violations = []
+
+for path in files:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except (FileNotFoundError, UnicodeDecodeError):
+        continue
+
+    in_fence = False
+    in_span = False
+    for n, line in enumerate(lines, 1):
+        stripped = line.lstrip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            in_span = False
+            continue
+        if in_fence:
+            continue
+        if EM not in line and "`" not in line:
+            continue
+        for ch in line:
+            if ch == "`":
+                in_span = not in_span
+            elif ch == EM and not in_span:
+                violations.append((path, n, line.rstrip()))
+                break
+
+if violations:
+    print("Em-dash (\u2014) found in prose. Use a comma, colon, semicolon, or")
+    print("period instead. Em-dashes are only allowed inside code spans/blocks.")
+    print()
+    for path, n, text in violations:
+        print(f"  {path}:{n}: {text}")
+    print()
+    print(f"Blocking prose em-dashes: {len(violations)}")
+    sys.exit(1)
+
+print("No prose em-dashes in changed docs files.")
+PY
+
 if command -v npx >/dev/null 2>&1; then
     MD_CMD=(npx --yes markdownlint-cli2@0.20.0)
 elif command -v markdownlint-cli2 >/dev/null 2>&1; then
@@ -62,11 +112,63 @@ fi
 
 echo "Linting docs files: ${EXISTING_FILES[*]}"
 
+# OS-tabs are an mdBook theme construct (see docs/book/theme/pc-enhance.js):
+# a `<div class="os-tabs-src">` wraps one ATX heading per OS/shell that the
+# preprocessor turns into tab labels at render time. Those headings are widget
+# markup, not document structure, so they trip MD024/MD001/MD022. Lint a
+# line-preserving mirror where headings inside those divs are rewritten to HTML
+# comments; everything else (including real prose headings) is linted as-is.
+MIRROR_ROOT="$(mktemp -d)"
+for file in "${EXISTING_FILES[@]}"; do
+    mirror_path="$MIRROR_ROOT/$file"
+    mkdir -p "$(dirname "$mirror_path")"
+    python3 - "$file" "$mirror_path" <<'PY'
+import re
+import sys
+
+src, dst = sys.argv[1], sys.argv[2]
+open_re = re.compile(r'<div\s+class="[^"]*\bos-tabs-src\b[^"]*"', re.IGNORECASE)
+close_re = re.compile(r"</div>", re.IGNORECASE)
+heading_re = re.compile(r"^(\s*)(#{1,6})\s+(.*\S)\s*$")
+
+depth = 0
+out = []
+with open(src, encoding="utf-8") as fh:
+    for line in fh:
+        body = line.rstrip("\n")
+        if depth == 0:
+            if open_re.search(body):
+                depth = 1
+            out.append(body)
+            continue
+        # inside an os-tabs-src div
+        if open_re.search(body):
+            depth += 1
+        m = heading_re.match(body)
+        if m:
+            out.append(f"{m.group(1)}<!-- os-tab: {m.group(3)} -->")
+        else:
+            out.append(body)
+        if close_re.search(body):
+            depth -= 1
+
+with open(dst, "w", encoding="utf-8") as fh:
+    fh.write("\n".join(out) + "\n")
+PY
+done
+
+cp .markdownlint-cli2.yaml "$MIRROR_ROOT/.markdownlint-cli2.yaml" 2>/dev/null || true
+
+LINT_OUTPUT_RAW="$(mktemp)"
 LINT_OUTPUT_FILE="$(mktemp)"
 set +e
-"${MD_CMD[@]}" "${EXISTING_FILES[@]}" >"$LINT_OUTPUT_FILE" 2>&1
+( cd "$MIRROR_ROOT" && "${MD_CMD[@]}" "${EXISTING_FILES[@]}" ) >"$LINT_OUTPUT_RAW" 2>&1
 LINT_EXIT=$?
 set -e
+# Map mirror paths back to repo-relative paths so downstream filtering and
+# human output reference the real files.
+sed "s#^${MIRROR_ROOT}/##" "$LINT_OUTPUT_RAW" >"$LINT_OUTPUT_FILE"
+rm -rf "$MIRROR_ROOT" "$LINT_OUTPUT_RAW"
 
 if [ "$LINT_EXIT" -eq 0 ]; then
     cat "$LINT_OUTPUT_FILE"

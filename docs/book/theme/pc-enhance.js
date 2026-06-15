@@ -1,10 +1,40 @@
 /* ZeroClaw docs enhancement layer (Tier B PoC).
-   - Right-hand "On this page" TOC built from content headings, with scroll-spy.
+   - Right-hand page TOC built from content headings, with scroll-spy.
    - Hero banner injected on the landing page (introduction).
    - Reading-progress bar under the menu bar.
    No build-time coupling: everything is derived from the rendered DOM. */
 (function () {
   'use strict';
+
+  const LOCALE_TEXT = {
+    en: {
+      onThisPage: 'On this page',
+      quickStart: 'Quickstart',
+    },
+    es: {
+      onThisPage: 'En esta página',
+      quickStart: 'Inicio rápido',
+    },
+    fr: {
+      onThisPage: 'Sur cette page',
+      quickStart: 'Démarrage rapide',
+    },
+    ja: {
+      onThisPage: 'このページ',
+      quickStart: 'クイックスタート',
+    },
+    'zh-CN': {
+      onThisPage: '本页目录',
+      quickStart: '快速入门',
+    },
+  };
+
+  function localeText(key, fallback) {
+    const lang = document.documentElement.lang || 'en';
+    const exact = LOCALE_TEXT[lang];
+    const base = LOCALE_TEXT[lang.split('-')[0]];
+    return (exact && exact[key]) || (base && base[key]) || fallback;
+  }
 
   function ready(fn) {
     if (document.readyState !== 'loading') fn();
@@ -46,7 +76,8 @@
 
     const title = document.createElement('div');
     title.className = 'pc-toc-title';
-    title.textContent = 'On this page';
+    title.textContent = localeText('onThisPage', 'On this page');
+    toc.setAttribute('aria-label', title.textContent);
     toc.appendChild(title);
 
     const list = document.createElement('ul');
@@ -104,26 +135,41 @@
     const t = firstH1.textContent.toLowerCase();
     if (!/introduction|zeroclaw|welcome|overview/.test(t)) return;
 
+    const intro = firstH1.nextElementSibling?.matches('p')
+      ? firstH1.nextElementSibling
+      : null;
+    const subtitle =
+      intro?.textContent.trim() || 'Personal AI assistant you own, written in Rust.';
+    const quickstart = Array.from(main.querySelectorAll('a[href]')).find((a) => {
+      const href = a.getAttribute('href') || '';
+      return /(^|\/)getting-started\/quick-?start\.html$/.test(href);
+    });
+    const quickstartHref =
+      quickstart?.getAttribute('href') || 'getting-started/quickstart.html';
+    const quickstartText =
+      localeText('quickStart', quickstart?.textContent.trim() || 'Quickstart');
+
     const hero = document.createElement('section');
     hero.className = 'pc-hero';
-    // Static scaffold only — no interpolation of page-derived text here.
     hero.innerHTML =
       '<div class="pc-hero-glow"></div>' +
       '<div class="pc-hero-inner">' +
       '<div class="pc-hero-badge">ZeroClaw</div>' +
       '<h1 class="pc-hero-title"></h1>' +
-      // Subtitle is intentionally hardcoded here: it is product positioning,
-      // not page content, and changes rarely. If it needs to vary per build,
-      // promote it to a data-hero-sub attribute read from the landing Markdown.
-      '<p class="pc-hero-sub">Your personal AI assistant — one static binary, runs anywhere, no vendor lock-in.</p>' +
+      '<p class="pc-hero-sub"></p>' +
       '<div class="pc-hero-actions">' +
-      '<a class="pc-btn pc-btn-primary" href="getting-started/quick-start.html">Quick start →</a>' +
+      '<a class="pc-btn pc-btn-primary"></a>' +
       '<a class="pc-btn pc-btn-secondary" href="https://github.com/zeroclaw-labs/zeroclaw">GitHub</a>' +
       '</div></div>';
     // Insert the page-derived heading as text, never as HTML, so a crafted
-    // heading cannot inject markup (textContent -> innerHTML re-encoding sink).
+    // heading or translation cannot inject markup.
     hero.querySelector('.pc-hero-title').textContent = firstH1.textContent;
+    hero.querySelector('.pc-hero-sub').textContent = subtitle;
+    const primary = hero.querySelector('.pc-btn-primary');
+    primary.href = quickstartHref;
+    primary.textContent = quickstartText.replace(/\s*→\s*$/, '') + ' →';
     firstH1.replaceWith(hero);
+    if (intro) intro.remove();
   }
 
   // ── Wrap tables for horizontal scroll on narrow screens ────────────────
@@ -174,11 +220,86 @@
     obs.observe(box, { childList: true, subtree: true });
   }
 
+  // ── OS tabs ────────────────────────────────────────────────────────────
+  // Authoring: wrap the divergent content in a single
+  //   <div class="os-tabs-src"> ... </div>
+  // with one H3/H4 heading per OS (Linux / macOS / Windows). Each heading and
+  // the markdown beneath it (labelled fenced blocks, prose) becomes a tab
+  // panel. This transform replaces the source div with the radio/label/panel
+  // widget, generating unique ids per instance so multiple pickers coexist.
+  let osTabsSeq = 0;
+  function installOsTabs() {
+    const sources = document.querySelectorAll('.os-tabs-src');
+    sources.forEach(function (src) {
+      const headings = Array.from(src.children).filter(function (el) {
+        return el.tagName === 'H3' || el.tagName === 'H4';
+      });
+      if (headings.length < 1) return;
+
+      const group = 'os-tabs-' + ++osTabsSeq;
+      const wrap = document.createElement('div');
+      wrap.className = 'os-tabs';
+
+      const labels = document.createElement('nav');
+      labels.className = 'os-tab-labels';
+
+      const panels = [];
+      const labelEls = [];
+      headings.forEach(function (h, i) {
+        const id = group + '-' + i;
+        const radio = document.createElement('input');
+        radio.type = 'radio';
+        radio.name = group;
+        radio.id = id;
+        if (i === 0) radio.checked = true;
+        wrap.appendChild(radio);
+
+        const label = document.createElement('label');
+        label.setAttribute('for', id);
+        label.textContent = h.textContent.replace(/\u00B6/g, '').trim();
+        labels.appendChild(label);
+        labelEls.push(label);
+
+        const panel = document.createElement('div');
+        panel.className = 'os-tab-panel';
+        let node = h.nextElementSibling;
+        while (node && node.tagName !== 'H3' && node.tagName !== 'H4') {
+          const next = node.nextElementSibling;
+          panel.appendChild(node);
+          node = next;
+        }
+        panels.push(panel);
+
+        // Active-state is driven here (any number of tabs), not by positional
+        // CSS selectors, so adding a tab needs no CSS change.
+        radio.addEventListener('change', function () {
+          panels.forEach(function (p, j) {
+            p.classList.toggle('is-active', j === i);
+          });
+          labelEls.forEach(function (l, j) {
+            l.classList.toggle('is-active', j === i);
+          });
+        });
+        if (i === 0) {
+          panel.classList.add('is-active');
+          label.classList.add('is-active');
+        }
+      });
+
+      wrap.appendChild(labels);
+      panels.forEach(function (p) {
+        wrap.appendChild(p);
+      });
+      src.replaceWith(wrap);
+    });
+  }
+
   ready(function () {
     installProgressBar();
     installHero();
     installToc();
     wrapTables();
     installFoldableRows();
+    installOsTabs();
   });
 })();

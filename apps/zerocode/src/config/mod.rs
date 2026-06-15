@@ -42,12 +42,26 @@ impl ChordSpec {
 pub(crate) struct ThemeSection {
     #[serde(default = "default_theme")]
     pub name: String,
+    /// Per-agent theme overrides keyed by agent alias. When the Code or Chat
+    /// pane is focused on an agent listed here, that agent's theme replaces
+    /// the base `name` while the pane is active. Sparse: agents not listed use
+    /// the base theme.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub agent_override: HashMap<String, AgentThemeOverride>,
+}
+
+/// One `[theme.agent_override.<alias>]` entry. Mirrors the `{ name }` shape of
+/// the base `[theme]` section so the resolver path is identical.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AgentThemeOverride {
+    pub name: String,
 }
 
 impl Default for ThemeSection {
     fn default() -> Self {
         Self {
             name: default_theme(),
+            agent_override: HashMap::new(),
         }
     }
 }
@@ -135,15 +149,33 @@ fn default_theme() -> String {
 
 impl ZerocodeConfig {
     pub fn resolve_theme(&self) -> Result<Theme> {
-        let name = &self.theme.name;
-        if name.trim().is_empty() {
+        let name = self.theme.name.trim();
+        if name.is_empty() {
             return theme::theme_by_name(theme::DEFAULT_THEME_NAME)
                 .context("default theme missing from registry");
         }
-        theme::theme_by_name(name).with_context(|| {
-            let known = theme::theme_names().collect::<Vec<_>>().join(", ");
-            format!("unknown theme '{name}' in {FILE_NAME}; known themes: {known}")
-        })
+        // Unknown theme name (e.g. a config written by a newer build, or a
+        // typo) falls back to the inherit-shell `terminal` theme rather than
+        // aborting the TUI. The fallback is always present in the registry.
+        Ok(theme::theme_by_name(name).unwrap_or_else(theme::fallback_theme))
+    }
+
+    /// Resolve the per-agent theme override for `alias`, if one is configured.
+    /// Returns `Ok(None)` when the agent has no override (the pane uses the base
+    /// theme). An override naming an unknown theme falls back to the
+    /// inherit-shell `terminal` theme rather than failing — same graceful
+    /// posture as the global theme.
+    pub fn resolve_agent_theme(&self, alias: &str) -> Result<Option<Theme>> {
+        let Some(over) = self.theme.agent_override.get(alias) else {
+            return Ok(None);
+        };
+        let name = over.name.trim();
+        if name.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(
+            theme::theme_by_name(name).unwrap_or_else(theme::fallback_theme),
+        ))
     }
 
     /// Resolve the stored keybindings into a validated override table.
@@ -155,6 +187,23 @@ impl ZerocodeConfig {
             .map(|(k, v)| (k.clone(), v.clone().into_vec()))
             .collect();
         keybindings::build_override_table(rows)
+    }
+
+    /// Aliases that have a `[theme.agent_override.<alias>]` entry. The single
+    /// iteration point over the override map so callers never reach into the
+    /// section's internals.
+    pub fn agent_override_aliases(&self) -> impl Iterator<Item = &str> {
+        self.theme.agent_override.keys().map(String::as_str)
+    }
+
+    /// The configured override theme name for `alias`, if any. Returns the raw
+    /// stored name without validating it against the registry; for a resolved
+    /// palette use `resolve_agent_theme`.
+    pub fn agent_override_name(&self, alias: &str) -> Option<&str> {
+        self.theme
+            .agent_override
+            .get(alias)
+            .map(|o| o.name.as_str())
     }
 
     pub fn resolve_locale(&self) -> Option<String> {
@@ -262,6 +311,42 @@ pub(crate) fn persist_theme(config_dir: &Path, theme_name: &str) -> Result<()> {
         "name".to_string(),
         toml::Value::String(theme_name.to_string()),
     );
+    write_document(&path, &doc)
+}
+
+/// Persist a per-agent theme override, writing only
+/// `[theme.agent_override.<alias>].name`. Other agents' overrides and every
+/// other section are preserved.
+pub(crate) fn persist_agent_theme(config_dir: &Path, alias: &str, theme_name: &str) -> Result<()> {
+    let path = config_path(config_dir);
+    let mut doc = load_document(&path)?;
+    section_mut_path(&mut doc, &["theme", "agent_override", alias])?.insert(
+        "name".to_string(),
+        toml::Value::String(theme_name.to_string()),
+    );
+    write_document(&path, &doc)
+}
+
+/// Remove a per-agent theme override, dropping the whole
+/// `[theme.agent_override.<alias>]` entry (and the `agent_override` table if it
+/// becomes empty). A no-op when the agent has no override. Other sections are
+/// preserved.
+pub(crate) fn persist_agent_theme_clear(config_dir: &Path, alias: &str) -> Result<()> {
+    let path = config_path(config_dir);
+    let mut doc = load_document(&path)?;
+    let Some(theme_tbl) = doc.get_mut("theme").and_then(toml::Value::as_table_mut) else {
+        return write_document(&path, &doc);
+    };
+    let Some(over_tbl) = theme_tbl
+        .get_mut("agent_override")
+        .and_then(toml::Value::as_table_mut)
+    else {
+        return write_document(&path, &doc);
+    };
+    over_tbl.remove(alias);
+    if over_tbl.is_empty() {
+        theme_tbl.remove("agent_override");
+    }
     write_document(&path, &doc)
 }
 
@@ -486,15 +571,132 @@ mod tests {
     }
 
     #[test]
-    fn resolve_unknown_theme_errors() {
+    fn resolve_unknown_theme_falls_back_to_terminal() {
         let c = ZerocodeConfig {
             theme: ThemeSection {
                 name: "bogus".to_string(),
+                ..Default::default()
             },
             ..Default::default()
         };
-        let err = c.resolve_theme().unwrap_err();
-        assert!(err.to_string().contains("unknown theme 'bogus'"));
+        let resolved = c
+            .resolve_theme()
+            .expect("unknown theme falls back, never errors");
+        assert_eq!(resolved.title, theme::fallback_theme().title);
+        assert_eq!(resolved.background, theme::fallback_theme().background);
+    }
+
+    #[test]
+    fn agent_override_resolves_known_theme() {
+        let body =
+            "[theme]\nname = \"nord_dark\"\n\n[theme.agent_override.coder]\nname = \"dracula\"\n";
+        let c: ZerocodeConfig = toml::from_str(body).unwrap();
+        let t = c
+            .resolve_agent_theme("coder")
+            .unwrap()
+            .expect("override present");
+        assert_eq!(t.title, theme::theme_by_name("dracula").unwrap().title);
+    }
+
+    #[test]
+    fn agent_override_absent_alias_is_none() {
+        let c: ZerocodeConfig = toml::from_str("[theme]\nname = \"nord_dark\"\n").unwrap();
+        assert!(c.resolve_agent_theme("nobody").unwrap().is_none());
+    }
+
+    #[test]
+    fn agent_override_unknown_theme_falls_back_to_terminal() {
+        let body = "[theme.agent_override.coder]\nname = \"no_such_theme\"\n";
+        let c: ZerocodeConfig = toml::from_str(body).unwrap();
+        let t = c
+            .resolve_agent_theme("coder")
+            .expect("unknown override falls back, never errors")
+            .expect("override present");
+        assert_eq!(t.title, theme::fallback_theme().title);
+        assert_eq!(t.background, theme::fallback_theme().background);
+    }
+
+    #[test]
+    fn agent_override_blank_name_is_none() {
+        let body = "[theme.agent_override.coder]\nname = \"  \"\n";
+        let c: ZerocodeConfig = toml::from_str(body).unwrap();
+        assert!(c.resolve_agent_theme("coder").unwrap().is_none());
+    }
+
+    #[test]
+    fn agent_override_aliases_lists_configured() {
+        let body = "[theme.agent_override.a]\nname = \"dracula\"\n[theme.agent_override.b]\nname = \"nord_dark\"\n";
+        let c: ZerocodeConfig = toml::from_str(body).unwrap();
+        let mut aliases: Vec<&str> = c.agent_override_aliases().collect();
+        aliases.sort_unstable();
+        assert_eq!(aliases, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn default_config_emits_no_agent_override() {
+        let body = toml::to_string_pretty(&ZerocodeConfig::default()).unwrap();
+        assert!(
+            !body.contains("agent_override"),
+            "default config must not scaffold agent_override; got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn persist_agent_theme_writes_nested_and_preserves_others() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(
+            dir.path(),
+            "[theme]\nname = \"nord_dark\"\n\n[future]\nkeep = true\n",
+        );
+        persist_agent_theme(dir.path(), "coder", "dracula").unwrap();
+        let doc: toml::Table = toml::from_str(&read(dir.path())).unwrap();
+        assert_eq!(doc["theme"]["name"].as_str(), Some("nord_dark"));
+        assert_eq!(
+            doc["theme"]["agent_override"]["coder"]["name"].as_str(),
+            Some("dracula")
+        );
+        assert_eq!(doc["future"]["keep"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn persist_agent_theme_round_trips_through_resolver() {
+        let dir = tempfile::tempdir().unwrap();
+        persist_agent_theme(dir.path(), "coder", "dracula").unwrap();
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        let t = cfg.resolve_agent_theme("coder").unwrap().unwrap();
+        assert_eq!(t.title, theme::theme_by_name("dracula").unwrap().title);
+    }
+
+    #[test]
+    fn persist_agent_theme_clear_removes_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        persist_agent_theme(dir.path(), "a", "dracula").unwrap();
+        persist_agent_theme(dir.path(), "b", "nord_dark").unwrap();
+        persist_agent_theme_clear(dir.path(), "a").unwrap();
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert!(cfg.resolve_agent_theme("a").unwrap().is_none());
+        assert!(cfg.resolve_agent_theme("b").unwrap().is_some());
+    }
+
+    #[test]
+    fn persist_agent_theme_clear_drops_empty_table() {
+        let dir = tempfile::tempdir().unwrap();
+        persist_agent_theme(dir.path(), "only", "dracula").unwrap();
+        persist_agent_theme_clear(dir.path(), "only").unwrap();
+        let on_disk = read(dir.path());
+        assert!(
+            !on_disk.contains("agent_override"),
+            "clearing the last override must drop the table; got:\n{on_disk}"
+        );
+    }
+
+    #[test]
+    fn persist_agent_theme_clear_is_noop_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        seed(dir.path(), "[theme]\nname = \"nord_dark\"\n");
+        persist_agent_theme_clear(dir.path(), "ghost").unwrap();
+        let cfg = ensure_and_load(dir.path()).unwrap();
+        assert_eq!(cfg.theme.name, "nord_dark");
     }
 
     #[test]
@@ -503,6 +705,7 @@ mod tests {
             let c = ZerocodeConfig {
                 theme: ThemeSection {
                     name: blank.to_string(),
+                    ..Default::default()
                 },
                 ..Default::default()
             };

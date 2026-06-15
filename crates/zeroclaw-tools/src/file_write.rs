@@ -7,11 +7,28 @@ use zeroclaw_config::policy::SecurityPolicy;
 /// Write file contents with path sandboxing
 pub struct FileWriteTool {
     security: Arc<SecurityPolicy>,
+    /// Whether writes to the workspace will persist on the host filesystem.
+    /// `false` when the runtime uses an ephemeral sandbox (e.g. Docker without
+    /// a workspace volume mount), in which case writes succeed inside the
+    /// container but are invisible on the host.
+    persistent_writes: bool,
 }
 
 impl FileWriteTool {
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
-        Self { security }
+        Self {
+            security,
+            persistent_writes: true,
+        }
+    }
+
+    /// Construct with an explicit persistence flag derived from the active
+    /// runtime adapter's `has_filesystem_access()`.
+    pub fn new_with_persistence(security: Arc<SecurityPolicy>, persistent_writes: bool) -> Self {
+        Self {
+            security,
+            persistent_writes,
+        }
     }
 }
 
@@ -83,6 +100,21 @@ impl Tool for FileWriteTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: autonomy is read-only".into()),
+            });
+        }
+
+        if !self.persistent_writes {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    "file_write is unavailable: the active runtime uses an ephemeral workspace \
+                     (tmpfs / no host volume mount). Files written here would not persist on the \
+                     host after the session ends. To fix this, set \
+                     `runtime.docker.mount_workspace = true` in your config and ensure the \
+                     workspace directory is bind-mounted into the container."
+                        .into(),
+                ),
             });
         }
 
@@ -249,6 +281,15 @@ mod tests {
             ..SecurityPolicy::default()
         });
         FileWriteTool::new(security)
+    }
+
+    fn ephemeral_tool(workspace: std::path::PathBuf) -> FileWriteTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace,
+            ..SecurityPolicy::default()
+        });
+        FileWriteTool::new_with_persistence(security, false)
     }
 
     #[test]
@@ -627,6 +668,36 @@ mod tests {
         assert!(!outside.join("hijack.txt").exists());
 
         let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn file_write_blocks_ephemeral_runtime() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_write_ephemeral");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let tool = ephemeral_tool(dir.clone());
+        let result = tool
+            .execute(json!({"path": "out.txt", "content": "should-block"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("ephemeral workspace"),
+            "error should mention ephemeral workspace, got: {:?}",
+            result.error
+        );
+        assert!(
+            !dir.join("out.txt").exists(),
+            "no file should be written in ephemeral mode"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]

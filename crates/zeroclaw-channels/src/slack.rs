@@ -3215,13 +3215,26 @@ impl SlackChannel {
                 if user.is_empty() || user == bot_user_id {
                     continue;
                 }
-                if !self.is_user_allowed(user) {
+                let allowed_peers = (self.peer_resolver)();
+                if !crate::allowlist::is_user_allowed(
+                    &allowed_peers,
+                    user,
+                    crate::allowlist::Match::Sensitive,
+                ) {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"user": user})),
-                        "ignoring message from unauthorized user"
+                            .with_attrs(::serde_json::json!({
+                                "user": user,
+                                "alias": self.alias,
+                                "allowed_peer_count": allowed_peers.len(),
+                            })),
+                        if allowed_peers.is_empty() {
+                            "ignoring message: no peers resolved for this channel — add a [peer_groups.<name>] with channel = \"slack.<alias>\" and external_peers (use [\"*\"] to allow everyone)"
+                        } else {
+                            "ignoring message from unauthorized user"
+                        }
                     );
                     continue;
                 }
@@ -3686,7 +3699,7 @@ impl SlackChannel {
 
 const SLACK_TRUNCATION_INDICATOR: &str = "\n\n...[message truncated]";
 
-/// Split `text` into chunks of at most `max_chars`, breaking at newline or
+/// Split `text` into chunks of at most `max_chars` bytes, breaking at newline or
 /// space boundaries when possible. Returns at most `max_chunks` pieces; if the
 /// text would require more, the last chunk includes a truncation indicator.
 fn split_text_into_chunks(text: &str, max_chars: usize, max_chunks: usize) -> Vec<String> {
@@ -3711,7 +3724,10 @@ fn split_text_into_chunks(text: &str, max_chars: usize, max_chunks: usize) -> Ve
                 chunks.push(remaining.to_string());
             } else {
                 // Truncate with indicator.
-                let avail = max_chars - SLACK_TRUNCATION_INDICATOR.len();
+                let avail = crate::util::floor_char_boundary(
+                    remaining,
+                    max_chars.saturating_sub(SLACK_TRUNCATION_INDICATOR.len()),
+                );
                 let break_at = remaining[..avail]
                     .rfind('\n')
                     .map(|i| i + 1)
@@ -3725,7 +3741,7 @@ fn split_text_into_chunks(text: &str, max_chars: usize, max_chunks: usize) -> Ve
         }
 
         // Normal chunk: find a good break point.
-        let limit = max_chars.min(remaining.len());
+        let limit = crate::util::floor_char_boundary(remaining, max_chars);
         let break_at = remaining[..limit]
             .rfind('\n')
             .map(|i| i + 1)
@@ -3774,6 +3790,10 @@ impl Channel for SlackChannel {
     /// agent sees when a teammate `@`s it.
     fn self_addressed_mention(&self) -> Option<String> {
         self.self_handle().map(|id| format!("<@{id}>"))
+    }
+
+    fn is_direct_message(&self, msg: &zeroclaw_api::channel::ChannelMessage) -> bool {
+        !Self::is_group_channel_id(&msg.reply_target)
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
@@ -4358,7 +4378,12 @@ impl Channel for SlackChannel {
                         }
 
                         // Sender validation
-                        if !self.is_user_allowed(user) {
+                        let allowed_peers = (self.peer_resolver)();
+                        if !crate::allowlist::is_user_allowed(
+                            &allowed_peers,
+                            user,
+                            crate::allowlist::Match::Sensitive,
+                        ) {
                             ::zeroclaw_log::record!(
                                 WARN,
                                 ::zeroclaw_log::Event::new(
@@ -4366,8 +4391,16 @@ impl Channel for SlackChannel {
                                     ::zeroclaw_log::Action::Note
                                 )
                                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                .with_attrs(::serde_json::json!({"user": user})),
-                                "ignoring message from unauthorized user"
+                                .with_attrs(::serde_json::json!({
+                                    "user": user,
+                                    "alias": self.alias,
+                                    "allowed_peer_count": allowed_peers.len(),
+                                })),
+                                if allowed_peers.is_empty() {
+                                    "ignoring message: no peers resolved for this channel — add a [peer_groups.<name>] with channel = \"slack.<alias>\" and external_peers (use [\"*\"] to allow everyone)"
+                                } else {
+                                    "ignoring message from unauthorized user"
+                                }
                             );
                             continue;
                         }
@@ -4686,6 +4719,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn split_text_into_chunks_safe_on_multibyte_utf8() {
+        let text = format!(
+            "{}{}{}",
+            "a".repeat(SLACK_BLOCK_TEXT_MAX_CHARS - 1),
+            "😀",
+            "tail"
+        );
+        let chunks = split_text_into_chunks(&text, SLACK_BLOCK_TEXT_MAX_CHARS, 3);
+
+        assert_eq!(chunks.concat(), text);
+        assert_eq!(chunks[0].len(), SLACK_BLOCK_TEXT_MAX_CHARS - 1);
+        assert_eq!(chunks[1], "😀tail");
+        for chunk in &chunks {
+            assert!(chunk.len() <= SLACK_BLOCK_TEXT_MAX_CHARS);
+            assert!(chunk.is_char_boundary(chunk.len()));
+        }
+    }
+
+    #[test]
     fn slack_channel_name() {
         let ch = SlackChannel::new(
             "xoxb-fake".into(),
@@ -4895,6 +4947,28 @@ mod tests {
     }
 
     #[test]
+    fn is_direct_message_true_for_im_reply_target() {
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            vec![],
+            "slack_test_alias",
+            Arc::new(Vec::new),
+        );
+        let dm = zeroclaw_api::channel::ChannelMessage {
+            reply_target: "D0B189MTELX".into(),
+            channel: "slack".into(),
+            ..Default::default()
+        };
+        let group = zeroclaw_api::channel::ChannelMessage {
+            reply_target: "C12345".into(),
+            ..dm.clone()
+        };
+        assert!(Channel::is_direct_message(&ch, &dm));
+        assert!(!Channel::is_direct_message(&ch, &group));
+    }
+
+    #[test]
     fn extract_channel_ids_filters_archived_and_non_member_entries() {
         let payload = serde_json::json!({
             "channels": [
@@ -4932,6 +5006,19 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
         );
         assert!(ch.is_user_allowed("U12345"));
+    }
+
+    #[test]
+    fn explicit_user_peer_is_allowed() {
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            vec![],
+            "slack_test_alias",
+            Arc::new(|| vec!["U01EXAMPLE".into()]),
+        );
+        assert!(ch.is_user_allowed("U01EXAMPLE"));
+        assert!(!ch.is_user_allowed("U99OTHER"));
     }
 
     #[test]
