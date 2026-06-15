@@ -4881,7 +4881,10 @@ mod tests {
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
         assert_eq!(msg.effective_content(), "");
-        assert_eq!(msg.reasoning_content.as_deref(), Some("Thinking output here"));
+        assert_eq!(
+            msg.reasoning_content.as_deref(),
+            Some("Thinking output here")
+        );
     }
 
     #[test]
