@@ -781,21 +781,27 @@ fn resolve_agent_overrides(
 // ── Mode bar ─────────────────────────────────────────────────────
 
 fn draw_mode_bar(frame: &mut ratatui::Frame, area: Rect, active: Mode) {
-    let mut spans = Vec::new();
-    for m in &MODES {
-        let label_style = if *m == active {
-            theme::selected_style().add_modifier(Modifier::BOLD)
-        } else {
-            theme::body_style()
-        };
-        spans.push(Span::styled(
-            format!(" {} ", crate::i18n::t(m.fluent_key())),
-            label_style,
-        ));
-        spans.push(Span::raw(" "));
-    }
+    use ratatui::widgets::Tabs;
 
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    let active_idx = MODES.iter().position(|m| *m == active).unwrap_or(0);
+    let titles: Vec<ratatui::text::Line> = MODES
+        .iter()
+        .map(|m| {
+            let label = crate::i18n::t(m.fluent_key());
+            ratatui::text::Line::from(ratatui::text::Span::styled(
+                format!(" {} ", label),
+                theme::body_style(),
+            ))
+        })
+        .collect();
+
+    let tabs = Tabs::new(titles)
+        .select(active_idx)
+        .style(theme::bar_style())
+        .highlight_style(theme::selected_style().add_modifier(Modifier::BOLD))
+        .divider("│")
+        .padding("", "");
+    frame.render_widget(tabs, area);
 }
 
 // ── Status bar ───────────────────────────────────────────────────

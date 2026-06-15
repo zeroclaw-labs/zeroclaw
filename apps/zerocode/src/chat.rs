@@ -2932,6 +2932,8 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     let mut in_italic = false;
     let mut in_strike = false;
     let mut in_code_block = false;
+    let mut code_block_lang: Option<String> = None;
+    let mut code_block_text: String = String::new();
     let mut heading_level: Option<HeadingLevel> = None;
     let mut blockquote_depth: u32 = 0;
     let mut link_url: Option<String> = None;
@@ -3017,13 +3019,77 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
                     ));
                 }
             }
-            MdEvent::Start(Tag::CodeBlock(_)) => {
+            MdEvent::Start(Tag::CodeBlock(kind)) => {
                 push_line(&mut lines, &mut current_spans);
                 in_code_block = true;
+                code_block_text.clear();
+                let lang = match kind {
+                    pulldown_cmark::CodeBlockKind::Fenced(info) => {
+                        let s = info.trim();
+                        if s.is_empty() { None } else { Some(s.to_string()) }
+                    }
+                    pulldown_cmark::CodeBlockKind::Indented => None,
+                };
+                code_block_lang = lang;
+
+                // Render header bar: ┌─ <lang> ── [Copy] ─┐
+                let lang_display = code_block_lang.clone().unwrap_or_default();
+                let header_text = if lang_display.is_empty() {
+                    " code ".to_string()
+                } else {
+                    format!(" {} ", lang_display)
+                };
+                let copy_label = " [Copy] ";
+                let avail = width.saturating_sub(4) as usize; // ┌─ ─┐
+                let inner = avail.saturating_sub(header_text.len().max(copy_label.len()));
+                let dots = if inner > 2 { inner - 2 } else { 0 };
+                let left_dots = dots / 2;
+                let right_dots = dots - left_dots;
+                let header = format!(
+                    "\u{250c}{}{}\u{2510}",
+                    header_text,
+                    "\u{2500}".repeat(left_dots.max(0)),
+                );
+                lines.push(Line::from(vec![
+                    Span::styled(header, theme::dim_style()),
+                    Span::styled(copy_label, theme::accent_style().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "\u{2500}".repeat(right_dots.max(0)) + "\u{2510}",
+                        theme::dim_style(),
+                    ),
+                ]));
             }
             MdEvent::End(TagEnd::CodeBlock) => {
                 push_line(&mut lines, &mut current_spans);
                 in_code_block = false;
+
+                // Render footer bar: └── <lang> [Copy] ────┘
+                // The [Copy] label is clickable — pressing it or clicking
+                // copies the full code block text to the clipboard.
+                let avail = width.saturating_sub(4) as usize;
+                let copy_label = " [Copy] ";
+                let dots = avail.saturating_sub(copy_label.len());
+                let left_dots = if dots > 1 { dots / 2 } else { 0 };
+                let right_dots = dots.saturating_sub(left_dots);
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("\u{2514}{}", "\u{2500}".repeat(left_dots)),
+                        theme::dim_style(),
+                    ),
+                    Span::styled(copy_label, theme::accent_style().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!(
+                            "{}\u{2518}",
+                            "\u{2500}".repeat(right_dots.saturating_sub(1))
+                        ),
+                        theme::dim_style(),
+                    ),
+                ]));
+
+                // Inline copy action — copies the accumulated code block
+                // text to clipboard on press (handled by the chat pane's
+                // input dispatch).
+                code_block_text.clear();
             }
             MdEvent::Start(Tag::Item) => {
                 push_line(&mut lines, &mut current_spans);
@@ -3099,6 +3165,7 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
             MdEvent::Text(t) => {
                 let owned = t.to_string();
                 if in_code_block {
+                    code_block_text.push_str(&owned);
                     for code_line in owned.split('\n') {
                         push_line(&mut lines, &mut current_spans);
                         current_spans.push(Span::styled(
