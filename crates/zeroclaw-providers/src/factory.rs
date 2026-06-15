@@ -42,6 +42,10 @@ pub trait FamilyProviderFactory {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>>;
+
+    fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        has_api_key(key)
+    }
 }
 
 /// Spec trait for OpenAI-compatible families. Implementing this gives a
@@ -54,6 +58,7 @@ pub trait CompatFamilySpec {
     const DISPLAY: &'static str;
     const DEFAULT_URL: &'static str;
     const AUTH: AuthStyle;
+    const FALLBACK_ALLOWS_MISSING_API_KEY: bool = false;
 
     /// `models.dev` catalog key for this provider, when present in the
     /// public catalog. Lets `list_models()` pre-populate the model
@@ -154,6 +159,18 @@ impl<T: CompatFamilySpec> FamilyProviderFactory for T {
             opts,
         ))
     }
+
+    fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        has_api_key(key) || T::FALLBACK_ALLOWS_MISSING_API_KEY
+    }
+}
+
+fn has_api_key(key: Option<&str>) -> bool {
+    has_non_empty_value(key)
+}
+
+fn has_non_empty_value(value: Option<&str>) -> bool {
+    value.map(str::trim).is_some_and(|value| !value.is_empty())
 }
 
 /// Apply cross-cutting compat post-processing (timeout, headers, api_path,
@@ -178,6 +195,9 @@ pub fn apply_compat_options(
     }
     if let Some(mt) = opts.provider_max_tokens {
         p = p.with_max_tokens(Some(mt));
+    }
+    if let Some(ref cert_path) = opts.tls_ca_cert_path {
+        p = p.with_tls_ca_cert_path(cert_path);
     }
     Box::new(p)
 }
@@ -292,6 +312,52 @@ pub fn dispatch_family_factory(
     zeroclaw_config::for_each_model_provider_slot!(emit_dispatch)
 }
 
+pub(crate) fn fallback_auth_ready_for_alias(
+    config: &zeroclaw_config::schema::Config,
+    family: &str,
+    alias: &str,
+    key: Option<&str>,
+    opts: &ModelProviderRuntimeOptions,
+) -> bool {
+    let provider_kind = opts
+        .provider_kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(family);
+
+    macro_rules! emit_auth_ready {
+        ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
+            match provider_kind {
+                "openai-compatible" | "openai_compatible" => {
+                    let default_cfg = zeroclaw_config::schema::ModelProviderConfig::default();
+                    let cfg = config
+                        .providers
+                        .models
+                        .find("openai", alias)
+                        .unwrap_or(&default_cfg);
+                    cfg.fallback_auth_ready(key, opts)
+                }
+                $(
+                    $type_str => {
+                        let default_cfg: $cfg_ty;
+                        let cfg: &$cfg_ty = match config.providers.models.$field.get(alias) {
+                            Some(c) => c,
+                            None => {
+                                default_cfg = <$cfg_ty>::default();
+                                &default_cfg
+                            }
+                        };
+                        cfg.fallback_auth_ready(key, opts)
+                    }
+                )+
+                _ => has_api_key(key),
+            }
+        }
+    }
+    zeroclaw_config::for_each_model_provider_slot!(emit_auth_ready)
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // Per-family impls — grouped by category. Adding a family means: one row
 // in `for_each_model_provider_slot!` (zeroclaw-config) plus one impl
@@ -301,7 +367,7 @@ pub fn dispatch_family_factory(
 use zeroclaw_config::schema::{
     Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnthropicModelProviderConfig,
     AnyscaleModelProviderConfig, ArceeModelProviderConfig, AstraiModelProviderConfig,
-    AtomicChatModelProviderConfig, AvianModelProviderConfig, AzureModelProviderConfig,
+    AtomicChatModelProviderConfig, AuthMode, AvianModelProviderConfig, AzureModelProviderConfig,
     BaichuanModelProviderConfig, BasetenModelProviderConfig, BedrockModelProviderConfig,
     CerebrasModelProviderConfig, CloudflareModelProviderConfig, CohereModelProviderConfig,
     CopilotModelProviderConfig, CustomModelProviderConfig, DeepinfraModelProviderConfig,
@@ -410,11 +476,13 @@ impl CompatFamilySpec for SglangModelProviderConfig {
     const DISPLAY: &'static str = "SGLang";
     const DEFAULT_URL: &'static str = "http://localhost:30000/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const FALLBACK_ALLOWS_MISSING_API_KEY: bool = true;
 }
 impl CompatFamilySpec for VllmModelProviderConfig {
     const DISPLAY: &'static str = "vLLM";
     const DEFAULT_URL: &'static str = "http://localhost:8000/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const FALLBACK_ALLOWS_MISSING_API_KEY: bool = true;
 }
 impl CompatFamilySpec for AstraiModelProviderConfig {
     const DISPLAY: &'static str = "Astrai";
@@ -437,6 +505,7 @@ impl CompatFamilySpec for LitellmModelProviderConfig {
     const DISPLAY: &'static str = "LiteLLM";
     const DEFAULT_URL: &'static str = "http://localhost:4000/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const FALLBACK_ALLOWS_MISSING_API_KEY: bool = true;
 }
 impl CompatFamilySpec for CerebrasModelProviderConfig {
     const DISPLAY: &'static str = "Cerebras";
@@ -632,6 +701,7 @@ impl CompatFamilySpec for AtomicChatModelProviderConfig {
     /// entry when they run it on a non-default port.
     const DEFAULT_URL: &'static str = "http://127.0.0.1:1337/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const FALLBACK_ALLOWS_MISSING_API_KEY: bool = true;
     const MODELS_DEV_KEY: Option<&'static str> = Some("atomic-chat");
     fn build_compat(
         &self,
@@ -690,6 +760,10 @@ impl FamilyProviderFactory for MinimaxModelProviderConfig {
         )
         .with_merge_system_into_user();
         Ok(apply_compat_options(p, opts))
+    }
+
+    fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        has_api_key(key) || has_non_empty_value(self.oauth_refresh_token.as_deref())
     }
 }
 
@@ -823,10 +897,17 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
         }
         // Default: chat_completions wire with standard API key.
         let mut p = crate::openai::OpenAiModelProvider::with_base_url(alias, api_url, key);
+        if let Some(t) = opts.provider_timeout_secs {
+            p = p.with_timeout_secs(t);
+        }
         if let Some(mt) = opts.provider_max_tokens {
             p = p.with_max_tokens(Some(mt));
         }
         Ok(Box::new(p))
+    }
+
+    fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        has_api_key(key) || self.base.requires_openai_auth
     }
 }
 
@@ -886,6 +967,10 @@ impl FamilyProviderFactory for OllamaModelProviderConfig {
             opts,
         ))
     }
+
+    fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        true
+    }
 }
 
 impl FamilyProviderFactory for GeminiModelProviderConfig {
@@ -912,6 +997,10 @@ impl FamilyProviderFactory for GeminiModelProviderConfig {
             self.oauth_client_id.clone(),
             self.oauth_client_secret.clone(),
         )))
+    }
+
+    fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        has_api_key(key) || matches!(self.auth_mode, Some(AuthMode::OAuth))
     }
 }
 
@@ -1005,6 +1094,10 @@ impl FamilyProviderFactory for BedrockModelProviderConfig {
         }
         Ok(Box::new(p))
     }
+
+    fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        true
+    }
 }
 
 impl FamilyProviderFactory for QwenModelProviderConfig {
@@ -1083,6 +1176,12 @@ impl FamilyProviderFactory for QwenModelProviderConfig {
         .with_openrouter_vendor_prefix("qwen");
         Ok(apply_compat_options(p, opts))
     }
+
+    fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        has_api_key(key)
+            || has_non_empty_value(self.oauth_refresh_token.as_deref())
+            || matches!(self.auth_mode, Some(AuthMode::OAuth))
+    }
 }
 
 impl FamilyProviderFactory for GroqModelProviderConfig {
@@ -1123,6 +1222,10 @@ impl FamilyProviderFactory for CopilotModelProviderConfig {
             alias, key,
         )))
     }
+
+    fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        true
+    }
 }
 
 impl FamilyProviderFactory for GeminiCliModelProviderConfig {
@@ -1138,6 +1241,10 @@ impl FamilyProviderFactory for GeminiCliModelProviderConfig {
             self.binary_path.as_deref(),
         )))
     }
+
+    fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        true
+    }
 }
 
 impl FamilyProviderFactory for KiloCliModelProviderConfig {
@@ -1152,6 +1259,10 @@ impl FamilyProviderFactory for KiloCliModelProviderConfig {
             alias,
             self.binary_path.as_deref(),
         )))
+    }
+
+    fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        true
     }
 }
 
@@ -1188,6 +1299,10 @@ impl FamilyProviderFactory for LmstudioModelProviderConfig {
             AuthStyle::Bearer,
         );
         Ok(apply_compat_options(p, opts))
+    }
+
+    fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        true
     }
 }
 
@@ -1227,6 +1342,10 @@ impl FamilyProviderFactory for LlamacppModelProviderConfig {
         }
         Ok(apply_compat_options(p, opts))
     }
+
+    fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        true
+    }
 }
 
 impl FamilyProviderFactory for OsaurusModelProviderConfig {
@@ -1249,6 +1368,10 @@ impl FamilyProviderFactory for OsaurusModelProviderConfig {
             AuthStyle::Bearer,
         );
         Ok(apply_compat_options(p, opts))
+    }
+
+    fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        true
     }
 }
 
@@ -1317,6 +1440,10 @@ impl FamilyProviderFactory for CustomModelProviderConfig {
             p = p.with_merge_system_into_user();
         }
         Ok(apply_compat_options(p, opts))
+    }
+
+    fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        true
     }
 }
 

@@ -4,7 +4,7 @@ setlocal enabledelayedexpansion
 :: ============================================================================
 :: ZeroClaw Windows Setup Script
 :: Simplifies building and installing ZeroClaw on Windows.
-:: Usage: setup.bat [--prebuilt | --minimal | --standard | --full | --help]
+:: Usage: setup.bat [--prebuilt | --minimal | --dist | --default | --all | --dry-run | --help]
 :: ============================================================================
 
 set "VERSION=0.8.0"
@@ -22,12 +22,19 @@ set "RESET=[0m"
 
 :: Parse arguments
 set "MODE=interactive"
+set "DRY_RUN=false"
+:parse_args
+if "%~1"==""           goto :start
 if "%~1"=="--help"     goto :show_help
 if "%~1"=="-h"         goto :show_help
-if "%~1"=="--prebuilt" set "MODE=prebuilt" & goto :start
-if "%~1"=="--minimal"  set "MODE=minimal"  & goto :start
-if "%~1"=="--standard" set "MODE=standard" & goto :start
-if "%~1"=="--full"     set "MODE=full"     & goto :start
+if "%~1"=="--dry-run"  set "DRY_RUN=true" & shift & goto :parse_args
+if "%~1"=="--prebuilt" set "MODE=prebuilt" & shift & goto :parse_args
+if "%~1"=="--minimal"  set "MODE=minimal"  & shift & goto :parse_args
+if "%~1"=="--dist"     set "MODE=dist"     & shift & goto :parse_args
+if "%~1"=="--default"  set "MODE=default"  & shift & goto :parse_args
+if "%~1"=="--all"      set "MODE=all"      & shift & goto :parse_args
+echo Unknown option: %~1
+goto :show_help
 
 :start
 echo.
@@ -61,7 +68,11 @@ for /f %%a in ('powershell -Command "[math]::Round((Get-PSDrive $env:SystemDrive
 where cargo >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
     echo   %YELLOW%Rust not found.%RESET%
-    goto :install_rust
+    if "%DRY_RUN%"=="true" (
+        echo   [dry-run] Would install Rust via rustup
+    ) else (
+        goto :install_rust
+    )
 ) else (
     for /f "tokens=2" %%v in ('rustc --version 2^>nul') do set "RUST_VER=%%v"
     echo   %GREEN%OK%RESET% Rust !RUST_VER! found
@@ -116,37 +127,44 @@ echo   %YELLOW%NOTE: You may need to restart your terminal for PATH changes.%RES
 goto :choose_mode
 
 :: ---- Choose build mode ----
+:: >>> generated:menu by `cargo generate installers` - do not edit <<<
 :choose_mode
-echo.
-
 if "%MODE%"=="prebuilt" goto :install_prebuilt
-if "%MODE%"=="minimal"  goto :build_minimal
-if "%MODE%"=="standard" goto :build_standard
-if "%MODE%"=="full"     goto :build_full
+if "%MODE%"=="minimal" goto :build_minimal
+if "%MODE%"=="dist" goto :build_dist
+if "%MODE%"=="default" goto :build_default
+if "%MODE%"=="all" goto :build_all
 
-:: Interactive mode
 echo %BOLD%[2/5] Choose installation method:%RESET%
 echo.
-echo   1) Prebuilt binary   - Download pre-compiled release (fastest, ~2 min)
-echo   2) Minimal build     - Core only (^--no-default-features, ~15 min)
-echo   3) Standard build    - Default + Lark/Feishu + Matrix (~20 min)
-echo   4) Full build        - All features including hardware + browser (~30 min)
+echo   1) Prebuilt binary - Download pre-compiled release (fastest)
+echo   2) minimal build - core only, no default features
+echo   3) dist build - all channels, no heavyweight extras (recommended)
+echo   4) default build - default feature set
+echo   5) all build - every feature including hardware and browser
 echo.
-set /p "CHOICE=  Select [1-4] (default: 1): "
-
+set /p "CHOICE=  Select [1-5] (default: 1): "
 if "%CHOICE%"=="" set "CHOICE=1"
 if "%CHOICE%"=="1" goto :install_prebuilt
 if "%CHOICE%"=="2" goto :build_minimal
-if "%CHOICE%"=="3" goto :build_standard
-if "%CHOICE%"=="4" goto :build_full
-
-echo   %RED%Invalid choice. Please enter 1-4.%RESET%
+if "%CHOICE%"=="3" goto :build_dist
+if "%CHOICE%"=="4" goto :build_default
+if "%CHOICE%"=="5" goto :build_all
+echo   %RED%Invalid choice. Please enter 1-5.%RESET%
 goto :choose_mode
+:: >>> end generated:menu <<<
 
 :: ---- Prebuilt binary ----
 :install_prebuilt
 echo.
 echo %BOLD%[3/5] Downloading prebuilt binary...%RESET%
+
+if "%DRY_RUN%"=="true" (
+    echo   [dry-run] Would download the prebuilt Windows release archive
+    echo   [dry-run] Would install to %USERPROFILE%\.zeroclaw\bin
+    echo   [dry-run] Would add %USERPROFILE%\.zeroclaw\bin to PATH
+    goto :dry_run_done
+)
 
 :: Try to get latest release URL via gh or curl
 where gh >nul 2>&1
@@ -164,8 +182,8 @@ if not defined DOWNLOAD_URL (
 echo   Downloading from release...
 curl -sSfL -o "%TEMP%\zeroclaw-windows.zip" "!DOWNLOAD_URL!"
 if %ERRORLEVEL% NEQ 0 (
-    echo   %YELLOW%Prebuilt binary not available. Falling back to source build - standard%RESET%
-    goto :build_standard
+    echo   %YELLOW%Prebuilt binary not available. Falling back to source build - dist%RESET%
+    goto :build_dist
 )
 
 :: Extract
@@ -190,29 +208,43 @@ if exist "%USERPROFILE%\.zeroclaw\bin\zerocode.exe" (
 )
 goto verify
 
-:: ---- Minimal build ----
+:: ---- Source build presets ----
+:: >>> generated:presets by `cargo generate installers` - do not edit <<<
 :build_minimal
 set "FEATURES=--no-default-features"
 set "BUILD_DESC=minimal (core only, no default features)"
 goto :do_build
 
-:: ---- Standard build ----
-:build_standard
-set "FEATURES=--features channel-matrix,channel-lark"
-set "BUILD_DESC=standard (Matrix + Lark/Feishu)"
+:build_dist
+set "FEATURES=--no-default-features --features acp-bridge,agent-runtime,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-imessage,channel-irc,channel-lark,channel-linq,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-wati,channel-webhook,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,gateway,observability-prometheus,schema-export"
+set "BUILD_DESC=dist (all channels, no heavyweight extras (recommended))"
 goto :do_build
 
-:: ---- Full build ----
-:build_full
-set "FEATURES=--features channel-matrix,channel-lark,browser-native,hardware,rag-pdf,observability-otel"
-set "BUILD_DESC=full (all features)"
+:build_default
+set "FEATURES="
+set "BUILD_DESC=default (default feature set)"
 goto :do_build
+
+:build_all
+set "FEATURES=--no-default-features --features acp-bridge,agent-runtime,browser-native,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-feishu,channel-imessage,channel-irc,channel-lark,channel-line,channel-linq,channel-matrix,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-nostr,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-wati,channel-webhook,channel-wechat,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,dev-sim,gateway,hardware,memory-postgres,observability-otel,observability-prometheus,peripheral-rpi,plugins-wasm,probe,rag-pdf,sandbox-bubblewrap,sandbox-landlock,schema-export,webauthn,whatsapp-web"
+set "BUILD_DESC=all (every feature including hardware and browser)"
+goto :do_build
+:: >>> end generated:presets <<<
 
 :: ---- Build from source ----
 :do_build
 echo.
 echo %BOLD%[3/5] Building ZeroClaw (%BUILD_DESC%)...%RESET%
 echo   Target: %TARGET%
+
+if "%DRY_RUN%"=="true" (
+    echo   [dry-run] Would run: cargo build --release --locked %FEATURES% --target %TARGET%
+    echo   [dry-run] Would run: cargo build --release --locked -p zerocode --target %TARGET%
+    echo   [dry-run] Would install to %USERPROFILE%\.zeroclaw\bin
+    echo   [dry-run] Would build web dashboard ^(cargo web build^) and install to %LOCALAPPDATA%\zeroclaw\web\dist
+    echo   [dry-run] Would add %USERPROFILE%\.zeroclaw\bin to PATH
+    goto :dry_run_done
+)
 
 :: Ensure we're in the repo root (check for Cargo.toml)
 if not exist "Cargo.toml" (
@@ -247,7 +279,11 @@ echo   %GREEN%OK%RESET% Build succeeded.
 echo   Command: cargo build --release --locked -p zerocode --target %TARGET%
 cargo build --release --locked -p zerocode --target %TARGET%
 if %ERRORLEVEL% NEQ 0 (
-    echo   %YELLOW%WARNING: zerocode TUI build failed; continuing with zeroclaw only.%RESET%
+    echo.
+    echo   %RED%ERROR: zerocode TUI build failed.%RESET%
+    echo   zerocode ships with every install; a partial install is not produced.
+    echo   Fix the build error above and re-run setup.bat.
+    goto :error_exit
 )
 
 :: Copy binary to a convenient location
@@ -275,6 +311,30 @@ if %ERRORLEVEL% NEQ 0 (
     setx PATH "%PATH%;%USERPROFILE%\.zeroclaw\bin" >nul 2>&1
     set "PATH=%PATH%;%USERPROFILE%\.zeroclaw\bin"
     echo   %GREEN%OK%RESET% Added to PATH
+)
+
+:: Build and install the web dashboard so the gateway serves it. Mirrors
+:: install.sh: assets must land where the gateway auto-detects them
+:: (%LOCALAPPDATA%\zeroclaw\web\dist) so a service-launched daemon finds
+:: them regardless of working directory.
+where npm >nul 2>&1
+if %ERRORLEVEL% EQU 0 (
+    echo   Building web dashboard ^(cargo web build^)...
+    cargo web build
+    if %ERRORLEVEL% EQU 0 (
+        if exist "web\dist\index.html" (
+            mkdir "%LOCALAPPDATA%\zeroclaw\web\dist" 2>nul
+            xcopy /E /I /Y "web\dist" "%LOCALAPPDATA%\zeroclaw\web\dist" >nul
+            echo   %GREEN%OK%RESET% Web dashboard installed to %LOCALAPPDATA%\zeroclaw\web\dist
+        )
+    ) else (
+        echo   %YELLOW%WARNING: dashboard build failed; gateway runs in API-only mode.%RESET%
+        echo   %YELLOW%Re-run setup.bat once the build issue is resolved.%RESET%
+    )
+) else (
+    echo   %YELLOW%npm not found - skipping dashboard build. The gateway will run%RESET%
+    echo   %YELLOW%in API-only mode. Install Node.js and re-run setup.bat to build%RESET%
+    echo   %YELLOW%and install the dashboard.%RESET%
 )
 
 goto verify
@@ -335,8 +395,10 @@ echo.
 echo Options:
 echo   --prebuilt    Download pre-compiled binary (fastest)
 echo   --minimal     Build core only ^(--no-default-features^)
-echo   --standard    Build with Matrix + Lark/Feishu
-echo   --full        Build with all features
+echo   --dist        Build all channels, no heavyweight extras (recommended)
+echo   --default     Build the default feature set
+echo   --all         Build every feature including hardware and browser
+echo   --dry-run     Show what would happen without building or installing
 echo   --help, -h    Show this help message
 echo.
 echo Without arguments, runs in interactive mode.
@@ -357,6 +419,12 @@ echo Need help? Open an issue at %REPO%/issues
 echo.
 endlocal
 exit /b 1
+
+:: ---- Dry-run summary ----
+:dry_run_done
+echo.
+echo   %GREEN%Dry run complete.%RESET% No changes were made.
+goto :end
 
 :: ---- Clean exit ----
 :end
