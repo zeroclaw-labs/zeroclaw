@@ -15095,19 +15095,60 @@ impl Config {
                 crate::providers::TranscriptionProviders::slot_names(),
             ),
         ];
-        // Known provider config field names that should appear at the
-        // alias level, not nested one level deeper.
+        // All known provider config field names across model, TTS, and
+        // transcription provider structs. If an extra-nested table contains
+        // any of these keys, it is almost certainly provider config that
+        // got silently dropped by serde due to the extra nesting level.
+        // Derived from ModelProviderConfig, TtsProviderConfig,
+        // TranscriptionProviderConfig, and all family-specific structs.
         const PROVIDER_FIELD_NAMES: &[&str] = &[
-            "model",
+            // ModelProviderConfig base
             "api_key",
-            "uri",
-            "endpoint",
-            "wire_api",
             "kind",
-            "temperature",
+            "uri",
+            "model",
             "fallback",
-            "enabled",
+            "fallback_models",
+            "temperature",
+            "timeout_secs",
             "extra_headers",
+            "wire_api",
+            "requires_openai_auth",
+            "max_tokens",
+            "merge_system_into_user",
+            "provider_extra",
+            "pricing",
+            "native_tools",
+            "think",
+            "chat_template_kwargs",
+            // Family-specific model provider fields
+            "resource",
+            "deployment",
+            "api_version",
+            "endpoint",
+            "auth_mode",
+            "oauth_refresh_token",
+            "oauth_client_id",
+            "oauth_client_secret",
+            "oauth_project",
+            "oauth_resource_url",
+            "num_ctx",
+            "num_predict",
+            "temperature_override",
+            "binary_path",
+            "region",
+            // TTS provider fields
+            "voice",
+            "speed",
+            "stability",
+            "similarity_boost",
+            "language_code",
+            "response_format",
+            // Transcription provider fields
+            "language",
+            "initial_prompt",
+            "bearer_token",
+            "max_audio_bytes",
         ];
         let mut out = Vec::new();
         for (kind, slots) in kind_slots {
@@ -15127,14 +15168,17 @@ impl Config {
                     };
                     // Check if any key in the inner table is itself a
                     // table containing provider-shaped fields. This
-                    // indicates an extra nesting level.
+                    // indicates an extra nesting level where provider
+                    // config fields were silently dropped by serde.
                     for (inner_key, inner_value) in inner {
                         if let Some(deep_table) = inner_value.as_table() {
                             let has_provider_fields = deep_table
                                 .keys()
                                 .any(|k| PROVIDER_FIELD_NAMES.contains(&k.as_str()));
                             if has_provider_fields {
-                                out.push(format!("providers.{kind}.{family}.{alias}.{inner_key}"));
+                                out.push(format!(
+                                    "providers.{kind}.{family}.{alias}.{inner_key}"
+                                ));
                             }
                         }
                     }
@@ -26223,6 +26267,35 @@ timeout = 30
         assert!(
             Config::extra_nested_provider_aliases(non_provider).is_empty(),
             "non-provider sub-table must not trigger"
+        );
+
+        // Family-specific fields only (Azure resource/deployment/api_version).
+        let azure_only = r#"
+schema_version = 3
+
+[providers.models.azure.prod.prod]
+resource = "my-resource"
+deployment = "gpt-4o"
+api_version = "2024-02-01"
+"#;
+        assert_eq!(
+            Config::extra_nested_provider_aliases(azure_only),
+            vec!["providers.models.azure.prod.prod".to_string()],
+            "family-specific fields (resource, deployment, api_version) must be detected"
+        );
+
+        // TTS family-specific fields (voice/speed).
+        let tts_nested = r#"
+schema_version = 3
+
+[providers.tts.openai.default.default]
+voice = "alloy"
+speed = 1.0
+"#;
+        assert_eq!(
+            Config::extra_nested_provider_aliases(tts_nested),
+            vec!["providers.tts.openai.default.default".to_string()],
+            "TTS family-specific fields must be detected"
         );
 
         // Hostile shapes.
