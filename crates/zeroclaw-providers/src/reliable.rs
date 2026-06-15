@@ -1,4 +1,5 @@
 use super::ModelProvider;
+use super::dispatch::ProviderDispatch;
 use super::stream_guard::AbortOnDrop;
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
@@ -749,7 +750,11 @@ impl ModelProvider for ReliableModelProvider {
                     .with_attrs(::serde_json::json!({"model_provider": name})),
                 "Warming up model_provider connection pool"
             );
-            if model_provider.warmup().await.is_err() {
+            if ProviderDispatch::from_ref(&**model_provider)
+                .warmup()
+                .await
+                .is_err()
+            {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -783,7 +788,7 @@ impl ModelProvider for ReliableModelProvider {
                 let mut last_diagnostic: Option<ProviderErrorDiagnostic> = None;
 
                 for attempt in 0..=self.max_retries {
-                    match model_provider
+                    match ProviderDispatch::from_ref(&**model_provider)
                         .chat_with_system(system_prompt, message, current_model, temperature)
                         .await
                     {
@@ -966,7 +971,7 @@ impl ModelProvider for ReliableModelProvider {
                 let mut last_diagnostic: Option<ProviderErrorDiagnostic> = None;
 
                 for attempt in 0..=self.max_retries {
-                    match model_provider
+                    match ProviderDispatch::from_ref(&**model_provider)
                         .chat_with_history(&effective_messages, current_model, temperature)
                         .await
                     {
@@ -1169,7 +1174,7 @@ impl ModelProvider for ReliableModelProvider {
                 let mut last_diagnostic: Option<ProviderErrorDiagnostic> = None;
 
                 for attempt in 0..=self.max_retries {
-                    match model_provider
+                    match ProviderDispatch::from_ref(&**model_provider)
                         .chat_with_tools(&effective_messages, tools, current_model, temperature)
                         .await
                     {
@@ -1363,7 +1368,10 @@ impl ModelProvider for ReliableModelProvider {
                         tools: request.tools,
                         thinking: request.thinking,
                     };
-                    match model_provider.chat(req, current_model, temperature).await {
+                    match ProviderDispatch::from_ref(&**model_provider)
+                        .chat(req, current_model, temperature)
+                        .await
+                    {
                         Ok(resp) => {
                             // Re-roll a transient empty completion instead of
                             // returning a blank turn (bounded by `max_retries`;
@@ -1579,7 +1587,12 @@ impl ModelProvider for ReliableModelProvider {
                 tools: request.tools,
                 thinking: request.thinking,
             };
-            let stream = model_provider.stream_chat(req, &current_model, temperature, options);
+            let stream = ProviderDispatch::from_ref(&**model_provider).stream_chat(
+                req,
+                &current_model,
+                temperature,
+                options,
+            );
             let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
             let handle = ::zeroclaw_spawn::spawn!(async move {
