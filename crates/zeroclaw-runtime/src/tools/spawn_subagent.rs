@@ -267,7 +267,7 @@ mod tests {
         config.agents.insert(
             alias.to_string(),
             AliasedAgentConfig {
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..AliasedAgentConfig::default()
             },
         );
@@ -384,7 +384,7 @@ mod tests {
         config.agents.insert(
             alias.to_string(),
             AliasedAgentConfig {
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..AliasedAgentConfig::default()
             },
         );

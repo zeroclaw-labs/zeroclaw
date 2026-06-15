@@ -16,7 +16,7 @@ Last updated: **June 2026** (merge queue enabled on `master`).
 ZeroClaw uses a single default branch: `master`. All contributor PRs target
 `master` directly. There is no `dev` or promotion branch.
 
-Maintainers with merge authority: `theonlyhennygod` and `JordanTheJet`.
+Maintainers with merge authority: `JordanTheJet`, `singlerider`, `Audacity88`, `WareWolf-MoonWall`, `Nillth`, and `tidux`.
 
 ---
 

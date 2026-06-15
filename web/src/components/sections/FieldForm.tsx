@@ -45,6 +45,7 @@ import {
   listProps,
   objectArrayElementProps,
   patchConfig,
+  resolveAliasSource,
   type AgentOptionsResponse,
   type ConfigApiError,
   type DriftEntry,
@@ -156,7 +157,7 @@ export interface FieldFormHandle {
 
 function rendererFor(
   entry: ListResponseEntry,
-): "bool" | "array" | "object-array" | "secret" | "select" | "number" | "text" {
+): "bool" | "array" | "object-array" | "secret" | "select" | "alias-ref" | "number" | "text" {
   if (entry.is_secret) return "secret";
   switch (entry.kind) {
     case "bool":
@@ -172,6 +173,8 @@ function rendererFor(
       return entry.enum_variants && entry.enum_variants.length > 0
         ? "select"
         : "text";
+    case "alias-ref":
+      return "alias-ref";
     default:
       return "text";
   }
@@ -380,6 +383,22 @@ function loadAgentOptions(): Promise<AgentOptionsResponse> {
     agentOptionsPromise = null;
   });
   return agentOptionsPromise;
+}
+
+// In-flight de-dupe for generic alias-source resolution. Keyed by the wire
+// `alias_source` value; a fresh fetch fires per mount so newly-created
+// aliases surface on the next form visit.
+const aliasSourcePromises: Record<string, Promise<string[]> | undefined> = {};
+function loadAliasSource(source: string): Promise<string[]> {
+  const inflight = aliasSourcePromises[source];
+  if (inflight) return inflight;
+  const p = resolveAliasSource(source)
+    .then((r) => r.values)
+    .finally(() => {
+      aliasSourcePromises[source] = undefined;
+    });
+  aliasSourcePromises[source] = p;
+  return p;
 }
 
 /// Clear the per-provider model catalog cache. Called by Config.tsx when
@@ -1098,6 +1117,26 @@ function FieldRow({
     null,
   );
 
+  // Generic alias-reference picker. Any field the schema typed as
+  // `PropKind::AliasRef` carries `alias_source`; resolve its values from the
+  // live config with no per-path special-casing.
+  const aliasSource = entry.kind === "alias-ref" ? entry.alias_source : undefined;
+  const [aliasValues, setAliasValues] = useState<string[] | null>(null);
+  useEffect(() => {
+    if (!aliasSource) return;
+    let cancelled = false;
+    void loadAliasSource(aliasSource)
+      .then((values) => {
+        if (!cancelled) setAliasValues(values);
+      })
+      .catch(() => {
+        if (!cancelled) setAliasValues([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [aliasSource]);
+
   useEffect(() => {
     if (!isProviderModelField) return;
     void primeModelProviderCatalog();
@@ -1265,6 +1304,26 @@ function FieldRow({
               </option>
             ))}
           </select>
+        ) : renderer === "alias-ref" ? (
+          <>
+            <input
+              id={entry.path}
+              list={`alias-${entry.path}`}
+              value={value}
+              onChange={(e) => onChange(e.target.value)}
+              className="input-electric w-full px-3 py-2 text-sm"
+              placeholder={
+                aliasValues === null
+                  ? "Loading options..."
+                  : "Pick from list or type a value"
+              }
+            />
+            <datalist id={`alias-${entry.path}`}>
+              {(aliasValues ?? []).map((v) => (
+                <option key={v} value={v} />
+              ))}
+            </datalist>
+          </>
         ) : isProviderModelField &&
           providerModels !== null &&
           providerModels.length > 0 ? (
