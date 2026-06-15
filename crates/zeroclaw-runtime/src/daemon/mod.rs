@@ -1363,6 +1363,10 @@ fn auto_detect_heartbeat_channel(config: &Config) -> Option<(String, String)> {
         // Mattermost requires explicit target
         return None;
     }
+    if !config.channels.matrix.is_empty() {
+        // Matrix requires explicit target
+        return None;
+    }
     None
 }
 
