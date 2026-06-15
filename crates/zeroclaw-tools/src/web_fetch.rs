@@ -566,7 +566,12 @@ fn validate_target_url_with_dns_check(
         );
     }
 
-    if private_tolerated {
+    // Only WARN when a private-host bypass concretely fired here: an explicit
+    // carve-out, or "*" lifting the block for a literally private/local host.
+    // Gating on bare `private_tolerated` would log this SSRF-bypass on *every*
+    // fetch once "*" is set, burying the real signal. (The new "*"-tolerates-a-
+    // resolved-private-IP case is only knowable post-DNS, which this path skips.)
+    if private_explicit || (private_tolerated && host_is_private_or_local) {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
