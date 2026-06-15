@@ -199,6 +199,24 @@ pub fn apply_compat_options(
     if let Some(ref cert_path) = opts.tls_ca_cert_path {
         p = p.with_tls_ca_cert_path(cert_path);
     }
+    if let Some(extra) = &opts.provider_extra {
+        if extra.is_object() {
+            p = p.with_extra_body(extra.clone());
+        } else {
+            let config_path = format!("[providers.models.{}].provider_extra", p.alias);
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "alias": p.alias,
+                        "config_path": &config_path,
+                    })),
+                "provider_extra must be a JSON object (use TOML inline \
+                 table syntax, not a JSON string). Got: {extra}. Config path: {config_path}",
+            );
+        }
+    }
     Box::new(p)
 }
 
