@@ -59,6 +59,7 @@ pub mod method {
     pub const CONFIG_DELETE: &str = "config/delete";
     pub const CONFIG_RELOAD: &str = "config/reload";
     pub const CONFIG_MAP_KEYS: &str = "config/map-keys";
+    pub const CONFIG_RESOLVE_ALIAS_SOURCE: &str = "config/resolve-alias-source";
     pub const CONFIG_MAP_KEY_CREATE: &str = "config/map-key-create";
     pub const CONFIG_MAP_KEY_DELETE: &str = "config/map-key-delete";
     pub const CONFIG_TEMPLATES: &str = "config/templates";
@@ -808,6 +809,19 @@ impl RpcClient {
         Ok(result.keys)
     }
 
+    pub async fn config_resolve_alias_source(
+        &self,
+        source: crate::wire::AliasSource,
+    ) -> Result<Vec<String>> {
+        let result: ConfigResolveAliasSourceResult = self
+            .call(
+                method::CONFIG_RESOLVE_ALIAS_SOURCE,
+                serde_json::json!({ "source": source }),
+            )
+            .await?;
+        Ok(result.values)
+    }
+
     pub async fn config_map_key_create(&self, path: &str, key: &str) -> Result<()> {
         let _: Value = self
             .call(
@@ -1317,6 +1331,12 @@ pub struct LocalesFetchResult {
 #[serde(rename_all = "snake_case")]
 pub struct ConfigMapKeysResult {
     pub keys: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ConfigResolveAliasSourceResult {
+    pub values: Vec<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]

@@ -168,7 +168,7 @@ pub fn humanize_section_key(key: &str) -> String {
         "providers.transcription" => return "Transcription providers".to_string(),
         _ => {}
     }
-    let mut s = key.replace(['_', '-'], " ");
+    let mut s = key.replace(['_', '-', '.'], " ");
     if let Some(c) = s.get_mut(0..1) {
         c.make_ascii_uppercase();
     }
@@ -637,6 +637,18 @@ pub fn section_has_signal(cfg: &crate::schema::Config, section: Section) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn humanize_strips_dots_underscores_and_hyphens() {
+        assert_eq!(humanize_section_key("mcp.servers"), "Mcp servers");
+        assert_eq!(humanize_section_key("mcp_bundles"), "Mcp bundles");
+        assert_eq!(
+            humanize_section_key("knowledge-bundles"),
+            "Knowledge bundles"
+        );
+        assert_eq!(Section::McpServers.label(), "Mcp servers");
+        assert_eq!(Section::McpBundles.label(), "Mcp bundles");
+    }
 
     /// Round-trip every entry in the canonical list. `from_key`,
     /// `as_str`, `section_index`, and `QUICKSTART_SECTIONS` are all

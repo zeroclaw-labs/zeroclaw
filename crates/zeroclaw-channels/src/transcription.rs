@@ -4,7 +4,11 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use reqwest::multipart::{Form, Part};
 
-use zeroclaw_config::schema::TranscriptionConfig;
+use zeroclaw_config::providers::TranscriptionProviderEntry;
+use zeroclaw_config::schema::{
+    AssemblyAiSttConfig, Config, DeepgramSttConfig, GoogleSttConfig, LocalWhisperConfig,
+    OpenAiSttConfig, TranscriptionConfig,
+};
 
 /// Maximum upload size accepted by most Whisper-compatible APIs (25 MB).
 const MAX_AUDIO_BYTES: usize = 25 * 1024 * 1024;
@@ -734,6 +738,71 @@ impl TranscriptionManager {
         let mut transcription_providers: HashMap<String, Box<dyn TranscriptionProvider>> =
             HashMap::new();
 
+        Self::register_legacy_providers(&mut transcription_providers, config);
+
+        if config.enabled && transcription_providers.is_empty() {
+            bail!(
+                "Transcription is enabled but no transcription provider registered \
+                 successfully. Configure at least one of: [transcription] (Groq) \
+                 with api_key + api_url; [transcription.openai]; [transcription.deepgram]; \
+                 [transcription.assemblyai]; [transcription.google]; [transcription.local_whisper]; \
+                 or [providers.transcription.<type>.<alias>]."
+            );
+        }
+
+        Ok(Self {
+            transcription_providers,
+            max_audio_bytes: config.max_audio_bytes,
+            agent_transcription_provider: String::new(),
+        })
+    }
+
+    /// Build a manager bound to a specific agent's dotted
+    /// `transcription_provider` reference.
+    ///
+    /// Current v0.8 config stores STT provider instances under
+    /// `[providers.transcription.<type>.<alias>]`, and agents reference them
+    /// as `<type>.<alias>`. This constructor preserves the legacy
+    /// `TranscriptionConfig` registrations while also registering current
+    /// typed provider instances under their dotted aliases.
+    pub fn from_config_for_agent(config: &Config, agent_alias: Option<&str>) -> Result<Self> {
+        if matches!(config.transcription.max_audio_bytes, Some(0)) {
+            bail!("transcription.max_audio_bytes must be greater than zero");
+        }
+
+        let mut transcription_providers: HashMap<String, Box<dyn TranscriptionProvider>> =
+            HashMap::new();
+
+        Self::register_legacy_providers(&mut transcription_providers, &config.transcription);
+        Self::register_typed_providers(&mut transcription_providers, config);
+
+        if config.transcription.enabled && transcription_providers.is_empty() {
+            bail!(
+                "Transcription is enabled but no transcription provider registered \
+                 successfully. Configure at least one of: [providers.transcription.<type>.<alias>], \
+                 [transcription] (Groq) with api_key + api_url, [transcription.openai], \
+                 [transcription.deepgram], [transcription.assemblyai], [transcription.google], \
+                 or [transcription.local_whisper]."
+            );
+        }
+
+        let agent_transcription_provider = agent_alias
+            .or_else(|| config.resolved_runtime_agent_alias())
+            .and_then(|alias| config.agents.get(alias))
+            .map(|a| a.transcription_provider.as_str().to_string())
+            .unwrap_or_default();
+
+        Ok(Self {
+            transcription_providers,
+            max_audio_bytes: config.transcription.max_audio_bytes,
+            agent_transcription_provider,
+        })
+    }
+
+    fn register_legacy_providers(
+        transcription_providers: &mut HashMap<String, Box<dyn TranscriptionProvider>>,
+        config: &TranscriptionConfig,
+    ) {
         if let Ok(groq) = GroqProvider::from_config("groq", config) {
             transcription_providers.insert("groq".to_string(), Box::new(groq));
         }
@@ -778,21 +847,133 @@ impl TranscriptionManager {
                 }
             }
         }
+    }
 
-        if config.enabled && transcription_providers.is_empty() {
-            bail!(
-                "Transcription is enabled but no transcription provider registered \
-                 successfully. Configure at least one of: [transcription] (Groq) \
-                 with api_key + api_url; [transcription.openai]; [transcription.deepgram]; \
-                 [transcription.assemblyai]; [transcription.google]; [transcription.local_whisper]."
-            );
+    fn register_typed_providers(
+        transcription_providers: &mut HashMap<String, Box<dyn TranscriptionProvider>>,
+        config: &Config,
+    ) {
+        for (family, alias, entry) in config.providers.transcription.iter_entries() {
+            let dotted = format!("{family}.{alias}");
+            let (log_invalid_config, result): (bool, Result<Box<dyn TranscriptionProvider>>) =
+                match entry {
+                    TranscriptionProviderEntry::Groq(provider_config) => {
+                        let groq_config = TranscriptionConfig {
+                            enabled: config.transcription.enabled,
+                            api_key: provider_config.base.api_key.clone(),
+                            api_url: "https://api.groq.com/openai/v1/audio/transcriptions"
+                                .to_string(),
+                            model: provider_config
+                                .model
+                                .clone()
+                                .filter(|model| !model.trim().is_empty())
+                                .unwrap_or_else(|| "whisper-large-v3-turbo".to_string()),
+                            language: provider_config.base.language.clone(),
+                            initial_prompt: provider_config.base.initial_prompt.clone(),
+                            max_audio_bytes: config.transcription.max_audio_bytes,
+                            max_duration_secs: config.transcription.max_duration_secs,
+                            openai: None,
+                            deepgram: None,
+                            assemblyai: None,
+                            google: None,
+                            local_whisper: None,
+                            transcribe_non_ptt_audio: config.transcription.transcribe_non_ptt_audio,
+                        };
+                        (
+                            false,
+                            GroqProvider::from_config(alias, &groq_config)
+                                .map(|p| Box::new(p) as _),
+                        )
+                    }
+                    TranscriptionProviderEntry::OpenAi(provider_config) => {
+                        let openai_config = OpenAiSttConfig {
+                            api_key: provider_config.base.api_key.clone(),
+                            model: provider_config
+                                .model
+                                .clone()
+                                .filter(|model| !model.trim().is_empty())
+                                .unwrap_or_else(|| "whisper-1".to_string()),
+                        };
+                        (
+                            false,
+                            OpenAiWhisperProvider::from_config(alias, &openai_config)
+                                .map(|p| Box::new(p) as _),
+                        )
+                    }
+                    TranscriptionProviderEntry::Deepgram(provider_config) => {
+                        let deepgram_config = DeepgramSttConfig {
+                            api_key: provider_config.base.api_key.clone(),
+                            model: provider_config
+                                .model
+                                .clone()
+                                .filter(|model| !model.trim().is_empty())
+                                .unwrap_or_else(|| "nova-2".to_string()),
+                        };
+                        (
+                            false,
+                            DeepgramProvider::from_config(alias, &deepgram_config)
+                                .map(|p| Box::new(p) as _),
+                        )
+                    }
+                    TranscriptionProviderEntry::AssemblyAi(provider_config) => {
+                        let assemblyai_config = AssemblyAiSttConfig {
+                            api_key: provider_config.base.api_key.clone(),
+                        };
+                        (
+                            false,
+                            AssemblyAiProvider::from_config(alias, &assemblyai_config)
+                                .map(|p| Box::new(p) as _),
+                        )
+                    }
+                    TranscriptionProviderEntry::Google(provider_config) => {
+                        let google_config = GoogleSttConfig {
+                            api_key: provider_config.base.api_key.clone(),
+                            language_code: provider_config
+                                .base
+                                .language
+                                .clone()
+                                .filter(|language| !language.trim().is_empty())
+                                .unwrap_or_else(|| "en-US".to_string()),
+                        };
+                        (
+                            false,
+                            GoogleSttProvider::from_config(alias, &google_config)
+                                .map(|p| Box::new(p) as _),
+                        )
+                    }
+                    TranscriptionProviderEntry::LocalWhisper(provider_config) => {
+                        let local_config = LocalWhisperConfig {
+                            url: provider_config.uri.clone(),
+                            bearer_token: provider_config.bearer_token.clone(),
+                            max_audio_bytes: provider_config.max_audio_bytes,
+                            timeout_secs: provider_config.timeout_secs,
+                        };
+                        (
+                            true,
+                            LocalWhisperProvider::from_config(alias, &local_config)
+                                .map(|p| Box::new(p) as _),
+                        )
+                    }
+                };
+
+            match result {
+                Ok(provider) => {
+                    transcription_providers.insert(dotted, provider);
+                }
+                Err(e) if log_invalid_config => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"error": format!("{}", e), "dotted": dotted})
+                            ),
+                        "typed local_whisper config invalid, provider skipped"
+                    );
+                }
+                Err(_) => {}
+            }
         }
-
-        Ok(Self {
-            transcription_providers,
-            max_audio_bytes: config.max_audio_bytes,
-            agent_transcription_provider: String::new(),
-        })
     }
 
     /// Set the resolved agent `transcription_provider` alias. Called by
@@ -1191,6 +1372,39 @@ mod tests {
             .unwrap()
             .with_agent_transcription_provider("openai");
         assert_eq!(manager.agent_transcription_provider, "openai");
+    }
+
+    #[test]
+    fn manager_from_config_for_agent_registers_dotted_provider_refs() {
+        let mut config = zeroclaw_config::schema::Config {
+            transcription: TranscriptionConfig {
+                enabled: true,
+                ..TranscriptionConfig::default()
+            },
+            ..zeroclaw_config::schema::Config::default()
+        };
+        config.providers.transcription.groq.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::GroqTranscriptionProviderConfig {
+                base: zeroclaw_config::schema::TranscriptionProviderConfig {
+                    api_key: Some("test-groq-key".to_string()),
+                    ..zeroclaw_config::schema::TranscriptionProviderConfig::default()
+                },
+                ..zeroclaw_config::schema::GroqTranscriptionProviderConfig::default()
+            },
+        );
+        config.agents.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                transcription_provider: "groq.default".into(),
+                ..zeroclaw_config::schema::AliasedAgentConfig::default()
+            },
+        );
+
+        let manager = TranscriptionManager::from_config_for_agent(&config, None).unwrap();
+
+        assert_eq!(manager.agent_transcription_provider, "groq.default");
+        assert!(manager.available_providers().contains(&"groq.default"));
     }
 
     #[test]

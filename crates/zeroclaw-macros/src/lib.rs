@@ -103,14 +103,12 @@ fn has_serde_meta(field: &syn::Field, ident: &str) -> bool {
 ///
 /// ## Enum fields
 ///
-/// Enum types used as fields must implement `HasPropKind`. Add the type to the
-/// `impl_enum_prop_kind!` block in `crates/zeroclaw-config/src/schema.rs`, or
-/// implement `HasPropKind` at the enum's definition site:
+/// Enum types used as fields must implement `HasPropKind`. Derive it at the
+/// enum's definition site:
 ///
 /// ```ignore
-/// impl crate::config::HasPropKind for YourEnum {
-///     const PROP_KIND: crate::config::PropKind = crate::config::PropKind::Enum;
-/// }
+/// #[derive(Serialize, Deserialize, zeroclaw_macros::ConfigEnum)]
+/// pub enum YourEnum { /* ... */ }
 /// ```
 ///
 /// Live examples: see `ChannelsConfig`, `ProvidersConfig`, and `MemoryConfig`
@@ -376,6 +374,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                                 derived_from_secret: false,
                                 credential_class: #credential_class_expr,
                                 tab: #tab_token,
+                                alias_source: None,
                             });
                         }
                     }
@@ -2190,6 +2189,12 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             }
         };
 
+        let alias_source_expr = if is_vec {
+            quote! { None::<crate::config::AliasSource> }
+        } else {
+            quote! { <#inner_ty as crate::config::HasPropKind>::ALIAS_SOURCE }
+        };
+
         if is_secret {
             prop_is_secret_arms.push(quote! { #full_name_lit => true, });
         }
@@ -2257,6 +2262,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         derived_from_secret: #derived_from_secret,
                         credential_class: #credential_class_expr,
                         tab: #tab_token,
+                        alias_source: #alias_source_expr,
                     }
                 }
             });
@@ -2276,6 +2282,7 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                     #credential_class_expr,
                     #tab_token,
                     &<#inner_ty as crate::config::HasPropKind>::display_secret_terminals(),
+                    #alias_source_expr,
                 )
             });
         }
@@ -2543,6 +2550,23 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
     };
 
     TokenStream::from(expanded)
+}
+
+#[proc_macro_derive(ConfigEnum)]
+pub fn derive_config_enum(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    let name = &input.ident;
+    if !matches!(input.data, Data::Enum(_)) {
+        return syn::Error::new_spanned(&input, "ConfigEnum can only be derived for enums")
+            .to_compile_error()
+            .into();
+    }
+    let (impl_g, ty_g, where_g) = input.generics.split_for_impl();
+    TokenStream::from(quote! {
+        impl #impl_g crate::config::HasPropKind for #name #ty_g #where_g {
+            const PROP_KIND: crate::config::PropKind = crate::config::PropKind::Enum;
+        }
+    })
 }
 
 fn derive_category(prefix: &str) -> String {

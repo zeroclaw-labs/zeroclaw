@@ -27,6 +27,11 @@ use crate::theme;
 
 pub(crate) type Term = Terminal<CrosstermBackend<Stdout>>;
 
+fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        | KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+}
+
 pub(crate) fn init_terminal() -> Result<Term> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -44,7 +49,7 @@ pub(crate) fn init_terminal() -> Result<Term> {
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
         let _ = execute!(
             stdout,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+            PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
         );
     }
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
@@ -353,6 +358,42 @@ impl App {
         if !self.sections.is_empty() {
             self.load_section_content(self.section_cursor).await?;
         }
+        Ok(())
+    }
+
+    pub(crate) async fn open_agent_config(&mut self, alias: &str) -> Result<()> {
+        self.section = ConfigSection::Zeroclaw;
+        self.zeroclaw_pane = ZeroclawPane::Detail;
+        self.deactivate_filter();
+
+        let Some(section_idx) = self.sections.iter().position(|s| s.key == "agents") else {
+            return Ok(());
+        };
+
+        self.section_cursor = section_idx;
+        self.loaded_section = Some(section_idx);
+        self.load_aliases("agents").await?;
+
+        let Some(alias_idx) = self.aliases.iter().position(|a| a == alias) else {
+            self.alias_cursor = 0;
+            self.screen = Screen::AliasList {
+                section_idx,
+                map_path: "agents".to_string(),
+                breadcrumb: vec!["agents".to_string()],
+            };
+            self.status_msg = None;
+            return Ok(());
+        };
+
+        self.alias_cursor = alias_idx;
+        let prefix = format!("agents.{alias}");
+        self.load_fields(&prefix).await?;
+        self.screen = Screen::FieldList {
+            section_idx,
+            prefix,
+            breadcrumb: vec!["agents".to_string(), alias.to_string()],
+        };
+        self.status_msg = None;
         Ok(())
     }
 
@@ -2274,50 +2315,23 @@ impl App {
             }
         }
 
-        // `risk_profile` / `runtime_profile` inside an agent alias →
-        // present a picker populated from the matching map's aliases.
-        // agents.<alias>.risk_profile     → list keys of risk_profiles.*
-        // agents.<alias>.runtime_profile  → list keys of runtime_profiles.*
-        if field_path.starts_with("agents.") {
-            let segs: Vec<&str> = field_path.split('.').collect();
-            // Expect agents.<alias>.<field>
-            if segs.len() == 3 {
-                let map_path = match segs[2] {
-                    "risk_profile" => Some("risk_profiles"),
-                    "runtime_profile" => Some("runtime_profiles"),
-                    _ => None,
-                };
-                if let Some(map_path) = map_path {
-                    self.status_msg = Some(format!("Loading {map_path}..."));
-                    let _ = self.draw(term);
-                    match self.rpc.config_list(Some(map_path)).await {
-                        Ok(entries) => {
-                            let prefix = format!("{map_path}.");
-                            let mut aliases: Vec<String> = entries
-                                .iter()
-                                .filter_map(|e| e.path.strip_prefix(&prefix))
-                                .filter_map(|rest| rest.split('.').next())
-                                .map(|s| s.to_string())
-                                .collect();
-                            aliases.sort();
-                            aliases.dedup();
-                            if !aliases.is_empty() {
-                                self.select_cursor = aliases
-                                    .iter()
-                                    .position(|v| v == &field_current)
-                                    .unwrap_or(0);
-                                self.select_items = aliases;
-                                self.status_msg = None;
-                            } else {
-                                self.status_msg =
-                                    Some(format!("No {map_path} defined — enter manually"));
-                            }
-                        }
-                        Err(_) => {
-                            self.status_msg =
-                                Some(format!("{map_path} fetch failed — enter manually"));
-                        }
-                    }
+        // Alias-reference fields resolve their picker list generically from
+        // the field's `alias_source` — no per-path special-casing.
+        if let Some(source) = self.fields[idx].alias_source {
+            self.status_msg = Some(crate::i18n::t("zc-config-status-loading-aliases"));
+            let _ = self.draw(term);
+            match self.rpc.config_resolve_alias_source(source).await {
+                Ok(values) if !values.is_empty() => {
+                    self.select_cursor =
+                        values.iter().position(|v| v == &field_current).unwrap_or(0);
+                    self.select_items = values;
+                    self.status_msg = None;
+                }
+                Ok(_) => {
+                    self.status_msg = Some(crate::i18n::t("zc-config-status-no-aliases"));
+                }
+                Err(_) => {
+                    self.status_msg = Some(crate::i18n::t("zc-config-status-alias-fetch-failed"));
                 }
             }
         }
@@ -3436,7 +3450,7 @@ impl App {
 
             let title = match field.kind {
                 PropKind::Bool => format!(" {short_name} (toggle) "),
-                PropKind::Enum => format!(" {short_name} (select) "),
+                PropKind::Enum | PropKind::AliasRef => format!(" {short_name} (select) "),
                 _ => format!(" {short_name} "),
             };
 
@@ -4020,7 +4034,7 @@ fn edit_in_external_editor(
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
         let _ = execute!(
             term.backend_mut(),
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+            PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
         );
     }
     // Force a full redraw so ratatui repaints everything.
@@ -4041,5 +4055,19 @@ fn edit_in_external_editor(
             let _ = std::fs::remove_file(&tmp_path);
             Err(format!("failed to launch {editor}: {e}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyboard_enhancement_flags_disambiguate_modified_enter() {
+        assert!(
+            keyboard_enhancement_flags()
+                .contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+            "Shift+Enter reaches crossterm as plain Enter on common terminals unless keyboard enhancement asks for modified-key disambiguation"
+        );
     }
 }
