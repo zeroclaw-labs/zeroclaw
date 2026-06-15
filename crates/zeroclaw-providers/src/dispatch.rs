@@ -29,12 +29,37 @@ pub struct ProviderDispatch {
     inner: Arc<dyn ModelProvider>,
 }
 
+/// Borrowed-reference twin of [`ProviderDispatch`]. Use this at call
+/// sites that already hold a `&dyn ModelProvider` and shouldn't be
+/// forced to plumb `Arc<dyn ModelProvider>` through their signatures
+/// just to gain attribution. Same surface, same on-disk shape; the
+/// only difference is the storage discipline.
+///
+/// Streaming note: `stream_chat` on this borrowed variant is
+/// intentionally **not** provided. `stream_chat` returns a
+/// `BoxStream<'static, …>` that must outlive the dispatcher; only
+/// `Arc<dyn ModelProvider>` can satisfy that lifetime. Callers that
+/// stream must hold the provider as an `Arc` and use
+/// [`ProviderDispatch`].
+pub struct ProviderDispatchRef<'a> {
+    inner: &'a dyn ModelProvider,
+}
+
 impl ProviderDispatch {
     /// Wrap an `Arc<dyn ModelProvider>` so its method calls open
     /// `attribution_span!(&*inner)` automatically.
     #[must_use]
     pub fn new(inner: Arc<dyn ModelProvider>) -> Self {
         Self { inner }
+    }
+
+    /// Wrap a borrowed `&dyn ModelProvider`. Returns a
+    /// [`ProviderDispatchRef`] for ergonomic chaining at call sites
+    /// that don't hold an `Arc`. See [`ProviderDispatchRef`] for the
+    /// streaming caveat.
+    #[must_use]
+    pub fn from_ref(inner: &dyn ModelProvider) -> ProviderDispatchRef<'_> {
+        ProviderDispatchRef { inner }
     }
 
     /// Open `attribution_span!(&*self.inner)` + `scope!(model: model)`
@@ -220,6 +245,147 @@ impl ProviderDispatch {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(&*self.inner);
         self.inner.warmup().instrument(span).await
+    }
+}
+
+impl<'a> ProviderDispatchRef<'a> {
+    /// Open `attribution_span!(self.inner)` + `scope!(model: model)`
+    /// around the inner provider's `chat` call.
+    pub async fn chat(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<ChatResponse> {
+        use zeroclaw_log::Instrument;
+        let span = zeroclaw_log::attribution_span!(self.inner);
+        async move {
+            zeroclaw_log::scope!(
+                model: model,
+                => self.inner.chat(request, model, temperature)
+            )
+            .await
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Wrap the inner provider's `simple_chat`. Dispatched through
+    /// `self.inner` so a concrete `simple_chat` override on the inner
+    /// provider is honored (rather than the trait default that
+    /// delegates to `chat_with_system`).
+    pub async fn simple_chat(
+        &self,
+        message: &str,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<String> {
+        use zeroclaw_log::Instrument;
+        let span = zeroclaw_log::attribution_span!(self.inner);
+        async move {
+            zeroclaw_log::scope!(
+                model: model,
+                => self.inner.simple_chat(message, model, temperature)
+            )
+            .await
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Wrap the inner provider's `chat_with_system`.
+    pub async fn chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<String> {
+        use zeroclaw_log::Instrument;
+        let span = zeroclaw_log::attribution_span!(self.inner);
+        async move {
+            zeroclaw_log::scope!(
+                model: model,
+                => self.inner.chat_with_system(system_prompt, message, model, temperature)
+            )
+            .await
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Wrap the inner provider's `chat_with_history`.
+    pub async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<String> {
+        use zeroclaw_log::Instrument;
+        let span = zeroclaw_log::attribution_span!(self.inner);
+        async move {
+            zeroclaw_log::scope!(
+                model: model,
+                => self.inner.chat_with_history(messages, model, temperature)
+            )
+            .await
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Wrap the inner provider's `chat_with_tools`.
+    pub async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<ChatResponse> {
+        use zeroclaw_log::Instrument;
+        let span = zeroclaw_log::attribution_span!(self.inner);
+        async move {
+            zeroclaw_log::scope!(
+                model: model,
+                => self.inner.chat_with_tools(messages, tools, model, temperature)
+            )
+            .await
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Wrap the inner provider's `list_models`. No `model` parameter,
+    /// so attribution only.
+    pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        use zeroclaw_log::Instrument;
+        let span = zeroclaw_log::attribution_span!(self.inner);
+        self.inner.list_models().instrument(span).await
+    }
+
+    /// Wrap the inner provider's `list_models_with_pricing`.
+    pub async fn list_models_with_pricing(&self) -> anyhow::Result<Vec<ModelInfo>> {
+        use zeroclaw_log::Instrument;
+        let span = zeroclaw_log::attribution_span!(self.inner);
+        self.inner.list_models_with_pricing().instrument(span).await
+    }
+
+    /// Wrap the inner provider's `warmup`. No `model` parameter, so
+    /// attribution only.
+    pub async fn warmup(&self) -> anyhow::Result<()> {
+        use zeroclaw_log::Instrument;
+        let span = zeroclaw_log::attribution_span!(self.inner);
+        self.inner.warmup().instrument(span).await
+    }
+
+    /// Hand back the underlying borrowed provider reference. Useful
+    /// at call sites that need to forward the provider to a non-call
+    /// API (e.g. a helper that holds a `&dyn ModelProvider` for
+    /// non-attribution reasons such as a manual
+    /// `attribution_span!(provider).entered()` on a sibling event).
+    #[must_use]
+    pub fn inner(&self) -> &'a dyn ModelProvider {
+        self.inner
     }
 }
 
@@ -454,6 +620,69 @@ mod tests {
             }
         }
         assert!(found, "stream chunk record was not attributed");
+        zeroclaw_log::clear_broadcast_hook();
+    }
+
+    #[tokio::test]
+    async fn dispatch_ref_chat_attaches_inner_provider_attribution() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        // Hold the fake by ownership but pass &dyn to the borrowed
+        // dispatcher — exercises the call shape that the runtime's
+        // turn helpers use.
+        let fake = FakeAnthropic {
+            alias: "ref-alias".into(),
+        };
+        let dispatch = ProviderDispatch::from_ref(&fake as &dyn ModelProvider);
+        let request = ChatRequest {
+            messages: &[],
+            tools: None,
+            thinking: None,
+        };
+        let _ = dispatch.chat(request, "claude-sonnet-4-6", None).await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut found = false;
+        while !found && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.contains("fake-anthropic chat called"))
+                        .unwrap_or(false)
+                    {
+                        let zc = value.get("zeroclaw").expect("zeroclaw block present");
+                        assert_eq!(
+                            zc.get("model_provider_alias").and_then(|v| v.as_str()),
+                            Some("ref-alias"),
+                        );
+                        assert_eq!(
+                            zc.get("model_provider_type").and_then(|v| v.as_str()),
+                            Some("anthropic"),
+                        );
+                        assert_eq!(
+                            zc.get("model").and_then(|v| v.as_str()),
+                            Some("claude-sonnet-4-6"),
+                        );
+                        found = true;
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_elapsed) => {}
+            }
+        }
+        assert!(
+            found,
+            "did not capture the fake-anthropic event via borrowed dispatcher",
+        );
         zeroclaw_log::clear_broadcast_hook();
     }
 }

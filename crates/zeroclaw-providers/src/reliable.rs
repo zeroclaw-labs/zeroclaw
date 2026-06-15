@@ -4050,11 +4050,7 @@ mod tests {
         );
         // The wrapper must report the inner provider's role/alias,
         // not its own.
-        assert_eq!(
-            reliable.role(),
-            inner_role,
-            "wrapper must delegate role()",
-        );
+        assert_eq!(reliable.role(), inner_role, "wrapper must delegate role()",);
         assert_eq!(
             reliable.alias(),
             inner_alias,

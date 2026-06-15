@@ -43,7 +43,7 @@ pub(crate) mod stream_guard;
 pub mod telnyx;
 pub mod traits;
 
-pub use dispatch::ProviderDispatch;
+pub use dispatch::{ProviderDispatch, ProviderDispatchRef};
 #[allow(unused_imports)]
 pub use traits::{
     ChatMessage, ChatRequest, ChatResponse, ConversationMessage, ModelProvider,
