@@ -14,6 +14,51 @@ pub struct SecretFieldInfo {
     pub is_set: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AliasSource {
+    ModelProviders,
+    TtsProviders,
+    TranscriptionProviders,
+    Channels,
+    RiskProfiles,
+    RuntimeProfiles,
+    Agents,
+    SkillBundles,
+    KnowledgeBundles,
+    McpBundles,
+}
+
+impl AliasSource {
+    #[must_use]
+    pub const fn section_path(self) -> &'static str {
+        match self {
+            Self::ModelProviders => "providers.models",
+            Self::TtsProviders => "providers.tts",
+            Self::TranscriptionProviders => "providers.transcription",
+            Self::Channels => "channels",
+            Self::RiskProfiles => "risk_profiles",
+            Self::RuntimeProfiles => "runtime_profiles",
+            Self::Agents => "agents",
+            Self::SkillBundles => "skill_bundles",
+            Self::KnowledgeBundles => "knowledge_bundles",
+            Self::McpBundles => "mcp_bundles",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_two_tier(self) -> bool {
+        matches!(
+            self,
+            Self::ModelProviders
+                | Self::TtsProviders
+                | Self::TranscriptionProviders
+                | Self::Channels
+        )
+    }
+}
+
 /// Runtime type classification for config property values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -24,6 +69,8 @@ pub enum PropKind {
     Float,
     /// An enum or other serde-serializable type (parsed as TOML string).
     Enum,
+    /// A reference to a configured alias; `alias_source` names the namespace.
+    AliasRef,
     /// A `Vec<String>` field; set via comma-separated input.
     StringArray,
     /// A `Vec<T>` field where `T` is a serializable struct (e.g. `Vec<McpServerConfig>`,
@@ -46,6 +93,8 @@ pub enum PropKind {
 /// else as `PropKind::Enum`.
 pub trait HasPropKind {
     const PROP_KIND: PropKind;
+
+    const ALIAS_SOURCE: Option<AliasSource> = None;
 
     /// Terminal field names whose values must be redacted when this type is
     /// displayed as an object/object-array prop. Most prop kinds have no
@@ -86,19 +135,31 @@ impl HasPropKind for Vec<String> {
 // serialize as plain strings; the schema-tooling layer treats them as
 // strings too.
 impl HasPropKind for crate::providers::ModelProviderRef {
-    const PROP_KIND: PropKind = PropKind::String;
+    const PROP_KIND: PropKind = PropKind::AliasRef;
+    const ALIAS_SOURCE: Option<AliasSource> = Some(AliasSource::ModelProviders);
 }
 impl HasPropKind for Vec<crate::providers::ModelProviderRef> {
     const PROP_KIND: PropKind = PropKind::StringArray;
 }
 impl HasPropKind for crate::providers::TtsProviderRef {
-    const PROP_KIND: PropKind = PropKind::String;
+    const PROP_KIND: PropKind = PropKind::AliasRef;
+    const ALIAS_SOURCE: Option<AliasSource> = Some(AliasSource::TtsProviders);
 }
 impl HasPropKind for crate::providers::TranscriptionProviderRef {
-    const PROP_KIND: PropKind = PropKind::String;
+    const PROP_KIND: PropKind = PropKind::AliasRef;
+    const ALIAS_SOURCE: Option<AliasSource> = Some(AliasSource::TranscriptionProviders);
 }
 impl HasPropKind for crate::providers::ChannelRef {
-    const PROP_KIND: PropKind = PropKind::String;
+    const PROP_KIND: PropKind = PropKind::AliasRef;
+    const ALIAS_SOURCE: Option<AliasSource> = Some(AliasSource::Channels);
+}
+impl HasPropKind for crate::providers::RiskProfileRef {
+    const PROP_KIND: PropKind = PropKind::AliasRef;
+    const ALIAS_SOURCE: Option<AliasSource> = Some(AliasSource::RiskProfiles);
+}
+impl HasPropKind for crate::providers::RuntimeProfileRef {
+    const PROP_KIND: PropKind = PropKind::AliasRef;
+    const ALIAS_SOURCE: Option<AliasSource> = Some(AliasSource::RuntimeProfiles);
 }
 impl HasPropKind for Vec<crate::providers::ChannelRef> {
     const PROP_KIND: PropKind = PropKind::StringArray;
@@ -108,7 +169,8 @@ impl HasPropKind for Vec<crate::providers::ChannelRef> {
 // PeerUsername round-trip as plain strings; AccessMode and
 // MemoryBackendKind are enums.
 impl HasPropKind for crate::multi_agent::AgentAlias {
-    const PROP_KIND: PropKind = PropKind::String;
+    const PROP_KIND: PropKind = PropKind::AliasRef;
+    const ALIAS_SOURCE: Option<AliasSource> = Some(AliasSource::Agents);
 }
 impl HasPropKind for crate::multi_agent::PeerGroupName {
     const PROP_KIND: PropKind = PropKind::String;
@@ -315,6 +377,8 @@ pub struct PropFieldInfo {
     /// Tab grouping for this field. `ConfigTab::None` when the field has
     /// no tab annotation (flat display, no tab bar).
     pub tab: ConfigTab,
+    /// Alias namespace for `PropKind::AliasRef` fields; `None` otherwise.
+    pub alias_source: Option<AliasSource>,
 }
 
 impl PropKind {
@@ -328,6 +392,7 @@ impl PropKind {
             Self::Integer => "integer",
             Self::Float => "float",
             Self::Enum => "enum",
+            Self::AliasRef => "alias_ref",
             Self::StringArray => "string_array",
             Self::ObjectArray => "object_array",
             Self::Object => "object",
@@ -719,6 +784,8 @@ pub struct ConfigFieldEntry {
     /// Tab grouping. `ConfigTab::None` = no tab grouping (flat display).
     #[serde(default, skip_serializing_if = "ConfigTab::is_none")]
     pub tab: ConfigTab,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias_source: Option<AliasSource>,
 }
 
 impl ConfigFieldEntry {
@@ -750,6 +817,7 @@ impl ConfigFieldEntry {
             description: info.description.to_string(),
             section,
             tab: info.tab,
+            alias_source: info.alias_source,
         }
     }
 }

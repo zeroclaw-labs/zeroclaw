@@ -1268,7 +1268,7 @@ mod tests {
             "broken".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "totally-fake.default".into(),
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..Default::default()
             },
         );
