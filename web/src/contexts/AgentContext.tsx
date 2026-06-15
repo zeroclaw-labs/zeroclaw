@@ -3,7 +3,7 @@ import type { ApprovalDecision, PendingApproval, WsMessage } from '@/types/api';
 import { WebSocketClient, getOrCreateSessionId } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
 import { t } from '@/lib/i18n';
-import { getProp, putProp, getStatus, getSessionMessages, abortSession, deleteSession } from '@/lib/api';
+import { getProp, putProp, listProps, getStatus, getSessionMessages, abortSession, deleteSession } from '@/lib/api';
 import { primeModelProviderCatalog, modelProviderDisplayName } from '@/lib/modelProviders';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
 import {
@@ -59,54 +59,6 @@ export function useAgent() {
 }
 
 const MODEL_SWITCH_TIMEOUT_MS = 10_000;
-
-/**
- * Extract the `model` identifiers from a `model_routes` prop value.
- *
- * `/api/config/prop` returns the value as a display *string* (never a real
- * array, and with no `populated` flag), so this tolerates every shape we might
- * see: an already-parsed array, a JSON-encoded array, or the TOML-ish display
- * string the gateway currently emits, e.g.
- * `[{ hint = "fast", model = "Qwen3.6-35B-A3B", model_provider = "vllm.default" }]`.
- * Returns a de-duplicated, order-preserving list of model names.
- */
-function extractRouteModels(value: unknown): string[] {
-  const out: string[] = [];
-  const push = (m: unknown) => {
-    if (typeof m === 'string' && m.length > 0 && !out.includes(m)) out.push(m);
-  };
-
-  const fromArray = (arr: unknown[]) => {
-    for (const r of arr) {
-      if (r && typeof r === 'object') push((r as Record<string, unknown>).model);
-    }
-  };
-
-  if (Array.isArray(value)) {
-    fromArray(value);
-    return out;
-  }
-
-  if (typeof value === 'string') {
-    // Try strict JSON first (future-proofing if the wire format changes).
-    try {
-      const parsed = JSON.parse(value);
-      if (Array.isArray(parsed)) {
-        fromArray(parsed);
-        if (out.length > 0) return out;
-      }
-    } catch {
-      // Not JSON — fall through to string scraping.
-    }
-    // Scrape `model = "..."` pairs. `\bmodel\s*=` does not match
-    // `model_provider = ...` because of the intervening `_provider`.
-    const re = /\bmodel\s*=\s*"([^"]+)"/g;
-    let match: RegExpExecArray | null;
-    while ((match = re.exec(value)) !== null) push(match[1]);
-  }
-
-  return out;
-}
 
 function friendlyAgentError(message?: string): string {
   const raw = message?.trim() || t('agent.unknown_error');
@@ -538,30 +490,46 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         const status = await getStatus(agentAlias);
         if (cancelled) return;
 
-        const activeModel =
-          typeof status.model === 'string' && status.model.length > 0
-            ? status.model
-            : null;
-        setCurrentModel(activeModel);
+        let activeModel = status.model;
 
-        // Fetch model_routes from config. The REST `/api/config/prop`
-        // endpoint returns `value` as a display *string* (and carries no
-        // `populated` flag), so we can't rely on `Array.isArray`. Parse the
-        // model names out of whatever shape we get — a real array, a
-        // JSON-encoded array, or the TOML-ish display string.
+        // Per-agent model (multi-agent / schema V3). The old global `model` /
+        // `default_model` keys were removed in V3, so the source of truth is THIS
+        // agent's own `agents.<alias>.model_provider` — a ref into
+        // `providers.models.<family>.<alias>`. (Previously this read the global
+        // keys, which now 404, so the button fell back to the daemon's global
+        // status model — the wrong model on every agent page.)
+        let activeRef: string | null = null;
         try {
-          const routesProp = await getProp('model_routes');
-          if (cancelled) return;
-          const models = extractRouteModels(routesProp.value);
-          // Always keep the active model selectable, even if it has no route.
-          const merged = [
-            ...(activeModel && !models.includes(activeModel) ? [activeModel] : []),
-            ...models,
-          ].filter((m): m is string => typeof m === 'string' && m.length > 0);
-          setAvailableModels(merged);
+          const refProp = await getProp(`agents.${agentAlias}.model_provider`);
+          // NOTE: GET /api/config/prop returns only `{ path, value }` — it has
+          // no `populated` field (that exists only on /api/config/list). A set
+          // prop has a string value; an unset one returns the "<unset>"
+          // sentinel; a missing path throws. So gate on the value, not
+          // `populated` (which would be undefined here and silently fail).
+          if (typeof refProp.value === 'string' && refProp.value !== '<unset>') {
+            activeRef = refProp.value;
+          }
         } catch {
+          // ignore — fall back to the status value below
+        }
+        if (cancelled) return;
+        // Show the agent's configured provider ref (e.g. "kilo.minimax_m3"),
+        // falling back to the daemon status model only if unset.
+        setCurrentModel(activeRef ?? activeModel);
+
+        // Available switch targets = every configured provider ref
+        // (`providers.models.<family>.<alias>`), discovered via config/list.
+        try {
+          const list = await listProps('providers.models');
           if (cancelled) return;
-          setAvailableModels(activeModel ? [activeModel] : []);
+          const refs = (list.entries ?? [])
+            .map((e) => e.path)
+            .filter((p) => /^providers\.models\.[^.]+\.[^.]+\.model$/.test(p))
+            .map((p) => p.replace(/^providers\.models\./, '').replace(/\.model$/, ''));
+          const unique = Array.from(new Set(refs));
+          setAvailableModels(unique.length > 0 ? unique : activeRef ? [activeRef] : []);
+        } catch {
+          setAvailableModels(activeRef ? [activeRef] : []);
         }
       } catch {
         // Ignore errors — dropdown will just show current model once loaded
@@ -626,23 +594,10 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     armWatchdog();
 
     try {
-      // The active model is NOT a top-level `model`/`default_model` key — those
-      // paths don't exist in the schema (writing them 404s with
-      // `path_not_found`). The agent resolves its model from its
-      // model_provider entry: `providers.models.<provider>.model`
-      // (see Agent::from_config / resolved_model_provider_for_agent). Resolve
-      // this agent's provider, then write the chosen model onto that entry.
-      const providerProp = await getProp(`agents.${agentAlias}.model_provider`);
-      const provider =
-        typeof providerProp.value === 'string' ? providerProp.value.trim() : '';
-      if (!provider) {
-        throw new Error(t('agent.failed_switch_model'));
-      }
-      await putProp(`providers.models.${provider}.model`, model);
-      // The write-phase watchdog may have fired (or a newer switch may have
-      // superseded this one) while the request was in flight. Bail before
-      // touching the live socket so we never tear it down after giving up.
-      if (pendingModelSwitchRef.current !== model) return;
+      // Per-agent switch: write THIS agent's own model_provider ref (multi-agent
+      // / schema V3). `model` here is a provider ref (e.g. "kilo.minimax_m3").
+      // The global `model`/`default_model` keys were removed in V3.
+      await putProp(`agents.${agentAlias}.model_provider`, model);
 
       // If a turn is actively streaming, abort it on the backend before we tear
       // down the socket. This prevents the old model from continuing to execute
