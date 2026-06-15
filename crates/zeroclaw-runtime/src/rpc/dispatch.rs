@@ -3489,6 +3489,15 @@ mod tests {
         serde_json::from_str(s).unwrap()
     }
 
+    fn make_approval_test_dispatcher() -> RpcDispatcher {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(zeroclaw_config::schema::Config::default(), sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        RpcDispatcher::new(ctx, tx, "test-peer-approval:pid=1".into())
+    }
+
     #[test]
     fn method_from_wire_roundtrip() {
         for (method, wire) in Method::ALL {
@@ -3512,6 +3521,52 @@ mod tests {
         for (_, wire) in Method::ALL {
             assert!(seen.insert(*wire), "duplicate wire name: {wire}");
         }
+    }
+
+    #[test]
+    fn session_approve_resolves_pending_request() {
+        let dispatcher = make_approval_test_dispatcher();
+        let (tx, mut rx) =
+            tokio::sync::oneshot::channel::<zeroclaw_api::channel::ChannelApprovalResponse>();
+        dispatcher
+            .ctx
+            .approval_pending
+            .insert("req-allow".to_string(), tx);
+
+        let result = dispatcher
+            .handle_session_approve(&json!({
+                "session_id": "sess-1",
+                "request_id": "req-allow",
+                "decision": "allow_once"
+            }))
+            .unwrap();
+
+        assert_eq!(result["session_id"], "sess-1");
+        assert_eq!(result["request_id"], "req-allow");
+        assert_eq!(result["acknowledged"], true);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            zeroclaw_api::channel::ChannelApprovalResponse::Approve
+        );
+        assert!(!dispatcher.ctx.approval_pending.contains("req-allow"));
+    }
+
+    #[test]
+    fn session_approve_unknown_request_is_acknowledged_noop() {
+        let dispatcher = make_approval_test_dispatcher();
+
+        let result = dispatcher
+            .handle_session_approve(&json!({
+                "session_id": "sess-1",
+                "request_id": "timed-out-req",
+                "decision": "allow_once"
+            }))
+            .unwrap();
+
+        assert_eq!(result["session_id"], "sess-1");
+        assert_eq!(result["request_id"], "timed-out-req");
+        assert_eq!(result["acknowledged"], true);
+        assert!(!dispatcher.ctx.approval_pending.contains("timed-out-req"));
     }
 
     #[test]
