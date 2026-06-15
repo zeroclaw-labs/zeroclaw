@@ -44,13 +44,16 @@ impl ConsciousnessAgent for MemoryAgent {
     fn perceive(&mut self, _state: &ConsciousnessState, signals: &[BusMessage]) -> Vec<Proposal> {
         let mut proposals = Vec::new();
 
+        let graph_nodes = self.graph.lock().node_count();
         let entry_count = self.consolidation.lock().entry_count();
         if entry_count > 0 {
             proposals.push(Proposal {
                 id: self.next_id(),
                 source: AgentKind::Memory,
                 action: "consolidate_memories".to_string(),
-                reasoning: format!("Consolidation engine has {} entries pending", entry_count),
+                reasoning: format!(
+                    "Consolidation engine has {entry_count} entries pending; memory graph tracks {graph_nodes} nodes"
+                ),
                 confidence: 0.8,
                 priority: Priority::Normal,
                 contradicts: Vec::new(),
@@ -64,7 +67,9 @@ impl ConsciousnessAgent for MemoryAgent {
                     id: self.next_id(),
                     source: AgentKind::Memory,
                     action: format!("store:{}", signal.payload),
-                    reasoning: "Received insight for storage".to_string(),
+                    reasoning: format!(
+                        "Received insight for storage; memory graph tracks {graph_nodes} nodes"
+                    ),
                     confidence: 0.7,
                     priority: Priority::Normal,
                     contradicts: Vec::new(),

@@ -10,7 +10,6 @@
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
-use serde_json;
 use std::path::PathBuf;
 
 // BotRateLimiter uses atomics but is not serializable — skipped from config.

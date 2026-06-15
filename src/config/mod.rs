@@ -8,10 +8,9 @@ pub use zeroclaw_config::providers;
 pub mod schema;
 pub mod traits;
 
-// Fork-only ("x0") config types live in `zeroclaw_config::x0_extensions` and are
-// not re-exported at the crate root. Surface them through `crate::config::*` so
-// the x0-legacy modules (onboard wizard, life, soul, runtime/wasm,
-// delegate tools, wallet_pay) that predate the crate split keep resolving.
+// X0 extension config types live in `zeroclaw_config::x0_extensions` and are
+// surfaced through `crate::config::*` so opt-in X0 modules use explicit V3
+// extension structs instead of fields removed from the core schema.
 pub use zeroclaw_config::x0_extensions::{
     AutonomyConfig, CognitiveConfig, ConsciousnessConfig, CosmicBrainConfig, CronConfig,
     DelegateAgentConfig, LifeConfig, ModelStrategyConfig, ReplicationConfig, SoulConfig,

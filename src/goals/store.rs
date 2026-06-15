@@ -13,9 +13,11 @@ pub fn propose(config: &Config, goal: &Goal) -> Result<Goal> {
     let verification_json = serde_json::to_string(&goal.verification_method)
         .context("Failed to serialize verification_method")?;
     with_connection(config, |conn| {
+        let sql = format!(
+            "INSERT INTO goals ({COLUMN_LIST}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+        );
         conn.execute(
-            "INSERT INTO goals (id, title, description, source, status, priority, proposed_at, approved_at, completed_at, evidence, success_criteria, verification_method)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            &sql,
             params![
                 goal.id,
                 goal.title,
@@ -43,20 +45,20 @@ pub fn list(config: &Config, status_filter: Option<GoalStatus>) -> Result<Vec<Go
 
         match status_filter {
             Some(s) => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, title, description, source, status, priority, proposed_at, approved_at, completed_at, evidence, success_criteria, verification_method
-                     FROM goals WHERE status = ?1 ORDER BY priority DESC, proposed_at ASC",
-                )?;
+                let sql = format!(
+                    "SELECT {COLUMN_LIST} FROM goals WHERE status = ?1 ORDER BY priority DESC, proposed_at ASC"
+                );
+                let mut stmt = conn.prepare(&sql)?;
                 let rows = stmt.query_map(params![s.as_str()], map_goal_row)?;
                 for row in rows {
                     goals.push(row?);
                 }
             }
             None => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, title, description, source, status, priority, proposed_at, approved_at, completed_at, evidence, success_criteria, verification_method
-                     FROM goals ORDER BY priority DESC, proposed_at ASC",
-                )?;
+                let sql = format!(
+                    "SELECT {COLUMN_LIST} FROM goals ORDER BY priority DESC, proposed_at ASC"
+                );
+                let mut stmt = conn.prepare(&sql)?;
                 let rows = stmt.query_map([], map_goal_row)?;
                 for row in rows {
                     goals.push(row?);
@@ -70,10 +72,8 @@ pub fn list(config: &Config, status_filter: Option<GoalStatus>) -> Result<Vec<Go
 
 pub fn get(config: &Config, id: &str) -> Result<Goal> {
     with_connection(config, |conn| {
-        let mut stmt = conn.prepare(
-            "SELECT id, title, description, source, status, priority, proposed_at, approved_at, completed_at, evidence, success_criteria, verification_method
-             FROM goals WHERE id = ?1",
-        )?;
+        let sql = format!("SELECT {COLUMN_LIST} FROM goals WHERE id = ?1");
+        let mut stmt = conn.prepare(&sql)?;
         let mut rows = stmt.query(params![id])?;
         if let Some(row) = rows.next()? {
             map_goal_row(row).map_err(Into::into)

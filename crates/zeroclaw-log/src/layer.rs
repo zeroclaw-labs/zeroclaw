@@ -575,9 +575,7 @@ fn strip_outer_quotes(s: &str) -> String {
 #[cfg(test)]
 mod e2e_tests {
     use crate as zeroclaw_log;
-    use crate::{
-        Action, Event, EventOutcome, subscribe_or_install, try_install_capture_subscriber,
-    };
+    use crate::{Action, Event, EventOutcome, LogConfig};
     use ::zeroclaw_api::attribution::{Attributable, ChannelKind, Role};
 
     /// Synthetic Attributable test fixture standing in for a real
@@ -608,66 +606,64 @@ mod e2e_tests {
         let _subscriber_guard = TEST_LOCK.lock();
         let _writer_guard = crate::writer::WRITER_TEST_LOCK.lock();
 
-        try_install_capture_subscriber();
-        let mut rx = subscribe_or_install();
-        // Drain any pre-existing buffered events from prior tests.
-        while rx.try_recv().is_ok() {}
+        use tracing_subscriber::layer::SubscriberExt;
+
+        crate::clear_broadcast_hook();
+        let tmp = tempfile::tempdir().unwrap();
+        crate::init_from_config(
+            &LogConfig {
+                log_persistence: "rolling".into(),
+                ..LogConfig::default()
+            },
+            tmp.path(),
+        );
 
         let thing = FakeTelegramChannel {
             alias: "clamps".into(),
         };
 
-        {
-            use zeroclaw_log::Instrument;
-            async {
+        tracing::subscriber::with_default(
+            tracing_subscriber::Registry::default().with(super::LogCaptureLayer),
+            || {
+                let span = zeroclaw_log::attribution_span!(&thing);
+                let _entered = span.enter();
                 zeroclaw_log::record!(
                     INFO,
                     Event::new(module_path!(), Action::Note).with_outcome(EventOutcome::Success),
                     "attribution-span e2e test"
                 );
-            }
-            .instrument(zeroclaw_log::attribution_span!(&thing))
-            .await;
-        }
+            },
+        );
 
-        // Drain captured events and find ours. `recv` is awaited inside a
-        // deadline so the receiver can recover from `Lagged` errors caused
-        // by other workspace tests firing `record!` into the same global
-        // broadcast hook in parallel; a single Lagged would otherwise abort
-        // the search prematurely.
+        // Read captured events and find ours. The writer lock above isolates
+        // the process-global writer state from concurrent writer tests.
         let mut found = false;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !found && std::time::Instant::now() < deadline {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let step = remaining.min(std::time::Duration::from_millis(50));
-            match tokio::time::timeout(step, rx.recv()).await {
-                Ok(Ok(value)) => {
-                    if value
-                        .get("message")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.contains("attribution-span e2e test"))
-                        .unwrap_or(false)
-                    {
-                        let zc = value.get("zeroclaw").expect("zeroclaw block present");
-                        assert_eq!(
-                            zc.get("channel").and_then(|v| v.as_str()),
-                            Some("telegram.clamps"),
-                            "expected channel composite, got: {zc:?}"
-                        );
-                        assert_eq!(
-                            zc.get("channel_type").and_then(|v| v.as_str()),
-                            Some("telegram"),
-                        );
-                        assert_eq!(
-                            zc.get("channel_alias").and_then(|v| v.as_str()),
-                            Some("clamps"),
-                        );
-                        found = true;
-                    }
-                }
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
-                Err(_elapsed) => {}
+        let path = crate::runtime_trace_path().expect("runtime trace path");
+        let contents = std::fs::read_to_string(path).expect("runtime trace contents");
+        for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+            let value: serde_json::Value = serde_json::from_str(line).expect("json log line");
+            if value
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(|s| s.contains("attribution-span e2e test"))
+                .unwrap_or(false)
+            {
+                let zc = value.get("zeroclaw").expect("zeroclaw block present");
+                assert_eq!(
+                    zc.get("channel").and_then(|v| v.as_str()),
+                    Some("telegram.clamps"),
+                    "expected channel composite, got: {zc:?}"
+                );
+                assert_eq!(
+                    zc.get("channel_type").and_then(|v| v.as_str()),
+                    Some("telegram"),
+                );
+                assert_eq!(
+                    zc.get("channel_alias").and_then(|v| v.as_str()),
+                    Some("clamps"),
+                );
+                found = true;
+                break;
             }
         }
         assert!(

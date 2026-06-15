@@ -10,7 +10,6 @@ use std::sync::Arc;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
 
 use crate::conscience::types::{GateVerdict, Value};
 use crate::consciousness::traits::{AgentKind, ConsciousnessState, Proposal};
@@ -142,7 +141,7 @@ pub struct SelfContinuityEngine {
     lessons_log: LessonsLog,
     consciousness_state: ConsciousnessState,
     quantum_brain: QuantumBrainEngine,
-    memory_backend: Arc<RwLock<dyn Memory>>,
+    memory_backend: Arc<dyn Memory>,
 
     working_memory: Vec<String>,
     episodic_buffer: Vec<String>,
@@ -180,7 +179,7 @@ impl SelfContinuityEngine {
         identity: Identity,
         mission: String,
         principles: Vec<String>,
-        memory_backend: Arc<RwLock<dyn Memory>>,
+        memory_backend: Arc<dyn Memory>,
         quantum_brain: QuantumBrainEngine,
     ) -> Self {
         Self {
@@ -446,6 +445,31 @@ impl CognitionLayer for SelfContinuityEngine {
     }
 }
 
+impl MemoryLayer for SelfContinuityEngine {
+    fn episodic(&self) -> &[String] {
+        &self.episodic_buffer
+    }
+
+    fn semantic(&self) -> &[String] {
+        &self.semantic_cache
+    }
+
+    fn working(&self) -> &[String] {
+        &self.working_memory
+    }
+
+    fn long_term(&self) -> &dyn Memory {
+        self.memory_backend.as_ref()
+    }
+
+    fn consolidate(&mut self) -> Result<usize> {
+        let moved = self.working_memory.len() + self.episodic_buffer.len();
+        self.semantic_cache.append(&mut self.working_memory);
+        self.semantic_cache.append(&mut self.episodic_buffer);
+        Ok(moved)
+    }
+}
+
 impl PerceptionLayer for SelfContinuityEngine {
     fn sensors(&self) -> &[String] {
         &self.sensor_list
@@ -691,7 +715,7 @@ mod tests {
     }
 
     fn make_engine() -> SelfContinuityEngine {
-        let memory: Arc<RwLock<dyn Memory>> = Arc::new(RwLock::new(MockMemory));
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
         SelfContinuityEngine::new(
             SoulModel::default(),
             make_identity(),

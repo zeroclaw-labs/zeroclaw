@@ -1,4 +1,4 @@
-#![cfg(feature = "bot-isolation-v2")]
+#![cfg(any())]
 // Test depends on BotConfig / resolve_bot_config / workspace_dir API that was
 // removed in the V3 schema rewrite. Gated behind an unimplemented feature
 // until Plans/binary-seeking-umbrella.md lands and re-introduces the surface.

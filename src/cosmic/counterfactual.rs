@@ -102,8 +102,11 @@ impl CounterfactualEngine {
     }
 
     pub fn compare_scenarios(&mut self, scenarios: &[Scenario]) -> Vec<SimulationResult> {
-        let mut results: Vec<SimulationResult> =
-            scenarios.iter().map(|s| self.simulate(s)).collect();
+        let mut results: Vec<SimulationResult> = scenarios
+            .iter()
+            .take(self.max_scenarios)
+            .map(|s| self.simulate(s))
+            .collect();
         results.sort_by(|a, b| {
             b.predicted_outcome
                 .partial_cmp(&a.predicted_outcome)
@@ -342,7 +345,7 @@ mod tests {
             .map(|i| make_scenario(&format!("s{i}"), vec![("x", 0.5)]))
             .collect();
         let results = engine.compare_scenarios(&scenarios);
-        assert_eq!(results.len(), 5);
+        assert_eq!(results.len(), 2);
     }
 
     #[test]

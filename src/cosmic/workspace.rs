@@ -155,7 +155,7 @@ impl GlobalWorkspace {
         result
     }
 
-    pub fn compete_quantum(&mut self, rng: &mut dyn rand_core::RngCore) -> BroadcastResult {
+    pub fn compete_quantum<R: rand::Rng + ?Sized>(&mut self, rng: &mut R) -> BroadcastResult {
         let candidates: Vec<(SubsystemId, f64)> = self
             .entries
             .values()

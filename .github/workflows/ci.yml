@@ -111,13 +111,11 @@ jobs:
           - name: no default features
             args: --no-default-features --workspace --exclude zeroclawlabs --exclude zeroclaw-desktop
             sys_deps: ""
-          # Guard the fork-only x0-legacy surface (cosmic / quantum /
-          # consciousness / onboard wizard / control plane). It is not part of
-          # ci-all, so nothing else builds it — without this it silently rots
-          # against the V3 API (it had drifted to 231 errors before the rewrite).
-          # --all-targets also keeps the #[cfg(test)] modules compiling.
-          - name: x0-legacy
-            args: -p zeroclawlabs --features x0-legacy --all-targets
+          # Guard the opt-in X0 surface (cosmic / quantum / consciousness /
+          # extended tools / onboard wizard) without adding it to the default
+          # production build. --all-targets also keeps cfg(test) modules clean.
+          - name: x0-extended
+            args: -p zeroclawlabs --features x0-extended --all-targets
             sys_deps: libudev-dev
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

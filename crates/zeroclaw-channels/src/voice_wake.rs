@@ -312,6 +312,7 @@ impl Channel for VoiceWakeChannel {
                                         sender: "voice_user".into(),
                                         reply_target: "voice_user".into(),
                                         content: trimmed,
+                                        subject: None,
                                         channel: "voice_wake".into(),
                                         channel_alias: Some(self_alias.clone()),
                                         timestamp: ts,

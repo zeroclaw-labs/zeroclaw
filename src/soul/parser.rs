@@ -93,11 +93,25 @@ fn extract_frontmatter<'a>(content: &'a str, soul: &mut SoulModel) -> &'a str {
                 // soul_version is validated but not stored — we only support v1
                 "soul_version" | "version" => {
                     if value != "1" {
-                        tracing::warn!("Unsupported soul version: {value}, expected 1");
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"version": value})),
+                            "Unsupported soul version; expected 1"
+                        );
                     }
                 }
                 _ => {
-                    tracing::debug!("Unknown frontmatter key: {key}");
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"key": key})),
+                        "Unknown frontmatter key"
+                    );
                 }
             }
         }
@@ -165,7 +179,12 @@ fn apply_section(soul: &mut SoulModel, section: &str, lines: &[&str]) {
             }
         }
         _ => {
-            tracing::debug!("Unknown soul section: {section}");
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"section": section})),
+                "Unknown soul section"
+            );
         }
     }
 }

@@ -5206,9 +5206,9 @@ mod tests {
         #[test]
         fn rejects_absolute_outside_workspace() {
             let workspace = TempDir::new().unwrap();
-            // `/etc/hostname` exists on every Linux host; we don't actually
-            // read it, just canonicalise.
-            let result = validate_marker_target("/etc/hostname", Some(workspace.path()));
+            // `/etc/hosts` exists on Linux and macOS; we don't actually read it,
+            // just canonicalise it.
+            let result = validate_marker_target("/etc/hosts", Some(workspace.path()));
             assert!(result.is_err(), "expected Err for /etc target");
             let msg = result.unwrap_err().to_string();
             assert!(

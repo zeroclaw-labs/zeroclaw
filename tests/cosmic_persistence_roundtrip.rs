@@ -1,4 +1,4 @@
-#![cfg(feature = "x0-legacy")]
+#![cfg(feature = "x0-extended")]
 
 use zeroclaw::cosmic::{
     BeliefSource, CausalGraph, ConsolidationEngine, CosmicMemoryGraph, CosmicPersistence,
@@ -167,7 +167,7 @@ fn encrypted_persistence_roundtrip() {
     let dir = tempfile::tempdir().expect("tempdir");
     let key_dir = tempfile::tempdir().expect("key_dir");
 
-    let store = zeroclaw::security::SecretStore::new(key_dir.path(), true);
+    let store = zeroclaw_runtime::security::SecretStore::new(key_dir.path(), true);
     let persistence = CosmicPersistence::new(dir.path()).with_encryption(store);
 
     let mut sm = SelfModel::new(500);

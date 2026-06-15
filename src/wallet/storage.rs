@@ -51,9 +51,14 @@ impl WalletStore {
                 .context("Failed to set wallet file permissions")?;
         }
 
-        tracing::info!(
-            address = %keypair.address(),
-            path = %self.wallet_path.display(),
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write).with_attrs(
+                ::serde_json::json!({
+                    "address": keypair.address().to_string(),
+                    "path": self.wallet_path.display().to_string()
+                })
+            ),
             "Wallet saved (encrypted)"
         );
         Ok(())

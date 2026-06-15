@@ -3,6 +3,30 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+fn log_debug(message: &str, attrs: Value) {
+    ::zeroclaw_log::record!(
+        DEBUG,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(attrs),
+        message
+    );
+}
+
+fn log_info(message: &str, attrs: Value) {
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(attrs),
+        message
+    );
+}
+
+fn log_warn(message: &str, attrs: Value) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(attrs),
+        message
+    );
+}
+
 pub struct ControlClient {
     base_url: String,
     bot_id: String,
@@ -91,24 +115,30 @@ pub async fn run_heartbeat_loop(
                         for cmd in cmds {
                             let cmd_id = cmd.get("id").and_then(|v| v.as_str()).unwrap_or("");
                             let kind = cmd.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-                            tracing::info!(command_id = cmd_id, kind, "received pending command");
+                            log_info(
+                                "received pending command",
+                                json!({ "command_id": cmd_id, "kind": kind }),
+                            );
                             let result = execute_command(&cmd).await;
                             let (status, result_str) = match result {
                                 Ok(r) => ("acked", r),
                                 Err(e) => ("failed", e.to_string()),
                             };
                             if let Err(e) = client.ack_command(cmd_id, status, Some(&result_str)).await {
-                                tracing::warn!(command_id = cmd_id, error = %e, "failed to ack command");
+                                log_warn(
+                                    "failed to ack command",
+                                    json!({ "command_id": cmd_id, "error": e.to_string() }),
+                                );
                             }
                         }
                     }
                     Err(e) => {
-                        tracing::debug!(error = %e, "heartbeat failed");
+                        log_debug("heartbeat failed", json!({ "error": e.to_string() }));
                     }
                 }
             }
             _ = shutdown.changed() => {
-                tracing::info!("heartbeat loop shutting down");
+                log_info("heartbeat loop shutting down", json!({}));
                 break;
             }
         }
@@ -121,23 +151,23 @@ async fn execute_command(cmd: &Value) -> Result<String> {
     let payload = cmd.get("payload").and_then(|v| v.as_str()).unwrap_or("{}");
     match kind {
         "reload_config" => {
-            tracing::info!("reloading config");
+            log_info("reloading config", json!({}));
             Ok("config reloaded".to_string())
         }
         "restart" => {
-            tracing::info!("restart requested");
+            log_info("restart requested", json!({}));
             Ok("restart scheduled".to_string())
         }
         "stop" => {
-            tracing::info!("stop requested");
+            log_info("stop requested", json!({}));
             Ok("stop acknowledged".to_string())
         }
         "run_agent" => {
-            tracing::info!(payload, "run agent requested");
+            log_info("run agent requested", json!({ "payload": payload }));
             Ok(format!("agent run queued: {payload}"))
         }
         "shell" => {
-            tracing::info!("shell command denied by security policy");
+            log_info("shell command denied by security policy", json!({}));
             Ok("shell execution denied".to_string())
         }
         _ => Ok(format!("unknown command kind: {kind}")),

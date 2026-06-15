@@ -23,6 +23,32 @@ use super::traits::{
 use super::wisdom::WisdomAccumulator;
 use crate::cosmic::{CosmicPersistence, PersistenceError};
 
+fn log_debug(message: &str, attrs: serde_json::Value) {
+    ::zeroclaw_log::record!(
+        DEBUG,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(attrs),
+        message
+    );
+}
+
+fn log_info(message: &str, attrs: serde_json::Value) {
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(attrs),
+        message
+    );
+}
+
+fn log_warn(message: &str, attrs: serde_json::Value) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(attrs),
+        message
+    );
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum RebuttalStrategy {
     EvidenceBased,
@@ -260,9 +286,9 @@ impl ConsciousnessOrchestrator {
                 "ffn_gate": tick_result.ncn_signals.ffn_gate,
             },
         });
-        tracing::debug!(
-            "consciousness sync: {}",
-            serde_json::to_string(&payload).unwrap_or_default()
+        log_debug(
+            "consciousness sync",
+            serde_json::json!({ "payload": payload }),
         );
         self.last_tick_payload = Some(payload.clone());
 
@@ -278,7 +304,10 @@ impl ConsciousnessOrchestrator {
             {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::warn!("consciousness sync client build failed: {e}");
+                    log_warn(
+                        "consciousness sync client build failed",
+                        serde_json::json!({ "error": e.to_string() }),
+                    );
                     return;
                 }
             };
@@ -287,7 +316,10 @@ impl ConsciousnessOrchestrator {
                 req = req.header("Authorization", format!("Bearer {t}"));
             }
             if let Err(e) = req.send() {
-                tracing::warn!("consciousness sync POST failed: {e}");
+                log_warn(
+                    "consciousness sync POST failed",
+                    serde_json::json!({ "error": e.to_string() }),
+                );
             }
         });
     }
@@ -329,9 +361,9 @@ impl ConsciousnessOrchestrator {
         let pre_prune_count = all_proposals.len();
         all_proposals.retain(|p| p.confidence >= 0.2);
         if pre_prune_count != all_proposals.len() {
-            tracing::debug!(
-                pruned = pre_prune_count - all_proposals.len(),
-                "Pruned low-confidence proposals (< 0.2)"
+            log_debug(
+                "Pruned low-confidence proposals (< 0.2)",
+                serde_json::json!({ "pruned": pre_prune_count - all_proposals.len() }),
             );
         }
 
@@ -352,7 +384,10 @@ impl ConsciousnessOrchestrator {
                 .cached_consensus
                 .is_some_and(|c| c >= self.config.approval_threshold)
         {
-            tracing::debug!("Skipping re-evaluation — proposals unchanged since last tick");
+            log_debug(
+                "Skipping re-evaluation — proposals unchanged since last tick",
+                serde_json::json!({}),
+            );
             (filtered_proposals.clone(), 0, Vec::new())
         } else {
             self.phase_debate_and_decide(&filtered_proposals)
@@ -428,22 +463,26 @@ impl ConsciousnessOrchestrator {
         let tick_total = perceive_dur + deliberate_dur + act_dur + reflect_dur;
         self.profiler.record_tick(tick_total);
 
-        tracing::debug!(
-            perceive_us = perceive_us,
-            deliberate_us = deliberate_us,
-            act_us = act_us,
-            reflect_us = reflect_us,
-            "Consciousness tick phase timing"
+        log_debug(
+            "Consciousness tick phase timing",
+            serde_json::json!({
+                "perceive_us": perceive_us,
+                "deliberate_us": deliberate_us,
+                "act_us": act_us,
+                "reflect_us": reflect_us,
+            }),
         );
 
         if self.state.tick_count > 0 && self.state.tick_count.is_multiple_of(100) {
             let summary = self.profiler.summary();
-            tracing::info!(
-                total_ticks = summary.total_ticks,
-                avg_tick_ms = %format!("{:.2}", summary.avg_tick_ms),
-                p50_tick_ms = %format!("{:.2}", summary.p50_tick_ms),
-                p99_tick_ms = %format!("{:.2}", summary.p99_tick_ms),
-                "Consciousness profiler summary (100-tick interval)"
+            log_info(
+                "Consciousness profiler summary (100-tick interval)",
+                serde_json::json!({
+                    "total_ticks": summary.total_ticks,
+                    "avg_tick_ms": format!("{:.2}", summary.avg_tick_ms),
+                    "p50_tick_ms": format!("{:.2}", summary.p50_tick_ms),
+                    "p99_tick_ms": format!("{:.2}", summary.p99_tick_ms),
+                }),
             );
         }
 
@@ -845,12 +884,14 @@ impl ConsciousnessOrchestrator {
                 let score_b = b.priority.weight() * b.confidence * accuracy_b;
 
                 if (score_a - score_b).abs() < 0.1 {
-                    tracing::debug!(
-                        proposal_a = a.id,
-                        proposal_b = b.id,
-                        score_a = %format!("{score_a:.3}"),
-                        score_b = %format!("{score_b:.3}"),
-                        "Contradiction scores within 0.1 — entering multi-strategy rebuttal"
+                    log_debug(
+                        "Contradiction scores within 0.1 — entering multi-strategy rebuttal",
+                        serde_json::json!({
+                            "proposal_a": a.id,
+                            "proposal_b": b.id,
+                            "score_a": format!("{score_a:.3}"),
+                            "score_b": format!("{score_b:.3}"),
+                        }),
                     );
 
                     let mut final_a = score_a;
@@ -865,10 +906,12 @@ impl ConsciousnessOrchestrator {
                         if round >= max_rounds {
                             break;
                         }
-                        tracing::debug!(
-                            round = round,
-                            strategy = ?strategy,
-                            "Rebuttal round with strategy"
+                        log_debug(
+                            "Rebuttal round with strategy",
+                            serde_json::json!({
+                                "round": round,
+                                "strategy": format!("{strategy:?}"),
+                            }),
                         );
 
                         let _prompt = strategy.prompt();
@@ -909,11 +952,13 @@ impl ConsciousnessOrchestrator {
 
                         if (final_a - final_b).abs() >= 0.1 {
                             resolved_by = Some(*strategy);
-                            tracing::debug!(
-                                strategy = ?strategy,
-                                final_a = %format!("{final_a:.3}"),
-                                final_b = %format!("{final_b:.3}"),
-                                "Rebuttal resolved deadlock"
+                            log_debug(
+                                "Rebuttal resolved deadlock",
+                                serde_json::json!({
+                                    "strategy": format!("{strategy:?}"),
+                                    "final_a": format!("{final_a:.3}"),
+                                    "final_b": format!("{final_b:.3}"),
+                                }),
                             );
                             break;
                         }
@@ -1215,7 +1260,10 @@ impl ConsciousnessOrchestrator {
         if let Some(v) = data.get("wisdom") {
             match serde_json::from_value::<Vec<super::wisdom::WisdomEntry>>(v.clone()) {
                 Ok(entries) => self.wisdom.restore(entries),
-                Err(e) => tracing::warn!(error = %e, "Failed to restore wisdom; using defaults"),
+                Err(e) => log_warn(
+                    "Failed to restore wisdom; using defaults",
+                    serde_json::json!({ "error": e.to_string() }),
+                ),
             }
         }
         if let Some(v) = data.get("prediction_ledger") {
@@ -1224,7 +1272,10 @@ impl ConsciousnessOrchestrator {
             ) {
                 Ok(records) => self.prediction_ledger.restore(records),
                 Err(e) => {
-                    tracing::warn!(error = %e, "Failed to restore prediction_ledger; using defaults");
+                    log_warn(
+                        "Failed to restore prediction_ledger; using defaults",
+                        serde_json::json!({ "error": e.to_string() }),
+                    );
                 }
             }
         }

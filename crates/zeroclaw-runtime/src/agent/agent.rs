@@ -796,10 +796,10 @@ impl Agent {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": agent_alias, "workspace": agent_workspace.display().to_string(), "e": e.to_string()})), "Failed to ensure per-agent bootstrap files (continuing with whatever exists): ");
         }
         let security = Arc::new({
-            let mut policy = SecurityPolicy::from_risk_profile(
-                risk_profile,
-                session_cwd.unwrap_or(&agent_workspace),
-            );
+            let mut policy = SecurityPolicy::for_agent(config, agent_alias)?;
+            if let Some(session_cwd) = session_cwd {
+                policy.workspace_dir = session_cwd.to_path_buf();
+            }
             // When a per-session cwd overrides the sandbox root, ensure
             // the per-agent workspace (where skills, identity, and config
             // data live) remains readable. Without this, file_read and
@@ -3587,6 +3587,59 @@ mod tests {
         assert!(
             !policy_no_push.is_resolved_path_allowed(&skill_resolved),
             "without allowed_roots.push, workspace files must be outside the sandbox"
+        );
+    }
+
+    #[test]
+    fn session_cwd_with_runtime_profile_keeps_agent_workspace_readable() {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let session = tmp.path().join("session");
+        std::fs::create_dir_all(&session).expect("session dir");
+
+        let mut config = Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config
+            .risk_profiles
+            .insert("test-risk".to_string(), RiskProfileConfig::default());
+        config.runtime_profiles.insert(
+            "test-runtime".to_string(),
+            RuntimeProfileConfig {
+                max_actions_per_hour: 7,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "test-risk".to_string(),
+                runtime_profile: "test-runtime".to_string(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let agent_workspace = config.agent_workspace_dir("test-agent");
+        std::fs::create_dir_all(&agent_workspace).expect("agent workspace dir");
+        let skill_file = agent_workspace.join("SKILL.md");
+        std::fs::write(&skill_file, "body").expect("skill file");
+        let skill_resolved = std::fs::canonicalize(&skill_file).unwrap_or(skill_file);
+
+        let mut policy =
+            SecurityPolicy::for_agent(&config, "test-agent").expect("resolvable policy");
+        policy.workspace_dir = session.clone();
+        policy.allowed_roots.push(agent_workspace);
+
+        assert_eq!(policy.workspace_dir, session);
+        assert_eq!(policy.max_actions_per_hour, 7);
+        assert!(
+            policy.is_resolved_path_allowed(&skill_resolved),
+            "agent workspace must stay readable when a session cwd overrides the policy workspace"
         );
     }
 

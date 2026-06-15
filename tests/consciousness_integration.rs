@@ -1,4 +1,4 @@
-#![cfg(feature = "x0-legacy")]
+#![cfg(feature = "x0-extended")]
 
 use std::sync::Arc;
 
@@ -1128,7 +1128,7 @@ fn feedback_loop_10_neuromodulation_state_exposed_to_agents() {
 #[tokio::test]
 async fn consciousness_hook_wires_and_runs_through_the_runner() {
     use zeroclaw::config::Config;
-    use zeroclaw::hooks::{build_runner, HookResult};
+    use zeroclaw::hooks::{HookResult, build_runner};
     use zeroclaw_api::channel::ChannelMessage;
 
     // Idempotent at the registry layer; mirrors main.rs startup.
@@ -1159,7 +1159,10 @@ async fn consciousness_hook_wires_and_runs_through_the_runner() {
     let _ = runner
         .run_on_message_received(ChannelMessage::default())
         .await;
-    match runner.run_before_prompt_build("USER PROMPT".to_string()).await {
+    match runner
+        .run_before_prompt_build("USER PROMPT".to_string())
+        .await
+    {
         HookResult::Continue(prompt) => assert!(
             prompt.contains("USER PROMPT"),
             "the prompt body must survive the consciousness hook, got: {prompt}"

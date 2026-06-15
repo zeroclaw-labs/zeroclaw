@@ -274,8 +274,10 @@ impl ConsciousnessAgent for ConscienceAgent {
     fn reflect(&mut self, outcomes: &[ActionOutcome], _state: &ConsciousnessState) {
         for outcome in outcomes {
             if !outcome.success {
-                tracing::warn!(
-                    action = %outcome.action,
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Validate)
+                        .with_attrs(::serde_json::json!({ "action": &outcome.action })),
                     "Conscience audit detected issue"
                 );
             }

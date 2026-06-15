@@ -5,10 +5,12 @@
 //! crate cannot depend on this binary-local module, so `main.rs` registers a
 //! process-global factory and the runtime builds one hook per Agent.
 //!
-//!     main.rs → consciousness::register_hook_factory()
-//!         → zeroclaw_runtime::hooks::registry::register_factory(...)
-//!     Agent::run → HookRunner.register(ConsciousnessHook { orchestrator })
-//!     on_message_received → orchestrator.tick()  (observe-only)
+//! ```text
+//! main.rs -> consciousness::register_hook_factory()
+//!     -> zeroclaw_runtime::hooks::registry::register_factory(...)
+//! Agent::run -> HookRunner.register(ConsciousnessHook { orchestrator })
+//! on_message_received -> orchestrator.tick()  (observe-only)
+//! ```
 //!
 //! The hook is observe-only: it ticks the perceive→debate→decide→act→reflect
 //! cycle and records the resulting coherence/proposal counts, but never
@@ -111,13 +113,18 @@ impl HookHandler for ConsciousnessHook {
 
     async fn on_message_received(&self, message: ChannelMessage) -> HookResult<ChannelMessage> {
         let result = self.orchestrator.lock().await.tick();
-        tracing::debug!(
-            target: "consciousness",
-            coherence = result.coherence,
-            proposals = result.proposals_generated,
-            approved = result.proposals_approved,
-            vetoed = result.proposals_vetoed,
-            debate_rounds = result.debate_rounds_used,
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "target": "consciousness",
+                    "coherence": result.coherence,
+                    "proposals": result.proposals_generated,
+                    "approved": result.proposals_approved,
+                    "vetoed": result.proposals_vetoed,
+                    "debate_rounds": result.debate_rounds_used
+                })
+            ),
             "consciousness tick"
         );
 

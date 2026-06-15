@@ -88,7 +88,10 @@ impl InitiativeEngine {
 
         let trigger_reason = trigger.description().to_string();
 
-        let recent_memories = memory.recall("*", 5, None, None, None).await.unwrap_or_default();
+        let recent_memories = memory
+            .recall("*", 5, None, None, None)
+            .await
+            .unwrap_or_default();
         let memory_context = recent_memories
             .iter()
             .map(|m| format!("- {}", m.content))

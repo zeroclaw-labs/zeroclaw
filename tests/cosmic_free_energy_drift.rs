@@ -1,4 +1,4 @@
-#![cfg(feature = "x0-legacy")]
+#![cfg(feature = "x0-extended")]
 
 use zeroclaw::cosmic::{DriftDetector, FreeEnergyState};
 

@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::debug;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserUseConfig {
@@ -186,7 +185,16 @@ impl Tool for BrowserUseTool {
             action.as_str()
         );
 
-        debug!(action = action.as_str(), endpoint = %endpoint, "browser_use request");
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "action": action.as_str(),
+                    "endpoint": endpoint
+                })
+            ),
+            "browser_use request"
+        );
 
         let client = crate::config::build_runtime_proxy_client("tool.browser_use");
         let mut request = client

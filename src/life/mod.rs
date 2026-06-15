@@ -13,6 +13,30 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::Duration;
 
+fn log_debug(message: &str, attrs: serde_json::Value) {
+    ::zeroclaw_log::record!(
+        DEBUG,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(attrs),
+        message
+    );
+}
+
+fn log_info(message: &str, attrs: serde_json::Value) {
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(attrs),
+        message
+    );
+}
+
+fn log_warn(message: &str, attrs: serde_json::Value) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(attrs),
+        message
+    );
+}
+
 mod dream;
 mod emotional;
 mod initiative;
@@ -115,9 +139,9 @@ impl LifeLoop {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        tracing::info!(
-            "Life loop started — tick interval: {}s",
-            self.config.tick_interval_secs
+        log_info(
+            "Life loop started",
+            serde_json::json!({ "tick_interval_secs": self.config.tick_interval_secs }),
         );
 
         let tick = Duration::from_secs(u64::from(self.config.tick_interval_secs));
@@ -152,10 +176,9 @@ impl LifeLoop {
                 );
                 meter.update_state("initiative", f64::from(state.curiosity).clamp(0.0, 1.0));
                 let snap = meter.snapshot();
-                tracing::debug!(
-                    phi = snap.phi,
-                    hub_ratio = snap.hub_ratio,
-                    "Life loop integration tick"
+                log_debug(
+                    "Life loop integration tick",
+                    serde_json::json!({ "phi": snap.phi, "hub_ratio": snap.hub_ratio }),
                 );
             }
 
@@ -183,11 +206,13 @@ impl LifeLoop {
                 if let Some(ref consolidation) = self.consolidation {
                     let mut c = consolidation.lock().await;
                     let result = c.consolidate();
-                    tracing::debug!(
-                        merged = result.merged_count,
-                        patterns = result.patterns_found,
-                        pruned = result.pruned_count,
-                        "Life loop consolidation tick"
+                    log_debug(
+                        "Life loop consolidation tick",
+                        serde_json::json!({
+                            "merged": result.merged_count,
+                            "patterns": result.patterns_found,
+                            "pruned": result.pruned_count
+                        }),
                     );
 
                     if let Some(ref wm) = self.world_model {
@@ -289,12 +314,12 @@ impl LifeLoop {
                     let p = persistence.lock().await;
                     let save_ok = p.save_all(&snapshot).is_ok();
                     if save_ok {
-                        tracing::debug!(
-                            modules = snapshot.modules.len(),
-                            "Life loop persistence checkpoint saved"
+                        log_debug(
+                            "Life loop persistence checkpoint saved",
+                            serde_json::json!({ "modules": snapshot.modules.len() }),
                         );
                     } else {
-                        tracing::warn!("Persistence save failed");
+                        log_warn("Persistence save failed", serde_json::json!({}));
                     }
                     if let Some(ref sm) = self.self_model {
                         let mut sm = sm.lock().await;
@@ -311,11 +336,17 @@ impl LifeLoop {
             }
 
             if let Err(e) = self.maybe_initiate().await {
-                tracing::warn!("Life initiative error: {e}");
+                log_warn(
+                    "Life initiative error",
+                    serde_json::json!({ "error": e.to_string() }),
+                );
             }
 
             if let Err(e) = self.maybe_dream().await {
-                tracing::warn!("Life dream error: {e}");
+                log_warn(
+                    "Life dream error",
+                    serde_json::json!({ "error": e.to_string() }),
+                );
             }
 
             {
@@ -344,7 +375,10 @@ impl LifeLoop {
             .await?;
 
         if let Some(msg) = message {
-            tracing::info!("Life loop initiated contact: {}", &msg[..msg.len().min(80)]);
+            log_info(
+                "Life loop initiated contact",
+                serde_json::json!({ "message_preview": &msg[..msg.len().min(80)] }),
+            );
             self.observer.record_event(&ObserverEvent::LifeInitiative {
                 trigger: "auto".into(),
                 message_preview: msg[..msg.len().min(50)].to_string(),
@@ -361,9 +395,11 @@ impl LifeLoop {
             .await?;
 
         if let Some(dream) = insight {
-            tracing::info!(
-                "Life loop dream insight: {}",
-                &dream.synthesis[..dream.synthesis.len().min(80)]
+            log_info(
+                "Life loop dream insight",
+                serde_json::json!({
+                    "insight_preview": &dream.synthesis[..dream.synthesis.len().min(80)]
+                }),
             );
             self.observer
                 .record_event(&ObserverEvent::LifeDreamComplete {

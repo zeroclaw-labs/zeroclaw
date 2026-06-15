@@ -3,15 +3,17 @@
 //! module. Mirrors the conscience hook's factory-registry pattern.
 //!
 //! Wiring path:
-//!     main.rs → continuity::hook::register_hook_factory()
-//!         → zeroclaw_runtime::hooks::registry::register_factory(...)
-//!     ↓ per Agent build (only when `[continuity].enabled`):
-//!     ContinuityHook::with_persistence loads <data_dir>/continuity/preferences.json
-//!     ↓ before every LLM call:
-//!     before_llm_call → prepend a system message carrying learned preferences
-//!     ↓ after every successful tool call:
-//!     on_after_tool_call → extract_tool_preference → autosave when a new
-//!     affinity is learned
+//! ```text
+//! main.rs -> continuity::hook::register_hook_factory()
+//!     -> zeroclaw_runtime::hooks::registry::register_factory(...)
+//! per Agent build (only when `[continuity].enabled`):
+//! ContinuityHook::with_persistence loads <data_dir>/continuity/preferences.json
+//! before every LLM call:
+//! before_llm_call -> prepend a system message carrying learned preferences
+//! after every successful tool call:
+//! on_after_tool_call -> extract_tool_preference -> autosave when a new
+//! affinity is learned
+//! ```
 //!
 //! The hook holds its `PreferenceModel` behind an `Arc<Mutex<…>>` because
 //! the `HookHandler` methods take `&self`; the lock is only held for the

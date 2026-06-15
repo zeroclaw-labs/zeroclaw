@@ -38,7 +38,7 @@ impl Default for PhenomenalState {
 }
 
 impl PhenomenalState {
-    pub fn to_8d_vector(&self) -> [f64; 8] {
+    pub fn to_8d_vector(self) -> [f64; 8] {
         [
             self.attention,
             self.arousal,
@@ -51,7 +51,7 @@ impl PhenomenalState {
         ]
     }
 
-    pub fn quantum_magnitude(&self) -> f64 {
+    pub fn quantum_magnitude(self) -> f64 {
         (self.quantum_coherence.powi(2)
             + self.entanglement_strength.powi(2)
             + self.superposition_entropy.powi(2))
@@ -111,7 +111,7 @@ pub enum Priority {
 }
 
 impl Priority {
-    pub fn weight(&self) -> f64 {
+    pub fn weight(self) -> f64 {
         match self {
             Self::Low => 0.25,
             Self::Normal => 0.5,

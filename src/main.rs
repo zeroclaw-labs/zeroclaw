@@ -265,19 +265,14 @@ mod verifiable_intent;
 mod conscience;
 #[cfg(feature = "x0-extended")]
 mod continuity;
-// conscience::cosmic_bridge expects `crate::cosmic` to resolve, so the
-// bin needs the cosmic module visible too (even though it's mostly
-// no-op without x0-legacy's gated sub-modules).
 #[cfg(feature = "x0-extended")]
 mod cosmic;
-// The bin re-includes these x0-legacy modules so sibling modules resolve
-// in the bin crate: tools/shell.rs → crate::runtime, cosmic/workspace.rs →
-// crate::quantum. The lib declares them under the same gate.
-#[cfg(feature = "x0-legacy")]
+// The bin mirrors X0 modules so sibling modules resolve in the bin crate.
+#[cfg(feature = "x0-extended")]
 mod consciousness;
-#[cfg(feature = "x0-legacy")]
+#[cfg(feature = "x0-extended")]
 mod quantum;
-#[cfg(feature = "x0-legacy")]
+#[cfg(feature = "x0-extended")]
 mod runtime;
 #[cfg(feature = "x0-extended")]
 mod soul;
@@ -1381,10 +1376,9 @@ async fn main() -> Result<()> {
 
     // Install the consciousness orchestrator hook so every Agent built after
     // this point ticks the perceive→debate→decide→act→reflect loop once per
-    // inbound message when config.consciousness.enabled is true. Gated behind
-    // x0-legacy alongside the consciousness module itself.
+    // inbound message when config.consciousness.enabled is true.
     //   src/consciousness/hook.rs (HookHandler implementation)
-    #[cfg(feature = "x0-legacy")]
+    #[cfg(feature = "x0-extended")]
     crate::consciousness::hook::register_hook_factory();
 
     let cmd = apply_i18n_to_command(Cli::command());
@@ -2127,7 +2121,9 @@ async fn main() -> Result<()> {
                         use zeroclaw_runtime::sop::{SopAuditLogger, SopEngine};
                         let sop_config = current_config.sop.clone();
                         let workspace_dir = current_config.data_dir.clone();
+                        let config_for_mqtt = current_config.clone();
                         move |mqtt_config| {
+                            let config = config_for_mqtt.clone();
                             let engine = if sop_config.sops_dir.is_some() {
                                 let mut e = SopEngine::new(sop_config.clone());
                                 e.reload(&workspace_dir);
@@ -2136,9 +2132,50 @@ async fn main() -> Result<()> {
                                 SopEngine::new(SopConfig::default())
                             };
                             let engine = Arc::new(Mutex::new(engine));
-                            let audit =
-                                Arc::new(SopAuditLogger::new(Arc::new(NoneMemory::new("none"))));
                             Box::pin(async move {
+                                let audit_memory = if let Some(agent_alias) =
+                                    config.resolved_runtime_agent_alias()
+                                {
+                                    match zeroclaw_memory::create_memory_for_agent(
+                                        &config,
+                                        agent_alias,
+                                        config
+                                            .model_provider_for_agent(agent_alias)
+                                            .and_then(|e| e.api_key.as_deref()),
+                                    )
+                                    .await
+                                    {
+                                        Ok(memory) => memory,
+                                        Err(e) => {
+                                            ::zeroclaw_log::record!(
+                                                WARN,
+                                                ::zeroclaw_log::Event::new(
+                                                    module_path!(),
+                                                    ::zeroclaw_log::Action::Note
+                                                )
+                                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                                .with_attrs(::serde_json::json!({
+                                                    "agent": agent_alias,
+                                                    "error": e.to_string()
+                                                })),
+                                                "MQTT SOP listener: failed to create configured audit memory; falling back to none"
+                                            );
+                                            Arc::new(NoneMemory::new("none"))
+                                        }
+                                    }
+                                } else {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                                        "MQTT SOP listener: no enabled runtime agent for audit memory; falling back to none"
+                                    );
+                                    Arc::new(NoneMemory::new("none"))
+                                };
+                                let audit = Arc::new(SopAuditLogger::new(audit_memory));
                                 zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
                                     &mqtt_config,
                                     engine,

@@ -9,6 +9,14 @@ use super::collective::PeerState;
 const MAX_DATAGRAM_SIZE: usize = 1400;
 const MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 42, 1);
 
+fn warn_peer_transport(message: &str, attrs: serde_json::Value) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(attrs),
+        message
+    );
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PeerMessage {
@@ -31,17 +39,26 @@ impl PeerTransport {
         let socket = match UdpSocket::bind(bind_addr) {
             Ok(s) => {
                 if let Err(e) = s.set_nonblocking(true) {
-                    tracing::warn!("failed to set udp socket non-blocking: {e}");
+                    warn_peer_transport(
+                        "failed to set udp socket non-blocking",
+                        serde_json::json!({ "error": e.to_string() }),
+                    );
                     None
                 } else {
                     if let Err(e) = s.join_multicast_v4(&MULTICAST_ADDR, &Ipv4Addr::UNSPECIFIED) {
-                        tracing::warn!("failed to join multicast group: {e}");
+                        warn_peer_transport(
+                            "failed to join multicast group",
+                            serde_json::json!({ "error": e.to_string() }),
+                        );
                     }
                     Some(s)
                 }
             }
             Err(e) => {
-                tracing::warn!("peer transport bind on port {port} failed: {e}");
+                warn_peer_transport(
+                    "peer transport bind failed",
+                    serde_json::json!({ "port": port, "error": e.to_string() }),
+                );
                 None
             }
         };
@@ -67,7 +84,10 @@ impl PeerTransport {
             return;
         };
         if data.len() > MAX_DATAGRAM_SIZE {
-            tracing::warn!("discovery message exceeds max datagram size");
+            warn_peer_transport(
+                "discovery message exceeds max datagram size",
+                serde_json::json!({ "bytes": data.len(), "max_bytes": MAX_DATAGRAM_SIZE }),
+            );
             return;
         }
         let target: SocketAddr = (MULTICAST_ADDR, self.discovery_port).into();
@@ -85,7 +105,10 @@ impl PeerTransport {
             return;
         };
         if data.len() > MAX_DATAGRAM_SIZE {
-            tracing::warn!("state message exceeds max datagram size, dropping");
+            warn_peer_transport(
+                "state message exceeds max datagram size, dropping",
+                serde_json::json!({ "bytes": data.len(), "max_bytes": MAX_DATAGRAM_SIZE }),
+            );
             return;
         }
         let _ = socket.send_to(&data, peer_addr);

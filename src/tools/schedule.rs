@@ -370,7 +370,6 @@ impl ScheduleTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::AutonomyLevel;
     use tempfile::TempDir;
 
     fn test_setup() -> (TempDir, Config, Arc<SecurityPolicy>) {
@@ -380,7 +379,10 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        config.risk_profiles.entry("default".to_string()).or_default();
+        config
+            .risk_profiles
+            .entry("default".to_string())
+            .or_default();
         config
             .runtime_profiles
             .entry("default".to_string())

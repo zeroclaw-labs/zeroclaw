@@ -275,7 +275,10 @@ fn map_task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskItem> {
 }
 
 fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-    let db_path = config.shared_workspace_dir().join("taskqueue").join("tasks.db");
+    let db_path = config
+        .shared_workspace_dir()
+        .join("taskqueue")
+        .join("tasks.db");
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
             format!("Failed to create taskqueue directory: {}", parent.display())

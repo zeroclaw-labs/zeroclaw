@@ -1,4 +1,4 @@
-#![cfg(feature = "agent-e2e-v2")]
+#![cfg(any())]
 // Test references the pre-V3 zeroclaw::providers::Provider / InferenceProvider
 // traits and the pre-Attributable Tool surface. The V3 schema renamed these
 // (ModelProvider) and added Attributable as a Tool supertrait. Gated until the

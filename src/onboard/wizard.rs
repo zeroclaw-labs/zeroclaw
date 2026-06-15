@@ -163,42 +163,6 @@ pub fn run_wizard() -> Result<Config> {
     // ── Final summary ────────────────────────────────────────────
     print_summary(&config);
 
-    // ── Offer to launch channels immediately ─────────────────────
-    let has_channels = !config.channels.telegram.is_empty()
-        || !config.channels.discord.is_empty()
-        || !config.channels.slack.is_empty()
-        || !config.channels.imessage.is_empty()
-        || !config.channels.matrix.is_empty()
-        || !config.channels.email.is_empty()
-        || !config.channels.dingtalk.is_empty()
-        || !config.channels.qq.is_empty();
-
-    if has_channels && false {
-        let launch: bool = Confirm::new()
-            .with_prompt(format!(
-                "  {} Launch channels now? (connected channels → AI → reply)",
-                style("🚀").cyan()
-            ))
-            .default(true)
-            .interact()?;
-
-        if launch {
-            println!();
-            println!(
-                "  {} {}",
-                style("⚡").cyan(),
-                style("Starting channel server...").white().bold()
-            );
-            println!();
-            // Signal to main.rs to call start_channels after wizard returns.
-            // SAFETY: single-threaded onboarding wizard; no other thread is
-            // reading the environment concurrently (Rust 2024 made set_var unsafe).
-            unsafe {
-                std::env::set_var("ZEROCLAW_AUTOSTART_CHANNELS", "1");
-            }
-        }
-    }
-
     Ok(config)
 }
 
@@ -226,41 +190,6 @@ pub fn run_channels_repair_wizard() -> Result<Config> {
         style("✓").green().bold(),
         style(config.config_path.display()).green()
     );
-
-    let has_channels = !config.channels.telegram.is_empty()
-        || !config.channels.discord.is_empty()
-        || !config.channels.slack.is_empty()
-        || !config.channels.imessage.is_empty()
-        || !config.channels.matrix.is_empty()
-        || !config.channels.email.is_empty()
-        || !config.channels.dingtalk.is_empty()
-        || !config.channels.qq.is_empty();
-
-    if has_channels && false {
-        let launch: bool = Confirm::new()
-            .with_prompt(format!(
-                "  {} Launch channels now? (connected channels → AI → reply)",
-                style("🚀").cyan()
-            ))
-            .default(true)
-            .interact()?;
-
-        if launch {
-            println!();
-            println!(
-                "  {} {}",
-                style("⚡").cyan(),
-                style("Starting channel server...").white().bold()
-            );
-            println!();
-            // Signal to main.rs to call start_channels after wizard returns.
-            // SAFETY: single-threaded onboarding wizard; no other thread is
-            // reading the environment concurrently (Rust 2024 made set_var unsafe).
-            unsafe {
-                std::env::set_var("ZEROCLAW_AUTOSTART_CHANNELS", "1");
-            }
-        }
-    }
 
     Ok(config)
 }
@@ -746,20 +675,10 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "GLM-4.5 Air (lower latency)".to_string(),
             ),
         ],
-        "minimax" => vec![
-            (
-                "MiniMax-M2.5".to_string(),
-                "MiniMax M2.5 (latest flagship)".to_string(),
-            ),
-            (
-                "MiniMax-M2.5-highspeed".to_string(),
-                "MiniMax M2.5 High-Speed (fast)".to_string(),
-            ),
-            (
-                "MiniMax-M2.1".to_string(),
-                "MiniMax M2.1 (strong coding/reasoning)".to_string(),
-            ),
-        ],
+        "minimax" => MINIMAX_ONBOARD_MODELS
+            .iter()
+            .map(|(model, label)| ((*model).to_string(), (*label).to_string()))
+            .collect(),
         "qwen" => vec![
             (
                 "qwen-max".to_string(),
@@ -1358,7 +1277,11 @@ pub fn run_models_refresh(
 
     match fetch_live_models_for_provider(&provider_name, &api_key) {
         Ok(models) if !models.is_empty() => {
-            cache_live_models_for_provider(&config.shared_workspace_dir(), &provider_name, &models)?;
+            cache_live_models_for_provider(
+                &config.shared_workspace_dir(),
+                &provider_name,
+                &models,
+            )?;
             println!(
                 "Refreshed '{}' model cache with {} models.",
                 provider_name,
@@ -2439,82 +2362,82 @@ fn setup_channels() -> Result<ChannelsConfig> {
         let options = vec![
             format!(
                 "Telegram   {}",
-                if !config.telegram.is_empty() {
-                    "✅ connected"
-                } else {
+                if config.telegram.is_empty() {
                     "— connect your bot"
+                } else {
+                    "✅ connected"
                 }
             ),
             format!(
                 "Discord    {}",
-                if !config.discord.is_empty() {
-                    "✅ connected"
-                } else {
+                if config.discord.is_empty() {
                     "— connect your bot"
+                } else {
+                    "✅ connected"
                 }
             ),
             format!(
                 "Slack      {}",
-                if !config.slack.is_empty() {
-                    "✅ connected"
-                } else {
+                if config.slack.is_empty() {
                     "— connect your bot"
+                } else {
+                    "✅ connected"
                 }
             ),
             format!(
                 "iMessage   {}",
-                if !config.imessage.is_empty() {
-                    "✅ configured"
-                } else {
+                if config.imessage.is_empty() {
                     "— macOS only"
+                } else {
+                    "✅ configured"
                 }
             ),
             format!(
                 "Matrix     {}",
-                if !config.matrix.is_empty() {
-                    "✅ connected"
-                } else {
+                if config.matrix.is_empty() {
                     "— self-hosted chat"
+                } else {
+                    "✅ connected"
                 }
             ),
             format!(
                 "WhatsApp   {}",
-                if !config.whatsapp.is_empty() {
-                    "✅ connected"
-                } else {
+                if config.whatsapp.is_empty() {
                     "— Business Cloud API"
+                } else {
+                    "✅ connected"
                 }
             ),
             format!(
                 "IRC        {}",
-                if !config.irc.is_empty() {
-                    "✅ configured"
-                } else {
+                if config.irc.is_empty() {
                     "— IRC over TLS"
+                } else {
+                    "✅ configured"
                 }
             ),
             format!(
                 "Webhook    {}",
-                if !config.webhook.is_empty() {
-                    "✅ configured"
-                } else {
+                if config.webhook.is_empty() {
                     "— HTTP endpoint"
+                } else {
+                    "✅ configured"
                 }
             ),
             format!(
                 "DingTalk   {}",
-                if !config.dingtalk.is_empty() {
-                    "✅ connected"
-                } else {
+                if config.dingtalk.is_empty() {
                     "— DingTalk Stream Mode"
+                } else {
+                    "✅ connected"
                 }
             ),
             format!(
                 "QQ Official {}",
-                if !config.qq.is_empty() {
-                    "✅ connected"
-                } else {
+                if config.qq.is_empty() {
                     "— Tencent QQ Bot"
+                } else {
+                    "✅ connected"
                 }
             ),
             "Done — finish setup".to_string(),
@@ -2724,7 +2647,11 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     DiscordConfig {
                         enabled: true,
                         bot_token: token,
-                        guild_ids: if guild.is_empty() { Vec::new() } else { vec![guild] },
+                        guild_ids: if guild.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![guild]
+                        },
                         listen_to_bots: false,
                         mention_only: false,
                         ..DiscordConfig::default()
@@ -3978,21 +3905,9 @@ fn print_summary(config: &Config) {
     println!();
 
     println!("  {}", style("Quick summary:").white().bold());
-    println!(
-        "    {} Provider:      {}",
-        style("🤖").cyan(),
-        "openrouter"
-    );
-    println!(
-        "    {} Model:         {}",
-        style("🧠").cyan(),
-        "(default)"
-    );
-    println!(
-        "    {} Autonomy:      {}",
-        style("🛡️").cyan(),
-        "supervised"
-    );
+    println!("    {} Provider:      openrouter", style("🤖").cyan());
+    println!("    {} Model:         (default)", style("🧠").cyan());
+    println!("    {} Autonomy:      supervised", style("🛡️").cyan());
     println!(
         "    {} Memory:        {} (auto-save: {})",
         style("🧠").cyan(),
@@ -5012,7 +4927,8 @@ mod tests {
             ..Config::default()
         };
 
-        let err = run_models_refresh(&config, Some("unknown-unsupported-provider"), true).unwrap_err();
+        let err =
+            run_models_refresh(&config, Some("unknown-unsupported-provider"), true).unwrap_err();
         assert!(
             err.to_string()
                 .contains("does not support live model discovery")

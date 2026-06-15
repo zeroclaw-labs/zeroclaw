@@ -113,7 +113,10 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        config.risk_profiles.entry("default".to_string()).or_default();
+        config
+            .risk_profiles
+            .entry("default".to_string())
+            .or_default();
         config
             .runtime_profiles
             .entry("default".to_string())

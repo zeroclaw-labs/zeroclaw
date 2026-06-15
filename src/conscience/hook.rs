@@ -162,7 +162,7 @@ impl HookHandler for ConscienceHook {
                 })
                 .with_attrs(::serde_json::json!({
                     "tool": name,
-                    "verdict": verdict_label(&verdict),
+                    "verdict": verdict_label(verdict),
                     "score": score,
                 })),
             "conscience gate verdict"
@@ -220,7 +220,7 @@ impl HookHandler for ConscienceHook {
 /// Stable, log-friendly label for a gate verdict. Kept in English with a
 /// fixed set of values (RFC #5653 §4.6 — log fields are never translated)
 /// so downstream observers and dashboards can match on it.
-fn verdict_label(verdict: &GateVerdict) -> &'static str {
+fn verdict_label(verdict: GateVerdict) -> &'static str {
     match verdict {
         GateVerdict::Allow => "allow",
         GateVerdict::Block => "block",
@@ -446,9 +446,9 @@ mod tests {
     fn verdict_label_is_stable_and_lowercase() {
         // Observers and dashboards match on these exact strings; they are
         // part of the log contract and must not drift.
-        assert_eq!(verdict_label(&GateVerdict::Allow), "allow");
-        assert_eq!(verdict_label(&GateVerdict::Block), "block");
-        assert_eq!(verdict_label(&GateVerdict::Ask), "ask");
-        assert_eq!(verdict_label(&GateVerdict::Revise), "revise");
+        assert_eq!(verdict_label(GateVerdict::Allow), "allow");
+        assert_eq!(verdict_label(GateVerdict::Block), "block");
+        assert_eq!(verdict_label(GateVerdict::Ask), "ask");
+        assert_eq!(verdict_label(GateVerdict::Revise), "revise");
     }
 }

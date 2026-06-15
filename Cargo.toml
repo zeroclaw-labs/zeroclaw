@@ -364,24 +364,16 @@ rag-pdf = ["zeroclaw-tools/rag-pdf", "zeroclaw-runtime/rag-pdf"]
 webauthn = ["zeroclaw-runtime/webauthn", "zeroclaw-gateway?/webauthn"]
 embedded-web = ["zeroclaw-gateway/embedded-web"]
 
-# X0 fork features — all fork modules gated behind x0-extended until API porting is done
+# X0 fork features remain opt-in by product decision. The default build is the
+# production V3 runtime; do not add x0-extended to `default` until the extended
+# autonomy surface has a product-owned rollout policy and operational defaults.
 x0-extended = [
-    "agent-runtime", "wallet", "quantum", "runtime-wasm",
+    "agent-runtime", "wallet", "quantum", "runtime-wasm", "hardware",
     "dep:zeroclaw-conscience",
 ]
-# Legacy X0 fork modules (cosmic, quantum, consciousness, onboard wizard,
-# control plane, life, sce, turboquant, runtime/wasm). Superseded by the V3
-# multi-agent model but ported back to a compiling state and guarded by CI.
-# Kept out of x0-extended / the default build because they are heavier and
-# largely research/legacy; opt in to build or run them.
-x0-legacy = ["x0-extended", "hardware"]
-# Placeholder features for integration tests that target API surfaces not yet
-# present in the V3 schema. Defining them as empty no-ops registers the names
-# so `#![cfg(feature = "…")]` gates compile cleanly under `-D warnings`. When
-# the underlying surface lands, wire the dependencies in; until then the
-# tests are excluded from every build.
-bot-isolation-v2 = []  # tracked by Plans/binary-seeking-umbrella.md
-agent-e2e-v2 = []      # awaiting ModelProvider-based rewrite
+# Compatibility alias for older invocations. The former legacy/research modules
+# now live under x0-extended and are checked by the same X0 CI gate.
+x0-legacy = ["x0-extended"]
 wallet = [
     "dep:alloy-primitives", "dep:alloy-signer", "dep:alloy-signer-local", "dep:alloy-sol-types",
     "dep:alloy-provider", "dep:alloy-transport-http", "dep:alloy-network",

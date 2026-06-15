@@ -216,7 +216,6 @@ impl Tool for CronAddTool {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::security::AutonomyLevel;
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> Arc<Config> {
@@ -226,7 +225,10 @@ mod tests {
             ..Config::default()
         };
         // V3 cron validates the agent alias resolves to risk/runtime profiles.
-        config.risk_profiles.entry("default".to_string()).or_default();
+        config
+            .risk_profiles
+            .entry("default".to_string())
+            .or_default();
         config
             .runtime_profiles
             .entry("default".to_string())
