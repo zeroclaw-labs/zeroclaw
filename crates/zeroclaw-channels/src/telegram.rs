@@ -2247,13 +2247,25 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
         let is_group = Self::is_group_message(message);
         if self.mention_only && is_group {
-            let bot_username = self.bot_username.lock();
-            if let Some(ref bot_username) = *bot_username {
-                if !Self::contains_bot_mention(text, bot_username) {
+            // Bypass mention_only gate for replies to the bot's own messages.
+            // When a user replies directly to the bot, they expect a response
+            // even without an explicit @mention.
+            let is_reply_to_bot = message
+                .get("reply_to_message")
+                .and_then(|r| r.get("from"))
+                .and_then(|f| f.get("is_bot"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+
+            if !is_reply_to_bot {
+                let bot_username = self.bot_username.lock();
+                if let Some(ref bot_username) = *bot_username {
+                    if !Self::contains_bot_mention(text, bot_username) {
+                        return None;
+                    }
+                } else {
                     return None;
                 }
-            } else {
-                return None;
             }
         }
 
