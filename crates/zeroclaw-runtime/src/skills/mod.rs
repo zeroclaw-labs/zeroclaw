@@ -2838,6 +2838,7 @@ mod prompt_callable_name_tests {
             args: HashMap::new(),
             target: None,
             locked_args: HashMap::new(),
+            timeout_secs: None,
         }
     }
 
