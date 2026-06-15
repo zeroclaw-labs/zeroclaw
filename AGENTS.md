@@ -82,6 +82,13 @@ Full pre-PR validation (recommended):
 
 Docs-only changes: run markdown lint and link-integrity checks. If touching bootstrap scripts: `bash -n install.sh`.
 
+## Subagents
+
+Subagents (via `spawn_subagent` or cron `JobType::Agent`) inherit the parent's identity and permissions but run in isolated sessions. **Before running any shell commands or filesystem operations, subagents must explicitly set their working directory to the repository root** (the directory containing the top-level `Cargo.toml` and `AGENTS.md`). Do not assume the shell starts at repo root; always `cd` to it first (or use the equivalent in the tool's context).
+
+This guarantees consistent command behavior across parent and child runs.
+
+
 ## Project Snapshot
 
 ZeroClaw is a Rust-first autonomous agent runtime optimized for performance, efficiency, stability, extensibility, sustainability, and security.
@@ -115,7 +122,7 @@ Every workspace crate carries a stability tier per the Microkernel Architecture 
 | `zeroclaw-tools` | Experimental | Plugin migration at v1.0.0 |
 | `zeroclaw-runtime` | Experimental | Agent runtime (agent loop, security, cron, SOP, skills, observability) |
 | `zeroclaw-gateway` | Experimental | Separate binary at v0.9.0 |
-| `zeroclaw-tui` | Experimental | TUI onboarding wizard |
+| `zerocode` | Experimental | TUI onboarding wizard |
 | `zeroclaw-plugins` | Experimental | WASM plugin system — foundation for v1.0.0 plugin ecosystem |
 | `zeroclaw-hardware` | Experimental | USB discovery, peripherals, serial |
 | `zeroclaw-macros` | Beta | Tightly coupled to config schema |
@@ -141,7 +148,7 @@ Tiers are promoted, never demoted, through deliberate team decision.
 - `crates/zeroclaw-infra/` — shared infrastructure (debounce, session, stall watchdog)
 - `crates/zeroclaw-gateway/` — webhook/gateway server (separate binary)
 - `crates/zeroclaw-hardware/` — USB discovery, peripherals, serial, GPIO
-- `crates/zeroclaw-tui/` — TUI onboarding wizard
+- `crates/zerocode/` — TUI onboarding wizard
 - `crates/zeroclaw-plugins/` — WASM plugin system
 - `crates/zeroclaw-tool-call-parser/` — tool call parsing
 - `docs/` — topic-based documentation (setup-guides, reference, ops, security, hardware, contributing, maintainers)
@@ -158,11 +165,12 @@ When uncertain, classify as higher risk.
 ## Workflow
 
 1. **Read before write** — inspect existing module, factory wiring, and adjacent tests before editing.
-2. **One concern per PR** — avoid mixed feature+refactor+infra patches.
-3. **Implement minimal patch** — no speculative abstractions, no config keys without a concrete use case.
-4. **Validate by risk tier** — docs-only: lightweight checks. Code changes: full relevant checks.
-5. **Document impact** — update PR notes for behavior, risk, side effects, and rollback.
-6. **Queue hygiene** — stacked PR: declare `Depends on #...`. Replacing old PR: declare `Supersedes #...`.
+2. **Map non-trivial changes** — before architecture, config, security, workflow, governance, CI, or agent-assisted contribution changes, read `docs/book/src/contributing/architecture-map.md` to choose the relevant architecture and foundation docs.
+3. **One concern per PR** — avoid mixed feature+refactor+infra patches.
+4. **Implement minimal patch** — no speculative abstractions, no config keys without a concrete use case.
+5. **Validate by risk tier** — docs-only: lightweight checks. Code changes: full relevant checks.
+6. **Document impact** — update PR notes for behavior, risk, side effects, and rollback.
+7. **Queue hygiene** — stacked PR: declare `Depends on #...`. Replacing old PR: declare `Supersedes #...`.
 
 Branch/commit/PR rules:
 - Work from a non-`master` branch. Open a PR to `master`; do not push directly.
@@ -216,6 +224,7 @@ Dev-operational contracts — files consumed by AI coding skills and development
 
 ## Linked References
 
+- `@docs/book/src/contributing/architecture-map.md` — start-here map for humans and coding agents before non-trivial architecture, workflow, config, security, CI, governance, or agent-assisted contribution changes
 - `@docs/book/src/developing/extension-examples.md` — adding providers, channels, tools, peripherals; tool shared-state contract; architecture boundary rules
 - `@docs/book/src/contributing/privacy.md` — privacy rules and neutral-placeholder palette
 - `@docs/book/src/maintainers/superseding.md` — superseded-PR attribution, PR/commit templates, handoff template

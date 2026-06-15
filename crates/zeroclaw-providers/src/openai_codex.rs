@@ -2,6 +2,7 @@ use crate::ModelProviderRuntimeOptions;
 use crate::auth::AuthService;
 use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::multimodal;
+use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     ModelProvider, ProviderCapabilities, StreamChunk, StreamError, StreamEvent, StreamOptions,
@@ -27,7 +28,7 @@ const RESPONSES_HISTORY_KIND: &str = "responses_output_items";
 
 #[derive(Clone)]
 pub struct OpenAiCodexModelProvider {
-    /// `[model_providers.<family>.<alias>]` config-key alias.
+    /// `[providers.models.<family>.<alias>]` config-key alias.
     alias: String,
     auth: AuthService,
     auth_profile_override: Option<String>,
@@ -57,13 +58,13 @@ struct ResponsesRequest {
 }
 
 #[derive(Debug, Serialize)]
-struct ResponsesToolSpec {
+pub(crate) struct ResponsesToolSpec {
     #[serde(rename = "type")]
-    kind: String,
-    name: String,
-    description: String,
-    parameters: Value,
-    strict: bool,
+    pub(crate) kind: String,
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) parameters: Value,
+    pub(crate) strict: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -86,29 +87,29 @@ struct ResponsesResponse {
 }
 
 #[derive(Debug, Default)]
-struct ResponsesStreamState {
-    saw_text_delta: bool,
-    text_accumulator: String,
-    fallback_text: Option<String>,
-    tool_calls: HashMap<String, PendingToolCall>,
-    emitted_tool_call_ids: HashSet<String>,
-    collected_tool_calls: Vec<ProviderToolCall>,
-    output_items: Vec<Value>,
+pub(crate) struct ResponsesStreamState {
+    pub(crate) saw_text_delta: bool,
+    pub(crate) text_accumulator: String,
+    pub(crate) fallback_text: Option<String>,
+    pub(crate) tool_calls: HashMap<String, PendingToolCall>,
+    pub(crate) emitted_tool_call_ids: HashSet<String>,
+    pub(crate) collected_tool_calls: Vec<ProviderToolCall>,
+    pub(crate) output_items: Vec<Value>,
 }
 
 #[derive(Debug, Default, Clone)]
-struct PendingToolCall {
-    item_id: Option<String>,
-    call_id: Option<String>,
-    name: Option<String>,
-    arguments: String,
+pub(crate) struct PendingToolCall {
+    pub(crate) item_id: Option<String>,
+    pub(crate) call_id: Option<String>,
+    pub(crate) name: Option<String>,
+    pub(crate) arguments: String,
 }
 
 #[derive(Debug, Default)]
-struct ResponsesTurnResult {
-    text: Option<String>,
-    tool_calls: Vec<ProviderToolCall>,
-    reasoning_content: Option<String>,
+pub(crate) struct ResponsesTurnResult {
+    pub(crate) text: Option<String>,
+    pub(crate) tool_calls: Vec<ProviderToolCall>,
+    pub(crate) reasoning_content: Option<String>,
 }
 
 impl OpenAiCodexModelProvider {
@@ -210,7 +211,7 @@ fn is_default_responses_url(url: &str) -> bool {
     canonical_endpoint(url) == canonical_endpoint(DEFAULT_CODEX_RESPONSES_URL)
 }
 
-fn first_nonempty(text: Option<&str>) -> Option<String> {
+pub(crate) fn first_nonempty(text: Option<&str>) -> Option<String> {
     text.and_then(|value| {
         let trimmed = value.trim();
         if trimmed.is_empty() {
@@ -225,7 +226,7 @@ fn normalize_model_id(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
 }
 
-fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<ResponsesToolSpec>> {
+pub(crate) fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<ResponsesToolSpec>> {
     let items = tools?;
     if items.is_empty() {
         return None;
@@ -251,6 +252,16 @@ fn response_message_item(role: &str, content: Vec<Value>) -> Value {
         "role": role,
         "content": content,
     })
+}
+
+fn legacy_tool_output_message(content: &str) -> Value {
+    response_message_item(
+        "user",
+        vec![serde_json::json!({
+            "type": "input_text",
+            "text": format!("Legacy tool output without call_id:\n{content}"),
+        })],
+    )
 }
 
 fn response_item_type(item: &Value) -> Option<&str> {
@@ -309,7 +320,7 @@ fn decode_responses_history_items(reasoning_content: &str) -> Option<Vec<Value>>
     (!items.is_empty()).then_some(items)
 }
 
-fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Value>) {
+pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Value>) {
     let mut system_parts: Vec<&str> = Vec::new();
     let mut input: Vec<Value> = Vec::new();
 
@@ -412,7 +423,11 @@ fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Value>) {
             }
             "tool" => {
                 if let Ok(value) = serde_json::from_str::<Value>(&msg.content) {
-                    if let Some(call_id) = value.get("tool_call_id").and_then(Value::as_str) {
+                    if let Some(call_id) = value
+                        .get("tool_call_id")
+                        .and_then(Value::as_str)
+                        .and_then(|id| first_nonempty(Some(id)))
+                    {
                         let output = value
                             .get("content")
                             .and_then(Value::as_str)
@@ -423,20 +438,10 @@ fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Value>) {
                             "output": output,
                         }));
                     } else if !msg.content.trim().is_empty() {
-                        input.push(response_message_item(
-                            "tool",
-                            vec![serde_json::json!({
-                                "type": "output_text",
-                                "text": msg.content,
-                            })],
-                        ));
+                        input.push(legacy_tool_output_message(&msg.content));
                     }
                 } else if !msg.content.trim().is_empty() {
-                    input.push(serde_json::json!({
-                        "type": "function_call_output",
-                        "call_id": uuid::Uuid::new_v4().to_string(),
-                        "output": msg.content,
-                    }));
+                    input.push(legacy_tool_output_message(&msg.content));
                 }
             }
             _ => {}
@@ -489,7 +494,7 @@ fn resolve_reasoning_effort(model_id: &str, configured: Option<&str>) -> String 
     clamp_reasoning_effort(model_id, &raw)
 }
 
-fn nonempty_preserve(text: Option<&str>) -> Option<String> {
+pub(crate) fn nonempty_preserve(text: Option<&str>) -> Option<String> {
     text.and_then(|value| {
         if value.is_empty() {
             None
@@ -645,17 +650,17 @@ fn emit_tool_call(
 }
 
 #[derive(Debug)]
-struct ResponsesStreamApiError(String);
+pub(crate) struct ResponsesStreamApiError(pub(crate) String);
 
 impl std::fmt::Display for ResponsesStreamApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "OpenAI Codex stream error: {}", self.0)
+        write!(f, "OpenAI responses stream error: {}", self.0)
     }
 }
 
 impl std::error::Error for ResponsesStreamApiError {}
 
-fn process_responses_stream_event(
+pub(crate) fn process_responses_stream_event(
     event: Value,
     state: &mut ResponsesStreamState,
 ) -> anyhow::Result<Vec<StreamEvent>> {
@@ -828,7 +833,7 @@ fn process_responses_stream_event(
     Ok(emitted)
 }
 
-fn process_sse_chunk(
+pub(crate) fn process_sse_chunk(
     chunk: &str,
     state: &mut ResponsesStreamState,
 ) -> anyhow::Result<Vec<StreamEvent>> {
@@ -920,7 +925,7 @@ fn ensure_nonempty_responses_turn(
     }
 }
 
-fn extract_stream_error_message(event: &Value) -> Option<String> {
+pub(crate) fn extract_stream_error_message(event: &Value) -> Option<String> {
     let event_type = event.get("type").and_then(Value::as_str);
 
     if event_type == Some("error") {
@@ -951,7 +956,7 @@ fn extract_stream_error_message(event: &Value) -> Option<String> {
     None
 }
 
-fn append_utf8_stream_chunk(
+pub(crate) fn append_utf8_stream_chunk(
     body: &mut String,
     pending: &mut Vec<u8>,
     chunk: &[u8],
@@ -1088,8 +1093,24 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<Re
     }
 
     if !pending_utf8.is_empty() {
-        let err = std::str::from_utf8(&pending_utf8)
-            .expect_err("pending bytes should be invalid UTF-8 at end of stream");
+        let err = match std::str::from_utf8(&pending_utf8) {
+            Err(e) => e,
+            Ok(_) => {
+                // Structurally unreachable: append_utf8_stream_chunk only accumulates
+                // incomplete multi-byte sequences (error_len == None), so from_utf8
+                // always returns Err here. Handled as an error rather than a panic so
+                // the daemon survives if the invariant is somehow violated.
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "openai_codex: pending bytes were valid UTF-8 (invariant violated)"
+                );
+                return Err(anyhow::Error::msg(
+                    "OpenAI Codex response stream ended with valid UTF-8 in pending bytes (unexpected)",
+                ));
+            }
+        };
         ::zeroclaw_log::record!(
             ERROR,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -1105,7 +1126,109 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<Re
     parse_responses_body(&body)
 }
 
+struct ResolvedCodexCredentials {
+    bearer_token: String,
+    account_id: Option<String>,
+    access_token: Option<String>,
+    use_gateway_api_key_auth: bool,
+}
+
 impl OpenAiCodexModelProvider {
+    async fn resolve_credentials(&self) -> anyhow::Result<ResolvedCodexCredentials> {
+        let use_gateway_api_key_auth = self.custom_endpoint && self.gateway_api_key.is_some();
+
+        let profile = match self
+            .auth
+            .get_profile("openai-codex", self.auth_profile_override.as_deref())
+            .await
+        {
+            Ok(profile) => profile,
+            Err(err) if use_gateway_api_key_auth => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                    "failed to load OpenAI Codex profile; continuing with custom endpoint API key mode"
+                );
+                None
+            }
+            Err(err) => return Err(err),
+        };
+
+        let oauth_access_token = match self
+            .auth
+            .get_valid_openai_access_token(self.auth_profile_override.as_deref())
+            .await
+        {
+            Ok(token) => token,
+            Err(err) if use_gateway_api_key_auth => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                    "failed to refresh OpenAI token; continuing with custom endpoint API key mode"
+                );
+                None
+            }
+            Err(err) => return Err(err),
+        };
+
+        let account_id = profile.and_then(|p| p.account_id).or_else(|| {
+            oauth_access_token
+                .as_deref()
+                .and_then(extract_account_id_from_jwt)
+        });
+
+        let access_token = if use_gateway_api_key_auth {
+            oauth_access_token
+        } else {
+            Some(oauth_access_token.ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"missing": "oauth_access_token"})),
+                    "openai_codex: auth profile not found"
+                );
+                anyhow::Error::msg(
+                    "OpenAI Codex auth profile not found. Run `zeroclaw auth login --provider openai-codex`.",
+                )
+            })?)
+        };
+
+        let account_id = if use_gateway_api_key_auth {
+            account_id
+        } else {
+            Some(account_id.ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"missing": "account_id"})),
+                    "openai_codex: account_id not found in profile/token"
+                );
+                anyhow::Error::msg(
+                    "OpenAI Codex account id not found in auth profile/token. Run `zeroclaw auth login --provider openai-codex` again.",
+                )
+            })?)
+        };
+
+        let bearer_token = if use_gateway_api_key_auth {
+            self.gateway_api_key.clone().unwrap_or_default()
+        } else {
+            access_token.clone().unwrap_or_default()
+        };
+
+        Ok(ResolvedCodexCredentials {
+            bearer_token,
+            account_id,
+            access_token,
+            use_gateway_api_key_auth,
+        })
+    }
+
     fn responses_request_builder(
         &self,
         bearer_token: &str,
@@ -1149,81 +1272,7 @@ impl OpenAiCodexModelProvider {
         tools: Option<Vec<ResponsesToolSpec>>,
         model: &str,
     ) -> anyhow::Result<ResponsesTurnResult> {
-        let use_gateway_api_key_auth = self.custom_endpoint && self.gateway_api_key.is_some();
-        let profile = match self
-            .auth
-            .get_profile("openai-codex", self.auth_profile_override.as_deref())
-            .await
-        {
-            Ok(profile) => profile,
-            Err(err) if use_gateway_api_key_auth => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
-                    "failed to load OpenAI Codex profile; continuing with custom endpoint API key mode"
-                );
-                None
-            }
-            Err(err) => return Err(err),
-        };
-        let oauth_access_token = match self
-            .auth
-            .get_valid_openai_access_token(self.auth_profile_override.as_deref())
-            .await
-        {
-            Ok(token) => token,
-            Err(err) if use_gateway_api_key_auth => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
-                    "failed to refresh OpenAI token; continuing with custom endpoint API key mode"
-                );
-                None
-            }
-            Err(err) => return Err(err),
-        };
-
-        let account_id = profile.and_then(|profile| profile.account_id).or_else(|| {
-            oauth_access_token
-                .as_deref()
-                .and_then(extract_account_id_from_jwt)
-        });
-        let access_token = if use_gateway_api_key_auth {
-            oauth_access_token
-        } else {
-            Some(oauth_access_token.ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"missing": "oauth_access_token"})),
-                    "openai_codex: auth profile not found"
-                );
-                anyhow::Error::msg(
-                    "OpenAI Codex auth profile not found. Run `zeroclaw auth login --provider openai-codex`.",
-                )
-            })?)
-        };
-        let account_id = if use_gateway_api_key_auth {
-            account_id
-        } else {
-            Some(account_id.ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"missing": "account_id"})),
-                    "openai_codex: account_id not found in profile/token"
-                );
-                anyhow::Error::msg(
-                    "OpenAI Codex account id not found in auth profile/token. Run `zeroclaw auth login --provider openai-codex` again.",
-                )
-            })?)
-        };
+        let creds = self.resolve_credentials().await?;
         let normalized_model = normalize_model_id(model);
 
         let has_tools = tools.is_some();
@@ -1249,17 +1298,11 @@ impl OpenAiCodexModelProvider {
             parallel_tool_calls: has_tools.then_some(true),
         };
 
-        let bearer_token = if use_gateway_api_key_auth {
-            self.gateway_api_key.as_deref().unwrap_or_default()
-        } else {
-            access_token.as_deref().unwrap_or_default()
-        };
-
         let request_builder = self.responses_request_builder(
-            bearer_token,
-            account_id.as_deref(),
-            access_token.as_deref(),
-            use_gateway_api_key_auth,
+            &creds.bearer_token,
+            creds.account_id.as_deref(),
+            creds.access_token.as_deref(),
+            creds.use_gateway_api_key_auth,
             &request,
         );
 
@@ -1290,10 +1333,10 @@ impl OpenAiCodexModelProvider {
                 request.stream = false;
                 let non_streaming_response = self
                     .responses_request_builder(
-                        bearer_token,
-                        account_id.as_deref(),
-                        access_token.as_deref(),
-                        use_gateway_api_key_auth,
+                        &creds.bearer_token,
+                        creds.account_id.as_deref(),
+                        creds.access_token.as_deref(),
+                        creds.use_gateway_api_key_auth,
                         &request,
                     )
                     .json(&request)
@@ -1342,6 +1385,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
             native_tool_calling: true,
             vision: true,
             prompt_caching: false,
+            extended_thinking: false,
         }
     }
 
@@ -1408,11 +1452,11 @@ impl ModelProvider for OpenAiCodexModelProvider {
     }
 
     fn supports_streaming(&self) -> bool {
-        false
+        true
     }
 
     fn supports_streaming_tool_events(&self) -> bool {
-        false
+        true
     }
 
     fn stream_chat(
@@ -1431,9 +1475,9 @@ impl ModelProvider for OpenAiCodexModelProvider {
         let tools = request.tools.map(|items| items.to_vec());
         let model = model.to_string();
         let count_tokens = options.count_tokens;
-        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(16);
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
-        tokio::spawn(async move {
+        let handle = ::zeroclaw_spawn::spawn!(async move {
             let config = zeroclaw_config::schema::MultimodalConfig::default();
             let prepared =
                 match crate::multimodal::prepare_messages_for_provider(&messages, &config).await {
@@ -1446,47 +1490,58 @@ impl ModelProvider for OpenAiCodexModelProvider {
                     }
                 };
 
-            let (instructions, input) = build_responses_input(&prepared.messages);
-            let result = provider
-                .send_responses_request(
-                    input,
-                    instructions,
-                    convert_tools(tools.as_deref()),
-                    &model,
-                )
-                .await;
-
-            match result {
-                Ok(response) => {
-                    for tool_call in response.tool_calls {
-                        if tx.send(Ok(StreamEvent::ToolCall(tool_call))).await.is_err() {
-                            return;
-                        }
-                    }
-
-                    if let Some(text) = response.text.filter(|text| !text.is_empty()) {
-                        let chunk = if count_tokens {
-                            StreamChunk::delta(text).with_token_estimate()
-                        } else {
-                            StreamChunk::delta(text)
-                        };
-                        if tx.send(Ok(StreamEvent::TextDelta(chunk))).await.is_err() {
-                            return;
-                        }
-                    }
-
-                    let _ = tx.send(Ok(StreamEvent::Final)).await;
-                }
+            let creds = match provider.resolve_credentials().await {
+                Ok(c) => c,
                 Err(err) => {
                     let _ = tx
                         .send(Err(StreamError::ModelProvider(err.to_string())))
                         .await;
+                    return;
                 }
-            }
+            };
+
+            let (instructions, input) = build_responses_input(&prepared.messages);
+            let normalized_model = normalize_model_id(&model);
+            let tools = convert_tools(tools.as_deref());
+            let has_tools = tools.is_some();
+            let request = ResponsesRequest {
+                model: normalized_model.to_string(),
+                input,
+                instructions,
+                store: false,
+                stream: true,
+                text: ResponsesTextOptions {
+                    verbosity: "medium".to_string(),
+                },
+                reasoning: ResponsesReasoningOptions {
+                    effort: resolve_reasoning_effort(
+                        normalized_model,
+                        provider.reasoning_effort.as_deref(),
+                    ),
+                    summary: "auto".to_string(),
+                },
+                include: vec!["reasoning.encrypted_content".to_string()],
+                tools,
+                tool_choice: has_tools.then(|| "auto".to_string()),
+                parallel_tool_calls: has_tools.then_some(true),
+            };
+
+            let request_builder = provider
+                .responses_request_builder(
+                    &creds.bearer_token,
+                    creds.account_id.as_deref(),
+                    creds.access_token.as_deref(),
+                    creds.use_gateway_api_key_auth,
+                    &request,
+                )
+                .json(&request);
+
+            crate::openai::run_responses_sse(request_builder, &tx, count_tokens).await;
         });
 
-        stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|event| (event, rx))
+        let guard = AbortOnDrop::new(handle.abort_handle());
+        stream::unfold((rx, guard), |(mut rx, guard)| async move {
+            rx.recv().await.map(|event| (event, (rx, guard)))
         })
         .boxed()
     }
@@ -1567,7 +1622,7 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server_handle = tokio::spawn(async move {
+        let server_handle = zeroclaw_spawn::spawn!(async move {
             axum::serve(listener, app).await.unwrap();
         });
 
@@ -1685,6 +1740,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking: None,
                 },
                 "gpt-5-codex",
                 None,
@@ -1721,6 +1777,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking: None,
                 },
                 "gpt-5-codex",
                 None,
@@ -1753,6 +1810,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking: None,
                 },
                 "gpt-5-codex",
                 None,
@@ -1762,7 +1820,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("OpenAI Codex stream error: quota exceeded"),
+                .contains("OpenAI responses stream error: quota exceeded"),
             "{err}"
         );
         assert_eq!(captured.lock().unwrap().len(), 1);
@@ -1785,6 +1843,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking: None,
                 },
                 "gpt-5-codex",
                 None,
@@ -2033,6 +2092,75 @@ data: [DONE]
     }
 
     #[test]
+    fn build_responses_input_replays_plain_tool_text_without_synthetic_call_id() {
+        let messages = vec![ChatMessage {
+            role: "tool".into(),
+            content: "legacy plain text result".into(),
+        }];
+
+        let (_, input) = build_responses_input(&messages);
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(
+            input[0]["content"][0]["text"],
+            "Legacy tool output without call_id:\nlegacy plain text result"
+        );
+        assert!(input[0].get("call_id").is_none());
+    }
+
+    #[test]
+    fn build_responses_input_replays_tool_json_without_call_id_as_text() {
+        let messages = vec![ChatMessage {
+            role: "tool".into(),
+            content: r#"{"content":"legacy result","status":"ok"}"#.into(),
+        }];
+
+        let (_, input) = build_responses_input(&messages);
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(
+            input[0]["content"][0]["text"],
+            r#"Legacy tool output without call_id:
+{"content":"legacy result","status":"ok"}"#
+        );
+        assert!(input[0].get("call_id").is_none());
+    }
+
+    #[test]
+    fn build_responses_input_replays_blank_tool_call_id_as_legacy_text() {
+        for raw_id in ["", "   "] {
+            let messages = vec![ChatMessage {
+                role: "tool".into(),
+                content: serde_json::json!({
+                    "tool_call_id": raw_id,
+                    "content": "legacy result"
+                })
+                .to_string(),
+            }];
+
+            let (_, input) = build_responses_input(&messages);
+
+            assert_eq!(input.len(), 1);
+            assert_eq!(input[0]["type"], "message");
+            assert_eq!(input[0]["role"], "user");
+            assert_eq!(input[0]["content"][0]["type"], "input_text");
+            assert!(input[0].get("call_id").is_none());
+            assert!(
+                input[0]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("\"legacy result\"")
+            );
+        }
+    }
+
+    #[test]
     fn build_responses_input_maps_native_assistant_tool_calls() {
         let messages = vec![ChatMessage::assistant(
             r#"{"content":"Using shell","tool_calls":[{"id":"call_abc","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#,
@@ -2209,12 +2337,12 @@ data: [DONE]
     }
 
     #[test]
-    fn provider_does_not_advertise_streaming_until_live_sse_is_wired() {
+    fn provider_advertises_streaming_tool_events() {
         let provider =
             OpenAiCodexModelProvider::new("test", &ModelProviderRuntimeOptions::default(), None)
                 .expect("provider should initialize");
 
-        assert!(!provider.supports_streaming());
-        assert!(!provider.supports_streaming_tool_events());
+        assert!(provider.supports_streaming());
+        assert!(provider.supports_streaming_tool_events());
     }
 }

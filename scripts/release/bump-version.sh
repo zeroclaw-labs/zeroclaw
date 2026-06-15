@@ -64,6 +64,12 @@ if [[ -f "$TAURI_CONF" ]]; then
   changed=$((changed + 1))
 fi
 
+# ── Windows installer (setup.bat) ──────────────────────────────────
+echo "Windows setup.bat..."
+bump "setup.bat" \
+  'set "VERSION=[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?"' \
+  "set \"VERSION=${VERSION}\""
+
 # ── Workspace Cargo.toml ───────────────────────────────────────────
 # Bumps [workspace.package] version (the root version inherited by every child
 # crate via `version.workspace = true`) and the version pins on every path dep
@@ -76,9 +82,13 @@ if [[ -f "$ROOT_CARGO" ]]; then
   # [workspace.package] version — first bare `version = "..."` line in the file
   sed -i -E '0,/^version = "[^"]+"/s||version = "'"$VERSION"'"|' "$ROOT_CARGO" 2>/dev/null \
     || sed -i '' -E '/^version = "[^"]+"/{s//version = "'"$VERSION"'"/;:a;n;ba;}' "$ROOT_CARGO"
-  # [workspace.dependencies] path-dep version pins, skipping aardvark*
-  sed -i -E '/path = "crates\/aardvark/!s|(path = "crates/[^"]+", version = ")[^"]+(")|\1'"$VERSION"'\2|' "$ROOT_CARGO" 2>/dev/null \
-    || sed -i '' -E '/path = "crates\/aardvark/!s|(path = "crates/[^"]+", version = ")[^"]+(")|\1'"$VERSION"'\2|' "$ROOT_CARGO"
+  # [workspace.dependencies] path-dep version pins, skipping aardvark*. Covers
+  # both crates/ and apps/ path deps (e.g. apps/zerocode) so every in-tree
+  # member tracks the workspace version; a missed apps/ pin leaves the lockfile
+  # unresolvable and breaks `cargo metadata` mid-bump. Uses '#' as the sed
+  # delimiter so the (crates|apps) alternation pipe is not read as a delimiter.
+  sed -i -E '/path = "crates\/aardvark/!s#(path = "(crates|apps)/[^"]+", version = ")[^"]+(")#\1'"$VERSION"'\3#' "$ROOT_CARGO" 2>/dev/null \
+    || sed -i '' -E '/path = "crates\/aardvark/!s#(path = "(crates|apps)/[^"]+", version = ")[^"]+(")#\1'"$VERSION"'\3#' "$ROOT_CARGO"
   after="$(sha256sum "$ROOT_CARGO" | awk '{print $1}')"
   if [[ "$before" != "$after" ]]; then
     echo "  updated: Cargo.toml ([workspace.package] + [workspace.dependencies])"
@@ -109,26 +119,24 @@ fi
 # ── Marketplace: Dokploy ───────────────────────────────────────────
 echo "Marketplace templates..."
 bump "marketplace/dokploy/meta-entry.json" \
-  '"version": "[0-9]+\.[0-9]+\.[0-9]+"' \
+  '"version": "[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?"' \
   "\"version\": \"${VERSION}\""
 
 bump "marketplace/dokploy/blueprints/zeroclaw/docker-compose.yml" \
-  'ghcr\.io/zeroclaw-labs/zeroclaw:[0-9]+\.[0-9]+\.[0-9]+' \
+  'ghcr\.io/zeroclaw-labs/zeroclaw:[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?' \
   "ghcr.io/zeroclaw-labs/zeroclaw:${VERSION}"
 
 # ── Marketplace: EasyPanel ─────────────────────────────────────────
 bump "marketplace/easypanel/meta.yaml" \
-  'ghcr\.io/zeroclaw-labs/zeroclaw:[0-9]+\.[0-9]+\.[0-9]+' \
+  'ghcr\.io/zeroclaw-labs/zeroclaw:[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?' \
   "ghcr.io/zeroclaw-labs/zeroclaw:${VERSION}"
 
 # ── Workflow description examples ──────────────────────────────────
 echo "Workflow descriptions..."
 for wf in \
-  .github/workflows/sync-marketplace-templates.yml \
-  .github/workflows/discord-release.yml \
-  marketplace/sync-marketplace-templates.yml; do
+  .github/workflows/discord-release.yml; do
   bump "$wf" \
-    '\(e\.g\. v[0-9]+\.[0-9]+\.[0-9]+\)' \
+    '\(e\.g\. v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?\)' \
     "(e.g. v${VERSION})"
 done
 
@@ -154,7 +162,7 @@ for f in "${docs_files[@]}"; do
   rel="${f#$REPO_ROOT/}"
   # Image tags share one form across .md and .po (no quotes involved).
   bump "$rel" \
-    'zeroclawlabs/zeroclaw:v[0-9]+\.[0-9]+\.[0-9]+' \
+    'zeroclawlabs/zeroclaw:v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?' \
     "zeroclawlabs/zeroclaw:v${VERSION}"
   # Version literal needs per-format dispatch: the unescaped pattern is
   # a strict substring of the escaped one, so running both blindly
@@ -163,7 +171,7 @@ for f in "${docs_files[@]}"; do
   case "$f" in
     *.md)
       bump "$rel" \
-        '"version": "[0-9]+\.[0-9]+\.[0-9]+"' \
+        '"version": "[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?"' \
         "\"version\": \"${VERSION}\""
       ;;
     *.po)
@@ -172,11 +180,27 @@ for f in "${docs_files[@]}"; do
       # emits as a single backslash followed by a quote, restoring
       # the gettext escaped form.
       bump "$rel" \
-        '\\"version\\": \\"[0-9]+\.[0-9]+\.[0-9]+\\"' \
+        '\\"version\\": \\"[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?\\"' \
         '\\"version\\": \\"'"${VERSION}"'\\"'
       ;;
   esac
 done
+
+# ── Generated install surfaces (single source of truth) ───────────
+# After the workspace version is bumped, regenerate every spec-driven install
+# surface so version and feature sets stay canonical. This OWNS the version and
+# feature content of setup.bat, dist/aur/PKGBUILD, dist/scoop/zeroclaw.json,
+# flake.nix, the Dockerfiles/Containerfile feature sets, and
+# dev/ci/docker-tags.toml. No per-file sed hacks for those. CI's Installer
+# Drift gate fails if this is skipped.
+echo "Generated install surfaces (cargo generate installers)..."
+if command -v cargo >/dev/null 2>&1; then
+  ( cd "$REPO_ROOT" && cargo generate installers ) \
+    && { echo "  regenerated install surfaces"; changed=$((changed + 1)); } \
+    || echo "  warn: cargo generate installers failed; run it manually and commit the result"
+else
+  echo "  skip: cargo not on PATH; run 'cargo generate installers' before committing"
+fi
 
 echo ""
 if [[ $changed -gt 0 ]]; then

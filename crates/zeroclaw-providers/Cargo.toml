@@ -9,7 +9,8 @@ publish = false
 [dependencies]
 zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
-zeroclaw-config = { workspace = true, default-features = true }
+zeroclaw-spawn.workspace = true
+zeroclaw-config = { workspace = true, default-features = false }
 anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"
@@ -34,6 +35,7 @@ tokio-util = { version = "0.7", default-features = false }
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 
 [dev-dependencies]
+tokio = { version = "1.50", features = ["test-util"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 hyper = { version = "1", features = ["http1", "server"] }
 tempfile = "3.26"

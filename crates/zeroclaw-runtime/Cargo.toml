@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 zeroclaw-api.workspace = true
+zeroclaw-spawn.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-config.workspace = true
 zeroclaw-log.workspace = true
@@ -36,12 +37,13 @@ hostname = "0.4.2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 indicatif = "0.18"
 lru = "0.16"
+mime_guess = "2"
 nanohtml2text = "0.2"
 parking_lot = "0.12"
 portable-atomic = "1"
 rand = "0.10"
 regex = "1.10"
-rumqttc = "0.25"
+rumqttc = { version = "0.25", default-features = false, features = ["use-rustls-no-provider"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring", "blocking", "multipart", "stream", "socks"] }
 ring = "0.17"
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -86,6 +88,10 @@ landlock = { version = "0.4", optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Console", "Win32_Globalization"] }
+encoding_rs = "0.8"
+
 [features]
 default = ["observability-prometheus", "schema-export"]
 observability-prometheus = ["dep:prometheus"]
@@ -94,7 +100,6 @@ sandbox-landlock = ["dep:landlock"]
 schema-export = ["dep:schemars", "zeroclaw-config/schema-export"]
 
 
-channel-nostr = ["zeroclaw-config/channel-nostr"]
 browser-native = []
 rag-pdf = ["dep:pdf-extract"]
 plugins-wasm = ["dep:zeroclaw-plugins"]

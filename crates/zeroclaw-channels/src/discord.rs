@@ -16,6 +16,7 @@ use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
 use zeroclaw_api::media::MediaAttachment;
+use zeroclaw_runtime::i18n;
 
 /// Discord channel — connects via Gateway WebSocket for real-time messages
 pub struct DiscordChannel {
@@ -37,6 +38,13 @@ pub struct DiscordChannel {
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     listen_to_bots: bool,
     mention_only: bool,
+    /// Raw IDENTIFY mask override (config `intents_mask`). `Some` wins over
+    /// everything `gateway_intents()` would derive — including `Some(0)`,
+    /// a legal IDENTIFY value. Intents are connection-scoped (sent once in
+    /// IDENTIFY), so a construction-time snapshot matches the connection
+    /// lifecycle exactly: config reloads rebuild channels, which re-derives
+    /// the mask.
+    intents_mask_override: Option<u64>,
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
@@ -68,8 +76,41 @@ pub struct DiscordChannel {
     /// inbound message from a channel via `GET /channels/{id}`. Thread type
     /// is stable for the channel's lifetime so the cache lives as long as
     /// the channel instance.
-    thread_channels: Arc<AsyncMutex<HashMap<String, bool>>>,
+    ///
+    /// Value is `Some(parent_id)` when the channel is a thread, `None`
+    /// when it is a regular (non-thread) channel.
+    thread_channels: Arc<AsyncMutex<HashMap<String, Option<String>>>>,
+    /// Ephemeral Discord gateway session state for Resume across reconnects.
+    gateway_session: Mutex<DiscordGatewaySession>,
 }
+
+#[derive(Clone, Debug, Default)]
+struct DiscordGatewaySession {
+    session_id: Option<String>,
+    resume_gateway_url: Option<String>,
+    sequence: Option<i64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DiscordListenerFatalError {
+    message: String,
+}
+
+impl DiscordListenerFatalError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for DiscordListenerFatalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DiscordListenerFatalError {}
 
 impl DiscordChannel {
     pub fn new(
@@ -89,6 +130,7 @@ impl DiscordChannel {
             peer_resolver,
             listen_to_bots,
             mention_only,
+            intents_mask_override: None,
             typing_handles: Mutex::new(HashMap::new()),
             proxy_url: None,
             transcription: None,
@@ -104,6 +146,7 @@ impl DiscordChannel {
             pending_approvals: Arc::new(AsyncMutex::new(HashMap::new())),
             approval_timeout_secs: 300,
             thread_channels: Arc::new(AsyncMutex::new(HashMap::new())),
+            gateway_session: Mutex::new(DiscordGatewaySession::default()),
         }
     }
 
@@ -111,6 +154,23 @@ impl DiscordChannel {
     pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
         self.proxy_url = proxy_url;
         self
+    }
+
+    /// Send exactly `mask` in IDENTIFY when `Some`, ignoring the derived
+    /// mask entirely (including `Some(0)`, a legal IDENTIFY value). Operator
+    /// escape hatch (config `intents_mask`).
+    pub fn with_intents_mask(mut self, mask: Option<u64>) -> Self {
+        self.intents_mask_override = mask;
+        self
+    }
+
+    /// Gateway intent mask for IDENTIFY: the raw `intents_mask` override
+    /// when set, otherwise the fixed baseline.
+    fn gateway_intents(&self) -> u64 {
+        if let Some(mask) = self.intents_mask_override {
+            return mask;
+        }
+        BASELINE_INTENTS
     }
 
     pub fn with_approval_timeout_secs(mut self, secs: u64) -> Self {
@@ -174,9 +234,214 @@ impl DiscordChannel {
         self
     }
 
+    fn fatal_listener_error(message: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(DiscordListenerFatalError::new(message))
+    }
+
+    fn validate_gateway_preflight_response(
+        response: reqwest::Response,
+    ) -> anyhow::Result<reqwest::Response> {
+        Ok(response.error_for_status()?)
+    }
+
     pub fn with_archive_memory(mut self, mem: std::sync::Arc<dyn zeroclaw_memory::Memory>) -> Self {
         self.archive_memory = Some(mem);
         self
+    }
+
+    /// Keep archived messages in sync when Discord reports them edited or
+    /// deleted. Markers are appended rather than replacing content, so the
+    /// original text and the edit history stay searchable. Markers are
+    /// plain text in the entry body — the same in-band convention as the
+    /// create path's `[attachments: …]` marker. They are advisory context
+    /// for the agent, not tamper-proof provenance: message content can
+    /// imitate them.
+    ///
+    /// Only messages that were actually archived are touched — the `get`
+    /// on the `discord_{message_id}` key gates everything (a message that
+    /// failed any create-time filter was never stored). Edits additionally
+    /// re-run the author checks against the UPDATE payload: archive-time
+    /// authorization is not durable, and a peer removed from the allowlist
+    /// must not keep writing into the archive by editing old messages.
+    async fn sync_archive_for_message_event(
+        &self,
+        event_type: &str,
+        d: &serde_json::Value,
+        bot_user_id: &str,
+    ) {
+        let Some(archive_mem) = self.archive_memory.clone() else {
+            return;
+        };
+        match event_type {
+            "MESSAGE_UPDATE" => self.apply_archive_edit(&archive_mem, d, bot_user_id).await,
+            "MESSAGE_DELETE" => {
+                let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                if !message_id.is_empty() {
+                    self.apply_archive_tombstone(&archive_mem, message_id).await;
+                }
+            }
+            "MESSAGE_DELETE_BULK" => {
+                // Moderation bulk deletes carry `ids`, not `id` — and they
+                // are the highest-signal deletions an archive can record.
+                let ids = d
+                    .get("ids")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|i| i.as_str()).collect::<Vec<&str>>())
+                    .unwrap_or_default();
+                for id in ids {
+                    self.apply_archive_tombstone(&archive_mem, id).await;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Fetch the archived entry for a message id, or `None` (logging
+    /// lookup failures — a missed sync beats a silent one).
+    async fn archived_entry(
+        &self,
+        archive_mem: &std::sync::Arc<dyn zeroclaw_memory::Memory>,
+        key: &str,
+    ) -> Option<zeroclaw_memory::MemoryEntry> {
+        match archive_mem.get(key).await {
+            Ok(entry) => entry,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error": format!("{e}"),
+                            "key": key,
+                        })),
+                    "discord archive lookup failed for message event"
+                );
+                None
+            }
+        }
+    }
+
+    /// Re-store an entry preserving its category and session attribution.
+    async fn restore_archived_entry(
+        &self,
+        archive_mem: &std::sync::Arc<dyn zeroclaw_memory::Memory>,
+        key: &str,
+        content: &str,
+        existing: &zeroclaw_memory::MemoryEntry,
+    ) {
+        if let Err(e) = archive_mem
+            .store(
+                key,
+                content,
+                existing.category.clone(),
+                existing.session_id.as_deref(),
+            )
+            .await
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "error": format!("{e}"),
+                        "key": key,
+                    })),
+                "failed to sync discord archive for message event"
+            );
+        }
+    }
+
+    /// Append a deletion tombstone. Idempotent: gateway redelivery (and a
+    /// MESSAGE_DELETE racing a bulk delete) must not double-stamp.
+    async fn apply_archive_tombstone(
+        &self,
+        archive_mem: &std::sync::Arc<dyn zeroclaw_memory::Memory>,
+        message_id: &str,
+    ) {
+        let key = format!("discord_{message_id}");
+        let Some(existing) = self.archived_entry(archive_mem, &key).await else {
+            return;
+        };
+        if existing.content.contains("[deleted at ") {
+            return;
+        }
+        // Deletes carry no payload timestamp; receipt time is the best
+        // available.
+        let ts = chrono::Utc::now().to_rfc3339();
+        let updated = format!("{} [deleted at {ts}]", existing.content);
+        self.restore_archived_entry(archive_mem, &key, &updated, &existing)
+            .await;
+    }
+
+    /// Append an edit marker for a genuine content edit.
+    ///
+    /// Discord sends the full message object on every MESSAGE_UPDATE —
+    /// embed unfurls, pins, flag changes — with `content` present and
+    /// unchanged. Only real content edits set `edited_timestamp`, so that
+    /// field gates the append (and keys the idempotency check: redelivered
+    /// or duplicate events for the same edit are no-ops).
+    async fn apply_archive_edit(
+        &self,
+        archive_mem: &std::sync::Arc<dyn zeroclaw_memory::Memory>,
+        d: &serde_json::Value,
+        bot_user_id: &str,
+    ) {
+        let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
+        if message_id.is_empty() {
+            return;
+        }
+        let Some(edited_ts) = d.get("edited_timestamp").and_then(|t| t.as_str()) else {
+            return;
+        };
+        let new_content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        if new_content.is_empty() {
+            return;
+        }
+        // Author re-checks: same gates the create path applied, evaluated
+        // against *current* policy. A payload without an author cannot be
+        // attributed and is not recorded.
+        let author_id = d
+            .get("author")
+            .and_then(|a| a.get("id"))
+            .and_then(|i| i.as_str())
+            .unwrap_or("");
+        if author_id.is_empty() || author_id == bot_user_id {
+            return;
+        }
+        if !self.listen_to_bots
+            && d.get("author")
+                .and_then(|a| a.get("bot"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        {
+            return;
+        }
+        if !self.is_user_allowed(author_id) {
+            return;
+        }
+
+        let key = format!("discord_{message_id}");
+        let Some(existing) = self.archived_entry(archive_mem, &key).await else {
+            return;
+        };
+        let marker_key = format!(" [edited at {edited_ts}:");
+        if existing.content.contains(&marker_key) {
+            return;
+        }
+        let marker = format!(" [edited at {edited_ts}: {new_content}]");
+        // Edits are remote-controlled and unlimited; bound entry growth by
+        // dropping the middle of the history once it gets large — the
+        // original text and the latest edit are what the archive is for.
+        let mut base = existing.content.clone();
+        if base.len() + marker.len() > MAX_ARCHIVE_ENTRY_BYTES
+            && let Some(first_marker) = base.find(" [edited at ")
+        {
+            base.truncate(first_marker);
+            base.push_str(" [edit history truncated]");
+        }
+        let updated = format!("{base}{marker}");
+        self.restore_archived_entry(archive_mem, &key, &updated, &existing)
+            .await;
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -201,22 +466,23 @@ impl DiscordChannel {
     }
 
     /// Resolve whether `channel_id` is a Discord thread (ANNOUNCEMENT,
-    /// PUBLIC, or PRIVATE thread) via `GET /channels/{id}`. Results are
-    /// cached for the channel instance's lifetime: thread-ness is stable
-    /// for a given channel ID, so one lookup per ID per process. Failures
-    /// (network, 429, missing `type` field) fall through to `false` so a
-    /// transient API hiccup never blocks inbound delivery.
-    async fn is_thread_channel(&self, client: &reqwest::Client, channel_id: &str) -> bool {
+    /// PUBLIC, or PRIVATE thread) via `GET /channels/{id}`. Returns
+    /// `Some(parent_id)` when the channel is a thread, `None` otherwise.
+    /// Results are cached for the channel instance's lifetime: thread-ness
+    /// is stable for a given channel ID, so one lookup per ID per process.
+    /// Failures (network, 429, missing fields) return `None` without
+    /// caching so the next message retries.
+    async fn thread_parent(&self, client: &reqwest::Client, channel_id: &str) -> Option<String> {
         {
             let cache = self.thread_channels.lock().await;
-            if let Some(&value) = cache.get(channel_id) {
-                return value;
+            if let Some(value) = cache.get(channel_id) {
+                return value.clone();
             }
         }
 
         // Only a successful API response is cached. A transient network blip
         // or 429 must not poison the cache for the channel's lifetime; the
-        // next message should retry the lookup. Failure paths return `false`
+        // next message should retry the lookup. Failure paths return `None`
         // (the safe default) without writing to the cache. The whole request
         // is wrapped in an explicit timeout so a hung Discord API call can
         // never stall the listener; the shared channel HTTP client may not
@@ -251,14 +517,20 @@ impl DiscordChannel {
                 );
                 anyhow::Error::msg(format!("body parse failed: {e}"))
             })?;
-            Ok::<bool, anyhow::Error>(
-                body.get("type")
-                    .and_then(serde_json::Value::as_u64)
-                    .map(is_thread_channel_type)
-                    .unwrap_or(false),
-            )
+            let is_thread = body
+                .get("type")
+                .and_then(serde_json::Value::as_u64)
+                .map(is_thread_channel_type)
+                .unwrap_or(false);
+            Ok::<Option<String>, anyhow::Error>(if is_thread {
+                body.get("parent_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            } else {
+                None
+            })
         };
-        let is_thread = match tokio::time::timeout(THREAD_LOOKUP_TIMEOUT, lookup).await {
+        let result = match tokio::time::timeout(THREAD_LOOKUP_TIMEOUT, lookup).await {
             Ok(Ok(value)) => value,
             Ok(Err(e)) => {
                 ::zeroclaw_log::record!(
@@ -269,19 +541,19 @@ impl DiscordChannel {
                         ),
                     "channel lookup failed"
                 );
-                return false;
+                return None;
             }
             Err(_) => {
                 ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel_id": channel_id, "timeout_secs": THREAD_LOOKUP_TIMEOUT.as_secs()})), "channel lookup timed out");
-                return false;
+                return None;
             }
         };
 
         self.thread_channels
             .lock()
             .await
-            .insert(channel_id.to_string(), is_thread);
-        is_thread
+            .insert(channel_id.to_string(), result.clone());
+        result
     }
 
     /// Apply the trust-boundary / delivery-failure emoji reactions to the
@@ -324,15 +596,40 @@ const fn is_thread_channel_type(channel_type: u64) -> bool {
 /// is a safety bound so a hung request cannot stall the listener.
 const THREAD_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Pure channel-filter decision: does `msg_channel` pass the allowlist?
+///
+/// A channel passes when:
+/// 1. `channel_filter` is empty (accept all), OR
+/// 2. `msg_channel` is directly in `channel_filter`, OR
+/// 3. `thread_parent_id` is `Some(parent)` and `parent` is in `channel_filter`
+///    (thread whose parent forum/channel is allowed).
+fn channel_passes_filter(
+    channel_filter: &[String],
+    msg_channel: &str,
+    thread_parent_id: Option<&str>,
+) -> bool {
+    if channel_filter.is_empty() {
+        return true;
+    }
+    if channel_filter.iter().any(|c| c == msg_channel) {
+        return true;
+    }
+    if let Some(parent) = thread_parent_id {
+        return channel_filter.iter().any(|c| c == parent);
+    }
+    false
+}
+
 /// Process Discord message attachments in a single pass.
 ///
 /// Returns the text block appended to the agent's prompt and the structured
 /// `MediaAttachment` list consumed by the media pipeline. Each attachment is
 /// downloaded at most once: text/* is inlined as text, audio is transcribed
-/// inline when a transcription manager is configured (otherwise it goes
-/// through the media pipeline), and image/video/document attachments are
-/// saved to the workspace and emitted as `[KIND:<path>]` markers plus a
-/// `MediaAttachment` for vision-capable providers.
+/// inline when a transcription manager is configured and returns non-empty
+/// text (otherwise it falls through to the media pipeline), and
+/// image/video/document attachments are saved to the workspace and emitted as
+/// `[KIND:<path>]` markers plus a `MediaAttachment` for vision-capable
+/// providers.
 async fn process_attachments(
     attachments: &[serde_json::Value],
     client: &reqwest::Client,
@@ -392,6 +689,7 @@ async fn process_attachments(
         // Audio with channel-level transcription configured: transcribe
         // inline so the agent receives `[Voice] <transcript>` text rather
         // than opaque bytes through the media pipeline.
+        let mut downloaded_audio_bytes = None;
         if is_audio && let Some(manager) = transcription_manager {
             let bytes = match download_attachment_bytes(client, url, name).await {
                 Some(b) => b,
@@ -414,6 +712,7 @@ async fn process_attachments(
                             )
                         );
                         text_parts.push(format!("[Voice] {trimmed}"));
+                        continue;
                     }
                 }
                 Err(e) => {
@@ -428,14 +727,17 @@ async fn process_attachments(
                     );
                 }
             }
-            continue;
+            downloaded_audio_bytes = Some(bytes);
         }
 
         let marker_kind = marker_kind_for(ct, is_audio);
 
-        let bytes = match download_attachment_bytes(client, url, name).await {
+        let bytes = match downloaded_audio_bytes {
             Some(b) => b,
-            None => continue,
+            None => match download_attachment_bytes(client, url, name).await {
+                Some(b) => b,
+                None => continue,
+            },
         };
 
         let marker_target = match workspace_dir {
@@ -826,11 +1128,7 @@ fn validate_marker_target(
 fn classify_outgoing_attachments(
     attachments: &[DiscordAttachment],
     workspace_dir: Option<&Path>,
-) -> (
-    Vec<PathBuf>,
-    Vec<String>,
-    Vec<(String, DiscordMarkerFailure)>,
-) {
+) -> (Vec<PathBuf>, Vec<String>, Vec<DiscordMarkerFailure>) {
     let mut local_files = Vec::new();
     let mut remote_urls = Vec::new();
     let mut failures = Vec::new();
@@ -845,7 +1143,7 @@ fn classify_outgoing_attachments(
                     DiscordMarkerFailure::NotFound => "not found",
                 };
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"kind": attachment.kind.marker_name(), "target": attachment.target, "reason": kind_label, "error": format!("{}", e)})), "dropping unresolved outbound attachment marker");
-                failures.push((attachment.target.clone(), e.kind()));
+                failures.push(e.kind());
             }
         }
     }
@@ -853,23 +1151,23 @@ fn classify_outgoing_attachments(
     (local_files, remote_urls, failures)
 }
 
-/// Build the Matrix-style "(note: I couldn't deliver ...)" tail appended
-/// to the bot's reply when at least one marker was dropped. Returns
-/// `None` when the failure list is empty so callers can keep the body
-/// untouched.
-fn delivery_failure_note(failures: &[(String, DiscordMarkerFailure)]) -> Option<String> {
+/// Build the count-only delivery failure tail appended to the bot's reply
+/// when at least one marker was dropped. Returns `None` when the failure
+/// list is empty so callers can keep the body untouched.
+fn delivery_failure_note(failures: &[DiscordMarkerFailure]) -> Option<String> {
     if failures.is_empty() {
         return None;
     }
-    let targets: Vec<&str> = failures.iter().map(|(t, _)| t.as_str()).collect();
-    Some(if targets.len() == 1 {
-        format!("(note: I couldn't deliver the file at {}.)", targets[0])
+    let count = failures.len().to_string();
+    let key = if failures.len() == 1 {
+        "channel-discord-delivery-failure-note-one"
     } else {
-        format!(
-            "(note: I couldn't deliver these files: {}.)",
-            targets.join(", ")
-        )
-    })
+        "channel-discord-delivery-failure-note-many"
+    };
+    Some(i18n::get_required_cli_string_with_args(
+        key,
+        &[("count", count.as_str())],
+    ))
 }
 
 /// Compose the final reply body with the delivery-failure note appended.
@@ -887,17 +1185,17 @@ fn compose_body_with_failure_note(content: &str, note: Option<&str>) -> String {
 /// kinds of marker failures occurred. 🚫 signals a trust-boundary refusal,
 /// ⚠️ signals a post-validation delivery failure. Both can fire on the
 /// same message when a batch mixes refusals and not-found targets.
-fn decide_failure_reactions(failures: &[(String, DiscordMarkerFailure)]) -> Vec<&'static str> {
+fn decide_failure_reactions(failures: &[DiscordMarkerFailure]) -> Vec<&'static str> {
     let mut out = Vec::new();
     if failures
         .iter()
-        .any(|(_, k)| matches!(k, DiscordMarkerFailure::Refused))
+        .any(|k| matches!(k, DiscordMarkerFailure::Refused))
     {
         out.push("🚫");
     }
     if failures
         .iter()
-        .any(|(_, k)| matches!(k, DiscordMarkerFailure::NotFound))
+        .any(|k| matches!(k, DiscordMarkerFailure::NotFound))
     {
         out.push("⚠️");
     }
@@ -1110,6 +1408,10 @@ const BASE64_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstu
 ///
 /// Discord rejects longer payloads with `50035 Invalid Form Body`.
 const DISCORD_MAX_MESSAGE_LENGTH: usize = 2000;
+/// Upper bound for an archived message entry once edit markers accrue.
+/// Edits are remote-controlled and unlimited; past this size the middle of
+/// the edit history is dropped (original text and latest edit retained).
+const MAX_ARCHIVE_ENTRY_BYTES: usize = 16 * 1024;
 const DISCORD_ACK_REACTIONS: &[&str] = &["⚡️", "🦀", "🙌", "💪", "👌", "👀", "👣"];
 
 /// Split a message into chunks that respect Discord's 2000-character limit.
@@ -1296,6 +1598,18 @@ fn contains_bot_mention(content: &str, bot_user_id: &str) -> bool {
     content.contains(&tags[0]) || content.contains(&tags[1])
 }
 
+/// Whether a Discord message `type` represents a real user turn the bot should
+/// act on, versus a system/auto message it must ignore.
+///
+/// Only `DEFAULT` (0) and `REPLY` (19) are conversational. Everything else is a
+/// system message: notably `THREAD_CREATED` (18) — posted in the parent channel
+/// when a thread is created — and `THREAD_STARTER_MESSAGE` (21), plus joins,
+/// pins, boosts, etc. Acting on `THREAD_CREATED` is what made the bot "respond
+/// to a thread's birth message".
+fn is_conversational_message_type(message_type: u64) -> bool {
+    matches!(message_type, 0 | 19)
+}
+
 /// Decide whether an inbound Discord message passes the listener gate.
 /// Returns the cleaned text body when admitted, or `None` to drop the
 /// message. Attachment-only messages (empty `content` plus at least one
@@ -1357,6 +1671,83 @@ fn base64_decode(input: &str) -> Option<String> {
     }
 
     String::from_utf8(bytes).ok()
+}
+
+// Discord gateway intent bits (API v10) — the ones zeroclaw consumes or
+// exposes as opt-ins. https://discord.com/developers/docs/events/gateway#gateway-intents
+const INTENT_GUILDS: u64 = 1 << 0;
+const INTENT_GUILD_MEMBERS: u64 = 1 << 1; // privileged
+const INTENT_GUILD_PRESENCES: u64 = 1 << 8; // privileged
+const INTENT_GUILD_MESSAGES: u64 = 1 << 9;
+const INTENT_DIRECT_MESSAGES: u64 = 1 << 12;
+const INTENT_MESSAGE_CONTENT: u64 = 1 << 15; // privileged
+
+/// The intents every Discord channel needs: guild topology plus guild/DM
+/// messages with content. MESSAGE_CONTENT is privileged but always requested
+/// — without it the bot only sees text in DMs and @-mentions, which silently
+/// breaks `archive`, `listen_to_bots`, and mention-free channels.
+const BASELINE_INTENTS: u64 =
+    INTENT_GUILDS | INTENT_GUILD_MESSAGES | INTENT_DIRECT_MESSAGES | INTENT_MESSAGE_CONTENT;
+
+/// Human-readable names for a resolved intent mask, for connect logs and
+/// close-code diagnostics. Bits without a known name (possible via the raw
+/// `intents_mask` override) are reported as one hex remainder entry rather
+/// than silently dropped.
+fn intent_names(mask: u64) -> Vec<String> {
+    let known: [(u64, &str); 6] = [
+        (INTENT_GUILDS, "guilds"),
+        (INTENT_GUILD_MEMBERS, "guild_members"),
+        (INTENT_GUILD_PRESENCES, "guild_presences"),
+        (INTENT_GUILD_MESSAGES, "guild_messages"),
+        (INTENT_DIRECT_MESSAGES, "direct_messages"),
+        (INTENT_MESSAGE_CONTENT, "message_content"),
+    ];
+    let mut names = Vec::new();
+    let mut rest = mask;
+    for (bit, name) in known {
+        if mask & bit != 0 {
+            names.push(name.to_string());
+            rest &= !bit;
+        }
+    }
+    if rest != 0 {
+        names.push(format!("unknown({rest:#x})"));
+    }
+    names
+}
+
+/// Close 4014 means the Developer Portal doesn't grant a privileged intent
+/// we requested. Name the portal toggles so the operator knows exactly what
+/// to fix instead of staring at a bare close code.
+fn disallowed_intents_hint(mask: u64) -> String {
+    let mut requested = Vec::new();
+    if mask & INTENT_MESSAGE_CONTENT != 0 {
+        requested.push("Message Content".to_string());
+    }
+    if mask & INTENT_GUILD_MEMBERS != 0 {
+        requested.push("Server Members".to_string());
+    }
+    if mask & INTENT_GUILD_PRESENCES != 0 {
+        requested.push("Presence".to_string());
+    }
+    if requested.is_empty() {
+        // Reachable only via an `intents_mask` override with no privileged
+        // bits — name the raw mask so the operator has something to act on.
+        requested.push(format!("mask {mask:#x}"));
+    }
+    format!(
+        " — a privileged intent is not enabled for this bot in the Discord \
+         Developer Portal (Bot → Privileged Gateway Intents). Requested: {}",
+        requested.join(", ")
+    )
+}
+
+fn is_fatal_gateway_close_code(code: u16) -> bool {
+    matches!(code, 4004 | 4010 | 4011 | 4012 | 4013 | 4014)
+}
+
+fn requires_new_session_close_code(code: u16) -> bool {
+    matches!(code, 4007 | 4009)
 }
 
 impl ::zeroclaw_api::attribution::Attributable for DiscordChannel {
@@ -1482,26 +1873,51 @@ impl Channel for DiscordChannel {
     #[allow(clippy::too_many_lines)]
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let bot_user_id = Self::bot_user_id_from_token(&self.bot_token).unwrap_or_default();
+        let mut had_ready = false;
 
         // Get Gateway URL
-        let gw_resp: serde_json::Value = self
+        let gw_resp = self
             .http_client()
             .get("https://discord.com/api/v10/gateway/bot")
             .header("Authorization", format!("Bot {}", self.bot_token))
             .send()
-            .await?
-            .json()
             .await?;
+        let gw_resp = Self::validate_gateway_preflight_response(gw_resp)?;
+        let gw_resp: serde_json::Value = gw_resp.json().await?;
 
-        let gw_url = gw_resp
+        if let Some(remaining) = gw_resp
+            .get("session_start_limit")
+            .and_then(|v| v.get("remaining"))
+            .and_then(serde_json::Value::as_u64)
+            && remaining == 0
+        {
+            return Err(Self::fatal_listener_error(
+                "discord gateway identify blocked: session_start_limit.remaining is 0",
+            ));
+        }
+
+        let fresh_gateway_url = gw_resp
             .get("url")
             .and_then(|u| u.as_str())
-            .unwrap_or("wss://gateway.discord.gg");
+            .ok_or_else(|| Self::fatal_listener_error("discord gateway preflight missing url"))?
+            .to_string();
+        let session_snapshot = self.gateway_session.lock().clone();
+        let can_resume =
+            session_snapshot.session_id.is_some() && session_snapshot.sequence.is_some();
+        let gw_url = if can_resume {
+            session_snapshot
+                .resume_gateway_url
+                .clone()
+                .unwrap_or_else(|| fresh_gateway_url.clone())
+        } else {
+            fresh_gateway_url.clone()
+        };
 
         let ws_url = format!("{gw_url}/?v=10&encoding=json");
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"resume": can_resume, "gateway_url": gw_url})),
             "connecting to gateway..."
         );
 
@@ -1531,38 +1947,71 @@ impl Channel for DiscordChannel {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(41250);
 
-        // Send Identify (opcode 2)
-        let identify = json!({
-            "op": 2,
-            "d": {
-                "token": self.bot_token,
-                "intents": 37377, // GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT | DIRECT_MESSAGES
-                "properties": {
-                    "os": "linux",
-                    "browser": "zeroclaw",
-                    "device": "zeroclaw"
+        let mut sequence = session_snapshot.sequence.unwrap_or(-1);
+
+        if can_resume {
+            let resume = json!({
+                "op": 6,
+                "d": {
+                    "token": self.bot_token,
+                    "session_id": session_snapshot.session_id,
+                    "seq": session_snapshot.sequence,
                 }
+            });
+            write.send(Message::Text(resume.to_string().into())).await?;
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"sequence": sequence})),
+                "sent Discord Resume"
+            );
+        } else {
+            let intents = self.gateway_intents();
+            if intents & BASELINE_INTENTS != BASELINE_INTENTS {
+                // Only reachable via the raw `intents_mask` override — the
+                // derived path always starts from the full baseline.
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "intents": intents,
+                            "missing": intent_names(BASELINE_INTENTS & !intents),
+                        })),
+                    "intents_mask drops baseline intents — message handling may go quiet"
+                );
             }
-        });
-        write
-            .send(Message::Text(identify.to_string().into()))
-            .await?;
-
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "connected and identified"
-        );
-
-        // Track the last sequence number for heartbeats and resume.
-        // Only accessed in the select! loop below, so a plain i64 suffices.
-        let mut sequence: i64 = -1;
+            let identify = json!({
+                "op": 2,
+                "d": {
+                    "token": self.bot_token,
+                    "intents": intents,
+                    "properties": {
+                        "os": "linux",
+                        "browser": "zeroclaw",
+                        "device": "zeroclaw"
+                    }
+                }
+            });
+            write
+                .send(Message::Text(identify.to_string().into()))
+                .await?;
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "intents": intents,
+                        "intent_names": intent_names(intents),
+                    })),
+                "sent Discord Identify"
+            );
+        }
 
         // Spawn heartbeat timer — sends a tick signal, actual heartbeat
         // is assembled in the select! loop where `sequence` lives.
         let (hb_tx, mut hb_rx) = tokio::sync::mpsc::channel::<()>(1);
         let hb_interval = heartbeat_interval;
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(hb_interval));
             loop {
                 interval.tick().await;
@@ -1626,9 +2075,37 @@ impl Channel for DiscordChannel {
                             }
                             continue;
                         }
-                        Some(Ok(Message::Close(_))) | None => break,
+                        Some(Ok(Message::Close(frame))) => {
+                            if let Some(frame) = frame {
+                                let code = u16::from(frame.code);
+                                let reason = frame.reason.to_string();
+                                if requires_new_session_close_code(code) {
+                                    let mut session = self.gateway_session.lock();
+                                    session.session_id = None;
+                                    session.resume_gateway_url = None;
+                                    session.sequence = None;
+                                }
+                                if is_fatal_gateway_close_code(code) {
+                                    let mut message = format!(
+                                        "discord gateway closed with fatal code {code}: {reason}"
+                                    );
+                                    if code == 4014 {
+                                        message.push_str(&disallowed_intents_hint(
+                                            self.gateway_intents(),
+                                        ));
+                                    }
+                                    return Err(Self::fatal_listener_error(message));
+                                }
+                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"code": code, "reason": reason, "had_ready": had_ready, "sequence": sequence})), "discord gateway closed; reconnecting");
+                            }
+                            break;
+                        }
+                        None => {
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"had_ready": had_ready, "sequence": sequence})), "discord gateway stream ended; reconnecting");
+                            break;
+                        }
                         Some(Err(e)) => {
-                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "websocket read error, reconnecting");
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", e), "had_ready": had_ready, "sequence": sequence})), "websocket read error, reconnecting");
                             break;
                         }
                         _ => continue,
@@ -1648,9 +2125,53 @@ impl Channel for DiscordChannel {
                     // Track sequence number from all dispatch events
                     if let Some(s) = event.get("s").and_then(serde_json::Value::as_i64) {
                         sequence = s;
+                        self.gateway_session.lock().sequence = Some(s);
                     }
 
                     let op = event.get("op").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                    let event_type = event.get("t").and_then(|t| t.as_str()).unwrap_or("");
+
+                    match event_type {
+                        "READY" => {
+                            had_ready = true;
+                            let session_id = event
+                                .get("d")
+                                .and_then(|d| d.get("session_id"))
+                                .and_then(serde_json::Value::as_str)
+                                .map(ToString::to_string);
+                            let resume_gateway_url = event
+                                .get("d")
+                                .and_then(|d| d.get("resume_gateway_url"))
+                                .and_then(serde_json::Value::as_str)
+                                .map(ToString::to_string);
+                            {
+                                let mut session = self.gateway_session.lock();
+                                session.session_id = session_id.clone();
+                                session.resume_gateway_url = resume_gateway_url;
+                                session.sequence = if sequence >= 0 { Some(sequence) } else { None };
+                            }
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                                    ::serde_json::json!({"sequence": sequence, "session_id_present": session_id.is_some()})
+                                ),
+                                "discord READY received"
+                            );
+                            continue;
+                        }
+                        "RESUMED" => {
+                            had_ready = true;
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                                    ::serde_json::json!({"sequence": sequence})
+                                ),
+                                "discord RESUMED received"
+                            );
+                            continue;
+                        }
+                        _ => {}
+                    }
 
                     match op {
                         // Op 1: Server requests an immediate heartbeat
@@ -1664,19 +2185,40 @@ impl Channel for DiscordChannel {
                         }
                         // Op 7: Reconnect
                         7 => {
-                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "received Reconnect (op 7), closing for restart");
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"had_ready": had_ready, "sequence": sequence})), "received Reconnect (op 7), closing for restart");
                             break;
                         }
                         // Op 9: Invalid Session
                         9 => {
-                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "received Invalid Session (op 9), closing for restart");
+                            let resumable = event.get("d").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                            if !resumable {
+                                let mut session = self.gateway_session.lock();
+                                session.session_id = None;
+                                session.resume_gateway_url = None;
+                                session.sequence = None;
+                            }
+                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"resumable": resumable, "had_ready": had_ready, "sequence": sequence})), "received Invalid Session (op 9), closing for restart");
                             break;
                         }
                         _ => {}
                     }
 
+                    // MESSAGE_UPDATE / MESSAGE_DELETE / MESSAGE_DELETE_BULK
+                    // keep the archive in sync. All three already arrive
+                    // under the GUILD_MESSAGES / DIRECT_MESSAGES intents;
+                    // agent routing stays MESSAGE_CREATE-only.
+                    if event_type == "MESSAGE_UPDATE"
+                        || event_type == "MESSAGE_DELETE"
+                        || event_type == "MESSAGE_DELETE_BULK"
+                    {
+                        if let Some(d) = event.get("d") {
+                            self.sync_archive_for_message_event(event_type, d, &bot_user_id)
+                                .await;
+                        }
+                        continue;
+                    }
+
                     // Only handle MESSAGE_CREATE (opcode 0, type "MESSAGE_CREATE")
-                    let event_type = event.get("t").and_then(|t| t.as_str()).unwrap_or("");
                     if event_type != "MESSAGE_CREATE" {
                         continue;
                     }
@@ -1684,6 +2226,20 @@ impl Channel for DiscordChannel {
                     let Some(d) = event.get("d") else {
                         continue;
                     };
+
+                    // Skip non-conversational system messages. Discord posts a
+                    // MESSAGE_CREATE of type 18 (THREAD_CREATED) in the parent
+                    // channel when a thread is born — authored by the human who
+                    // created it, with the thread name as content — which would
+                    // otherwise pass the admit gate and make the bot "reply" to
+                    // the thread's birth. Type 21 (THREAD_STARTER_MESSAGE), pins,
+                    // joins, etc. are likewise not user turns. Only DEFAULT (0)
+                    // and REPLY (19) are real messages to act on. Absent `type`
+                    // defaults to 0 for forward-compatibility.
+                    let message_type = d.get("type").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                    if !is_conversational_message_type(message_type) {
+                        continue;
+                    }
 
                     // Skip messages from the bot itself
                     let author_id = d.get("author").and_then(|a| a.get("id")).and_then(|i| i.as_str()).unwrap_or("");
@@ -1714,12 +2270,26 @@ impl Channel for DiscordChannel {
                     }
 
                     // Channel allowlist. Empty = watch every channel.
+                    // Thread messages carry the thread's own channel_id, not the
+                    // parent's. When the direct match fails, look up the thread's
+                    // parent_id and accept if *that* is in the allowlist.
                     if !channel_filter.is_empty() {
                         let msg_channel = d
                             .get("channel_id")
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("");
-                        if !channel_filter.iter().any(|c| c == msg_channel) {
+                        let parent_id = if !msg_channel.is_empty()
+                            && !channel_filter.iter().any(|c| c == msg_channel)
+                        {
+                            self.thread_parent(&self.http_client(), msg_channel).await
+                        } else {
+                            None
+                        };
+                        if !channel_passes_filter(
+                            &channel_filter,
+                            msg_channel,
+                            parent_id.as_deref(),
+                        ) {
                             continue;
                         }
                     }
@@ -1849,7 +2419,7 @@ impl Channel for DiscordChannel {
                         let reaction_channel_id = channel_id.clone();
                         let reaction_message_id = message_id.to_string();
                         let reaction_emoji = random_discord_ack_reaction().to_string();
-                        tokio::spawn(async move {
+                        zeroclaw_spawn::spawn!(async move {
                             if let Err(err) = reaction_channel
                                 .add_reaction(
                                     &reaction_channel_id,
@@ -1877,7 +2447,8 @@ impl Channel for DiscordChannel {
                     // is worse.
                     let thread_ts = if channel_id.is_empty() {
                         None
-                    } else if self.is_thread_channel(&client, &channel_id).await {
+                    } else if self.thread_parent(&client, &channel_id).await.is_some()
+                    {
                         Some(channel_id.clone())
                     } else {
                         None
@@ -1905,6 +2476,7 @@ impl Channel for DiscordChannel {
                         interruption_scope_id: thread_ts.clone(),
                         thread_ts,
                         attachments: media_attachments,
+                        subject: None,
                     };
 
                     if tx.send(channel_msg).await.is_err() {
@@ -1940,7 +2512,7 @@ impl Channel for DiscordChannel {
         let token = self.bot_token.clone();
         let channel_id = recipient.to_string();
 
-        let handle = tokio::spawn(async move {
+        let handle = zeroclaw_spawn::spawn!(async move {
             let url = format!("https://discord.com/api/v10/channels/{channel_id}/typing");
             loop {
                 let _ = client
@@ -2441,6 +3013,361 @@ mod tests {
         assert_eq!(ch.name(), "discord");
     }
 
+    /// (channel, archive) pair backed by a throwaway sqlite file, mirroring
+    /// the orchestrator's `with_archive_memory` wiring.
+    fn archived_test_channel() -> (
+        DiscordChannel,
+        std::sync::Arc<dyn zeroclaw_memory::Memory>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let mem: std::sync::Arc<dyn zeroclaw_memory::Memory> = std::sync::Arc::new(
+            zeroclaw_memory::SqliteMemory::new_named("sqlite", dir.path(), "discord").unwrap(),
+        );
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(|| vec!["*".to_string()]),
+            false,
+            false,
+        )
+        .with_archive_memory(std::sync::Arc::clone(&mem));
+        (ch, mem, dir)
+    }
+
+    async fn seed_archived_message(mem: &std::sync::Arc<dyn zeroclaw_memory::Memory>) {
+        mem.store(
+            "discord_111",
+            "@alice in #200 at t0: original text",
+            zeroclaw_memory::MemoryCategory::Custom("discord".to_string()),
+            Some("200"),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn message_update_appends_edit_marker_to_archived_entry() {
+        let (ch, mem, _dir) = archived_test_channel();
+        seed_archived_message(&mem).await;
+
+        let d = serde_json::json!({
+            "id": "111", "channel_id": "200", "content": "revised text",
+            "edited_timestamp": "2026-06-11T01:00:00Z",
+            "author": {"id": "u-alice", "bot": false}
+        });
+        ch.sync_archive_for_message_event("MESSAGE_UPDATE", &d, "botid")
+            .await;
+
+        let entry = mem.get("discord_111").await.unwrap().unwrap();
+        assert!(
+            entry
+                .content
+                .starts_with("@alice in #200 at t0: original text")
+        );
+        assert!(
+            entry
+                .content
+                .contains("[edited at 2026-06-11T01:00:00Z: revised text]")
+        );
+        // Session attribution survives the re-store.
+        assert_eq!(entry.session_id.as_deref(), Some("200"));
+    }
+
+    #[tokio::test]
+    async fn redelivered_update_is_idempotent() {
+        let (ch, mem, _dir) = archived_test_channel();
+        seed_archived_message(&mem).await;
+        let d = serde_json::json!({
+            "id": "111", "channel_id": "200", "content": "revised text",
+            "edited_timestamp": "2026-06-11T01:00:00Z",
+            "author": {"id": "u-alice", "bot": false}
+        });
+        ch.sync_archive_for_message_event("MESSAGE_UPDATE", &d, "botid")
+            .await;
+        ch.sync_archive_for_message_event("MESSAGE_UPDATE", &d, "botid")
+            .await;
+        let entry = mem.get("discord_111").await.unwrap().unwrap();
+        assert_eq!(entry.content.matches("[edited at ").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn full_object_update_without_edited_timestamp_is_not_an_edit() {
+        // Discord sends the complete message object (content included,
+        // unchanged) on embed unfurls, pins, and flag changes — only real
+        // edits carry edited_timestamp. No phantom markers.
+        let (ch, mem, _dir) = archived_test_channel();
+        seed_archived_message(&mem).await;
+        let d = serde_json::json!({
+            "id": "111", "channel_id": "200", "content": "original text",
+            "edited_timestamp": serde_json::Value::Null,
+            "author": {"id": "u-alice", "bot": false}
+        });
+        ch.sync_archive_for_message_event("MESSAGE_UPDATE", &d, "botid")
+            .await;
+        let entry = mem.get("discord_111").await.unwrap().unwrap();
+        assert_eq!(entry.content, "@alice in #200 at t0: original text");
+    }
+
+    #[tokio::test]
+    async fn deauthorized_author_cannot_write_via_edits() {
+        // Archive-time authorization is not durable: once a peer leaves
+        // the allowlist their edits must stop reaching the archive.
+        let dir = tempfile::tempdir().unwrap();
+        let mem: std::sync::Arc<dyn zeroclaw_memory::Memory> = std::sync::Arc::new(
+            zeroclaw_memory::SqliteMemory::new_named("sqlite", dir.path(), "discord").unwrap(),
+        );
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(|| vec!["someone-else".to_string()]),
+            false,
+            false,
+        )
+        .with_archive_memory(std::sync::Arc::clone(&mem));
+        seed_archived_message(&mem).await;
+
+        let d = serde_json::json!({
+            "id": "111", "channel_id": "200", "content": "injected",
+            "edited_timestamp": "2026-06-11T01:00:00Z",
+            "author": {"id": "u-alice", "bot": false}
+        });
+        ch.sync_archive_for_message_event("MESSAGE_UPDATE", &d, "botid")
+            .await;
+        let entry = mem.get("discord_111").await.unwrap().unwrap();
+        assert_eq!(entry.content, "@alice in #200 at t0: original text");
+    }
+
+    #[tokio::test]
+    async fn message_delete_appends_tombstone_once() {
+        let (ch, mem, _dir) = archived_test_channel();
+        seed_archived_message(&mem).await;
+
+        let d = serde_json::json!({"id": "111", "channel_id": "200"});
+        ch.sync_archive_for_message_event("MESSAGE_DELETE", &d, "botid")
+            .await;
+        // Redelivery must not double-stamp.
+        ch.sync_archive_for_message_event("MESSAGE_DELETE", &d, "botid")
+            .await;
+
+        let entry = mem.get("discord_111").await.unwrap().unwrap();
+        assert!(
+            entry
+                .content
+                .starts_with("@alice in #200 at t0: original text")
+        );
+        assert_eq!(entry.content.matches("[deleted at ").count(), 1);
+        assert_eq!(entry.session_id.as_deref(), Some("200"));
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_tombstones_every_archived_id() {
+        let (ch, mem, _dir) = archived_test_channel();
+        seed_archived_message(&mem).await;
+        mem.store(
+            "discord_112",
+            "@bob in #200 at t1: second message",
+            zeroclaw_memory::MemoryCategory::Custom("discord".to_string()),
+            Some("200"),
+        )
+        .await
+        .unwrap();
+
+        let d = serde_json::json!({"ids": ["111", "112", "999"], "channel_id": "200"});
+        ch.sync_archive_for_message_event("MESSAGE_DELETE_BULK", &d, "botid")
+            .await;
+
+        assert!(
+            mem.get("discord_111")
+                .await
+                .unwrap()
+                .unwrap()
+                .content
+                .contains("[deleted at ")
+        );
+        assert!(
+            mem.get("discord_112")
+                .await
+                .unwrap()
+                .unwrap()
+                .content
+                .contains("[deleted at ")
+        );
+        // Unarchived ids stay unarchived.
+        assert!(mem.get("discord_999").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn edit_then_delete_keeps_both_markers() {
+        let (ch, mem, _dir) = archived_test_channel();
+        seed_archived_message(&mem).await;
+        let edit = serde_json::json!({
+            "id": "111", "channel_id": "200", "content": "revised",
+            "edited_timestamp": "2026-06-11T01:00:00Z",
+            "author": {"id": "u-alice", "bot": false}
+        });
+        ch.sync_archive_for_message_event("MESSAGE_UPDATE", &edit, "botid")
+            .await;
+        let del = serde_json::json!({"id": "111", "channel_id": "200"});
+        ch.sync_archive_for_message_event("MESSAGE_DELETE", &del, "botid")
+            .await;
+        let entry = mem.get("discord_111").await.unwrap().unwrap();
+        assert!(entry.content.contains("[edited at "));
+        assert!(entry.content.contains("[deleted at "));
+    }
+
+    #[tokio::test]
+    async fn message_events_for_unarchived_messages_are_ignored() {
+        // A message that never passed the inbound filters was never stored;
+        // its edit/delete events must not conjure an archive entry.
+        let (ch, mem, _dir) = archived_test_channel();
+
+        let d = serde_json::json!({
+            "id": "999", "channel_id": "200", "content": "whatever",
+            "edited_timestamp": "2026-06-11T01:00:00Z",
+            "author": {"id": "u-alice", "bot": false}
+        });
+        ch.sync_archive_for_message_event("MESSAGE_UPDATE", &d, "botid")
+            .await;
+        ch.sync_archive_for_message_event("MESSAGE_DELETE", &d, "botid")
+            .await;
+
+        assert!(mem.get("discord_999").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn edit_history_growth_is_bounded() {
+        let (ch, mem, _dir) = archived_test_channel();
+        seed_archived_message(&mem).await;
+        let big = "z".repeat(4000);
+        for i in 0..10 {
+            let d = serde_json::json!({
+                "id": "111", "channel_id": "200",
+                "content": format!("{big}-{i}"),
+                "edited_timestamp": format!("2026-06-11T01:00:{i:02}Z"),
+                "author": {"id": "u-alice", "bot": false}
+            });
+            ch.sync_archive_for_message_event("MESSAGE_UPDATE", &d, "botid")
+                .await;
+        }
+        let entry = mem.get("discord_111").await.unwrap().unwrap();
+        // Bounded: cap plus at most one marker's overshoot.
+        assert!(entry.content.len() < MAX_ARCHIVE_ENTRY_BYTES + 5000);
+        assert!(entry.content.contains("[edit history truncated]"));
+        assert!(
+            entry
+                .content
+                .starts_with("@alice in #200 at t0: original text")
+        );
+        // The latest edit always survives.
+        assert!(entry.content.contains("01:00:09Z"));
+    }
+
+    #[test]
+    fn gateway_intents_default_matches_legacy_mask() {
+        // The pre-resolver IDENTIFY hardcoded 37377. A default-config channel
+        // must request exactly the same mask — no silent behavior change.
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        );
+        assert_eq!(ch.gateway_intents(), 37377);
+        assert_eq!(ch.gateway_intents(), BASELINE_INTENTS);
+    }
+
+    #[test]
+    fn intent_names_decode_the_mask() {
+        assert_eq!(
+            intent_names(BASELINE_INTENTS),
+            vec![
+                "guilds",
+                "guild_messages",
+                "direct_messages",
+                "message_content"
+            ]
+        );
+        assert_eq!(
+            intent_names(BASELINE_INTENTS | INTENT_GUILD_MEMBERS | INTENT_GUILD_PRESENCES),
+            vec![
+                "guilds",
+                "guild_members",
+                "guild_presences",
+                "guild_messages",
+                "direct_messages",
+                "message_content"
+            ]
+        );
+        // Bits with no known name (reachable via the raw override) are
+        // reported, not dropped.
+        assert_eq!(
+            intent_names(INTENT_GUILDS | (1 << 21)),
+            vec!["guilds".to_string(), format!("unknown({:#x})", 1u64 << 21)]
+        );
+    }
+
+    #[test]
+    fn disallowed_intents_hint_names_privileged_toggles() {
+        let hint = disallowed_intents_hint(BASELINE_INTENTS | INTENT_GUILD_MEMBERS);
+        assert!(hint.contains("Server Members"));
+        assert!(hint.contains("Message Content"));
+        assert!(!hint.contains("Presence,"));
+
+        let base_hint = disallowed_intents_hint(BASELINE_INTENTS);
+        assert!(base_hint.contains("Message Content"));
+        assert!(!base_hint.contains("Server Members"));
+
+        // An override mask with no privileged bits still produces an
+        // actionable message instead of a dangling empty list.
+        let bare = disallowed_intents_hint(INTENT_GUILDS);
+        assert!(bare.contains("mask 0x1"));
+    }
+
+    #[test]
+    fn intents_mask_override_wins_verbatim() {
+        // Operator escape hatch: a Some(_) intents_mask is sent exactly as
+        // configured, ignoring the derived baseline — including Some(0),
+        // which is a legal IDENTIFY value.
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        )
+        .with_intents_mask(Some(46593));
+        assert_eq!(ch.gateway_intents(), 46593);
+
+        let zero = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        )
+        .with_intents_mask(Some(0));
+        assert_eq!(zero.gateway_intents(), 0);
+
+        // None means "derive".
+        let derived = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        )
+        .with_intents_mask(None);
+        assert_eq!(derived.gateway_intents(), BASELINE_INTENTS);
+    }
+
     #[test]
     fn base64_decode_bot_id() {
         // "MTIzNDU2" decodes to "123456"
@@ -2454,6 +3381,29 @@ mod tests {
         let token = "MTIzNDU2.fake.hmac";
         let id = DiscordChannel::bot_user_id_from_token(token);
         assert_eq!(id, Some("123456".to_string()));
+    }
+
+    #[test]
+    fn gateway_preflight_429_remains_retryable_http_error() {
+        let response = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(reqwest::StatusCode::TOO_MANY_REQUESTS)
+                .header(reqwest::header::RETRY_AFTER, "1")
+                .body(reqwest::Body::from(""))
+                .expect("test response should build"),
+        );
+
+        let error = DiscordChannel::validate_gateway_preflight_response(response)
+            .expect_err("429 should remain an HTTP error");
+        assert!(error.downcast_ref::<reqwest::Error>().is_some());
+        assert!(
+            error.downcast_ref::<DiscordListenerFatalError>().is_none(),
+            "gateway preflight 429 must not be wrapped as fatal"
+        );
+        assert!(
+            !zeroclaw_providers::reliable::is_non_retryable(&error),
+            "gateway preflight 429 should stay on the supervisor retry path"
+        );
     }
 
     #[test]
@@ -2578,6 +3528,25 @@ mod tests {
     }
 
     #[test]
+    fn fatal_gateway_close_codes_match_expected_discord_auth_and_intent_errors() {
+        for code in [4004_u16, 4010, 4011, 4012, 4013, 4014] {
+            assert!(
+                is_fatal_gateway_close_code(code),
+                "code {code} should be fatal"
+            );
+        }
+        assert!(!is_fatal_gateway_close_code(4007));
+        assert!(!is_fatal_gateway_close_code(4009));
+    }
+
+    #[test]
+    fn new_session_close_codes_match_invalidated_gateway_sessions() {
+        assert!(requires_new_session_close_code(4007));
+        assert!(requires_new_session_close_code(4009));
+        assert!(!requires_new_session_close_code(4004));
+    }
+
+    #[test]
     fn base64_decode_invalid_chars() {
         let decoded = base64_decode("!!!!");
         assert!(decoded.is_none());
@@ -2594,6 +3563,19 @@ mod tests {
         assert!(contains_bot_mention("hi <@12345>", "12345"));
         assert!(contains_bot_mention("hi <@!12345>", "12345"));
         assert!(!contains_bot_mention("hi <@99999>", "12345"));
+    }
+
+    #[test]
+    fn thread_created_and_system_messages_are_not_conversational() {
+        // The bug: THREAD_CREATED (18) was treated as a normal message, so the
+        // bot replied to a thread's birth. It and other system types must be
+        // rejected; only DEFAULT (0) and REPLY (19) are real user turns.
+        assert!(is_conversational_message_type(0)); // DEFAULT
+        assert!(is_conversational_message_type(19)); // REPLY
+        assert!(!is_conversational_message_type(18)); // THREAD_CREATED
+        assert!(!is_conversational_message_type(21)); // THREAD_STARTER_MESSAGE
+        assert!(!is_conversational_message_type(6)); // CHANNEL_PINNED_MESSAGE
+        assert!(!is_conversational_message_type(7)); // USER_JOIN
     }
 
     #[test]
@@ -3149,6 +4131,118 @@ mod tests {
         assert!(media.is_empty());
     }
 
+    #[tokio::test]
+    async fn process_attachments_preserves_audio_when_transcription_fails() {
+        use crate::transcription::TranscriptionManager;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let media_server = MockServer::start().await;
+        let whisper_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/voice.ogg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-audio"))
+            .expect(1)
+            .mount(&media_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .set_body_json(serde_json::json!({"error": "stt unavailable"})),
+            )
+            .mount(&whisper_server)
+            .await;
+
+        let audio_url = format!("{}/voice.ogg", media_server.uri());
+        let attachments = vec![serde_json::json!({
+            "content_type": "audio/ogg",
+            "filename": "voice.ogg",
+            "url": audio_url,
+        })];
+        let transcription =
+            TranscriptionManager::new(&local_whisper_transcription_config(&whisper_server))
+                .expect("transcription manager")
+                .with_agent_transcription_provider("local_whisper");
+
+        let client = reqwest::Client::new();
+        let (text, media) =
+            process_attachments(&attachments, &client, None, Some(&transcription)).await;
+
+        assert_eq!(
+            text,
+            format!("[AUDIO:{}]", attachments[0]["url"].as_str().unwrap())
+        );
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0].file_name, "voice.ogg");
+        assert_eq!(media[0].mime_type.as_deref(), Some("audio/ogg"));
+        assert_eq!(media[0].data, b"fake-audio");
+    }
+
+    #[tokio::test]
+    async fn process_attachments_preserves_audio_when_transcription_is_empty() {
+        use crate::transcription::TranscriptionManager;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let media_server = MockServer::start().await;
+        let whisper_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/voice.ogg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-audio"))
+            .expect(1)
+            .mount(&media_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": ""})))
+            .mount(&whisper_server)
+            .await;
+
+        let audio_url = format!("{}/voice.ogg", media_server.uri());
+        let attachments = vec![serde_json::json!({
+            "content_type": "audio/ogg",
+            "filename": "voice.ogg",
+            "url": audio_url,
+        })];
+        let transcription =
+            TranscriptionManager::new(&local_whisper_transcription_config(&whisper_server))
+                .expect("transcription manager")
+                .with_agent_transcription_provider("local_whisper");
+
+        let client = reqwest::Client::new();
+        let (text, media) =
+            process_attachments(&attachments, &client, None, Some(&transcription)).await;
+
+        assert_eq!(
+            text,
+            format!("[AUDIO:{}]", attachments[0]["url"].as_str().unwrap())
+        );
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0].file_name, "voice.ogg");
+        assert_eq!(media[0].mime_type.as_deref(), Some("audio/ogg"));
+        assert_eq!(media[0].data, b"fake-audio");
+    }
+
+    fn local_whisper_transcription_config(
+        server: &wiremock::MockServer,
+    ) -> zeroclaw_config::schema::TranscriptionConfig {
+        zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                url: format!("{}/v1/transcribe", server.uri()),
+                bearer_token: Some("test-token".to_string()),
+                max_audio_bytes: 10 * 1024 * 1024,
+                timeout_secs: 30,
+            }),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn marker_kind_for_classifies_each_mime_family() {
         assert_eq!(marker_kind_for("image/png", false), "IMAGE");
@@ -3188,6 +4282,40 @@ mod tests {
                 "type {non_thread} must not classify as thread"
             );
         }
+    }
+
+    #[test]
+    fn channel_filter_empty_accepts_everything() {
+        let filter: Vec<String> = vec![];
+        assert!(channel_passes_filter(&filter, "12345", None));
+        assert!(channel_passes_filter(&filter, "99999", Some("12345")));
+        assert!(channel_passes_filter(&filter, "", None));
+    }
+
+    #[test]
+    fn channel_filter_direct_match() {
+        let filter = vec!["111".to_string(), "222".to_string()];
+        assert!(channel_passes_filter(&filter, "111", None));
+        assert!(channel_passes_filter(&filter, "222", None));
+        assert!(!channel_passes_filter(&filter, "333", None));
+    }
+
+    #[test]
+    fn channel_filter_thread_parent_fallback() {
+        let filter = vec!["111".to_string()];
+        // Thread whose parent is in the allowlist — accepted.
+        assert!(channel_passes_filter(&filter, "999", Some("111")));
+        // Thread whose parent is NOT in the allowlist — rejected.
+        assert!(!channel_passes_filter(&filter, "999", Some("888")));
+        // Non-thread channel not in the allowlist — rejected.
+        assert!(!channel_passes_filter(&filter, "999", None));
+    }
+
+    #[test]
+    fn channel_filter_direct_match_skips_parent_check() {
+        let filter = vec!["111".to_string()];
+        // Direct match with a parent_id present — parent is irrelevant.
+        assert!(channel_passes_filter(&filter, "111", Some("999")));
     }
 
     #[test]
@@ -3255,7 +4383,7 @@ mod tests {
         assert!(locals.is_empty());
         assert!(remotes.is_empty());
         assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].1, DiscordMarkerFailure::NotFound);
+        assert_eq!(failures[0], DiscordMarkerFailure::NotFound);
     }
 
     #[test]
@@ -3278,7 +4406,7 @@ mod tests {
         );
         assert!(remotes.is_empty());
         assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].1, DiscordMarkerFailure::Refused);
+        assert_eq!(failures[0], DiscordMarkerFailure::Refused);
     }
 
     #[test]
@@ -3294,7 +4422,7 @@ mod tests {
         assert!(locals.is_empty(), "relative paths must be refused");
         assert!(remotes.is_empty());
         assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].1, DiscordMarkerFailure::Refused);
+        assert_eq!(failures[0], DiscordMarkerFailure::Refused);
     }
 
     #[test]
@@ -3320,7 +4448,7 @@ mod tests {
         assert!(locals.is_empty());
         assert!(remotes.is_empty());
         assert_eq!(failures.len(), 3);
-        for (_, kind) in &failures {
+        for kind in &failures {
             assert_eq!(*kind, DiscordMarkerFailure::Refused);
         }
     }
@@ -3339,7 +4467,7 @@ mod tests {
         );
         assert!(remotes.is_empty());
         assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].1, DiscordMarkerFailure::Refused);
+        assert_eq!(failures[0], DiscordMarkerFailure::Refused);
     }
 
     #[test]
@@ -3377,28 +4505,43 @@ mod tests {
 
     #[test]
     fn delivery_failure_note_singular_for_one_failure() {
-        let note = delivery_failure_note(&[(
-            "/workspace/missing.png".to_string(),
-            DiscordMarkerFailure::NotFound,
-        )])
-        .expect("one failure should produce a note");
-        assert_eq!(
-            note,
-            "(note: I couldn't deliver the file at /workspace/missing.png.)"
+        let note = delivery_failure_note(&[DiscordMarkerFailure::NotFound])
+            .expect("one failure should produce a note");
+        assert_eq!(note, "(note: I couldn't deliver 1 file.)");
+        assert!(
+            !note.contains("/workspace/missing.png"),
+            "user-facing failure note must not echo local marker targets"
         );
     }
 
     #[test]
-    fn delivery_failure_note_plural_lists_targets_in_order() {
+    fn delivery_failure_note_plural_redacts_targets() {
         let note = delivery_failure_note(&[
-            ("a.png".to_string(), DiscordMarkerFailure::Refused),
-            ("b.pdf".to_string(), DiscordMarkerFailure::NotFound),
-            ("c.mp4".to_string(), DiscordMarkerFailure::Refused),
+            DiscordMarkerFailure::Refused,
+            DiscordMarkerFailure::NotFound,
+            DiscordMarkerFailure::Refused,
         ])
         .expect("multiple failures should produce a note");
-        assert_eq!(
-            note,
-            "(note: I couldn't deliver these files: a.png, b.pdf, c.mp4.)"
+        assert_eq!(note, "(note: I couldn't deliver 3 files.)");
+        assert!(
+            !note.contains("a.png") && !note.contains("b.pdf") && !note.contains("c.mp4"),
+            "user-facing failure note must not echo failed marker targets"
+        );
+    }
+
+    #[test]
+    fn composed_delivery_failure_note_redacts_parsed_marker_target() {
+        let content = "Done\n[IMAGE: /workspace/missing.png]";
+        let (cleaned_content, parsed_attachments) = parse_attachment_markers(content);
+        let (_locals, _remotes, failures) =
+            classify_outgoing_attachments(&parsed_attachments, None);
+        let note = delivery_failure_note(&failures);
+        let composed = compose_body_with_failure_note(&cleaned_content, note.as_deref());
+
+        assert_eq!(composed, "Done\n\n(note: I couldn't deliver 1 file.)");
+        assert!(
+            !composed.contains("/workspace/missing.png"),
+            "composed outbound body must not echo failed marker targets"
         );
     }
 
@@ -3434,23 +4577,23 @@ mod tests {
     #[test]
     fn decide_failure_reactions_emits_refused_only() {
         let r = decide_failure_reactions(&[
-            ("a".to_string(), DiscordMarkerFailure::Refused),
-            ("b".to_string(), DiscordMarkerFailure::Refused),
+            DiscordMarkerFailure::Refused,
+            DiscordMarkerFailure::Refused,
         ]);
         assert_eq!(r, vec!["🚫"]);
     }
 
     #[test]
     fn decide_failure_reactions_emits_not_found_only() {
-        let r = decide_failure_reactions(&[("a".to_string(), DiscordMarkerFailure::NotFound)]);
+        let r = decide_failure_reactions(&[DiscordMarkerFailure::NotFound]);
         assert_eq!(r, vec!["\u{26A0}\u{FE0F}"]);
     }
 
     #[test]
     fn decide_failure_reactions_emits_both_when_mixed() {
         let r = decide_failure_reactions(&[
-            ("a".to_string(), DiscordMarkerFailure::Refused),
-            ("b".to_string(), DiscordMarkerFailure::NotFound),
+            DiscordMarkerFailure::Refused,
+            DiscordMarkerFailure::NotFound,
         ]);
         assert_eq!(r, vec!["🚫", "\u{26A0}\u{FE0F}"]);
     }

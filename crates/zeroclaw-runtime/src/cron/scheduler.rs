@@ -1,7 +1,7 @@
 use crate::cron::store::{RunCompletionAction, persist_run_completion_state, persist_run_result};
 use crate::cron::{
     CronJob, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs, due_jobs,
-    next_run_for_schedule, sync_declarative_jobs,
+    next_run_for_schedule, skip_missed_run, sync_declarative_jobs,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
@@ -19,10 +19,111 @@ use zeroclaw_memory::{MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN};
 const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
 const SCHEDULER_COMPONENT: &str = "scheduler";
+const CRON_AGENT_DEFAULT_EXCLUDED_TOOLS: &[&str] = &[
+    "cron_add",
+    "cron_update",
+    "cron_remove",
+    "cron_run",
+    "schedule",
+];
 
 /// Type alias for the optional broadcast sender used to push cron results
 /// to connected dashboard/SSE clients.
 pub type EventBroadcast = Option<tokio::sync::broadcast::Sender<serde_json::Value>>;
+
+#[derive(Clone, Copy)]
+pub enum CronDeliveryContext {
+    Scheduled,
+    ToolManual,
+    GatewayManual,
+}
+
+impl CronDeliveryContext {
+    fn failure_message(self, best_effort: bool) -> &'static str {
+        match (self, best_effort) {
+            (Self::Scheduled, true) => "Cron delivery failed (best_effort)",
+            (Self::Scheduled, false) => "Cron delivery failed",
+            (Self::ToolManual, true) => "cron_run delivery failed (best_effort)",
+            (Self::ToolManual, false) => "cron_run delivery failed",
+            (Self::GatewayManual, true) => "manual cron trigger delivery failed (best_effort)",
+            (Self::GatewayManual, false) => "manual cron trigger delivery failed",
+        }
+    }
+}
+
+pub struct CronDeliveryOutcome {
+    pub success: bool,
+    pub status: String,
+    pub output: String,
+}
+
+pub async fn deliver_and_classify_run_result(
+    config: &Config,
+    job: &CronJob,
+    mut success: bool,
+    mut output: String,
+    context: CronDeliveryContext,
+) -> CronDeliveryOutcome {
+    let mut status = if success { "ok" } else { "error" }.to_string();
+
+    if let Err(e) = deliver_if_configured(config, job, &output).await {
+        // Cron add-time accepts dangling delivery refs (the job's channel
+        // may not be provisioned yet); the loudly-logged warn here is
+        // the scheduler-side half of that contract. Manual trigger paths
+        // share this classifier so status history cannot drift again.
+        let channel = job.delivery.channel.as_deref().unwrap_or("");
+        let target = job.delivery.to.as_deref().unwrap_or("");
+        let delivery_error = e.to_string();
+
+        if job.delivery.best_effort {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "job_id": job.id,
+                        "agent_alias": job.agent_alias,
+                        "channel": channel,
+                        "target": target,
+                        "error": delivery_error
+                    })),
+                context.failure_message(true)
+            );
+            if success {
+                status = "degraded".to_string();
+            }
+        } else {
+            success = false;
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "job_id": job.id,
+                        "agent_alias": job.agent_alias,
+                        "channel": channel,
+                        "target": target,
+                        "error": delivery_error
+                    })),
+                context.failure_message(false)
+            );
+            status = "error".to_string();
+        }
+
+        if output.trim().is_empty() {
+            output = format!("delivery failed: {delivery_error}");
+        } else {
+            output.push_str("\n\ndelivery failed: ");
+            output.push_str(&delivery_error);
+        }
+    }
+
+    CronDeliveryOutcome {
+        success,
+        status,
+        output,
+    }
+}
 
 pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
@@ -93,6 +194,7 @@ pub async fn run(config: Config, event_tx: EventBroadcast) -> Result<()> {
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             "Scheduler startup: catch-up disabled by config"
         );
+        skip_missed_jobs_on_startup(&config).await;
     }
 
     loop {
@@ -186,6 +288,80 @@ async fn catch_up_overdue_jobs(config: &Config, event_tx: &EventBroadcast) {
     );
 }
 
+/// Advance `next_run` for all overdue jobs without executing them.
+///
+/// Called at scheduler startup when `catch_up_on_startup` is disabled so
+/// that the normal polling loop (which selects `next_run <= now`) doesn't
+/// pick up jobs that became overdue during daemon downtime.
+///
+/// - Recurring jobs: `next_run` is advanced to the next future occurrence.
+/// - One-shot `At` jobs: disabled with a `skipped` last status.
+async fn skip_missed_jobs_on_startup(config: &Config) {
+    let now = Utc::now();
+    let jobs = match all_overdue_jobs(config, now) {
+        Ok(jobs) => jobs,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "Scheduler startup skip: query failed",
+            );
+            return;
+        }
+    };
+
+    if jobs.is_empty() {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "Scheduler startup skip: no overdue jobs to advance",
+        );
+        return;
+    }
+
+    let mut skipped_recurring: u64 = 0;
+    let mut skipped_oneshot: u64 = 0;
+
+    for job in &jobs {
+        let is_oneshot = matches!(job.schedule, Schedule::At { .. });
+        match skip_missed_run(config, job, now) {
+            Ok(()) => {
+                if is_oneshot {
+                    skipped_oneshot += 1;
+                } else {
+                    skipped_recurring += 1;
+                }
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "job_id": job.id,
+                            "error": format!("{}", e),
+                        })),
+                    "Scheduler startup skip: failed to advance job",
+                );
+            }
+        }
+    }
+
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "total": jobs.len(),
+                "skipped_recurring": skipped_recurring,
+                "skipped_oneshot": skipped_oneshot,
+            })
+        ),
+        "Scheduler startup skip: advanced overdue jobs without executing",
+    );
+}
+
 pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
     use zeroclaw_log::Instrument;
     let Some(agent_alias) = resolve_owning_agent(config, job) else {
@@ -206,6 +382,21 @@ pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
     Box::pin(execute_job_with_retry(config, &security, &agent_alias, job))
         .instrument(span)
         .await
+}
+
+fn cron_agent_run_security_policy(base: &SecurityPolicy, job: &CronJob) -> SecurityPolicy {
+    let mut policy = base.clone();
+    if !matches!(job.job_type, JobType::Agent) || job.allowed_tools.is_some() {
+        return policy;
+    }
+
+    let excluded = policy.excluded_tools.get_or_insert_with(Vec::new);
+    for tool in CRON_AGENT_DEFAULT_EXCLUDED_TOOLS {
+        if !excluded.iter().any(|existing| existing == tool) {
+            excluded.push((*tool).to_string());
+        }
+    }
+    policy
 }
 
 async fn execute_job_with_retry(
@@ -452,8 +643,9 @@ async fn run_agent_job(
     // a future refactor that flips the default can't quietly promote
     // every cron-launched agent to a depth-1 subagent — they're
     // top-level runs by design, despite riding through SubAgentSpawn.
+    let run_security = cron_agent_run_security_policy(subagent_ctx.policy.as_ref(), job);
     let run_overrides = crate::agent::loop_::AgentRunOverrides {
-        security: Some(subagent_ctx.policy.clone()),
+        security: Some(Arc::new(run_security)),
         memory: None,
         is_subagent: false,
     };
@@ -520,43 +712,22 @@ async fn run_agent_job(
 async fn persist_job_result(
     config: &Config,
     job: &CronJob,
-    mut success: bool,
+    success: bool,
     output: &str,
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
 ) -> bool {
     let duration_ms = (finished_at - started_at).num_milliseconds();
-    let mut persisted_status = if success { "ok" } else { "error" }.to_string();
-    let mut persisted_output = output.to_string();
+    let outcome = deliver_and_classify_run_result(
+        config,
+        job,
+        success,
+        output.to_string(),
+        CronDeliveryContext::Scheduled,
+    )
+    .await;
 
-    if let Err(e) = deliver_if_configured(config, job, output).await {
-        // Cron add-time accepts dangling delivery refs (the job's channel
-        // may not be provisioned yet); the loudly-logged warn here is
-        // the scheduler-side half of that contract — operators see the
-        // exact channel composite, target, and job id every time a
-        // dangling delivery fires.
-        let channel = job.delivery.channel.as_deref().unwrap_or("");
-        let target = job.delivery.to.as_deref().unwrap_or("");
-        if job.delivery.best_effort {
-            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "agent_alias": job.agent_alias, "channel": channel, "target": target, "error": format!("{}", e)})), "Cron delivery failed (best_effort)");
-            if success {
-                persisted_status = "degraded".to_string();
-            }
-        } else {
-            success = false;
-            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"job_id": job.id, "agent_alias": job.agent_alias, "channel": channel, "target": target, "error": format!("{}", e)})), "Cron delivery failed");
-            persisted_status = "error".to_string();
-        }
-
-        if persisted_output.trim().is_empty() {
-            persisted_output = format!("delivery failed: {e}");
-        } else {
-            persisted_output.push_str("\n\ndelivery failed: ");
-            persisted_output.push_str(&e.to_string());
-        }
-    }
-
-    let action = if is_one_shot_auto_delete(job) && success {
+    let action = if is_one_shot_auto_delete(job) && outcome.success {
         RunCompletionAction::Delete
     } else if matches!(job.schedule, Schedule::At { .. }) {
         RunCompletionAction::Disable
@@ -571,8 +742,8 @@ async fn persist_job_result(
         started_at,
         finished_at,
         job_state_at,
-        &persisted_status,
-        Some(&persisted_output),
+        &outcome.status,
+        Some(&outcome.output),
         duration_ms,
         action,
     ) {
@@ -593,8 +764,8 @@ async fn persist_job_result(
                 config,
                 job,
                 job_state_at,
-                &persisted_status,
-                Some(&persisted_output),
+                &outcome.status,
+                Some(&outcome.output),
                 RunCompletionAction::Disable,
             ) {
                 ::zeroclaw_log::record!(
@@ -612,8 +783,8 @@ async fn persist_job_result(
                 config,
                 job,
                 job_state_at,
-                &persisted_status,
-                Some(&persisted_output),
+                &outcome.status,
+                Some(&outcome.output),
                 action,
             ) {
                 ::zeroclaw_log::record!(
@@ -627,7 +798,7 @@ async fn persist_job_result(
         }
     }
 
-    success
+    outcome.success
 }
 
 fn is_one_shot_auto_delete(job: &CronJob) -> bool {
@@ -915,8 +1086,8 @@ mod tests {
             TEST_AGENT.to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: format!("openrouter.{TEST_AGENT}").into(),
-                risk_profile: TEST_AGENT.to_string(),
-                runtime_profile: TEST_AGENT.to_string(),
+                risk_profile: TEST_AGENT.into(),
+                runtime_profile: TEST_AGENT.into(),
                 ..Default::default()
             },
         );
@@ -1025,6 +1196,48 @@ mod tests {
             ..test_job("echo test")
         };
         assert!(!is_high_frequency_agent_job(&job));
+    }
+
+    #[test]
+    fn cron_agent_run_security_policy_excludes_scheduler_mutation_tools_by_default() {
+        let security = SecurityPolicy::default();
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.allowed_tools = None;
+
+        let policy = cron_agent_run_security_policy(&security, &job);
+
+        for tool in [
+            "cron_add",
+            "cron_update",
+            "cron_remove",
+            "cron_run",
+            "schedule",
+        ] {
+            assert!(
+                !policy.is_tool_allowed(tool),
+                "{tool} must be excluded from default cron agent runs"
+            );
+        }
+        assert!(
+            policy.is_tool_allowed("http_request"),
+            "non-scheduler tools remain available when the base policy is unrestricted"
+        );
+    }
+
+    #[test]
+    fn cron_agent_run_security_policy_respects_explicit_allowed_tools() {
+        let security = SecurityPolicy::default();
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.allowed_tools = Some(vec!["cron_add".into()]);
+
+        let policy = cron_agent_run_security_policy(&security, &job);
+
+        assert!(
+            policy.is_tool_allowed("cron_add"),
+            "explicit cron job allowed_tools should remain the override for intentional scheduler automation"
+        );
     }
 
     #[tokio::test]
@@ -1743,6 +1956,43 @@ mod tests {
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "degraded");
+    }
+
+    #[tokio::test]
+    async fn delivery_failure_classification_preserves_empty_output_evidence() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        register_delivery_fn(Box::new(
+            |_config, channel, _target, _thread_id, _output| {
+                Box::pin(async move {
+                    if channel == "fail-delivery" {
+                        anyhow::bail!("synthetic delivery failure");
+                    }
+                    Ok(())
+                })
+            },
+        ));
+        let mut job = cron::add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("fail-delivery".into()),
+            to: Some("123456".into()),
+            thread_id: None,
+            best_effort: true,
+        };
+
+        let outcome = deliver_and_classify_run_result(
+            &config,
+            &job,
+            true,
+            String::new(),
+            CronDeliveryContext::Scheduled,
+        )
+        .await;
+
+        assert!(outcome.success);
+        assert_eq!(outcome.status, "degraded");
+        assert!(outcome.output.starts_with("delivery failed:"));
     }
 
     #[tokio::test]

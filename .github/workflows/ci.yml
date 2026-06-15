@@ -3,9 +3,18 @@ name: Quality Gate
 on:
   pull_request:
     branches: [master]
+  push:
+    branches: [master]
+  # Merge queue: GitHub builds a temporary `gh-readonly-queue/master/…` branch
+  # and fires `merge_group`. The required `CI Required Gate` must report on that
+  # branch or queued PRs stall, so the full gate runs here too.
+  merge_group:
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number }}
+  # Merge-queue runs key on the unique queue ref (github.ref →
+  # `refs/heads/gh-readonly-queue/master/pr-N-<sha>`) so speculative entries
+  # never cancel each other; PRs still key on the PR number.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -16,10 +25,26 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  # ── Stage 1: Lint (fast gate — fails early before burning compute) ────────
+  # ── Fast serial gate: fail formatting errors before burning compute ───────
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.93.0
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  # ── Post-format required quality gate ─────────────────────────────────────
 
   lint:
     name: Lint
+    needs: [fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -29,8 +54,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: 1.93.0
-          components: rustfmt, clippy
+          components: clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        id: rust-cache
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
@@ -38,22 +64,55 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y libudev-dev
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
-      - name: Check formatting
-        run: cargo fmt --all -- --check
       - name: Clippy
-        run: >
-          cargo clippy
-          --workspace
-          --exclude zeroclaw-desktop
-          --all-targets
-          --features ci-all
-          -- -D warnings
+        shell: bash
+        run: |
+          set +e
+          cargo_log="${RUNNER_TEMP}/cargo-clippy.log"
+          SECONDS=0
+          cargo clippy \
+            --workspace \
+            --exclude zeroclaw-desktop \
+            --all-targets \
+            --features ci-all \
+            -- -D warnings 2>&1 | tee "$cargo_log"
+          cargo_status=${PIPESTATUS[0]}
+          duration_seconds=$SECONDS
+          set -e
 
-  # ── Stage 2: Build + Check (parallel, gated on lint) ─────────────────────
+          workspace_path_compiles="$(grep -E -c 'Compiling.*\([^)]*zeroclaw' "$cargo_log" || true)"
+          total_compiles="$(grep -c 'Compiling' "$cargo_log" || true)"
+          downloaded_crates="$(grep -c 'Downloaded' "$cargo_log" || true)"
+          cache_hit="${RUST_CACHE_HIT:-unknown}"
+          summary_file="${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+          {
+            echo "### Lint diagnostics"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Runner OS | \`${{ runner.os }}\` |"
+            echo "| Rust cache exact hit | \`${cache_hit}\` |"
+            echo "| Clippy duration | \`${duration_seconds}s\` |"
+            echo "| Clippy status | \`${cargo_status}\` |"
+            echo "| Workspace path compile lines | \`${workspace_path_compiles}\` |"
+            echo "| Total compile lines | \`${total_compiles}\` |"
+            echo "| Downloaded crate lines | \`${downloaded_crates}\` |"
+          } >> "$summary_file"
+
+          exit "$cargo_status"
+        env:
+          RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+      - name: Config-write isolation guard
+        run: cargo test --test architecture tests_that_persist_config_isolate_the_path
+      - name: Fluent coverage guard (no bare user-facing strings)
+        run: cargo test --test architecture user_facing_strings_route_through_fluent
+
+  # ── Post-format build + check fan-out ─────────────────────────────────────
 
   build:
     name: Build ${{ matrix.target }}
-    needs: [lint]
+    needs: [fmt]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     strategy:
@@ -73,7 +132,7 @@ jobs:
           toolchain: 1.93.0
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        if: runner.os != 'Windows'
+        id: rust-cache
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
@@ -85,14 +144,45 @@ jobs:
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Build
         shell: bash
-        run: cargo build --profile ci --locked --target ${{ matrix.target }}
+        run: |
+          set +e
+          cargo_log="${RUNNER_TEMP}/cargo-build-${{ matrix.target }}.log"
+          SECONDS=0
+          cargo build --profile ci --locked --target ${{ matrix.target }} 2>&1 | tee "$cargo_log"
+          cargo_status=${PIPESTATUS[0]}
+          duration_seconds=$SECONDS
+          set -e
+
+          workspace_path_compiles="$(grep -E -c 'Compiling.*\([^)]*zeroclaw' "$cargo_log" || true)"
+          total_compiles="$(grep -c 'Compiling' "$cargo_log" || true)"
+          downloaded_crates="$(grep -c 'Downloaded' "$cargo_log" || true)"
+          cache_hit="${RUST_CACHE_HIT:-unknown}"
+          summary_file="${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+          {
+            echo "### Build diagnostics: ${{ matrix.target }}"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Target | \`${{ matrix.target }}\` |"
+            echo "| Runner OS | \`${{ runner.os }}\` |"
+            echo "| Rust cache exact hit | \`${cache_hit}\` |"
+            echo "| Cargo duration | \`${duration_seconds}s\` |"
+            echo "| Cargo status | \`${cargo_status}\` |"
+            echo "| Workspace path compile lines | \`${workspace_path_compiles}\` |"
+            echo "| Total compile lines | \`${total_compiles}\` |"
+            echo "| Downloaded crate lines | \`${downloaded_crates}\` |"
+          } >> "$summary_file"
+
+          exit "$cargo_status"
         env:
+          RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
   check:
     name: Check (${{ matrix.name }})
-    needs: [lint]
+    needs: [fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -124,7 +214,7 @@ jobs:
 
   check-32bit:
     name: Check (32-bit)
-    needs: [lint]
+    needs: [fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -146,7 +236,7 @@ jobs:
 
   bench:
     name: Benchmarks Compile
-    needs: [lint]
+    needs: [fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -163,11 +253,11 @@ jobs:
       - name: Verify benchmarks compile
         run: cargo bench --no-run --locked
 
-  # ── Stage 3: Test (gated on lint) ────────────────────────────────────────
+  # ── Post-format tests ─────────────────────────────────────────────────────
 
   test:
     name: Test
-    needs: [lint]
+    needs: [fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -191,11 +281,11 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
-  # ── Stage 4: Security (parallel with test, gated on lint) ────────────────
+  # ── Post-format security checks ───────────────────────────────────────────
 
   security:
     name: Security
-    needs: [lint]
+    needs: [fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -212,14 +302,59 @@ jobs:
       - name: Check licenses, sources, and advisories
         run: cargo deny check
 
-  # ── Stage 5: Required gate ────────────────────────────────────────────────
+  nix-eval:
+    name: Nix Module Eval
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install Nix
+        run: sudo apt-get update -qq && sudo apt-get install -y nix-bin nix-setup-systemd
+      - name: Verify Nix
+        run: sudo nix --version
+      - name: Evaluate Nix module assertions
+        run: sudo nix --extra-experimental-features "nix-command flakes" build .#checks.x86_64-linux.nixos-module-eval --no-link
+
+  docs-style:
+    name: Docs Style
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Resolve base SHA
+        id: base
+        run: echo "sha=$(git merge-base origin/master HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Docs quality gate (markdown lint + em-dash prose check)
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: bash scripts/ci/docs_quality_gate.sh
+
+  installer-drift:
+    name: Installer Drift
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.93.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Check generated install surfaces are in sync with the spec
+        run: cargo generate installers --check
+
+  # ── Required gate ─────────────────────────────────────────────────────────
   # Branch protection requires only this single job — internal structure
   # can change without touching branch protection settings.
 
   gate:
     name: CI Required Gate
     if: always()
-    needs: [lint, build, check, check-32bit, bench, test, security]
+    needs: [fmt, lint, build, check, check-32bit, bench, test, security, nix-eval, docs-style, installer-drift]
     runs-on: ubuntu-latest
     steps:
       - name: Check results

@@ -14,10 +14,16 @@ For hand-authored local skills, use `SKILL.md` or `SKILL.toml`. Use `SKILL.md` f
 
 A minimal instruction-only skill can be just a Markdown file:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 mkdir -p ~/.zeroclaw/workspace/skills/release-check
 $EDITOR ~/.zeroclaw/workspace/skills/release-check/SKILL.md
 ```
+
+</div>
 
 ```markdown
 # Release check
@@ -47,66 +53,74 @@ Supported frontmatter fields are `name`, `description`, `version`, `author`, and
 
 ## Create a TOML skill
 
-Here is the same skill as a structured TOML manifest:
-
-```toml
-[skill]
-name = "release-check"
-description = "Check release readiness before tagging"
-version = "0.1.0"
-author = "zeroclaw_user"
-tags = ["release", "docs"]
-prompts = [
-  "Review the release notes, changelog, version tags, and migration notes before confirming that a release is ready."
-]
-
-[[tools]]
-name = "show_latest_tag"
-description = "Print the latest local git tag"
-kind = "shell"
-command = "git describe --tags --abbrev=0"
-```
-
-The `[skill]` table requires `name` and `description`. `version` defaults to `0.1.0` when omitted. `author`, `tags`, and `prompts` are optional.
-
-Tool entries may use `kind = "shell"`, `kind = "http"`, or `kind = "script"`. Keep tool descriptions narrow and concrete so the model knows when to use them.
+A skill can also be a structured TOML manifest (`SKILL.toml`). The `[skill]` table requires `name` and `description`; `version` defaults to `0.1.0` when omitted; `author`, `tags`, and `prompts` are optional. Tool entries may use `kind = "shell"`, `kind = "http"`, or `kind = "script"`. Keep tool descriptions narrow and concrete so the model knows when to use them.
 
 ## Manage installed skills
 
 List installed skills:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw skills list
 ```
 
+</div>
+
 Audit an installed skill or a local skill directory:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw skills audit release-check
 zeroclaw skills audit ./release-check
 ```
 
+</div>
+
 Install a skill from a local directory, Git URL, registry name, or ClawHub source:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw skills install ./release-check
 zeroclaw skills install https://example.com/zeroclaw-release-check.git
 zeroclaw skills install release-check
 zeroclaw skills install clawhub:release-check
 ```
 
+</div>
+
 Remove an installed skill:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw skills remove release-check
 ```
 
+</div>
+
 Run `TEST.sh` validation for one skill, or omit the name to test all installed skills:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 zeroclaw skills test release-check
 zeroclaw skills test --verbose
 ```
+
+</div>
 
 `zeroclaw skills test` runs the skill's `TEST.sh` file when one exists. Inspect `TEST.sh` before running tests from a skill source you do not already trust.
 
@@ -114,47 +128,23 @@ zeroclaw skills test --verbose
 
 ZeroClaw can optionally suggest an installable skill capability when a submitted prompt clearly names something that exists in cached registry metadata but is not installed. The server-side path runs after submission and before the normal LLM turn. It only returns a suggestion; it does not install the skill, enable it, write memory, or treat the skill body as global instructions.
 
-Enable it in config:
-
-```toml
-[skills.install_suggestions]
-enabled = true
-```
-
-The suggestion matcher uses installed skill names and cached registry metadata such as names, aliases, and frontmatter. It intentionally avoids matching unapproved skill bodies. Plugin/package-level discovery remains follow-up scope until the plugin registry search/install surface is available. Exact composer-time suggestions while the user is still typing require ACP, gateway, or client UI support and are outside this server-only path.
+Enable it via the `skills` config (gateway, zerocode, or `zeroclaw config set`). The suggestion matcher uses installed skill names and cached registry metadata such as names, aliases, and frontmatter. It intentionally avoids matching unapproved skill bodies. Plugin/package-level discovery remains follow-up scope until the plugin registry search/install surface is available. Exact composer-time suggestions while the user is still typing require ACP, gateway, or client UI support and are outside this server-only path.
 
 ## Script safety
 
 ZeroClaw audits skills before loading or installing them. Script-like files such as `.sh`, `.bash`, `.ps1`, and files with shell shebangs are blocked by default.
 
-If you intentionally use script-bearing skills, enable them in the ZeroClaw config:
+If you intentionally use script-bearing skills, enable `skills.allow_scripts`. Keep this disabled unless you trust the skill source and have reviewed what the scripts do.
 
-```toml
-[skills]
-allow_scripts = true
-```
-
-Keep this disabled unless you trust the skill source and have reviewed what the scripts do.
+For Python-specific execution patterns, interpreter policy, and native versus Docker trade-offs, see [Running Python skills](./python-skills.md).
 
 ## Loading community skills
 
-Community open-skills loading is opt-in:
-
-```toml
-[skills]
-open_skills_enabled = true
-```
-
-When enabled, ZeroClaw loads skills from the configured `open_skills_dir`, or from `$HOME/open-skills` when no directory is set. If that directory does not exist, ZeroClaw may clone the community open-skills repository; if it does exist and is a git checkout, ZeroClaw may pull updates. Enable this only for community sources you trust, or point `open_skills_dir` at a reviewed local copy.
+Community open-skills loading is opt-in via the `skills` config. When enabled, ZeroClaw loads skills from the configured `open_skills_dir`, or from `$HOME/open-skills` when no directory is set. If that directory does not exist, ZeroClaw may clone the community open-skills repository; if it does exist and is a git checkout, ZeroClaw may pull updates. Enable this only for community sources you trust, or point `open_skills_dir` at a reviewed local copy.
 
 ## Advanced config
 
 The default prompt injection mode is `full`, which includes full skill instructions in the system prompt. Use `compact` to keep only compact metadata in context and load skill details on demand:
-
-```toml
-[skills]
-prompt_injection_mode = "compact"
-```
 
 ## See also
 

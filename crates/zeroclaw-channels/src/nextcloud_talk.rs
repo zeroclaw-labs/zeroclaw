@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use parking_lot::Mutex;
+use reqwest::Method;
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -288,7 +289,7 @@ impl NextcloudTalkChannel {
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({"actor_id": actor_id})),
-                "Talk: ignoring message from unauthorized actor: . Add to channels.nextcloud_talk.allowed_users in config.toml, or run `zeroclaw onboard --channels-only` to configure interactively."
+                "Talk: ignoring message from unauthorized actor: . Add to channels.nextcloud_talk.allowed_users in config.toml, or run `zeroclaw config set channels.nextcloud_talk.allowed-users='[\"<user-id>\"]'`."
             );
             return messages;
         }
@@ -330,6 +331,7 @@ impl NextcloudTalkChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         });
 
         messages
@@ -414,7 +416,7 @@ impl NextcloudTalkChannel {
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({"actor_id": actor_id})),
-                "Talk: ignoring message from unauthorized actor: . Add to channels.nextcloud_talk.allowed_users in config.toml, or run `zeroclaw onboard --channels-only` to configure interactively."
+                "Talk: ignoring message from unauthorized actor: . Add to channels.nextcloud_talk.allowed_users in config.toml, or run `zeroclaw config set channels.nextcloud_talk.allowed-users='[\"<user-id>\"]'`."
             );
             return messages;
         }
@@ -473,27 +475,53 @@ impl NextcloudTalkChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         });
 
         messages
     }
 
-    async fn send_to_room(&self, room_token: &str, content: &str) -> anyhow::Result<()> {
+    fn ocs_chat_url(&self, room_token: &str, message_id: Option<&str>) -> String {
         let encoded_room = urlencoding::encode(room_token);
-        let url = format!(
-            "{}/ocs/v2.php/apps/spreed/api/v1/chat/{}?format=json",
-            self.base_url, encoded_room
-        );
+        match message_id {
+            Some(message_id) => format!(
+                "{}/ocs/v2.php/apps/spreed/api/v1/chat/{}/{}?format=json",
+                self.base_url, encoded_room, message_id
+            ),
+            None => format!(
+                "{}/ocs/v2.php/apps/spreed/api/v1/chat/{}?format=json",
+                self.base_url, encoded_room
+            ),
+        }
+    }
 
-        let response = self
-            .client
-            .post(&url)
+    fn ocs_chat_request(
+        &self,
+        method: Method,
+        room_token: &str,
+        message_id: Option<&str>,
+    ) -> reqwest::RequestBuilder {
+        self.client
+            .request(method, self.ocs_chat_url(room_token, message_id))
             .bearer_auth(&self.app_token)
             .header("OCS-APIRequest", "true")
             .header("Accept", "application/json")
+    }
+
+    async fn post_to_room(
+        &self,
+        room_token: &str,
+        content: &str,
+    ) -> anyhow::Result<reqwest::Response> {
+        Ok(self
+            .ocs_chat_request(Method::POST, room_token, None)
             .json(&serde_json::json!({ "message": content }))
             .send()
-            .await?;
+            .await?)
+    }
+
+    async fn send_to_room(&self, room_token: &str, content: &str) -> anyhow::Result<()> {
+        let response = self.post_to_room(room_token, content).await?;
 
         if response.status().is_success() {
             return Ok(());
@@ -517,21 +545,7 @@ impl NextcloudTalkChannel {
         room_token: &str,
         content: &str,
     ) -> anyhow::Result<String> {
-        let encoded_room = urlencoding::encode(room_token);
-        let url = format!(
-            "{}/ocs/v2.php/apps/spreed/api/v1/chat/{}?format=json",
-            self.base_url, encoded_room
-        );
-
-        let response = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.app_token)
-            .header("OCS-APIRequest", "true")
-            .header("Accept", "application/json")
-            .json(&serde_json::json!({ "message": content }))
-            .send()
-            .await?;
+        let response = self.post_to_room(room_token, content).await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -574,18 +588,8 @@ impl NextcloudTalkChannel {
         message_id: &str,
         content: &str,
     ) -> anyhow::Result<()> {
-        let encoded_room = urlencoding::encode(room_token);
-        let url = format!(
-            "{}/ocs/v2.php/apps/spreed/api/v1/chat/{}/{}?format=json",
-            self.base_url, encoded_room, message_id
-        );
-
         let response = self
-            .client
-            .put(&url)
-            .bearer_auth(&self.app_token)
-            .header("OCS-APIRequest", "true")
-            .header("Accept", "application/json")
+            .ocs_chat_request(Method::PUT, room_token, Some(message_id))
             .json(&serde_json::json!({ "message": content }))
             .send()
             .await?;
@@ -596,32 +600,15 @@ impl NextcloudTalkChannel {
 
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"status": status.to_string(), "body": body})),
-            "Talk edit_message failed"
-        );
-        anyhow::bail!("Talk edit API error: {status}");
+        anyhow::bail!("Talk edit API error: {status}: {body}");
     }
 
     /// Delete a message via the Nextcloud Talk OCS API.
     ///
     /// `DELETE /ocs/v2.php/apps/spreed/api/v1/chat/{token}/{messageId}`
     async fn delete_message(&self, room_token: &str, message_id: &str) -> anyhow::Result<()> {
-        let encoded_room = urlencoding::encode(room_token);
-        let url = format!(
-            "{}/ocs/v2.php/apps/spreed/api/v1/chat/{}/{}?format=json",
-            self.base_url, encoded_room, message_id
-        );
-
         let response = self
-            .client
-            .delete(&url)
-            .bearer_auth(&self.app_token)
-            .header("OCS-APIRequest", "true")
-            .header("Accept", "application/json")
+            .ocs_chat_request(Method::DELETE, room_token, Some(message_id))
             .send()
             .await?;
 
@@ -643,16 +630,10 @@ impl NextcloudTalkChannel {
 
     /// Truncate text to the Nextcloud Talk character limit (UTF-8 char boundary safe).
     fn truncate_to_nc_limit(text: &str) -> &str {
-        if text.chars().count() <= NC_MAX_MESSAGE_LENGTH {
-            return text;
+        match text.char_indices().nth(NC_MAX_MESSAGE_LENGTH) {
+            Some((end, _)) => &text[..end],
+            None => text,
         }
-        // Find the byte offset of the NC_MAX_MESSAGE_LENGTH-th character boundary.
-        let end = text
-            .char_indices()
-            .nth(NC_MAX_MESSAGE_LENGTH)
-            .map(|(idx, _)| idx)
-            .unwrap_or(text.len());
-        &text[..end]
     }
 }
 
@@ -751,10 +732,11 @@ impl Channel for NextcloudTalkChannel {
                 // Non-fatal: log and continue. The final send will still deliver the
                 // complete response even if mid-stream edits fail.
                 ::zeroclaw_log::record!(
-                    DEBUG,
+                    WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "Talk update_draft skipped"
+                    "Talk update_draft edit failed; final response will still be delivered"
                 );
             }
         }
@@ -885,6 +867,8 @@ pub fn verify_nextcloud_talk_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn nextcloud_talk_channel_name() {
@@ -995,6 +979,93 @@ mod tests {
             .await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn send_succeeds_without_message_id_in_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ocs/v2.php/apps/spreed/api/v1/chat/room-token-123"))
+            .and(query_param("format", "json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ocs": { "data": {} }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let channel = NextcloudTalkChannel::new(
+            server.uri(),
+            "app-token".into(),
+            "zeroclaw".into(),
+            "nextcloud_talk_test_alias",
+            Arc::new(|| vec!["user_a".into()]),
+        );
+        let result = channel
+            .send(&SendMessage::new("hello", "room-token-123"))
+            .await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn send_draft_returns_message_id_from_response() {
+        use zeroclaw_config::schema::StreamMode;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ocs/v2.php/apps/spreed/api/v1/chat/room-token-123"))
+            .and(query_param("format", "json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ocs": { "data": { "id": 42 } }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let channel = NextcloudTalkChannel::new(
+            server.uri(),
+            "app-token".into(),
+            "zeroclaw".into(),
+            "nextcloud_talk_test_alias",
+            Arc::new(|| vec!["user_a".into()]),
+        )
+        .with_streaming(StreamMode::Partial, 1000);
+        let result = channel
+            .send_draft(&SendMessage::new("hello", "room-token-123"))
+            .await;
+
+        assert_eq!(result.unwrap(), Some("42".to_string()));
+    }
+
+    #[tokio::test]
+    async fn send_draft_errors_when_message_id_missing() {
+        use zeroclaw_config::schema::StreamMode;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ocs/v2.php/apps/spreed/api/v1/chat/room-token-123"))
+            .and(query_param("format", "json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ocs": { "data": {} }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let channel = NextcloudTalkChannel::new(
+            server.uri(),
+            "app-token".into(),
+            "zeroclaw".into(),
+            "nextcloud_talk_test_alias",
+            Arc::new(|| vec!["user_a".into()]),
+        )
+        .with_streaming(StreamMode::Partial, 1000);
+        let result = channel
+            .send_draft(&SendMessage::new("hello", "room-token-123"))
+            .await;
+
+        assert!(result.is_err());
     }
 
     #[test]

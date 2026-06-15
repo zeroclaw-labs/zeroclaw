@@ -43,7 +43,7 @@ pub struct Route {
 ///
 /// This wraps multiple pre-created model_providers and selects the right one per request.
 pub struct RouterModelProvider {
-    /// `[model_providers.<family>.<alias>]` config-key alias.
+    /// `[providers.models.<family>.<alias>]` config-key alias.
     alias: String,
     routes: HashMap<String, (usize, String)>, // hint → (provider_index, model)
     model_providers: Vec<(String, Box<dyn ModelProvider>)>,
@@ -183,7 +183,7 @@ impl RouterModelProvider {
 /// model_provider from the route table based on per-provider pricing maps.
 ///
 /// Pricing is keyed by model_provider name (the alias under
-/// `[model_providers.<model_provider>.<alias>]`); each model_provider's pricing map
+/// `[providers.models.<model_provider>.<alias>]`); each model_provider's pricing map
 /// holds user-defined keys (model identifiers, optionally suffixed with
 /// `.input` / `.output`) mapped to USD-per-1M-token rates.
 #[derive(Debug, Clone)]
@@ -306,6 +306,25 @@ impl ModelProvider for RouterModelProvider {
         self.model_providers
             .iter()
             .any(|(_, model_provider)| model_provider.supports_streaming_tool_events())
+    }
+
+    fn stream_chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+    ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        let (_, model_provider) = &self.model_providers[provider_idx];
+        model_provider.stream_chat_with_system(
+            system_prompt,
+            message,
+            &resolved_model,
+            temperature,
+            options,
+        )
     }
 
     fn stream_chat_with_history(
@@ -505,6 +524,16 @@ mod tests {
                 response,
             }
         }
+
+        fn stream_response(&self, model: &str) -> BoxStream<'static, StreamResult<StreamChunk>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_stream_model.lock() = model.to_string();
+            let chunks = vec![
+                Ok(StreamChunk::delta(self.response)),
+                Ok(StreamChunk::final_chunk()),
+            ];
+            futures_util::stream::iter(chunks).boxed()
+        }
     }
 
     #[async_trait]
@@ -523,6 +552,17 @@ mod tests {
             true
         }
 
+        fn stream_chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+            self.stream_response(model)
+        }
+
         fn stream_chat_with_history(
             &self,
             _messages: &[ChatMessage],
@@ -530,13 +570,7 @@ mod tests {
             _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> BoxStream<'static, StreamResult<StreamChunk>> {
-            self.stream_calls.fetch_add(1, Ordering::SeqCst);
-            *self.last_stream_model.lock() = model.to_string();
-            let chunks = vec![
-                Ok(StreamChunk::delta(self.response)),
-                Ok(StreamChunk::final_chunk()),
-            ];
-            futures_util::stream::iter(chunks).boxed()
+            self.stream_response(model)
         }
     }
     impl ::zeroclaw_api::attribution::Attributable for StreamingMockModelProvider {
@@ -850,6 +884,7 @@ mod tests {
                 native_tool_calling: self.tools,
                 vision: self.vision,
                 prompt_caching: false,
+                extended_thinking: false,
             }
         }
 
@@ -1156,6 +1191,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_chat_with_system_routes_hint_to_correct_provider_and_model() {
+        let streaming = Arc::new(StreamingMockModelProvider::new("streamed system response"));
+        let router = RouterModelProvider::new(
+            "test",
+            vec![
+                (
+                    "default".into(),
+                    Box::new(MockModelProvider::new("default")) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "streaming".into(),
+                    Box::new(Arc::clone(&streaming)) as Box<dyn ModelProvider>,
+                ),
+            ],
+            vec![(
+                "reasoning".into(),
+                Route {
+                    provider_name: "streaming".into(),
+                    model: "claude-opus".into(),
+                },
+            )],
+            "model".into(),
+        );
+
+        let mut stream = router.stream_chat_with_system(
+            Some("system"),
+            "hello",
+            "hint:reasoning",
+            Some(0.0),
+            StreamOptions::new(true),
+        );
+
+        let mut collected = String::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.expect("stream chunk should be ok");
+            collected.push_str(&chunk.delta);
+        }
+
+        assert_eq!(collected, "streamed system response");
+        assert_eq!(streaming.stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*streaming.last_stream_model.lock(), "claude-opus");
+    }
+
+    #[tokio::test]
     async fn stream_chat_with_history_routes_hint_to_correct_provider_and_model() {
         let streaming = Arc::new(StreamingMockModelProvider::new("streamed response"));
         let router = RouterModelProvider::new(
@@ -1240,6 +1319,7 @@ mod tests {
             ChatRequest {
                 messages: &messages,
                 tools: Some(&tools),
+                thinking: None,
             },
             "hint:reasoning",
             Some(0.0),

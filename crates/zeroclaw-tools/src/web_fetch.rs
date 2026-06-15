@@ -39,16 +39,25 @@ impl WebFetchTool {
         timeout_secs: u64,
         firecrawl: FirecrawlConfig,
         allowed_private_hosts: Vec<String>,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
             security,
-            allowed_domains: normalize_allowed_domains(allowed_domains),
-            blocked_domains: normalize_allowed_domains(blocked_domains),
-            allowed_private_hosts: normalize_allowed_domains(allowed_private_hosts),
+            allowed_domains: normalize_allowed_domains(
+                allowed_domains,
+                "web_fetch.allowed_domains",
+            )?,
+            blocked_domains: normalize_allowed_domains(
+                blocked_domains,
+                "web_fetch.blocked_domains",
+            )?,
+            allowed_private_hosts: normalize_allowed_domains(
+                allowed_private_hosts,
+                "web_fetch.allowed_private_hosts",
+            )?,
             max_response_size,
             timeout_secs,
             firecrawl,
-        }
+        })
     }
 
     fn validate_url(&self, raw_url: &str) -> anyhow::Result<String> {
@@ -62,6 +71,15 @@ impl WebFetchTool {
     }
 
     fn truncate_response(&self, text: &str) -> String {
+        // max_response_size == 0 means "unlimited" (matches the
+        // http_request tool's documented semantics + tests at
+        // crates/zeroclaw-tools/src/http_request.rs:151). Without this
+        // branch, the unsigned-arithmetic path below would truncate
+        // every response to zero bytes, then append the truncation
+        // marker — useless content + spurious Firecrawl fallback.
+        if self.max_response_size == 0 {
+            return text.to_string();
+        }
         if text.len() > self.max_response_size {
             let mut truncated = text
                 .chars()
@@ -79,7 +97,16 @@ impl WebFetchTool {
         response: reqwest::Response,
     ) -> anyhow::Result<String> {
         let mut bytes_stream = response.bytes_stream();
-        let hard_cap = self.max_response_size.saturating_add(1);
+        // max_response_size == 0 → unlimited. Without this branch, the
+        // existing saturating_add(1) made hard_cap = 1 byte, so the
+        // entire stream was truncated after one byte. Use usize::MAX as
+        // the effective hard_cap when unlimited so append_chunk_with_cap
+        // never stops early on size grounds.
+        let hard_cap = if self.max_response_size == 0 {
+            usize::MAX
+        } else {
+            self.max_response_size.saturating_add(1)
+        };
         let mut bytes = Vec::new();
 
         while let Some(chunk_result) = bytes_stream.next().await {
@@ -467,6 +494,24 @@ fn validate_target_url(
     allowed_private_hosts: &[String],
     tool_name: &str,
 ) -> anyhow::Result<String> {
+    validate_target_url_with_dns_check(
+        raw_url,
+        allowed_domains,
+        blocked_domains,
+        allowed_private_hosts,
+        tool_name,
+        validate_resolved_host_is_public,
+    )
+}
+
+fn validate_target_url_with_dns_check(
+    raw_url: &str,
+    allowed_domains: &[String],
+    blocked_domains: &[String],
+    allowed_private_hosts: &[String],
+    tool_name: &str,
+    validate_dns: impl FnOnce(&str) -> anyhow::Result<()>,
+) -> anyhow::Result<String> {
     let url = raw_url.trim();
 
     if url.is_empty() {
@@ -495,10 +540,11 @@ fn validate_target_url(
         anyhow::bail!("Host '{host}' is in {tool_name}.blocked_domains");
     }
 
+    let host_is_private_or_local = is_private_or_local_host(&host);
     let private_host_allowed =
-        is_private_or_local_host(&host) && host_matches_allowlist(&host, allowed_private_hosts);
+        host_matches_private_allowlist(&host, allowed_private_hosts, host_is_private_or_local);
 
-    if is_private_or_local_host(&host) && !private_host_allowed {
+    if host_is_private_or_local && !private_host_allowed {
         anyhow::bail!(
             "Blocked local/private host: {host}. \
              To allow this host, add it to {tool_name}.allowed_private_hosts in config.toml"
@@ -511,7 +557,7 @@ fn validate_target_url(
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                 .with_attrs(::serde_json::json!({"tool_name": tool_name, "host": host})),
-            ": allowing private/local host '' via allowed_private_hosts"
+            "web_fetch: allowing host via allowed_private_hosts"
         );
     }
 
@@ -520,7 +566,7 @@ fn validate_target_url(
     }
 
     if !private_host_allowed {
-        validate_resolved_host_is_public(&host)?;
+        validate_dns(&host)?;
     }
 
     Ok(url.to_string())
@@ -541,43 +587,66 @@ fn append_chunk_with_cap(buffer: &mut Vec<u8>, chunk: &[u8], hard_cap: usize) ->
     buffer.len() >= hard_cap
 }
 
-fn normalize_allowed_domains(domains: Vec<String>) -> Vec<String> {
+fn normalize_allowed_domains(domains: Vec<String>, label: &str) -> anyhow::Result<Vec<String>> {
+    let mut rejected = Vec::new();
     let mut normalized = domains
         .into_iter()
-        .filter_map(|d| normalize_domain(&d))
+        .filter_map(|d| {
+            normalize_domain(&d).or_else(|| {
+                rejected.push(d.clone());
+                None
+            })
+        })
         .collect::<Vec<_>>();
+    if !rejected.is_empty() {
+        anyhow::bail!(
+            "Invalid {label} entry(s): [{}]. Each entry must be a valid domain, hostname, IPv4, or IPv6 address.",
+            rejected.join(", ")
+        );
+    }
     normalized.sort_unstable();
     normalized.dedup();
-    normalized
+    Ok(normalized)
 }
 
 fn normalize_domain(raw: &str) -> Option<String> {
-    let mut d = raw.trim().to_lowercase();
-    if d.is_empty() {
+    let input = raw.trim();
+    if input.is_empty() || input.chars().any(char::is_whitespace) {
         return None;
     }
 
-    if let Some(stripped) = d.strip_prefix("https://") {
-        d = stripped.to_string();
-    } else if let Some(stripped) = d.strip_prefix("http://") {
-        d = stripped.to_string();
+    let bare_ip = match (input.starts_with('['), input.ends_with(']')) {
+        (true, true) => &input[1..input.len() - 1],
+        (false, false) => input,
+        _ => return None,
+    };
+    if let Ok(ip) = bare_ip.parse::<std::net::IpAddr>() {
+        return Some(ip.to_string().to_lowercase());
     }
 
-    if let Some((host, _)) = d.split_once('/') {
-        d = host.to_string();
-    }
+    let parsed = reqwest::Url::parse(input)
+        .or_else(|_| reqwest::Url::parse(&format!("https://{input}")))
+        .ok()?;
 
-    d = d.trim_start_matches('.').trim_end_matches('.').to_string();
-
-    if let Some((host, _)) = d.split_once(':') {
-        d = host.to_string();
-    }
-
-    if d.is_empty() || d.chars().any(char::is_whitespace) {
+    if !parsed.username().is_empty() || parsed.password().is_some() {
         return None;
     }
 
-    Some(d)
+    let host = parsed.host_str()?;
+    let trimmed = host.trim();
+    let host_no_brackets = match (trimmed.starts_with('['), trimmed.ends_with(']')) {
+        (true, true) => &trimmed[1..trimmed.len() - 1],
+        (false, false) => trimmed,
+        _ => return None,
+    };
+    let normalized = host_no_brackets
+        .trim_start_matches('.')
+        .trim_end_matches('.');
+    if normalized.is_empty() {
+        return None;
+    }
+
+    Some(normalized.to_lowercase())
 }
 
 fn extract_host(url: &str) -> anyhow::Result<String> {
@@ -643,6 +712,23 @@ fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
             || host
                 .strip_suffix(domain)
                 .is_some_and(|prefix| prefix.ends_with('.'))
+    })
+}
+
+fn host_matches_private_allowlist(
+    host: &str,
+    allowed_private_hosts: &[String],
+    host_is_private_or_local: bool,
+) -> bool {
+    allowed_private_hosts.iter().any(|domain| {
+        if domain == "*" {
+            host_is_private_or_local
+        } else {
+            host == domain
+                || host
+                    .strip_suffix(domain)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        }
     })
 }
 
@@ -775,6 +861,7 @@ mod tests {
             FirecrawlConfig::default(),
             vec![],
         )
+        .unwrap()
     }
 
     fn test_tool_with_private_hosts(
@@ -798,6 +885,7 @@ mod tests {
                 .map(String::from)
                 .collect(),
         )
+        .unwrap()
     }
 
     fn test_tool_with_firecrawl(firecrawl: FirecrawlConfig) -> WebFetchTool {
@@ -814,6 +902,7 @@ mod tests {
             firecrawl,
             vec![],
         )
+        .unwrap()
     }
 
     // ── Name and schema ──────────────────────────────────────────
@@ -912,7 +1001,8 @@ mod tests {
             30,
             FirecrawlConfig::default(),
             vec![],
-        );
+        )
+        .unwrap();
         let err = tool
             .validate_url("https://example.com")
             .unwrap_err()
@@ -1029,7 +1119,8 @@ mod tests {
             30,
             FirecrawlConfig::default(),
             vec![],
-        );
+        )
+        .unwrap();
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -1048,6 +1139,107 @@ mod tests {
     }
 
     #[test]
+    fn truncate_response_zero_means_unlimited() {
+        // max_response_size == 0 must be treated as unlimited — no truncation
+        // marker, full text returned regardless of length.
+        let tool = WebFetchTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["example.com".into()],
+            vec![],
+            0, // unlimited
+            30,
+            FirecrawlConfig::default(),
+            vec![],
+        )
+        .unwrap();
+        let long_text = "x".repeat(10_000);
+        let result = tool.truncate_response(&long_text);
+        assert_eq!(result.len(), 10_000, "zero limit must not truncate");
+        assert!(
+            !result.contains("[Response truncated"),
+            "must not append truncation marker"
+        );
+    }
+
+    /// Drives the actual streamed-read path (standard_fetch +
+    /// read_response_text_limited) via wiremock to lock in the
+    /// max_response_size=0 behaviour. Audacity88 review (PR #6884)
+    /// flagged the direct-helper test as insufficient because it
+    /// did not exercise the saturating_add(1) cap that previously
+    /// stopped streaming after 1 byte and triggered spurious
+    /// Firecrawl fallback.
+    #[tokio::test]
+    async fn standard_fetch_with_zero_limit_returns_full_body_and_skips_firecrawl_fallback() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let addr = server.address();
+
+        // Body must exceed FIRECRAWL_MIN_BODY_LEN (100 bytes) so any
+        // truncation to <100 bytes would (incorrectly) trigger fallback.
+        let body = "a".repeat(500);
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body.clone()))
+            .mount(&server)
+            .await;
+
+        let tool = WebFetchTool::new(
+            Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Supervised,
+                ..SecurityPolicy::default()
+            }),
+            vec!["*".into()],
+            vec![],
+            0, // max_response_size = unlimited
+            30,
+            FirecrawlConfig {
+                enabled: true,
+                ..FirecrawlConfig::default()
+            },
+            vec![],
+        )
+        .unwrap();
+
+        // Bypass SSRF-guarded execute() — call standard_fetch directly so
+        // wiremock on 127.0.0.1 is reachable.
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("reqwest client");
+        let standard_result = tool.standard_fetch(&client, &url).await;
+
+        // (a) standard result IS the full body — proves streamed read did
+        // not stop after 1 byte under the zero-limit path.
+        assert!(
+            standard_result.success,
+            "standard_fetch must succeed, got error={:?}",
+            standard_result.error
+        );
+        assert_eq!(
+            standard_result.output.len(),
+            body.len(),
+            "streamed body length under zero-limit must equal full body"
+        );
+        assert_eq!(
+            standard_result.output, body,
+            "streamed body content must equal full body"
+        );
+        assert!(
+            !standard_result.output.contains("[Response truncated"),
+            "must not append truncation marker under zero limit"
+        );
+
+        // (b) result does NOT trip should_fallback_to_firecrawl — proves
+        // the regression (1-byte short body) is locked out.
+        assert!(
+            !tool.should_fallback_to_firecrawl(&standard_result),
+            "500-byte body under zero limit must not trigger Firecrawl fallback"
+        );
+    }
+
+    #[test]
     fn truncate_over_limit() {
         let tool = WebFetchTool::new(
             Arc::new(SecurityPolicy::default()),
@@ -1057,7 +1249,8 @@ mod tests {
             30,
             FirecrawlConfig::default(),
             vec![],
-        );
+        )
+        .unwrap();
         let text = "hello world this is long";
         let truncated = tool.truncate_response(text);
         assert!(truncated.contains("[Response truncated"));
@@ -1072,12 +1265,32 @@ mod tests {
     }
 
     #[test]
+    fn normalize_domain_rejects_userinfo() {
+        assert!(normalize_domain("https://user@example.com").is_none());
+        assert!(normalize_domain("user@example.com").is_none());
+        assert!(normalize_domain("https://user:pass@example.com").is_none());
+        assert!(normalize_domain("user:pass@example.com").is_none());
+    }
+
+    #[test]
+    fn normalize_domain_rejects_unmatched_brackets() {
+        assert!(normalize_domain("[::1").is_none());
+        assert!(normalize_domain("::1]").is_none());
+        assert!(normalize_domain("[127.0.0.1").is_none());
+        assert!(normalize_domain("127.0.0.1]").is_none());
+    }
+
+    #[test]
     fn normalize_deduplicates() {
-        let got = normalize_allowed_domains(vec![
-            "example.com".into(),
-            "EXAMPLE.COM".into(),
-            "https://example.com/".into(),
-        ]);
+        let got = normalize_allowed_domains(
+            vec![
+                "example.com".into(),
+                "EXAMPLE.COM".into(),
+                "https://example.com/".into(),
+            ],
+            "test",
+        )
+        .unwrap();
         assert_eq!(got, vec!["example.com".to_string()]);
     }
 
@@ -1420,7 +1633,8 @@ mod tests {
                 ..FirecrawlConfig::default()
             },
             vec![],
-        );
+        )
+        .unwrap();
 
         // Bypass SSRF-guarded execute() — call standard_fetch + fallback
         // logic directly so wiremock on 127.0.0.1 is reachable.
@@ -1509,7 +1723,8 @@ mod tests {
                 ..FirecrawlConfig::default()
             },
             vec![],
-        );
+        )
+        .unwrap();
 
         // Bypass SSRF-guarded execute() — call standard_fetch + fallback
         // logic directly so wiremock on 127.0.0.1 is reachable.
@@ -1545,6 +1760,99 @@ mod tests {
     fn allowed_private_host_bypasses_ssrf_block() {
         let tool = test_tool_with_private_hosts(vec!["*"], vec![], vec!["192.168.1.5"]);
         assert!(tool.validate_url("https://192.168.1.5/api").is_ok());
+    }
+
+    #[test]
+    fn allowed_private_domain_skips_dns_public_check() {
+        let allowed_domains = vec!["*".to_string()];
+        let blocked_domains = vec![];
+        let allowed_private_hosts = vec!["local.internal".to_string()];
+
+        let result = validate_target_url_with_dns_check(
+            "https://local.internal/api",
+            &allowed_domains,
+            &blocked_domains,
+            &allowed_private_hosts,
+            "web_fetch",
+            |_| {
+                panic!("DNS public-host validation should be skipped");
+            },
+        );
+
+        assert!(
+            result.is_ok(),
+            "allowlisted private domain was rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn unallowed_domain_resolving_private_ip_still_blocked() {
+        let allowed_domains = vec!["*".to_string()];
+        let blocked_domains = vec![];
+        let allowed_private_hosts = vec![];
+
+        let err = validate_target_url_with_dns_check(
+            "https://local.internal/api",
+            &allowed_domains,
+            &blocked_domains,
+            &allowed_private_hosts,
+            "web_fetch",
+            |host| {
+                validate_resolved_ips_are_public(
+                    host,
+                    &[std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                        192, 168, 1, 5,
+                    ))],
+                )
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("non-global address"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn private_allowlist_wildcard_does_not_allow_public_domain_miss() {
+        let allowed_domains = vec!["example.com".to_string()];
+        let blocked_domains = vec![];
+        let allowed_private_hosts = vec!["*".to_string()];
+
+        let err = validate_target_url_with_dns_check(
+            "https://not-example.com/api",
+            &allowed_domains,
+            &blocked_domains,
+            &allowed_private_hosts,
+            "web_fetch",
+            |_| anyhow::Ok(()),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("allowed_domains"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn blocklist_overrides_allowed_private_domain() {
+        let allowed_domains = vec!["*".to_string()];
+        let blocked_domains = vec!["local.internal".to_string()];
+        let allowed_private_hosts = vec!["local.internal".to_string()];
+
+        let err = validate_target_url_with_dns_check(
+            "https://local.internal/api",
+            &allowed_domains,
+            &blocked_domains,
+            &allowed_private_hosts,
+            "web_fetch",
+            |_| anyhow::bail!("blocklist should run before DNS validation"),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("blocked_domains"), "unexpected error: {err}");
     }
 
     #[test]

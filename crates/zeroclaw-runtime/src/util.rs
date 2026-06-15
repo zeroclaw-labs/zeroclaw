@@ -70,6 +70,31 @@ pub enum MaybeSet<T> {
     Null,
 }
 
+/// Return free heap memory at the top of glibc's arenas to the kernel.
+///
+/// After the session reaper or an explicit `session/close` drops an `Agent`
+/// and its conversation history, glibc keeps the freed pages in its per-arena
+/// free lists instead of `munmap`-ing them, so resident set size stays flat
+/// despite a correct free. This releases the arena tops so the daemon's RSS
+/// actually falls. No-op on targets without glibc's `malloc_trim`.
+///
+/// Gated on Linux + glibc specifically: `libc` is a `cfg(unix)`-only
+/// dependency, and `malloc_trim` is a glibc extension. A bare
+/// `target_env = "gnu"` also matches the `windows-gnu` target, where `libc`
+/// is absent and the call fails to resolve.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn release_freed_heap() {
+    // SAFETY: `malloc_trim` only inspects and releases the allocator's own
+    // free lists. It takes no Rust-owned pointer and frees nothing the program
+    // still references, so it cannot dangle a pointer or double free.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub fn release_freed_heap() {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

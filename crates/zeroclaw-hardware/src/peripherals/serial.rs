@@ -5,6 +5,9 @@
 //! Response: {"id":"1","ok":true,"result":"done"}
 
 use crate::peripherals::Peripheral;
+#[cfg(unix)]
+use crate::util::should_open_serial_nonexclusive;
+use crate::util::{is_serial_path_allowed, serial_open_baud, serial_path_allowlist_hint};
 use async_trait::async_trait;
 use portable_atomic::{AtomicU64, Ordering};
 use serde_json::{Value, json};
@@ -19,21 +22,6 @@ use zeroclaw_config::schema::PeripheralBoardConfig;
 
 tool_attribution!(GpioReadTool, ToolKind::Plugin);
 tool_attribution!(GpioWriteTool, ToolKind::Plugin);
-
-/// Allowed serial path patterns (security: deny arbitrary paths).
-const ALLOWED_PATH_PREFIXES: &[&str] = &[
-    "/dev/ttyACM",
-    "/dev/ttyUSB",
-    "/dev/tty.usbmodem",
-    "/dev/cu.usbmodem",
-    "/dev/tty.usbserial",
-    "/dev/cu.usbserial", // Arduino Uno (FTDI), clones
-    "COM",               // Windows
-];
-
-fn is_path_allowed(path: &str) -> bool {
-    ALLOWED_PATH_PREFIXES.iter().any(|p| path.starts_with(p))
-}
 
 /// JSON request/response over serial.
 async fn send_request(port: &mut SerialStream, cmd: &str, args: Value) -> anyhow::Result<Value> {
@@ -77,7 +65,7 @@ pub struct SerialTransport {
 const SERIAL_TIMEOUT_SECS: u64 = 5;
 
 impl SerialTransport {
-    async fn request(&self, cmd: &str, args: Value) -> anyhow::Result<ToolResult> {
+    pub(crate) async fn request(&self, cmd: &str, args: Value) -> anyhow::Result<ToolResult> {
         let mut port = self.port.lock().await;
         let resp = tokio::time::timeout(
             std::time::Duration::from_secs(SERIAL_TIMEOUT_SECS),
@@ -142,29 +130,35 @@ impl SerialPeripheral {
             anyhow::Error::msg("Serial peripheral requires path")
         })?;
 
-        if !is_path_allowed(path) {
+        if !is_serial_path_allowed(path) {
             anyhow::bail!(
-                "Serial path not allowed: {}. Allowed: /dev/ttyACM*, /dev/ttyUSB*, /dev/tty.usbmodem*, /dev/cu.usbmodem*",
-                path
+                "Serial path not allowed: {}. Allowed: {}",
+                path,
+                serial_path_allowlist_hint()
             );
         }
 
-        let port = tokio_serial::new(path, config.baud)
-            .open_native_async()
-            .map_err(|e| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "path": path,
-                            "baud": config.baud,
-                            "error": format!("{}", e),
-                        })),
-                    "serial peripheral open failed"
-                );
-                anyhow::Error::msg(format!("Failed to open {path}: {e}"))
-            })?;
+        let builder = tokio_serial::new(path, serial_open_baud(path, config.baud));
+        #[cfg(unix)]
+        let builder = if should_open_serial_nonexclusive(path) {
+            builder.exclusive(false)
+        } else {
+            builder
+        };
+        let port = builder.open_native_async().map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "path": path,
+                        "baud": config.baud,
+                        "error": format!("{}", e),
+                    })),
+                "serial peripheral open failed"
+            );
+            anyhow::Error::msg(format!("Failed to open {path}: {e}"))
+        })?;
 
         let name = format!("{}-{}", config.board, path.replace('/', "_"));
         let transport = Arc::new(SerialTransport {

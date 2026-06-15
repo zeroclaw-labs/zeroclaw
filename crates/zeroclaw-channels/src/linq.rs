@@ -218,7 +218,7 @@ impl LinqChannel {
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({"normalized_from": normalized_from})),
-                "ignoring message from unauthorized sender: . Add to channels.linq.allowed_senders in config.toml, or run `zeroclaw onboard --channels-only` to configure interactively."
+                "ignoring message from unauthorized sender: . Add to channels.linq.allowed_senders in config.toml, or run `zeroclaw config set channels.linq.allowed-senders='[\"<sender-id>\"]'`."
             );
             return messages;
         }
@@ -316,6 +316,7 @@ impl LinqChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         });
 
         messages

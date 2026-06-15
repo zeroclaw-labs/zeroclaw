@@ -1,13 +1,13 @@
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
 use opentelemetry::metrics::{Counter, Gauge, Histogram};
-use opentelemetry::trace::{Span, SpanKind, Status, Tracer};
-use opentelemetry::{KeyValue, global};
+use opentelemetry::trace::{Span, SpanKind, Status, TraceContextExt as _, Tracer};
+use opentelemetry::{Context, KeyValue, global};
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use std::any::Any;
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::sync::Mutex;
 
 /// OpenTelemetry-backed observer — exports traces and metrics via OTLP.
 pub struct OtelObserver {
@@ -28,6 +28,9 @@ pub struct OtelObserver {
     tokens_used: Counter<u64>,
     active_sessions: Gauge<u64>,
     queue_depth: Gauge<u64>,
+
+    // Turn span tracking for parent/child correlation
+    active_agent_spans: Mutex<HashMap<String, (global::BoxedSpan, Context)>>,
 }
 
 impl OtelObserver {
@@ -181,7 +184,21 @@ impl OtelObserver {
             tokens_used,
             active_sessions,
             queue_depth,
+            active_agent_spans: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn parent_cx_for(&self, turn_id: Option<&str>) -> Context {
+        if let Some(tid) = turn_id
+            && let Some((_, cx)) = self
+                .active_agent_spans
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(tid)
+        {
+            return cx.clone();
+        }
+        Context::current()
     }
 }
 
@@ -193,18 +210,104 @@ impl Observer for OtelObserver {
             ObserverEvent::AgentStart {
                 model_provider,
                 model,
+                channel,
+                agent_alias,
+                turn_id,
             } => {
                 self.agent_starts.add(
                     1,
                     &[
-                        KeyValue::new("model_provider", model_provider.clone()),
-                        KeyValue::new("model", model.clone()),
+                        KeyValue::new("gen_ai.provider.name", model_provider.clone()),
+                        KeyValue::new("gen_ai.request.model", model.clone()),
                     ],
                 );
+
+                let span = tracer.build(
+                    opentelemetry::trace::SpanBuilder::from_name("gen_ai.agent.invoke")
+                        .with_kind(SpanKind::Internal)
+                        .with_attributes(vec![
+                            KeyValue::new("gen_ai.provider.name", model_provider.clone()),
+                            KeyValue::new("gen_ai.request.model", model.clone()),
+                            KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
+                            KeyValue::new(
+                                "gen_ai.agent.name",
+                                agent_alias.clone().unwrap_or_default(),
+                            ),
+                            KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
+                        ]),
+                );
+
+                if let Some(tid) = turn_id {
+                    let parent_cx =
+                        Context::current().with_remote_span_context(span.span_context().clone());
+                    self.active_agent_spans
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(tid.clone(), (span, parent_cx));
+                }
             }
-            ObserverEvent::LlmRequest { .. }
-            | ObserverEvent::ToolCallStart { .. }
-            | ObserverEvent::TurnComplete
+            ObserverEvent::LlmRequest {
+                model_provider,
+                model,
+                messages_count,
+                channel,
+                agent_alias,
+                turn_id,
+            } => {
+                let parent_cx = self.parent_cx_for(turn_id.as_deref());
+                let mut span = tracer.build_with_context(
+                    opentelemetry::trace::SpanBuilder::from_name("llm.request")
+                        .with_kind(SpanKind::Client)
+                        .with_attributes(vec![
+                            KeyValue::new("gen_ai.provider.name", model_provider.clone()),
+                            KeyValue::new("gen_ai.request.model", model.clone()),
+                            KeyValue::new("gen_ai.operation.name", "llm.request"),
+                            KeyValue::new(
+                                "zeroclaw.messages_count",
+                                i64::try_from(*messages_count).unwrap_or(i64::MAX),
+                            ),
+                            KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
+                            KeyValue::new(
+                                "gen_ai.agent.name",
+                                agent_alias.clone().unwrap_or_default(),
+                            ),
+                            KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
+                        ]),
+                    &parent_cx,
+                );
+                span.end();
+            }
+            ObserverEvent::ToolCallStart {
+                tool,
+                tool_call_id,
+                arguments,
+                channel,
+                agent_alias,
+                turn_id,
+            } => {
+                let mut span_attrs = vec![
+                    KeyValue::new("gen_ai.operation.name", "execute_tool"),
+                    KeyValue::new("tool.name", tool.clone()),
+                    KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
+                    KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
+                    KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
+                ];
+                if let Some(id) = tool_call_id {
+                    span_attrs.push(KeyValue::new("gen_ai.tool.call.id", id.clone()));
+                }
+                if let Some(args) = arguments {
+                    span_attrs.push(KeyValue::new("gen_ai.tool.arguments", args.clone()));
+                }
+                let parent_cx = self.parent_cx_for(turn_id.as_deref());
+                let mut span = tracer.build_with_context(
+                    opentelemetry::trace::SpanBuilder::from_name("tool_call.start")
+                        .with_kind(SpanKind::Client)
+                        .with_attributes(span_attrs),
+                    &parent_cx,
+                );
+                span.end();
+            }
+            ObserverEvent::TurnComplete
             | ObserverEvent::CacheHit { .. }
             | ObserverEvent::CacheMiss { .. } => {}
             ObserverEvent::LlmResponse {
@@ -213,32 +316,50 @@ impl Observer for OtelObserver {
                 duration,
                 success,
                 error_message: _,
-                input_tokens: _,
-                output_tokens: _,
+                input_tokens,
+                output_tokens,
+                channel,
+                agent_alias,
+                turn_id,
             } => {
                 let secs = duration.as_secs_f64();
                 let attrs = [
-                    KeyValue::new("model_provider", model_provider.clone()),
-                    KeyValue::new("model", model.clone()),
-                    KeyValue::new("success", success.to_string()),
+                    KeyValue::new("gen_ai.provider.name", model_provider.clone()),
+                    KeyValue::new("gen_ai.request.model", model.clone()),
+                    KeyValue::new("gen_ai.response.model", model.clone()),
+                    KeyValue::new("gen_ai.operation.name", "llm.response"),
+                    KeyValue::new("success", *success),
+                    KeyValue::new("duration_s", secs),
+                    KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
+                    KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
+                    KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
                 ];
                 self.llm_calls.add(1, &attrs);
                 self.llm_duration.record(secs, &attrs);
 
-                // Create a completed span for visibility in trace backends.
-                let start_time = SystemTime::now()
-                    .checked_sub(*duration)
-                    .unwrap_or(SystemTime::now());
-                let mut span = tracer.build(
-                    opentelemetry::trace::SpanBuilder::from_name("llm.call")
-                        .with_kind(SpanKind::Internal)
-                        .with_start_time(start_time)
-                        .with_attributes(vec![
-                            KeyValue::new("model_provider", model_provider.clone()),
-                            KeyValue::new("model", model.clone()),
-                            KeyValue::new("success", *success),
-                            KeyValue::new("duration_s", secs),
-                        ]),
+                let mut span_attrs = vec![
+                    KeyValue::new("gen_ai.provider.name", model_provider.clone()),
+                    KeyValue::new("gen_ai.request.model", model.clone()),
+                    KeyValue::new("gen_ai.response.model", model.clone()),
+                    KeyValue::new("gen_ai.operation.name", "llm.response"),
+                    KeyValue::new("success", *success),
+                    KeyValue::new("duration_s", secs),
+                    KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
+                    KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
+                    KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
+                ];
+                if let Some(input) = input_tokens {
+                    span_attrs.push(KeyValue::new("gen_ai.usage.input_tokens", *input as i64));
+                }
+                if let Some(output) = output_tokens {
+                    span_attrs.push(KeyValue::new("gen_ai.usage.output_tokens", *output as i64));
+                }
+                let parent_cx = self.parent_cx_for(turn_id.as_deref());
+                let mut span = tracer.build_with_context(
+                    opentelemetry::trace::SpanBuilder::from_name("llm.response")
+                        .with_kind(SpanKind::Client)
+                        .with_attributes(span_attrs),
+                    &parent_cx,
                 );
                 if *success {
                     span.set_status(Status::Ok);
@@ -253,50 +374,57 @@ impl Observer for OtelObserver {
                 duration,
                 tokens_used,
                 cost_usd,
+                channel: _,
+                agent_alias: _,
+                turn_id,
             } => {
+                if let Some(tid) = turn_id {
+                    let entry = self
+                        .active_agent_spans
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(tid);
+                    if let Some((mut span, _)) = entry {
+                        let secs = duration.as_secs_f64();
+                        span.set_attribute(KeyValue::new("duration_s", secs));
+                        if let Some(usage) = tokens_used {
+                            span.set_attribute(KeyValue::new(
+                                "gen_ai.usage.input_tokens",
+                                usage.input_tokens as i64,
+                            ));
+                            span.set_attribute(KeyValue::new(
+                                "gen_ai.usage.output_tokens",
+                                usage.output_tokens as i64,
+                            ));
+                        }
+                        if let Some(c) = cost_usd {
+                            span.set_attribute(KeyValue::new("cost_usd", *c));
+                        }
+                        span.end();
+                    }
+                }
+
                 let secs = duration.as_secs_f64();
-                let start_time = SystemTime::now()
-                    .checked_sub(*duration)
-                    .unwrap_or(SystemTime::now());
-
-                // Create a completed span with correct timing
-                let mut span = tracer.build(
-                    opentelemetry::trace::SpanBuilder::from_name("agent.invocation")
-                        .with_kind(SpanKind::Internal)
-                        .with_start_time(start_time)
-                        .with_attributes(vec![
-                            KeyValue::new("model_provider", model_provider.clone()),
-                            KeyValue::new("model", model.clone()),
-                            KeyValue::new("duration_s", secs),
-                        ]),
-                );
-                if let Some(t) = tokens_used {
-                    span.set_attribute(KeyValue::new("tokens_used", *t as i64));
-                }
-                if let Some(c) = cost_usd {
-                    span.set_attribute(KeyValue::new("cost_usd", *c));
-                }
-                span.end();
-
                 self.agent_duration.record(
                     secs,
                     &[
-                        KeyValue::new("model_provider", model_provider.clone()),
-                        KeyValue::new("model", model.clone()),
+                        KeyValue::new("gen_ai.provider.name", model_provider.clone()),
+                        KeyValue::new("gen_ai.request.model", model.clone()),
                     ],
                 );
-                // Note: tokens are recorded via record_metric(TokensUsed) to avoid
-                // double-counting. AgentEnd only records duration.
             }
             ObserverEvent::ToolCall {
                 tool,
+                tool_call_id,
                 duration,
                 success,
+                arguments,
+                result,
+                channel,
+                agent_alias,
+                turn_id,
             } => {
                 let secs = duration.as_secs_f64();
-                let start_time = SystemTime::now()
-                    .checked_sub(*duration)
-                    .unwrap_or(SystemTime::now());
 
                 let status = if *success {
                     Status::Ok
@@ -304,24 +432,41 @@ impl Observer for OtelObserver {
                     Status::error("")
                 };
 
-                let mut span = tracer.build(
-                    opentelemetry::trace::SpanBuilder::from_name("tool.call")
+                let mut span_attrs = vec![
+                    KeyValue::new("gen_ai.operation.name", "execute_tool"),
+                    KeyValue::new("tool.name", tool.clone()),
+                    KeyValue::new("tool.success", *success),
+                    KeyValue::new("duration_s", secs),
+                    KeyValue::new("zeroclaw.channel", channel.clone().unwrap_or_default()),
+                    KeyValue::new("gen_ai.agent.name", agent_alias.clone().unwrap_or_default()),
+                    KeyValue::new("zeroclaw.turn_id", turn_id.clone().unwrap_or_default()),
+                ];
+                if let Some(id) = tool_call_id {
+                    span_attrs.push(KeyValue::new("gen_ai.tool.call.id", id.clone()));
+                }
+                if let Some(args) = arguments {
+                    span_attrs.push(KeyValue::new("gen_ai.tool.arguments", args.clone()));
+                    span_attrs.push(KeyValue::new("input.value", args.clone()));
+                }
+                if let Some(res) = result {
+                    span_attrs.push(KeyValue::new("gen_ai.tool.result", res.clone()));
+                    span_attrs.push(KeyValue::new("output.value", res.clone()));
+                }
+                let parent_cx = self.parent_cx_for(turn_id.as_deref());
+                let mut span = tracer.build_with_context(
+                    opentelemetry::trace::SpanBuilder::from_name("tool_call.result")
                         .with_kind(SpanKind::Internal)
-                        .with_start_time(start_time)
-                        .with_attributes(vec![
-                            KeyValue::new("tool.name", tool.clone()),
-                            KeyValue::new("tool.success", *success),
-                            KeyValue::new("duration_s", secs),
-                        ]),
+                        .with_attributes(span_attrs),
+                    &parent_cx,
                 );
                 span.set_status(status);
                 span.end();
 
-                let attrs = [
+                let metric_attrs = [
                     KeyValue::new("tool", tool.clone()),
                     KeyValue::new("success", success.to_string()),
                 ];
-                self.tool_calls.add(1, &attrs);
+                self.tool_calls.add(1, &metric_attrs);
                 self.tool_duration
                     .record(secs, &[KeyValue::new("tool", tool.clone())]);
             }
@@ -383,6 +528,18 @@ impl Observer for OtelObserver {
     }
 
     fn flush(&self) {
+        // Flush orphan live spans (turns that ended without AgentEnd)
+        let orphans: Vec<(global::BoxedSpan, Context)> = self
+            .active_agent_spans
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .map(|(_, v)| v)
+            .collect();
+        for (mut span, _) in orphans {
+            span.end();
+        }
+
         if let Err(e) = self.tracer_provider.force_flush() {
             ::zeroclaw_log::record!(
                 WARN,
@@ -442,11 +599,17 @@ mod tests {
         obs.record_event(&ObserverEvent::AgentStart {
             model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::LlmRequest {
             model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             messages_count: 2,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
             model_provider: "openrouter".into(),
@@ -456,13 +619,19 @@ mod tests {
             error_message: None,
             input_tokens: Some(100),
             output_tokens: Some(50),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(500),
-            tokens_used: Some(100),
+            tokens_used: None,
             cost_usd: Some(0.0015),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::AgentEnd {
             model_provider: "openrouter".into(),
@@ -470,20 +639,39 @@ mod tests {
             duration: Duration::ZERO,
             tokens_used: None,
             cost_usd: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
             tool: "shell".into(),
+            tool_call_id: None,
             arguments: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(10),
             success: true,
+            arguments: None,
+            result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "file_read".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(5),
             success: false,
+            arguments: None,
+            result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::TurnComplete);
         obs.record_event(&ObserverEvent::ChannelMessage {
@@ -514,6 +702,50 @@ mod tests {
         obs.flush();
     }
 
+    /// Regression test for upstream issue #5980 — tool spans must accept a
+    /// populated `tool_call_id`, full `arguments`, and `result` without
+    /// panicking, including payloads large enough that naive attribute
+    /// encoding could truncate them. We can't assert on exported span
+    /// attributes here because the OTLP pipeline runs asynchronously, but
+    /// verifying the recording path handles all three optional fields
+    /// exercises the new gen_ai.tool.* code paths.
+    #[test]
+    fn tool_call_with_id_args_and_result_does_not_panic() {
+        let obs = test_observer();
+        obs.record_event(&ObserverEvent::ToolCallStart {
+            tool: "shell".into(),
+            tool_call_id: Some("toolu_01ABC".into()),
+            arguments: Some(r#"{"command":"ls -la /tmp"}"#.into()),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
+        });
+        obs.record_event(&ObserverEvent::ToolCall {
+            tool: "shell".into(),
+            tool_call_id: Some("toolu_01ABC".into()),
+            duration: Duration::from_millis(42),
+            success: true,
+            arguments: Some(r#"{"command":"ls -la /tmp"}"#.into()),
+            result: Some("total 0\ndrwxr-xr-x  2 root root 40 Apr 22 12:00 .\n".into()),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
+        });
+        // Failure case — the issue author specifically wants to see *why*
+        // a tool call failed, so the result field is the error text.
+        obs.record_event(&ObserverEvent::ToolCall {
+            tool: "shell".into(),
+            tool_call_id: Some("toolu_02DEF".into()),
+            duration: Duration::from_millis(3),
+            success: false,
+            arguments: Some(r#"{"command":"rm -rf /"}"#.into()),
+            result: Some("Error: command denied by allowlist policy".into()),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
+        });
+    }
+
     // ── §8.2 OTel export failure resilience tests ────────────
 
     #[test]
@@ -537,6 +769,9 @@ mod tests {
             error_message: Some("404 Not Found".into()),
             input_tokens: None,
             output_tokens: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
     }
 
@@ -556,6 +791,87 @@ mod tests {
         obs.record_metric(&ObserverMetric::TokensUsed(0));
         obs.record_metric(&ObserverMetric::ActiveSessions(0));
         obs.record_metric(&ObserverMetric::QueueDepth(0));
+    }
+
+    #[test]
+    fn turn_id_opens_and_closes_agent_span() {
+        let obs = test_observer();
+        obs.record_event(&ObserverEvent::AgentStart {
+            model_provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            channel: Some("wss".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
+        });
+
+        assert!(
+            obs.active_agent_spans
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key("turn-1"),
+            "AgentStart should open a live span keyed by turn_id"
+        );
+
+        obs.record_event(&ObserverEvent::LlmRequest {
+            model_provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            messages_count: 2,
+            channel: Some("wss".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
+        });
+        obs.record_event(&ObserverEvent::LlmResponse {
+            model_provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            duration: Duration::from_millis(25),
+            success: true,
+            error_message: None,
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            channel: Some("wss".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
+        });
+        obs.record_event(&ObserverEvent::ToolCallStart {
+            tool: "shell".into(),
+            tool_call_id: Some("call-1".into()),
+            arguments: Some(r#"{"command":"date"}"#.into()),
+            channel: Some("wss".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
+        });
+        obs.record_event(&ObserverEvent::ToolCall {
+            tool: "shell".into(),
+            tool_call_id: Some("call-1".into()),
+            duration: Duration::from_millis(5),
+            success: true,
+            arguments: Some(r#"{"command":"date"}"#.into()),
+            result: Some("Mon Apr 22 12:00:00 UTC 2026".into()),
+            channel: Some("wss".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
+        });
+        obs.record_event(&ObserverEvent::AgentEnd {
+            model_provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            duration: Duration::from_millis(50),
+            tokens_used: Some(zeroclaw_api::observability_traits::TurnTokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+            }),
+            cost_usd: None,
+            channel: Some("wss".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
+        });
+
+        assert!(
+            !obs.active_agent_spans
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key("turn-1"),
+            "AgentEnd should close the live span"
+        );
     }
 
     #[test]
@@ -594,11 +910,20 @@ mod tests {
             error_message: None,
             input_tokens: Some(10),
             output_tokens: Some(5),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(50),
             success: true,
+            arguments: None,
+            result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
     }
 

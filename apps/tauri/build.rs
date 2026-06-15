@@ -1,17 +1,12 @@
 fn main() {
     #[cfg(target_os = "windows")]
     {
-        let manifest = std::path::PathBuf::from(
-            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set"),
-        )
-        .join("windows")
-        .join("app.manifest");
-
-        println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
-        println!(
-            "cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}",
-            manifest.display()
+        let attrs = tauri_build::Attributes::new().windows_attributes(
+            tauri_build::WindowsAttributes::new()
+                .app_manifest(include_str!("windows/app.manifest")),
         );
+        tauri_build::try_build(attrs).expect("failed to run tauri_build");
+        return;
     }
 
     tauri_build::build();

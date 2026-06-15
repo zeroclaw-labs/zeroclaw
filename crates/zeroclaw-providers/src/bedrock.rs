@@ -470,6 +470,8 @@ struct ConverseRequest {
     inference_config: Option<InferenceConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_config: Option<ToolConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    additional_model_request_fields: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -492,6 +494,34 @@ enum ContentBlock {
     ToolResult(ToolResultWrapper),
     CachePointBlock(CachePointWrapper),
     Image(ImageWrapper),
+    /// Thinking block for round-tripping extended thinking in conversation
+    /// history. Required when thinking is enabled and assistant messages
+    /// contain tool_use blocks.
+    #[serde(rename = "reasoningContent")]
+    ReasoningContent(ReasoningContentOutWrapper),
+}
+
+/// Outgoing reasoning content block for request messages.
+/// Serializes as `{"reasoningContent": {"reasoningText": {"text": "..."}}}`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReasoningContentOutWrapper {
+    reasoning_content: ReasoningContentOutBlock,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReasoningContentOutBlock {
+    reasoning_text: ReasoningTextOutField,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ReasoningTextOutField {
+    text: String,
+    /// Signature for integrity verification — round-tripped from the
+    /// original thinking block returned by the model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -585,12 +615,29 @@ struct InferenceConfig {
     temperature: Option<f64>,
 }
 
-/// Some Bedrock models (the Claude opus-4-7 family) reject `temperature` in
-/// `inferenceConfig` with a 400 "temperature is deprecated for this model".
-/// Substring match covers region/profile prefixes (e.g. `us.anthropic.…`)
-/// and version suffixes (e.g. `-v1:0`).
-fn bedrock_model_omits_temperature(model: &str) -> bool {
-    model.contains("claude-opus-4-7")
+/// Whether a Bedrock model accepts the fixed-budget native-thinking shape
+/// (`additionalModelRequestFields.thinking = {"type": "enabled", "budget_tokens": N}`).
+/// AWS's Opus 4.7 model card states the model only supports adaptive thinking
+/// and rejects fixed budgets with a 400; until adaptive thinking is implemented,
+/// those models stay on prompt-based reasoning.
+/// AWS docs:
+/// <https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-4-7.html>
+fn bedrock_model_supports_native_thinking(model: &str) -> bool {
+    !model.contains("claude-opus-4-7")
+}
+
+/// Whether a Bedrock model accepts `cachePoint` blocks for prompt caching.
+///
+/// Only Anthropic Claude and Amazon Nova models support prompt caching on
+/// Bedrock; other families (Qwen, Llama, Mistral, DeepSeek, …) reject a request
+/// that contains a `cachePoint` with a 400: "You invoked an unsupported model or
+/// your request did not allow prompt caching". Caching is purely an
+/// optimization, so we allowlist the known-supported families and skip
+/// `cachePoint` insertion everywhere else rather than risk that error.
+/// AWS docs: <https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html>
+fn bedrock_model_supports_prompt_caching(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.contains("claude") || model.contains("nova")
 }
 
 #[derive(Debug, Serialize)]
@@ -657,15 +704,39 @@ struct ConverseOutputMessage {
 /// Response content blocks from the Converse API.
 ///
 /// Uses `#[serde(untagged)]` to match Bedrock's union format where `text` is a
-/// simple string value and `toolUse` is a nested object. Unknown block types
-/// (e.g. `reasoningContent`, `guardContent`) are captured as `Other` to prevent
-/// deserialization failures.
+/// simple string value and `toolUse` is a nested object. `reasoningContent`
+/// carries extended thinking output. Unknown block types (e.g. `guardContent`)
+/// are captured as `Other` to prevent deserialization failures.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum ResponseContentBlock {
     ToolUse(ResponseToolUseWrapper),
+    ReasoningContent(ReasoningContentWrapper),
     Text(TextBlock),
     Other(#[allow(dead_code)] serde_json::Value),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReasoningContentWrapper {
+    reasoning_content: ReasoningContentBlock,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReasoningContentBlock {
+    #[serde(default)]
+    reasoning_text: Option<ReasoningTextField>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReasoningTextField {
+    #[serde(default)]
+    text: Option<String>,
+    /// Signature for integrity verification — must be round-tripped
+    /// when sending thinking blocks back in conversation history.
+    #[serde(default)]
+    signature: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -677,7 +748,7 @@ struct ResponseToolUseWrapper {
 // ── BedrockModelProvider ─────────────────────────────────────────────
 
 pub struct BedrockModelProvider {
-    /// `[model_providers.<family>.<alias>]` config-key alias.
+    /// `[providers.models.<family>.<alias>]` config-key alias.
     alias: String,
     auth: Option<BedrockAuth>,
     max_tokens: u32,
@@ -1107,6 +1178,38 @@ impl BedrockModelProvider {
             .and_then(|v| serde_json::from_value::<Vec<ProviderToolCall>>(v.clone()).ok())?;
 
         let mut blocks = Vec::new();
+
+        // When extended thinking is enabled, assistant messages must start
+        // with reasoning content blocks (including signatures) before any
+        // tool_use blocks. The reasoning_content field stores JSON-encoded
+        // thinking blocks from the original response.
+        if let Some(reasoning) = value
+            .get("reasoning_content")
+            .and_then(serde_json::Value::as_str)
+            .filter(|r| !r.is_empty())
+        {
+            // reasoning_content may contain multiple JSON blocks joined by \n
+            for part in reasoning.split('\n') {
+                if let Ok(block) = serde_json::from_str::<serde_json::Value>(part) {
+                    let text = block
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let signature = block
+                        .get("signature")
+                        .and_then(|s| s.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string());
+                    blocks.push(ContentBlock::ReasoningContent(ReasoningContentOutWrapper {
+                        reasoning_content: ReasoningContentOutBlock {
+                            reasoning_text: ReasoningTextOutField { text, signature },
+                        },
+                    }));
+                }
+            }
+        }
+
         if let Some(text) = value
             .get("content")
             .and_then(serde_json::Value::as_str)
@@ -1183,6 +1286,7 @@ impl BedrockModelProvider {
 
     fn parse_converse_response(response: ConverseResponse) -> ProviderChatResponse {
         let mut text_parts = Vec::new();
+        let mut thinking_parts = Vec::new();
         let mut tool_calls = Vec::new();
 
         let usage = response.usage.map(|u| TokenUsage {
@@ -1202,6 +1306,16 @@ impl BedrockModelProvider {
                             text_parts.push(trimmed);
                         }
                     }
+                    ResponseContentBlock::ReasoningContent(wrapper) => {
+                        if let Some(reasoning_text) = wrapper.reasoning_content.reasoning_text {
+                            // Store as JSON with signature for round-tripping.
+                            let block = serde_json::json!({
+                                "text": reasoning_text.text.as_deref().unwrap_or(""),
+                                "signature": reasoning_text.signature.as_deref().unwrap_or(""),
+                            });
+                            thinking_parts.push(block.to_string());
+                        }
+                    }
                     ResponseContentBlock::ToolUse(wrapper) => {
                         if !wrapper.tool_use.name.is_empty() {
                             tool_calls.push(ProviderToolCall {
@@ -1217,6 +1331,12 @@ impl BedrockModelProvider {
             }
         }
 
+        let reasoning_content = if thinking_parts.is_empty() {
+            None
+        } else {
+            Some(thinking_parts.join("\n"))
+        };
+
         ProviderChatResponse {
             text: if text_parts.is_empty() {
                 None
@@ -1225,7 +1345,7 @@ impl BedrockModelProvider {
             },
             tool_calls,
             usage,
-            reasoning_content: None,
+            reasoning_content,
         }
     }
 
@@ -1346,6 +1466,7 @@ impl ModelProvider for BedrockModelProvider {
             native_tool_calling: true,
             vision: true,
             prompt_caching: false,
+            extended_thinking: true,
         }
     }
 
@@ -1376,14 +1497,14 @@ impl ModelProvider for BedrockModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let auth = self.resolve_auth().await?;
 
+        let supports_caching = bedrock_model_supports_prompt_caching(model);
         let system = system_prompt.map(|text| {
             let mut blocks = vec![SystemBlock::Text(TextBlock {
                 text: text.to_string(),
             })];
-            if Self::should_cache_system(text) {
+            if supports_caching && Self::should_cache_system(text) {
                 blocks.push(SystemBlock::CachePoint(CachePointWrapper {
                     cache_point: CachePoint::default_cache(),
                 }));
@@ -1402,13 +1523,10 @@ impl ModelProvider for BedrockModelProvider {
             messages,
             inference_config: Some(InferenceConfig {
                 max_tokens: self.max_tokens,
-                temperature: if bedrock_model_omits_temperature(model) {
-                    None
-                } else {
-                    Some(temperature)
-                },
+                temperature,
             }),
             tool_config: None,
+            additional_model_request_fields: None,
         };
 
         let response = self.send_converse_request(&auth, model, &request).await?;
@@ -1430,7 +1548,6 @@ impl ModelProvider for BedrockModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let auth = self.resolve_auth().await?;
 
         let (system_blocks, mut converse_messages) = Self::convert_messages(request.messages);
@@ -1438,12 +1555,17 @@ impl ModelProvider for BedrockModelProvider {
         // Strip empty text ContentBlocks that would cause Bedrock 400 errors.
         Self::sanitize_empty_content_blocks(&mut converse_messages);
 
+        // Prompt caching (cachePoint) is only accepted by Claude/Nova models;
+        // sending it to e.g. Qwen or Llama returns a 400. Gate all cachePoint
+        // insertion on model support (see issue #7312).
+        let supports_caching = bedrock_model_supports_prompt_caching(model);
+
         // Apply cachePoint to system if large.
         let system = system_blocks.map(|mut blocks| {
             let has_large_system = blocks
                 .iter()
                 .any(|b| matches!(b, SystemBlock::Text(tb) if Self::should_cache_system(&tb.text)));
-            if has_large_system {
+            if supports_caching && has_large_system {
                 blocks.push(SystemBlock::CachePoint(CachePointWrapper {
                     cache_point: CachePoint::default_cache(),
                 }));
@@ -1452,7 +1574,8 @@ impl ModelProvider for BedrockModelProvider {
         });
 
         // Apply cachePoint to last message if conversation is long.
-        if Self::should_cache_conversation(request.messages)
+        if supports_caching
+            && Self::should_cache_conversation(request.messages)
             && let Some(last_msg) = converse_messages.last_mut()
         {
             last_msg
@@ -1464,18 +1587,50 @@ impl ModelProvider for BedrockModelProvider {
 
         let tool_config = Self::convert_tools_to_converse(request.tools);
 
+        // Native thinking forces temperature=1.0 (Anthropic API requirement).
+        // Otherwise the caller's Option<f64> flows through verbatim; None
+        // omits the field via skip_serializing_if.
+        let (effective_temperature, additional_fields, effective_max_tokens) = match request
+            .thinking
+        {
+            Some(params) if bedrock_model_supports_native_thinking(model) => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"budget_tokens": params.budget_tokens})),
+                    "Bedrock native extended thinking enabled; forcing temperature=1.0"
+                );
+                let fields = serde_json::json!({
+                    "thinking": {
+                        "type": "enabled",
+                        "budget_tokens": params.budget_tokens
+                    }
+                });
+                let min_required = params.budget_tokens + 1;
+                let max_tokens = self.max_tokens.max(min_required);
+                (Some(1.0), Some(fields), max_tokens)
+            }
+            Some(_) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"model": model})),
+                    "Native extended thinking requested but model only supports adaptive thinking; falling back to prompt-based reasoning"
+                );
+                (temperature, None, self.max_tokens)
+            }
+            None => (temperature, None, self.max_tokens),
+        };
+
         let converse_request = ConverseRequest {
             system,
             messages: converse_messages,
             inference_config: Some(InferenceConfig {
-                max_tokens: self.max_tokens,
-                temperature: if bedrock_model_omits_temperature(model) {
-                    None
-                } else {
-                    Some(temperature)
-                },
+                max_tokens: effective_max_tokens,
+                temperature: effective_temperature,
             }),
             tool_config,
+            additional_model_request_fields: additional_fields,
         };
 
         let response = self
@@ -1917,6 +2072,7 @@ mod tests {
                 temperature: Some(0.7),
             }),
             tool_config: None,
+            additional_model_request_fields: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("system"));
@@ -1924,29 +2080,69 @@ mod tests {
         assert!(json.contains("maxTokens"));
     }
 
-    // ── Opus 4.7 temperature-omission tests (issue #6095) ────────
-
     #[test]
-    fn bedrock_model_omits_temperature_matches_opus_4_7() {
-        assert!(bedrock_model_omits_temperature(
+    fn bedrock_model_supports_native_thinking_excludes_opus_4_7() {
+        // Per AWS Bedrock model card, Opus 4.7 only supports adaptive thinking;
+        // fixed-budget native thinking returns a 400.
+        assert!(!bedrock_model_supports_native_thinking(
             "us.anthropic.claude-opus-4-7"
         ));
-        assert!(bedrock_model_omits_temperature(
+        assert!(!bedrock_model_supports_native_thinking(
             "anthropic.claude-opus-4-7-v1:0"
         ));
     }
 
     #[test]
-    fn bedrock_model_omits_temperature_skips_other_models() {
-        assert!(!bedrock_model_omits_temperature(
+    fn bedrock_model_supports_native_thinking_allows_other_models() {
+        assert!(bedrock_model_supports_native_thinking(
             "us.anthropic.claude-opus-4-6-v1"
         ));
-        assert!(!bedrock_model_omits_temperature(
+        assert!(bedrock_model_supports_native_thinking(
             "us.anthropic.claude-sonnet-4-6-v1"
         ));
-        assert!(!bedrock_model_omits_temperature(
+        assert!(bedrock_model_supports_native_thinking(
             "us.anthropic.claude-haiku-4-5-v1"
         ));
+    }
+
+    #[test]
+    fn prompt_caching_supported_for_claude_and_nova() {
+        for model in [
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "us.anthropic.claude-sonnet-4-6-v1",
+            "anthropic.claude-3-7-sonnet-20250219-v1:0",
+            "amazon.nova-pro-v1:0",
+            "us.amazon.nova-lite-v1:0",
+        ] {
+            assert!(
+                bedrock_model_supports_prompt_caching(model),
+                "expected prompt caching support for {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_caching_unsupported_for_other_families() {
+        // Regression for #7312: Qwen (and other non-Claude/Nova families) reject
+        // cachePoint blocks, so caching must be disabled for them.
+        for model in [
+            "qwen.qwen3-coder-next",
+            "meta.llama3-1-70b-instruct-v1:0",
+            "mistral.mistral-large-2407-v1:0",
+            "deepseek.r1-v1:0",
+        ] {
+            assert!(
+                !bedrock_model_supports_prompt_caching(model),
+                "expected NO prompt caching support for {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_caching_match_is_case_insensitive() {
+        assert!(bedrock_model_supports_prompt_caching("ANTHROPIC.CLAUDE-X"));
+        assert!(bedrock_model_supports_prompt_caching("Amazon.Nova-Pro"));
+        assert!(!bedrock_model_supports_prompt_caching("QWEN.qwen3"));
     }
 
     #[test]

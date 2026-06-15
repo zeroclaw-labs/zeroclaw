@@ -6,7 +6,18 @@
 /docs/book/po-extract/
 /docs/book/src/reference/cli.md
 /docs/book/src/reference/config.md
+/docs/book/src/zerocode/zerocode-theme-list.md
+/docs/book/src/_snippets/zerocode-pane-nav-keys.md
+/docs/book/src/_snippets/zerocode-quickstart-pane-keys.md
+/docs/book/src/_snippets/hardware-boards.md
+/docs/book/src/_snippets/hardware-transports.md
+/docs/book/src/_snippets/hardware-tools-base.md
+/docs/book/src/_snippets/hardware-tools-aardvark.md
+/docs/book/src/_snippets/hardware-release-targets.md
+/docs/book/src/_snippets/hardware-pi-targets.md
+/docs/book/src/_snippets/hardware-lowmem-lto.md
 /docs/book/theme/lang-switcher.js
+/docs/book/theme/pc-themes.css
 /docs/superpowers/plans
 /docs/superpowers/specs
 .secrets
@@ -95,3 +106,4 @@ web/src/lib/api-generated.ts
 # Generated OpenAPI spec (transient handoff for openapi-typescript)
 target/openapi.json
 /v[0-9]*.toml
+.worktrees/

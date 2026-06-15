@@ -203,6 +203,13 @@ impl SessionBackend for SessionStore {
     fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
         self.delete_session(session_key)
     }
+
+    /// Quick existence probe mirroring how `delete_session` decides whether
+    /// the session is on disk (#7126). Checking file presence is the same
+    /// O(1) `stat` that `delete_session` itself performs.
+    fn session_exists(&self, session_key: &str) -> bool {
+        self.session_path(session_key).exists()
+    }
 }
 
 #[cfg(test)]
@@ -489,6 +496,24 @@ mod tests {
         let deleted = backend.delete_session("trait_delete").unwrap();
         assert!(deleted);
         assert!(backend.load("trait_delete").is_empty());
+    }
+
+    // ── session_exists (#7126) ─────────────────────────────────────
+    #[test]
+    fn session_exists_tracks_lifecycle() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+
+        assert!(!backend.session_exists("ghost"));
+
+        backend
+            .append("ghost", &ChatMessage::user("first"))
+            .unwrap();
+        assert!(backend.session_exists("ghost"));
+
+        backend.delete_session("ghost").unwrap();
+        assert!(!backend.session_exists("ghost"));
     }
 
     // ── get_session_metadata (trait default) tests ──────────────────

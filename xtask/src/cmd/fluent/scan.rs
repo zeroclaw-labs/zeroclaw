@@ -3,21 +3,26 @@ use crate::util::*;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-pub fn run() -> anyhow::Result<()> {
+pub fn run(catalog: Option<&str>) -> anyhow::Result<()> {
     let root = repo_root();
-    let locales_dir = fluent_locales_dir(&root);
-    let en_dir = locales_dir.join("en");
 
-    if !en_dir.exists() {
-        anyhow::bail!("English locale dir not found: {}", en_dir.display());
-    }
-
-    // Collect all keys from en FTL files
+    // Collect all en keys across every catalogue root.
     let mut en_keys: HashSet<String> = HashSet::new();
-    for ftl_path in ftl_files_in(&en_dir)? {
-        for key in message_ids_from_file(&ftl_path)? {
-            en_keys.insert(key);
+    let mut found_en = false;
+    for locales_dir in fluent_catalog_roots_for(&root, catalog)? {
+        let en_dir = locales_dir.join("en");
+        if !en_dir.exists() {
+            continue;
         }
+        found_en = true;
+        for ftl_path in ftl_files_in(&en_dir)? {
+            for key in message_ids_from_file(&ftl_path)? {
+                en_keys.insert(key);
+            }
+        }
+    }
+    if !found_en {
+        anyhow::bail!("no fluent catalogue roots with an en/ dir found");
     }
 
     println!("==> {} keys in en FTL files", en_keys.len());
@@ -104,6 +109,7 @@ impl SourceIndex {
         let mut paths = Vec::new();
         collect_rs_files(&root.join("crates"), &mut paths)?;
         collect_rs_files(&root.join("src"), &mut paths)?;
+        collect_rs_files(&root.join("apps"), &mut paths)?;
 
         let files = paths
             .into_iter()

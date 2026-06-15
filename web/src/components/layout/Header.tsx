@@ -15,7 +15,9 @@ const routeTitles: Record<string, string> = {
   '/config': 'nav.config',
   '/logs': 'nav.logs',
   '/doctor': 'nav.doctor',
-  '/onboard': 'nav.onboard',
+  '/canvas': 'nav.canvas',
+  '/acp-console': 'nav.acp',
+  '/quickstart': 'nav.quickstart',
 };
 
 interface HeaderProps {
@@ -33,7 +35,7 @@ export default function Header({ onMenuToggle, onCollapseToggle, collapsed }: He
   const langRef = useRef<HTMLDivElement>(null);
 
   // Fall back to a plain title for unknown routes rather than mislabeling
-  // them as "Dashboard" — e.g. early /onboard hits before the entry was
+  // them as "Dashboard" — e.g. early /quickstart hits before the entry was
   // mapped here showed "Dashboard" for the first-run flow.
   const titleKey = routeTitles[location.pathname];
   const pageTitle = titleKey ? t(titleKey) : '';

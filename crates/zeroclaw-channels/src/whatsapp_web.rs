@@ -34,8 +34,10 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use tokio::select;
-use wa_rs_proto::whatsapp::device_props::PlatformType;
+use waproto::whatsapp::device_props::PlatformType;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+#[cfg(feature = "whatsapp-web")]
+use zeroclaw_api::media::MediaAttachment;
 #[cfg(not(feature = "whatsapp-web"))]
 use zeroclaw_runtime::i18n;
 
@@ -75,6 +77,8 @@ pub struct WhatsAppWebChannel {
     mention_only: bool,
     /// Bot phone number (digits only), resolved from pair_phone or device identity at runtime
     bot_phone: Arc<Mutex<Option<String>>>,
+    /// Bot LID number (digits only), resolved from device identity at runtime
+    bot_lid: Arc<Mutex<Option<String>>>,
     /// Usage mode (business vs personal policy filtering)
     mode: zeroclaw_config::schema::WhatsAppWebMode,
     /// DM policy when mode = personal
@@ -83,10 +87,12 @@ pub struct WhatsAppWebChannel {
     group_policy: zeroclaw_config::schema::WhatsAppChatPolicy,
     /// Whether to always respond in self-chat when mode = personal
     self_chat_mode: bool,
-    /// Bot handle for shutdown
-    bot_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Bot handle for shutdown.
+    /// whatsapp-rust 0.6: `Bot::run()` now returns `BotHandle` (a Future + abort)
+    /// rather than a tokio JoinHandle directly (oxidezap/whatsapp-rust BotHandle wrapper).
+    bot_handle: Arc<Mutex<Option<whatsapp_rust::bot::BotHandle>>>,
     /// Client handle for sending messages and typing indicators
-    client: Arc<Mutex<Option<Arc<wa_rs::Client>>>>,
+    client: Arc<Mutex<Option<Arc<whatsapp_rust::Client>>>>,
     /// Message sender channel
     tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ChannelMessage>>>>,
     /// Voice transcription (STT) config
@@ -159,6 +165,7 @@ impl WhatsAppWebChannel {
             peer_resolver,
             mention_only,
             bot_phone: Arc::new(Mutex::new(bot_phone)),
+            bot_lid: Arc::new(Mutex::new(None)),
             mode,
             dm_policy,
             group_policy,
@@ -217,7 +224,13 @@ impl WhatsAppWebChannel {
     #[cfg(feature = "whatsapp-web")]
     pub fn with_tts(mut self, config: &zeroclaw_config::schema::Config) -> Self {
         if config.tts.enabled {
-            match super::tts::TtsManager::from_config(config) {
+            // Bind the TTS manager to the agent that owns THIS channel so the
+            // voice reply uses that agent's `tts_provider`. Without this the
+            // shared manager resolves the lexicographically-smallest enabled
+            // agent, which silently breaks TTS when that agent has no
+            // `tts_provider` set (e.g. a background/delegate agent).
+            let owner = config.agent_for_channel(&format!("whatsapp.{}", self.alias));
+            match super::tts::TtsManager::from_config_for_agent(config, owner) {
                 Ok(m) => self.tts_manager = Some(Arc::new(m)),
                 Err(e) => ::zeroclaw_log::record!(
                     WARN,
@@ -261,20 +274,29 @@ impl WhatsAppWebChannel {
     }
 
     /// Check whether a phone number is allowed against a provided allowlist.
+    ///
+    /// The per-entry comparison is E.164 normalization, which the in-tree
+    /// `crate::allowlist::Match` modes can't express, so it goes through
+    /// `crate::allowlist::is_user_allowed_by` with a custom matcher. `phone`
+    /// is matched only after `normalize_phone_token`; a token with no canonical
+    /// form never matches. `allowed_numbers` is the caller's freshly-resolved
+    /// peer list, so no allowlist state is cached.
     #[cfg(feature = "whatsapp-web")]
     fn is_number_allowed_for_list(allowed_numbers: &[String], phone: &str) -> bool {
+        // This channel historically accepted a surrounding-whitespace wildcard
+        // (`entry.trim() == "*"`), which is broader than the shared helper's
+        // exact `"*"` check, so keep that pre-check here.
         if allowed_numbers.iter().any(|entry| entry.trim() == "*") {
             return true;
         }
-
-        let Some(phone_norm) = Self::normalize_phone_token(phone) else {
-            return false;
-        };
-
-        allowed_numbers.iter().any(|entry| {
-            Self::normalize_phone_token(entry)
-                .as_deref()
-                .is_some_and(|allowed_norm| allowed_norm == phone_norm)
+        crate::allowlist::is_user_allowed_by(allowed_numbers, phone, |entry, phone| {
+            match (
+                Self::normalize_phone_token(entry),
+                Self::normalize_phone_token(phone),
+            ) {
+                (Some(entry_norm), Some(phone_norm)) => entry_norm == phone_norm,
+                _ => false,
+            }
         })
     }
 
@@ -310,7 +332,7 @@ impl WhatsAppWebChannel {
     /// processed normally.
     #[cfg(feature = "whatsapp-web")]
     fn lid_rejection_diagnostic(
-        sender: &wa_rs_binary::jid::Jid,
+        sender: &wacore_binary::jid::Jid,
         mapped_phone: Option<&str>,
     ) -> String {
         if !sender.is_lid() {
@@ -332,8 +354,8 @@ impl WhatsAppWebChannel {
     /// Build normalized sender candidates from sender JID, optional alt JID, and optional LID->PN mapping.
     #[cfg(feature = "whatsapp-web")]
     fn sender_phone_candidates(
-        sender: &wa_rs_binary::jid::Jid,
-        sender_alt: Option<&wa_rs_binary::jid::Jid>,
+        sender: &wacore_binary::jid::Jid,
+        sender_alt: Option<&wacore_binary::jid::Jid>,
         mapped_phone: Option<&str>,
     ) -> Vec<String> {
         let mut candidates = Vec::new();
@@ -355,6 +377,30 @@ impl WhatsAppWebChannel {
         }
 
         candidates
+    }
+
+    /// Compute the reply target for a chat.
+    ///
+    /// As of whatsapp-rust 0.6+ with PR #636, the library handles LID→PN
+    /// resolution internally and requires consistent LID namespace throughout
+    /// the message stanza. We now pass the chat JID unchanged and let the
+    /// library handle addressing.
+    ///
+    /// Previously (pre-0.6), this function converted LID JIDs to phone JIDs
+    /// because LIDs couldn't receive messages directly. Now the library
+    /// expects LID format when the recipient is LID-addressed.
+    #[cfg(feature = "whatsapp-web")]
+    fn compute_reply_target(chat_jid: &str) -> String {
+        // Pass through unchanged - library handles LID resolution internally
+        chat_jid.to_string()
+    }
+
+    /// Resolve an outbound recipient. With whatsapp-rust 0.6+ and PR #636,
+    /// LID JIDs are handled internally by the library, so we pass through unchanged.
+    #[cfg(feature = "whatsapp-web")]
+    fn resolve_outbound_recipient(recipient: &str) -> String {
+        // Pass through unchanged - library handles LID resolution internally
+        recipient.trim().to_string()
     }
 
     /// Normalize phone number to E.164 format
@@ -410,14 +456,14 @@ impl WhatsAppWebChannel {
     /// - Full JIDs (e.g. "12345@s.whatsapp.net")
     /// - E.164-like numbers (e.g. "+1234567890")
     #[cfg(feature = "whatsapp-web")]
-    fn recipient_to_jid(&self, recipient: &str) -> Result<wa_rs_binary::jid::Jid> {
+    fn recipient_to_jid(&self, recipient: &str) -> Result<wacore_binary::jid::Jid> {
         let trimmed = recipient.trim();
         if trimmed.is_empty() {
             anyhow::bail!("Recipient cannot be empty");
         }
 
         if trimmed.contains('@') {
-            return trimmed.parse::<wa_rs_binary::jid::Jid>().map_err(|e| {
+            return trimmed.parse::<wacore_binary::jid::Jid>().map_err(|e| {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -437,7 +483,7 @@ impl WhatsAppWebChannel {
             anyhow::bail!("Recipient `{trimmed}` does not contain a valid phone number");
         }
 
-        Ok(wa_rs_binary::jid::Jid::pn(digits))
+        Ok(wacore_binary::jid::Jid::pn(digits))
     }
 
     // ── Reconnect state-machine helpers (used by listen() and tested directly) ──
@@ -488,8 +534,8 @@ impl WhatsAppWebChannel {
     /// transcription fails (all logged as warnings).
     #[cfg(feature = "whatsapp-web")]
     async fn try_transcribe_voice_note(
-        client: &wa_rs::Client,
-        audio: &wa_rs_proto::whatsapp::message::AudioMessage,
+        client: &whatsapp_rust::Client,
+        audio: &waproto::whatsapp::message::AudioMessage,
         transcription_config: Option<&zeroclaw_config::schema::TranscriptionConfig>,
         transcription_manager: Option<&super::transcription::TranscriptionManager>,
     ) -> Option<String> {
@@ -512,7 +558,7 @@ impl WhatsAppWebChannel {
         }
 
         // Download the encrypted audio
-        use wa_rs::download::Downloadable;
+        use whatsapp_rust::download::Downloadable;
         let audio_data = match client.download(audio as &dyn Downloadable).await {
             Ok(data) => data,
             Err(e) => {
@@ -576,15 +622,232 @@ impl WhatsAppWebChannel {
         }
     }
 
+    #[cfg(feature = "whatsapp-web")]
+    fn extract_context_info(
+        msg: &waproto::whatsapp::Message,
+    ) -> Option<&waproto::whatsapp::ContextInfo> {
+        use wacore::proto_helpers::MessageExt;
+        let base = msg.get_base_message();
+
+        if let Some(ref ext) = base.extended_text_message
+            && let Some(ref ctx) = ext.context_info
+        {
+            return Some(ctx);
+        }
+        if let Some(ref img) = base.image_message
+            && let Some(ref ctx) = img.context_info
+        {
+            return Some(ctx);
+        }
+        if let Some(ref vid) = base.video_message
+            && let Some(ref ctx) = vid.context_info
+        {
+            return Some(ctx);
+        }
+        if let Some(ref doc) = base.document_message
+            && let Some(ref ctx) = doc.context_info
+        {
+            return Some(ctx);
+        }
+        if let Some(ref aud) = base.audio_message
+            && let Some(ref ctx) = aud.context_info
+        {
+            return Some(ctx);
+        }
+        if let Some(ref stk) = base.sticker_message
+            && let Some(ref ctx) = stk.context_info
+        {
+            return Some(ctx);
+        }
+
+        None
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn extract_quoted_message(
+        msg: &waproto::whatsapp::Message,
+    ) -> Option<&waproto::whatsapp::Message> {
+        Self::extract_context_info(msg).and_then(|ctx| ctx.quoted_message.as_deref())
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn mime_extension(mime: &str, fallback: &str) -> String {
+        let subtype = mime
+            .split(';')
+            .next()
+            .and_then(|clean| clean.split_once('/').map(|(_, subtype)| subtype))
+            .and_then(|subtype| subtype.split('+').next())
+            .filter(|subtype| {
+                !subtype.is_empty()
+                    && subtype
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '.')
+            })
+            .unwrap_or(fallback);
+
+        match subtype {
+            "jpeg" => "jpg".to_string(),
+            "svg+xml" => "svg".to_string(),
+            other => other.to_string(),
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn push_downloaded_attachment(
+        client: &whatsapp_rust::Client,
+        downloadable: &dyn whatsapp_rust::download::Downloadable,
+        file_name: String,
+        mime_type: Option<String>,
+        attachments: &mut Vec<MediaAttachment>,
+    ) {
+        let data = match client.download(downloadable).await {
+            Ok(data) => data,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "file": file_name,
+                            "error": format!("{}", e),
+                        })),
+                    "failed to download WhatsApp media attachment"
+                );
+                return;
+            }
+        };
+
+        attachments.push(MediaAttachment {
+            file_name,
+            data,
+            mime_type,
+        });
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn collect_media_attachments(
+        client: &whatsapp_rust::Client,
+        msg: &waproto::whatsapp::Message,
+        file_prefix: &str,
+        include_audio: bool,
+        attachments: &mut Vec<MediaAttachment>,
+    ) {
+        use wacore::proto_helpers::MessageExt;
+        use whatsapp_rust::download::Downloadable;
+
+        let base = msg.get_base_message();
+
+        if let Some(ref image) = base.image_message {
+            let mime = image
+                .mimetype
+                .clone()
+                .unwrap_or_else(|| "image/jpeg".to_string());
+            let file_name = format!(
+                "{file_prefix}whatsapp-image.{}",
+                Self::mime_extension(&mime, "jpg")
+            );
+            Self::push_downloaded_attachment(
+                client,
+                image.as_ref() as &dyn Downloadable,
+                file_name,
+                Some(mime),
+                attachments,
+            )
+            .await;
+        }
+
+        if let Some(ref video) = base.video_message {
+            let mime = video
+                .mimetype
+                .clone()
+                .unwrap_or_else(|| "video/mp4".to_string());
+            let file_name = format!(
+                "{file_prefix}whatsapp-video.{}",
+                Self::mime_extension(&mime, "mp4")
+            );
+            Self::push_downloaded_attachment(
+                client,
+                video.as_ref() as &dyn Downloadable,
+                file_name,
+                Some(mime),
+                attachments,
+            )
+            .await;
+        }
+
+        if include_audio && let Some(ref audio) = base.audio_message {
+            let mime = audio
+                .mimetype
+                .clone()
+                .unwrap_or_else(|| "audio/ogg".to_string());
+            let file_name = format!(
+                "{file_prefix}whatsapp-audio.{}",
+                Self::mime_extension(&mime, "ogg")
+            );
+            Self::push_downloaded_attachment(
+                client,
+                audio.as_ref() as &dyn Downloadable,
+                file_name,
+                Some(mime),
+                attachments,
+            )
+            .await;
+        }
+
+        if let Some(ref sticker) = base.sticker_message {
+            let mime = sticker
+                .mimetype
+                .clone()
+                .unwrap_or_else(|| "image/webp".to_string());
+            let file_name = format!(
+                "{file_prefix}whatsapp-sticker.{}",
+                Self::mime_extension(&mime, "webp")
+            );
+            Self::push_downloaded_attachment(
+                client,
+                sticker.as_ref() as &dyn Downloadable,
+                file_name,
+                Some(mime),
+                attachments,
+            )
+            .await;
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn media_fallback_content(content: String, msg: &waproto::whatsapp::Message) -> String {
+        if !content.is_empty() {
+            return content;
+        }
+
+        use wacore::proto_helpers::MessageExt;
+        let base = msg.get_base_message();
+
+        if base.sticker_message.is_some() {
+            return "[Sticker]".to_string();
+        }
+        if base.image_message.is_some() {
+            return "[Image]".to_string();
+        }
+        if base.video_message.is_some() {
+            return "[Video]".to_string();
+        }
+        if base.document_message.is_some() {
+            return "[Document]".to_string();
+        }
+
+        String::new()
+    }
+
     /// Synthesize text to speech and send as a WhatsApp voice note (static version for spawned tasks).
     #[cfg(feature = "whatsapp-web")]
     async fn synthesize_voice_static(
-        client: &wa_rs::Client,
-        to: &wa_rs_binary::jid::Jid,
+        client: &whatsapp_rust::Client,
+        to: &wacore_binary::jid::Jid,
         text: &str,
         tts_manager: &super::tts::TtsManager,
     ) -> Result<()> {
-        let audio_bytes = tts_manager.synthesize(text).await?;
+        let audio_bytes = tts_manager.synthesize_opus(text).await?;
         let audio_len = audio_bytes.len();
         ::zeroclaw_log::record!(
             INFO,
@@ -596,9 +859,10 @@ impl WhatsAppWebChannel {
             anyhow::bail!("TTS returned empty audio");
         }
 
-        use wa_rs_core::download::MediaType;
+        use wacore::download::MediaType;
+        use whatsapp_rust::upload::UploadOptions;
         let upload = client
-            .upload(audio_bytes, MediaType::Audio)
+            .upload(audio_bytes, MediaType::Audio, UploadOptions::default())
             .await
             .map_err(|e| {
                 ::zeroclaw_log::record!(
@@ -621,17 +885,24 @@ impl WhatsAppWebChannel {
             )
         );
 
-        // Estimate duration: Opus at ~32kbps → bytes / 4000 ≈ seconds
+        // Estimate duration from file size: Opus at ~32 kbps → bytes / 4000 ≈ seconds
         #[allow(clippy::cast_possible_truncation)]
         let estimated_seconds = std::cmp::max(1, (upload.file_length / 4000) as u32);
 
-        let voice_msg = wa_rs_proto::whatsapp::Message {
-            audio_message: Some(Box::new(wa_rs_proto::whatsapp::message::AudioMessage {
+        // whatsapp-rust 0.6: UploadResponse cryptographic fields became
+        // `[u8; 32]` for type safety. Pull the Vec<u8> copies before
+        // consuming the strings so the partial-move on `upload.direct_path`
+        // doesn't bite.
+        let media_key = upload.media_key_vec();
+        let file_enc_sha256 = upload.file_enc_sha256_vec();
+        let file_sha256 = upload.file_sha256_vec();
+        let voice_msg = waproto::whatsapp::Message {
+            audio_message: Some(Box::new(waproto::whatsapp::message::AudioMessage {
                 url: Some(upload.url),
                 direct_path: Some(upload.direct_path),
-                media_key: Some(upload.media_key),
-                file_enc_sha256: Some(upload.file_enc_sha256),
-                file_sha256: Some(upload.file_sha256),
+                media_key: Some(media_key),
+                file_enc_sha256: Some(file_enc_sha256),
+                file_sha256: Some(file_sha256),
                 file_length: Some(upload.file_length),
                 mimetype: Some("audio/ogg; codecs=opus".to_string()),
                 ptt: Some(true),
@@ -670,68 +941,113 @@ impl WhatsAppWebChannel {
     #[cfg(feature = "whatsapp-web")]
     fn jid_digits(jid: &str) -> String {
         let user_part = jid.split_once('@').map(|(u, _)| u).unwrap_or(jid);
+        let user_part = user_part
+            .split_once(':')
+            .map(|(u, _)| u)
+            .unwrap_or(user_part);
         user_part.chars().filter(|c| c.is_ascii_digit()).collect()
     }
 
-    /// Extract mentioned JIDs from the base (unwrapped) message's context_info.
-    ///
-    /// Uses `get_base_message()` to see through ephemeral/view-once/edited/document wrappers,
-    /// matching the same unwrapping that `text_content()` performs.
-    ///
-    /// NOTE: Only checks `extended_text_message.context_info`. Media messages (image, video,
-    /// document) carry mentions in their own `context_info`, but `text_content()` already
-    /// ignores captions so those messages are filtered out upstream as empty text.
     #[cfg(feature = "whatsapp-web")]
-    fn extract_mentioned_jids(msg: &wa_rs_proto::whatsapp::Message) -> Vec<String> {
-        use wa_rs_core::proto_helpers::MessageExt;
-        let base = msg.get_base_message();
-
-        if let Some(ref ext) = base.extended_text_message
-            && let Some(ref ctx) = ext.context_info
-            && !ctx.mentioned_jid.is_empty()
-        {
-            return ctx.mentioned_jid.clone();
+    fn store_jid_digits(slot: &Arc<Mutex<Option<String>>>, jid: &str) -> Option<String> {
+        let digits = Self::jid_digits(jid);
+        if digits.is_empty() {
+            None
+        } else {
+            *slot.lock() = Some(digits.clone());
+            Some(digits)
         }
+    }
 
-        Vec::new()
+    #[cfg(feature = "whatsapp-web")]
+    fn jid_matches_bot(jid: &str, bot_phone: &str, bot_lid: Option<&str>) -> bool {
+        let digits = Self::jid_digits(jid);
+        !digits.is_empty()
+            && ((!bot_phone.is_empty() && digits == bot_phone)
+                || bot_lid.is_some_and(|lid| !lid.is_empty() && digits == lid))
+    }
+
+    /// Extract mentioned JIDs from the base (unwrapped) message's context_info.
+    #[cfg(feature = "whatsapp-web")]
+    fn extract_mentioned_jids(msg: &waproto::whatsapp::Message) -> Vec<String> {
+        Self::extract_context_info(msg)
+            .map(|ctx| ctx.mentioned_jid.clone())
+            .unwrap_or_default()
     }
 
     /// Check whether the bot is mentioned -- either structurally or via text fallback.
     #[cfg(feature = "whatsapp-web")]
-    fn contains_bot_mention(text: &str, mentioned_jids: &[String], bot_phone: &str) -> bool {
-        // 1. Structured: check if any mentioned_jid's digits match the bot's phone digits
+    fn contains_bot_mention(
+        text: &str,
+        mentioned_jids: &[String],
+        bot_phone: &str,
+        bot_lid: Option<&str>,
+    ) -> bool {
+        // 1. Structured: check if any mentioned_jid's digits match the bot's phone or LID digits
         for jid in mentioned_jids {
-            let digits = Self::jid_digits(jid);
-            if !digits.is_empty() && digits == bot_phone {
+            if Self::jid_matches_bot(jid, bot_phone, bot_lid) {
                 return true;
             }
         }
 
         // 2. Text fallback: word-boundary-aware match for @<bot_digits>.
         //    Scan all occurrences -- an earlier prefix false-match must not mask a later real mention.
-        let pattern = format!("@{bot_phone}");
-        let mut search_from = 0;
-        while let Some(rel_pos) = text[search_from..].find(&pattern) {
-            let pos = search_from + rel_pos;
-            let after_idx = pos + pattern.len();
-            // Leading boundary: @ must be preceded by whitespace or start-of-string
-            let leading_ok = pos == 0
-                || text[..pos]
-                    .chars()
-                    .next_back()
-                    .is_none_or(|ch| !ch.is_ascii_alphanumeric());
-            // Trailing boundary: character after digits must not be a digit
-            let trailing_ok = text[after_idx..]
-                .chars()
-                .next()
-                .is_none_or(|ch| !ch.is_ascii_digit());
-            if leading_ok && trailing_ok {
-                return true;
+        fn has_text_mention(text: &str, digits: &str) -> bool {
+            if digits.is_empty() {
+                return false;
             }
-            search_from = after_idx;
+
+            let pattern = format!("@{digits}");
+            let mut search_from = 0;
+            while let Some(rel_pos) = text[search_from..].find(&pattern) {
+                let pos = search_from + rel_pos;
+                let after_idx = pos + pattern.len();
+                let leading_ok = pos == 0
+                    || text[..pos]
+                        .chars()
+                        .next_back()
+                        .is_none_or(|ch| !ch.is_ascii_alphanumeric());
+                let trailing_ok = text[after_idx..]
+                    .chars()
+                    .next()
+                    .is_none_or(|ch| !ch.is_ascii_digit());
+                if leading_ok && trailing_ok {
+                    return true;
+                }
+                search_from = after_idx;
+            }
+            false
         }
 
-        false
+        has_text_mention(text, bot_phone) || bot_lid.is_some_and(|lid| has_text_mention(text, lid))
+    }
+
+    /// Extract the author JID of the message quoted by a reply.
+    #[cfg(feature = "whatsapp-web")]
+    fn extract_reply_participant(msg: &waproto::whatsapp::Message) -> Option<&str> {
+        Self::extract_context_info(msg).and_then(|ctx| ctx.participant.as_deref())
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn is_reply_to_bot(
+        msg: &waproto::whatsapp::Message,
+        bot_phone: &str,
+        bot_lid: Option<&str>,
+    ) -> bool {
+        Self::extract_reply_participant(msg)
+            .is_some_and(|participant| Self::jid_matches_bot(participant, bot_phone, bot_lid))
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn is_message_addressed_to_bot(
+        msg: &waproto::whatsapp::Message,
+        text: &str,
+        bot_phone: &str,
+        bot_lid: Option<&str>,
+    ) -> bool {
+        let mentioned_jids = Self::extract_mentioned_jids(msg);
+        Self::contains_bot_mention(text, &mentioned_jids, bot_phone, bot_lid)
+            || Self::is_reply_to_bot(msg, bot_phone, bot_lid)
     }
 }
 
@@ -805,7 +1121,8 @@ impl Channel for WhatsAppWebChannel {
             }
         }
 
-        let to = self.recipient_to_jid(&message.recipient)?;
+        let deliverable_recipient = Self::resolve_outbound_recipient(&message.recipient);
+        let to = self.recipient_to_jid(&deliverable_recipient)?;
 
         // Voice chat mode: send text normally AND queue a voice note of the
         // final answer. Only substantive messages (not tool outputs) are queued.
@@ -844,7 +1161,7 @@ impl Channel for WhatsAppWebChannel {
                 let to_clone = to.clone();
                 let recipient = message.recipient.clone();
                 let tts_manager = self.tts_manager.clone().unwrap();
-                tokio::spawn(async move {
+                zeroclaw_spawn::spawn!(async move {
                     // Wait 10 seconds — long enough for the agent to finish its
                     // full tool chain and send the final answer.
                     tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
@@ -901,16 +1218,23 @@ impl Channel for WhatsAppWebChannel {
         }
 
         // Send text message
-        let outgoing = wa_rs_proto::whatsapp::Message {
+        let outgoing = waproto::whatsapp::Message {
             conversation: Some(message.content.clone()),
             ..Default::default()
         };
 
-        let message_id = client.send_message(to, outgoing).await?;
+        // Box::pin the large future (~34KB) so it doesn't inflate the
+        // enclosing Send future's stack slot — clippy::large_futures.
+        // whatsapp-rust 0.6: send_message returns `SendResult { message_id, to }`
+        // instead of a bare `String` (oxidezap/whatsapp-rust#597).
+        let send_result = Box::pin(client.send_message(to, outgoing)).await?;
         ::zeroclaw_log::record!(
             DEBUG,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            &format!("sent text to {} (id: {})", message.recipient, message_id)
+            &format!(
+                "sent text to {} (id: {})",
+                message.recipient, send_result.message_id
+            )
         );
         Ok(())
     }
@@ -924,14 +1248,16 @@ impl Channel for WhatsAppWebChannel {
         // borrowing `self` for its 'static lifetime.
         let alias = std::sync::Arc::new(self.alias.clone());
 
-        use wa_rs::bot::Bot;
-        use wa_rs::pair_code::PairCodeOptions;
-        use wa_rs::store::{Device, DeviceStore};
-        use wa_rs_binary::jid::JidExt as _;
-        use wa_rs_core::proto_helpers::MessageExt;
-        use wa_rs_core::types::events::Event;
-        use wa_rs_tokio_transport::TokioWebSocketTransportFactory;
-        use wa_rs_ureq_http::UreqHttpClient;
+        use wacore::proto_helpers::MessageExt;
+        use wacore::store::DevicePropsOverride;
+        use wacore::types::events::Event;
+        use wacore_binary::jid::JidExt as _;
+        use whatsapp_rust::TokioRuntime;
+        use whatsapp_rust::bot::Bot;
+        use whatsapp_rust::pair_code::PairCodeOptions;
+        use whatsapp_rust::store::{Device, DeviceStore};
+        use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
+        use whatsapp_rust_ureq_http_client::UreqHttpClient;
 
         let retry_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
@@ -960,6 +1286,24 @@ impl Channel for WhatsAppWebChannel {
                     device.load_from_serializable(core_device);
                 } else {
                     anyhow::bail!("Device exists but failed to load");
+                }
+                if let Some(ref pn) = device.pn
+                    && let Some(digits) = Self::store_jid_digits(&self.bot_phone, pn.user())
+                {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        &format!("pre-resolved bot phone from saved session: +{}", digits)
+                    );
+                }
+                if let Some(ref lid) = device.lid
+                    && let Some(digits) = Self::store_jid_digits(&self.bot_lid, lid.user())
+                {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        &format!("pre-resolved bot LID from saved session: {}", digits)
+                    );
                 }
             } else {
                 ::zeroclaw_log::record!(
@@ -1000,17 +1344,25 @@ impl Channel for WhatsAppWebChannel {
             let wa_self_chat_mode = self.self_chat_mode;
             let mention_only = self.mention_only;
             let bot_phone_clone = self.bot_phone.clone();
+            let bot_lid_clone = self.bot_lid.clone();
             let wa_dm_mention_patterns = self.dm_mention_patterns.clone();
             let wa_group_mention_patterns = self.group_mention_patterns.clone();
 
+            // whatsapp-rust 0.6: BotBuilder gained a 4th typestate slot for the
+            // async runtime (oxidezap/whatsapp-rust#621). `with_runtime` is
+            // required before `.build()` resolves; we use the bundled
+            // `TokioRuntime`. `with_device_props` switched from three
+            // positional Options to a `DevicePropsOverride` builder
+            // (oxidezap/whatsapp-rust#586).
             let mut builder = Bot::builder()
                 .with_backend(backend)
                 .with_transport_factory(transport_factory)
                 .with_http_client(http_client)
+                .with_runtime(TokioRuntime)
                 .with_device_props(
-                    Some("ZeroClaw".to_string()),
-                    None,
-                    Some(PlatformType::Desktop),
+                    DevicePropsOverride::new()
+                        .with_os("ZeroClaw")
+                        .with_platform_type(PlatformType::Desktop),
                 )
                 .on_event({
                     let alias = Arc::clone(&alias);
@@ -1028,19 +1380,32 @@ impl Channel for WhatsAppWebChannel {
                     let wa_dm_policy = wa_dm_policy.clone();
                     let wa_group_policy = wa_group_policy.clone();
                     let bot_phone_inner = bot_phone_clone.clone();
+                    let bot_lid_inner = bot_lid_clone.clone();
                     let wa_dm_mention_patterns = wa_dm_mention_patterns.clone();
                     let wa_group_mention_patterns = wa_group_mention_patterns.clone();
                     async move {
-                        match event {
+                        // whatsapp-rust 0.6: event handlers receive `Arc<Event>`
+                        // per PR #613, so we match against `&*event` to get a
+                        // `&Event` reference and bind variant fields by ref.
+                        match &*event {
                             Event::Message(msg, info) => {
                                 let sender_jid = info.source.sender.clone();
                                 let sender_alt = info.source.sender_alt.clone();
                                 let sender = sender_jid.user().to_string();
-                                let _is_group = info.source.chat.is_group();
                                 let chat = info.source.chat.to_string();
 
+                                // whatsapp-rust 0.6: `Client::get_phone_number_from_lid`
+                                // was replaced by the unified `get_lid_pn_entry`
+                                // (oxidezap/whatsapp-rust#487). The new helper
+                                // returns the full LID↔phone entry; we extract
+                                // the phone field on hit, swallow lookup errors
+                                // back to `None` (consistent with the legacy
+                                // semantics — best-effort enrichment).
                                 let mapped_phone = if sender_jid.is_lid() {
-                                    client.get_phone_number_from_lid(&sender_jid.user).await
+                                    match client.get_lid_pn_entry(&sender_jid).await {
+                                        Ok(Some(entry)) => Some(entry.phone_number),
+                                        _ => None,
+                                    }
                                 } else {
                                     None
                                 };
@@ -1059,12 +1424,7 @@ impl Channel for WhatsAppWebChannel {
                                     .cloned();
 
                                 let is_group = info.source.is_group;
-
-                                // Phone-based reply target for self-chat.
-                                // LID JIDs (e.g. 76188559093817@lid) are internal
-                                // identifiers that cannot receive messages; replies
-                                // must go to the phone JID (digits@s.whatsapp.net).
-                                let mut reply_target = chat.clone();
+                                let reply_target = Self::compute_reply_target(&chat);
 
                                 // ── Personal-mode chat-type policy filtering ──
                                 if wa_mode == zeroclaw_config::schema::WhatsAppWebMode::Personal {
@@ -1084,20 +1444,6 @@ impl Channel for WhatsAppWebChannel {
                                             return;
                                         }
                                         // self_chat_mode=true: always process, skip further policy checks.
-                                        //
-                                        // When the chat JID is LID-based, replies
-                                        // won't be delivered. Convert to a phone
-                                        // JID so the reply shows up in the self-chat.
-                                        if info.source.chat.is_lid() {
-                                            let phone_digits = normalized
-                                                .as_ref()
-                                                .map(|n| n.chars().filter(|c| c.is_ascii_digit()).collect::<String>())
-                                                .filter(|d| !d.is_empty());
-                                            if let Some(digits) = phone_digits {
-                                                reply_target = format!("{digits}@s.whatsapp.net");
-                                                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"reply_target": reply_target})), "self-chat LID→phone reply target");
-                                            }
-                                        }
                                     } else if info.source.is_from_me
                                         && !fromme_outside_self_chat_is_operator_trigger(
                                             is_group,
@@ -1188,19 +1534,19 @@ impl Channel for WhatsAppWebChannel {
 
                                 // Use transcribed voice text, or fall back to text content.
                                 // Track whether this chat used a voice note so we reply in kind.
-                                // We store the chat JID (reply_target) since that's what send() receives.
                                 let content = if let Some(ref vt) = voice_text {
                                     if let Ok(mut vs) = voice_chats.lock() {
-                                        vs.insert(chat.clone());
+                                        vs.insert(reply_target.clone());
                                     }
                                     format!("[Voice] {vt}")
                                 } else {
                                     if let Ok(mut vs) = voice_chats.lock() {
-                                        vs.remove(&chat);
+                                        vs.remove(&reply_target);
                                     }
                                     let text = msg.text_content().unwrap_or("");
                                     text.trim().to_string()
                                 };
+                                let content = Self::media_fallback_content(content, msg);
 
                                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WhatsApp Web message received (sender_len={}, chat_len={}, content_len={})", sender.len(), chat.len(), content.len()));
                                 ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("WhatsApp Web message content: {}", content));
@@ -1213,15 +1559,12 @@ impl Channel for WhatsAppWebChannel {
                                 // mention_only: skip group messages without a bot mention
                                 if mention_only && is_group {
                                     let bot_phone = bot_phone_inner.lock();
-                                    if let Some(ref bp) = *bot_phone {
-                                        let mentioned_jids =
-                                            Self::extract_mentioned_jids(&msg);
-                                        if !Self::contains_bot_mention(
-                                            &content,
-                                            &mentioned_jids,
-                                            bp,
-                                        ) {
-                                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ignoring group message without bot mention");
+                                    let bot_lid = bot_lid_inner.lock();
+                                    if bot_phone.is_some() || bot_lid.is_some() {
+                                        let bp = bot_phone.as_deref().unwrap_or("");
+                                        let bl = bot_lid.as_deref();
+                                        if !Self::is_message_addressed_to_bot(msg, &content, bp, bl) {
+                                            ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ignoring group message not addressed to bot");
                                             return;
                                         }
                                     } else {
@@ -1250,21 +1593,42 @@ impl Channel for WhatsAppWebChannel {
                                         }
                                     };
 
+                                let mut attachments = Vec::new();
+                                Self::collect_media_attachments(
+                                    &client,
+                                    msg,
+                                    "",
+                                    false,
+                                    &mut attachments,
+                                )
+                                .await;
+                                if let Some(quoted) = Self::extract_quoted_message(msg) {
+                                    Self::collect_media_attachments(
+                                        &client,
+                                        quoted,
+                                        "quoted-",
+                                        true,
+                                        &mut attachments,
+                                    )
+                                    .await;
+                                }
+
                                 if let Err(e) = tx_inner
                                     .send(ChannelMessage {
                                         id: uuid::Uuid::new_v4().to_string(),
                                         channel: "whatsapp".to_string(),
                                         channel_alias: Some((*alias).clone()),
                                         sender: normalized.clone(),
-                                        // Reply to the originating chat JID (DM or group).
-                                        // For self-chat with LID JIDs, this is the
-                                        // resolved phone JID (see above).
+                                        // Reply to the originating chat JID (DM or group),
+                                        // passed through unchanged (library handles
+                                        // LID addressing internally).
                                         reply_target,
                                         content,
                                         timestamp: chrono::Utc::now().timestamp() as u64,
                                         thread_ts: None,
                                         interruption_scope_id: None,
-                    attachments: vec![],
+                                        attachments,
+                                        subject: None,
                                     })
                                     .await
                                 {
@@ -1279,17 +1643,18 @@ impl Channel for WhatsAppWebChannel {
                                     let device = client
                                         .persistence_manager()
                                         .get_device_snapshot()
-                                        .await;
-                                    if let Some(ref pn) = device.pn {
-                                        let phone = pn.user();
-                                        let digits: String = phone
-                                            .chars()
-                                            .filter(|c: &char| c.is_ascii_digit())
-                                            .collect();
-                                        if !digits.is_empty() {
-                                            *bot_phone_inner.lock() = Some(digits.clone());
-                                            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("resolved bot identity from device: +{}", digits));
-                                        }
+                                    .await;
+                                    if let Some(ref pn) = device.pn
+                                        && let Some(digits) =
+                                            Self::store_jid_digits(&bot_phone_inner, pn.user())
+                                    {
+                                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("resolved bot identity from device: +{}", digits));
+                                    }
+                                    if let Some(ref lid) = device.lid
+                                        && let Some(digits) =
+                                            Self::store_jid_digits(&bot_lid_inner, lid.user())
+                                    {
+                                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("resolved bot LID from device: {}", digits));
                                     }
                                 }
                             }
@@ -1310,7 +1675,7 @@ impl Channel for WhatsAppWebChannel {
                             }
                             Event::PairingQrCode { code, .. } => {
                                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "WhatsApp Web QR code received (scan with WhatsApp > Linked Devices)");
-                                match Self::render_pairing_qr(&code) {
+                                match Self::render_pairing_qr(code) {
                                     Ok(rendered) => {
                                         eprintln!();
                                         eprintln!(
@@ -1481,7 +1846,8 @@ impl Channel for WhatsAppWebChannel {
             }
         }
 
-        let to = self.recipient_to_jid(recipient)?;
+        let deliverable_recipient = Self::resolve_outbound_recipient(recipient);
+        let to = self.recipient_to_jid(&deliverable_recipient)?;
         client.chatstate().send_composing(&to).await.map_err(|e| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -1520,7 +1886,8 @@ impl Channel for WhatsAppWebChannel {
             }
         }
 
-        let to = self.recipient_to_jid(recipient)?;
+        let deliverable_recipient = Self::resolve_outbound_recipient(recipient);
+        let to = self.recipient_to_jid(&deliverable_recipient)?;
         client.chatstate().send_paused(&to).await.map_err(|e| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -1626,7 +1993,7 @@ impl Channel for WhatsAppWebChannel {
 mod tests {
     use super::*;
     #[cfg(feature = "whatsapp-web")]
-    use wa_rs_binary::jid::Jid;
+    use wacore_binary::jid::Jid;
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
@@ -1806,6 +2173,39 @@ mod tests {
         let candidates =
             WhatsAppWebChannel::sender_phone_candidates(&sender, None, Some("15551234567"));
         assert!(candidates.contains(&"+15551234567".to_string()));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn compute_reply_target_preserves_lid_dm() {
+        // LID DM → preserved as-is (library handles LID resolution internally)
+        let chat_jid = "76188559093817@lid";
+        let result = WhatsAppWebChannel::compute_reply_target(chat_jid);
+        assert_eq!(
+            result, chat_jid,
+            "LID DM must be preserved - library handles LID addressing natively"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn compute_reply_target_preserves_pn_dm() {
+        // PN DM → preserved as-is
+        let chat_jid = "15551234567@s.whatsapp.net";
+        let result = WhatsAppWebChannel::compute_reply_target(chat_jid);
+        assert_eq!(result, chat_jid, "PN DM must preserve original chat JID");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn compute_reply_target_preserves_group() {
+        // Group chat → preserved as-is
+        let chat_jid = "120363012345678901@g.us";
+        let result = WhatsAppWebChannel::compute_reply_target(chat_jid);
+        assert_eq!(
+            result, chat_jid,
+            "Group chat must preserve original chat JID"
+        );
     }
 
     // ── lid_rejection_diagnostic: scoped LID warning ────
@@ -2033,6 +2433,67 @@ mod tests {
 
     // ── Mention detection tests ──
 
+    #[cfg(feature = "whatsapp-web")]
+    fn extended_text_reply(
+        participant: &str,
+        mentioned_jids: &[&str],
+    ) -> waproto::whatsapp::Message {
+        waproto::whatsapp::Message {
+            extended_text_message: Some(Box::new(
+                waproto::whatsapp::message::ExtendedTextMessage {
+                    text: Some("expand the previous response".to_string()),
+                    context_info: Some(Box::new(waproto::whatsapp::ContextInfo {
+                        participant: Some(participant.to_string()),
+                        mentioned_jid: mentioned_jids
+                            .iter()
+                            .map(|jid| (*jid).to_string())
+                            .collect(),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn sticker_reply(
+        participant: &str,
+        quoted_message: Option<waproto::whatsapp::Message>,
+    ) -> waproto::whatsapp::Message {
+        waproto::whatsapp::Message {
+            sticker_message: Some(Box::new(waproto::whatsapp::message::StickerMessage {
+                mimetype: Some("image/webp".to_string()),
+                context_info: Some(Box::new(waproto::whatsapp::ContextInfo {
+                    participant: Some(participant.to_string()),
+                    quoted_message: quoted_message.map(Box::new),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn image_mention(mentioned_jids: &[&str]) -> waproto::whatsapp::Message {
+        waproto::whatsapp::Message {
+            image_message: Some(Box::new(waproto::whatsapp::message::ImageMessage {
+                mimetype: Some("image/jpeg".to_string()),
+                context_info: Some(Box::new(waproto::whatsapp::ContextInfo {
+                    mentioned_jid: mentioned_jids
+                        .iter()
+                        .map(|jid| (*jid).to_string())
+                        .collect(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn jid_digits_extracts_phone_from_jid() {
@@ -2054,12 +2515,14 @@ mod tests {
         assert!(WhatsAppWebChannel::contains_bot_mention(
             "hey @919211916069 check this",
             &jids,
-            "919211916069"
+            "919211916069",
+            None
         ));
         assert!(WhatsAppWebChannel::contains_bot_mention(
             "hey check this",
             &jids,
-            "919211916069"
+            "919211916069",
+            None
         ));
     }
 
@@ -2070,12 +2533,14 @@ mod tests {
         assert!(WhatsAppWebChannel::contains_bot_mention(
             "hey @919211916069 check this",
             &no_jids,
-            "919211916069"
+            "919211916069",
+            None
         ));
         assert!(WhatsAppWebChannel::contains_bot_mention(
             "hey @919211916069",
             &no_jids,
-            "919211916069"
+            "919211916069",
+            None
         ));
     }
 
@@ -2086,12 +2551,14 @@ mod tests {
         assert!(!WhatsAppWebChannel::contains_bot_mention(
             "hey @919211916069 check this",
             &no_jids,
-            "91921191606"
+            "91921191606",
+            None
         ));
         assert!(!WhatsAppWebChannel::contains_bot_mention(
             "hey @155512345678",
             &no_jids,
-            "15551234567"
+            "15551234567",
+            None
         ));
     }
 
@@ -2102,7 +2569,8 @@ mod tests {
         assert!(!WhatsAppWebChannel::contains_bot_mention(
             "just a regular message",
             &no_jids,
-            "919211916069"
+            "919211916069",
+            None
         ));
     }
 
@@ -2113,7 +2581,8 @@ mod tests {
         assert!(WhatsAppWebChannel::contains_bot_mention(
             "@9192119160691 real @919211916069",
             &no_jids,
-            "919211916069"
+            "919211916069",
+            None
         ));
     }
 
@@ -2124,7 +2593,178 @@ mod tests {
         assert!(!WhatsAppWebChannel::contains_bot_mention(
             "foo@919211916069 bar",
             &no_jids,
+            "919211916069",
+            None
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn jid_digits_strips_device_suffix() {
+        assert_eq!(
+            WhatsAppWebChannel::jid_digits("919211916069:16@s.whatsapp.net"),
             "919211916069"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::jid_digits("227728477442093:3@lid"),
+            "227728477442093"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn contains_bot_mention_matches_lid() {
+        let jids = vec!["227728477442093@lid".to_string()];
+        assert!(WhatsAppWebChannel::contains_bot_mention(
+            "hey @DisplayName check this",
+            &jids,
+            "6287778315246",
+            Some("227728477442093")
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn contains_bot_mention_matches_lid_when_phone_unknown() {
+        let jids = vec!["227728477442093@lid".to_string()];
+        assert!(WhatsAppWebChannel::contains_bot_mention(
+            "hey @DisplayName check this",
+            &jids,
+            "",
+            Some("227728477442093")
+        ));
+        assert!(!WhatsAppWebChannel::contains_bot_mention(
+            "plain @ mention",
+            &[],
+            "",
+            None
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn extract_mentioned_jids_reads_media_context_info() {
+        let msg = image_mention(&["100@s.whatsapp.net"]);
+        assert_eq!(
+            WhatsAppWebChannel::extract_mentioned_jids(&msg),
+            vec!["100@s.whatsapp.net".to_string()]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn message_addressed_to_bot_accepts_reply_to_phone_jid() {
+        let msg = extended_text_reply("100@s.whatsapp.net", &[]);
+        assert!(WhatsAppWebChannel::is_message_addressed_to_bot(
+            &msg,
+            "expand the previous response",
+            "100",
+            None,
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn message_addressed_to_bot_accepts_reply_to_lid_jid() {
+        let msg = extended_text_reply("200@lid", &[]);
+        assert!(WhatsAppWebChannel::is_message_addressed_to_bot(
+            &msg,
+            "expand the previous response",
+            "100",
+            Some("200"),
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn message_addressed_to_bot_accepts_media_reply_to_lid_jid() {
+        let msg = sticker_reply("200@lid", None);
+        assert!(WhatsAppWebChannel::is_message_addressed_to_bot(
+            &msg,
+            "[Sticker]",
+            "100",
+            Some("200"),
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn extract_quoted_message_reads_media_context_info() {
+        let quoted = waproto::whatsapp::Message {
+            image_message: Some(Box::new(waproto::whatsapp::message::ImageMessage {
+                mimetype: Some("image/png".to_string()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let msg = sticker_reply("200@lid", Some(quoted));
+        let quoted = WhatsAppWebChannel::extract_quoted_message(&msg)
+            .expect("sticker reply should expose the quoted message");
+        assert!(quoted.image_message.is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_fallback_content_keeps_sticker_messages_addressable() {
+        let msg = sticker_reply("200@lid", None);
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
+            "[Sticker]"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content("hello".to_string(), &msg),
+            "hello"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_fallback_content_leaves_non_media_messages_empty() {
+        let msg = waproto::whatsapp::Message::default();
+        assert_eq!(
+            WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
+            ""
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn mime_extension_uses_safe_subtype() {
+        assert_eq!(
+            WhatsAppWebChannel::mime_extension("image/jpeg; name=photo", "jpg"),
+            "jpg"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::mime_extension("application/vnd.ms-excel", "bin"),
+            "vnd.ms-excel"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::mime_extension("image/../../png", "bin"),
+            "bin"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn message_addressed_to_bot_rejects_reply_to_other_participant() {
+        let msg = extended_text_reply("300@s.whatsapp.net", &[]);
+        assert!(!WhatsAppWebChannel::is_message_addressed_to_bot(
+            &msg,
+            "expand the previous response",
+            "100",
+            Some("200"),
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn message_addressed_to_bot_accepts_explicit_mention_in_other_reply() {
+        let msg = extended_text_reply("300@s.whatsapp.net", &["100@s.whatsapp.net"]);
+        assert!(WhatsAppWebChannel::is_message_addressed_to_bot(
+            &msg,
+            "expand the previous response",
+            "100",
+            Some("200"),
         ));
     }
 
@@ -2147,6 +2787,7 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
         );
         assert_eq!(*ch.bot_phone.lock(), Some("919211916069".to_string()));
+        assert_eq!(*ch.bot_lid.lock(), None);
     }
 
     #[test]

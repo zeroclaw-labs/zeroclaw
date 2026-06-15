@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 /// Gemini model_provider supporting multiple authentication methods.
 pub struct GeminiModelProvider {
-    /// `[model_providers.gemini.<alias>]` config-key alias.
+    /// `[providers.models.gemini.<alias>]` config-key alias.
     alias: String,
     auth: Option<GeminiAuth>,
     oauth_project: Arc<tokio::sync::Mutex<Option<String>>>,
@@ -196,7 +196,8 @@ fn build_parts(content: &str) -> Vec<Part> {
 
 #[derive(Debug, Serialize, Clone)]
 struct GenerationConfig {
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
     #[serde(rename = "maxOutputTokens")]
     max_output_tokens: u32,
 }
@@ -334,6 +335,48 @@ const CLOUDCODE_PA_ENDPOINT: &str = "https://cloudcode-pa.googleapis.com/v1inter
 /// loadCodeAssist endpoint for resolving the project ID.
 const LOAD_CODE_ASSIST_ENDPOINT: &str =
     "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
+
+/// A `loadCodeAssist` project reference: a bare id string, or an object
+/// carrying `id` / `projectId`. Google returns either shape depending on
+/// whether the account already has an onboarded project.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ProjectRef {
+    Id(String),
+    Object {
+        #[serde(alias = "projectId")]
+        id: Option<String>,
+    },
+}
+
+impl ProjectRef {
+    fn into_id(self) -> Option<String> {
+        match self {
+            Self::Id(id) => Some(id),
+            Self::Object { id } => id,
+        }
+        .filter(|p| !p.trim().is_empty())
+    }
+}
+
+#[derive(Deserialize)]
+struct LoadCodeAssistResponse {
+    #[serde(rename = "cloudaicompanionProject")]
+    cloudaicompanion_project: Option<ProjectRef>,
+    #[serde(rename = "currentCloudaicompanionProject")]
+    current_cloudaicompanion_project: Option<ProjectRef>,
+}
+
+impl LoadCodeAssistResponse {
+    fn resolve_project_id(self) -> Option<String> {
+        self.cloudaicompanion_project
+            .and_then(ProjectRef::into_id)
+            .or_else(|| {
+                self.current_cloudaicompanion_project
+                    .and_then(ProjectRef::into_id)
+            })
+    }
+}
 
 /// Google AI Studio's Gemini endpoint.
 pub(crate) const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -526,7 +569,7 @@ impl GeminiModelProvider {
     /// Create a new Gemini model_provider.
     ///
     /// Authentication priority:
-    /// 1. Explicit API key passed in (from `[model_providers.gemini.<alias>]
+    /// 1. Explicit API key passed in (from `[providers.models.gemini.<alias>]
     ///    api_key`, reachable via the schema-mirror env grammar)
     /// 2. Gemini CLI OAuth tokens (`~/.gemini/oauth_creds.json`)
     pub fn new(alias: &str, api_key: Option<&str>) -> Self {
@@ -555,7 +598,7 @@ impl GeminiModelProvider {
     /// Create a new Gemini model_provider with managed OAuth from auth-profiles.json.
     ///
     /// Authentication priority:
-    /// 1. Explicit API key passed in (from `[model_providers.gemini.<alias>]`)
+    /// 1. Explicit API key passed in (from `[providers.models.gemini.<alias>]`)
     /// 2. Managed OAuth from auth-profiles.json (if auth_service provided)
     /// 3. Gemini CLI OAuth tokens (`~/.gemini/oauth_creds.json`)
     pub fn new_with_auth(
@@ -947,16 +990,9 @@ impl GeminiModelProvider {
             anyhow::bail!("loadCodeAssist failed (HTTP {status}): {body}");
         }
 
-        #[derive(Deserialize)]
-        struct LoadCodeAssistResponse {
-            #[serde(rename = "cloudaicompanionProject")]
-            cloudaicompanion_project: Option<String>,
-        }
-
         let result: LoadCodeAssistResponse = response.json().await?;
         let project = result
-            .cloudaicompanion_project
-            .filter(|p| !p.trim().is_empty())
+            .resolve_project_id()
             .or(project_seed)
             .ok_or_else(|| {
                 ::zeroclaw_log::record!(
@@ -1085,7 +1121,6 @@ impl GeminiModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<(String, Option<TokenUsage>)> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let (contents, system_instruction) = Self::build_chat_contents(messages, None);
         self.send_generate_content(contents, system_instruction, model, temperature)
             .await
@@ -1107,7 +1142,7 @@ impl GeminiModelProvider {
         contents: Vec<Content>,
         system_instruction: Option<Content>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
     ) -> anyhow::Result<(String, Option<TokenUsage>)> {
         let auth = self.auth.as_ref().ok_or_else(|| {
             ::zeroclaw_log::record!(
@@ -1123,7 +1158,7 @@ impl GeminiModelProvider {
                  2. Run `gemini` CLI to authenticate (tokens will be reused)\n\
                  3. Run `zeroclaw auth login --model-provider gemini`\n\
                  4. Get an API key from https://aistudio.google.com/app/apikey\n\
-                 5. Run `zeroclaw onboard` to configure",
+                 5. Run `zeroclaw quickstart --model-provider gemini --api-key <key>` to configure",
             )
         })?;
 
@@ -1377,6 +1412,7 @@ impl ModelProvider for GeminiModelProvider {
             vision: true,
             native_tool_calling: false,
             prompt_caching: false,
+            extended_thinking: false,
         }
     }
 
@@ -1387,7 +1423,6 @@ impl ModelProvider for GeminiModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let system_instruction = system_prompt.map(|sys| Content {
             role: None,
             parts: vec![Part::text(sys)],
@@ -1437,8 +1472,6 @@ impl ModelProvider for GeminiModelProvider {
         } else {
             None
         };
-
-        let temperature = temperature.unwrap_or(self.default_temperature());
         let (contents, system_instruction) =
             Self::build_chat_contents(request.messages, tool_instructions.as_deref());
         let (text, usage) = self
@@ -1581,6 +1614,71 @@ mod tests {
         );
         assert_eq!(GeminiModelProvider::normalize_non_empty(""), None);
         assert_eq!(GeminiModelProvider::normalize_non_empty(" \t\n"), None);
+    }
+
+    fn resolve(body: &str) -> Option<String> {
+        serde_json::from_str::<LoadCodeAssistResponse>(body)
+            .unwrap()
+            .resolve_project_id()
+    }
+
+    #[test]
+    fn load_code_assist_reads_bare_string_project() {
+        assert_eq!(
+            resolve(r#"{"cloudaicompanionProject":"my-proj"}"#),
+            Some("my-proj".into())
+        );
+    }
+
+    #[test]
+    fn load_code_assist_reads_object_id_and_project_id() {
+        assert_eq!(
+            resolve(r#"{"cloudaicompanionProject":{"id":"obj-proj"}}"#),
+            Some("obj-proj".into())
+        );
+        assert_eq!(
+            resolve(r#"{"cloudaicompanionProject":{"projectId":"alias-proj"}}"#),
+            Some("alias-proj".into())
+        );
+    }
+
+    #[test]
+    fn load_code_assist_falls_back_to_current_project() {
+        assert_eq!(
+            resolve(r#"{"currentCloudaicompanionProject":"current-proj"}"#),
+            Some("current-proj".into())
+        );
+        assert_eq!(
+            resolve(r#"{"currentCloudaicompanionProject":{"id":"current-obj"}}"#),
+            Some("current-obj".into())
+        );
+    }
+
+    #[test]
+    fn load_code_assist_prefers_primary_over_current() {
+        assert_eq!(
+            resolve(
+                r#"{"cloudaicompanionProject":"primary","currentCloudaicompanionProject":"current"}"#
+            ),
+            Some("primary".into())
+        );
+    }
+
+    #[test]
+    fn load_code_assist_skips_blank_primary_for_current() {
+        assert_eq!(
+            resolve(
+                r#"{"cloudaicompanionProject":"  ","currentCloudaicompanionProject":"current"}"#
+            ),
+            Some("current".into())
+        );
+    }
+
+    #[test]
+    fn load_code_assist_none_when_no_project_context() {
+        assert_eq!(resolve(r#"{}"#), None);
+        assert_eq!(resolve(r#"{"cloudaicompanionProject":{"id":null}}"#), None);
+        assert_eq!(resolve(r#"{"cloudaicompanionProject":""}"#), None);
     }
 
     #[test]
@@ -1761,7 +1859,7 @@ mod tests {
             }],
             system_instruction: None,
             generation_config: GenerationConfig {
-                temperature: 0.7,
+                temperature: Some(0.7),
                 max_output_tokens: 8192,
             },
         };
@@ -1800,7 +1898,7 @@ mod tests {
             }],
             system_instruction: None,
             generation_config: GenerationConfig {
-                temperature: 0.7,
+                temperature: Some(0.7),
                 max_output_tokens: 8192,
             },
         };
@@ -1843,7 +1941,7 @@ mod tests {
             }],
             system_instruction: None,
             generation_config: GenerationConfig {
-                temperature: 0.7,
+                temperature: Some(0.7),
                 max_output_tokens: 8192,
             },
         };
@@ -1876,7 +1974,7 @@ mod tests {
                 parts: vec![Part::text("You are helpful")],
             }),
             generation_config: GenerationConfig {
-                temperature: 0.7,
+                temperature: Some(0.7),
                 max_output_tokens: 8192,
             },
         };
@@ -1903,7 +2001,7 @@ mod tests {
                 }],
                 system_instruction: None,
                 generation_config: Some(GenerationConfig {
-                    temperature: 0.7,
+                    temperature: Some(0.7),
                     max_output_tokens: 8192,
                 }),
             },

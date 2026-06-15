@@ -1,9 +1,10 @@
 use crate::compatible::sse_bytes_to_events;
 use crate::multimodal;
+use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    ModelProvider, ProviderCapabilities, StreamError, StreamEvent, StreamOptions, StreamResult,
-    TokenUsage, ToolCall as ProviderToolCall,
+    ModelInfo, ModelProvider, ProviderCapabilities, StreamError, StreamEvent, StreamOptions,
+    StreamResult, TokenUsage, ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
 use futures_util::StreamExt as _;
@@ -14,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use zeroclaw_api::tool::ToolSpec;
 
 pub struct OpenRouterModelProvider {
-    /// `[model_providers.<family>.<alias>]` config-key alias.
+    /// `[providers.models.<family>.<alias>]` config-key alias.
     alias: String,
     credential: Option<String>,
     timeout_secs: u64,
@@ -30,7 +31,8 @@ const OPENROUTER_CONNECT_TIMEOUT_SECS: u64 = 10;
 struct ChatRequest {
     model: String,
     messages: Vec<Message>,
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
 }
@@ -46,22 +48,6 @@ struct Message {
 enum MessageContent {
     Text(String),
     Parts(Vec<MessagePart>),
-}
-
-/// RAII guard that aborts a spawned tokio task when dropped.
-///
-/// Used by `stream_chat` to bind the SSE-forwarding task's lifetime to the
-/// returned stream. When a caller cancels the stream (timeout, user abort,
-/// client disconnect), the guard is dropped together with the stream state
-/// and the in-flight HTTP request is cancelled so it stops consuming
-/// bandwidth and connection-pool slots. `AbortHandle::abort` is a no-op
-/// after the task has finished naturally, so the happy path is unaffected.
-struct AbortOnDrop(tokio::task::AbortHandle);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
 }
 
 /// Marker placed on a content block to opt it into OpenRouter prompt caching.
@@ -112,7 +98,8 @@ struct ResponseMessage {
 struct NativeChatRequest {
     model: String,
     messages: Vec<NativeMessage>,
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<NativeToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -331,6 +318,35 @@ impl OpenRouterModelProvider {
             .collect()
     }
 
+    fn build_chat_with_system_request(
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: Option<f64>,
+        max_tokens: Option<u32>,
+    ) -> ChatRequest {
+        let mut messages = Vec::new();
+
+        if let Some(sys) = system_prompt {
+            messages.push(Message {
+                role: "system".to_string(),
+                content: Self::to_message_content("system", sys),
+            });
+        }
+
+        messages.push(Message {
+            role: "user".to_string(),
+            content: Self::to_message_content("user", message),
+        });
+
+        ChatRequest {
+            model: model.to_string(),
+            messages,
+            temperature,
+            max_tokens,
+        }
+    }
+
     fn to_message_content(role: &str, content: &str) -> MessageContent {
         if role == "system" {
             // Serialize system messages as a single-text-part array so we can
@@ -408,7 +424,7 @@ impl OpenRouterModelProvider {
         response: reqwest::Response,
     ) -> anyhow::Result<String> {
         response.text().await.map_err(|error| {
-            let sanitized = super::sanitize_api_error(&format!("{}", error));
+            let sanitized = super::format_error_chain(&error);
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -498,6 +514,7 @@ impl ModelProvider for OpenRouterModelProvider {
             native_tool_calling: true,
             vision: true,
             prompt_caching: false,
+            extended_thinking: false,
         }
     }
 
@@ -540,6 +557,15 @@ impl ModelProvider for OpenRouterModelProvider {
         Ok(ids)
     }
 
+    async fn list_models_with_pricing(&self) -> anyhow::Result<Vec<ModelInfo>> {
+        // OpenRouter's public `/models` payload carries a `pricing` object per
+        // model. The default trait impl would discard it (delegates to
+        // `list_models` → `pricing: None`); override to surface pricing so the
+        // cost-rates editor can prefill rates for the first-class `openrouter`
+        // slot, matching the OpenAI-compatible vendor-fallback path.
+        crate::openrouter_catalog::list_all_models_with_pricing().await
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -556,32 +582,17 @@ impl ModelProvider for OpenRouterModelProvider {
                 "openrouter: API key not configured"
             );
             anyhow::Error::msg(
-                "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var.",
+                "OpenRouter API key not set. Set OPENROUTER_API_KEY env var or run `zeroclaw quickstart --model-provider openrouter --api-key <key>`.",
             )
         })?;
 
-        let temperature = temperature.unwrap_or(self.default_temperature());
-
-        let mut messages = Vec::new();
-
-        if let Some(sys) = system_prompt {
-            messages.push(Message {
-                role: "system".to_string(),
-                content: MessageContent::Text(sys.to_string()),
-            });
-        }
-
-        messages.push(Message {
-            role: "user".to_string(),
-            content: Self::to_message_content("user", message),
-        });
-
-        let request = ChatRequest {
-            model: model.to_string(),
-            messages,
+        let request = Self::build_chat_with_system_request(
+            system_prompt,
+            message,
+            model,
             temperature,
-            max_tokens: self.max_tokens,
-        };
+            self.max_tokens,
+        );
 
         let body = self.merge_extra_body(&request)?;
         let response = self
@@ -636,11 +647,9 @@ impl ModelProvider for OpenRouterModelProvider {
                 "openrouter: API key not configured"
             );
             anyhow::Error::msg(
-                "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var.",
+                "OpenRouter API key not set. Set OPENROUTER_API_KEY env var or run `zeroclaw quickstart --model-provider openrouter --api-key <key>`.",
             )
         })?;
-
-        let temperature = temperature.unwrap_or(self.default_temperature());
 
         let api_messages: Vec<Message> = messages
             .iter()
@@ -710,11 +719,9 @@ impl ModelProvider for OpenRouterModelProvider {
                 "openrouter: API key not configured"
             );
             anyhow::Error::msg(
-                "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var.",
+                "OpenRouter API key not set. Set OPENROUTER_API_KEY env var or run `zeroclaw quickstart --model-provider openrouter --api-key <key>`.",
             )
         })?;
-
-        let temperature = temperature.unwrap_or(self.default_temperature());
 
         let tools = Self::convert_tools(request.tools);
         let native_request = NativeChatRequest {
@@ -804,14 +811,12 @@ impl ModelProvider for OpenRouterModelProvider {
             None => {
                 return stream::once(async {
                     Err(StreamError::ModelProvider(
-                        "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var.".to_string(),
+                        "OpenRouter API key not set. Set OPENROUTER_API_KEY env var or run `zeroclaw quickstart --model-provider openrouter --api-key <key>`.".to_string(),
                     ))
                 })
                 .boxed();
             }
         };
-
-        let temperature = temperature.unwrap_or(self.default_temperature());
 
         let tools = Self::convert_tools(request.tools);
         let native_request = NativeChatRequest {
@@ -836,7 +841,7 @@ impl ModelProvider for OpenRouterModelProvider {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
-        let handle = tokio::spawn(async move {
+        let handle = ::zeroclaw_spawn::spawn!(async move {
             let response = match client
                 .post("https://openrouter.ai/api/v1/chat/completions")
                 .header("Authorization", format!("Bearer {credential}"))
@@ -849,7 +854,9 @@ impl ModelProvider for OpenRouterModelProvider {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = tx.send(Err(StreamError::Http(e.to_string()))).await;
+                    let _ = tx
+                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .await;
                     return;
                 }
             };
@@ -883,7 +890,7 @@ impl ModelProvider for OpenRouterModelProvider {
         // consuming OpenRouter quota for a request the caller no longer
         // wants. `AbortHandle::abort` is a no-op if the task has already
         // finished, so the happy path is unaffected.
-        let guard = AbortOnDrop(handle.abort_handle());
+        let guard = AbortOnDrop::new(handle.abort_handle());
 
         stream::unfold((rx, guard), |(mut rx, guard)| async move {
             rx.recv().await.map(|event| (event, (rx, guard)))
@@ -907,11 +914,9 @@ impl ModelProvider for OpenRouterModelProvider {
                 "openrouter: API key not configured"
             );
             anyhow::Error::msg(
-                "OpenRouter API key not set. Run `zeroclaw onboard` or set OPENROUTER_API_KEY env var.",
+                "OpenRouter API key not set. Set OPENROUTER_API_KEY env var or run `zeroclaw quickstart --model-provider openrouter --api-key <key>`.",
             )
         })?;
-
-        let temperature = temperature.unwrap_or(self.default_temperature());
 
         // Convert tool JSON values to NativeToolSpec
         let native_tools: Option<Vec<NativeToolSpec>> = if tools.is_empty() {
@@ -1069,6 +1074,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking: None,
         };
 
         let mut stream = model_provider.stream_chat(
@@ -1107,6 +1113,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking: None,
         };
 
         let mut stream = model_provider.stream_chat(
@@ -1131,7 +1138,7 @@ mod tests {
         let req = NativeChatRequest {
             model: "anthropic/claude-haiku-4-5".into(),
             messages: vec![],
-            temperature: 0.0,
+            temperature: Some(0.0),
             tools: None,
             tool_choice: None,
             max_tokens: None,
@@ -1146,7 +1153,7 @@ mod tests {
         let req = NativeChatRequest {
             model: "anthropic/claude-haiku-4-5".into(),
             messages: vec![],
-            temperature: 0.0,
+            temperature: Some(0.0),
             tools: None,
             tool_choice: None,
             max_tokens: None,
@@ -1231,28 +1238,30 @@ mod tests {
 
     #[test]
     fn chat_request_serializes_with_system_and_user() {
-        let request = ChatRequest {
-            model: "anthropic/claude-sonnet-4".into(),
-            messages: vec![
-                Message {
-                    role: "system".into(),
-                    content: MessageContent::Text("You are helpful".into()),
-                },
-                Message {
-                    role: "user".into(),
-                    content: MessageContent::Text("Summarize this".into()),
-                },
-            ],
-            temperature: 0.5,
-            max_tokens: None,
-        };
+        let request = OpenRouterModelProvider::build_chat_with_system_request(
+            Some("You are helpful"),
+            "Summarize this",
+            "anthropic/claude-sonnet-4",
+            Some(0.5),
+            None,
+        );
 
-        let json = serde_json::to_string(&request).unwrap();
+        let json = serde_json::to_value(&request).unwrap();
+        let messages = json["messages"]
+            .as_array()
+            .expect("messages should serialize as an array");
+        let system_parts = messages[0]["content"]
+            .as_array()
+            .expect("system content should use content parts");
 
-        assert!(json.contains("anthropic/claude-sonnet-4"));
-        assert!(json.contains("\"role\":\"system\""));
-        assert!(json.contains("\"role\":\"user\""));
-        assert!(json.contains("\"temperature\":0.5"));
+        assert_eq!(json["model"], "anthropic/claude-sonnet-4");
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(system_parts[0]["type"], "text");
+        assert_eq!(system_parts[0]["text"], "You are helpful");
+        assert_eq!(system_parts[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "Summarize this");
+        assert_eq!(json["temperature"], 0.5);
     }
 
     #[test]
@@ -1277,7 +1286,7 @@ mod tests {
                     content: MessageContent::Text(msg.content.clone()),
                 })
                 .collect(),
-            temperature: 0.0,
+            temperature: Some(0.0),
             max_tokens: None,
         };
 
@@ -1967,7 +1976,7 @@ mod tests {
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![],
-            temperature: 0.5,
+            temperature: Some(0.5),
             max_tokens: None,
         };
 
@@ -1983,7 +1992,7 @@ mod tests {
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![],
-            temperature: 0.5,
+            temperature: Some(0.5),
             max_tokens: None,
         };
 
@@ -1999,7 +2008,7 @@ mod tests {
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![],
-            temperature: 0.5,
+            temperature: Some(0.5),
             max_tokens: None,
         };
 
@@ -2020,7 +2029,7 @@ mod tests {
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![],
-            temperature: 0.5,
+            temperature: Some(0.5),
             max_tokens: None,
         };
 
@@ -2036,7 +2045,7 @@ mod tests {
         let request = ChatRequest {
             model: "test-model".into(),
             messages: vec![],
-            temperature: 0.5,
+            temperature: Some(0.5),
             max_tokens: None,
         };
 
@@ -2057,7 +2066,7 @@ mod tests {
         let request = NativeChatRequest {
             model: "anthropic/claude-sonnet-4".into(),
             messages: vec![],
-            temperature: 0.7,
+            temperature: Some(0.7),
             tools: None,
             tool_choice: None,
             max_tokens: None,
@@ -2086,12 +2095,12 @@ mod tests {
         let finished = Arc::new(AtomicBool::new(false));
         let finished_clone = Arc::clone(&finished);
 
-        let handle = tokio::spawn(async move {
+        let handle = zeroclaw_spawn::spawn!(async move {
             tokio::time::sleep(Duration::from_secs(30)).await;
             finished_clone.store(true, Ordering::SeqCst);
         });
         let raw_handle = handle.abort_handle();
-        let guard = AbortOnDrop(handle.abort_handle());
+        let guard = AbortOnDrop::new(handle.abort_handle());
 
         assert!(!raw_handle.is_finished());
 

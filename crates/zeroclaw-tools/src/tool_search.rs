@@ -16,10 +16,67 @@ use zeroclaw_api::tool::{Tool, ToolResult};
 /// Default maximum number of search results.
 const DEFAULT_MAX_RESULTS: usize = 5;
 
+type ActivationHook = Arc<dyn Fn(Arc<dyn Tool>) + Send + Sync>;
+
+/// Tool-level access policy applied at discovery time.
+///
+/// When set on `ToolSearchTool`, deferred tools that fail this check are
+/// never surfaced to the LLM and never activated — keeping them out of
+/// the context window entirely.
+#[derive(Clone, Default)]
+pub struct ToolAccessPolicy {
+    pub allowed: Option<Vec<String>>,
+    pub denied: Option<Vec<String>>,
+}
+
+impl ToolAccessPolicy {
+    /// Construct from a `SecurityPolicy`'s tool fields and an optional
+    /// caller-supplied allowlist. Used by both `run()` and
+    /// `process_message()` to keep policy construction in sync.
+    pub fn from_security(
+        allowed_tools: Option<&[String]>,
+        excluded_tools: Option<&[String]>,
+        caller_allowed: Option<&[String]>,
+    ) -> Option<Self> {
+        let mut policy = Self::default();
+        if let Some(list) = allowed_tools {
+            let mut merged = list.to_vec();
+            if let Some(caller) = caller_allowed {
+                merged.retain(|t| caller.iter().any(|c| c == t));
+            }
+            policy.allowed = Some(merged);
+        } else if let Some(caller) = caller_allowed {
+            policy.allowed = Some(caller.to_vec());
+        }
+        if let Some(list) = excluded_tools {
+            policy.denied = Some(list.to_vec());
+        }
+        if policy.allowed.is_some() || policy.denied.is_some() {
+            Some(policy)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_tool_allowed(&self, name: &str) -> bool {
+        let in_allow = self
+            .allowed
+            .as_ref()
+            .is_none_or(|list| list.iter().any(|t| t == name));
+        let in_deny = self
+            .denied
+            .as_ref()
+            .is_some_and(|list| list.iter().any(|t| t == name));
+        in_allow && !in_deny
+    }
+}
+
 /// Built-in tool that fetches full schemas for deferred MCP tools.
 pub struct ToolSearchTool {
     deferred: DeferredMcpToolSet,
     activated: Arc<Mutex<ActivatedToolSet>>,
+    access_policy: Option<ToolAccessPolicy>,
+    activation_hook: Option<ActivationHook>,
 }
 
 impl ToolSearchTool {
@@ -27,6 +84,32 @@ impl ToolSearchTool {
         Self {
             deferred,
             activated,
+            access_policy: None,
+            activation_hook: None,
+        }
+    }
+
+    pub fn with_access_policy(mut self, policy: ToolAccessPolicy) -> Self {
+        self.access_policy = Some(policy);
+        self
+    }
+
+    pub fn with_activation_hook(mut self, hook: ActivationHook) -> Self {
+        self.activation_hook = Some(hook);
+        self
+    }
+
+    fn is_allowed(&self, tool_name: &str) -> bool {
+        self.access_policy
+            .as_ref()
+            .is_none_or(|p| p.is_tool_allowed(tool_name))
+    }
+
+    fn notify_activated(&self, tools: Vec<Arc<dyn Tool>>) {
+        if let Some(hook) = &self.activation_hook {
+            for tool in tools {
+                hook(tool);
+            }
         }
     }
 }
@@ -88,8 +171,15 @@ impl Tool for ToolSearchTool {
             return self.select_tools(&names);
         }
 
-        // Keyword search mode
-        let results = self.deferred.search(query, max_results);
+        // Keyword search mode.
+        // When a policy is active, fetch all matches so denied tools don't
+        // consume result slots. The max_results cap is applied after filtering.
+        let search_limit = if self.access_policy.is_some() {
+            usize::MAX
+        } else {
+            max_results
+        };
+        let results = self.deferred.search(query, search_limit);
         if results.is_empty() {
             return Ok(ToolResult {
                 success: true,
@@ -98,17 +188,35 @@ impl Tool for ToolSearchTool {
             });
         }
 
-        // Activate and return full specs
+        // Activate and return full specs (policy-filtered, then capped)
         let mut output = String::from("<functions>\n");
         let mut activated_count = 0;
+        let mut returned_count = 0;
+        let mut newly_activated = Vec::new();
         let mut guard = self.activated.lock().unwrap();
 
         for stub in &results {
+            if returned_count >= max_results {
+                break;
+            }
+            if !self.is_allowed(&stub.prefixed_name) {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    &format!(
+                        "tool_search: '{}' matched query but denied by access policy",
+                        stub.prefixed_name
+                    )
+                );
+                continue;
+            }
             if let Some(spec) = self.deferred.tool_spec(&stub.prefixed_name) {
                 if !guard.is_activated(&stub.prefixed_name)
                     && let Some(tool) = self.deferred.activate(&stub.prefixed_name)
                 {
-                    guard.activate(stub.prefixed_name.clone(), Arc::from(tool));
+                    let tool: Arc<dyn Tool> = Arc::from(tool);
+                    guard.activate(stub.prefixed_name.clone(), Arc::clone(&tool));
+                    newly_activated.push(tool);
                     activated_count += 1;
                 }
                 let _ = writeln!(
@@ -118,11 +226,13 @@ impl Tool for ToolSearchTool {
                     spec.description.replace('"', "\\\""),
                     spec.parameters
                 );
+                returned_count += 1;
             }
         }
 
         output.push_str("</functions>\n");
         drop(guard);
+        self.notify_activated(newly_activated);
 
         ::zeroclaw_log::record!(
             DEBUG,
@@ -146,10 +256,20 @@ impl ToolSearchTool {
         let mut output = String::from("<functions>\n");
         let mut not_found = Vec::new();
         let mut activated_count = 0;
+        let mut newly_activated = Vec::new();
         let mut guard = self.activated.lock().unwrap();
 
         for name in names {
             if name.is_empty() {
+                continue;
+            }
+            if !self.is_allowed(name) {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    &format!("tool_search select: '{}' denied by access policy", name)
+                );
+                not_found.push(*name);
                 continue;
             }
             match self.deferred.tool_spec(name) {
@@ -157,7 +277,9 @@ impl ToolSearchTool {
                     if !guard.is_activated(name)
                         && let Some(tool) = self.deferred.activate(name)
                     {
-                        guard.activate(String::from(*name), Arc::from(tool));
+                        let tool: Arc<dyn Tool> = Arc::from(tool);
+                        guard.activate(String::from(*name), Arc::clone(&tool));
+                        newly_activated.push(tool);
                         activated_count += 1;
                     }
                     let _ = writeln!(
@@ -176,6 +298,7 @@ impl ToolSearchTool {
 
         output.push_str("</functions>\n");
         drop(guard);
+        self.notify_activated(newly_activated);
 
         if !not_found.is_empty() {
             let _ = write!(output, "\nNot found: {}", not_found.join(", "));
@@ -372,5 +495,142 @@ mod tests {
             .unwrap();
 
         assert_eq!(activated.lock().unwrap().tool_specs().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn activation_hook_receives_newly_activated_tools_once() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_hook = Arc::clone(&seen);
+        let tool = ToolSearchTool::new(
+            make_deferred_set(vec![make_stub("srv__tool", "A tool")]).await,
+            Arc::clone(&activated),
+        )
+        .with_activation_hook(Arc::new(move |tool| {
+            seen_hook.lock().unwrap().push(tool.name().to_string());
+        }));
+
+        tool.execute(serde_json::json!({"query": "select:srv__tool"}))
+            .await
+            .unwrap();
+        tool.execute(serde_json::json!({"query": "select:srv__tool"}))
+            .await
+            .unwrap();
+
+        assert_eq!(seen.lock().unwrap().as_slice(), ["srv__tool"]);
+    }
+
+    #[test]
+    fn policy_none_is_unrestricted() {
+        let p = ToolAccessPolicy::default();
+        assert!(p.is_tool_allowed("shell"));
+        assert!(p.is_tool_allowed("anything"));
+    }
+
+    #[test]
+    fn policy_allowlist_admits_only_listed() {
+        let p = ToolAccessPolicy {
+            allowed: Some(vec!["shell".into(), "file_read".into()]),
+            denied: None,
+        };
+        assert!(p.is_tool_allowed("shell"));
+        assert!(!p.is_tool_allowed("file_write"));
+    }
+
+    #[test]
+    fn policy_denylist_rejects_listed() {
+        let p = ToolAccessPolicy {
+            allowed: None,
+            denied: Some(vec!["shell".into()]),
+        };
+        assert!(!p.is_tool_allowed("shell"));
+        assert!(p.is_tool_allowed("file_read"));
+    }
+
+    #[test]
+    fn policy_deny_overrides_allow() {
+        let p = ToolAccessPolicy {
+            allowed: Some(vec!["shell".into(), "file_read".into()]),
+            denied: Some(vec!["shell".into()]),
+        };
+        assert!(!p.is_tool_allowed("shell"));
+        assert!(p.is_tool_allowed("file_read"));
+    }
+
+    #[tokio::test]
+    async fn policy_filters_keyword_search_results() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let stubs = vec![
+            make_stub("srv__allowed_tool", "An allowed tool"),
+            make_stub("srv__blocked_tool", "A blocked tool"),
+        ];
+        let policy = ToolAccessPolicy {
+            allowed: None,
+            denied: Some(vec!["srv__blocked_tool".into()]),
+        };
+        let tool = ToolSearchTool::new(make_deferred_set(stubs).await, Arc::clone(&activated))
+            .with_access_policy(policy);
+
+        let result = tool
+            .execute(serde_json::json!({"query": "tool"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("srv__allowed_tool"));
+        assert!(!result.output.contains("srv__blocked_tool"));
+        assert!(!activated.lock().unwrap().is_activated("srv__blocked_tool"));
+    }
+
+    #[tokio::test]
+    async fn policy_denied_tool_does_not_consume_max_results_slot() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        // "denied_tool" ranks higher (more keyword matches) but is blocked.
+        // "allowed_tool" ranks lower but should still be returned with max_results=1.
+        let stubs = vec![
+            make_stub("srv__denied_tool", "tool for searching files"),
+            make_stub("srv__allowed_tool", "tool for files"),
+        ];
+        let policy = ToolAccessPolicy {
+            allowed: None,
+            denied: Some(vec!["srv__denied_tool".into()]),
+        };
+        let tool = ToolSearchTool::new(make_deferred_set(stubs).await, Arc::clone(&activated))
+            .with_access_policy(policy);
+
+        let result = tool
+            .execute(serde_json::json!({"query": "searching files", "max_results": 1}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        // The allowed tool should be returned even though max_results=1
+        // and the denied tool ranked higher.
+        assert!(result.output.contains("srv__allowed_tool"));
+        assert!(!result.output.contains("srv__denied_tool"));
+        assert!(activated.lock().unwrap().is_activated("srv__allowed_tool"));
+    }
+
+    #[tokio::test]
+    async fn policy_filters_select_results() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let stubs = vec![
+            make_stub("srv__ok", "OK tool"),
+            make_stub("srv__nope", "Blocked tool"),
+        ];
+        let policy = ToolAccessPolicy {
+            allowed: Some(vec!["srv__ok".into()]),
+            denied: None,
+        };
+        let tool = ToolSearchTool::new(make_deferred_set(stubs).await, Arc::clone(&activated))
+            .with_access_policy(policy);
+
+        let result = tool
+            .execute(serde_json::json!({"query": "select:srv__ok,srv__nope"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("srv__ok"));
+        assert!(!result.output.contains("\"name\": \"srv__nope\""));
+        assert!(result.output.contains("Not found"));
+        assert!(!activated.lock().unwrap().is_activated("srv__nope"));
     }
 }

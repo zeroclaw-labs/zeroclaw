@@ -3,33 +3,48 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 (() => {
-    const darkThemes = ['ayu', 'navy', 'coal'];
-    const lightThemes = ['light', 'rust'];
-
-    const classList = document.getElementsByTagName('html')[0].classList;
-
-    let lastThemeWasLight = true;
-    for (const cssClass of classList) {
-        if (darkThemes.includes(cssClass)) {
-            lastThemeWasLight = false;
-            break;
-        }
+    // Resolve dark/light from the active theme's --color-scheme, which
+    // pc-themes.css sets per dashboard theme (html.<id>). This works for all
+    // themes without hardcoding their names; falls back to the OS preference.
+    function isLight() {
+        const scheme = getComputedStyle(document.documentElement)
+            .getPropertyValue('--color-scheme')
+            .trim();
+        if (scheme === 'light') return true;
+        if (scheme === 'dark') return false;
+        return !window.matchMedia('(prefers-color-scheme: dark)').matches;
     }
 
-    const theme = lastThemeWasLight ? 'default' : 'dark';
-    // Accessibility: larger default font and high-contrast strokes so diagrams
-    // stay legible for readers with low vision or colourblindness. Values tuned
-    // for both the ayu dark and light mdbook themes.
+    function cssVar(name, fallback) {
+        const v = getComputedStyle(document.documentElement)
+            .getPropertyValue(name)
+            .trim();
+        return v || fallback;
+    }
+
+    const light = isLight();
+
+    // Theme mermaid from our --pc-* tokens so nodes/edges/text track the
+    // active dashboard theme and stay legible on any background.
     mermaid.initialize({
         startOnLoad: true,
-        theme,
+        theme: 'base',
         themeVariables: {
             fontSize: '18px',
-            fontFamily: 'ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif',
-            primaryBorderColor: lastThemeWasLight ? '#1f2937' : '#e5e7eb',
-            lineColor: lastThemeWasLight ? '#1f2937' : '#e5e7eb',
-            primaryColor: lastThemeWasLight ? '#eff6ff' : '#1e3a8a',
-            primaryTextColor: lastThemeWasLight ? '#111827' : '#f9fafb',
+            fontFamily: cssVar('--pc-font-ui', 'ui-sans-serif, system-ui, sans-serif'),
+            background: cssVar('--pc-bg-base', light ? '#ffffff' : '#1e1e24'),
+            primaryColor: cssVar('--pc-bg-elevated', light ? '#eef2f7' : '#27272a'),
+            secondaryColor: cssVar('--pc-bg-surface', light ? '#f4f4f5' : '#232329'),
+            tertiaryColor: cssVar('--pc-bg-surface', light ? '#f4f4f5' : '#232329'),
+            primaryTextColor: cssVar('--pc-text-primary', light ? '#18181b' : '#d4d4d8'),
+            secondaryTextColor: cssVar('--pc-text-primary', light ? '#18181b' : '#d4d4d8'),
+            tertiaryTextColor: cssVar('--pc-text-primary', light ? '#18181b' : '#d4d4d8'),
+            primaryBorderColor: cssVar('--pc-accent', light ? '#0891b2' : '#22d3ee'),
+            secondaryBorderColor: cssVar('--pc-border-strong', light ? '#00000022' : '#ffffff22'),
+            tertiaryBorderColor: cssVar('--pc-border-strong', light ? '#00000022' : '#ffffff22'),
+            lineColor: cssVar('--pc-accent', light ? '#0891b2' : '#22d3ee'),
+            textColor: cssVar('--pc-text-primary', light ? '#18181b' : '#d4d4d8'),
+            nodeTextColor: cssVar('--pc-text-primary', light ? '#18181b' : '#d4d4d8'),
         },
         flowchart: {
             curve: 'basis',
@@ -47,21 +62,17 @@
         },
     });
 
-    // Simplest way to make mermaid re-render the diagrams in the new theme is via refreshing the page
-
-    for (const darkTheme of darkThemes) {
-        document.getElementById(darkTheme).addEventListener('click', () => {
-            if (lastThemeWasLight) {
-                window.location.reload();
-            }
-        });
-    }
-
-    for (const lightTheme of lightThemes) {
-        document.getElementById(lightTheme).addEventListener('click', () => {
-            if (!lastThemeWasLight) {
-                window.location.reload();
-            }
+    // Mermaid renders to static SVG, so switching theme needs a re-render.
+    // Reload when the active scheme actually flips (light <-> dark) after a
+    // theme-switcher click. Works for every theme via the delegated handler.
+    const themeList = document.getElementById('mdbook-theme-list');
+    if (themeList) {
+        themeList.addEventListener('click', (e) => {
+            if (!e.target.closest('button.theme')) return;
+            // Defer so book.js applies the new html class first.
+            setTimeout(() => {
+                if (isLight() !== light) window.location.reload();
+            }, 60);
         });
     }
 })();

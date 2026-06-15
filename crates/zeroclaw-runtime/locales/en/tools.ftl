@@ -39,6 +39,30 @@ tool-delegate = Delegate a subtask to a specialized agent. Use when: a task bene
 
 tool-file-edit = Edit a file by replacing an exact string match with new content
 
+tool-file-download = Download a file from the configured remote endpoint and write it to the agent's workspace. Supply the identifier of the document to fetch and a workspace-relative destination path; the endpoint URL is fixed by host config and is never model-controlled. Bytes are streamed straight to disk and are not loaded into model context. Returns the HTTP status, the number of bytes written, and the destination path.
+tool-file-download-param-document-id = Identifier of the document to fetch from the configured endpoint.
+tool-file-download-param-dest-path = Workspace-relative path to write the file to. The parent directory must already exist.
+tool-file-download-error-disabled = file_download is disabled: [file_download].url is not configured
+tool-file-download-error-read-only = Action blocked: autonomy is read-only
+tool-file-download-error-rate-limited-hour = Rate limit exceeded: too many actions in the last hour
+tool-file-download-error-rate-limited-budget = Rate limit exceeded: action budget exhausted
+tool-file-download-error-missing-document-id = Missing 'document_id' parameter
+tool-file-download-error-missing-dest-path = Missing 'dest_path' parameter
+tool-file-download-error-invalid-file-name = Invalid dest_path '{ $dest_path }': must end in a concrete file name
+tool-file-download-error-no-parent = Invalid dest_path '{ $dest_path }': has no parent directory
+tool-file-download-error-resolve-dir = Cannot resolve destination directory for '{ $dest_path }': { $err }
+tool-file-download-error-client-build = Failed to build download client: { $err }
+tool-file-download-error-request = Download request failed: { $err }
+tool-file-download-error-status = Download endpoint returned status { $status }
+tool-file-download-error-too-large-reported = Download too large: endpoint reports { $len } bytes (limit: { $limit } bytes)
+tool-file-download-error-too-large-stream = Download too large: exceeded limit of { $limit } bytes
+tool-file-download-error-temp-create = Failed to create temporary download file: { $err }
+tool-file-download-error-read-body = Failed while reading response body: { $err }
+tool-file-download-error-write-body = Failed while writing downloaded bytes: { $err }
+tool-file-download-error-flush = Failed to flush downloaded file: { $err }
+tool-file-download-error-move = Failed to move downloaded file into place: { $err }
+tool-file-download-success = Downloaded { $written } bytes to { $dest_path } ({ $status })
+
 tool-file-read = Read file contents with line numbers. Supports partial reading via offset and limit. Extracts text from PDF; other binary files are read with lossy UTF-8 conversion.
 
 tool-file-write = Write contents to a file in the workspace
@@ -59,7 +83,7 @@ tool-http-request = Make HTTP requests to external APIs. Supports GET, POST, PUT
 
 tool-image-info = Read image file metadata (format, dimensions, size) and optionally return base64-encoded data.
 
-tool-jira = Interact with Jira: get tickets with configurable detail level, search issues with JQL, and add comments with mention and formatting support.
+tool-jira = Interact with Jira: read tickets, search with JQL, add comments, list projects and per-issue transitions, transition an issue through its workflow, and create new issues.
 
 tool-knowledge = Manage a knowledge graph of architecture decisions, solution patterns, lessons learned, and experts. Actions: capture, search, relate, suggest, expert_find, lessons_extract, graph_stats.
 

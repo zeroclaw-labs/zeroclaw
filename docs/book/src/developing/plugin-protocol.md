@@ -56,18 +56,6 @@ skills and between bundles.
 
 ## Manifest format
 
-```toml
-name = "my-plugin"                    # Unique identifier (required)
-version = "0.1.0"                     # Semver version (required)
-description = "What this plugin does" # Human-readable (optional)
-author = "Your Name"                  # Author (optional)
-wasm_path = "plugin.wasm"             # Path to .wasm relative to manifest (required for non-skill capabilities; optional/ignored for skill-only)
-capabilities = ["tool"]               # What the plugin provides (required)
-permissions = ["http_client"]          # What the plugin needs (optional)
-signature = "base64url..."            # Ed25519 signature (optional)
-publisher_key = "hex..."              # Publisher public key (optional)
-```
-
 ### Capabilities
 
 | Value | Description |
@@ -146,7 +134,7 @@ On failure:
 ## Host functions
 
 Host functions are provided by the ZeroClaw runtime and callable from within
-the WASM plugin. Each is gated on a manifest permission — calling without the
+the WASM plugin. Each is gated on a manifest permission, calling without the
 required permission returns an error.
 
 ### `zc_http_request`
@@ -194,22 +182,6 @@ variable is not set.
 ## Writing a plugin in Rust
 
 ### Dependencies
-
-```toml
-[package]
-name = "my-plugin"
-edition = "2024"
-
-[lib]
-crate-type = ["cdylib"]
-
-[dependencies]
-extism-pdk = "1.4"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-
-[workspace]
-```
 
 The `[workspace]` table is needed to prevent Cargo from searching for a parent
 workspace.
@@ -262,7 +234,11 @@ pub fn execute(input: String) -> FnResult<String> {
 
 ### Building
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # Install the WASM target (once)
 rustup target add wasm32-wasip1
 
@@ -270,13 +246,19 @@ rustup target add wasm32-wasip1
 cargo build --target wasm32-wasip1 --release
 ```
 
+</div>
+
 The output `.wasm` file is at
 `target/wasm32-wasip1/release/<crate_name>.wasm`. Copy it alongside your
 `manifest.toml`.
 
 ### Installing
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # Copy to plugin directory
 zeroclaw plugin install /path/to/my-plugin/
 
@@ -284,8 +266,10 @@ zeroclaw plugin install /path/to/my-plugin/
 cp -r my-plugin/ ~/.zeroclaw/plugins/my-plugin/
 ```
 
+</div>
+
 ## Configuration
 
-Enable the plugin system via the `[plugins]` and `[plugins.security]` sections of `config.toml` — see the [Config reference](../reference/config.md) for all fields, defaults, and the `signature_mode` enum.
+Enable the plugin system via the `plugins` and `plugins.security` sections (gateway, zerocode, or `zeroclaw config set`): see the [Config reference](../reference/config.md) for all fields, defaults, and the `signature_mode` enum.
 
 The `plugins-wasm` feature flag must be enabled at compile time (included in the default `ci-all` feature set).

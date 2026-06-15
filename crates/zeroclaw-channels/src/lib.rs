@@ -8,7 +8,9 @@
 #![cfg_attr(feature = "channel-matrix", recursion_limit = "256")]
 
 pub mod allowlist;
+pub mod listing;
 pub mod orchestrator;
+pub mod paced_channel;
 pub mod util;
 
 // Always-compiled channels and utilities (no feature gate)
@@ -18,8 +20,11 @@ pub mod cli;
 pub mod link_enricher;
 pub mod transcription;
 pub mod tts;
+pub mod voice;
 
 // Feature-gated channels
+#[cfg(feature = "channel-amqp")]
+pub mod amqp;
 #[cfg(feature = "channel-bluesky")]
 pub mod bluesky;
 #[cfg(feature = "channel-clawdtalk")]
@@ -64,6 +69,8 @@ pub mod signal;
 pub mod slack;
 #[cfg(feature = "channel-telegram")]
 pub mod telegram;
+#[cfg(feature = "channel-twitch")]
+pub mod twitch;
 #[cfg(feature = "channel-twitter")]
 pub mod twitter;
 #[cfg(feature = "channel-voice-call")]
@@ -78,7 +85,9 @@ pub mod webhook;
 pub mod wechat;
 #[cfg(feature = "channel-wecom")]
 pub mod wecom;
-#[cfg(feature = "channel-whatsapp-cloud")]
+#[cfg(feature = "channel-wecom-ws")]
+pub mod wecom_ws;
+#[cfg(any(feature = "channel-whatsapp-cloud", feature = "whatsapp-web"))]
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_storage;

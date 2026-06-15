@@ -128,24 +128,35 @@ fn security_full_autonomy_parses() {
 // Credential pattern validation (via config/schema)
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Config does not expose raw API keys in Debug output.
+/// Config property readback does not expose raw API keys.
 #[test]
-fn security_config_debug_does_not_leak_api_key() {
+fn security_config_secret_property_readback_masks_api_key() {
     let mut config = Config::default();
-    config.providers.models.openrouter.insert(
-        "default".to_string(),
-        zeroclaw::config::OpenRouterModelProviderConfig {
-            base: zeroclaw::config::ModelProviderConfig {
-                api_key: Some("sk-1234567890abcdef".to_string()),
-                ..Default::default()
-            },
-        },
+    let path = "providers.models.openrouter.default.api_key";
+    let secret = "sk-1234567890abcdef";
+
+    assert!(
+        Config::prop_is_secret(path),
+        "{path} should be classified as a secret config property"
     );
+    config
+        .providers
+        .models
+        .ensure("openrouter", "default")
+        .expect("openrouter provider entry should be creatable");
+    config
+        .set_prop(path, secret)
+        .expect("secret config property should be settable");
 
-    let debug_output = format!("{:?}", config);
-
-    if debug_output.contains("sk-1234567890abcdef") {
-        // Known pattern — nested Debug shows all fields.
-        // Security boundary is at scrub_credentials in loop_.rs.
-    }
+    let readback = config
+        .get_prop(path)
+        .expect("secret config property should be readable");
+    assert_ne!(
+        readback, secret,
+        "secret config property readback must not expose the raw API key"
+    );
+    assert!(
+        readback.contains("****"),
+        "secret config property readback should use a masked placeholder, got {readback:?}"
+    );
 }

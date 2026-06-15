@@ -11,7 +11,7 @@ use base64::Engine;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_config::schema::Config;
@@ -491,11 +491,13 @@ struct AccountData {
     saved_at: Option<String>,
 }
 
-/// Persistent sync cursor.
+/// Persistent sync cursor and context tokens.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct SyncData {
     #[serde(default)]
     get_updates_buf: String,
+    #[serde(default)]
+    context_tokens: HashMap<String, String>,
 }
 
 /// Write bytes to a file with owner-only permissions (0o600) on Unix.
@@ -522,29 +524,37 @@ fn build_base_info() -> serde_json::Value {
     })
 }
 
-fn markdown_to_plain_text(text: &str) -> String {
-    // TODO: Cache these Regex values instead of compiling them on every send path.
-    let code_block_re = regex::Regex::new(r"```[^\n]*\n?([\s\S]*?)```").unwrap();
-    let image_re = regex::Regex::new(r"!\[[^\]]*\]\([^)]*\)").unwrap();
-    let link_re = regex::Regex::new(r"\[([^\]]+)\]\([^)]*\)").unwrap();
-    let heading_re = regex::Regex::new(r"(?m)^\s{0,3}#{1,6}\s+").unwrap();
-    let blockquote_re = regex::Regex::new(r"(?m)^>\s?").unwrap();
-    let bullet_re = regex::Regex::new(r"(?m)^\s*[-*+]\s+").unwrap();
-    let emphasis_re = regex::Regex::new(r"(\*\*|__|~~|`|\*)").unwrap();
-    let table_separator_re = regex::Regex::new(r"^\|[\s:|-]+\|$").unwrap();
-    let table_row_re = regex::Regex::new(r"^\|(.+)\|$").unwrap();
+static CODE_BLOCK_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"```[^\n]*\n?([\s\S]*?)```").unwrap());
+static IMAGE_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"!\[[^\]]*\]\([^)]*\)").unwrap());
+static LINK_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"\[([^\]]+)\]\([^)]*\)").unwrap());
+static HEADING_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?m)^\s{0,3}#{1,6}\s+").unwrap());
+static BLOCKQUOTE_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?m)^>\s?").unwrap());
+static BULLET_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?m)^\s*[-*+]\s+").unwrap());
+static EMPHASIS_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(\*\*|__|~~|`|\*)").unwrap());
+static TABLE_SEPARATOR_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"^\|[\s:|-]+\|$").unwrap());
+static TABLE_ROW_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"^\|(.+)\|$").unwrap());
 
-    let mut result = code_block_re.replace_all(text, "$1").into_owned();
-    result = image_re.replace_all(&result, "").into_owned();
-    result = link_re.replace_all(&result, "$1").into_owned();
+fn markdown_to_plain_text(text: &str) -> String {
+    let mut result = CODE_BLOCK_RE.replace_all(text, "$1").into_owned();
+    result = IMAGE_RE.replace_all(&result, "").into_owned();
+    result = LINK_RE.replace_all(&result, "$1").into_owned();
 
     let mut lines = Vec::new();
     for line in result.lines() {
-        if table_separator_re.is_match(line) {
+        if TABLE_SEPARATOR_RE.is_match(line) {
             continue;
         }
 
-        if let Some(captures) = table_row_re.captures(line) {
+        if let Some(captures) = TABLE_ROW_RE.captures(line) {
             let inner = captures.get(1).map(|value| value.as_str()).unwrap_or("");
             lines.push(
                 inner
@@ -560,10 +570,10 @@ fn markdown_to_plain_text(text: &str) -> String {
     }
 
     result = lines.join("\n");
-    result = heading_re.replace_all(&result, "").into_owned();
-    result = blockquote_re.replace_all(&result, "").into_owned();
-    result = bullet_re.replace_all(&result, "").into_owned();
-    result = emphasis_re.replace_all(&result, "").into_owned();
+    result = HEADING_RE.replace_all(&result, "").into_owned();
+    result = BLOCKQUOTE_RE.replace_all(&result, "").into_owned();
+    result = BULLET_RE.replace_all(&result, "").into_owned();
+    result = EMPHASIS_RE.replace_all(&result, "").into_owned();
 
     while result.contains("\n\n\n") {
         result = result.replace("\n\n\n", "\n\n");
@@ -755,14 +765,23 @@ impl WeChatChannel {
         let sync_path = self.state_dir.join("sync.json");
         if let Ok(data) = std::fs::read_to_string(&sync_path)
             && let Ok(sync) = serde_json::from_str::<SyncData>(&data)
-            && !sync.get_updates_buf.is_empty()
         {
-            *self.cursor.lock() = sync.get_updates_buf;
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                "loaded persisted sync cursor"
-            );
+            if !sync.get_updates_buf.is_empty() {
+                *self.cursor.lock() = sync.get_updates_buf;
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "loaded persisted sync cursor"
+                );
+            }
+            if !sync.context_tokens.is_empty() {
+                *self.context_tokens.lock() = sync.context_tokens;
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "loaded persisted context tokens"
+                );
+            }
         }
     }
 
@@ -809,7 +828,7 @@ impl WeChatChannel {
     }
 
     /// Save sync cursor to disk.
-    fn save_cursor(&self, cursor: &str) {
+    fn save_sync_data(&self) {
         if let Err(e) = std::fs::create_dir_all(&self.state_dir) {
             ::zeroclaw_log::record!(
                 WARN,
@@ -821,7 +840,8 @@ impl WeChatChannel {
             return;
         }
         let data = SyncData {
-            get_updates_buf: cursor.to_string(),
+            get_updates_buf: self.cursor.lock().clone(),
+            context_tokens: self.context_tokens.lock().clone(),
         };
         let path = self.state_dir.join("sync.json");
         match serde_json::to_string(&data) {
@@ -858,6 +878,7 @@ impl WeChatChannel {
         self.context_tokens
             .lock()
             .insert(user_id.to_string(), token.to_string());
+        self.save_sync_data();
     }
 
     fn get_context_token(&self, user_id: &str) -> Option<String> {
@@ -893,7 +914,7 @@ impl WeChatChannel {
             let mut cfg = config.write();
             if !cfg.channels.wechat.contains_key(&self.alias) {
                 anyhow::bail!(
-                    "Missing [channels.wechat.{}] section. Run `zeroclaw onboard --channels-only` first",
+                    "Missing [channels.wechat.{}] section. Run `zeroclaw config set channels.wechat.<alias>.app-id=<id>` to configure.",
                     self.alias
                 );
             }
@@ -2137,6 +2158,8 @@ impl Channel for WeChatChannel {
                     if let Ok(mut t) = self.bot_token.write() {
                         *t = None;
                     }
+                    self.context_tokens.lock().clear();
+                    self.save_sync_data();
                     tokio::time::sleep(SESSION_PAUSE_DURATION).await;
                     // Try to re-login
                     if let Err(e) = self.ensure_logged_in().await {
@@ -2177,7 +2200,7 @@ impl Channel for WeChatChannel {
             {
                 cursor = new_cursor.to_string();
                 *self.cursor.lock() = cursor.clone();
-                self.save_cursor(&cursor);
+                self.save_sync_data();
             }
 
             if let Some(next_timeout) = data
@@ -2257,6 +2280,7 @@ impl Channel for WeChatChannel {
                     thread_ts: None,
                     interruption_scope_id: None,
                     attachments: Vec::new(),
+                    subject: None,
                 };
 
                 if tx.send(channel_msg).await.is_err() {
@@ -2316,7 +2340,7 @@ impl Channel for WeChatChannel {
         let url = self.api_url("sendtyping");
         let user_id = recipient.to_string();
 
-        let handle = tokio::spawn(async move {
+        let handle = zeroclaw_spawn::spawn!(async move {
             loop {
                 let body = serde_json::json!({
                     "ilink_user_id": &user_id,
@@ -2621,5 +2645,197 @@ mod tests {
             .and_then(|value| value.as_str())
             .unwrap_or("");
         assert!(!version.is_empty());
+    }
+
+    #[test]
+    fn sync_data_round_trip_preserves_context_tokens() {
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().to_path_buf();
+
+        let mut context_tokens = HashMap::new();
+        context_tokens.insert("user123".to_string(), "token_abc".to_string());
+        context_tokens.insert("user456".to_string(), "token_xyz".to_string());
+
+        let original_data = SyncData {
+            get_updates_buf: "cursor_value".to_string(),
+            context_tokens: context_tokens.clone(),
+        };
+
+        let sync_path = state_dir.join("sync.json");
+        let json = serde_json::to_string(&original_data).unwrap();
+        write_private(&sync_path, json.as_bytes()).unwrap();
+
+        let loaded_json = std::fs::read_to_string(&sync_path).unwrap();
+        let loaded_data: SyncData = serde_json::from_str(&loaded_json).unwrap();
+
+        assert_eq!(loaded_data.get_updates_buf, "cursor_value");
+        assert_eq!(loaded_data.context_tokens.len(), 2);
+        assert_eq!(
+            loaded_data.context_tokens.get("user123"),
+            Some(&"token_abc".to_string())
+        );
+        assert_eq!(
+            loaded_data.context_tokens.get("user456"),
+            Some(&"token_xyz".to_string())
+        );
+    }
+
+    #[test]
+    fn sync_data_backward_compatible_with_missing_context_tokens() {
+        let old_json = r#"{"get_updates_buf":"old_cursor"}"#;
+        let data: SyncData = serde_json::from_str(old_json).unwrap();
+
+        assert_eq!(data.get_updates_buf, "old_cursor");
+        assert!(data.context_tokens.is_empty());
+    }
+
+    #[test]
+    fn context_tokens_survive_channel_restart() {
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().to_path_buf();
+
+        {
+            let ch = WeChatChannel::new(
+                "test",
+                Arc::new(|| vec!["*".to_string()]),
+                None,
+                None,
+                Some(state_dir.clone()),
+            )
+            .unwrap();
+            ch.set_context_token("acct1:userA", "tok_A");
+            ch.set_context_token("acct1:userB", "tok_B");
+            *ch.cursor.lock() = "cursor_123".to_string();
+            ch.save_sync_data();
+        }
+
+        let ch2 = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir),
+        )
+        .unwrap();
+
+        assert_eq!(
+            ch2.get_context_token("acct1:userA"),
+            Some("tok_A".to_string())
+        );
+        assert_eq!(
+            ch2.get_context_token("acct1:userB"),
+            Some("tok_B".to_string())
+        );
+        assert_eq!(ch2.get_context_token("nonexistent"), None);
+        assert_eq!(*ch2.cursor.lock(), "cursor_123");
+    }
+
+    #[test]
+    fn set_context_token_persists_immediately() {
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().to_path_buf();
+
+        let ch = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir.clone()),
+        )
+        .unwrap();
+        ch.set_context_token("acct:user1", "immediate_tok");
+
+        let ch2 = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir),
+        )
+        .unwrap();
+        assert_eq!(
+            ch2.get_context_token("acct:user1"),
+            Some("immediate_tok".to_string())
+        );
+    }
+
+    #[test]
+    fn save_sync_data_preserves_context_tokens() {
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().to_path_buf();
+
+        let ch = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir.clone()),
+        )
+        .unwrap();
+        ch.set_context_token("acct:user1", "my_token");
+        *ch.cursor.lock() = "new_cursor_value".to_string();
+        ch.save_sync_data();
+
+        let ch2 = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir),
+        )
+        .unwrap();
+        assert_eq!(*ch2.cursor.lock(), "new_cursor_value");
+        assert_eq!(
+            ch2.get_context_token("acct:user1"),
+            Some("my_token".to_string())
+        );
+    }
+
+    #[test]
+    fn load_from_empty_state_dir_produces_defaults() {
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().to_path_buf();
+
+        let ch = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir),
+        )
+        .unwrap();
+
+        assert_eq!(ch.get_context_token("anything"), None);
+        assert_eq!(*ch.cursor.lock(), "");
+    }
+
+    #[test]
+    fn context_token_overwrite_persists_latest() {
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().to_path_buf();
+
+        let ch = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir.clone()),
+        )
+        .unwrap();
+        ch.set_context_token("acct:user1", "old_token");
+        ch.set_context_token("acct:user1", "new_token");
+
+        let ch2 = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir),
+        )
+        .unwrap();
+        assert_eq!(
+            ch2.get_context_token("acct:user1"),
+            Some("new_token".to_string())
+        );
     }
 }

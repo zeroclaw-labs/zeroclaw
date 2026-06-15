@@ -12,9 +12,10 @@ use zeroclaw_runtime::security::pairing::PairingGuard;
 
 /// Telegram's maximum message length for text messages
 const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
-/// Reserve space for continuation markers added by send_text_chunks:
-/// worst case is "(continued)\n\n" + chunk + "\n\n(continues...)" = 30 extra chars
-const TELEGRAM_CONTINUATION_OVERHEAD: usize = 30;
+const TELEGRAM_CONTINUED_PREFIX: &str = "(continued)\n\n";
+const TELEGRAM_CONTINUES_SUFFIX: &str = "\n\n(continues...)";
+const TELEGRAM_FENCE_REOPEN: &str = "```\n";
+const TELEGRAM_FENCE_CLOSE: &str = "```";
 const TELEGRAM_ACK_REACTIONS: &[&str] = &["⚡️", "👌", "👀", "🔥", "👍"];
 
 /// Metadata for an incoming document or photo attachment.
@@ -85,7 +86,8 @@ fn truncate_telegram_command_description(raw: &str) -> String {
 
 /// Split a message into chunks that respect Telegram's 4096 character limit.
 /// Tries to split at word boundaries when possible, and handles continuation.
-/// The effective per-chunk limit is reduced to leave room for continuation markers.
+/// The split budget includes continuation markers and synthetic code fences
+/// exactly as `send_text_chunks` will send them.
 fn split_message_for_telegram(message: &str) -> Vec<String> {
     if message.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH {
         return vec![message.to_string()];
@@ -93,50 +95,198 @@ fn split_message_for_telegram(message: &str) -> Vec<String> {
 
     let mut chunks = Vec::new();
     let mut remaining = message;
-    let chunk_limit = TELEGRAM_MAX_MESSAGE_LENGTH - TELEGRAM_CONTINUATION_OVERHEAD;
+    let mut in_code_block = false;
 
     while !remaining.is_empty() {
-        // If the remainder fits within the full limit, take it all (last chunk
-        // or single chunk — continuation overhead is at most 14 chars).
-        if remaining.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH {
-            chunks.push(remaining.to_string());
+        let has_previous = !chunks.is_empty();
+
+        if telegram_chunk_send_len(remaining, in_code_block, has_previous, false)
+            <= TELEGRAM_MAX_MESSAGE_LENGTH
+        {
+            let chunk = build_telegram_chunk(remaining, in_code_block, false);
+            chunks.push(chunk);
             break;
         }
 
-        // Find the byte offset for the Nth character boundary.
-        let hard_split = remaining
-            .char_indices()
-            .nth(chunk_limit)
-            .map_or(remaining.len(), |(idx, _)| idx);
+        let max_take = max_nonfinal_telegram_raw_chars(remaining, in_code_block, has_previous);
+        let hard_split = byte_index_after_chars(remaining, max_take);
+        let chunk_end = preferred_telegram_split_end(
+            remaining,
+            hard_split,
+            max_take,
+            in_code_block,
+            has_previous,
+        );
 
-        let chunk_end = if hard_split == remaining.len() {
-            hard_split
-        } else {
-            // Try to find a good break point (newline, then space)
-            let search_area = &remaining[..hard_split];
-
-            // Prefer splitting at newline
-            if let Some(pos) = search_area.rfind('\n') {
-                // Don't split if the newline is too close to the start
-                if search_area[..pos].chars().count() >= chunk_limit / 2 {
-                    pos + 1
-                } else {
-                    // Try space as fallback
-                    search_area.rfind(' ').unwrap_or(hard_split) + 1
-                }
-            } else if let Some(pos) = search_area.rfind(' ') {
-                pos + 1
-            } else {
-                // Hard split at character boundary
-                hard_split
-            }
-        };
-
-        chunks.push(remaining[..chunk_end].to_string());
+        let raw_chunk = &remaining[..chunk_end];
+        let starts_in_code_block = in_code_block;
+        in_code_block = code_block_state_after(raw_chunk, in_code_block);
+        chunks.push(build_telegram_chunk(raw_chunk, starts_in_code_block, true));
         remaining = &remaining[chunk_end..];
     }
 
     chunks
+}
+
+fn build_telegram_chunk(raw_chunk: &str, starts_in_code_block: bool, has_next: bool) -> String {
+    let reopen_prefix = if starts_in_code_block {
+        TELEGRAM_FENCE_REOPEN
+    } else {
+        ""
+    };
+    let ends_in_code_block = code_block_state_after(raw_chunk, starts_in_code_block);
+    let needs_synthetic_close = has_next && ends_in_code_block;
+    let mut chunk = String::with_capacity(
+        reopen_prefix.len()
+            + raw_chunk.len()
+            + if needs_synthetic_close {
+                "\n```".len()
+            } else {
+                0
+            },
+    );
+    chunk.push_str(reopen_prefix);
+    chunk.push_str(raw_chunk);
+    if needs_synthetic_close {
+        if !chunk.ends_with('\n') {
+            chunk.push('\n');
+        }
+        chunk.push_str(TELEGRAM_FENCE_CLOSE);
+    }
+    chunk
+}
+
+fn format_telegram_text_chunk(chunk: &str, index: usize, total: usize) -> String {
+    if total <= 1 {
+        return chunk.to_string();
+    }
+
+    if index == 0 {
+        format!("{chunk}{TELEGRAM_CONTINUES_SUFFIX}")
+    } else if index == total - 1 {
+        format!("{TELEGRAM_CONTINUED_PREFIX}{chunk}")
+    } else {
+        format!("{TELEGRAM_CONTINUED_PREFIX}{chunk}{TELEGRAM_CONTINUES_SUFFIX}")
+    }
+}
+
+fn telegram_chunk_marker_len(has_previous: bool, has_next: bool) -> usize {
+    let prefix_len = if has_previous {
+        TELEGRAM_CONTINUED_PREFIX.chars().count()
+    } else {
+        0
+    };
+    let suffix_len = if has_next {
+        TELEGRAM_CONTINUES_SUFFIX.chars().count()
+    } else {
+        0
+    };
+    prefix_len + suffix_len
+}
+
+fn telegram_chunk_body_len(raw_chunk: &str, starts_in_code_block: bool, has_next: bool) -> usize {
+    let reopen_len = if starts_in_code_block {
+        TELEGRAM_FENCE_REOPEN.chars().count()
+    } else {
+        0
+    };
+    let raw_len = raw_chunk.chars().count();
+    let ends_in_code_block = code_block_state_after(raw_chunk, starts_in_code_block);
+    let synthetic_close_len = if has_next && ends_in_code_block {
+        TELEGRAM_FENCE_CLOSE.chars().count() + usize::from(!raw_chunk.ends_with('\n'))
+    } else {
+        0
+    };
+
+    reopen_len + raw_len + synthetic_close_len
+}
+
+fn telegram_chunk_send_len(
+    raw_chunk: &str,
+    starts_in_code_block: bool,
+    has_previous: bool,
+    has_next: bool,
+) -> usize {
+    telegram_chunk_marker_len(has_previous, has_next)
+        + telegram_chunk_body_len(raw_chunk, starts_in_code_block, has_next)
+}
+
+fn max_nonfinal_telegram_raw_chars(
+    remaining: &str,
+    starts_in_code_block: bool,
+    has_previous: bool,
+) -> usize {
+    let remaining_chars = remaining.chars().count();
+    let marker_len = telegram_chunk_marker_len(has_previous, true);
+    let reopen_len = if starts_in_code_block {
+        TELEGRAM_FENCE_REOPEN.chars().count()
+    } else {
+        0
+    };
+    let upper = remaining_chars
+        .saturating_sub(1)
+        .min(TELEGRAM_MAX_MESSAGE_LENGTH - marker_len - reopen_len);
+
+    for take in (1..=upper).rev() {
+        let end = byte_index_after_chars(remaining, take);
+        if telegram_chunk_send_len(&remaining[..end], starts_in_code_block, has_previous, true)
+            <= TELEGRAM_MAX_MESSAGE_LENGTH
+        {
+            return take;
+        }
+    }
+
+    1
+}
+
+fn byte_index_after_chars(s: &str, char_count: usize) -> usize {
+    if char_count == 0 {
+        return 0;
+    }
+    s.char_indices()
+        .nth(char_count)
+        .map_or(s.len(), |(idx, _)| idx)
+}
+
+fn preferred_telegram_split_end(
+    remaining: &str,
+    hard_split: usize,
+    max_take: usize,
+    starts_in_code_block: bool,
+    has_previous: bool,
+) -> usize {
+    let search_area = &remaining[..hard_split];
+    let candidate_fits = |end: usize| {
+        end > 0
+            && end < remaining.len()
+            && telegram_chunk_send_len(&remaining[..end], starts_in_code_block, has_previous, true)
+                <= TELEGRAM_MAX_MESSAGE_LENGTH
+    };
+
+    if let Some(pos) = search_area.rfind('\n') {
+        let end = pos + '\n'.len_utf8();
+        if search_area[..pos].chars().count() >= max_take / 2 && candidate_fits(end) {
+            return end;
+        }
+    }
+
+    if let Some(pos) = search_area.rfind(' ') {
+        let end = pos + ' '.len_utf8();
+        if candidate_fits(end) {
+            return end;
+        }
+    }
+
+    hard_split
+}
+
+fn code_block_state_after(text: &str, mut in_code_block: bool) -> bool {
+    for line in text.split('\n') {
+        if line.trim_start().starts_with("```") {
+            in_code_block = !in_code_block;
+        }
+    }
+    in_code_block
 }
 
 fn pick_uniform_index(len: usize) -> usize {
@@ -360,6 +510,9 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<TelegramAttachment>) 
 /// Telegram Bot API maximum file download size (20 MB).
 const TELEGRAM_MAX_FILE_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
 
+/// Default minimum interval between Telegram draft edits.
+const TELEGRAM_DRAFT_UPDATE_INTERVAL_MS: u64 = 1000;
+
 /// Telegram channel — long-polls the Bot API for updates
 pub struct TelegramChannel {
     bot_token: String,
@@ -393,6 +546,10 @@ pub struct TelegramChannel {
     ack_reactions: bool,
     tts_manager: Option<Arc<super::tts::TtsManager>>,
     voice_chats: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Peers that always receive voice replies, sourced from peer-group
+    /// `output_modality = "voice"` config. Populated once at startup by
+    /// `with_voice_peer_prefs`; never mutated by session events.
+    static_voice_peers: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     pending_voice:
         Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
     /// Per-channel proxy URL override.
@@ -449,7 +606,7 @@ impl TelegramChannel {
             pairing,
             client: reqwest::Client::new(),
             stream_mode: StreamMode::Off,
-            draft_update_interval_ms: 1000,
+            draft_update_interval_ms: TELEGRAM_DRAFT_UPDATE_INTERVAL_MS,
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
             typing_handle: Mutex::new(None),
             mention_only,
@@ -462,6 +619,7 @@ impl TelegramChannel {
             ack_reactions: true,
             tts_manager: None,
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            static_voice_peers: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             proxy_url: None,
             tool_command_specs: Vec::new(),
@@ -507,7 +665,11 @@ impl TelegramChannel {
         draft_update_interval_ms: u64,
     ) -> Self {
         self.stream_mode = stream_mode;
-        self.draft_update_interval_ms = draft_update_interval_ms;
+        self.draft_update_interval_ms = if draft_update_interval_ms == 0 {
+            TELEGRAM_DRAFT_UPDATE_INTERVAL_MS
+        } else {
+            draft_update_interval_ms
+        };
         self
     }
 
@@ -528,6 +690,23 @@ impl TelegramChannel {
         }
         match super::transcription::TranscriptionManager::new(&config) {
             Ok(m) => {
+                // Wire the resolved STT backend alias here so the channel-internal
+                // voice path (`try_parse_voice_message` -> `manager.transcribe`)
+                // dispatches to a configured provider. The orchestrator only wires
+                // the alias for the MediaPipeline/attachment path, which inbound
+                // Telegram voice notes never traverse. Bind to the sole registered
+                // provider when exactly one is configured so the single-provider
+                // case dispatches without an agent context; multi-provider setups
+                // keep the alias empty and still require explicit
+                // `agent.<alias>.transcription_provider` routing through the
+                // orchestrator (mirrors `wati.rs` / `lark.rs` / `mattermost.rs`).
+                let names = m.available_providers();
+                let m = if names.len() == 1 {
+                    let only = names[0].to_string();
+                    m.with_agent_transcription_provider(only)
+                } else {
+                    m
+                };
                 self.transcription_manager = Some(std::sync::Arc::new(m));
                 self.transcription = Some(config);
             }
@@ -551,7 +730,13 @@ impl TelegramChannel {
     /// or when the manager fails to construct (logged at warn).
     pub fn with_tts(mut self, config: &zeroclaw_config::schema::Config) -> Self {
         if config.tts.enabled {
-            match super::tts::TtsManager::from_config(config) {
+            // Bind the TTS manager to the agent that owns THIS channel so the
+            // voice reply uses that agent's `tts_provider`. Without this the
+            // shared manager resolves the lexicographically-smallest enabled
+            // agent, which silently breaks TTS when that agent has no
+            // `tts_provider` set (e.g. a background/delegate agent).
+            let owner = config.agent_for_channel(&format!("telegram.{}", self.alias));
+            match super::tts::TtsManager::from_config_for_agent(config, owner) {
                 Ok(m) => self.tts_manager = Some(Arc::new(m)),
                 Err(e) => ::zeroclaw_log::record!(
                     WARN,
@@ -593,7 +778,7 @@ impl TelegramChannel {
         let emoji = random_telegram_ack_reaction().to_string();
         let body = build_telegram_ack_reaction_request(&chat_id, message_id, &emoji);
 
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             let response = match client.post(&url).json(&body).send().await {
                 Ok(resp) => resp,
                 Err(err) => {
@@ -621,7 +806,37 @@ impl TelegramChannel {
         value.trim().trim_start_matches('@').to_string()
     }
 
-    /// Wire the shared Config handle so `persist_allowed_identity` can
+    /// Pre-seed static voice preferences from peer-group config.
+    ///
+    /// Iterates `[peer_groups.*]` entries that reference this channel and
+    /// carry `output_modality = "voice"`, then records every `external_peers`
+    /// entry in `static_voice_peers`. These peers always receive TTS replies —
+    /// including cron/proactive messages with no inbound voice note to mirror.
+    ///
+    /// Unlike the session `voice_chats` set, `static_voice_peers` is never
+    /// cleared by voice-send or text-message events.
+    pub fn with_voice_peer_prefs(
+        self,
+        config: &zeroclaw_config::schema::Config,
+        channel_type: &str,
+        alias: impl AsRef<str>,
+    ) -> Self {
+        use zeroclaw_config::multi_agent::OutputModality;
+        let alias = alias.as_ref();
+        let dotted = format!("{channel_type}.{alias}");
+        if let Ok(mut sp) = self.static_voice_peers.lock() {
+            for group in config.peer_groups.values() {
+                let matches = group.channel == channel_type || group.channel == dotted;
+                if matches && group.output_modality == OutputModality::Voice {
+                    for peer in &group.external_peers {
+                        sp.insert(peer.to_string());
+                    }
+                }
+            }
+        }
+        self
+    }
+
     /// write a paired user into `peer_groups` and save. The long-running
     /// daemon sets this from the orchestrator; tests and one-shot
     /// callers leave it unset (pairing works at runtime, doesn't persist).
@@ -648,12 +863,13 @@ impl TelegramChannel {
             anyhow::bail!("Cannot persist empty Telegram identity");
         }
         let group_name = format!("telegram_{}", self.alias);
-        let channel_ref = format!("telegram.{}", self.alias);
+        let channel_ref: zeroclaw_config::providers::ChannelRef =
+            format!("telegram.{}", self.alias).into();
         let snapshot = {
             let mut cfg = config.write();
             if !cfg.channels.telegram.contains_key(&self.alias) {
                 anyhow::bail!(
-                    "Missing [channels.telegram.{}] section. Run `zeroclaw onboard --channels-only` first",
+                    "Missing [channels.telegram.{}] section. Run `zeroclaw config set channels.telegram.<alias>.bot-token=<token>` to configure.",
                     self.alias
                 );
             }
@@ -828,14 +1044,24 @@ impl TelegramChannel {
     /// When `immediate` is `true` (called from `finalize_draft`), the 10-second
     /// debounce is skipped and `synthesize_and_send_voice` is called directly,
     /// since the text is already the final response.
-    fn try_queue_voice_reply(&self, recipient: &str, content: &str, immediate: bool) {
-        let is_voice_chat = self
-            .voice_chats
+    /// Returns true if this recipient should receive a TTS voice reply —
+    /// either because they triggered a voice-note session (`voice_chats`) or
+    /// because their peer group has `output_modality = "voice"` in config
+    /// (`static_voice_peers`).
+    fn is_voice_chat(&self, recipient: &str) -> bool {
+        self.voice_chats
             .lock()
             .map(|vs| vs.contains(recipient))
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || self
+                .static_voice_peers
+                .lock()
+                .map(|sp| sp.contains(recipient))
+                .unwrap_or(false)
+    }
 
-        if !is_voice_chat || self.tts_manager.is_none() {
+    fn try_queue_voice_reply(&self, recipient: &str, content: &str, immediate: bool) {
+        if !self.is_voice_chat(recipient) || self.tts_manager.is_none() {
             return;
         }
 
@@ -864,7 +1090,7 @@ impl TelegramChannel {
             // Finalize path: text is already the final answer — no debounce.
             let text = content.to_string();
             let recipient = recipient.to_string();
-            tokio::spawn(async move {
+            zeroclaw_spawn::spawn!(async move {
                 if let Ok(mut vc) = voice_chats.lock() {
                     vc.remove(&recipient);
                 }
@@ -915,7 +1141,7 @@ impl TelegramChannel {
 
         let pending = self.pending_voice.clone();
         let recipient = recipient.to_string();
-        tokio::spawn(async move {
+        zeroclaw_spawn::spawn!(async move {
             // Wait 10 seconds — long enough for the agent to finish its
             // full tool chain and send the final answer.
             tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
@@ -980,7 +1206,7 @@ impl TelegramChannel {
         text: &str,
         tts_manager: &crate::tts::TtsManager,
     ) -> anyhow::Result<()> {
-        let audio_bytes = tts_manager.synthesize(text).await?;
+        let audio_bytes = tts_manager.synthesize_opus(text).await?;
         let audio_len = audio_bytes.len();
         ::zeroclaw_log::record!(
             INFO,
@@ -1002,7 +1228,7 @@ impl TelegramChannel {
                 "voice",
                 reqwest::multipart::Part::bytes(audio_bytes)
                     .file_name("voice.ogg")
-                    .mime_str("audio/ogg")?,
+                    .mime_str("audio/ogg; codecs=opus")?,
             );
 
         if let Some(tid) = thread_id {
@@ -1637,7 +1863,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
         // Prepend forwarding attribution when the message was forwarded
         if let Some(attr) = Self::format_forward_attribution(message) {
-            content = format!("{attr}{content}");
+            content = Self::prepend_forward_attribution(&attr, content);
         }
 
         Some(ChannelMessage {
@@ -1645,7 +1871,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             sender: sender_identity,
             reply_target,
             content,
-            channel: "telegram".to_string(),
+            channel: "telegram".into(),
             channel_alias: Some(self.alias.clone()),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1654,6 +1880,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             thread_ts: thread_id,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         })
     }
 
@@ -1803,7 +2030,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
         // Prepend forwarding attribution when the message was forwarded
         let content = if let Some(attr) = Self::format_forward_attribution(message) {
-            format!("{attr}{content}")
+            Self::prepend_forward_attribution(&attr, content)
         } else {
             content
         };
@@ -1813,7 +2040,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             sender: sender_identity,
             reply_target,
             content,
-            channel: "telegram".to_string(),
+            channel: "telegram".into(),
             channel_alias: Some(self.alias.clone()),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1822,6 +2049,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             thread_ts: thread_id,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         })
     }
 
@@ -1851,7 +2079,38 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// Returns `Some("[Forwarded from ...] ")` when the message is forwarded,
     /// `None` otherwise.
     fn format_forward_attribution(message: &serde_json::Value) -> Option<String> {
-        if let Some(from_chat) = message.get("forward_from_chat") {
+        if let Some(origin) = message.get("forward_origin") {
+            let origin_type = origin.get("type").and_then(serde_json::Value::as_str)?;
+            let label = match origin_type {
+                "user" => {
+                    let sender = origin.get("sender_user")?;
+                    Self::format_forwarded_user_label(sender, "unknown")
+                }
+                "hidden_user" => origin
+                    .get("sender_user_name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown hidden user")
+                    .to_string(),
+                "chat" => {
+                    let title = origin
+                        .get("sender_chat")
+                        .and_then(|chat| chat.get("title"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown chat");
+                    format!("chat: {title}")
+                }
+                "channel" => {
+                    let title = origin
+                        .get("chat")
+                        .and_then(|chat| chat.get("title"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown channel");
+                    format!("channel: {title}")
+                }
+                _ => "unknown source".to_string(),
+            };
+            Some(format!("[Forwarded from {label}] "))
+        } else if let Some(from_chat) = message.get("forward_from_chat") {
             // Forwarded from a channel or group
             let title = from_chat
                 .get("title")
@@ -1860,17 +2119,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             Some(format!("[Forwarded from channel: {title}] "))
         } else if let Some(from_user) = message.get("forward_from") {
             // Forwarded from a user (privacy allows identity)
-            let label = from_user
-                .get("username")
-                .and_then(serde_json::Value::as_str)
-                .map(|u| format!("@{u}"))
-                .or_else(|| {
-                    from_user
-                        .get("first_name")
-                        .and_then(serde_json::Value::as_str)
-                        .map(String::from)
-                })
-                .unwrap_or_else(|| "unknown".to_string());
+            let label = Self::format_forwarded_user_label(from_user, "unknown");
             Some(format!("[Forwarded from {label}] "))
         } else {
             // Forwarded from a user who hides their identity
@@ -1879,6 +2128,32 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .and_then(serde_json::Value::as_str)
                 .map(|name| format!("[Forwarded from {name}] "))
         }
+    }
+
+    fn prepend_forward_attribution(attr: &str, content: String) -> String {
+        let attr = attr.trim_end();
+        if content.starts_with("> ") {
+            format!("{attr}\n\n{content}")
+        } else {
+            format!("{attr} {content}")
+        }
+    }
+
+    fn format_forwarded_user_label(user: &serde_json::Value, fallback: &str) -> String {
+        if let Some(username) = user.get("username").and_then(serde_json::Value::as_str) {
+            return format!("@{username}");
+        }
+
+        let Some(first_name) = user.get("first_name").and_then(serde_json::Value::as_str) else {
+            return fallback.to_string();
+        };
+
+        let mut label = first_name.to_string();
+        if let Some(last_name) = user.get("last_name").and_then(serde_json::Value::as_str) {
+            label.push(' ');
+            label.push_str(last_name);
+        }
+        label
     }
 
     /// Extract reply context from a Telegram `reply_to_message`, if present.
@@ -2020,7 +2295,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
         // Prepend forwarding attribution when the message was forwarded
         let content = if let Some(attr) = Self::format_forward_attribution(message) {
-            format!("{attr}{content}")
+            Self::prepend_forward_attribution(&attr, content)
         } else {
             content
         };
@@ -2035,7 +2310,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             sender: sender_identity,
             reply_target,
             content,
-            channel: "telegram".to_string(),
+            channel: "telegram".into(),
             channel_alias: Some(self.alias.clone()),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2044,6 +2319,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             thread_ts: thread_id,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         })
     }
 
@@ -2219,17 +2495,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let chunks = split_message_for_telegram(message);
 
         for (index, chunk) in chunks.iter().enumerate() {
-            let text = if chunks.len() > 1 {
-                if index == 0 {
-                    format!("{chunk}\n\n(continues...)")
-                } else if index == chunks.len() - 1 {
-                    format!("(continued)\n\n{chunk}")
-                } else {
-                    format!("(continued)\n\n{chunk}\n\n(continues...)")
-                }
-            } else {
-                chunk.to_string()
-            };
+            let text = format_telegram_text_chunk(chunk, index, chunks.len());
 
             let mut markdown_body = serde_json::json!({
                 "chat_id": chat_id,
@@ -3681,7 +3947,7 @@ Ensure only one `zeroclaw` process is using this bot token."
         let url = self.api_url("sendChatAction");
         let chat_id = recipient.to_string();
 
-        let handle = tokio::spawn(async move {
+        let handle = zeroclaw_spawn::spawn!(async move {
             loop {
                 let body = serde_json::json!({
                     "chat_id": &chat_id,
@@ -3846,6 +4112,105 @@ mod tests {
     use super::*;
 
     #[test]
+    fn with_voice_peer_prefs_seeds_static_voice_peers_for_matching_groups_only() {
+        use zeroclaw_config::multi_agent::{OutputModality, PeerGroupConfig, PeerUsername};
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        // Voice group on this channel type — should be seeded.
+        config.peer_groups.insert(
+            "voicers".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                external_peers: vec![PeerUsername::new("@alice"), PeerUsername::new("@bob")],
+                output_modality: OutputModality::Voice,
+                ..Default::default()
+            },
+        );
+        // Voice group on a different channel — must NOT leak into telegram.
+        config.peer_groups.insert(
+            "other".to_string(),
+            PeerGroupConfig {
+                channel: "signal".into(),
+                external_peers: vec![PeerUsername::new("@carol")],
+                output_modality: OutputModality::Voice,
+                ..Default::default()
+            },
+        );
+        // Mirror group on this channel — not a voice preference, skip.
+        config.peer_groups.insert(
+            "mirrorers".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                external_peers: vec![PeerUsername::new("@dave")],
+                output_modality: OutputModality::Mirror,
+                ..Default::default()
+            },
+        );
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_voice_peer_prefs(&config, "telegram", "default");
+
+        // Peers go into static_voice_peers, not into the session voice_chats set.
+        let sp = ch.static_voice_peers.lock().unwrap();
+        assert!(sp.contains("@alice"), "voice peer should be in static set");
+        assert!(sp.contains("@bob"), "voice peer should be in static set");
+        assert!(
+            !sp.contains("@carol"),
+            "peers on another channel must not be seeded"
+        );
+        assert!(
+            !sp.contains("@dave"),
+            "mirror-modality peers must not be seeded"
+        );
+        drop(sp);
+
+        let vc = ch.voice_chats.lock().unwrap();
+        assert!(
+            !vc.contains("@alice"),
+            "static peers must not pollute the session voice_chats set"
+        );
+    }
+
+    #[test]
+    fn static_voice_peers_survive_session_voice_chats_removal() {
+        use zeroclaw_config::multi_agent::{OutputModality, PeerGroupConfig, PeerUsername};
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.peer_groups.insert(
+            "voicers".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                external_peers: vec![PeerUsername::new("@alice")],
+                output_modality: OutputModality::Voice,
+                ..Default::default()
+            },
+        );
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_voice_peer_prefs(&config, "telegram", "default");
+
+        // Simulate a voice-send removing @alice from voice_chats (even though
+        // she was never in it — this proves static peers are checked separately).
+        ch.voice_chats.lock().unwrap().remove("@alice");
+
+        // is_voice_chat must still return true via static_voice_peers.
+        assert!(
+            ch.is_voice_chat("@alice"),
+            "static voice peer must remain active after voice_chats removal"
+        );
+    }
+
+    #[test]
     fn telegram_channel_name() {
         let mention_only = false;
         let ch = TelegramChannel::new(
@@ -3855,6 +4220,54 @@ mod tests {
             mention_only,
         );
         assert_eq!(ch.name(), "telegram");
+    }
+
+    /// Regression for #6999 / #7000: the channel-internal voice path
+    /// (`try_parse_voice_message` -> `manager.transcribe`) must dispatch to a
+    /// configured STT backend. When exactly one provider is registered,
+    /// `with_transcription` binds it as the resolved alias so `transcribe()`
+    /// no longer fails with "Agent has no transcription_provider configured".
+    #[tokio::test]
+    async fn telegram_with_transcription_binds_sole_provider_alias() {
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("GROQ_API_KEY") };
+
+        // Only the Groq key is set -> exactly one provider registers.
+        let config = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test-groq-key".to_string()),
+            ..zeroclaw_config::schema::TranscriptionConfig::default()
+        };
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_transcription(config);
+
+        let manager = ch
+            .transcription_manager
+            .as_ref()
+            .expect("single configured provider must build a transcription manager");
+
+        // Alias is bound for the single-provider case. Stop before any network
+        // call by using an unsupported audio format, which `validate_audio`
+        // rejects first inside the provider's `transcribe`.
+        let err = manager
+            .transcribe(&[0u8; 16], "voice.aac")
+            .await
+            .expect_err("unsupported format must error before any network call");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("no transcription_provider configured"),
+            "alias must be bound for the single-provider case; got: {msg}"
+        );
+        assert!(
+            msg.contains("Unsupported audio format"),
+            "expected the bound provider to reach audio validation; got: {msg}"
+        );
     }
 
     #[test]
@@ -3914,7 +4327,7 @@ mod tests {
         // Manually insert a dummy handle
         {
             let mut guard = ch.typing_handle.lock();
-            *guard = Some(tokio::spawn(async {
+            *guard = Some(zeroclaw_spawn::spawn!(async {
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }));
         }
@@ -3939,7 +4352,7 @@ mod tests {
         // Insert a dummy handle first
         {
             let mut guard = ch.typing_handle.lock();
-            *guard = Some(tokio::spawn(async {
+            *guard = Some(zeroclaw_spawn::spawn!(async {
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }));
         }
@@ -3971,6 +4384,22 @@ mod tests {
         .with_streaming(StreamMode::Partial, 750);
         assert!(partial.supports_draft_updates());
         assert_eq!(partial.draft_update_interval_ms, 750);
+    }
+
+    #[test]
+    fn with_streaming_uses_default_for_zero_draft_update_interval() {
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_streaming(StreamMode::Partial, 0);
+
+        assert_eq!(
+            ch.draft_update_interval_ms,
+            TELEGRAM_DRAFT_UPDATE_INTERVAL_MS
+        );
     }
 
     #[tokio::test]
@@ -4692,6 +5121,46 @@ mod tests {
     }
 
     #[test]
+    fn telegram_split_counts_final_continued_marker_in_send_length() {
+        let msg = "a".repeat(8142);
+        let chunks = split_message_for_telegram(&msg);
+        assert!(chunks.len() >= 2);
+
+        for (index, chunk) in chunks.iter().enumerate() {
+            let text = format_telegram_text_chunk(chunk, index, chunks.len());
+            assert!(
+                text.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH,
+                "final sent chunk {index} must be <= {TELEGRAM_MAX_MESSAGE_LENGTH}, got {}",
+                text.chars().count()
+            );
+        }
+
+        let final_text =
+            format_telegram_text_chunk(chunks.last().unwrap(), chunks.len() - 1, chunks.len());
+        assert!(final_text.starts_with(TELEGRAM_CONTINUED_PREFIX));
+    }
+
+    #[test]
+    fn telegram_split_counts_middle_continuation_markers_in_send_length() {
+        let msg = "a".repeat(TELEGRAM_MAX_MESSAGE_LENGTH * 3);
+        let chunks = split_message_for_telegram(&msg);
+        assert!(chunks.len() >= 3);
+
+        for (index, chunk) in chunks.iter().enumerate() {
+            let text = format_telegram_text_chunk(chunk, index, chunks.len());
+            assert!(
+                text.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH,
+                "sent chunk {index} must be <= {TELEGRAM_MAX_MESSAGE_LENGTH}, got {}",
+                text.chars().count()
+            );
+        }
+
+        let middle = format_telegram_text_chunk(&chunks[1], 1, chunks.len());
+        assert!(middle.starts_with(TELEGRAM_CONTINUED_PREFIX));
+        assert!(middle.ends_with(TELEGRAM_CONTINUES_SUFFIX));
+    }
+
+    #[test]
     fn telegram_split_at_word_boundary() {
         let msg = format!(
             "{} more text here",
@@ -4806,21 +5275,39 @@ mod tests {
 
     #[tokio::test]
     async fn telegram_send_document_bytes_empty_file() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendDocument$"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(
+                serde_json::json!({ "ok": false, "description": "empty document rejected" }),
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
         let mention_only = false;
         let ch = TelegramChannel::new(
             "fake-token".into(),
             "telegram_test_alias",
             Arc::new(|| vec!["*".into()]),
             mention_only,
-        );
+        )
+        .with_api_base(mock_server.uri());
         let file_bytes: Vec<u8> = vec![];
 
         let result = ch
             .send_document_bytes("123456", None, file_bytes, "empty.txt", None)
             .await;
 
-        // Should not panic, will fail at API level
-        assert!(result.is_err());
+        let err = result.expect_err("empty document send should fail");
+        assert!(
+            err.to_string().contains("empty document rejected"),
+            "expected mocked Telegram error, got: {err}"
+        );
     }
 
     #[tokio::test]
@@ -5364,6 +5851,82 @@ mod tests {
                 part.len() <= TELEGRAM_MAX_MESSAGE_LENGTH,
                 "each part must be <= {TELEGRAM_MAX_MESSAGE_LENGTH}, got {}",
                 part.len()
+            );
+        }
+    }
+
+    #[test]
+    fn telegram_split_long_fenced_code_block_balances_each_chunk() {
+        let mut msg = String::new();
+        msg.push_str("Intro\n\n```rust\n");
+        for i in 0..700 {
+            let _ = writeln!(msg, "fn generated_{i}() {{ println!(\"line {i:03}\"); }}");
+        }
+        msg.push_str("```\n\nOutro");
+
+        let parts = split_message_for_telegram(&msg);
+        assert!(parts.len() >= 2, "long fenced code block should split");
+        for part in &parts {
+            assert!(
+                part.len() <= TELEGRAM_MAX_MESSAGE_LENGTH,
+                "balanced chunk must be <= {TELEGRAM_MAX_MESSAGE_LENGTH}, got {}",
+                part.len()
+            );
+            assert_eq!(
+                part.matches("```").count() % 2,
+                0,
+                "each chunk should have balanced markdown fences"
+            );
+
+            let html = TelegramChannel::markdown_to_telegram_html(part);
+            assert_eq!(
+                html.matches("<pre><code>").count(),
+                html.matches("</code></pre>").count(),
+                "rendered Telegram HTML should have balanced code blocks"
+            );
+        }
+
+        assert!(
+            parts.iter().skip(1).any(|part| part.starts_with("```\n")),
+            "continuation inside a code block should reopen a fence"
+        );
+        assert!(
+            parts
+                .iter()
+                .take(parts.len() - 1)
+                .any(|part| part.ends_with("\n```") || part.ends_with("```")),
+            "split chunks inside a code block should close the fence"
+        );
+    }
+
+    #[test]
+    fn telegram_split_fenced_code_send_text_stays_within_limit_and_balanced() {
+        let mut msg = String::new();
+        msg.push_str("```rust\n");
+        msg.push_str(&"a".repeat(TELEGRAM_MAX_MESSAGE_LENGTH + 120));
+        msg.push_str("\n```\n");
+
+        let parts = split_message_for_telegram(&msg);
+        assert!(parts.len() >= 2);
+
+        for (index, part) in parts.iter().enumerate() {
+            let text = format_telegram_text_chunk(part, index, parts.len());
+            assert!(
+                text.chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH,
+                "sent fenced chunk {index} must be <= {TELEGRAM_MAX_MESSAGE_LENGTH}, got {}",
+                text.chars().count()
+            );
+            assert_eq!(
+                text.matches("```").count() % 2,
+                0,
+                "sent fenced chunk {index} should have balanced markdown fences"
+            );
+
+            let html = TelegramChannel::markdown_to_telegram_html(&text);
+            assert_eq!(
+                html.matches("<pre><code>").count(),
+                html.matches("</code></pre>").count(),
+                "sent fenced chunk {index} should render balanced Telegram HTML"
             );
         }
     }
@@ -6376,6 +6939,162 @@ mod tests {
     // ── Forwarded message tests ─────────────────────────────────────
 
     #[test]
+    fn format_forward_attribution_supports_forward_origin_variants() {
+        let cases = vec![
+            (
+                "user with username",
+                serde_json::json!({
+                    "type": "user",
+                    "sender_user": { "id": 123, "username": "alice" }
+                }),
+                "[Forwarded from @alice] ",
+            ),
+            (
+                "user with display name",
+                serde_json::json!({
+                    "type": "user",
+                    "sender_user": {
+                        "id": 123,
+                        "first_name": "Alice",
+                        "last_name": "Smith"
+                    }
+                }),
+                "[Forwarded from Alice Smith] ",
+            ),
+            (
+                "hidden user",
+                serde_json::json!({
+                    "type": "hidden_user",
+                    "sender_user_name": "Anonymous Sender"
+                }),
+                "[Forwarded from Anonymous Sender] ",
+            ),
+            (
+                "chat",
+                serde_json::json!({
+                    "type": "chat",
+                    "sender_chat": { "id": 123, "title": "Secret Group" }
+                }),
+                "[Forwarded from chat: Secret Group] ",
+            ),
+            (
+                "channel",
+                serde_json::json!({
+                    "type": "channel",
+                    "chat": { "id": 123, "title": "News Channel" }
+                }),
+                "[Forwarded from channel: News Channel] ",
+            ),
+        ];
+
+        for (name, origin, expected) in cases {
+            let message = serde_json::json!({ "forward_origin": origin });
+            assert_eq!(
+                TelegramChannel::format_forward_attribution(&message),
+                Some(expected.to_string()),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_update_message_forward_origin_variants_reach_channel_content() {
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+
+        let cases = vec![
+            (
+                serde_json::json!({
+                    "type": "user",
+                    "sender_user": { "id": 123, "username": "bob" }
+                }),
+                "[Forwarded from @bob] forwarded item",
+            ),
+            (
+                serde_json::json!({
+                    "type": "hidden_user",
+                    "sender_user_name": "Hidden User"
+                }),
+                "[Forwarded from Hidden User] forwarded item",
+            ),
+            (
+                serde_json::json!({
+                    "type": "chat",
+                    "sender_chat": { "id": -123, "title": "Secret Group" }
+                }),
+                "[Forwarded from chat: Secret Group] forwarded item",
+            ),
+            (
+                serde_json::json!({
+                    "type": "channel",
+                    "chat": { "id": 123, "title": "News Channel" }
+                }),
+                "[Forwarded from channel: News Channel] forwarded item",
+            ),
+        ];
+
+        for (index, (origin, expected)) in cases.into_iter().enumerate() {
+            let update = serde_json::json!({
+                "update_id": 99 + index,
+                "message": {
+                    "message_id": 49 + index,
+                    "text": "forwarded item",
+                    "from": { "id": 1, "username": "alice" },
+                    "chat": { "id": 999 },
+                    "forward_origin": origin
+                }
+            });
+
+            let msg = ch
+                .parse_update_message(&update)
+                .expect("forward_origin message should parse");
+            assert_eq!(msg.content, expected);
+        }
+    }
+
+    #[test]
+    fn parse_update_message_forwarded_reply_keeps_quote_block_separate() {
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        let update = serde_json::json!({
+            "update_id": 110,
+            "message": {
+                "message_id": 60,
+                "text": "look at this news",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": 999 },
+                "forward_origin": {
+                    "type": "channel",
+                    "chat": { "id": 123, "title": "News Channel" }
+                },
+                "reply_to_message": {
+                    "message_id": 59,
+                    "text": "What do you think?",
+                    "from": { "id": 2, "username": "bot" }
+                }
+            }
+        });
+
+        let msg = ch
+            .parse_update_message(&update)
+            .expect("forwarded reply should parse");
+        assert_eq!(
+            msg.content,
+            "[Forwarded from channel: News Channel]\n\n> @bot:\n> What do you think?\n\nlook at this news"
+        );
+    }
+
+    #[test]
     fn parse_update_message_forwarded_from_user_with_username() {
         let mention_only = false;
         let ch = TelegramChannel::new(
@@ -6535,9 +7254,12 @@ mod tests {
             "photo": [
                 { "file_id": "abc123", "file_unique_id": "u1", "width": 320, "height": 240 }
             ],
-            "forward_from": {
-                "id": 42,
-                "username": "bob"
+            "forward_origin": {
+                "type": "user",
+                "sender_user": {
+                    "id": 42,
+                    "username": "bob"
+                }
             },
             "forward_date": 1_700_000_000
         });
@@ -6548,7 +7270,7 @@ mod tests {
 
         // Simulate what try_parse_attachment_message does after building content
         let photo_content = "[IMAGE:/tmp/photo.jpg]".to_string();
-        let content = format!("{attr}{photo_content}");
+        let content = TelegramChannel::prepend_forward_attribution(&attr, photo_content);
         assert_eq!(content, "[Forwarded from @bob] [IMAGE:/tmp/photo.jpg]");
     }
 

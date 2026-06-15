@@ -2,6 +2,7 @@ pub use zeroclaw_runtime::cron::*;
 
 use crate::config::Config;
 use anyhow::{Result, bail};
+use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 
 /// Bail with a clear error if the named agent isn't configured.
 fn require_configured_agent(config: &Config, agent_alias: &str) -> Result<()> {
@@ -43,13 +44,19 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
         crate::CronCommands::List => {
             let jobs = list_jobs(config)?;
             if jobs.is_empty() {
-                println!("No scheduled tasks yet.");
-                println!("\nUsage:");
-                println!("  zeroclaw cron add '0 9 * * *' 'agent -m \"Good morning!\"'");
+                println!("{}", get_required_cli_string("cli-cron-none"));
+                println!("\n{}", get_required_cli_string("cli-cron-usage"));
+                println!("  zeroclaw cron add '0 9 * * *' 'agent -m \"Good morning!\"'"); // i18n-exempt: literal command example
                 return Ok(());
             }
 
-            println!("🕒 Scheduled jobs ({}):", jobs.len());
+            println!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-cron-jobs-header",
+                    &[("count", &jobs.len().to_string())]
+                )
+            );
             for job in jobs {
                 let last_run = job
                     .last_run
@@ -64,10 +71,22 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     last_status,
                 );
                 if !job.command.is_empty() {
-                    println!("    cmd: {}", job.command);
+                    println!(
+                        "{}",
+                        get_required_cli_string_with_args(
+                            "cli-cron-list-cmd",
+                            &[("cmd", &job.command)]
+                        )
+                    );
                 }
                 if let Some(prompt) = &job.prompt {
-                    println!("    prompt: {prompt}");
+                    println!(
+                        "{}",
+                        get_required_cli_string_with_args(
+                            "cli-cron-list-prompt",
+                            &[("prompt", prompt)]
+                        )
+                    );
                 }
             }
             Ok(())
@@ -102,19 +121,52 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                         Some(allowed_tools)
                     },
                 )?;
-                println!("✅ Added agent cron job {}", job.id);
-                println!("  Expr  : {}", job.expression);
-                println!("  Next  : {}", job.next_run.to_rfc3339());
-                println!("  Prompt: {}", job.prompt.as_deref().unwrap_or_default());
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args("cli-cron-added-agent", &[("id", &job.id)])
+                );
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args("cli-cron-expr", &[("v", &job.expression)])
+                );
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-cron-next",
+                        &[("v", &job.next_run.to_rfc3339())]
+                    )
+                );
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-cron-prompt",
+                        &[("v", job.prompt.as_deref().unwrap_or_default())]
+                    )
+                );
             } else {
                 if !allowed_tools.is_empty() {
                     bail!("--allowed-tool is only supported with --prompt cron jobs");
                 }
                 let job = add_shell_job(config, &agent_alias, None, schedule, &command)?;
-                println!("✅ Added cron job {}", job.id);
-                println!("  Expr: {}", job.expression);
-                println!("  Next: {}", job.next_run.to_rfc3339());
-                println!("  Cmd : {}", job.command);
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args("cli-cron-added", &[("id", &job.id)])
+                );
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args("cli-cron-expr2", &[("v", &job.expression)])
+                );
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-cron-next2",
+                        &[("v", &job.next_run.to_rfc3339())]
+                    )
+                );
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args("cli-cron-cmd", &[("v", &job.command)])
+                );
             }
             Ok(())
         }
@@ -145,17 +197,47 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                         Some(allowed_tools)
                     },
                 )?;
-                println!("✅ Added one-shot agent cron job {}", job.id);
-                println!("  At    : {}", job.next_run.to_rfc3339());
-                println!("  Prompt: {}", job.prompt.as_deref().unwrap_or_default());
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-cron-added-oneshot-agent",
+                        &[("id", &job.id)]
+                    )
+                );
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-cron-at",
+                        &[("v", &job.next_run.to_rfc3339())]
+                    )
+                );
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-cron-prompt",
+                        &[("v", job.prompt.as_deref().unwrap_or_default())]
+                    )
+                );
             } else {
                 if !allowed_tools.is_empty() {
                     bail!("--allowed-tool is only supported with --prompt cron jobs");
                 }
                 let job = add_shell_job(config, &agent_alias, None, schedule, &command)?;
-                println!("✅ Added one-shot cron job {}", job.id);
-                println!("  At  : {}", job.next_run.to_rfc3339());
-                println!("  Cmd : {}", job.command);
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args("cli-cron-added-oneshot", &[("id", &job.id)])
+                );
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-cron-at2",
+                        &[("v", &job.next_run.to_rfc3339())]
+                    )
+                );
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args("cli-cron-cmd", &[("v", &job.command)])
+                );
             }
             Ok(())
         }
@@ -185,19 +267,64 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                         Some(allowed_tools)
                     },
                 )?;
-                println!("✅ Added interval agent cron job {}", job.id);
-                println!("  Every(ms): {every_ms}");
-                println!("  Next     : {}", job.next_run.to_rfc3339());
-                println!("  Prompt   : {}", job.prompt.as_deref().unwrap_or_default());
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-cron-added-interval-agent",
+                        &[("id", &job.id)]
+                    )
+                );
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-cron-every",
+                        &[("v", &every_ms.to_string())]
+                    )
+                );
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-cron-next3",
+                        &[("v", &job.next_run.to_rfc3339())]
+                    )
+                );
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-cron-prompt3",
+                        &[("v", job.prompt.as_deref().unwrap_or_default())]
+                    )
+                );
             } else {
                 if !allowed_tools.is_empty() {
                     bail!("--allowed-tool is only supported with --prompt cron jobs");
                 }
                 let job = add_shell_job(config, &agent_alias, None, schedule, &command)?;
-                println!("✅ Added interval cron job {}", job.id);
-                println!("  Every(ms): {every_ms}");
-                println!("  Next     : {}", job.next_run.to_rfc3339());
-                println!("  Cmd      : {}", job.command);
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-cron-added-interval",
+                        &[("id", &job.id)]
+                    )
+                );
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-cron-every",
+                        &[("v", &every_ms.to_string())]
+                    )
+                );
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-cron-next3",
+                        &[("v", &job.next_run.to_rfc3339())]
+                    )
+                );
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args("cli-cron-cmd3", &[("v", &job.command)])
+                );
             }
             Ok(())
         }
@@ -229,17 +356,47 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                         Some(allowed_tools)
                     },
                 )?;
-                println!("✅ Added one-shot agent cron job {}", job.id);
-                println!("  At    : {}", job.next_run.to_rfc3339());
-                println!("  Prompt: {}", job.prompt.as_deref().unwrap_or_default());
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-cron-added-oneshot-agent",
+                        &[("id", &job.id)]
+                    )
+                );
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-cron-at",
+                        &[("v", &job.next_run.to_rfc3339())]
+                    )
+                );
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-cron-prompt",
+                        &[("v", job.prompt.as_deref().unwrap_or_default())]
+                    )
+                );
             } else {
                 if !allowed_tools.is_empty() {
                     bail!("--allowed-tool is only supported with --prompt cron jobs");
                 }
                 let job = add_once(config, &agent_alias, &delay, &command)?;
-                println!("✅ Added one-shot cron job {}", job.id);
-                println!("  At  : {}", job.next_run.to_rfc3339());
-                println!("  Cmd : {}", job.command);
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args("cli-cron-added-oneshot", &[("id", &job.id)])
+                );
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-cron-at2",
+                        &[("v", &job.next_run.to_rfc3339())]
+                    )
+                );
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args("cli-cron-cmd", &[("v", &job.command)])
+                );
             }
             Ok(())
         }
@@ -314,21 +471,42 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             };
 
             let job = update_shell_job_with_approval(config, &agent_alias, &id, patch, false)?;
-            println!("\u{2705} Updated cron job {}", job.id);
-            println!("  Expr: {}", job.expression);
-            println!("  Next: {}", job.next_run.to_rfc3339());
-            println!("  Cmd : {}", job.command);
+            println!(
+                "{}",
+                get_required_cli_string_with_args("cli-cron-updated", &[("id", &job.id)])
+            );
+            println!(
+                "{}",
+                get_required_cli_string_with_args("cli-cron-expr2", &[("v", &job.expression)])
+            );
+            println!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-cron-next2",
+                    &[("v", &job.next_run.to_rfc3339())]
+                )
+            );
+            println!(
+                "{}",
+                get_required_cli_string_with_args("cli-cron-cmd", &[("v", &job.command)])
+            );
             Ok(())
         }
         crate::CronCommands::Remove { id } => remove_job(config, &id),
         crate::CronCommands::Pause { id } => {
             pause_job(config, &id)?;
-            println!("⏸️  Paused cron job {id}");
+            println!(
+                "{}",
+                get_required_cli_string_with_args("cli-cron-paused", &[("id", &id)])
+            );
             Ok(())
         }
         crate::CronCommands::Resume { id } => {
             resume_job(config, &id)?;
-            println!("▶️  Resumed cron job {id}");
+            println!(
+                "{}",
+                get_required_cli_string_with_args("cli-cron-resumed", &[("id", &id)])
+            );
             Ok(())
         }
     }
@@ -362,8 +540,8 @@ mod tests {
         config.agents.entry("test-agent".to_string()).or_insert(
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "openrouter.test-agent".into(),
-                risk_profile: "test-agent".to_string(),
-                runtime_profile: "test-agent".to_string(),
+                risk_profile: "test-agent".into(),
+                runtime_profile: "test-agent".into(),
                 ..Default::default()
             },
         );

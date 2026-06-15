@@ -21,7 +21,7 @@ pub struct ApprovalRequest {
 }
 
 /// The user's response to an approval request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ApprovalResponse {
     /// Execute this one call.
@@ -30,6 +30,35 @@ pub enum ApprovalResponse {
     No,
     /// Execute and add tool to session-scoped allowlist.
     Always,
+    /// Skip execution; return this as the tool result instead.
+    #[serde(rename = "replace_with")]
+    ReplaceWith(String),
+}
+
+/// Maximum length of an operator-supplied `DenyWithEdit` / `ReplaceWith`
+/// replacement, in bytes. The replacement is operator-authored but still
+/// untrusted input that becomes a tool result fed back to the model — cap it
+/// so a runaway paste can't blow up the context window.
+pub const MAX_REPLACEMENT_LEN: usize = 64 * 1024;
+
+/// Sanitize an operator-supplied tool-result replacement before it is fed back
+/// to the model: drop control characters (except `\n`, `\r`, `\t`) that could
+/// corrupt rendering or smuggle terminal escapes, and truncate to
+/// [`MAX_REPLACEMENT_LEN`] on a char boundary.
+#[must_use]
+pub fn sanitize_tool_replacement(replacement: &str) -> String {
+    let cleaned: String = replacement
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
+        .collect();
+    if cleaned.len() <= MAX_REPLACEMENT_LEN {
+        return cleaned;
+    }
+    let mut end = MAX_REPLACEMENT_LEN;
+    while end > 0 && !cleaned.is_char_boundary(end) {
+        end -= 1;
+    }
+    cleaned[..end].to_string()
 }
 
 /// A single audit log entry for an approval decision.
@@ -194,11 +223,11 @@ impl ApprovalManager {
         &self,
         tool_name: &str,
         args: &serde_json::Value,
-        decision: ApprovalResponse,
+        decision: &ApprovalResponse,
         channel: &str,
     ) {
         // If "Always", add to session allowlist.
-        if decision == ApprovalResponse::Always {
+        if *decision == ApprovalResponse::Always {
             let mut allowlist = self.session_allowlist.lock();
             allowlist.insert(tool_name.to_string());
         }
@@ -209,7 +238,7 @@ impl ApprovalManager {
             timestamp: Utc::now().to_rfc3339(),
             tool_name: tool_name.to_string(),
             arguments_summary: summary,
-            decision,
+            decision: decision.clone(),
             channel: channel.to_string(),
         };
         let mut log = self.audit_log.lock();
@@ -270,23 +299,42 @@ fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
 pub fn summarize_args(args: &serde_json::Value) -> String {
     match args {
         serde_json::Value::Object(map) => {
-            let parts: Vec<String> = map
-                .iter()
-                .map(|(k, v)| {
-                    let val = if looks_like_secret_key(k) {
-                        "[redacted]".to_string()
-                    } else {
-                        match v {
-                            serde_json::Value::String(s) => truncate_for_summary(s, 80),
-                            other => {
-                                let s = other.to_string();
-                                truncate_for_summary(&s, 80)
-                            }
+            let mut parts: Vec<String> = Vec::with_capacity(map.len());
+
+            // Prioritize "path" (used by file_write/file_edit etc.) so approval
+            // popups and audit logs always surface the target file first.
+            if let Some(v) = map.get("path") {
+                let val = if looks_like_secret_key("path") {
+                    "[redacted]".to_string()
+                } else {
+                    match v {
+                        serde_json::Value::String(s) => truncate_for_summary(s, 80),
+                        other => {
+                            let s = other.to_string();
+                            truncate_for_summary(&s, 80)
                         }
-                    };
-                    format!("{k}: {val}")
-                })
-                .collect();
+                    }
+                };
+                parts.push(format!("path: {val}"));
+            }
+
+            for (k, v) in map.iter() {
+                if k == "path" {
+                    continue;
+                }
+                let val = if looks_like_secret_key(k) {
+                    "[redacted]".to_string()
+                } else {
+                    match v {
+                        serde_json::Value::String(s) => truncate_for_summary(s, 80),
+                        other => {
+                            let s = other.to_string();
+                            truncate_for_summary(&s, 80)
+                        }
+                    }
+                };
+                parts.push(format!("{k}: {val}"));
+            }
             parts.join(", ")
         }
         other => {
@@ -337,6 +385,22 @@ fn truncate_for_summary(input: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use zeroclaw_config::schema::RiskProfileConfig;
+
+    #[test]
+    fn sanitize_replacement_strips_control_chars_keeps_whitespace() {
+        let dirty = "ok\u{0007}line\nnext\ttab\u{001b}[31m";
+        let clean = sanitize_tool_replacement(dirty);
+        assert_eq!(clean, "okline\nnext\ttab[31m");
+    }
+
+    #[test]
+    fn sanitize_replacement_truncates_on_char_boundary() {
+        let big = "é".repeat(MAX_REPLACEMENT_LEN); // 2 bytes each
+        let clean = sanitize_tool_replacement(&big);
+        assert!(clean.len() <= MAX_REPLACEMENT_LEN);
+        // Truncation must land on a char boundary (no panic, valid UTF-8).
+        assert!(clean.chars().all(|c| c == 'é'));
+    }
 
     fn supervised_config() -> RiskProfileConfig {
         RiskProfileConfig {
@@ -404,7 +468,7 @@ mod tests {
         mgr.record_decision(
             "file_write",
             &serde_json::json!({"path": "test.txt"}),
-            ApprovalResponse::Always,
+            &ApprovalResponse::Always,
             "cli",
         );
 
@@ -420,7 +484,7 @@ mod tests {
         mgr.record_decision(
             "shell",
             &serde_json::json!({"command": "ls"}),
-            ApprovalResponse::Always,
+            &ApprovalResponse::Always,
             "cli",
         );
 
@@ -434,7 +498,7 @@ mod tests {
         mgr.record_decision(
             "file_write",
             &serde_json::json!({}),
-            ApprovalResponse::Yes,
+            &ApprovalResponse::Yes,
             "cli",
         );
         assert!(mgr.needs_approval("file_write"));
@@ -449,13 +513,13 @@ mod tests {
         mgr.record_decision(
             "shell",
             &serde_json::json!({"command": "rm -rf ./build/"}),
-            ApprovalResponse::No,
+            &ApprovalResponse::No,
             "cli",
         );
         mgr.record_decision(
             "file_write",
             &serde_json::json!({"path": "out.txt", "content": "hello"}),
-            ApprovalResponse::Yes,
+            &ApprovalResponse::Yes,
             "cli",
         );
 
@@ -473,7 +537,7 @@ mod tests {
         mgr.record_decision(
             "shell",
             &serde_json::json!({"command": "ls"}),
-            ApprovalResponse::Yes,
+            &ApprovalResponse::Yes,
             "telegram",
         );
 
@@ -491,6 +555,19 @@ mod tests {
         let summary = summarize_args(&args);
         assert!(summary.contains("command: ls -la"));
         assert!(summary.contains("cwd: /tmp"));
+    }
+
+    #[test]
+    pub fn summarize_args_puts_path_first_for_file_tools() {
+        let args = serde_json::json!({
+            "path": "src/main.rs",
+            "old_string": "foo",
+            "new_string": "bar"
+        });
+        let summary = summarize_args(&args);
+        assert!(summary.starts_with("path: src/main.rs"));
+        assert!(summary.contains("old_string: foo"));
+        assert!(summary.contains("new_string: bar"));
     }
 
     #[test]
@@ -600,7 +677,7 @@ mod tests {
         mgr.record_decision(
             "file_write",
             &serde_json::json!({"path": "test.txt"}),
-            ApprovalResponse::Always,
+            &ApprovalResponse::Always,
             "telegram",
         );
 
@@ -614,7 +691,7 @@ mod tests {
         mgr.record_decision(
             "shell",
             &serde_json::json!({"command": "ls"}),
-            ApprovalResponse::Always,
+            &ApprovalResponse::Always,
             "telegram",
         );
 
@@ -630,6 +707,10 @@ mod tests {
         assert_eq!(json, "\"always\"");
         let parsed: ApprovalResponse = serde_json::from_str("\"no\"").unwrap();
         assert_eq!(parsed, ApprovalResponse::No);
+        let json =
+            serde_json::to_string(&ApprovalResponse::ReplaceWith("foo".to_string())).unwrap();
+        let parsed: ApprovalResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, ApprovalResponse::ReplaceWith("foo".to_string()));
     }
 
     // ── ApprovalRequest ──────────────────────────────────────
@@ -671,6 +752,16 @@ mod tests {
     }
 
     #[test]
+    fn non_interactive_tool_search_is_auto_approved() {
+        let config = RiskProfileConfig::default();
+        let mgr = ApprovalManager::for_non_interactive(&config);
+        assert!(
+            !mgr.needs_approval("tool_search"),
+            "tool_search discovery must not need approval in non-interactive mode"
+        );
+    }
+
+    #[test]
     fn non_interactive_weather_is_auto_approved() {
         let config = RiskProfileConfig::default();
         let mgr = ApprovalManager::for_non_interactive(&config);
@@ -702,6 +793,9 @@ mod tests {
             ChannelApprovalResponse::Approve => ApprovalResponse::Yes,
             ChannelApprovalResponse::AlwaysApprove => ApprovalResponse::Always,
             ChannelApprovalResponse::Deny => ApprovalResponse::No,
+            ChannelApprovalResponse::DenyWithEdit { replacement } => {
+                ApprovalResponse::ReplaceWith(replacement)
+            }
         };
         assert_eq!(mapped, ApprovalResponse::Yes);
     }
@@ -713,6 +807,9 @@ mod tests {
             ChannelApprovalResponse::Approve => ApprovalResponse::Yes,
             ChannelApprovalResponse::AlwaysApprove => ApprovalResponse::Always,
             ChannelApprovalResponse::Deny => ApprovalResponse::No,
+            ChannelApprovalResponse::DenyWithEdit { replacement } => {
+                ApprovalResponse::ReplaceWith(replacement)
+            }
         };
         assert_eq!(mapped, ApprovalResponse::Always);
     }
@@ -724,8 +821,34 @@ mod tests {
             ChannelApprovalResponse::Approve => ApprovalResponse::Yes,
             ChannelApprovalResponse::AlwaysApprove => ApprovalResponse::Always,
             ChannelApprovalResponse::Deny => ApprovalResponse::No,
+            ChannelApprovalResponse::DenyWithEdit { replacement } => {
+                ApprovalResponse::ReplaceWith(replacement)
+            }
         };
         assert_eq!(mapped, ApprovalResponse::No);
+    }
+
+    #[test]
+    fn channel_deny_with_edit_maps_to_replace_with() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+        let mapped = match (ChannelApprovalResponse::DenyWithEdit {
+            replacement: "x".to_string(),
+        }) {
+            ChannelApprovalResponse::Approve => ApprovalResponse::Yes,
+            ChannelApprovalResponse::AlwaysApprove => ApprovalResponse::Always,
+            ChannelApprovalResponse::Deny => ApprovalResponse::No,
+            ChannelApprovalResponse::DenyWithEdit { replacement } => {
+                ApprovalResponse::ReplaceWith(replacement)
+            }
+        };
+        assert!(matches!(mapped, ApprovalResponse::ReplaceWith(s) if s == "x"));
+    }
+
+    #[test]
+    fn replace_with_is_not_yes_or_no() {
+        let r = ApprovalResponse::ReplaceWith("new text".to_string());
+        assert_ne!(r, ApprovalResponse::Yes);
+        assert_ne!(r, ApprovalResponse::No);
     }
 
     #[test]

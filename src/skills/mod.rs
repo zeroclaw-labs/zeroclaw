@@ -33,16 +33,22 @@ pub async fn handle_command(
         crate::SkillCommands::List => {
             let skills = load_skills_with_config(workspace_dir, config);
             if skills.is_empty() {
-                println!("No skills installed.");
+                println!("{}", get_required_cli_string("cli-skills-none-installed"));
                 println!();
-                println!("  Create one: mkdir -p ~/.zeroclaw/workspace/skills/my-skill");
+                println!("{}", get_required_cli_string("cli-skills-create-hint"));
                 println!(
-                    "              echo '# My Skill' > ~/.zeroclaw/workspace/skills/my-skill/SKILL.md"
+                    "              echo '# My Skill' > ~/.zeroclaw/workspace/skills/my-skill/SKILL.md" // i18n-exempt: literal shell command example
                 );
                 println!();
-                println!("  Or install: zeroclaw skills install <source>");
+                println!("{}", get_required_cli_string("cli-skills-install-hint"));
             } else {
-                println!("Installed skills ({}):", skills.len());
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-installed-header",
+                        &[("count", &skills.len().to_string())],
+                    )
+                );
                 println!();
                 for skill in &skills {
                     println!(
@@ -63,7 +69,13 @@ pub async fn handle_command(
                         );
                     }
                     if !skill.tags.is_empty() {
-                        println!("    Tags:  {}", skill.tags.join(", "));
+                        println!(
+                            "    {}",
+                            get_required_cli_string_with_args(
+                                "cli-skills-tags",
+                                &[("tags", &skill.tags.join(", "))],
+                            )
+                        );
                     }
                 }
             }
@@ -531,10 +543,45 @@ fn prompt_for_description(description: Option<String>) -> Result<String> {
 }
 
 fn open_in_editor(path: &std::path::Path) -> Result<()> {
-    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let Some(editor) = editor_from_env_or_path() else {
+        anyhow::bail!("no editor found; set VISUAL or EDITOR");
+    };
     let status = std::process::Command::new(&editor).arg(path).status()?;
     if !status.success() {
         anyhow::bail!("{editor} exited with non-zero status");
     }
     Ok(())
+}
+
+fn editor_from_env_or_path() -> Option<String> {
+    std::env::var("VISUAL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .or_else(|| {
+            fallback_editors()
+                .iter()
+                .copied()
+                .find(|candidate| executable_on_path(candidate))
+                .map(str::to_string)
+        })
+}
+
+fn executable_on_path(name: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())
+}
+
+fn fallback_editors() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["notepad.exe", "nano", "vim"]
+    } else {
+        &["nano", "vi", "vim", "editor"]
+    }
 }

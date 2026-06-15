@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use std::path::Path;
+use zeroclaw_runtime::i18n::get_required_cli_string_with_args;
 
 /// Result of a single diagnostic check.
 pub struct CheckResult {
@@ -55,6 +56,9 @@ pub async fn run_quick(config: &crate::config::Config) -> Result<Vec<CheckResult
     // 8. Version sanity
     results.push(check_version());
 
+    // 9. gateway.web_dist_dir is a literal path (no shell-style expansion)
+    results.push(check_web_dist_dir(config));
+
     Ok(results)
 }
 
@@ -69,6 +73,7 @@ pub async fn run_full(config: &crate::config::Config) -> Result<Vec<CheckResult>
     results.push(check_memory_roundtrip(config).await);
 
     // 11. WebSocket handshake
+    #[cfg(feature = "gateway")]
     results.push(check_websocket_handshake(config).await);
 
     Ok(results)
@@ -91,9 +96,24 @@ pub fn print_results(results: &[CheckResult]) {
     }
     println!();
     if failed == 0 {
-        println!("  \x1b[32mAll {total} checks passed.\x1b[0m");
+        println!(
+            "  \x1b[32m{}\x1b[0m",
+            get_required_cli_string_with_args(
+                "cli-selftest-all-passed",
+                &[("total", &total.to_string())]
+            )
+        );
     } else {
-        println!("  \x1b[31m{failed}/{total} checks failed.\x1b[0m");
+        println!(
+            "  \x1b[31m{}\x1b[0m",
+            get_required_cli_string_with_args(
+                "cli-selftest-some-failed",
+                &[
+                    ("failed", &failed.to_string()),
+                    ("total", &total.to_string())
+                ],
+            )
+        );
     }
     println!();
 }
@@ -197,8 +217,8 @@ fn check_tool_registry(config: &crate::config::Config) -> CheckResult {
 }
 
 fn check_channel_config(config: &crate::config::Config) -> CheckResult {
-    let channels = config.channels.channels();
-    let configured = channels.iter().filter(|(_, c)| *c).count();
+    let channels = zeroclaw_channels::listing::compiled_channels(&config.channels);
+    let configured = channels.iter().filter(|e| e.configured).count();
     CheckResult::pass(
         "channels",
         format!(
@@ -242,6 +262,77 @@ fn check_security_policy(config: &crate::config::Config) -> CheckResult {
 fn check_version() -> CheckResult {
     let version = env!("CARGO_PKG_VERSION");
     CheckResult::pass("version", format!("v{version}"))
+}
+
+/// Flag `gateway.web_dist_dir` values that rely on shell-style expansion
+/// (a leading `~` or any `$VAR` / `${VAR}`). The gateway reads this field
+/// verbatim and never invokes a shell, so values like `~/web-dist` or
+/// `$HOME/web-dist` resolve to literal on-disk paths and silently fail to
+/// find the bundled assets — surface that here at `zeroclaw self-test`
+/// time instead of at runtime.
+///
+/// User-facing strings (check name + detail) go through Fluent
+/// (`cli-self-test-web-dist-dir-*` keys) per AGENTS.md § Localization —
+/// no bare Rust literals for CLI output. The check `name` field is
+/// `&'static str`, so we resolve the Fluent string once into a leaked
+/// static at first call. Reason phrases are Fluent keys too
+/// (`cli-web-dist-dir-reason-{tilde,dollar}`).
+fn check_web_dist_dir(config: &crate::config::Config) -> CheckResult {
+    let name = web_dist_dir_check_name();
+    match config.gateway.web_dist_dir.as_deref() {
+        None => CheckResult::pass(
+            name,
+            zeroclaw_runtime::i18n::get_required_cli_string(
+                "cli-self-test-web-dist-dir-pass-unset",
+            ),
+        ),
+        Some(value) => match web_dist_dir_expansion_reason_key(value) {
+            None => CheckResult::pass(
+                name,
+                zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "cli-self-test-web-dist-dir-pass-literal",
+                    &[("path", value)],
+                ),
+            ),
+            Some(reason_key) => {
+                let reason = zeroclaw_runtime::i18n::get_required_cli_string(reason_key);
+                CheckResult::fail(
+                    name,
+                    zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                        "cli-self-test-web-dist-dir-fail-expansion",
+                        &[("path", value), ("reason", reason.as_str())],
+                    ),
+                )
+            }
+        },
+    }
+}
+
+/// Resolve the localized check name once and cache it as a `&'static str`
+/// (CheckResult::name is `&'static str` to stay copyable across the table
+/// renderer). Falls back to the bare identifier if the Fluent string is
+/// missing (mirrors the `missing_cli_string` warn-log behavior).
+fn web_dist_dir_check_name() -> &'static str {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<&'static str> = OnceLock::new();
+    CACHED.get_or_init(|| {
+        let resolved =
+            zeroclaw_runtime::i18n::get_required_cli_string("cli-self-test-web-dist-dir-name");
+        Box::leak(resolved.into_boxed_str())
+    })
+}
+
+/// Return the Fluent reason key when `value` looks like it expects
+/// shell expansion the gateway will not perform. `None` means the value
+/// is a literal path that the gateway can resolve as-is.
+fn web_dist_dir_expansion_reason_key(value: &str) -> Option<&'static str> {
+    if value.starts_with('~') {
+        Some("cli-web-dist-dir-reason-tilde")
+    } else if value.contains('$') {
+        Some("cli-web-dist-dir-reason-dollar")
+    } else {
+        None
+    }
 }
 
 /// Resolve a wildcard bind address (`0.0.0.0`, `[::]`) to a concrete
@@ -292,13 +383,7 @@ async fn check_gateway_health(config: &crate::config::Config) -> CheckResult {
 }
 
 async fn check_memory_roundtrip(config: &crate::config::Config) -> CheckResult {
-    let mem = match crate::memory::create_memory(
-        &config.memory,
-        &config.data_dir,
-        config
-            .first_model_provider()
-            .and_then(|e| e.api_key.as_deref()),
-    ) {
+    let mem = match crate::memory::create_memory(&config.memory, &config.data_dir, None) {
         Ok(m) => m,
         Err(e) => return CheckResult::fail("memory", format!("cannot create backend: {e}")),
     };
@@ -334,6 +419,7 @@ async fn check_memory_roundtrip(config: &crate::config::Config) -> CheckResult {
     }
 }
 
+#[cfg(feature = "gateway")]
 async fn check_websocket_handshake(config: &crate::config::Config) -> CheckResult {
     let port = config.gateway.port;
     let (probe_host, _) = resolve_probe_host(&config.gateway.host);
@@ -351,7 +437,92 @@ async fn check_websocket_handshake(config: &crate::config::Config) -> CheckResul
 
 #[cfg(test)]
 mod tests {
-    use super::{format_probe_url, resolve_probe_host};
+    use super::{format_probe_url, resolve_probe_host, web_dist_dir_expansion_reason_key};
+
+    #[test]
+    fn web_dist_dir_with_tilde_resolves_to_tilde_reason_key() {
+        // Issue #6079: `~/web-dist` is read verbatim and silently fails.
+        // #6961 Round 3: predicate now returns Fluent key, not bare phrase.
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("~/web-dist"),
+            Some("cli-web-dist-dir-reason-tilde")
+        );
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("~"),
+            Some("cli-web-dist-dir-reason-tilde")
+        );
+    }
+
+    #[test]
+    fn web_dist_dir_with_env_var_resolves_to_dollar_reason_key() {
+        // Issue #6079: `$HOME/web-dist` and `${HOME}/web-dist` are read verbatim.
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("$HOME/web-dist"),
+            Some("cli-web-dist-dir-reason-dollar")
+        );
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("${HOME}/web-dist"),
+            Some("cli-web-dist-dir-reason-dollar")
+        );
+        assert_eq!(
+            web_dist_dir_expansion_reason_key("/srv/$USER/dist"),
+            Some("cli-web-dist-dir-reason-dollar")
+        );
+        // Absolute and relative literal paths must NOT be flagged.
+        assert!(web_dist_dir_expansion_reason_key("/srv/zeroclaw/web-dist").is_none());
+        assert!(web_dist_dir_expansion_reason_key("./dist").is_none());
+    }
+
+    #[test]
+    fn check_web_dist_dir_emits_localized_fail_for_tilde() {
+        // #6961 Round 3: the failure detail goes through Fluent
+        // (cli-self-test-web-dist-dir-fail-expansion) — assert the
+        // resolved English string contains the inlined path + reason.
+        let mut config = crate::config::Config::default();
+        config.gateway.web_dist_dir = Some("~/web-dist".to_string());
+
+        let result = super::check_web_dist_dir(&config);
+        assert!(!result.passed, "tilde path must fail the check");
+
+        let expected_reason =
+            zeroclaw_runtime::i18n::get_required_cli_string("cli-web-dist-dir-reason-tilde");
+        let expected_detail = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+            "cli-self-test-web-dist-dir-fail-expansion",
+            &[("path", "~/web-dist"), ("reason", expected_reason.as_str())],
+        );
+        assert_eq!(result.detail, expected_detail);
+
+        let expected_name =
+            zeroclaw_runtime::i18n::get_required_cli_string("cli-self-test-web-dist-dir-name");
+        assert_eq!(result.name, expected_name.as_str());
+    }
+
+    #[test]
+    fn check_web_dist_dir_emits_localized_pass_for_literal() {
+        let mut config = crate::config::Config::default();
+        config.gateway.web_dist_dir = Some("/srv/zeroclaw/web-dist".to_string());
+
+        let result = super::check_web_dist_dir(&config);
+        assert!(result.passed);
+
+        let expected_detail = zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+            "cli-self-test-web-dist-dir-pass-literal",
+            &[("path", "/srv/zeroclaw/web-dist")],
+        );
+        assert_eq!(result.detail, expected_detail);
+    }
+
+    #[test]
+    fn check_web_dist_dir_emits_localized_pass_when_unset() {
+        let config = crate::config::Config::default();
+        let result = super::check_web_dist_dir(&config);
+        assert!(result.passed);
+
+        let expected_detail = zeroclaw_runtime::i18n::get_required_cli_string(
+            "cli-self-test-web-dist-dir-pass-unset",
+        );
+        assert_eq!(result.detail, expected_detail);
+    }
 
     #[test]
     fn resolve_probe_host_ipv4_wildcard() {

@@ -218,7 +218,7 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// would destroy sibling rows.
     async fn forget_for_agent(&self, key: &str, agent_id: &str) -> anyhow::Result<bool>;
 
-    /// Remove all memories in a namespace (category).
+    /// Remove all memories whose `namespace` field equals the given value.
     /// Returns the number of deleted entries.
     /// Default: returns unsupported error. Backends that support bulk deletion override this.
     async fn purge_namespace(&self, _namespace: &str) -> anyhow::Result<usize> {
@@ -426,6 +426,27 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     async fn ensure_agent_uuid(&self, alias: &str) -> anyhow::Result<String> {
         Ok(alias.to_string())
     }
+}
+
+/// High-level memory lifecycle policy.
+/// Implemented by strategy objects that wrap one or more `Memory` backends.
+#[async_trait]
+pub trait MemoryStrategy: Send + Sync {
+    /// Load and format relevant memory context for a conversation turn.
+    async fn load_context(&self, query: &str, session_id: Option<&str>) -> anyhow::Result<String>;
+
+    /// Consolidate a conversation turn into long-term memory.
+    async fn consolidate_turn(
+        &self,
+        user_message: &str,
+        assistant_response: &str,
+        provider: &dyn crate::model_provider::ModelProvider,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<()>;
+
+    /// Run memory governance (cleanup, archiving, background consolidation).
+    async fn run_governance(&self) -> anyhow::Result<()>;
 }
 
 #[cfg(test)]

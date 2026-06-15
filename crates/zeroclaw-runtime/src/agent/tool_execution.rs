@@ -11,10 +11,9 @@ use tokio_util::sync::CancellationToken;
 use crate::approval::ApprovalManager;
 use crate::observability::{Observer, ObserverEvent};
 use crate::tools::Tool;
-use crate::util::truncate_with_ellipsis;
 
 // Items that still live in `loop_` — import via the parent module.
-use super::loop_::{ParsedToolCall, ToolLoopCancelled, scrub_credentials};
+use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled, scrub_credentials};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -40,16 +39,28 @@ pub struct ToolExecutionOutcome {
 pub async fn execute_one_tool(
     call_name: &str,
     call_arguments: serde_json::Value,
+    tool_call_id: Option<&str>,
     tools_registry: &[Box<dyn Tool>],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
 ) -> Result<ToolExecutionOutcome> {
-    let args_summary = truncate_with_ellipsis(&call_arguments.to_string(), 300);
+    // Serialize arguments once and carry the full JSON into both observer
+    // events. Previously the start event received a 300-char summary and the
+    // completion event received no arguments at all, which made tool spans
+    // opaque in OTel backends (see upstream issue #5980 — "Otel Traces Should
+    // Include More Details About Why A Tool Call Failed"). Size is bounded
+    // downstream by the tracing exporter, so we don't need to clip here.
+    let full_args = call_arguments.to_string();
+    let tool_call_id_owned = tool_call_id.map(str::to_string);
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
-        arguments: Some(args_summary),
+        tool_call_id: tool_call_id_owned.clone(),
+        arguments: Some(full_args.clone()),
+        channel: None,
+        agent_alias: None,
+        turn_id: None,
     });
     let start = Instant::now();
 
@@ -62,15 +73,22 @@ pub async fn execute_one_tool(
     let Some(tool) = static_tool.or(activated_arc.as_deref()) else {
         let reason = format!("Unknown tool: {call_name}");
         let duration = start.elapsed();
+        let scrubbed_reason = scrub_credentials(&reason);
         observer.record_event(&ObserverEvent::ToolCall {
             tool: call_name.to_string(),
+            tool_call_id: tool_call_id_owned.clone(),
             duration,
             success: false,
+            arguments: Some(full_args.clone()),
+            result: Some(scrubbed_reason.clone()),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         return Ok(ToolExecutionOutcome {
-            output: reason.clone(),
+            output: reason,
             success: false,
-            error_reason: Some(scrub_credentials(&reason)),
+            error_reason: Some(scrubbed_reason),
             duration,
             receipt: None,
         });
@@ -88,11 +106,15 @@ pub async fn execute_one_tool(
     // execute() impls add zero logging.
     let _start_guard = tool_span.clone().entered();
     ::zeroclaw_log::record!(
-        INFO,
+        DEBUG,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Invoke)
             .with_category(::zeroclaw_log::EventCategory::Tool)
-            .with_attrs(::serde_json::json!({"input": call_arguments})),
-        "tool invocation start"
+            .with_attrs(::serde_json::json!({
+                "tool": call_name,
+                "tool_call_id": tool_call_id,
+                "input": call_arguments,
+            })),
+        format!("tool call: {call_name}")
     );
     drop(_start_guard);
 
@@ -114,22 +136,36 @@ pub async fn execute_one_tool(
             let duration = start.elapsed();
             if r.success {
                 ::zeroclaw_log::record!(
-                    INFO,
+                    DEBUG,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
                         .with_category(::zeroclaw_log::EventCategory::Tool)
                         .with_outcome(::zeroclaw_log::EventOutcome::Success)
                         .with_duration(duration.as_millis() as u64)
-                        .with_attrs(::serde_json::json!({"output": r.output})),
-                    "tool invocation complete"
+                        .with_attrs(::serde_json::json!({
+                            "tool": call_name,
+                            "tool_call_id": tool_call_id,
+                            "input": call_arguments,
+                            "output": r.output,
+                        })),
+                    format!("tool result: {call_name}")
                 );
             } else {
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Tool).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_duration(duration.as_millis() as u64).with_attrs(::serde_json::json!({"error": r.error.clone().unwrap_or_default(), "output": r.output})), "tool invocation failed");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_category(::zeroclaw_log::EventCategory::Tool)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_duration(duration.as_millis() as u64)
+                        .with_attrs(::serde_json::json!({
+                            "tool": call_name,
+                            "tool_call_id": tool_call_id,
+                            "input": call_arguments,
+                            "error": r.error.clone().unwrap_or_default(),
+                            "output": r.output,
+                        })),
+                    format!("tool failed: {call_name}")
+                );
             }
-            observer.record_event(&ObserverEvent::ToolCall {
-                tool: call_name.to_string(),
-                duration,
-                success: r.success,
-            });
             if r.success {
                 let normalized_output = if r.output.is_empty() {
                     "(no output)"
@@ -140,6 +176,17 @@ pub async fn execute_one_tool(
                 let receipt = receipt_generator.map(|receipt_gen| {
                     receipt_gen.generate_now(call_name, &call_arguments, &output)
                 });
+                observer.record_event(&ObserverEvent::ToolCall {
+                    tool: call_name.to_string(),
+                    tool_call_id: tool_call_id_owned.clone(),
+                    duration,
+                    success: true,
+                    arguments: Some(full_args.clone()),
+                    result: Some(output.clone()),
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
+                });
                 Ok(ToolExecutionOutcome {
                     output,
                     success: true,
@@ -149,10 +196,22 @@ pub async fn execute_one_tool(
                 })
             } else {
                 let reason = r.error.unwrap_or(r.output);
+                let scrubbed_reason = scrub_credentials(&reason);
+                observer.record_event(&ObserverEvent::ToolCall {
+                    tool: call_name.to_string(),
+                    tool_call_id: tool_call_id_owned.clone(),
+                    duration,
+                    success: false,
+                    arguments: Some(full_args.clone()),
+                    result: Some(scrubbed_reason.clone()),
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
+                });
                 Ok(ToolExecutionOutcome {
                     output: format!("Error: {reason}"),
                     success: false,
-                    error_reason: Some(scrub_credentials(&reason)),
+                    error_reason: Some(scrubbed_reason),
                     duration,
                     receipt: None,
                 })
@@ -166,19 +225,31 @@ pub async fn execute_one_tool(
                     .with_category(::zeroclaw_log::EventCategory::Tool)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_duration(duration.as_millis() as u64)
-                    .with_attrs(::serde_json::json!({"error": format!("{e:?}")})),
-                "tool invocation errored"
+                    .with_attrs(::serde_json::json!({
+                        "tool": call_name,
+                        "tool_call_id": tool_call_id,
+                        "input": call_arguments,
+                        "error": format!("{e:?}"),
+                    })),
+                format!("tool error: {call_name}")
             );
+            let reason = format!("Error executing {call_name}: {e}");
+            let scrubbed_reason = scrub_credentials(&reason);
             observer.record_event(&ObserverEvent::ToolCall {
                 tool: call_name.to_string(),
+                tool_call_id: tool_call_id_owned.clone(),
                 duration,
                 success: false,
+                arguments: Some(full_args.clone()),
+                result: Some(scrubbed_reason.clone()),
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
             });
-            let reason = format!("Error executing {call_name}: {e}");
             Ok(ToolExecutionOutcome {
-                output: reason.clone(),
+                output: reason,
                 success: false,
-                error_reason: Some(scrub_credentials(&reason)),
+                error_reason: Some(scrubbed_reason),
                 duration,
                 receipt: None,
             })
@@ -231,6 +302,7 @@ pub async fn execute_tools_parallel(
             execute_one_tool(
                 &call.name,
                 call.arguments.clone(),
+                call.tool_call_id.as_deref(),
                 tools_registry,
                 activated_tools,
                 observer,
@@ -246,6 +318,12 @@ pub async fn execute_tools_parallel(
 
 // ── Sequential execution ─────────────────────────────────────────────────
 
+/// Cancellation contract: a cancel mid-batch stops dispatch and returns
+/// `Ok` with the outcomes of the calls that completed (a strict prefix of
+/// `tool_calls`) — never an error. The token is checked before each call so
+/// a tool that fires the token never lets a later call start, and a cancel
+/// that interrupts a running tool drops that call's outcome. Callers detect
+/// the cut-short batch by comparing lengths.
 pub async fn execute_tools_sequential(
     tool_calls: &[ParsedToolCall],
     tools_registry: &[Box<dyn Tool>],
@@ -257,18 +335,26 @@ pub async fn execute_tools_sequential(
     let mut outcomes = Vec::with_capacity(tool_calls.len());
 
     for call in tool_calls {
-        outcomes.push(
-            execute_one_tool(
-                &call.name,
-                call.arguments.clone(),
-                tools_registry,
-                activated_tools,
-                observer,
-                cancellation_token,
-                receipt_generator,
-            )
-            .await?,
-        );
+        if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
+            break;
+        }
+        let outcome = match execute_one_tool(
+            &call.name,
+            call.arguments.clone(),
+            call.tool_call_id.as_deref(),
+            tools_registry,
+            activated_tools,
+            observer,
+            cancellation_token,
+            receipt_generator,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(e) if is_tool_loop_cancelled(&e) => break,
+            Err(e) => return Err(e),
+        };
+        outcomes.push(outcome);
     }
 
     Ok(outcomes)

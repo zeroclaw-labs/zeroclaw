@@ -3,7 +3,8 @@ import type { ApprovalDecision, PendingApproval, WsMessage } from '@/types/api';
 import { WebSocketClient, getOrCreateSessionId } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
 import { t } from '@/lib/i18n';
-import { getProp, putProp, getStatus, getSessionMessages, abortSession } from '@/lib/api';
+import { getProp, putProp, getStatus, getSessionMessages, abortSession, deleteSession } from '@/lib/api';
+import { primeModelProviderCatalog, modelProviderDisplayName } from '@/lib/modelProviders';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
 import {
   loadChatHistory,
@@ -58,19 +59,54 @@ export function useAgent() {
 }
 
 const MODEL_SWITCH_TIMEOUT_MS = 10_000;
-const LOCAL_PROVIDER_NAMES: Record<string, string> = {
-  atomic_chat: 'Atomic Chat',
-  gemini_cli: 'Gemini CLI',
-  kilocli: 'KiloCLI',
-  lmstudio: 'LM Studio',
-  llamacpp: 'llama.cpp server',
-  ollama: 'Ollama',
-  opencode: 'OpenCode',
-  osaurus: 'Osaurus',
-  sglang: 'SGLang',
-  synthetic: 'Synthetic',
-  vllm: 'vLLM',
-};
+
+/**
+ * Extract the `model` identifiers from a `model_routes` prop value.
+ *
+ * `/api/config/prop` returns the value as a display *string* (never a real
+ * array, and with no `populated` flag), so this tolerates every shape we might
+ * see: an already-parsed array, a JSON-encoded array, or the TOML-ish display
+ * string the gateway currently emits, e.g.
+ * `[{ hint = "fast", model = "Qwen3.6-35B-A3B", model_provider = "vllm.default" }]`.
+ * Returns a de-duplicated, order-preserving list of model names.
+ */
+function extractRouteModels(value: unknown): string[] {
+  const out: string[] = [];
+  const push = (m: unknown) => {
+    if (typeof m === 'string' && m.length > 0 && !out.includes(m)) out.push(m);
+  };
+
+  const fromArray = (arr: unknown[]) => {
+    for (const r of arr) {
+      if (r && typeof r === 'object') push((r as Record<string, unknown>).model);
+    }
+  };
+
+  if (Array.isArray(value)) {
+    fromArray(value);
+    return out;
+  }
+
+  if (typeof value === 'string') {
+    // Try strict JSON first (future-proofing if the wire format changes).
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) {
+        fromArray(parsed);
+        if (out.length > 0) return out;
+      }
+    } catch {
+      // Not JSON — fall through to string scraping.
+    }
+    // Scrape `model = "..."` pairs. `\bmodel\s*=` does not match
+    // `model_provider = ...` because of the intervening `_provider`.
+    const re = /\bmodel\s*=\s*"([^"]+)"/g;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(value)) !== null) push(match[1]);
+  }
+
+  return out;
+}
 
 function friendlyAgentError(message?: string): string {
   const raw = message?.trim() || t('agent.unknown_error');
@@ -81,7 +117,7 @@ function friendlyAgentError(message?: string): string {
     const provider = localConnectFailure[1] ?? '';
     const model = localConnectFailure[2] ?? 'the selected model';
     const url = localConnectFailure[3] ?? 'the configured endpoint';
-    const displayProvider = LOCAL_PROVIDER_NAMES[provider] ?? provider;
+    const displayProvider = modelProviderDisplayName(provider);
     return `${displayProvider} is unreachable at ${url}. Start the local provider service, confirm it serves ${model}, then try again.`;
   }
   return raw;
@@ -120,6 +156,12 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   const switchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsVersionRef = useRef(0);
   const localMessageMutationVersionRef = useRef(0);
+
+  // Prime the model-provider catalog once so error formatting can resolve
+  // display names from the backend registry rather than a local shadow list.
+  useEffect(() => {
+    void primeModelProviderCatalog();
+  }, []);
 
   // Hydrate chat from server (preferred) or localStorage fallback
   useEffect(() => {
@@ -217,7 +259,11 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
 
       case 'message':
       case 'done': {
-        const content = msg.full_response ?? msg.content ?? pendingContentRef.current;
+        const raw_content = msg.full_response ?? msg.content ?? pendingContentRef.current;
+        // Skip whitespace-only content (e.g. models that emit "\n\n"
+        // alongside tool_calls) to avoid accumulating blank lines in the
+        // assistant bubble. Ref: #6702.
+        const content = raw_content.trim();
         const thinking = capturedThinkingRef.current || pendingThinkingRef.current || undefined;
         if (content) {
           localMessageMutationVersionRef.current += 1;
@@ -243,7 +289,17 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       }
 
       case 'tool_call': {
-        const toolName = msg.name ?? 'unknown';
+        // Defense in depth (issue #7151): the chat WebSocket shares a broadcast
+        // bus with observability telemetry, whose `tool_call` frames have a
+        // different shape (`tool`/`duration_ms`/`success`) and carry no `name`.
+        // Such a frame would otherwise produce a permanent "unknown" tool card
+        // with a spinner that never resolves (no matching `tool_result`). The
+        // backend already filters these out, but ignore them here too so a
+        // malformed telemetry frame can never render a stuck card.
+        if (!msg.name) {
+          break;
+        }
+        const toolName = msg.name;
         const toolArgs = msg.args;
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => {
@@ -273,6 +329,13 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       }
 
       case 'tool_result': {
+        // Defense in depth (issue #7151): mirrors the `tool_call` guard
+        // above. Observability `tool_result`-shaped telemetry would otherwise
+        // overwrite the most recent pending tool card with an empty output.
+        if (!msg.name) {
+          break;
+        }
+        const toolName = msg.name;
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => {
           const idx = prev.findIndex((m) => m.toolCall && m.toolCall.output === undefined);
@@ -291,7 +354,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
               id: generateUUID(),
               role: 'agent' as const,
               content: `${t('agent.tool_result_prefix')} ${msg.output ?? ''}`,
-              toolCall: { name: msg.name ?? 'unknown', output: msg.output ?? '' },
+              toolCall: { name: toolName, output: msg.output ?? '' },
               timestamp: new Date(),
             },
           ];
@@ -456,40 +519,49 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
 
     async function loadModelInfo() {
       try {
-        const status = await getStatus();
+        // Resolve the *agent-scoped* active model. `/api/status?agent=<alias>`
+        // runs the same `resolved_model_provider_for_agent` logic the gateway
+        // uses to construct the Agent, so `status.model` reflects the value
+        // written to this agent's provider entry
+        // (`providers.models.<provider>.model`) — including a model we just
+        // switched to. Calling `getStatus()` without the alias would return
+        // the install-wide default model, which is wrong for any non-default
+        // agent and would clobber `currentModel` right after a switch.
+        //
+        // The previous implementation also tried `getProp('model')` /
+        // `getProp('default_model')` to "prefer the configured value", but
+        // those top-level paths don't exist in the schema (they 404 with
+        // `path_not_found`) and the prop GET endpoint never returns a
+        // `populated` flag for non-secret fields — so that branch was dead
+        // code that only added two failing round trips per load. The
+        // agent-scoped status already is the configured value.
+        const status = await getStatus(agentAlias);
         if (cancelled) return;
 
-        let activeModel = status.model;
-
-        // Prefer the model written to config over the startup status value.
-        try {
-          const modelProp = await getProp('model');
-          if (modelProp.populated && typeof modelProp.value === 'string') {
-            activeModel = modelProp.value;
-          } else {
-            const defaultModelProp = await getProp('default_model');
-            if (defaultModelProp.populated && typeof defaultModelProp.value === 'string') {
-              activeModel = defaultModelProp.value;
-            }
-          }
-        } catch {
-          // ignore
-        }
+        const activeModel =
+          typeof status.model === 'string' && status.model.length > 0
+            ? status.model
+            : null;
         setCurrentModel(activeModel);
 
-        // Fetch model_routes from config
+        // Fetch model_routes from config. The REST `/api/config/prop`
+        // endpoint returns `value` as a display *string* (and carries no
+        // `populated` flag), so we can't rely on `Array.isArray`. Parse the
+        // model names out of whatever shape we get — a real array, a
+        // JSON-encoded array, or the TOML-ish display string.
         try {
           const routesProp = await getProp('model_routes');
-          if (routesProp.populated && Array.isArray(routesProp.value)) {
-            const models = routesProp.value
-              .map((r) => (r as Record<string, unknown>).model)
-              .filter((m): m is string => typeof m === 'string');
-            setAvailableModels(models.length > 0 ? models : [activeModel]);
-          } else {
-            setAvailableModels([activeModel]);
-          }
+          if (cancelled) return;
+          const models = extractRouteModels(routesProp.value);
+          // Always keep the active model selectable, even if it has no route.
+          const merged = [
+            ...(activeModel && !models.includes(activeModel) ? [activeModel] : []),
+            ...models,
+          ].filter((m): m is string => typeof m === 'string' && m.length > 0);
+          setAvailableModels(merged);
         } catch {
-          setAvailableModels([activeModel]);
+          if (cancelled) return;
+          setAvailableModels(activeModel ? [activeModel] : []);
         }
       } catch {
         // Ignore errors — dropdown will just show current model once loaded
@@ -501,7 +573,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     return () => {
       cancelled = true;
     };
-  }, [modelInfoVersion]);
+  }, [modelInfoVersion, agentAlias]);
 
   const sendMessage = useCallback((content: string) => {
     if (!wsRef.current?.connected) return;
@@ -530,21 +602,47 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     setModelLoading(true);
     pendingModelSwitchRef.current = model;
 
-    // Safety net: if the reconnect never succeeds, clear the loading state.
-    if (switchTimeoutRef.current) clearTimeout(switchTimeoutRef.current);
-    switchTimeoutRef.current = setTimeout(() => {
-      if (pendingModelSwitchRef.current) {
-        pendingModelSwitchRef.current = null;
-        setModelLoading(false);
-        setError(t('agent.model_switch_timeout'));
-      }
-    }, MODEL_SWITCH_TIMEOUT_MS);
+    // Watchdog so the UI can never get stuck on the loading spinner. It is
+    // armed once per phase — for the config write, then again for the socket
+    // reconnect — so each phase gets its own full budget. Originally a single
+    // timer armed at the top had to cover *both* phases: a slow daemon write
+    // could consume the whole budget and fire "model switch timed out" while
+    // the switch was still progressing (and, because it nulls the pending
+    // ref, the later onOpen would skip updating currentModel — a timeout
+    // error for a switch that actually succeeded). Splitting the budget keeps
+    // the spinner bounded against a hung request *and* a reconnect that never
+    // opens, without the false positive. The `=== model` identity check stops
+    // a fired watchdog from clobbering a newer switch.
+    const armWatchdog = () => {
+      if (switchTimeoutRef.current) clearTimeout(switchTimeoutRef.current);
+      switchTimeoutRef.current = setTimeout(() => {
+        if (pendingModelSwitchRef.current === model) {
+          pendingModelSwitchRef.current = null;
+          setModelLoading(false);
+          setError(t('agent.model_switch_timeout'));
+        }
+      }, MODEL_SWITCH_TIMEOUT_MS);
+    };
+    armWatchdog();
 
     try {
-      // Determine whether 'model' or 'default_model' is the active key, then write to it.
-      const modelProp = await getProp('model');
-      const targetKey = modelProp.populated ? 'model' : 'default_model';
-      await putProp(targetKey, model);
+      // The active model is NOT a top-level `model`/`default_model` key — those
+      // paths don't exist in the schema (writing them 404s with
+      // `path_not_found`). The agent resolves its model from its
+      // model_provider entry: `providers.models.<provider>.model`
+      // (see Agent::from_config / resolved_model_provider_for_agent). Resolve
+      // this agent's provider, then write the chosen model onto that entry.
+      const providerProp = await getProp(`agents.${agentAlias}.model_provider`);
+      const provider =
+        typeof providerProp.value === 'string' ? providerProp.value.trim() : '';
+      if (!provider) {
+        throw new Error(t('agent.failed_switch_model'));
+      }
+      await putProp(`providers.models.${provider}.model`, model);
+      // The write-phase watchdog may have fired (or a newer switch may have
+      // superseded this one) while the request was in flight. Bail before
+      // touching the live socket so we never tear it down after giving up.
+      if (pendingModelSwitchRef.current !== model) return;
 
       // If a turn is actively streaming, abort it on the backend before we tear
       // down the socket. This prevents the old model from continuing to execute
@@ -575,6 +673,12 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       // after we tear it down. Clear here explicitly because we null out the
       // old socket's callbacks below, so its onClose will not fire to do it.
       setPendingApproval(null);
+
+      // Re-arm the watchdog with a fresh budget for the reconnect phase — the
+      // one step no awaited promise covers. Bail first if the write phase
+      // already timed out (or a newer switch superseded this one).
+      if (pendingModelSwitchRef.current !== model) return;
+      armWatchdog();
 
       // Tear down the old socket and create a fresh one.
       // The backend will read the updated config when the new socket opens
@@ -609,9 +713,60 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   }, []);
 
   const clearAllMessages = useCallback(() => {
+    // Optimistically wipe the rendered transcript and any in-flight streaming
+    // state. Bumping the mutation version fences off a racing hydration fetch
+    // so it can't repopulate the just-cleared view.
     localMessageMutationVersionRef.current += 1;
     setMessages([]);
-  }, []);
+    pendingContentRef.current = '';
+    pendingThinkingRef.current = '';
+    capturedThinkingRef.current = '';
+    setStreamingContent('');
+    setStreamingThinking('');
+    setTyping(false);
+    setPendingApproval(null);
+
+    const sid = sessionIdRef.current;
+
+    // The live WebSocket Agent holds the full conversation in memory for the
+    // life of the connection, and the gateway persists each turn to the
+    // session backend. Clearing only React state leaves both intact, so the
+    // next turn still carries prior context and a reload/reconnect repopulates
+    // the old transcript (issue #7126). To genuinely reset context we must:
+    //   1. delete the persisted backend session history, and
+    //   2. tear down + reconnect the socket so the gateway builds a fresh
+    //      Agent that seeds from the now-empty backend.
+    void (async () => {
+      try {
+        // Reuses the existing DELETE /api/sessions/{id} primitive
+        // (gateway -> SessionBackend::delete_session). Best-effort: a 404 when
+        // session persistence is disabled, or any transport failure, must not
+        // block the local clear or the reconnect below.
+        await deleteSession(sid);
+      } catch {
+        // Persistence disabled or request failed — proceed with the reconnect
+        // so the live in-memory context is reset regardless.
+      }
+
+      // Rebuild the socket so the backend constructs a new Agent with no seeded
+      // history. Detach the old socket's callbacks first so its onClose does
+      // not write stale connection state. If there is no socket (disconnected),
+      // the alias-bound effect will reconnect on its own — nothing to do here.
+      const oldWs = wsRef.current;
+      if (oldWs) {
+        oldWs.onOpen = null;
+        oldWs.onClose = null;
+        oldWs.onError = null;
+        oldWs.onMessage = null;
+        oldWs.disconnect();
+
+        const ws = new WebSocketClient({ agentAlias });
+        attachSocketCallbacks(ws);
+        ws.connect();
+        wsRef.current = ws;
+      }
+    })();
+  }, [agentAlias, attachSocketCallbacks]);
 
   const respondToApproval = useCallback((decision: ApprovalDecision) => {
     setPendingApproval((current) => {

@@ -1,5 +1,12 @@
 use std::time::Duration;
 
+/// Token usage breakdown for a single agent turn.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TurnTokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
 /// Discrete events emitted by the agent runtime for observability.
 ///
 /// Each variant represents a lifecycle event that observers can record,
@@ -12,6 +19,9 @@ pub enum ObserverEvent {
     AgentStart {
         model_provider: String,
         model: String,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// A request is about to be sent to an LLM model_provider.
     ///
@@ -21,6 +31,9 @@ pub enum ObserverEvent {
         model_provider: String,
         model: String,
         messages_count: usize,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// Result of a single LLM model_provider call.
     LlmResponse {
@@ -31,6 +44,9 @@ pub enum ObserverEvent {
         error_message: Option<String>,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// The agent session has finished.
     ///
@@ -39,19 +55,53 @@ pub enum ObserverEvent {
         model_provider: String,
         model: String,
         duration: Duration,
-        tokens_used: Option<u64>,
+        tokens_used: Option<TurnTokenUsage>,
         cost_usd: Option<f64>,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// A tool call is about to be executed.
     ToolCallStart {
         tool: String,
+        /// Provider-assigned tool call identifier, when the underlying tool
+        /// call originated from a native structured tool call block (e.g.
+        /// OpenAI `tool_calls[].id`, Anthropic `tool_use.id`). `None` for
+        /// text-parsed (XML/markdown) tool calls.
+        ///
+        /// Observers can correlate `ToolCallStart` → `ToolCall` → the
+        /// emitting LLM response via this id.
+        tool_call_id: Option<String>,
+        /// Full JSON arguments the agent passed to the tool. `None` when
+        /// arguments are unavailable at the call site.
         arguments: Option<String>,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// A tool call has completed with a success/failure outcome.
     ToolCall {
         tool: String,
+        /// Provider-assigned tool call identifier, when present. See
+        /// [`ObserverEvent::ToolCallStart::tool_call_id`].
+        tool_call_id: Option<String>,
         duration: Duration,
         success: bool,
+        /// Full JSON arguments the agent passed to the tool.
+        ///
+        /// Carried here (in addition to `ToolCallStart`) so observers that
+        /// build a single completed span per tool call — e.g. the OTel
+        /// exporter — can attach arguments at span-end time without holding
+        /// per-call state.
+        arguments: Option<String>,
+        /// Scrubbed tool output or error reason. Populated for both success
+        /// and failure outcomes so backends can show the actual tool result
+        /// in trace viewers. Credentials are scrubbed before this field is
+        /// emitted.
+        result: Option<String>,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// The agent produced a final answer for the current user message.
     TurnComplete,
@@ -253,11 +303,54 @@ mod tests {
     }
 
     #[test]
+    fn observer_events_carry_turn_metadata_and_structured_usage() {
+        let usage = TurnTokenUsage {
+            input_tokens: 12,
+            output_tokens: 34,
+        };
+
+        let event = ObserverEvent::AgentEnd {
+            model_provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            duration: Duration::from_millis(50),
+            tokens_used: Some(usage.clone()),
+            cost_usd: Some(0.001),
+            channel: Some("wss".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
+        };
+
+        match event {
+            ObserverEvent::AgentEnd {
+                tokens_used,
+                channel,
+                agent_alias,
+                turn_id,
+                ..
+            } => {
+                let tokens = tokens_used.expect("usage should be present");
+                assert_eq!(tokens.input_tokens, 12);
+                assert_eq!(tokens.output_tokens, 34);
+                assert_eq!(channel.as_deref(), Some("wss"));
+                assert_eq!(agent_alias.as_deref(), Some("default"));
+                assert_eq!(turn_id.as_deref(), Some("turn-1"));
+            }
+            _ => panic!("expected AgentEnd"),
+        }
+    }
+
+    #[test]
     fn observer_event_and_metric_are_cloneable() {
         let event = ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: Some("call_abc123".into()),
             duration: Duration::from_millis(10),
             success: true,
+            arguments: Some(r#"{"command":"date"}"#.into()),
+            result: Some("Mon Apr 22 12:00:00 UTC 2026\n".into()),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         };
         let metric = ObserverMetric::RequestLatency(Duration::from_millis(8));
 
