@@ -2299,7 +2299,7 @@ mod tests {
             "test-agent".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "openrouter.default".into(),
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..Default::default()
             },
         );
@@ -2349,7 +2349,7 @@ mod tests {
             "only-agent".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "openrouter.default".into(),
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..Default::default()
             },
         );
@@ -2424,7 +2424,7 @@ mod tests {
             "agent-alpha".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "openrouter.default".into(),
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..Default::default()
             },
         );
@@ -2432,7 +2432,7 @@ mod tests {
             "agent-beta".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "openrouter.default".into(),
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..Default::default()
             },
         );
@@ -2482,7 +2482,7 @@ mod tests {
             "agent-alpha".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "openrouter.default".into(),
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..Default::default()
             },
         );
@@ -2490,7 +2490,7 @@ mod tests {
             "agent-beta".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "openrouter.default".into(),
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..Default::default()
             },
         );
@@ -2898,7 +2898,7 @@ mod tests {
             "test-agent".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "anthropic.default".into(),
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..Default::default()
             },
         );
@@ -3014,7 +3014,7 @@ mod tests {
             "test-agent".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "anthropic.default".into(),
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..Default::default()
             },
         );

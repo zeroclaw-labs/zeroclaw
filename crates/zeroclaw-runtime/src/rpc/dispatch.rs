@@ -84,6 +84,7 @@ pub enum Method {
     ConfigList,
     ConfigDelete,
     ConfigMapKeys,
+    ConfigResolveAliasSource,
     ConfigMapKeyCreate,
     ConfigMapKeyDelete,
     ConfigMapKeyRename,
@@ -182,6 +183,10 @@ impl Method {
         (Method::ConfigList, "config/list"),
         (Method::ConfigDelete, "config/delete"),
         (Method::ConfigMapKeys, "config/map-keys"),
+        (
+            Method::ConfigResolveAliasSource,
+            "config/resolve-alias-source",
+        ),
         (Method::ConfigMapKeyCreate, "config/map-key-create"),
         (Method::ConfigMapKeyDelete, "config/map-key-delete"),
         (Method::ConfigMapKeyRename, "config/map-key-rename"),
@@ -485,6 +490,9 @@ impl RpcDispatcher {
             Method::ConfigList => self.handle_config_list(&req.params),
             Method::ConfigDelete => self.handle_config_delete(&req.params).await,
             Method::ConfigMapKeys => self.handle_config_map_keys(&req.params),
+            Method::ConfigResolveAliasSource => {
+                self.handle_config_resolve_alias_source(&req.params)
+            }
             Method::ConfigMapKeyCreate => self.handle_config_map_key_create(&req.params).await,
             Method::ConfigMapKeyDelete => self.handle_config_map_key_delete(&req.params).await,
             Method::ConfigMapKeyRename => self.handle_config_map_key_rename(&req.params).await,
@@ -2498,6 +2506,16 @@ impl RpcDispatcher {
         })
     }
 
+    fn handle_config_resolve_alias_source(&self, params: &Value) -> RpcResult {
+        let req: ConfigResolveAliasSourceParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let values = config.resolve_alias_source(req.source);
+        to_result(ConfigResolveAliasSourceResult {
+            source: req.source,
+            values,
+        })
+    }
+
     fn handle_config_map_keys(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeysParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
@@ -3019,7 +3037,9 @@ impl RpcDispatcher {
                     has_picker,
                     completed,
                     ready: false,
-                    group: String::new(),
+                    group: zeroclaw_config::sections::section_group_for_key(&key)
+                        .label()
+                        .to_string(),
                     is_quickstart: wizard.is_some(),
                     shape: wizard.map(Section::shape),
                     label,
@@ -3733,7 +3753,7 @@ mod tests {
             AliasedAgentConfig {
                 enabled: true,
                 model_provider: "openai.test-provider".into(),
-                risk_profile: "test-profile".to_string(),
+                risk_profile: "test-profile".into(),
                 ..Default::default()
             },
         );

@@ -4154,7 +4154,11 @@ async fn process_channel_message_body(
     // ── Reply-intent precheck ────────────────────────────────────────
     let explicit_channel_address =
         is_explicitly_addressed_channel_message(&msg.channel, &msg.content);
-    let classifier_intent = if explicit_channel_address {
+    let direct_message = target_channel
+        .as_ref()
+        .map(|c| c.is_direct_message(&msg))
+        .unwrap_or(false);
+    let classifier_intent = if explicit_channel_address || direct_message {
         AssistantChannelOutcome::Reply(String::new())
     } else {
         let (classifier_provider_arc, classifier_model_owned, classifier_temperature): (
@@ -5492,7 +5496,7 @@ pub async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<(
         .peer_groups
         .entry(group_name.clone())
         .or_insert_with(|| PeerGroupConfig {
-            channel: "telegram.default".to_string(),
+            channel: "telegram.default".into(),
             ..PeerGroupConfig::default()
         });
 
@@ -5841,7 +5845,7 @@ fn build_channel_by_id(
                     .context("WhatsApp channel is not configured")?;
                 if !wa.is_web_config() {
                     anyhow::bail!(
-                        "WhatsApp channel send requires Web mode (session_path must be set)"
+                        "WhatsApp channel send requires Web mode (set session_path, pair_phone, or mode = personal)"
                     );
                 }
                 let alias = "default".to_string();
@@ -6986,7 +6990,7 @@ fn collect_configured_channels(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                "WhatsApp config has both phone_number_id and session_path set; preferring Cloud API mode. Remove one selector to avoid ambiguity."
+                "WhatsApp config has both phone_number_id (Cloud) and a Web selector (session_path/pair_phone/pair_code/ws_url/mode=personal) set; preferring Cloud API mode. Remove one selector to avoid ambiguity."
             );
         }
         // Runtime negotiation: detect backend type from config
@@ -9413,6 +9417,43 @@ pub async fn deliver_announcement(
                 .get(alias)
                 .ok_or_else(not_configured)?;
             anyhow::bail!("wecom_ws channel is not connected");
+        }
+        #[cfg(feature = "channel-email")]
+        "email" => {
+            let em = config
+                .channels
+                .email
+                .get(alias)
+                .ok_or_else(not_configured)?;
+            let peers = config.channel_external_peers("email", alias);
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+                Arc::new(move || peers.clone());
+            let ch = EmailChannel::new(em.clone(), alias.to_string(), peer_resolver);
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+        }
+        #[cfg(not(feature = "channel-email"))]
+        "email" => {
+            anyhow::bail!("Email channel requires the `channel-email` feature");
+        }
+        #[cfg(feature = "whatsapp-web")]
+        "whatsapp" | "whatsapp-web" | "whatsapp_web" => {
+            let wa = config
+                .channels
+                .whatsapp
+                .get(alias)
+                .ok_or_else(not_configured)?;
+            if !wa.is_web_config() {
+                anyhow::bail!("WhatsApp channel send requires Web mode (session_path must be set)");
+            }
+            let peers = config.channel_external_peers("whatsapp", alias);
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+                Arc::new(move || peers.clone());
+            let ch = WhatsAppWebChannel::new(wa, alias.to_string(), peer_resolver);
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+        }
+        #[cfg(not(feature = "whatsapp-web"))]
+        "whatsapp" | "whatsapp-web" | "whatsapp_web" => {
+            anyhow::bail!("WhatsApp channel requires the `whatsapp-web` feature");
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
@@ -12418,7 +12459,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-42".to_string(),
                 content: "What is the BTC price now?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -12533,7 +12574,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-42".to_string(),
                 content: "Which session is this?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -12658,7 +12699,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-42".to_string(),
                 content: "What is the BTC price now?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -12806,7 +12847,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-42".to_string(),
                 content: "What is the BTC price now?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -12923,7 +12964,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-42".to_string(),
                 content: "What is the BTC price now?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -13056,7 +13097,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-telegram".to_string(),
                 content: "What is the BTC price now?".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -13177,7 +13218,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-raw".to_string(),
                 content: "What is the BTC price now?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 3,
                 thread_ts: None,
@@ -13283,7 +13324,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "bob".to_string(),
                 reply_target: "chat-84".to_string(),
                 content: "What is the BTC price now?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: None,
@@ -13409,7 +13450,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "/models openrouter".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -13552,7 +13593,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "hello routed model_provider".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: None,
@@ -13627,7 +13668,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-precheck".to_string(),
                 content: "background chatter".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -13758,7 +13799,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "hello cached default model_provider".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 3,
                 thread_ts: None,
@@ -13862,7 +13903,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-iter-success".to_string(),
                 content: "Loop until done".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -13973,7 +14014,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "bob".to_string(),
                 reply_target: "chat-iter-fail".to_string(),
                 content: "Loop forever".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: None,
@@ -14339,7 +14380,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sender: "alice".to_string(),
             reply_target: "alice".to_string(),
             content: "hello".to_string(),
-            channel: "test-channel".to_string(),
+            channel: "test-channel".into(),
             channel_alias: None,
             timestamp: 1,
             thread_ts: None,
@@ -14354,7 +14395,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sender: "bob".to_string(),
             reply_target: "bob".to_string(),
             content: "world".to_string(),
-            channel: "test-channel".to_string(),
+            channel: "test-channel".into(),
             channel_alias: None,
             timestamp: 2,
             thread_ts: None,
@@ -14480,7 +14521,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "forwarded content".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -14496,7 +14537,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "summarize this".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: None,
@@ -14630,7 +14671,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "U123".to_string(),
                 reply_target: "C123".to_string(),
                 content: "first question".to_string(),
-                channel: "slack".to_string(),
+                channel: "slack".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: Some("1741234567.100001".to_string()),
@@ -14646,7 +14687,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "U123".to_string(),
                 reply_target: "C123".to_string(),
                 content: "second question".to_string(),
-                channel: "slack".to_string(),
+                channel: "slack".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: Some("1741234567.100001".to_string()),
@@ -14783,7 +14824,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "15555550123".to_string(),
                 reply_target: "15555550123".to_string(),
                 content: "first WhatsApp question".to_string(),
-                channel: "whatsapp".to_string(),
+                channel: "whatsapp".into(),
                 channel_alias: Some("default".to_string()),
                 timestamp: 1,
                 thread_ts: None,
@@ -14799,7 +14840,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "15555550123".to_string(),
                 reply_target: "15555550123".to_string(),
                 content: "second WhatsApp question".to_string(),
-                channel: "whatsapp".to_string(),
+                channel: "whatsapp".into(),
                 channel_alias: Some("default".to_string()),
                 timestamp: 2,
                 thread_ts: None,
@@ -14926,7 +14967,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "first chat".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -14942,7 +14983,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-2".to_string(),
                 content: "second chat".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: None,
@@ -15051,7 +15092,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-typing".to_string(),
                 content: "hello".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -15157,7 +15198,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-react".to_string(),
                 content: "hello".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -16477,7 +16518,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "hello".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -16496,7 +16537,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "follow up".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: None,
@@ -16643,7 +16684,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-refresh".to_string(),
                 content: "hello".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -16679,7 +16720,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-refresh".to_string(),
                 content: "/new".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: None,
@@ -16720,7 +16761,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-refresh".to_string(),
                 content: "hello again".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 3,
                 thread_ts: None,
@@ -16799,7 +16840,7 @@ BTC is currently around $65,000 based on latest tool output."#
         prompt_config.peer_groups.insert(
             "current-room".to_string(),
             zeroclaw_config::multi_agent::PeerGroupConfig {
-                channel: "test-channel.default".to_string(),
+                channel: "test-channel.default".into(),
                 agents: vec![
                     zeroclaw_config::multi_agent::AgentAlias::new("test-agent"),
                     zeroclaw_config::multi_agent::AgentAlias::new("peer-agent"),
@@ -16811,7 +16852,7 @@ BTC is currently around $65,000 based on latest tool output."#
         prompt_config.peer_groups.insert(
             "other-room".to_string(),
             zeroclaw_config::multi_agent::PeerGroupConfig {
-                channel: "other-channel.default".to_string(),
+                channel: "other-channel.default".into(),
                 agents: vec![
                     zeroclaw_config::multi_agent::AgentAlias::new("test-agent"),
                     zeroclaw_config::multi_agent::AgentAlias::new("other-agent"),
@@ -16840,7 +16881,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-ctx".to_string(),
                 content: "hello".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -16929,7 +16970,7 @@ BTC is currently around $65,000 based on latest tool output."#
         prompt_config.peer_groups.insert(
             "current-room".to_string(),
             zeroclaw_config::multi_agent::PeerGroupConfig {
-                channel: "test-channel.default".to_string(),
+                channel: "test-channel.default".into(),
                 agents: vec![
                     zeroclaw_config::multi_agent::AgentAlias::new("test-agent"),
                     zeroclaw_config::multi_agent::AgentAlias::new("peer-agent"),
@@ -16951,7 +16992,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-ctx".to_string(),
                 content: "hello".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -17065,7 +17106,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-image".to_string(),
                 content: "please inspect this".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -17206,7 +17247,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-telegram".to_string(),
                 content: "hello".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -18282,7 +18323,7 @@ This is an example JSON object for profile settings."#;
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-photo".to_string(),
                 content: "[IMAGE:/tmp/workspace/photo_99_1.jpg]\n\nWhat is this?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -18394,7 +18435,7 @@ This is an example JSON object for profile settings."#;
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-photo".to_string(),
                 content: "[IMAGE:/tmp/workspace/photo_99_1.jpg]\n\nWhat is this?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -18413,7 +18454,7 @@ This is an example JSON object for profile settings."#;
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-photo".to_string(),
                 content: "What is WAL?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: None,
@@ -18547,7 +18588,7 @@ This is an example JSON object for profile settings."#;
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-format".to_string(),
                 content: "trigger format error".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -18566,7 +18607,7 @@ This is an example JSON object for profile settings."#;
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-format".to_string(),
                 content: "What is WAL?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: None,
@@ -18748,7 +18789,7 @@ This is an example JSON object for profile settings."#;
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "please analyze-image from the dataset".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -18894,7 +18935,7 @@ This is an example JSON object for profile settings."#;
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "please analyze-image from the dataset".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -19032,7 +19073,7 @@ This is an example JSON object for profile settings."#;
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "just a regular text message".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -19190,7 +19231,7 @@ This is an example JSON object for profile settings."#;
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "write some code for me".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -19588,7 +19629,7 @@ This is an example JSON object for profile settings."#;
                 sender: "alice".to_string(),
                 reply_target: "C123".to_string(),
                 content: "thread-a question".to_string(),
-                channel: "slack".to_string(),
+                channel: "slack".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: Some("1741234567.100001".to_string()),
@@ -19604,7 +19645,7 @@ This is an example JSON object for profile settings."#;
                 sender: "alice".to_string(),
                 reply_target: "C123".to_string(),
                 content: "thread-b question".to_string(),
-                channel: "slack".to_string(),
+                channel: "slack".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: Some("1741234567.200002".to_string()),
@@ -20398,6 +20439,44 @@ Done."#;
                 "{channel} must report the real config table [channels.lark.default]; got: {msg}"
             );
         }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-email")]
+    async fn deliver_announcement_routes_email_to_email_arm() {
+        let config = zeroclaw_config::schema::Config::default();
+
+        let err = deliver_announcement(&config, "email.default", "user@example.com", None, "hi")
+            .await
+            .expect_err("expected email.default to bail because channel is not configured");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("unsupported delivery channel"),
+            "email.default must route to the email arm, not fall through; got: {msg}"
+        );
+        assert!(
+            msg.contains("[channels.email.default] not configured"),
+            "email.default must report the real config table; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn deliver_announcement_routes_whatsapp_to_whatsapp_arm() {
+        let config = zeroclaw_config::schema::Config::default();
+
+        let err = deliver_announcement(&config, "whatsapp.default", "+15551234567", None, "hi")
+            .await
+            .expect_err("expected whatsapp.default to bail because channel is not configured");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("unsupported delivery channel"),
+            "whatsapp.default must route to the whatsapp arm, not fall through; got: {msg}"
+        );
+        assert!(
+            msg.contains("[channels.whatsapp.default] not configured"),
+            "whatsapp.default must report the real config table; got: {msg}"
+        );
     }
 
     #[tokio::test]

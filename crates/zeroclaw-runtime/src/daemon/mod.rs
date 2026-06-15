@@ -1776,7 +1776,7 @@ mod tests {
         config.peer_groups.insert(
             "telegram_default".to_string(),
             PeerGroupConfig {
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 external_peers: vec![PeerUsername::new("user123")],
                 ..PeerGroupConfig::default()
             },

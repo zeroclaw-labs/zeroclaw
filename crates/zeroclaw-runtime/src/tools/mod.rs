@@ -502,7 +502,7 @@ pub fn all_tools_with_runtime(
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
-    let runtime_kind = root_config.runtime.kind.as_str();
+    let runtime_kind = root_config.runtime.kind.as_wire();
     let sandbox_cfg = risk_profile.sandbox_config();
     let sandbox = create_sandbox(&sandbox_cfg, runtime_kind, Some(&security.workspace_dir));
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
