@@ -1729,6 +1729,12 @@ impl QuickstartPane {
                             // normalise uppercase so a capitalised alias
                             // does not silently pass input only to fail at
                             // the end of quickstart (#7591).
+                            //
+                            // Character set must stay in sync with
+                            // zeroclaw_config::helpers::is_valid_alias_char
+                            // (the canonical definition).  Context-sensitive
+                            // rules (no leading/trailing `_`, no `__`,
+                            // 63-char cap) are enforced at submit time.
                             let normalized = c.to_ascii_lowercase();
                             if matches!(normalized, 'a'..='z' | '0'..='9' | '_') {
                                 a.name.push(normalized);
