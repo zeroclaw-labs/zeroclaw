@@ -925,20 +925,17 @@ impl From<RawResponseMessage> for ResponseMessage {
 }
 
 impl ResponseMessage {
-    /// Extract text content, falling back to `reasoning_content` when `content`
-    /// is missing or empty. Reasoning/thinking models (Qwen3, GLM-4, etc.)
-    /// often return their output solely in `reasoning_content`.
+    /// Extract text content from the `content` field only. Does NOT fall
+    /// back to `reasoning_content` — thinking/reasoning models (GLM-5.1,
+    /// DeepSeek, Qwen) return their thinking in `reasoning_content` which
+    /// must not leak into the user-visible response text. The
+    /// `reasoning_content` is preserved separately in
+    /// `ChatResponse.reasoning_content` for history round-tripping.
+    ///
     /// Strips `<think>...</think>` blocks that some models (e.g. MiniMax) embed
     /// inline in `content` instead of using a separate field.
     fn effective_content(&self) -> String {
-        if let Some(content) = self.content.as_ref().filter(|c| !c.is_empty()) {
-            let stripped = strip_think_tags(content);
-            if !stripped.is_empty() {
-                return stripped;
-            }
-        }
-
-        self.reasoning_content
+        self.content
             .as_ref()
             .map(|c| strip_think_tags(c))
             .filter(|c| !c.is_empty())
@@ -946,14 +943,7 @@ impl ResponseMessage {
     }
 
     fn effective_content_optional(&self) -> Option<String> {
-        if let Some(content) = self.content.as_ref().filter(|c| !c.is_empty()) {
-            let stripped = strip_think_tags(content);
-            if !stripped.is_empty() {
-                return Some(stripped);
-            }
-        }
-
-        self.reasoning_content
+        self.content
             .as_ref()
             .map(|c| strip_think_tags(c))
             .filter(|c| !c.is_empty())
