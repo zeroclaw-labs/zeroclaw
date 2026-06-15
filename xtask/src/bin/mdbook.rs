@@ -23,6 +23,16 @@ enum Cmd {
     Build,
     /// Regenerate cli.md, config.md, and rustdoc API reference
     Refs,
+    /// mdBook preprocessor: expand `{{#peer-group <channel>}}` directives.
+    /// Invoked by mdBook via book.toml; not run directly.
+    Preprocess {
+        /// `supports <renderer>` probe from mdBook (exit 0 = supported).
+        #[arg(value_name = "ARG")]
+        arg: Option<String>,
+        /// The renderer name mdBook passes after `supports`.
+        #[arg(value_name = "RENDERER")]
+        renderer: Option<String>,
+    },
     /// Sync .po files and AI-fill translation delta
     Sync {
         #[arg(long)]
@@ -30,7 +40,7 @@ enum Cmd {
         /// Re-translate all entries (quality pass, costs more)
         #[arg(long)]
         force: bool,
-        /// Provider alias from [providers.models.<kind>.<alias>] in config.toml
+        /// Provider alias from `[providers.models.<kind>.<alias>]` in config.toml
         #[arg(long)]
         model_provider: Option<String>,
         /// Config directory holding config.toml and .secret-key (default:
@@ -60,6 +70,10 @@ enum Cmd {
     RetrofitSelector,
     /// Regenerate pc-themes.css + switcher list from the dashboard theme registry
     Themes,
+    /// Regenerate hardware reference snippets from the board registry + catalog
+    Hardware,
+    /// Check internal links in the already-built book HTML
+    Linkcheck,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -70,6 +84,12 @@ fn main() -> anyhow::Result<()> {
         Cmd::Serve { locale } => cmd::mdbook::serve::run(locale.as_deref(), tag),
         Cmd::Build => cmd::mdbook::build::run(tag),
         Cmd::Refs => cmd::mdbook::refs::run(tag),
+        Cmd::Preprocess { arg, .. } => {
+            if arg.as_deref() == Some("supports") {
+                cmd::mdbook::peer_groups::supports();
+            }
+            cmd::mdbook::peer_groups::run()
+        }
         Cmd::Sync {
             locale,
             force,
@@ -100,5 +120,10 @@ fn main() -> anyhow::Result<()> {
         Cmd::PruneRoot => cmd::mdbook::versions::prune_root(),
         Cmd::RetrofitSelector => cmd::mdbook::versions::retrofit_selector(),
         Cmd::Themes => cmd::mdbook::themes::run(&xtask::util::repo_root()),
+        Cmd::Hardware => cmd::mdbook::hardware::run(&xtask::util::repo_root()),
+        Cmd::Linkcheck => cmd::mdbook::linkcheck::check_internal_links(
+            &xtask::util::repo_root(),
+            tag.unwrap_or("master"),
+        ),
     }
 }

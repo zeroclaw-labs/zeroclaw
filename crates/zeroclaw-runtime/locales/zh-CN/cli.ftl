@@ -354,6 +354,13 @@ onboard-openai-auth-codex = Codex 订阅
 onboard-openai-codex-followup =
     Codex 订阅身份验证使用您的 ChatGPT 账户。
     在启动代理之前，运行 `zeroclaw auth login --provider openai-codex` 进行身份验证。
+cli-web-dist-dir-reason-tilde = 以不会被展开的 `~` 开头
+cli-web-dist-dir-reason-dollar = 包含不会被展开的 `$`
+cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" — {$reason}；gateway.web_dist_dir 按原样读取，请自行展开该值（例如使用绝对路径）
+cli-self-test-web-dist-dir-name = web_dist_dir
+cli-self-test-web-dist-dir-pass-unset = 未设置（使用自动检测）
+cli-self-test-web-dist-dir-pass-literal = {$path}（字面路径）
+cli-self-test-web-dist-dir-fail-expansion = 警告：{$path} — {$reason}；gateway.web_dist_dir 按原样读取，请自行展开该值（例如使用绝对路径）
 cli-peripherals-none = 未配置外设。
 cli-peripherals-add-hint = 使用以下命令添加: zeroclaw peripheral add <board> <path>
 cli-peripherals-add-example = {"  "}示例: zeroclaw peripheral add nucleo-f401re <serial-path>
@@ -436,6 +443,13 @@ cli-press-enter = 按 Enter 退出...
 cli-quickstart-title = Quickstart — 端到端创建一个可用的 agent。
 cli-quickstart-cancelled = 已取消 quickstart。未写入配置。
 cli-quickstart-incomplete = {"  "}尚未填写所有选择器。
+cli-quickstart-create-agent = ── 创建 agent
+cli-quickstart-create-agent-locked = ── 创建 agent（已锁定 — 请先填写所有选择器）
+cli-quickstart-open-selector-prompt = 打开选择器（Enter），或选择创建。Esc 退出。
+cli-quickstart-use-existing = 使用已有项
+cli-quickstart-create-new = 新建
+cli-quickstart-model-provider-prompt = 模型提供方
+cli-quickstart-pick-configured-provider = 选择已配置的提供方
 cli-no-channels-compiled = {"  "}此二进制文件中未编译任何通道类型。
 cli-quickstart-complete = Quickstart 完成。已创建 agent `{$alias}`。
 cli-next-steps = 后续步骤：
@@ -490,6 +504,9 @@ cli-plugins-installed = 已安装的插件：
 cli-plugin-installed-from = 已从 {$source} 安装插件
 cli-plugin-removed = 已移除插件“{$name}”。
 cli-plugin-not-found = 未找到插件“{$name}”。
+cli-plugin-legacy-detected = 注意：位于旧位置（{$path}）的插件未被代理加载。请运行 `zeroclaw plugin migrate` 将其移动到 {$target}。
+cli-plugin-migrated = 已将 {$count} 个插件从 {$path} 移动到 {$target}。
+cli-plugin-migrate-none = 没有需要迁移的内容。
 cli-estop-resume-done = 急停恢复已完成。
 cli-estop-engaged = 急停已启用。
 cli-estop-status = 急停状态：

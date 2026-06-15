@@ -471,6 +471,43 @@ pub fn reschedule_after_run_with_status(
     }
 }
 
+/// Advance `next_run` of an overdue recurring job to its next future
+/// occurrence without executing the missed run.  For one-shot `At` jobs
+/// there is no future occurrence, so the job is disabled and its last
+/// status is recorded as `skipped`.
+///
+/// Called at scheduler startup when `catch_up_on_startup` is disabled,
+/// so the subsequent normal polling loop won't pick up jobs whose
+/// `next_run` is still in the past.
+pub fn skip_missed_run(config: &Config, job: &CronJob, now: DateTime<Utc>) -> Result<()> {
+    if matches!(job.schedule, Schedule::At { .. }) {
+        // One-shot job whose scheduled moment has already passed —
+        // disable it so it won't execute late.
+        let bounded_output = truncate_cron_output("skipped — catch_up_on_startup disabled");
+        with_initialized_connection(config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs
+                 SET enabled = 0, last_run = ?1, last_status = 'skipped', last_output = ?2
+                 WHERE id = ?3",
+                params![now.to_rfc3339(), bounded_output, job.id],
+            )
+            .context("Failed to disable overdue one-shot cron job on startup skip")?;
+            Ok(())
+        })
+    } else {
+        // Recurring job — advance next_run to the next future occurrence.
+        let next_run = next_run_for_schedule(&job.schedule, now)?;
+        with_initialized_connection(config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET next_run = ?1 WHERE id = ?2",
+                params![next_run.to_rfc3339(), job.id],
+            )
+            .context("Failed to advance next_run on startup skip")?;
+            Ok(())
+        })
+    }
+}
+
 pub fn record_run(
     config: &Config,
     job_id: &str,
@@ -2247,5 +2284,152 @@ schedule = { kind = "every", every_ms = 300000 }
             health.schedule,
             zeroclaw_config::schema::CronScheduleDecl::Every { every_ms: 300_000 }
         ));
+    }
+
+    #[test]
+    fn skip_missed_run_advances_recurring_job_next_run() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        // Add a cron job that will be "overdue" — its next_run is set based
+        // on the schedule from the current time, so we need to make it past.
+        let job = add_job(&config, "test-agent", "* * * * *", "echo test").unwrap();
+
+        // Force next_run into the past so the job appears overdue.
+        let past = Utc::now() - ChronoDuration::hours(1);
+        with_initialized_connection(&config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET next_run = ?1 WHERE id = ?2",
+                params![past.to_rfc3339(), job.id],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        // Verify it is overdue now.
+        assert!(
+            !all_overdue_jobs(&config, Utc::now()).unwrap().is_empty(),
+            "job with past next_run must appear in overdue"
+        );
+
+        // Skip the missed run.
+        let reloaded = get_job(&config, &job.id).unwrap();
+        skip_missed_run(&config, &reloaded, Utc::now()).unwrap();
+
+        // The job's next_run should now be in the future.
+        let updated = get_job(&config, &job.id).unwrap();
+        assert!(
+            updated.next_run > Utc::now(),
+            "skip_missed_run must advance next_run to the future"
+        );
+        assert!(updated.enabled, "recurring job must stay enabled");
+    }
+
+    #[test]
+    fn skip_missed_run_disables_overdue_oneshot_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let run_at = Utc::now() - ChronoDuration::hours(2);
+        let schedule = Schedule::At { at: run_at };
+        let job = add_job_with_schedule(&config, "test-agent", &schedule, "echo once").unwrap();
+
+        // The add_job_with_schedule should have set next_run = run_at,
+        // so the job is overdue now.
+        assert!(
+            !all_overdue_jobs(&config, Utc::now()).unwrap().is_empty(),
+            "one-shot job with past at-time must be overdue"
+        );
+
+        let reloaded = get_job(&config, &job.id).unwrap();
+        skip_missed_run(&config, &reloaded, Utc::now()).unwrap();
+
+        let updated = get_job(&config, &job.id).unwrap();
+        assert!(
+            !updated.enabled,
+            "overdue one-shot job must be disabled after skip"
+        );
+        assert_eq!(
+            updated.last_status.as_deref(),
+            Some("skipped"),
+            "one-shot job last_status must be 'skipped'"
+        );
+    }
+
+    fn add_job_with_schedule(
+        config: &Config,
+        agent_alias: &str,
+        schedule: &Schedule,
+        command: &str,
+    ) -> Result<CronJob> {
+        let now = Utc::now();
+        let job = CronJob {
+            id: format!("test-job-{}", Uuid::new_v4()),
+            expression: String::new(),
+            schedule: schedule.clone(),
+            command: command.to_string(),
+            prompt: None,
+            name: None,
+            job_type: JobType::Shell,
+            session_target: SessionTarget::Isolated,
+            model: None,
+            agent_alias: agent_alias.to_string(),
+            enabled: true,
+            delivery: DeliveryConfig::default(),
+            delete_after_run: false,
+            allowed_tools: None,
+            uses_memory: false,
+            source: "imperative".to_string(),
+            created_at: now,
+            next_run: next_run_for_schedule(schedule, now).unwrap_or(now),
+            last_run: None,
+            last_status: None,
+            last_output: None,
+        };
+        let job_type_str: String = match &job.job_type {
+            JobType::Shell => "shell".to_string(),
+            JobType::Agent => "agent".to_string(),
+        };
+        let schedule_json = serde_json::to_string(&job.schedule).unwrap();
+        let delivery_json = serde_json::to_string(&job.delivery).unwrap();
+        let allowed_tools_json =
+            crate::cron::store::encode_allowed_tools(job.allowed_tools.as_ref()).unwrap();
+        with_initialized_connection(config, |conn| {
+            conn.execute(
+                "INSERT INTO cron_jobs
+                 (id, expression, command, schedule, job_type, prompt, name,
+                  session_target, model, enabled, delivery, delete_after_run,
+                  allowed_tools, next_run, last_run, last_status, last_output,
+                  uses_memory, source, created_at, agent_alias)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+                params![
+                    job.id,
+                    job.expression,
+                    job.command,
+                    schedule_json,
+                    job_type_str.to_string(),
+                    job.prompt,
+                    job.name,
+                    job.session_target.as_str(),
+                    job.model,
+                    if job.enabled { 1 } else { 0 },
+                    delivery_json,
+                    if job.delete_after_run { 1 } else { 0 },
+                    allowed_tools_json,
+                    job.next_run.to_rfc3339(),
+                    job.last_run.map(|t| t.to_rfc3339()),
+                    job.last_status,
+                    job.last_output,
+                    if job.uses_memory { 1 } else { 0 },
+                    job.source,
+                    job.created_at.to_rfc3339(),
+                    job.agent_alias,
+                ],
+            )
+            .context("Failed to insert test cron job")?;
+            Ok(())
+        })?;
+        Ok(job)
     }
 }

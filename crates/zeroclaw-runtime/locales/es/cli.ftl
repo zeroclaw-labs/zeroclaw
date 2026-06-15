@@ -355,6 +355,13 @@ onboard-openai-auth-codex = Suscripción de Codex
 onboard-openai-codex-followup =
     La autenticación con la suscripción de Codex usa tu cuenta de ChatGPT.
     Ejecuta `zeroclaw auth login --provider openai-codex` para autenticarte antes de iniciar tu agente.
+cli-web-dist-dir-reason-tilde = comienza con `~`, que no se expande
+cli-web-dist-dir-reason-dollar = contiene `$`, que no se expande
+cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" — {$reason}; gateway.web_dist_dir se lee literalmente, así que expande el valor tú mismo (p. ej., una ruta absoluta)
+cli-self-test-web-dist-dir-name = web_dist_dir
+cli-self-test-web-dist-dir-pass-unset = no establecido (usando detección automática)
+cli-self-test-web-dist-dir-pass-literal = {$path} (ruta literal)
+cli-self-test-web-dist-dir-fail-expansion = ADVERTENCIA: {$path} — {$reason}; gateway.web_dist_dir se lee literalmente, así que expande el valor tú mismo (p. ej., una ruta absoluta)
 cli-peripherals-none = No hay periféricos configurados.
 cli-peripherals-add-hint = Agregue uno con: zeroclaw peripheral add <board> <path>
 cli-peripherals-add-example = {"  "}Ejemplo: zeroclaw peripheral add nucleo-f401re <serial-path>
@@ -437,6 +444,13 @@ cli-press-enter = Presiona Enter para salir...
 cli-quickstart-title = Quickstart — crea un agente funcional de principio a fin.
 cli-quickstart-cancelled = Quickstart cancelado. No se escribió ninguna configuración.
 cli-quickstart-incomplete = {"  "}Aún no se han completado todos los selectores.
+cli-quickstart-create-agent = ── Crear agente
+cli-quickstart-create-agent-locked = ── Crear agente (bloqueado — completa todos los selectores primero)
+cli-quickstart-open-selector-prompt = Abre un selector (Enter) o elige Crear. Esc para salir.
+cli-quickstart-use-existing = Usar existente
+cli-quickstart-create-new = Crear nuevo
+cli-quickstart-model-provider-prompt = Proveedor de modelo
+cli-quickstart-pick-configured-provider = Elige un proveedor configurado
 cli-no-channels-compiled = {"  "}No hay tipos de canal compilados en este binario.
 cli-quickstart-complete = Quickstart completado. Se creó el agente `{$alias}`.
 cli-next-steps = Siguientes pasos:
@@ -491,6 +505,9 @@ cli-plugins-installed = Complementos instalados:
 cli-plugin-installed-from = Complemento instalado desde {$source}
 cli-plugin-removed = Complemento '{$name}' eliminado.
 cli-plugin-not-found = No se encontró el complemento '{$name}'.
+cli-plugin-legacy-detected = Nota: los complementos en una ubicación heredada ({$path}) no se cargan en el agente. Ejecuta `zeroclaw plugin migrate` para moverlos a {$target}.
+cli-plugin-migrated = Se movieron {$count} complemento(s) de {$path} a {$target}.
+cli-plugin-migrate-none = No hay nada que migrar.
 cli-estop-resume-done = Reanudación de la parada de emergencia completada.
 cli-estop-engaged = Parada de emergencia activada.
 cli-estop-status = Estado de la parada de emergencia:

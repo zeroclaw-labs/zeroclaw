@@ -4,10 +4,15 @@ ZeroClaw provides prebuilt binaries for Android devices.
 
 ## Supported Architectures
 
-| Target | Android Version | Devices |
-|--------|-----------------|---------|
-| `armv7-linux-androideabi` | Android 4.1+ (API 16+) | Older 32-bit phones (Galaxy S3, etc.) |
-| `aarch64-linux-android` | Android 5.0+ (API 21+) | Modern 64-bit phones |
+ZeroClaw publishes a prebuilt `aarch64-linux-android` binary for modern 64-bit
+Android devices. The full set of prebuilt release targets (derived from the
+release workflow) is:
+
+{{#include ../_snippets/hardware-release-targets.md}}
+
+Only `aarch64-linux-android` targets Android directly. 32-bit Android
+(`armv7-linux-androideabi`) is not currently published as a prebuilt binary;
+on a 32-bit device, build from source (see below).
 
 ## Installation via Termux
 
@@ -21,24 +26,30 @@ Download from [F-Droid](https://f-droid.org/packages/com.termux/) (recommended) 
 
 ### 2. Download ZeroClaw
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # Check your architecture
 uname -m
-# aarch64 = 64-bit, armv7l/armv8l = 32-bit
+# aarch64 = 64-bit (prebuilt binary available)
+# armv7l/armv8l = 32-bit (build from source — no prebuilt binary)
 
-# Download the appropriate binary
-# For 64-bit (aarch64):
+# Download the prebuilt 64-bit (aarch64) binary
 curl -LO https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zeroclaw-aarch64-linux-android.tar.gz
 tar xzf zeroclaw-aarch64-linux-android.tar.gz
-
-# For 32-bit (armv7):
-curl -LO https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zeroclaw-armv7-linux-androideabi.tar.gz
-tar xzf zeroclaw-armv7-linux-androideabi.tar.gz
 ```
+
+</div>
 
 ### 3. Install and Run
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 chmod +x zeroclaw
 mv zeroclaw $PREFIX/bin/
 
@@ -49,16 +60,24 @@ zeroclaw --version
 zeroclaw quickstart
 ```
 
+</div>
+
 ## Direct Installation via ADB
 
 For advanced users who want to run ZeroClaw outside Termux:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # From your computer with ADB
 adb push zeroclaw /data/local/tmp/
 adb shell chmod +x /data/local/tmp/zeroclaw
 adb shell /data/local/tmp/zeroclaw --version
 ```
+
+</div>
 
 > ⚠️ Running outside Termux requires a rooted device or specific permissions for full functionality.
 
@@ -72,7 +91,11 @@ adb shell /data/local/tmp/zeroclaw --version
 
 To build for Android yourself:
 
-```bash
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 # Install Android NDK
 # Add targets
 rustup target add armv7-linux-androideabi aarch64-linux-android
@@ -86,15 +109,27 @@ cargo build --release --target armv7-linux-androideabi
 cargo build --release --target aarch64-linux-android
 ```
 
+</div>
+
 ## Troubleshooting
 
 ### "Permission denied"
-```bash
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
 chmod +x zeroclaw
 ```
 
+</div>
+
 ### "not found" or linker errors
+
 Make sure you downloaded the correct architecture for your device.
 
-### Old Android (4.x)
-Use the `armv7-linux-androideabi` build with API level 16+.
+### Old / 32-bit Android
+
+There is no prebuilt 32-bit Android binary. On a 32-bit device, add the
+`armv7-linux-androideabi` target and build from source as shown above.

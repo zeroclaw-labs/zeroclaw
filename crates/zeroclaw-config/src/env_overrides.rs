@@ -209,7 +209,7 @@ fn resolve_path(tail: &str, config: &mut Config) -> Result<String> {
 /// kebab field segment. Used by [`apply_env_overrides`] so the pre-override
 /// snapshot of a secret field captures the real plaintext rather than the
 /// display mask.
-fn raw_value_for_path(source: &Config, path: &str) -> Option<String> {
+pub(crate) fn raw_value_for_path(source: &Config, path: &str) -> Option<String> {
     let table = toml::Value::try_from(source).ok()?;
     let mut current: &toml::Value = &table;
     for segment in path.split('.') {

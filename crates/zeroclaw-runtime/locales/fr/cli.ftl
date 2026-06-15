@@ -358,6 +358,13 @@ onboard-openai-auth-codex = Abonnement Codex
 onboard-openai-codex-followup =
     L'authentification par abonnement Codex utilise votre compte ChatGPT.
     Exécutez `zeroclaw auth login --provider openai-codex` pour vous authentifier avant de démarrer votre agent.
+cli-web-dist-dir-reason-tilde = commence par `~` qui n'est pas développé
+cli-web-dist-dir-reason-dollar = contient `$` qui n'est pas développé
+cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" — {$reason} ; gateway.web_dist_dir est lu tel quel, vous devez donc développer la valeur vous-même (p. ex. un chemin absolu)
+cli-self-test-web-dist-dir-name = web_dist_dir
+cli-self-test-web-dist-dir-pass-unset = non défini (détection automatique utilisée)
+cli-self-test-web-dist-dir-pass-literal = {$path} (chemin littéral)
+cli-self-test-web-dist-dir-fail-expansion = AVERTISSEMENT : {$path} — {$reason} ; gateway.web_dist_dir est lu tel quel, vous devez donc développer la valeur vous-même (p. ex. un chemin absolu)
 cli-peripherals-none = Aucun périphérique configuré.
 cli-peripherals-add-hint = Ajoutez-en un avec : zeroclaw peripheral add <board> <path>
 cli-peripherals-add-example = {"  "}Exemple : zeroclaw peripheral add nucleo-f401re <serial-path>
@@ -440,6 +447,13 @@ cli-press-enter = Appuyez sur Entrée pour quitter...
 cli-quickstart-title = Quickstart — créez un agent fonctionnel de bout en bout.
 cli-quickstart-cancelled = Quickstart annulé. Aucune configuration écrite.
 cli-quickstart-incomplete = {"  "}Tous les sélecteurs ne sont pas encore renseignés.
+cli-quickstart-create-agent = ── Créer un agent
+cli-quickstart-create-agent-locked = ── Créer un agent (verrouillé — renseignez d'abord tous les sélecteurs)
+cli-quickstart-open-selector-prompt = Ouvrez un sélecteur (Entrée) ou choisissez Créer. Échap pour quitter.
+cli-quickstart-use-existing = Utiliser l'existant
+cli-quickstart-create-new = Créer nouveau
+cli-quickstart-model-provider-prompt = Fournisseur de modèle
+cli-quickstart-pick-configured-provider = Choisissez un fournisseur configuré
 cli-no-channels-compiled = {"  "}Aucun type de canal n'est compilé dans ce binaire.
 cli-quickstart-complete = Quickstart terminé. Agent `{$alias}` créé.
 cli-next-steps = Étapes suivantes :
@@ -494,6 +508,9 @@ cli-plugins-installed = Plugins installés :
 cli-plugin-installed-from = Plugin installé depuis {$source}
 cli-plugin-removed = Plugin « {$name} » supprimé.
 cli-plugin-not-found = Plugin « {$name} » introuvable.
+cli-plugin-legacy-detected = Remarque : les plugins situés à un emplacement hérité ({$path}) ne sont pas chargés par l'agent. Exécutez `zeroclaw plugin migrate` pour les déplacer vers {$target}.
+cli-plugin-migrated = {$count} plugin(s) déplacé(s) de {$path} vers {$target}.
+cli-plugin-migrate-none = Rien à migrer.
 cli-estop-resume-done = Reprise après arrêt d'urgence terminée.
 cli-estop-engaged = Arrêt d'urgence engagé.
 cli-estop-status = État de l'arrêt d'urgence :

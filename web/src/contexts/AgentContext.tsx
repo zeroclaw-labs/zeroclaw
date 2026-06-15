@@ -4,6 +4,7 @@ import { WebSocketClient, getOrCreateSessionId } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
 import { t } from '@/lib/i18n';
 import { getProp, putProp, listProps, getStatus, getSessionMessages, abortSession, deleteSession } from '@/lib/api';
+import { primeModelProviderCatalog, modelProviderDisplayName } from '@/lib/modelProviders';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
 import {
   loadChatHistory,
@@ -58,19 +59,6 @@ export function useAgent() {
 }
 
 const MODEL_SWITCH_TIMEOUT_MS = 10_000;
-const LOCAL_PROVIDER_NAMES: Record<string, string> = {
-  atomic_chat: 'Atomic Chat',
-  gemini_cli: 'Gemini CLI',
-  kilocli: 'KiloCLI',
-  lmstudio: 'LM Studio',
-  llamacpp: 'llama.cpp server',
-  ollama: 'Ollama',
-  opencode: 'OpenCode',
-  osaurus: 'Osaurus',
-  sglang: 'SGLang',
-  synthetic: 'Synthetic',
-  vllm: 'vLLM',
-};
 
 function friendlyAgentError(message?: string): string {
   const raw = message?.trim() || t('agent.unknown_error');
@@ -81,7 +69,7 @@ function friendlyAgentError(message?: string): string {
     const provider = localConnectFailure[1] ?? '';
     const model = localConnectFailure[2] ?? 'the selected model';
     const url = localConnectFailure[3] ?? 'the configured endpoint';
-    const displayProvider = LOCAL_PROVIDER_NAMES[provider] ?? provider;
+    const displayProvider = modelProviderDisplayName(provider);
     return `${displayProvider} is unreachable at ${url}. Start the local provider service, confirm it serves ${model}, then try again.`;
   }
   return raw;
@@ -120,6 +108,12 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   const switchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsVersionRef = useRef(0);
   const localMessageMutationVersionRef = useRef(0);
+
+  // Prime the model-provider catalog once so error formatting can resolve
+  // display names from the backend registry rather than a local shadow list.
+  useEffect(() => {
+    void primeModelProviderCatalog();
+  }, []);
 
   // Hydrate chat from server (preferred) or localStorage fallback
   useEffect(() => {
@@ -217,7 +211,11 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
 
       case 'message':
       case 'done': {
-        const content = msg.full_response ?? msg.content ?? pendingContentRef.current;
+        const raw_content = msg.full_response ?? msg.content ?? pendingContentRef.current;
+        // Skip whitespace-only content (e.g. models that emit "\n\n"
+        // alongside tool_calls) to avoid accumulating blank lines in the
+        // assistant bubble. Ref: #6702.
+        const content = raw_content.trim();
         const thinking = capturedThinkingRef.current || pendingThinkingRef.current || undefined;
         if (content) {
           localMessageMutationVersionRef.current += 1;
@@ -473,7 +471,23 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
 
     async function loadModelInfo() {
       try {
-        const status = await getStatus();
+        // Resolve the *agent-scoped* active model. `/api/status?agent=<alias>`
+        // runs the same `resolved_model_provider_for_agent` logic the gateway
+        // uses to construct the Agent, so `status.model` reflects the value
+        // written to this agent's provider entry
+        // (`providers.models.<provider>.model`) — including a model we just
+        // switched to. Calling `getStatus()` without the alias would return
+        // the install-wide default model, which is wrong for any non-default
+        // agent and would clobber `currentModel` right after a switch.
+        //
+        // The previous implementation also tried `getProp('model')` /
+        // `getProp('default_model')` to "prefer the configured value", but
+        // those top-level paths don't exist in the schema (they 404 with
+        // `path_not_found`) and the prop GET endpoint never returns a
+        // `populated` flag for non-secret fields — so that branch was dead
+        // code that only added two failing round trips per load. The
+        // agent-scoped status already is the configured value.
+        const status = await getStatus(agentAlias);
         if (cancelled) return;
 
         let activeModel = status.model;
@@ -556,15 +570,28 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     setModelLoading(true);
     pendingModelSwitchRef.current = model;
 
-    // Safety net: if the reconnect never succeeds, clear the loading state.
-    if (switchTimeoutRef.current) clearTimeout(switchTimeoutRef.current);
-    switchTimeoutRef.current = setTimeout(() => {
-      if (pendingModelSwitchRef.current) {
-        pendingModelSwitchRef.current = null;
-        setModelLoading(false);
-        setError(t('agent.model_switch_timeout'));
-      }
-    }, MODEL_SWITCH_TIMEOUT_MS);
+    // Watchdog so the UI can never get stuck on the loading spinner. It is
+    // armed once per phase — for the config write, then again for the socket
+    // reconnect — so each phase gets its own full budget. Originally a single
+    // timer armed at the top had to cover *both* phases: a slow daemon write
+    // could consume the whole budget and fire "model switch timed out" while
+    // the switch was still progressing (and, because it nulls the pending
+    // ref, the later onOpen would skip updating currentModel — a timeout
+    // error for a switch that actually succeeded). Splitting the budget keeps
+    // the spinner bounded against a hung request *and* a reconnect that never
+    // opens, without the false positive. The `=== model` identity check stops
+    // a fired watchdog from clobbering a newer switch.
+    const armWatchdog = () => {
+      if (switchTimeoutRef.current) clearTimeout(switchTimeoutRef.current);
+      switchTimeoutRef.current = setTimeout(() => {
+        if (pendingModelSwitchRef.current === model) {
+          pendingModelSwitchRef.current = null;
+          setModelLoading(false);
+          setError(t('agent.model_switch_timeout'));
+        }
+      }, MODEL_SWITCH_TIMEOUT_MS);
+    };
+    armWatchdog();
 
     try {
       // Per-agent switch: write THIS agent's own model_provider ref (multi-agent
@@ -601,6 +628,12 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       // after we tear it down. Clear here explicitly because we null out the
       // old socket's callbacks below, so its onClose will not fire to do it.
       setPendingApproval(null);
+
+      // Re-arm the watchdog with a fresh budget for the reconnect phase — the
+      // one step no awaited promise covers. Bail first if the write phase
+      // already timed out (or a newer switch superseded this one).
+      if (pendingModelSwitchRef.current !== model) return;
+      armWatchdog();
 
       // Tear down the old socket and create a fresh one.
       // The backend will read the updated config when the new socket opens
