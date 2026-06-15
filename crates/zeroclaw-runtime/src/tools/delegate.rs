@@ -2862,7 +2862,7 @@ mod tests {
             config.agents.insert(
                 alias.to_string(),
                 AliasedAgentConfig {
-                    risk_profile: profile.to_string(),
+                    risk_profile: profile.into(),
                     model_provider: "ollama.default".into(),
                     ..AliasedAgentConfig::default()
                 },
