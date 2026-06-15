@@ -15176,9 +15176,7 @@ impl Config {
                                 .keys()
                                 .any(|k| PROVIDER_FIELD_NAMES.contains(&k.as_str()));
                             if has_provider_fields {
-                                out.push(format!(
-                                    "providers.{kind}.{family}.{alias}.{inner_key}"
-                                ));
+                                out.push(format!("providers.{kind}.{family}.{alias}.{inner_key}"));
                             }
                         }
                     }
