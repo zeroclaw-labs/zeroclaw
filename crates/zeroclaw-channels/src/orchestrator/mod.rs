@@ -9465,7 +9465,9 @@ pub async fn deliver_announcement(
                 .get(alias)
                 .ok_or_else(not_configured)?;
             if !wa.is_web_config() {
-                anyhow::bail!("WhatsApp channel send requires Web mode (session_path must be set)");
+                anyhow::bail!(
+                    "WhatsApp channel send requires Web mode (set session_path, pair_phone, or mode = personal)"
+                );
             }
             let peers = config.channel_external_peers("whatsapp", alias);
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
@@ -20564,6 +20566,42 @@ Done."#;
         assert!(
             msg.contains("[channels.whatsapp.default] not configured"),
             "whatsapp.default must report the real config table; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn deliver_announcement_rejects_whatsapp_non_web_config_clearly() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.whatsapp.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                access_token: Some("test-token".to_string()),
+                phone_number_id: Some("phone-number-id".to_string()),
+                verify_token: Some("verify-token".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let err = deliver_announcement(&config, "whatsapp.default", "+15551234567", None, "hi")
+            .await
+            .expect_err("expected WhatsApp Cloud config to be rejected for cron delivery");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("WhatsApp channel send requires Web mode"),
+            "whatsapp.default must clearly explain the Web mode requirement; got: {msg}"
+        );
+        assert!(
+            msg.contains("session_path")
+                && msg.contains("pair_phone")
+                && msg.contains("mode = personal"),
+            "whatsapp.default must name the Web selectors accepted by cron delivery; got: {msg}"
+        );
+        assert!(
+            !msg.contains("unsupported delivery channel")
+                && !msg.contains("[channels.whatsapp.default] not configured"),
+            "whatsapp.default must reject the configured non-Web mode, not fall through; got: {msg}"
         );
     }
 
