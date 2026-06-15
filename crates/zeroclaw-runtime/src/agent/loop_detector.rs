@@ -277,6 +277,9 @@ impl LoopDetector {
         }
 
         let last = self.window.back()?;
+        // #7143: the stuck agent ran 43 near-duplicate shell calls returning
+        // byte-identical output, interleaved with other tools; filter (not a
+        // consecutive take_while) is what lets that non-adjacent run be counted.
         let same_tool_same_result: Vec<&ToolCallRecord> = self
             .window
             .iter()
