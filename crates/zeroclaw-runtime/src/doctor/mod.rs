@@ -506,7 +506,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         for (family, alias, entry) in config.providers.models.iter_entries() {
             found_any = true;
             let label = format!("{family}.{alias}");
-            if let Some(reason) = provider_validation_error(family) {
+            if let Some(reason) = provider_validation_error_with_uri(family, entry.uri.as_deref()) {
                 items.push(DiagItem::error(
                     cat,
                     format!("model_provider \"{label}\" is invalid: {reason}"),
@@ -581,7 +581,10 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         if route.hint.is_empty() {
             items.push(DiagItem::warn(cat, "model route with empty hint"));
         }
-        if let Some(reason) = provider_validation_error(&route.model_provider) {
+        if let Some(reason) = provider_validation_error_with_uri(
+            &route.model_provider,
+            resolve_provider_reference_uri(config, &route.model_provider),
+        ) {
             items.push(DiagItem::warn(
                 cat,
                 format!(
@@ -679,7 +682,10 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         if provider_type.is_empty() {
             continue;
         }
-        if let Some(reason) = provider_validation_error(provider_type) {
+        if let Some(reason) = provider_validation_error_with_uri(
+            provider_type,
+            resolve_provider_reference_uri(config, &agent.model_provider),
+        ) {
             items.push(DiagItem::warn(
                 cat,
                 format!(
@@ -733,8 +739,17 @@ fn web_dist_dir_expansion_reason_key(value: &str) -> Option<&'static str> {
     }
 }
 
-fn provider_validation_error(name: &str) -> Option<String> {
-    match zeroclaw_providers::create_model_provider(name, None) {
+/// Validate a model_provider, supplying the operator-configured endpoint
+/// `uri` so families that require an explicit endpoint (`custom`,
+/// `openai-compatible`) are not falsely flagged when a `uri` is in fact set.
+///
+/// Previously the doctor constructed the provider with a `None` endpoint,
+/// so any `custom`/`openai-compatible` alias tripped the factory's
+/// "requires `uri`" guard even though the runtime resolves the configured
+/// `uri` and serves traffic happily. See issue 7439.
+fn provider_validation_error_with_uri(name: &str, api_url: Option<&str>) -> Option<String> {
+    let api_url = api_url.map(str::trim).filter(|u| !u.is_empty());
+    match zeroclaw_providers::create_model_provider_with_url(name, None, api_url) {
         Ok(_) => None,
         Err(err) => Some(
             err.to_string()
@@ -744,6 +759,20 @@ fn provider_validation_error(name: &str) -> Option<String> {
                 .into(),
         ),
     }
+}
+
+/// Resolve the effective endpoint `uri` for a `<family>.<alias>` model_provider
+/// reference (as used by `[[model_routes]]` and `[agents]`). Prefers the
+/// alias entry's explicit `uri`, then falls back to the family-default
+/// endpoint. Returns `None` for a bare family with no dotted alias.
+fn resolve_provider_reference_uri<'a>(config: &'a Config, reference: &str) -> Option<&'a str> {
+    let (family, alias) = reference.split_once('.')?;
+    config
+        .providers
+        .models
+        .find(family, alias)
+        .and_then(|entry| entry.uri.as_deref())
+        .or_else(|| config.providers.models.resolved_endpoint_uri(family, alias))
 }
 
 fn embedding_provider_validation_error(name: &str) -> Option<String> {
@@ -1160,14 +1189,19 @@ mod tests {
 
     #[test]
     fn provider_validation_checks_custom_url_shape() {
-        assert!(provider_validation_error("openrouter").is_none());
-        assert!(provider_validation_error("custom:https://example.com").is_none());
-        assert!(provider_validation_error("anthropic-custom:https://example.com").is_none());
+        assert!(provider_validation_error_with_uri("openrouter", None).is_none());
+        assert!(provider_validation_error_with_uri("custom:https://example.com", None).is_none());
 
-        let invalid_custom = provider_validation_error("custom:").unwrap_or_default();
+        let anthropic_custom =
+            provider_validation_error_with_uri("anthropic-custom:https://example.com", None);
+        assert!(anthropic_custom.is_none());
+
+        let invalid_custom =
+            provider_validation_error_with_uri("custom:", None).unwrap_or_default();
         assert!(invalid_custom.contains("requires a URL"));
 
-        let invalid_unknown = provider_validation_error("totally-fake").unwrap_or_default();
+        let invalid_unknown =
+            provider_validation_error_with_uri("totally-fake", None).unwrap_or_default();
         assert!(invalid_unknown.contains("Unknown model_provider"));
     }
 
@@ -1283,6 +1317,94 @@ mod tests {
             "doctor should flag unknown agent model_provider"
         );
         assert_eq!(prov_item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn config_validation_accepts_custom_provider_with_uri() {
+        // Regression for issue 7439: a `custom` alias with an explicit `uri`
+        // serves traffic fine, so the doctor must NOT flag it invalid just
+        // because the family requires an endpoint.
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .ensure("custom", "vllm")
+            .expect("known model_provider type")
+            .uri = Some("http://10.0.0.15:8000/v1".to_string());
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+
+        let invalid = items.iter().find(|i| {
+            i.message.contains("model_provider \"custom.vllm\" is invalid")
+        });
+        assert!(
+            invalid.is_none(),
+            "custom provider with uri set must not be flagged invalid: {invalid:?}"
+        );
+        let valid = items
+            .iter()
+            .find(|i| i.message.contains("model_provider \"custom.vllm\" is valid"));
+        assert!(valid.is_some(), "expected a valid diag for custom.vllm");
+        assert_eq!(valid.unwrap().severity, Severity::Ok);
+    }
+
+    #[test]
+    fn config_validation_flags_custom_provider_without_uri() {
+        // The fix must stay specific: a `custom` alias with no `uri` is still
+        // genuinely misconfigured and should surface the error.
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .ensure("custom", "vllm")
+            .expect("known model_provider type");
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+
+        let invalid = items.iter().find(|i| {
+            i.message.contains("model_provider \"custom.vllm\" is invalid")
+        });
+        assert!(
+            invalid.is_some(),
+            "custom provider without uri must still be flagged invalid"
+        );
+        assert_eq!(invalid.unwrap().severity, Severity::Error);
+    }
+
+    #[test]
+    fn config_validation_accepts_agent_custom_provider_with_uri() {
+        // Second symptom from issue 7439: the agent's model_provider check
+        // stripped the alias and validated the bare `custom` family with no
+        // uri, producing a false `agent "..." uses invalid model_provider
+        // "custom"` warning. With the alias uri resolved it must pass.
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .ensure("custom", "vllm")
+            .expect("known model_provider type")
+            .uri = Some("http://10.0.0.15:8000/v1".to_string());
+        config.agents.insert(
+            "coding".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "custom.vllm".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+
+        let bad = items.iter().find(|i| {
+            i.message.contains("agent \"coding\" uses invalid model_provider \"custom\"")
+        });
+        assert!(
+            bad.is_none(),
+            "agent referencing custom.vllm with uri set must not be flagged: {bad:?}"
+        );
     }
 
     // The pre-Phase-6 tests `config_validation_catches_malformed_custom_provider`
