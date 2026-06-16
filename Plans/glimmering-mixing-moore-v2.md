@@ -1,5 +1,10 @@
 # Conscience + Loop Refactor — v2 (Re-Scoped 2026-05-28)
 
+> **Status (2026-06-16):** Slice A ✅ shipped — the conscience gate is wired live via the
+> `ConscienceHook` extension point and covered by `tests/conscience_gate_integration.rs`.
+> Slice B (retire the 29-arg `run_tool_call_loop`) is in progress under
+> `refactor/retire-legacy-loop`.
+
 > Supersedes `Plans/glimmering-mixing-moore.md`. The v1 plan was written when the
 > codebase looked different — several of its steps have shipped, the surrounding
 > APIs have grown, and the `run_tool_call_loop` parameter count has roughly
