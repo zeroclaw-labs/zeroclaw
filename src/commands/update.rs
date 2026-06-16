@@ -1166,4 +1166,81 @@ mod tests {
             "should report missing binary"
         );
     }
+
+    /// Regression: #7509 — verify extract_zip writes the zeroclaw.exe
+    /// binary bytes from a minimal Windows ZIP release asset.
+    #[test]
+    fn extract_zip_writes_zeroclaw_exe() {
+        use std::io::Write;
+
+        let fake_exe = b"fake zeroclaw windows binary content";
+        let mut zip_buf = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut zip_buf);
+            let mut writer = zip::ZipWriter::new(cursor);
+            let options =
+                zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            writer.start_file("zeroclaw.exe", options).unwrap();
+            writer.write_all(fake_exe).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("zeroclaw_new");
+        extract_zip(&zip_buf, &dest).unwrap();
+
+        let content = std::fs::read(&dest).unwrap();
+        assert_eq!(content, fake_exe);
+    }
+
+    #[test]
+    fn extract_zip_finds_zeroclaw_exe_in_subdirectory() {
+        use std::io::Write;
+
+        // Windows archive tools sometimes produce paths like
+        // `zeroclaw-v0.9/zeroclaw.exe`.  extract_zip matches by
+        // basename, so subdirectory entries must be found.
+        let fake_exe = b"zeroclaw-exe-in-subdir";
+        let mut zip_buf = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut zip_buf);
+            let mut writer = zip::ZipWriter::new(cursor);
+            let options =
+                zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            writer.start_file("zeroclaw-v0.9/zeroclaw.exe", options).unwrap();
+            writer.write_all(fake_exe).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("zeroclaw_new");
+        extract_zip(&zip_buf, &dest).unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), fake_exe);
+    }
+
+    #[test]
+    fn extract_zip_errors_on_missing_exe() {
+        use std::io::Write;
+
+        let mut zip_buf = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut zip_buf);
+            let mut writer = zip::ZipWriter::new(cursor);
+            let options =
+                zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            writer.start_file("README.txt", options).unwrap();
+            writer.write_all(b"hello").unwrap();
+            writer.finish().unwrap();
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("zeroclaw_new");
+        let result = extract_zip(&zip_buf, &dest);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("does not contain"),
+            "should report missing zeroclaw.exe"
+        );
+    }
 }
