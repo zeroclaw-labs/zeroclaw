@@ -17,8 +17,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::attachment::PendingAttachment;
 use crate::clipboard;
