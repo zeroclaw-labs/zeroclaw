@@ -301,7 +301,7 @@ pub async fn run_tool_call_loop(
             tools_registry,
             excluded_tools,
             activated_tools,
-        );
+        )?;
         let IterationToolSpecs {
             ref tool_specs,
             use_native_tools,
