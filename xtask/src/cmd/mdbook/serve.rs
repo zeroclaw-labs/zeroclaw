@@ -48,6 +48,8 @@ pub fn run(locale: Option<&str>, tag: Option<&str>) -> anyhow::Result<()> {
     // local iteration.
     crate::cmd::mdbook::build::inject_lang_switcher_locales(&book, &entries)?;
     crate::cmd::mdbook::themes::run(&root)?;
+    crate::cmd::mdbook::keymap::run(&root)?;
+    crate::cmd::mdbook::hardware::run(&root)?;
 
     // Watched locale: the one passed in, or the first entry in locales.toml.
     let watch_locale = locale
@@ -68,13 +70,17 @@ pub fn run(locale: Option<&str>, tag: Option<&str>) -> anyhow::Result<()> {
     crate::cmd::mdbook::build::assemble(&root, tag)?;
 
     // Watch the active locale for live-reload (rebuilds book/{locale}/ on change)
-    let mut watch = Command::new(mdbook_program()?)
+    let mut watch_cmd = Command::new(mdbook_program()?);
+    watch_cmd
         .args(["watch", "-d", &format!("book/{}/{}", tag_dir, watch_locale)])
         .env("MDBOOK_BOOK__LANGUAGE", &watch_locale)
         .current_dir(&book)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
+    if let Some((key, value)) = peer_groups_preprocessor_env() {
+        watch_cmd.env(key, value);
+    }
+    let mut watch = watch_cmd.spawn()?;
 
     // Re-copy api/ whenever mdbook's clean-on-rebuild removes it
     let running = Arc::new(AtomicBool::new(true));
@@ -135,12 +141,14 @@ pub fn run(locale: Option<&str>, tag: Option<&str>) -> anyhow::Result<()> {
 
 fn build_one_locale(book: &Path, tag_dir: &str, locale: &str) -> anyhow::Result<()> {
     let dest = format!("book/{}/{}", tag_dir, locale);
-    run_cmd(
-        Command::new(mdbook_program()?)
-            .args(["build", "-d", &dest])
-            .env("MDBOOK_BOOK__LANGUAGE", locale)
-            .current_dir(book),
-    )
+    let mut cmd = Command::new(mdbook_program()?);
+    cmd.args(["build", "-d", &dest])
+        .env("MDBOOK_BOOK__LANGUAGE", locale)
+        .current_dir(book);
+    if let Some((key, value)) = peer_groups_preprocessor_env() {
+        cmd.env(key, value);
+    }
+    run_cmd(&mut cmd)
 }
 
 async fn serve_static(dir: std::path::PathBuf) -> anyhow::Result<()> {

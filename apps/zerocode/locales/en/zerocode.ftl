@@ -40,13 +40,13 @@ zc-zerocode-conn-edit-text = Enter to save, Esc to cancel.
 zc-zerocode-conn-edit-bool = Enter toggles; this field saves on toggle.
 zc-zerocode-conn-edit-routes = One route per line. Enter for a new line, Ctrl+S to save, Esc to cancel.
 zc-zerocode-locale-loading = loading locales…
-zc-zerocode-locale-download = ⬇ Download locale file
-zc-zerocode-locale-set = Locale set to { $locale }. Restart to apply.
+zc-zerocode-locale-download = ⬇ Download selected locale file
+zc-zerocode-locale-set = Locale set to { $locale }. Download its locale file if needed, then restart to apply.
 zc-zerocode-locale-fetching = Downloading locale files for { $locale }…
 zc-zerocode-locale-downloaded = Downloaded { $written } for { $locale }. Skipped: { $skipped }
 zc-zerocode-locale-fetch-failed = Locale download failed for { $locale }: { $err }
 zc-zerocode-locale-list-failed = Failed to load locale list: { $err }
-zc-zerocode-locale-pick-first = Select a locale first, then download.
+zc-zerocode-locale-pick-first = Select a locale row first, then download its locale file.
 zc-zerocode-help-locale = select / download locale
 zc-zerocode-help-conn = edit connection field
 
@@ -214,6 +214,9 @@ zc-dashboard-detail-schedule = Schedule
 zc-dashboard-detail-next-run = Next Run
 zc-dashboard-detail-last-run = Last Run
 zc-dashboard-detail-last-status = Last Status
+zc-dashboard-detail-live-sessions = Live Sessions
+zc-dashboard-detail-persisted-sessions = Persisted Sessions
+zc-dashboard-cost-not-available = Cost tracking is not available. Configure a cost backend to see usage data.
 
 zc-dashboard-message-history = Message History ({ $count })
 zc-dashboard-loading-messages = Loading messages…
@@ -307,6 +310,9 @@ zc-quickstart-modal-action-save = save
 zc-quickstart-modal-type-prefix = Type:
 zc-quickstart-field-label-alias = Alias
 zc-quickstart-field-help-alias = Unique identifier for this provider instance. Change from "default" if your config already has one with that alias.
+zc-quickstart-model-loading = Loading models for { $provider }...
+zc-quickstart-model-retrying = Retrying model catalog for { $provider }...
+zc-quickstart-model-catalog-empty = catalog unavailable - type a model name
 zc-quickstart-action-done = Done
 zc-quickstart-no-peer-groups = No peer groups configured. Optional — agents can still send messages to channels.
 
@@ -315,8 +321,10 @@ zc-quickstart-help-external-peers = Comma- or newline-separated. Blank = no exte
 zc-quickstart-status-submitting = Submitting…
 zc-quickstart-status-created = Created `{ $alias }`. Reloading daemon — Chat will open when reconnected…
 zc-quickstart-status-errors = { $count } error(s) — fix selectors and resubmit
-zc-quickstart-status-can-create = All selectors ✓. Press `{ $chord }` to Create.
-zc-quickstart-status-hint = ↑/↓ to move, Enter to open. `{ $chord }` enables when every selector is ✓.
+zc-quickstart-status-first-error = { $where }{ $field }: { $message }{ $more }
+zc-quickstart-status-more-errors = { " " }(+{ $count } more)
+zc-quickstart-status-can-create = All required selectors ✓. Press `{ $chord }` to Create.
+zc-quickstart-status-hint = ↑/↓ to move, Enter to open. `{ $chord }` enables when all required selectors are ✓.
 
 zc-quickstart-channels-empty = No channels configured. An agent without channels still works via `zeroclaw agent <name>` from the CLI.
 zc-quickstart-channels-add = + Add channel
@@ -326,6 +334,9 @@ zc-quickstart-block-peers = Peer groups
 zc-quickstart-block-agent = Agent
 zc-quickstart-personality-help = Personality files (e=edit, t=use template, c=clear)
 zc-quickstart-save-and-close = Save & close
+zc-quickstart-no-template = No template is available for `{ $filename }`
+zc-quickstart-agent-name-field = name
+zc-quickstart-file-bytes = { $bytes } bytes
 
 zc-chat-pane-chat = Chat
 zc-chat-pane-acp = ACP
@@ -333,6 +344,8 @@ zc-chat-pane-acp = ACP
 zc-chat-no-agents = No enabled agents yet. Open Quickstart to create one, or use Config to add and enable an agent.
 zc-chat-error-fetch-agents = Failed to fetch agents: { $error }
 zc-chat-error-create-session = Failed to create session: { $error }
+zc-chat-session-restarted = New session started.
+zc-chat-session-restart-error = Failed to start a new session: { $error }
 
 zc-chat-thinking-visible = Thinking output: visible
 zc-chat-thinking-hidden = Thinking output: hidden
@@ -445,6 +458,9 @@ zc-config-status-fetching-templates = Fetching templates...
 zc-config-status-unsaved-discarded = Unsaved changes discarded
 zc-config-status-no-models = No models returned — enter manually
 zc-config-status-model-fetch-failed = Model fetch failed — enter manually
+zc-config-status-loading-aliases = Loading options...
+zc-config-status-no-aliases = None configured yet. Enter manually.
+zc-config-status-alias-fetch-failed = Options fetch failed. Enter manually.
 
 zc-config-footer-action-create = create
 zc-config-footer-action-cancel = cancel

@@ -1,17 +1,33 @@
 use std::time::Duration;
 
+/// Token usage breakdown for a single agent turn.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TurnTokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
 /// Discrete events emitted by the agent runtime for observability.
 ///
 /// Each variant represents a lifecycle event that observers can record,
 /// aggregate, or forward to external monitoring systems. Events carry
 /// just enough context for tracing and diagnostics without exposing
 /// sensitive prompt or response content.
+///
+/// Marked `#[non_exhaustive]` so out-of-tree observer implementations
+/// degrade gracefully when new variants are added in future minor
+/// releases — they must include a wildcard arm in their `match`
+/// expressions and will simply ignore unknown event kinds.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ObserverEvent {
     /// The agent orchestration loop has started a new session.
     AgentStart {
         model_provider: String,
         model: String,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// A request is about to be sent to an LLM model_provider.
     ///
@@ -21,6 +37,9 @@ pub enum ObserverEvent {
         model_provider: String,
         model: String,
         messages_count: usize,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// Result of a single LLM model_provider call.
     LlmResponse {
@@ -31,6 +50,9 @@ pub enum ObserverEvent {
         error_message: Option<String>,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// The agent session has finished.
     ///
@@ -39,8 +61,11 @@ pub enum ObserverEvent {
         model_provider: String,
         model: String,
         duration: Duration,
-        tokens_used: Option<u64>,
+        tokens_used: Option<TurnTokenUsage>,
         cost_usd: Option<f64>,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// A tool call is about to be executed.
     ToolCallStart {
@@ -56,6 +81,9 @@ pub enum ObserverEvent {
         /// Full JSON arguments the agent passed to the tool. `None` when
         /// arguments are unavailable at the call site.
         arguments: Option<String>,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// A tool call has completed with a success/failure outcome.
     ToolCall {
@@ -77,6 +105,57 @@ pub enum ObserverEvent {
         /// in trace viewers. Credentials are scrubbed before this field is
         /// emitted.
         result: Option<String>,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
+    },
+    /// A memory recall (search) operation has completed.
+    ///
+    /// Emitted at the runtime boundary after a hybrid-search query against
+    /// the brain DB. Carries an optional `query_summary` for diagnostics —
+    /// scrubbed and truncated user text, not a privacy-clean token. The
+    /// runtime applies `scrub_credentials` first and then truncates to ≤200
+    /// content chars (with a 3-char `...` ellipsis appended when truncation
+    /// occurred); short non-credential queries pass through unchanged.
+    MemoryRecall {
+        /// Scrubbed and truncated query summary. `None` when the caller has
+        /// no meaningful query to record (e.g., session-scoped fetches).
+        query_summary: Option<String>,
+        duration: Duration,
+        /// Number of `MemoryEntry` rows returned by the recall call.
+        num_entries: usize,
+        /// Bounded backend identifier (e.g. `"sqlite"`, `"qdrant"`, `"none"`).
+        backend: String,
+        success: bool,
+    },
+    /// A memory store (write) operation has completed.
+    ///
+    /// Emitted after persisting a memory entry. Carries only bounded
+    /// fields — the raw memory `key` is intentionally omitted because
+    /// keys can encode high-cardinality identifiers (UUIDs, phone
+    /// numbers, message timestamps) that would blow up Prometheus label
+    /// series.
+    MemoryStore {
+        /// Memory category (`"core"`, `"daily"`, `"conversation"`, etc.) —
+        /// bounded set, safe to use as a Prometheus label.
+        category: String,
+        /// Bounded backend identifier (e.g. `"sqlite"`, `"qdrant"`).
+        backend: String,
+        duration: Duration,
+        success: bool,
+    },
+    /// A RAG retrieval pass has completed.
+    ///
+    /// Emitted after vector + keyword retrieval against the hardware
+    /// datasheet index. Reports cardinalities only; carries an optional
+    /// scrubbed-and-truncated query summary on the same terms as
+    /// [`MemoryRecall`]. Has no `success` field because the underlying
+    /// `rag.retrieve` call is synchronous and infallible.
+    RagRetrieve {
+        query_summary: Option<String>,
+        duration: Duration,
+        num_chunks: usize,
+        num_boards: usize,
     },
     /// The agent produced a final answer for the current user message.
     TurnComplete,
@@ -278,6 +357,43 @@ mod tests {
     }
 
     #[test]
+    fn observer_events_carry_turn_metadata_and_structured_usage() {
+        let usage = TurnTokenUsage {
+            input_tokens: 12,
+            output_tokens: 34,
+        };
+
+        let event = ObserverEvent::AgentEnd {
+            model_provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            duration: Duration::from_millis(50),
+            tokens_used: Some(usage.clone()),
+            cost_usd: Some(0.001),
+            channel: Some("wss".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
+        };
+
+        match event {
+            ObserverEvent::AgentEnd {
+                tokens_used,
+                channel,
+                agent_alias,
+                turn_id,
+                ..
+            } => {
+                let tokens = tokens_used.expect("usage should be present");
+                assert_eq!(tokens.input_tokens, 12);
+                assert_eq!(tokens.output_tokens, 34);
+                assert_eq!(channel.as_deref(), Some("wss"));
+                assert_eq!(agent_alias.as_deref(), Some("default"));
+                assert_eq!(turn_id.as_deref(), Some("turn-1"));
+            }
+            _ => panic!("expected AgentEnd"),
+        }
+    }
+
+    #[test]
     fn observer_event_and_metric_are_cloneable() {
         let event = ObserverEvent::ToolCall {
             tool: "shell".into(),
@@ -286,6 +402,9 @@ mod tests {
             success: true,
             arguments: Some(r#"{"command":"date"}"#.into()),
             result: Some("Mon Apr 22 12:00:00 UTC 2026\n".into()),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         };
         let metric = ObserverMetric::RequestLatency(Duration::from_millis(8));
 
@@ -294,5 +413,32 @@ mod tests {
 
         assert!(matches!(cloned_event, ObserverEvent::ToolCall { .. }));
         assert!(matches!(cloned_metric, ObserverMetric::RequestLatency(_)));
+    }
+
+    #[test]
+    fn memory_event_variants_are_cloneable() {
+        let recall = ObserverEvent::MemoryRecall {
+            query_summary: Some("user asked about coffee orders".into()),
+            duration: Duration::from_millis(40),
+            num_entries: 3,
+            backend: "sqlite".into(),
+            success: true,
+        };
+        let store = ObserverEvent::MemoryStore {
+            category: "conversation".into(),
+            backend: "sqlite".into(),
+            duration: Duration::from_millis(8),
+            success: true,
+        };
+        let rag = ObserverEvent::RagRetrieve {
+            query_summary: None,
+            duration: Duration::from_millis(120),
+            num_chunks: 5,
+            num_boards: 2,
+        };
+
+        assert!(matches!(recall.clone(), ObserverEvent::MemoryRecall { .. }));
+        assert!(matches!(store.clone(), ObserverEvent::MemoryStore { .. }));
+        assert!(matches!(rag.clone(), ObserverEvent::RagRetrieve { .. }));
     }
 }

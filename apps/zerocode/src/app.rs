@@ -24,14 +24,22 @@ use crate::quickstart_pane;
 use crate::theme;
 use crate::widgets::{CtxBar, HelpContext, HelpEntry, HelpNode};
 
+/// Pending Quickstart chat transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingQuickstartChat {
+    /// Open the created agent after the daemon reconnects.
+    AfterReconnect(String),
+    /// Open the created agent on the current live connection.
+    Immediate(String),
+}
+
 /// State that must survive a reconnect — used by Quickstart's
 /// Stage-2 flow to route the user into the freshly-created agent's
 /// chat after the daemon comes back up.
 #[derive(Debug, Default)]
 pub struct CrossReconnectState {
-    /// Agent alias the next `run()` invocation should switch the
-    /// Chat tab onto. Consumed (cleared) after the first read.
-    pub start_chat_with: Option<String>,
+    /// The single pending handoff target for Quickstart-created agents.
+    pub pending_quickstart_chat: Option<PendingQuickstartChat>,
 }
 
 pub type SharedReconnectState = Arc<Mutex<CrossReconnectState>>;
@@ -103,6 +111,29 @@ async fn switch_mode(
         }
     }
     *mode = next;
+}
+
+async fn consume_immediate_start_chat(
+    reconnect_state: &SharedReconnectState,
+    mode: &mut Mode,
+    chat_pane: &mut chat::Chat,
+) {
+    let alias = {
+        let Ok(mut guard) = reconnect_state.lock() else {
+            return;
+        };
+        match guard.pending_quickstart_chat.take() {
+            Some(PendingQuickstartChat::Immediate(alias)) => Some(alias),
+            other => {
+                guard.pending_quickstart_chat = other;
+                None
+            }
+        }
+    };
+    if let Some(alias) = alias {
+        chat_pane.focus_agent(&alias).await;
+        *mode = Mode::Chat;
+    }
 }
 
 // ── Top-level entry point ────────────────────────────────────────
@@ -181,7 +212,13 @@ pub async fn run(
                 chat_pane.init().await?;
                 let pending_start_chat = {
                     let mut guard = reconnect_state.lock().expect("reconnect state poisoned");
-                    guard.start_chat_with.take()
+                    match guard.pending_quickstart_chat.take() {
+                        Some(PendingQuickstartChat::AfterReconnect(alias)) => Some(alias),
+                        other => {
+                            guard.pending_quickstart_chat = other;
+                            None
+                        }
+                    }
                 };
                 let mut logs_pane = logs::Logs::new(rpc.clone());
                 logs_pane.init().await?;
@@ -471,6 +508,9 @@ pub async fn run(
             if mode == Mode::Logs {
                 logs_pane.tick().await;
             }
+            if mode == Mode::Quickstart {
+                quickstart.tick().await;
+            }
             continue;
         }
 
@@ -606,6 +646,7 @@ pub async fn run(
                     )
                     .await;
                 }
+                consume_immediate_start_chat(&reconnect_state, &mut mode, &mut chat_pane).await;
             }
             Event::Mouse(mouse) => {
                 // Dismiss help on any click
@@ -643,7 +684,22 @@ pub async fn run(
                 if !matches!(conn_state, ConnectionState::Disconnected { .. }) {
                     match mode {
                         Mode::Dashboard => {
-                            dashboard_pane.handle_mouse(mouse, content_area);
+                            if let Some(action) = dashboard_pane.handle_mouse(mouse, content_area) {
+                                match action {
+                                    dashboard::DashboardMouseAction::OpenAgentConfig(alias) => {
+                                        config_app.open_agent_config(&alias).await?;
+                                        switch_mode(
+                                            &mut mode,
+                                            Mode::Config,
+                                            &conn_state,
+                                            &mut quickstart,
+                                            &mut acp_pane,
+                                            &mut chat_pane,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
                         }
                         Mode::Config => {
                             config_app.handle_mouse(mouse, content_area, term).await?;
@@ -661,6 +717,7 @@ pub async fn run(
                             quickstart.handle_mouse(mouse, content_area).await;
                         }
                     }
+                    consume_immediate_start_chat(&reconnect_state, &mut mode, &mut chat_pane).await;
                 }
             }
             Event::Paste(text) if !matches!(conn_state, ConnectionState::Disconnected { .. }) => {
@@ -783,8 +840,11 @@ fn draw_status_bar(
     spans.push(Span::styled(label, style));
     frame.render_widget(Paragraph::new(Line::from(spans)), right_area);
 
-    // Left: ctx bar, left-aligned in its own column.
-    if let Some(w) = ctx.widget() {
+    // Left: ctx bar, left-aligned in its own column. The bar is held back
+    // until the context-accounting feature is ready to show; there is no
+    // user-facing switch — the gate flips when the work lands.
+    const SHOW_CTX_BAR: bool = false;
+    if SHOW_CTX_BAR && let Some(w) = ctx.widget() {
         frame.render_widget(w, left_area);
     }
 }

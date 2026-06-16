@@ -16,6 +16,33 @@ pub fn ref_dir(root: &Path) -> PathBuf {
     root.join("docs/book/src/reference")
 }
 
+/// Resolve the Cargo target directory, honoring `CARGO_TARGET_DIR`, a
+/// `.cargo/config.toml` `build.target-dir`, and any other override Cargo
+/// applies. `cargo doc` writes its output under `<target-dir>/doc`; hardcoding
+/// `<root>/target/doc` breaks whenever the target dir is relocated (CI runners,
+/// shared caches, `CARGO_TARGET_DIR`). Falls back to `<root>/target` only when
+/// `cargo metadata` is unavailable.
+pub fn target_dir(root: &Path) -> PathBuf {
+    let output = Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(root)
+        .output();
+    if let Ok(out) = output
+        && out.status.success()
+        && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        && let Some(dir) = json.get("target_directory").and_then(|v| v.as_str())
+    {
+        return PathBuf::from(dir);
+    }
+    root.join("target")
+}
+
+/// The rustdoc output directory (`<target-dir>/doc`), resolved through
+/// [`target_dir`] so it tracks `cargo doc`'s actual output location.
+pub fn doc_dir(root: &Path) -> PathBuf {
+    target_dir(root).join("doc")
+}
+
 pub fn po_dir(root: &Path) -> PathBuf {
     root.join("docs/book/po")
 }
@@ -104,6 +131,33 @@ pub fn mdbook_program() -> anyhow::Result<PathBuf> {
     }
     anyhow::bail!(
         "'mdbook' not found on PATH\n  install: cargo install mdbook --version 0.5.0 --locked"
+    )
+}
+
+/// Point mdBook's `peer-groups` preprocessor at the xtask binary Cargo actually
+/// built, rather than the repo-relative `target/release/mdbook` hardcoded in
+/// `book.toml`. With a non-default `CARGO_TARGET_DIR` the helper lands under the
+/// external target dir while mdBook still tries the repo-relative path and fails
+/// with "preprocessor not found". The running xtask binary *is* the preprocessor
+/// (its `preprocess` subcommand), so the override resolves wherever Cargo placed
+/// it. mdBook maps `MDBOOK_PREPROCESSOR__PEER_GROUPS__COMMAND` to the
+/// `preprocessor.peer-groups.command` key (`__` -> `.`, `_` -> `-`) and splits
+/// the value with shlex, so the path is quoted.
+pub fn peer_groups_preprocessor_env() -> Option<(String, String)> {
+    let exe = std::env::current_exe().ok()?;
+    let exe_str = exe.to_string_lossy();
+    Some(peer_groups_preprocessor_env_for(&exe_str))
+}
+
+/// Pure form of [`peer_groups_preprocessor_env`] over an explicit helper path,
+/// so the mdBook env-key mapping and shlex quoting are unit-testable without
+/// resolving `current_exe`.
+fn peer_groups_preprocessor_env_for(helper_path: &str) -> (String, String) {
+    let quoted =
+        shlex::try_quote(helper_path).map_or_else(|_| helper_path.to_string(), |q| q.into_owned());
+    (
+        "MDBOOK_PREPROCESSOR__PEER_GROUPS__COMMAND".to_string(),
+        format!("{quoted} preprocess"),
     )
 }
 
@@ -273,4 +327,53 @@ pub fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> anyhow::Res
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_groups_env_key_matches_mdbook_mapping() {
+        let (key, value) = peer_groups_preprocessor_env_for("/some/dir/mdbook");
+        // mdBook lowercases, maps `__` -> `.` and `_` -> `-`, so this key must
+        // resolve to `preprocessor.peer-groups.command`.
+        assert_eq!(
+            key.strip_prefix("MDBOOK_")
+                .map(|k| k.to_lowercase().replace("__", ".").replace('_', "-")),
+            Some("preprocessor.peer-groups.command".to_string())
+        );
+        assert_eq!(value, "/some/dir/mdbook preprocess");
+    }
+
+    #[test]
+    fn peer_groups_env_quotes_paths_with_spaces() {
+        let (_, value) = peer_groups_preprocessor_env_for("/tmp/my target/release/mdbook");
+        let words: Vec<String> = shlex::Shlex::new(&value).collect();
+        assert_eq!(words, ["/tmp/my target/release/mdbook", "preprocess"]);
+    }
+
+    #[test]
+    fn doc_dir_follows_cargo_target_dir_override() {
+        // cargo metadata reflects CARGO_TARGET_DIR; doc_dir must resolve to
+        // <override>/doc so the assemble()/refs copy reads from where `cargo doc`
+        // actually wrote. This is the exact failure the hardcoded `target/doc`
+        // path had under a non-default CARGO_TARGET_DIR.
+        // SAFETY: single-threaded body; env is saved and restored.
+        let prev = std::env::var_os("CARGO_TARGET_DIR");
+        let alt = std::env::temp_dir().join("zc-xtask-target-dir-test");
+        unsafe {
+            std::env::set_var("CARGO_TARGET_DIR", &alt);
+        }
+        let resolved_target = target_dir(&repo_root());
+        let resolved_doc = doc_dir(&repo_root());
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("CARGO_TARGET_DIR", v),
+                None => std::env::remove_var("CARGO_TARGET_DIR"),
+            }
+        }
+        assert_eq!(resolved_target, alt);
+        assert_eq!(resolved_doc, alt.join("doc"));
+    }
 }

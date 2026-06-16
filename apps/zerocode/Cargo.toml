@@ -44,6 +44,7 @@ shellexpand = "3.1"
 directories = { workspace = true }
 fluent = "0.16"
 unic-langid = "0.9"
+zeroclaw-providers = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

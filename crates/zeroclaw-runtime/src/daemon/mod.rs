@@ -1,11 +1,13 @@
 use anyhow::Result;
 use chrono::Utc;
-use std::future::Future;
 use std::path::PathBuf;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN};
+
+mod registry;
+pub use registry::DaemonRegistry;
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
@@ -169,85 +171,11 @@ async fn wait_for_ephemeral(client_count: std::sync::Arc<std::sync::atomic::Atom
     }
 }
 
-/// Optional subsystem start functions injected by the binary crate.
-/// This allows the daemon to spawn subsystems without depending on their crates.
-#[allow(clippy::type_complexity)]
-pub struct DaemonSubsystems {
-    /// Start the gateway HTTP server. Injected by the binary when `gateway` feature is on.
-    /// The fifth argument is the reload sender — the gateway hands it to its
-    /// AppState so /admin/reload can signal the daemon to re-init.
-    /// The sixth argument is the TUI registry for the /api/tuis endpoint.
-    pub gateway_start: Option<
-        Box<
-            dyn Fn(
-                    String,
-                    u16,
-                    Config,
-                    Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
-                    Option<tokio::sync::watch::Sender<bool>>,
-                    Option<std::sync::Arc<crate::rpc::tui_identity::TuiRegistry>>,
-                ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>
-                + Send
-                + Sync,
-        >,
-    >,
-    /// Start supervised channels. Injected by the binary when channels crate is available.
-    /// The cancellation token is fired on reload so listener tasks drop their channel Arcs
-    /// before the new supervisor starts.
-    pub channels_start: Option<
-        Box<
-            dyn Fn(
-                    Config,
-                    tokio_util::sync::CancellationToken,
-                ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>
-                + Send
-                + Sync,
-        >,
-    >,
-    /// Start the local IPC RPC listener (Unix socket on Unix, Named Pipe on
-    /// Windows). First argument is the shared `RpcContext`; third is the
-    /// client count for `--ephemeral` shutdown.
-    pub socket_start: Option<
-        Box<
-            dyn Fn(
-                    std::sync::Arc<crate::rpc::context::RpcContext>,
-                    tokio_util::sync::CancellationToken,
-                    std::sync::Arc<std::sync::atomic::AtomicUsize>,
-                ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>
-                + Send
-                + Sync,
-        >,
-    >,
-    /// Start the WSS (WebSocket Secure) RPC listener for remote TUI connections.
-    /// Same signature as `socket_start`; shares `RpcContext` and `client_count`.
-    pub wss_start: Option<
-        Box<
-            dyn Fn(
-                    std::sync::Arc<crate::rpc::context::RpcContext>,
-                    tokio_util::sync::CancellationToken,
-                    std::sync::Arc<std::sync::atomic::AtomicUsize>,
-                ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>
-                + Send
-                + Sync,
-        >,
-    >,
-    /// Start the MQTT SOP listener. Injected by the binary when channels crate is available.
-    pub mqtt_start: Option<
-        Box<
-            dyn Fn(
-                    zeroclaw_config::schema::MqttConfig,
-                ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>
-                + Send
-                + Sync,
-        >,
-    >,
-}
-
 pub async fn run(
     config: Config,
     host: String,
     port: u16,
-    subsystems: DaemonSubsystems,
+    mut registry: DaemonRegistry,
     ephemeral: bool,
 ) -> Result<DaemonExit> {
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
@@ -285,7 +213,7 @@ pub async fn run(
     let tui_registry =
         std::sync::Arc::new(crate::rpc::tui_identity::TuiRegistry::new(&config.data_dir));
 
-    if let Some(gateway_start) = subsystems.gateway_start {
+    if let Some(gateway_start) = registry.take_gateway_start() {
         let gateway_cfg = config.clone();
         let gateway_host = host.clone();
         let gateway_event_tx = event_tx.clone();
@@ -310,7 +238,7 @@ pub async fn run(
 
     let channels_cancel = tokio_util::sync::CancellationToken::new();
 
-    if let Some(channels_start) = subsystems.channels_start {
+    if let Some(channels_start) = registry.take_channels_start() {
         if has_supervised_channels(&config) {
             let channels_cfg = config.clone();
             let channels_start = std::sync::Arc::new(channels_start);
@@ -346,7 +274,10 @@ pub async fn run(
     // RPC transports: Unix socket (#6837) and WSS (remote TUI connections).
     // Build the shared RpcContext if either transport is configured.
     let socket_client_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let need_rpc_ctx = subsystems.socket_start.is_some() || subsystems.wss_start.is_some();
+    let need_rpc_ctx = registry.has_socket_start() || registry.has_wss_start();
+
+    // Extract shared SOP engine from registry for RpcContext.
+    let (sop_engine, sop_audit) = registry.take_sop_engine();
 
     let rpc_ctx = if need_rpc_ctx {
         use crate::rpc::context::RpcContext;
@@ -454,13 +385,15 @@ pub async fn run(
             ),
             tui_registry,
             acp_session_store,
+            sop_engine,
+            sop_audit,
         }))
     } else {
         None
     };
 
     // Local IPC RPC listener (Unix socket on Unix, Named Pipe on Windows).
-    if let Some(socket_start) = subsystems.socket_start {
+    if let Some(socket_start) = registry.take_socket_start() {
         let rpc_ctx = rpc_ctx
             .clone()
             .expect("rpc_ctx built when socket_start is Some");
@@ -482,7 +415,7 @@ pub async fn run(
     }
 
     // WSS RPC listener (remote TUI connections).
-    if let Some(wss_start) = subsystems.wss_start {
+    if let Some(wss_start) = registry.take_wss_start() {
         let rpc_ctx = rpc_ctx
             .clone()
             .expect("rpc_ctx built when wss_start is Some");
@@ -504,7 +437,7 @@ pub async fn run(
     }
 
     // Wire up MQTT SOP listener if configured and referenced by an enabled agent
-    if let Some(mqtt_start) = subsystems.mqtt_start {
+    if let Some(mqtt_start) = registry.take_mqtt_start() {
         let active_mqtt: std::collections::HashSet<String> = config
             .agents
             .values()
@@ -1479,7 +1412,7 @@ fn has_supervised_channels(config: &Config) -> bool {
 }
 
 // run_mqtt_sop_listener has been moved to zeroclaw-channels::orchestrator::mqtt.
-// The daemon now receives it as a callback via DaemonSubsystems::mqtt_start.
+// The daemon now receives it as a starter via DaemonRegistry::register_mqtt.
 
 #[cfg(test)]
 mod tests {
@@ -1574,6 +1507,9 @@ mod tests {
                 draft_update_interval_ms: 0,
                 multi_message_delay_ms: 0,
                 stall_timeout_secs: 0,
+                slash_commands: false,
+                intents_mask: None,
+                reaction_notifications: zeroclaw_config::schema::DiscordReactionScope::Off,
                 interrupt_on_new_message: false,
                 archive: false,
                 approval_timeout_secs: 0,
@@ -1596,6 +1532,9 @@ mod tests {
                 draft_update_interval_ms: 0,
                 multi_message_delay_ms: 0,
                 stall_timeout_secs: 0,
+                slash_commands: false,
+                intents_mask: None,
+                reaction_notifications: zeroclaw_config::schema::DiscordReactionScope::Off,
                 interrupt_on_new_message: false,
                 archive: false,
                 approval_timeout_secs: 0,
@@ -1841,7 +1780,7 @@ mod tests {
         config.peer_groups.insert(
             "telegram_default".to_string(),
             PeerGroupConfig {
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 external_peers: vec![PeerUsername::new("user123")],
                 ..PeerGroupConfig::default()
             },
@@ -1905,6 +1844,62 @@ mod tests {
             .expect("task should not panic")
             .expect("signal handler should not error");
         assert_eq!(result, DaemonExit::Reload);
+    }
+
+    #[tokio::test]
+    async fn registry_gateway_starter_can_trigger_daemon_reload() {
+        use tokio::time::{Duration, timeout};
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let expected_data_dir = config.data_dir.clone();
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut registry = DaemonRegistry::new();
+        registry.register_gateway(Box::new(
+            move |host, port, config, event_tx, reload_tx, tui_registry| {
+                let seen_tx = seen_tx.clone();
+                Box::pin(async move {
+                    let has_event_tx = event_tx.is_some();
+                    let has_reload_tx = reload_tx.is_some();
+                    let has_tui_registry = tui_registry.is_some();
+                    seen_tx
+                        .send((
+                            host,
+                            port,
+                            config.data_dir.clone(),
+                            has_event_tx,
+                            has_reload_tx,
+                            has_tui_registry,
+                        ))
+                        .expect("record gateway starter inputs");
+                    reload_tx
+                        .expect("daemon should pass reload sender to gateway starter")
+                        .send(true)
+                        .expect("send reload signal");
+                    std::future::pending::<Result<()>>().await
+                })
+            },
+        ));
+
+        let exit = timeout(
+            Duration::from_secs(2),
+            run(config, "127.0.0.1".to_string(), 4242, registry, false),
+        )
+        .await
+        .expect("daemon should return after gateway-triggered reload")
+        .expect("daemon run should succeed");
+
+        assert_eq!(exit, DaemonExit::Reload);
+        let (host, port, data_dir, has_event_tx, has_reload_tx, has_tui_registry) = seen_rx
+            .try_recv()
+            .expect("gateway starter should record its daemon inputs");
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 4242);
+        assert_eq!(data_dir, expected_data_dir);
+        assert!(has_event_tx);
+        assert!(has_reload_tx);
+        assert!(has_tui_registry);
     }
 
     #[tokio::test]

@@ -16,6 +16,7 @@ pub fn run(tag: Option<&str>) -> anyhow::Result<()> {
     build_refs(&root)?;
     build_api(&root)?;
     build_locales(&root, tag)?;
+    crate::cmd::mdbook::linkcheck::check_internal_links(&root, tag.unwrap_or(DEFAULT_TAG))?;
     assemble(&root, tag)?;
     println!(
         "==> Done. Open: {}",
@@ -41,16 +42,30 @@ pub fn build_locales(root: &std::path::Path, tag: Option<&str>) -> anyhow::Resul
     );
     inject_lang_switcher_locales(&book, &entries)?;
     crate::cmd::mdbook::themes::run(root)?;
+    crate::cmd::mdbook::keymap::run(root)?;
+    crate::cmd::mdbook::hardware::run(root)?;
     let mdbook = mdbook_program()?;
+    let preprocessor_env = peer_groups_preprocessor_env();
     let tag_dir = tag.unwrap_or(DEFAULT_TAG);
+    // Search is enabled only for the primary locale. Per-locale searchindex is
+    // high-entropy (~6-7 MB raw each) and does not delta-compress across
+    // versions, so building it for every locale dominates gh-pages clone size.
+    // The primary locale (first in locales.toml, English) keeps full search;
+    // translated locales build without a search index or search box.
+    let primary_locale = entries.first().map(|e| e.code.clone());
     for entry in &entries {
         let dest = format!("book/{}/{}", tag_dir, entry.code);
-        run_cmd(
-            Command::new(&mdbook)
-                .args(["build", "-d", &dest])
-                .env("MDBOOK_BOOK__LANGUAGE", &entry.code)
-                .current_dir(&book),
-        )?;
+        let mut cmd = Command::new(&mdbook);
+        cmd.args(["build", "-d", &dest])
+            .env("MDBOOK_BOOK__LANGUAGE", &entry.code)
+            .current_dir(&book);
+        if Some(&entry.code) != primary_locale.as_ref() {
+            cmd.env("MDBOOK_OUTPUT__HTML__SEARCH__ENABLE", "false");
+        }
+        if let Some((key, value)) = &preprocessor_env {
+            cmd.env(key, value);
+        }
+        run_cmd(&mut cmd)?;
     }
     Ok(())
 }
@@ -100,7 +115,7 @@ pub fn assemble(root: &std::path::Path, tag: Option<&str>) -> anyhow::Result<()>
     let tag_dir = tag.unwrap_or(DEFAULT_TAG);
     let api_dest = book.join("book").join(tag_dir).join("api");
     let _ = std::fs::remove_dir_all(&api_dest);
-    copy_dir_all(root.join("target/doc"), &api_dest)?;
+    copy_dir_all(doc_dir(root), &api_dest)?;
 
     const INDEX_HTML: &str = "<!doctype html>\n<meta charset=\"utf-8\">\n<meta http-equiv=\"refresh\" content=\"0; url=./en/\">\n<link rel=\"canonical\" href=\"./en/\">\n<title>ZeroClaw Docs</title>\n";
     let out_dir = book.join("book").join(tag_dir);

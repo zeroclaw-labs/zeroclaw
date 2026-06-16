@@ -43,7 +43,7 @@ pub struct Route {
 ///
 /// This wraps multiple pre-created model_providers and selects the right one per request.
 pub struct RouterModelProvider {
-    /// `[model_providers.<family>.<alias>]` config-key alias.
+    /// `[providers.models.<family>.<alias>]` config-key alias.
     alias: String,
     routes: HashMap<String, (usize, String)>, // hint → (provider_index, model)
     model_providers: Vec<(String, Box<dyn ModelProvider>)>,
@@ -183,7 +183,7 @@ impl RouterModelProvider {
 /// model_provider from the route table based on per-provider pricing maps.
 ///
 /// Pricing is keyed by model_provider name (the alias under
-/// `[model_providers.<model_provider>.<alias>]`); each model_provider's pricing map
+/// `[providers.models.<model_provider>.<alias>]`); each model_provider's pricing map
 /// holds user-defined keys (model identifiers, optionally suffixed with
 /// `.input` / `.output`) mapped to USD-per-1M-token rates.
 #[derive(Debug, Clone)]
