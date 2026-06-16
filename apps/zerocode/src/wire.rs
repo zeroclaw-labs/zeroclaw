@@ -22,6 +22,83 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+// ── Doctor result shapes ────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DoctorSeverity {
+    Ok,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct DoctorResultEntry {
+    pub severity: DoctorSeverity,
+    pub category: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct DoctorSummary {
+    pub ok: usize,
+    pub warnings: usize,
+    pub errors: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct DoctorRunResult {
+    pub results: Vec<DoctorResultEntry>,
+    pub summary: DoctorSummary,
+}
+
+#[cfg(test)]
+mod doctor_wire_tests {
+    use super::*;
+    use zeroclaw_runtime::{
+        doctor::{DiagResult, Severity},
+        rpc::types::{
+            DoctorRunResult as RuntimeDoctorRunResult, DoctorSummary as RuntimeDoctorSummary,
+        },
+    };
+
+    #[test]
+    fn doctor_run_result_round_trips_canonical_rpc_shape() {
+        let canonical = RuntimeDoctorRunResult {
+            results: vec![
+                DiagResult {
+                    severity: Severity::Ok,
+                    category: "config".to_string(),
+                    message: "config ok".to_string(),
+                },
+                DiagResult {
+                    severity: Severity::Warn,
+                    category: "workspace".to_string(),
+                    message: "workspace warning".to_string(),
+                },
+                DiagResult {
+                    severity: Severity::Error,
+                    category: "daemon".to_string(),
+                    message: "daemon error".to_string(),
+                },
+            ],
+            summary: RuntimeDoctorSummary {
+                ok: 1,
+                warnings: 1,
+                errors: 1,
+            },
+        };
+
+        let canonical_json = serde_json::to_value(&canonical).unwrap();
+        let mirror: DoctorRunResult = serde_json::from_value(canonical_json.clone()).unwrap();
+
+        assert_eq!(serde_json::to_value(&mirror).unwrap(), canonical_json);
+    }
+}
+
 // ── Quickstart submission shapes ────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -49,5 +49,8 @@ zeroclaw-providers = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[dev-dependencies]
+zeroclaw-runtime = { workspace = true }
+
 [build-dependencies]
 serde_json = { version = "1.0", default-features = false, features = ["std"] }

@@ -14777,6 +14777,7 @@ dependencies = [
  "unic-langid",
  "unicode-width 0.2.2",
  "zeroclaw-providers",
+ "zeroclaw-runtime",
 ]
 
 [[package]]
