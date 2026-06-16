@@ -325,6 +325,11 @@ pub struct ChannelQuickStart {
     /// Bot token / shared secret if the channel needs one
     /// (Telegram, Discord). `None` for channels that don't.
     pub token: Option<String>,
+    /// HTTP port for webhook channel types. `None` for channels that
+    /// don't need one. The CLI adapter validates the raw port string
+    /// as `u16` and rejects invalid input.
+    #[serde(default)]
+    pub port: Option<u16>,
 }
 
 /// Agent identity payload from the Agent step. Personality file
@@ -624,6 +629,7 @@ mod tests {
                 channel_type: "cli".into(),
                 alias: "cli".into(),
                 token: None,
+                port: None,
             })],
             peer_groups: vec![],
             agent: AgentIdentity {

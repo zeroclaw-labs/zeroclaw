@@ -1058,25 +1058,76 @@ fn apply_homebrew_onboard_config_dir() {
     );
 }
 
-/// `zeroclaw quickstart` CLI entry — checklist UX, not a wizard.
-///
-/// Mirrors the TUI Quickstart pane's structure: a single screen
-/// listing all six selectors with `[ ]` / `[✓]` status and a one-line
-/// summary, the user picks which selector to fill (any order), each
-/// selector opens its own picker / field-form / channel-list sub-flow,
-/// and `c` creates the agent once every selector is `[✓]`. There are
-/// no pre-checked defaults anywhere — every selector starts `[ ]` and
-/// is only satisfied by an explicit user choice (either a "Use
-/// existing" pick of an already-configured alias, or a fully-filled
-/// "Create new" entry).
-///
-/// All option lists, field shapes, presets, and the apply path come
-/// directly from `zeroclaw_runtime::quickstart` — the same module the
-/// gateway and TUI surfaces consume. No RPC, no daemon: the CLI is
-/// compiled in-process with `zeroclaw-runtime` and calls
-/// `snapshot_state` / `field_shape` / `apply_with_surface` as plain
-/// functions.
-///
+// `zeroclaw quickstart` CLI entry — checklist UX, not a wizard.
+//
+// Mirrors the TUI Quickstart pane's structure: a single screen
+// listing all six selectors with `[ ]` / `[✓]` status and a one-line
+// summary, the user picks which selector to fill (any order), each
+// selector opens its own picker / field-form / channel-list sub-flow,
+// and `c` creates the agent once every selector is `[✓]`. There are
+// no pre-checked defaults anywhere — every selector starts `[ ]` and
+// is only satisfied by an explicit user choice (either a "Use
+// existing" pick of an already-configured alias, or a fully-filled
+// "Create new" entry).
+//
+// All option lists, field shapes, presets, and the apply path come
+// directly from `zeroclaw_runtime::quickstart` — the same module the
+// gateway and TUI surfaces consume. No RPC, no daemon: the CLI is
+// compiled in-process with `zeroclaw-runtime` and calls
+// `snapshot_state` / `field_shape` / `apply_with_surface` as plain
+// functions.
+
+/// Convert a CLI channel form entry into a `ChannelQuickStart`.
+/// Extracted from `run_quickstart_cli` so the port-parsing adapter
+/// can be tested directly.  See #7173 / #7215.
+#[cfg(feature = "agent-runtime")]
+fn channel_quickstart_from_cli(
+    kind: String,
+    alias: String,
+    extras: std::collections::BTreeMap<String, String>,
+) -> anyhow::Result<zeroclaw_config::presets::ChannelQuickStart> {
+    use zeroclaw_config::presets::ChannelQuickStart;
+    let port = extras
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("port"))
+        .map(|(_, v)| {
+            v.trim().parse::<u16>().map_err(|e| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "channel": kind,
+                            "alias": alias,
+                            "raw": v,
+                            "error": format!("{}", e),
+                        })),
+                    "quickstart cli: port is not a valid u16"
+                );
+                anyhow::Error::msg(format!(
+                    "Invalid port '{}' for {} channel '{}': must be a number (1-65535)",
+                    v.trim(),
+                    kind,
+                    alias,
+                ))
+            })
+        })
+        .transpose()?;
+    Ok(ChannelQuickStart {
+        channel_type: kind,
+        alias,
+        token: extras
+            .into_iter()
+            .find(|(k, _)| {
+                k.eq_ignore_ascii_case("bot-token")
+                    || k.eq_ignore_ascii_case("token")
+                    || k.eq_ignore_ascii_case("access-token")
+            })
+            .map(|(_, v)| v),
+        port,
+    })
+}
+
 /// Flag pre-fills (`--model-provider`, `--model`, `--api-key`,
 /// `--agent`) silently seed the relevant selector's value and mark it
 /// `[✓]` if the seed is enough to satisfy the selector; the user can
@@ -2196,30 +2247,19 @@ async fn run_quickstart_cli(
     // forces the `unbounded` preset. Submit it so the field stays well-formed.
     let runtime_profile = SelectorChoice::Fresh("unbounded".to_string());
     let memory = SelectorChoice::Fresh(form.memory.expect("memory satisfied"));
-    let channels = form
-        .channels
-        .into_iter()
-        .map(|c| match c {
+    let mut channels = Vec::with_capacity(form.channels.len());
+    for c in form.channels {
+        let selector = match c {
+            ChannelChoice::Existing { alias_ref } => SelectorChoice::Existing(alias_ref),
             ChannelChoice::Fresh {
                 kind,
                 alias,
                 extras,
                 ..
-            } => SelectorChoice::Fresh(ChannelQuickStart {
-                channel_type: kind,
-                alias,
-                token: extras
-                    .into_iter()
-                    .find(|(k, _)| {
-                        k.eq_ignore_ascii_case("bot-token")
-                            || k.eq_ignore_ascii_case("token")
-                            || k.eq_ignore_ascii_case("access-token")
-                    })
-                    .map(|(_, v)| v),
-            }),
-            ChannelChoice::Existing { alias_ref } => SelectorChoice::Existing(alias_ref),
-        })
-        .collect();
+            } => SelectorChoice::Fresh(channel_quickstart_from_cli(kind, alias, extras)?),
+        };
+        channels.push(selector);
+    }
     let agent_choice = form.agent.expect("agent satisfied");
     let submission = BuilderSubmission {
         model_provider,
@@ -7562,5 +7602,48 @@ mod tests {
             gate_security_posture(&whole, false).is_err(),
             "whole-config loss must fail closed when not explicitly allowed"
         );
+    }
+
+    // ── channel_quickstart_from_cli regression tests (#7215) ──────────
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn valid_port_reaches_channel_quickstart() {
+        let mut extras = std::collections::BTreeMap::new();
+        extras.insert("bot-token".to_string(), "mytoken".to_string());
+        extras.insert("port".to_string(), "8080".to_string());
+        let qs = channel_quickstart_from_cli("webhook".to_string(), "wh".to_string(), extras)
+            .expect("valid port should succeed");
+        assert_eq!(qs.port, Some(8080));
+        assert_eq!(qs.token.as_deref(), Some("mytoken"));
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn invalid_port_returns_error() {
+        let mut extras = std::collections::BTreeMap::new();
+        extras.insert("port".to_string(), "abc".to_string());
+        let err = channel_quickstart_from_cli("webhook".to_string(), "wh".to_string(), extras)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Invalid port"),
+            "expected 'Invalid port' message, got: {err}"
+        );
+        assert!(
+            err.contains("abc"),
+            "should mention the bad value, got: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn missing_port_is_fine_for_non_webhook_channels() {
+        let mut extras = std::collections::BTreeMap::new();
+        extras.insert("bot-token".to_string(), "tok".to_string());
+        let qs = channel_quickstart_from_cli("telegram".to_string(), "tg".to_string(), extras)
+            .expect("missing port should be ok for non-webhook");
+        assert_eq!(qs.port, None);
+        assert_eq!(qs.token.as_deref(), Some("tok"));
     }
 }
