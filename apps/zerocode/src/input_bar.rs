@@ -759,8 +759,7 @@ impl InputBarState {
         if self.cursor > 0 {
             let prev_grapheme = self.input[..self.cursor]
                 .graphemes(true)
-                .rev()
-                .next()
+                .next_back()
                 .unwrap_or("");
             let prev_start = self.cursor - prev_grapheme.len();
             self.input.replace_range(prev_start..self.cursor, "");
@@ -774,8 +773,7 @@ impl InputBarState {
         if self.cursor > 0 {
             let prev_grapheme = self.input[..self.cursor]
                 .graphemes(true)
-                .rev()
-                .next()
+                .next_back()
                 .unwrap_or("");
             self.cursor -= prev_grapheme.len();
         }
