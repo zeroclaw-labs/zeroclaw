@@ -2247,17 +2247,29 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
         let is_group = Self::is_group_message(message);
         if self.mention_only && is_group {
-            // Bypass mention_only gate for replies to the bot's own messages.
-            // When a user replies directly to the bot, they expect a response
-            // even without an explicit @mention.
-            let is_reply_to_bot = message
-                .get("reply_to_message")
-                .and_then(|r| r.get("from"))
-                .and_then(|f| f.get("is_bot"))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
+            // Bypass mention_only gate for replies to THIS bot's own
+            // messages. Check the replied-to message's username against
+            // our cached bot username (not just is_bot, which would
+            // match any bot in the group).
+            let is_reply_to_this_bot = {
+                let bot_username = self.bot_username.lock();
+                bot_username.as_ref().and_then(|bot_name| {
+                    let reply_from = message
+                        .get("reply_to_message")
+                        .and_then(|r| r.get("from"))?;
+                    let reply_username =
+                        reply_from.get("username").and_then(|u| u.as_str())?;
+                    // Normalize: strip leading @ if present
+                    let normalized = reply_username.trim_start_matches('@');
+                    if normalized.eq_ignore_ascii_case(bot_name) {
+                        Some(true)
+                    } else {
+                        None
+                    }
+                }) == Some(true)
+            };
 
-            if !is_reply_to_bot {
+            if !is_reply_to_this_bot {
                 let bot_username = self.bot_username.lock();
                 if let Some(ref bot_username) = *bot_username {
                     if !Self::contains_bot_mention(text, bot_username) {
