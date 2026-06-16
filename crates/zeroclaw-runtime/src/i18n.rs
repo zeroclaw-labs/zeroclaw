@@ -284,9 +284,12 @@ pub fn detect_locale() -> String {
 
 /// Auto-detect locale from the OS when config sets none. `sys-locale` is
 /// cross-platform: on Unix it checks `LANGUAGE` > `LC_ALL` > `LC_MESSAGES` >
-/// `LANG`, and on Windows/macOS it queries the OS directly.
+/// `LANG`, and on Windows/macOS it queries the OS directly. Walks every
+/// candidate rather than just the first: `LC_ALL=C` (common in CI/containers
+/// to force deterministic tool output) would otherwise shadow a perfectly
+/// usable `LANG=zh_CN.UTF-8` and we'd give up instead of trying it.
 fn locale_from_system() -> Option<String> {
-    sys_locale::get_locale().and_then(|raw| normalized_env_locale(&raw))
+    sys_locale::get_locales().find_map(|raw| normalized_env_locale(&raw))
 }
 
 /// Pure: normalize a raw OS locale value, rejecting the POSIX
