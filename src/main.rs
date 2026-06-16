@@ -4063,7 +4063,10 @@ async fn main() -> Result<()> {
                 ta(
                     "cli-status-trace-storage",
                     &[
-                        ("persistence", config.observability.log_persistence.as_wire()),
+                        (
+                            "persistence",
+                            config.observability.log_persistence.as_wire()
+                        ),
                         ("path", &config.observability.log_persistence_path),
                     ],
                     "Trace storage"
