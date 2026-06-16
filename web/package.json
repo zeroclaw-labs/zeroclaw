@@ -43,5 +43,8 @@
     "tailwindcss": "^4.0.0",
     "typescript": "~5.7.2",
     "vite": "^8.0.16"
+  },
+  "overrides": {
+    "js-yaml": "^4.2.0"
   }
 }
