@@ -2257,8 +2257,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     let reply_from = message
                         .get("reply_to_message")
                         .and_then(|r| r.get("from"))?;
-                    let reply_username =
-                        reply_from.get("username").and_then(|u| u.as_str())?;
+                    let reply_username = reply_from.get("username").and_then(|u| u.as_str())?;
                     // Normalize: strip leading @ if present
                     let normalized = reply_username.trim_start_matches('@');
                     if normalized.eq_ignore_ascii_case(bot_name) {
