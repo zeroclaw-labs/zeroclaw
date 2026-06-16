@@ -63,9 +63,9 @@ pub(crate) async fn announce_llm_request(
         model_provider: active_model_provider_name.to_string(),
         model: active_model.to_string(),
         messages_count: history.len(),
-        channel: None,
-        agent_alias: None,
-        turn_id: None,
+        channel: Some(ctx.channel_name.to_string()),
+        agent_alias: ctx.agent_alias.map(|s| s.to_string()),
+        turn_id: Some(ctx.turn_id.to_string()),
     });
     {
         let _provider_guard = ::zeroclaw_log::attribution_span!(active_model_provider).entered();

@@ -16,6 +16,7 @@ use zeroclaw_api::agent::TurnEvent;
 
 // Items that still live in `loop_` — import via the parent module.
 use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled, scrub_credentials};
+use super::turn::TurnMeta;
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -47,6 +48,7 @@ pub async fn execute_one_tool(
     tool_call_id: Option<&str>,
     tools_registry: &[Box<dyn Tool>],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    meta: &TurnMeta<'_>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
@@ -64,9 +66,9 @@ pub async fn execute_one_tool(
         tool: call_name.to_string(),
         tool_call_id: tool_call_id_owned.clone(),
         arguments: Some(full_args.clone()),
-        channel: None,
-        agent_alias: None,
-        turn_id: None,
+        channel: Some(meta.channel_name.to_string()),
+        agent_alias: meta.agent_alias.map(|s| s.to_string()),
+        turn_id: Some(meta.turn_id.to_string()),
     });
     let start = Instant::now();
 
@@ -111,9 +113,9 @@ pub async fn execute_one_tool(
             success: false,
             arguments: Some(full_args.clone()),
             result: Some(scrub_credentials(&reason)),
-            channel: None,
-            agent_alias: None,
-            turn_id: None,
+            channel: Some(meta.channel_name.to_string()),
+            agent_alias: meta.agent_alias.map(|s| s.to_string()),
+            turn_id: Some(meta.turn_id.to_string()),
         });
         return Ok(ToolExecutionOutcome {
             output: reason.clone(),
@@ -241,9 +243,9 @@ pub async fn execute_one_tool(
                         success: true,
                         arguments: Some(full_args.clone()),
                         result: Some(scrub_credentials(normalized_output)),
-                        channel: None,
-                        agent_alias: None,
-                        turn_id: None,
+                        channel: Some(meta.channel_name.to_string()),
+                        agent_alias: meta.agent_alias.map(|s| s.to_string()),
+                        turn_id: Some(meta.turn_id.to_string()),
                     });
                     Ok(ToolExecutionOutcome {
                         output: normalized_output.to_string(),
@@ -261,9 +263,9 @@ pub async fn execute_one_tool(
                         success: false,
                         arguments: Some(full_args.clone()),
                         result: Some(scrub_credentials(&reason)),
-                        channel: None,
-                        agent_alias: None,
-                        turn_id: None,
+                        channel: Some(meta.channel_name.to_string()),
+                        agent_alias: meta.agent_alias.map(|s| s.to_string()),
+                        turn_id: Some(meta.turn_id.to_string()),
                     });
                     Ok(ToolExecutionOutcome {
                         output: format!("Error: {reason}"),
@@ -298,9 +300,9 @@ pub async fn execute_one_tool(
                     success: false,
                     arguments: Some(full_args.clone()),
                     result: Some(scrub_credentials(&reason)),
-                    channel: None,
-                    agent_alias: None,
-                    turn_id: None,
+                    channel: Some(meta.channel_name.to_string()),
+                    agent_alias: meta.agent_alias.map(|s| s.to_string()),
+                    turn_id: Some(meta.turn_id.to_string()),
                 });
                 Ok(ToolExecutionOutcome {
                     output: reason.clone(),
@@ -373,6 +375,7 @@ pub async fn execute_tools_parallel(
     tool_calls: &[ParsedToolCall],
     tools_registry: &[Box<dyn Tool>],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    meta: &TurnMeta<'_>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
@@ -387,6 +390,7 @@ pub async fn execute_tools_parallel(
                 call.tool_call_id.as_deref(),
                 tools_registry,
                 activated_tools,
+                meta,
                 observer,
                 cancellation_token,
                 receipt_generator,
@@ -418,6 +422,7 @@ pub async fn execute_tools_sequential(
     tool_calls: &[ParsedToolCall],
     tools_registry: &[Box<dyn Tool>],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    meta: &TurnMeta<'_>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
@@ -435,6 +440,7 @@ pub async fn execute_tools_sequential(
             call.tool_call_id.as_deref(),
             tools_registry,
             activated_tools,
+            meta,
             observer,
             cancellation_token,
             receipt_generator,

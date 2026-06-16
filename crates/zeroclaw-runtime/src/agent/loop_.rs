@@ -750,6 +750,7 @@ pub async fn agent_turn(
     context_token_budget: usize,
     channel: Option<&dyn Channel>,
 ) -> Result<String> {
+    let turn_id = uuid::Uuid::new_v4().to_string();
     run_tool_call_loop(ToolLoop {
         exec: ResolvedAgentExecution::resolve(
             ResolvedModelAccess {
@@ -796,6 +797,8 @@ pub async fn agent_turn(
         // Phase 1: stamp Internal/Trusted. Real per-transport
         // stamping is PR C (RFC #6971 §4).
         ingress: IngressContext::internal(),
+        agent_alias: None,
+        turn_id: &turn_id,
     })
     .await
 }
@@ -1056,6 +1059,8 @@ pub async fn run(
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
         let base_observer = observability::create_observer(&config.observability);
         let observer: Arc<dyn Observer> = Arc::from(base_observer);
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let channel_name = if interactive { "cli" } else { "daemon" };
         let runtime: Arc<dyn platform::RuntimeAdapter> =
             Arc::from(platform::create_runtime(&config.runtime)?);
         let is_subagent_caller = overrides.is_subagent;
@@ -1446,9 +1451,9 @@ pub async fn run(
         observer.record_event(&ObserverEvent::AgentStart {
             model_provider: provider_name.to_string(),
             model: model_name.to_string(),
-            channel: None,
-            agent_alias: None,
-            turn_id: None,
+            channel: Some(channel_name.to_string()),
+            agent_alias: Some(agent_alias.to_string()),
+            turn_id: Some(turn_id.clone()),
         });
 
         // ── Hardware RAG (datasheet retrieval when peripherals + datasheet_dir) ──
@@ -1668,7 +1673,6 @@ pub async fn run(
         } else {
             None
         };
-        let channel_name = if interactive { "cli" } else { "daemon" };
         let memory_session_id = session_state_file.as_deref().and_then(|path| {
             let raw = path.to_string_lossy().trim().to_string();
             if raw.is_empty() {
@@ -1924,6 +1928,8 @@ pub async fn run(
                                 // Phase 1: stamp Internal/Trusted. Real per-transport
                                 // stamping is PR C (RFC #6971 §4).
                                 ingress: IngressContext::internal(),
+                                agent_alias: Some(agent_alias),
+                                turn_id: &turn_id,
                             }),
                         ),
                     )
@@ -1981,9 +1987,9 @@ pub async fn run(
                             observer.record_event(&ObserverEvent::AgentStart {
                                 model_provider: provider_name.to_string(),
                                 model: model_name.to_string(),
-                                channel: None,
-                                agent_alias: None,
-                                turn_id: None,
+                                channel: Some(channel_name.to_string()),
+                                agent_alias: Some(agent_alias.to_string()),
+                                turn_id: Some(turn_id.clone()),
                             });
 
                             continue;
@@ -2442,6 +2448,8 @@ pub async fn run(
                                     // Phase 1: stamp Internal/Trusted. Real per-transport
                                     // stamping is PR C (RFC #6971 §4).
                                     ingress: IngressContext::internal(),
+                                    agent_alias: Some(agent_alias),
+                                    turn_id: &turn_id,
                                 }),
                             ),
                         )
@@ -2501,9 +2509,9 @@ pub async fn run(
                                 observer.record_event(&ObserverEvent::AgentStart {
                                     model_provider: provider_name.to_string(),
                                     model: model_name.to_string(),
-                                    channel: None,
-                                    agent_alias: None,
-                                    turn_id: None,
+                                    channel: Some(channel_name.to_string()),
+                                    agent_alias: Some(agent_alias.to_string()),
+                                    turn_id: Some(turn_id.clone()),
                                 });
 
                                 continue;
