@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7-labs
 
 # ── Stage 0: Frontend build ─────────────────────────────────────
-FROM node:24-bookworm-slim AS web-node
+FROM node:24-bookworm-slim@sha256:63894611df2569aa672fd149131e615ddcb03dc00b88d7a431b9697c5fc2d584 AS web-node
 
 FROM rust:1.94-slim@sha256:da9dab7a6b8dd428e71718402e97207bb3e54167d37b5708616050b1e8f60ed6 AS web-builder
 WORKDIR /app
