@@ -5014,8 +5014,9 @@ mod tests {
             Some("chain-of-thought via vllm"),
             "the `reasoning` alias must populate the canonical reasoning_content field",
         );
-        // effective_content should also surface the reasoning when content is missing.
-        assert_eq!(msg.effective_content(), "chain-of-thought via vllm");
+        // effective_content returns "" when content is None — reasoning
+        // is preserved separately, not leaked into the response text.
+        assert_eq!(msg.effective_content(), "");
     }
 
     #[test]
