@@ -1394,9 +1394,23 @@ impl Channel for WhatsAppWebChannel {
                                         }
                                     };
 
+                                // Use the native WhatsApp message id so that
+                                // ack_reactions (add_reaction/remove_reaction)
+                                // can build a correct MessageKey targeting
+                                // the inbound message. Fall back to a UUID
+                                // when the key is missing (should be rare).
+                                let native_msg_id = info
+                                    .key
+                                    .id
+                                    .as_deref()
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_else(|| {
+                                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "WhatsApp message missing native key.id, falling back to UUID");
+                                        uuid::Uuid::new_v4().to_string()
+                                    });
                                 if let Err(e) = tx_inner
                                     .send(ChannelMessage {
-                                        id: uuid::Uuid::new_v4().to_string(),
+                                        id: native_msg_id,
                                         channel: "whatsapp".to_string(),
                                         channel_alias: Some((*alias).clone()),
                                         sender: normalized.clone(),
