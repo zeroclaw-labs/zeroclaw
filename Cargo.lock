@@ -14775,6 +14775,7 @@ dependencies = [
  "tokio-tungstenite 0.29.0",
  "toml 1.1.2+spec-1.1.0",
  "unic-langid",
+ "unicode-segmentation",
  "unicode-width 0.2.2",
  "zeroclaw-providers",
 ]
