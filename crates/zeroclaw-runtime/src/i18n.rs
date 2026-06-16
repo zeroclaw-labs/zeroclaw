@@ -275,29 +275,23 @@ fn load_ftl_with_reader(
     None
 }
 
-/// Detect locale: config.toml → system locale env vars → "en".
+/// Detect locale: config.toml → system locale (via `sys-locale`) → "en".
 pub fn detect_locale() -> String {
     locale_from_config()
-        .or_else(locale_from_system_env)
+        .or_else(locale_from_system)
         .unwrap_or_else(|| "en".to_string())
 }
 
-/// Auto-detect locale from the host environment when config sets none.
-/// `ZEROCLAW_LOCALE` (an explicit app-level override) wins first; `sys-locale`
-/// handles the rest cross-platform — on Unix it already checks `LANGUAGE` >
-/// `LC_ALL` > `LC_MESSAGES` > `LANG` internally, and on Windows/macOS it
-/// queries the OS directly, which also covers hosts (notably native Windows
-/// consoles) that don't set any POSIX locale env vars.
-fn locale_from_system_env() -> Option<String> {
-    std::env::var("ZEROCLAW_LOCALE")
-        .ok()
-        .and_then(|v| normalized_env_locale(&v))
-        .or_else(|| sys_locale::get_locale().and_then(|raw| normalized_env_locale(&raw)))
+/// Auto-detect locale from the OS when config sets none. `sys-locale` is
+/// cross-platform: on Unix it checks `LANGUAGE` > `LC_ALL` > `LC_MESSAGES` >
+/// `LANG`, and on Windows/macOS it queries the OS directly.
+fn locale_from_system() -> Option<String> {
+    sys_locale::get_locale().and_then(|raw| normalized_env_locale(&raw))
 }
 
-/// Pure: normalize a raw env-var locale value, rejecting the POSIX
+/// Pure: normalize a raw OS locale value, rejecting the POSIX
 /// "no locale configured" sentinels ("", "C", "POSIX"). Split out from
-/// `locale_from_system_env` so it is testable without environment access —
+/// `locale_from_system` so it is testable without environment access —
 /// no test may touch real env vars to verify locale logic.
 fn normalized_env_locale(raw: &str) -> Option<String> {
     let trimmed = raw.trim();

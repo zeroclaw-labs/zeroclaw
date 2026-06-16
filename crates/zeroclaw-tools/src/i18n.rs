@@ -179,21 +179,15 @@ fn detect_locale() -> String {
         }
     }
 
-    locale_from_system_env().unwrap_or_else(|| "en".to_string())
+    locale_from_system().unwrap_or_else(|| "en".to_string())
 }
 
-/// Auto-detect locale from the host environment when config sets none.
-/// Same precedence as `zeroclaw-runtime`'s `i18n::detect_locale`:
-/// `ZEROCLAW_LOCALE` (an explicit app-level override) wins first; `sys-locale`
-/// handles the rest cross-platform — on Unix it already checks `LANGUAGE` >
-/// `LC_ALL` > `LC_MESSAGES` > `LANG` internally, and on Windows/macOS it
-/// queries the OS directly, which also covers hosts (notably native Windows
-/// consoles) that don't set any POSIX locale env vars.
-fn locale_from_system_env() -> Option<String> {
-    std::env::var("ZEROCLAW_LOCALE")
-        .ok()
-        .and_then(|v| normalized_env_locale(&v))
-        .or_else(|| sys_locale::get_locale().and_then(|raw| normalized_env_locale(&raw)))
+/// Auto-detect locale from the OS when config sets none. Same as
+/// `zeroclaw-runtime`'s `i18n::detect_locale`: `sys-locale` is
+/// cross-platform — on Unix it checks `LANGUAGE` > `LC_ALL` > `LC_MESSAGES` >
+/// `LANG`, and on Windows/macOS it queries the OS directly.
+fn locale_from_system() -> Option<String> {
+    sys_locale::get_locale().and_then(|raw| normalized_env_locale(&raw))
 }
 
 /// Pure: normalize a raw env-var locale value, rejecting the POSIX
