@@ -80,5 +80,5 @@ export function matchCommands(prefix: string): CommandSpec[] {
 /** Markdown body for `/help`, derived from {@link COMMANDS}. */
 export function helpText(): string {
   const lines = COMMANDS.map((c) => `- \`${c.usage}\` — ${t(c.descriptionKey)}`);
-  return `**${t('agent.cmd_help_header')}**\n${lines.join('\n')}`;
+  return `**${t('agent.cmd_help_header')}**\n${lines.join('\n')}\n\n${t('agent.cmd_help_escape')}`;
 }

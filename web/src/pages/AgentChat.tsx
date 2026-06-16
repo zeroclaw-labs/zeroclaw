@@ -186,7 +186,9 @@ function AgentChatInner({ agentAlias }: { agentAlias: string }) {
       runCommand(trimmed);
     } else {
       if (!connected) return;
-      sendMessage(trimmed);
+      // `//` is the documented escape for a literal leading slash (#7223);
+      // strip one `/` so `//foo` is sent to the agent as `/foo`.
+      sendMessage(trimmed.startsWith('//') ? trimmed.slice(1) : trimmed);
     }
     setShowCommandHint(false);
     setInput('');

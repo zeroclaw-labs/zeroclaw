@@ -98,6 +98,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': '正在切换至模型：{model}…',
     'agent.cmd_model_busy': '已有模型切换正在进行中，请稍候。',
     'agent.cmd_model_failed': '切换至模型 {model} 失败。',
+    'agent.cmd_help_escape': '提示：如需发送以 / 开头的消息，请改用 //（例如 //foo 将发送 /foo）。',
     'agent.cmd_hint_title': '命令',
 
     // Tools
@@ -544,6 +545,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'Switching to model: {model}…',
     'agent.cmd_model_busy': 'A model switch is already in progress. Please wait for it to finish.',
     'agent.cmd_model_failed': 'Failed to switch to model: {model}.',
+    'agent.cmd_help_escape': 'Tip: to send a message starting with /, type // instead (e.g. //foo sends /foo).',
     'agent.cmd_hint_title': 'Commands',
     'agent.compact_mode': 'Compact',
     'agent.tool_activity_show': 'Show tool activity',
@@ -996,6 +998,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'Modele geçiliyor: {model}…',
     'agent.cmd_model_busy': 'Bir model değişikliği zaten devam ediyor. Lütfen bitmesini bekleyin.',
     'agent.cmd_model_failed': 'Modele geçiş başarısız: {model}.',
+    'agent.cmd_help_escape': 'İpucu: / ile başlayan bir mesaj göndermek için bunun yerine // yazın (örn. //foo, /foo gönderir).',
     'agent.cmd_hint_title': 'Komutlar',
 
     // Tools
@@ -1336,6 +1339,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'يتم التبديل إلى النموذج: {model}…',
     'agent.cmd_model_busy': 'هناك تبديل نموذج قيد التنفيذ بالفعل. يرجى الانتظار حتى ينتهي.',
     'agent.cmd_model_failed': 'فشل التبديل إلى النموذج: {model}.',
+    'agent.cmd_help_escape': 'نصيحة: لإرسال رسالة تبدأ بـ /، استخدم // بدلاً من ذلك (مثلاً //foo يرسل /foo).',
     'agent.cmd_hint_title': 'الأوامر',
 
     // Tools
@@ -1709,6 +1713,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'মডেলে স্যুইচ করা হচ্ছে: {model}…',
     'agent.cmd_model_busy': 'একটি মডেল পরিবর্তন ইতিমধ্যে চলছে। অনুগ্রহ করে শেষ হওয়ার জন্য অপেক্ষা করুন।',
     'agent.cmd_model_failed': 'মডেলে স্যুইচ ব্যর্থ: {model}।',
+    'agent.cmd_help_escape': 'টিপ: / দিয়ে শুরু হওয়া বার্তা পাঠাতে, পরিবর্তে // টাইপ করুন (যেমন //foo পাঠাবে /foo)।',
     'agent.cmd_hint_title': 'কমান্ড',
 
     // Tools
@@ -2082,6 +2087,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'Přepínání na model: {model}…',
     'agent.cmd_model_busy': 'Přepnutí modelu již probíhá. Počkejte prosím na jeho dokončení.',
     'agent.cmd_model_failed': 'Přepnutí na model selhalo: {model}.',
+    'agent.cmd_help_escape': 'Tip: Chcete-li odeslat zprávu začínající na /, napište místo toho // (např. //foo odešle /foo).',
     'agent.cmd_hint_title': 'Příkazy',
 
     // Tools
@@ -2455,6 +2461,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'Skifter til model: {model}…',
     'agent.cmd_model_busy': 'Et modelskift er allerede i gang. Vent venligst, til det er færdigt.',
     'agent.cmd_model_failed': 'Kunne ikke skifte til model: {model}.',
+    'agent.cmd_help_escape': 'Tip: For at sende en besked, der starter med /, skal du skrive // i stedet (f.eks. sender //foo /foo).',
     'agent.cmd_hint_title': 'Kommandoer',
 
     // Tools
@@ -2828,6 +2835,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'Wechsle zum Modell: {model}…',
     'agent.cmd_model_busy': 'Ein Modellwechsel läuft bereits. Bitte warten Sie, bis er abgeschlossen ist.',
     'agent.cmd_model_failed': 'Modellwechsel fehlgeschlagen: {model}.',
+    'agent.cmd_help_escape': 'Tipp: Um eine Nachricht zu senden, die mit / beginnt, geben Sie stattdessen // ein (z. B. sendet //foo /foo).',
     'agent.cmd_hint_title': 'Befehle',
 
     // Tools
@@ -3201,6 +3209,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'Μετάβαση στο μοντέλο: {model}…',
     'agent.cmd_model_busy': 'Μια αλλαγή μοντέλου είναι ήδη σε εξέλιξη. Παρακαλώ περιμένετε να ολοκληρωθεί.',
     'agent.cmd_model_failed': 'Η μετάβαση στο μοντέλο απέτυχε: {model}.',
+    'agent.cmd_help_escape': 'Συμβουλή: Για να στείλετε μήνυμα που ξεκινά με /, πληκτρολογήστε // αντί αυτού (π.χ. το //foo στέλνει /foo).',
     'agent.cmd_hint_title': 'Εντολές',
 
     // Tools
@@ -3574,6 +3583,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'Cambiando al modelo: {model}…',
     'agent.cmd_model_busy': 'Ya hay un cambio de modelo en curso. Por favor, espera a que termine.',
     'agent.cmd_model_failed': 'No se pudo cambiar al modelo: {model}.',
+    'agent.cmd_help_escape': 'Consejo: para enviar un mensaje que empiece con /, escribe // en su lugar (por ejemplo, //foo envía /foo).',
     'agent.cmd_hint_title': 'Comandos',
 
     // Tools
@@ -3947,6 +3957,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'Vaihdetaan malliin: {model}…',
     'agent.cmd_model_busy': 'Mallin vaihto on jo käynnissä. Odota, kunnes se on valmis.',
     'agent.cmd_model_failed': 'Malliin vaihto epäonnistui: {model}.',
+    'agent.cmd_help_escape': 'Vinkki: Jos haluat lähettää viestin, joka alkaa merkillä /, kirjoita sen sijaan // (esim. //foo lähettää /foo).',
     'agent.cmd_hint_title': 'Komennot',
 
     // Tools
@@ -4320,6 +4331,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'Changement vers le modèle : {model}…',
     'agent.cmd_model_busy': 'Un changement de modèle est déjà en cours. Veuillez attendre qu\'il se termine.',
     'agent.cmd_model_failed': 'Échec du changement vers le modèle : {model}.',
+    'agent.cmd_help_escape': 'Astuce : pour envoyer un message commençant par /, tapez // à la place (par ex. //foo envoie /foo).',
     'agent.cmd_hint_title': 'Commandes',
 
     // Tools
@@ -4707,6 +4719,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'מחליף למודל: {model}…',
     'agent.cmd_model_busy': 'החלפת מודל כבר מתבצעת. אנא המתן לסיומה.',
     'agent.cmd_model_failed': 'ההחלפה למודל נכשלה: {model}.',
+    'agent.cmd_help_escape': 'טיפ: כדי לשלוח הודעה שמתחילה ב-/, הקלידו // במקום זאת (למשל //foo ישלח /foo).',
     'agent.cmd_hint_title': 'פקודות',
 
     // Tools
@@ -5080,6 +5093,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'मॉडल पर स्विच कर रहा है: {model}…',
     'agent.cmd_model_busy': 'एक मॉडल स्विच पहले से ही चल रहा है। कृपया इसके समाप्त होने की प्रतीक्षा करें।',
     'agent.cmd_model_failed': 'मॉडल पर स्विच विफल: {model}।',
+    'agent.cmd_help_escape': 'सुझाव: / से शुरू होने वाला संदेश भेजने के लिए, इसके बजाय // टाइप करें (जैसे //foo भेजने पर /foo जाएगा)।',
     'agent.cmd_hint_title': 'कमांड',
 
     // Tools
@@ -5453,6 +5467,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'Váltás a modellre: {model}…',
     'agent.cmd_model_busy': 'Modellváltás már folyamatban van. Kérjük, várjon, amíg befejeződik.',
     'agent.cmd_model_failed': 'Nem sikerült váltani a modellre: {model}.',
+    'agent.cmd_help_escape': 'Tipp: Ha / karakterrel kezdődő üzenetet szeretne küldeni, írjon helyette //-t (pl. a //foo a /foo-t küldi el).',
     'agent.cmd_hint_title': 'Parancsok',
 
     // Tools
@@ -5826,6 +5841,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'Beralih ke model: {model}…',
     'agent.cmd_model_busy': 'Pergantian model sudah berlangsung. Harap tunggu hingga selesai.',
     'agent.cmd_model_failed': 'Gagal beralih ke model: {model}.',
+    'agent.cmd_help_escape': 'Tip: untuk mengirim pesan yang dimulai dengan /, ketik // sebagai gantinya (misalnya //foo akan mengirim /foo).',
     'agent.cmd_hint_title': 'Perintah',
 
     // Tools
@@ -6199,6 +6215,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'Passaggio al modello: {model}…',
     'agent.cmd_model_busy': 'Un cambio di modello è già in corso. Attendi che termini.',
     'agent.cmd_model_failed': 'Impossibile passare al modello: {model}.',
+    'agent.cmd_help_escape': 'Suggerimento: per inviare un messaggio che inizia con /, digita invece // (ad es. //foo invia /foo).',
     'agent.cmd_hint_title': 'Comandi',
 
     // Tools
@@ -6572,6 +6589,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'モデルに切り替え中: {model}…',
     'agent.cmd_model_busy': 'モデルの切り替えが既に進行中です。完了をお待ちください。',
     'agent.cmd_model_failed': 'モデルへの切り替えに失敗しました: {model}。',
+    'agent.cmd_help_escape': 'ヒント: / で始まるメッセージを送信するには、代わりに // と入力してください（例: //foo は /foo を送信します）。',
     'agent.cmd_hint_title': 'コマンド',
 
     // Tools
@@ -6959,6 +6977,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': '모델로 전환 중: {model}…',
     'agent.cmd_model_busy': '모델 전환이 이미 진행 중입니다. 완료될 때까지 기다려 주세요.',
     'agent.cmd_model_failed': '모델로 전환 실패: {model}.',
+    'agent.cmd_help_escape': '팁: /로 시작하는 메시지를 보내려면 대신 //를 입력하세요(예: //foo는 /foo를 전송합니다).',
     'agent.cmd_hint_title': '명령',
 
     // Tools
@@ -7332,6 +7351,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'Bytter til modell: {model}…',
     'agent.cmd_model_busy': 'Et modellbytte pågår allerede. Vennligst vent til det er ferdig.',
     'agent.cmd_model_failed': 'Kunne ikke bytte til modell: {model}.',
+    'agent.cmd_help_escape': 'Tips: For å sende en melding som starter med /, skriv // i stedet (f.eks. sender //foo /foo).',
     'agent.cmd_hint_title': 'Kommandoer',
 
     // Tools
@@ -7705,6 +7725,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'Overschakelen naar model: {model}…',
     'agent.cmd_model_busy': 'Een modelwissel is al bezig. Wacht tot deze is voltooid.',
     'agent.cmd_model_failed': 'Kon niet overschakelen naar model: {model}.',
+    'agent.cmd_help_escape': 'Tip: om een bericht te verzenden dat begint met /, typ in plaats daarvan // (bijv. //foo verzendt /foo).',
     'agent.cmd_hint_title': 'Commando\'s',
 
     // Tools
@@ -8078,6 +8099,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'Przełączanie na model: {model}…',
     'agent.cmd_model_busy': 'Zmiana modelu jest już w toku. Poczekaj, aż się zakończy.',
     'agent.cmd_model_failed': 'Nie udało się przełączyć na model: {model}.',
+    'agent.cmd_help_escape': 'Wskazówka: aby wysłać wiadomość zaczynającą się od /, wpisz zamiast tego // (np. //foo wyśle /foo).',
     'agent.cmd_hint_title': 'Polecenia',
 
     // Tools
@@ -8451,6 +8473,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'Alternando para o modelo: {model}…',
     'agent.cmd_model_busy': 'Uma troca de modelo já está em andamento. Aguarde até que termine.',
     'agent.cmd_model_failed': 'Falha ao alternar para o modelo: {model}.',
+    'agent.cmd_help_escape': 'Dica: para enviar uma mensagem que começa com /, digite // em vez disso (por exemplo, //foo envia /foo).',
     'agent.cmd_hint_title': 'Comandos',
 
     // Tools
@@ -8824,6 +8847,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'Se trece la modelul: {model}…',
     'agent.cmd_model_busy': 'O schimbare de model este deja în curs. Așteptați să se termine.',
     'agent.cmd_model_failed': 'Trecerea la model a eșuat: {model}.',
+    'agent.cmd_help_escape': 'Sfat: pentru a trimite un mesaj care începe cu /, tastați // în schimb (de exemplu, //foo trimite /foo).',
     'agent.cmd_hint_title': 'Comenzi',
 
     // Tools
@@ -9197,6 +9221,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'Переключение на модель: {model}…',
     'agent.cmd_model_busy': 'Переключение модели уже выполняется. Дождитесь его завершения.',
     'agent.cmd_model_failed': 'Не удалось переключиться на модель: {model}.',
+    'agent.cmd_help_escape': 'Совет: чтобы отправить сообщение, начинающееся с /, введите вместо этого // (например, //foo отправит /foo).',
     'agent.cmd_hint_title': 'Команды',
 
     // Tools
@@ -9584,6 +9609,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'Byter till modell: {model}…',
     'agent.cmd_model_busy': 'Ett modellbyte pågår redan. Vänligen vänta tills det är klart.',
     'agent.cmd_model_failed': 'Det gick inte att byta till modell: {model}.',
+    'agent.cmd_help_escape': 'Tips: för att skicka ett meddelande som börjar med /, skriv // istället (t.ex. skickar //foo /foo).',
     'agent.cmd_hint_title': 'Kommandon',
 
     // Tools
@@ -9957,6 +9983,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'กำลังเปลี่ยนเป็นโมเดล: {model}…',
     'agent.cmd_model_busy': 'กำลังเปลี่ยนโมเดลอยู่ โปรดรอจนกว่าจะเสร็จสิ้น',
     'agent.cmd_model_failed': 'ไม่สามารถเปลี่ยนเป็นโมเดล: {model}',
+    'agent.cmd_help_escape': 'เคล็ดลับ: หากต้องการส่งข้อความที่ขึ้นต้นด้วย / ให้พิมพ์ // แทน (เช่น //foo จะส่ง /foo)',
     'agent.cmd_hint_title': 'คำสั่ง',
 
     // Tools
@@ -10330,6 +10357,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'Lumilipat sa modelo: {model}…',
     'agent.cmd_model_busy': 'May kasalukuyang paglipat ng modelo. Maghintay hanggang matapos ito.',
     'agent.cmd_model_failed': 'Nabigong lumipat sa modelo: {model}.',
+    'agent.cmd_help_escape': 'Tip: upang magpadala ng mensaheng nagsisimula sa /, i-type ang // sa halip (hal., ipapadala ng //foo ang /foo).',
     'agent.cmd_hint_title': 'Mga Utos',
 
     // Tools
@@ -10703,6 +10731,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'Перехід до моделі: {model}…',
     'agent.cmd_model_busy': 'Зміна моделі вже виконується. Зачекайте, доки вона завершиться.',
     'agent.cmd_model_failed': 'Не вдалося перейти до моделі: {model}.',
+    'agent.cmd_help_escape': 'Підказка: щоб надіслати повідомлення, яке починається з /, введіть замість цього // (наприклад, //foo надішле /foo).',
     'agent.cmd_hint_title': 'Команди',
 
     // Tools
@@ -11076,6 +11105,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'ماڈل پر سوئچ ہو رہا ہے: {model}…',
     'agent.cmd_model_busy': 'ماڈل کی تبدیلی پہلے سے جاری ہے۔ براہ کرم اس کے ختم ہونے کا انتظار کریں۔',
     'agent.cmd_model_failed': 'ماڈل پر سوئچ ناکام: {model}۔',
+    'agent.cmd_help_escape': 'تجویز: / سے شروع ہونے والا پیغام بھیجنے کے لیے، اس کے بجائے // ٹائپ کریں (مثلاً //foo بھیجنے سے /foo جائے گا)۔',
     'agent.cmd_hint_title': 'کمانڈز',
 
     // Tools
@@ -11449,6 +11479,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.cmd_model_switching': 'Đang chuyển sang mô hình: {model}…',
     'agent.cmd_model_busy': 'Quá trình chuyển đổi mô hình đang diễn ra. Vui lòng đợi cho đến khi hoàn tất.',
     'agent.cmd_model_failed': 'Không thể chuyển sang mô hình: {model}.',
+    'agent.cmd_help_escape': 'Mẹo: để gửi một thông báo bắt đầu bằng /, hãy nhập // thay vào đó (ví dụ: //foo sẽ gửi /foo).',
     'agent.cmd_hint_title': 'Lệnh',
 
     // Tools
