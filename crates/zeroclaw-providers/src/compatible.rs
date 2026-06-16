@@ -752,7 +752,7 @@ impl OpenAiCompatibleModelProvider {
     /// outbound assistant message, preserving whichever field name the value
     /// originally carried so it round-trips faithfully on multi-turn requests
     /// (#6584). Returns `(None, None)` when this provider has reasoning replay
-    /// disabled — Groq rejects `reasoning_content`/`reasoning` on input
+    /// disabled - Groq rejects `reasoning_content`/`reasoning` on input
     /// assistant messages (#7616).
     fn assistant_reasoning_pair_for_replay(
         &self,
@@ -1974,7 +1974,7 @@ impl OpenAiCompatibleModelProvider {
                     // `reasoning` (OpenRouter / vLLM >= v0.16.0). Preserve
                     // whichever field name was originally received so the
                     // value round-trips faithfully on multi-turn requests
-                    // (#6584) — unless this provider has reasoning replay
+                    // (#6584) - unless this provider has reasoning replay
                     // disabled (Groq), in which case both are stripped (#7616).
                     let (reasoning_content, reasoning) =
                         self.assistant_reasoning_pair_for_replay(&value);
