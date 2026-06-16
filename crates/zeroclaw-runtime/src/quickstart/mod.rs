@@ -2173,6 +2173,7 @@ mod tests {
             channel_type: "telegram".into(),
             alias: "tg".into(),
             token: Some("tok-a".into()),
+            port: None,
         })];
         submission.peer_groups = vec![zeroclaw_config::presets::QuickstartPeerGroup {
             name: "team".into(),
