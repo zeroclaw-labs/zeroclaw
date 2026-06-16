@@ -569,7 +569,7 @@ pub async fn run_gateway(
         None
     };
 
-    let addr: SocketAddr = match format!("{host}:{port}").parse() {
+    let addr: SocketAddr = match zeroclaw_infra::parse_gateway_bind_socket_addr(host, port) {
         Ok(a) => a,
         Err(e) => {
             ::zeroclaw_log::record!(
@@ -585,7 +585,7 @@ pub async fn run_gateway(
                  127.0.0.1 so the gateway can still boot. Fix [gateway] host and \
                  POST /admin/reload."
             );
-            SocketAddr::from(([127, 0, 0, 1], port))
+            zeroclaw_infra::fallback_gateway_bind_socket_addr(port)
         }
     };
     let listener = tokio::net::TcpListener::bind(addr).await?;
