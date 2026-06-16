@@ -644,6 +644,12 @@ cli-status-max-cost-month = {"  "}Max cost/month:    ${$v}
 cli-status-otp = {"  "}OTP enabled:       {$v}
 cli-status-estop = {"  "}E-stop enabled:    {$v}
 cli-status-boards = {"  "}Boards:    {$v}
+cli-status-trace-storage = 🧾 Trace storage:  {$persistence} ({$path})
+cli-status-heartbeat = 💓 Heartbeat:      {$status}
+cli-status-memory = 🧠 Memory:         {$backend} (auto-save: {$auto_save})
+cli-status-allowed-roots = {"  "}Allowed roots:     {$roots}
+cli-status-allowed-commands = {"  "}Allowed commands:  {$commands}
+cli-status-cost-tracking = {"  "}Cost tracking:     {$status}
 
 # ── desktop / config / plugins / estop / auth ──
 cli-desktop-not-installed = ZeroClaw companion app is not installed.

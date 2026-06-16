@@ -4059,9 +4059,15 @@ async fn main() -> Result<()> {
                 )
             );
             println!(
-                "🧾 Trace storage:  {} ({})",
-                config.observability.log_persistence.as_wire(),
-                config.observability.log_persistence_path
+                "{}",
+                ta(
+                    "cli-status-trace-storage",
+                    &[
+                        ("persistence", config.observability.log_persistence.as_wire()),
+                        ("path", &config.observability.log_persistence_path),
+                    ],
+                    "Trace storage"
+                )
             );
             // Per-agent autonomy: each enabled agent picks its own
             // risk_profile, so list them rather than collapsing to one.
@@ -4113,18 +4119,30 @@ async fn main() -> Result<()> {
                 );
             }
             let effective_memory_backend = config.resolve_active_storage().kind();
+            let heartbeat_status: String = if config.heartbeat.enabled {
+                format!("every {}min", config.heartbeat.interval_minutes)
+            } else {
+                "disabled".into()
+            };
             println!(
-                "💓 Heartbeat:      {}",
-                if config.heartbeat.enabled {
-                    format!("every {}min", config.heartbeat.interval_minutes)
-                } else {
-                    "disabled".into()
-                }
+                "{}",
+                ta(
+                    "cli-status-heartbeat",
+                    &[("status", heartbeat_status.as_str())],
+                    "Heartbeat"
+                )
             );
+            let auto_save = if config.memory.auto_save { "on" } else { "off" };
             println!(
-                "🧠 Memory:         {} (auto-save: {})",
-                effective_memory_backend,
-                if config.memory.auto_save { "on" } else { "off" }
+                "{}",
+                ta(
+                    "cli-status-memory",
+                    &[
+                        ("backend", effective_memory_backend),
+                        ("auto_save", auto_save)
+                    ],
+                    "Memory"
+                )
             );
 
             println!();
@@ -4153,17 +4171,27 @@ async fn main() -> Result<()> {
                         "Workspace only"
                     )
                 );
+                let roots: String = if profile.allowed_roots.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    profile.allowed_roots.join(", ")
+                };
                 println!(
-                    "  Allowed roots:     {}",
-                    if profile.allowed_roots.is_empty() {
-                        "(none)".to_string()
-                    } else {
-                        profile.allowed_roots.join(", ")
-                    }
+                    "{}",
+                    ta(
+                        "cli-status-allowed-roots",
+                        &[("roots", &roots)],
+                        "Allowed roots"
+                    )
                 );
+                let commands = profile.allowed_commands.join(", ");
                 println!(
-                    "  Allowed commands:  {}",
-                    profile.allowed_commands.join(", ")
+                    "{}",
+                    ta(
+                        "cli-status-allowed-commands",
+                        &[("commands", &commands)],
+                        "Allowed commands"
+                    )
                 );
                 let actions_cap = config
                     .runtime_profile_for_agent(alias)
@@ -4177,13 +4205,18 @@ async fn main() -> Result<()> {
                     )
                 );
             }
+            let cost_status = if config.cost.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            };
             println!(
-                "  Cost tracking:     {}",
-                if config.cost.enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
+                "{}",
+                ta(
+                    "cli-status-cost-tracking",
+                    &[("status", cost_status)],
+                    "Cost tracking"
+                )
             );
             println!(
                 "{}",
