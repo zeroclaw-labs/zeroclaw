@@ -1156,7 +1156,7 @@ async fn delete_agent_cascade(
     // memory but STALE on disk, reappearing as a dangling reference on the next
     // config reload (which `validate()` then rejects). Mirrors rename's
     // `RenameReport.dirty_paths`.
-    for path in delete_cascade_dirty_paths(&cascade) {
+    for path in cascade.dirty_paths() {
         working.mark_dirty(&path);
     }
     if let Err(e) = persist_and_swap(state, working).await {
@@ -1168,45 +1168,6 @@ async fn delete_agent_cascade(
         created: false,
     })
     .into_response()
-}
-
-/// Derive the entry/section config paths a delete cascade mutated, so the
-/// persisting surface can mark each dirty. Includes the removed entry
-/// (`deleted_entry`) and the entry of every scrubbed soft reference
-/// (`applied`). Mirrors how rename marks `RenameReport.dirty_paths`.
-fn delete_cascade_dirty_paths(report: &zeroclaw_config::alias_refs::CascadeReport) -> Vec<String> {
-    let mut paths: Vec<String> = report
-        .applied
-        .iter()
-        .map(|site| dirty_entry_for(&site.path))
-        .collect();
-    if let Some(entry) = &report.deleted_entry {
-        paths.push(entry.clone());
-    }
-    paths.sort();
-    paths.dedup();
-    paths
-}
-
-/// Truncate a `RefSite` dotted path to the entry/section path that
-/// `apply_dirty_path` re-serialises wholesale, so a nested change (a dropped
-/// vec element or a removed map key) persists with the whole entry rather than
-/// requiring a leaf-precise dirty path.
-fn dirty_entry_for(refsite_path: &str) -> String {
-    let segs: Vec<&str> = refsite_path.split('.').collect();
-    match segs.first().copied() {
-        // agents.<name>.* and peer_groups.<g>.* → the entry root.
-        Some("agents" | "peer_groups") if segs.len() >= 2 => format!("{}.{}", segs[0], segs[1]),
-        // providers.<cat>.<fam>.<alias>.* → the provider entry.
-        Some("providers") if segs.len() >= 4 => segs[..4].join("."),
-        // Scalars / whole-vector fields (heartbeat.agent, acp.default_agent,
-        // escalation.alert_channels[i], model_routes[i]…) → strip any index.
-        _ => refsite_path
-            .split('[')
-            .next()
-            .unwrap_or(refsite_path)
-            .to_string(),
-    }
 }
 
 /// `POST /api/config/map-key?path=<section>&key=<name>` — instantiate a new
@@ -2233,39 +2194,9 @@ mod tests {
     // build_comment_prefix tests live in zeroclaw_config::comment_writer
     // — same reason.
 
-    #[test]
-    fn dirty_entry_for_truncates_ref_paths_to_persistable_entries() {
-        // agent / peer-group referrer sites → the entry root (whole subtree).
-        assert_eq!(dirty_entry_for("agents.lead.delegates[0]"), "agents.lead");
-        assert_eq!(
-            dirty_entry_for("agents.lead.workspace.access.bot"),
-            "agents.lead"
-        );
-        assert_eq!(
-            dirty_entry_for("agents.lead.workspace.read_memory_from[2]"),
-            "agents.lead"
-        );
-        assert_eq!(
-            dirty_entry_for("peer_groups.crew.agents[1]"),
-            "peer_groups.crew"
-        );
-        // scalars / whole-vector fields → the field/section, index stripped.
-        assert_eq!(dirty_entry_for("heartbeat.agent"), "heartbeat.agent");
-        assert_eq!(dirty_entry_for("acp.default_agent"), "acp.default_agent");
-        assert_eq!(
-            dirty_entry_for("escalation.alert_channels[3]"),
-            "escalation.alert_channels"
-        );
-        assert_eq!(
-            dirty_entry_for("model_routes[0].model_provider"),
-            "model_routes"
-        );
-        // provider entry → the 4-segment entry path.
-        assert_eq!(
-            dirty_entry_for("providers.models.anthropic.default.fallback[0]"),
-            "providers.models.anthropic.default"
-        );
-    }
+    // dirty_entry_for / CascadeReport::dirty_paths tests live in
+    // zeroclaw_config::alias_refs — single source of truth (the gateway and CLI
+    // both consume the promoted helper).
 
     #[test]
     fn delete_cascade_resolves_custom_workspace_before_removing_entry() {

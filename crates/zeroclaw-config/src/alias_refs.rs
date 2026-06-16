@@ -190,6 +190,54 @@ pub struct CascadeReport {
     pub deleted_entry: Option<String>,
 }
 
+impl CascadeReport {
+    /// Every entry/section config path the delete mutated — the removed entry
+    /// plus the entry of each scrubbed soft reference. A persisting surface marks
+    /// **each** of these dirty before saving: `Config::save_dirty` writes only
+    /// marked paths, so a referrer scrubbed in another entry that isn't listed
+    /// here would be dropped in memory but left stale on disk (reappearing as a
+    /// dangling reference on the next reload). Symmetric with
+    /// [`RenameReport::dirty_paths`]; paths are at entry granularity (e.g.
+    /// `agents.lead`, `peer_groups.crew`, `heartbeat.agent`) so a marked path
+    /// re-serialises the whole changed subtree. Sorted + deduplicated.
+    #[must_use]
+    pub fn dirty_paths(&self) -> Vec<String> {
+        let mut paths: Vec<String> = self
+            .applied
+            .iter()
+            .map(|site| dirty_entry_for(&site.path))
+            .collect();
+        if let Some(entry) = &self.deleted_entry {
+            paths.push(entry.clone());
+        }
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+}
+
+/// Truncate a [`RefSite`] dotted path to the entry/section path that an
+/// incremental save (`apply_dirty_path`) re-serialises wholesale, so a nested
+/// change (a dropped vec element or a removed/renamed map key) persists with the
+/// whole entry rather than needing a leaf-precise dirty path.
+#[must_use]
+pub fn dirty_entry_for(refsite_path: &str) -> String {
+    let segs: Vec<&str> = refsite_path.split('.').collect();
+    match segs.first().copied() {
+        // agents.<name>.* and peer_groups.<g>.* → the entry root.
+        Some("agents" | "peer_groups") if segs.len() >= 2 => format!("{}.{}", segs[0], segs[1]),
+        // providers.<cat>.<fam>.<alias>.* → the provider entry.
+        Some("providers") if segs.len() >= 4 => segs[..4].join("."),
+        // Scalars / whole-vector fields (heartbeat.agent, acp.default_agent,
+        // escalation.alert_channels[i], model_routes[i]…) → strip any index.
+        _ => refsite_path
+            .split('[')
+            .next()
+            .unwrap_or(refsite_path)
+            .to_string(),
+    }
+}
+
 /// Why a [`delete_with_cascade`] did not complete. `Refused` is an expected,
 /// renderable outcome (a hard reference blocks the delete), not a bug.
 #[derive(Debug)]
@@ -2635,5 +2683,73 @@ mod tests {
             "elevenlabs.studio"
         );
         assert!(find_all_references(&cfg, &kind, "default").is_empty());
+    }
+
+    #[test]
+    fn dirty_entry_for_truncates_ref_paths_to_persistable_entries() {
+        // agent / peer-group referrer sites → the entry root (whole subtree).
+        assert_eq!(dirty_entry_for("agents.lead.delegates[0]"), "agents.lead");
+        assert_eq!(
+            dirty_entry_for("agents.lead.workspace.access.bot"),
+            "agents.lead"
+        );
+        assert_eq!(
+            dirty_entry_for("peer_groups.crew.agents[1]"),
+            "peer_groups.crew"
+        );
+        // scalars / whole-vector fields → the field/section, index stripped.
+        assert_eq!(dirty_entry_for("heartbeat.agent"), "heartbeat.agent");
+        assert_eq!(dirty_entry_for("acp.default_agent"), "acp.default_agent");
+        assert_eq!(
+            dirty_entry_for("escalation.alert_channels[3]"),
+            "escalation.alert_channels"
+        );
+        assert_eq!(
+            dirty_entry_for("model_routes[0].model_provider"),
+            "model_routes"
+        );
+        // provider entry → the 4-segment entry path.
+        assert_eq!(
+            dirty_entry_for("providers.models.anthropic.default.fallback[0]"),
+            "providers.models.anthropic.default"
+        );
+    }
+
+    #[test]
+    fn cascade_report_dirty_paths_covers_scrubs_and_deleted_entry() {
+        // A delete that scrubbed two referrers in different entries + removed the
+        // entry must report all three dirty paths (deduped, sorted).
+        let mut cfg = empty_config();
+        cfg.heartbeat.enabled = false;
+        cfg.heartbeat.agent = "bot".to_string();
+        cfg.agents
+            .insert("bot".to_string(), AliasedAgentConfig::default());
+        cfg.agents.insert(
+            "lead".to_string(),
+            AliasedAgentConfig {
+                delegates: vec!["bot".to_string()],
+                ..Default::default()
+            },
+        );
+        let report = delete_with_cascade(
+            &mut cfg,
+            &AliasKind::Agent,
+            "bot",
+            CascadePolicy::RefuseOnHard,
+        )
+        .expect("delete succeeds");
+        let dirty = report.dirty_paths();
+        assert!(
+            dirty.contains(&"agents.bot".to_string()),
+            "removed entry: {dirty:?}"
+        );
+        assert!(
+            dirty.contains(&"agents.lead".to_string()),
+            "scrubbed delegate: {dirty:?}"
+        );
+        assert!(
+            dirty.contains(&"heartbeat.agent".to_string()),
+            "cleared heartbeat: {dirty:?}"
+        );
     }
 }
