@@ -284,12 +284,19 @@ pub fn detect_locale() -> String {
 
 /// Auto-detect locale from the OS when config sets none. `sys-locale` is
 /// cross-platform: on Unix it checks `LANGUAGE` > `LC_ALL` > `LC_MESSAGES` >
-/// `LANG`, and on Windows/macOS it queries the OS directly. Walks every
-/// candidate rather than just the first: `LC_ALL=C` (common in CI/containers
-/// to force deterministic tool output) would otherwise shadow a perfectly
-/// usable `LANG=zh_CN.UTF-8` and we'd give up instead of trying it.
+/// `LANG`, and on Windows/macOS it queries the OS directly.
 fn locale_from_system() -> Option<String> {
-    sys_locale::get_locales().find_map(|raw| normalized_env_locale(&raw))
+    pick_locale(sys_locale::get_locales())
+}
+
+/// Pure: take the first candidate that isn't a POSIX "no locale" sentinel.
+/// Split out from `locale_from_system` so it is testable without environment
+/// access. Walks every candidate rather than just the first: `LC_ALL=C`
+/// (common in CI/containers to force deterministic tool output) would
+/// otherwise shadow a perfectly usable `LANG=zh_CN.UTF-8` and we'd give up
+/// instead of trying it.
+fn pick_locale(mut candidates: impl Iterator<Item = String>) -> Option<String> {
+    candidates.find_map(|raw| normalized_env_locale(&raw))
 }
 
 /// Pure: normalize a raw OS locale value, rejecting the POSIX
@@ -647,6 +654,24 @@ mod tests {
         );
         assert_eq!(normalized_env_locale("fr_FR"), Some("fr-FR".to_string()));
         assert_eq!(normalized_env_locale(" ja "), Some("ja".to_string()));
+    }
+
+    #[test]
+    fn pick_locale_skips_posix_sentinel_to_find_a_usable_candidate() {
+        // LC_ALL=C with LANG=zh_CN.UTF-8 is common in CI/containers: sys-locale
+        // yields "C" as the top-priority candidate, but it must not shadow
+        // the real locale carried by a lower-priority variable.
+        let candidates = ["C".to_string(), "zh-CN".to_string()];
+        assert_eq!(
+            pick_locale(candidates.into_iter()),
+            Some("zh-CN".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_locale_returns_none_when_all_candidates_are_sentinels() {
+        let candidates = ["C".to_string(), "POSIX".to_string(), "".to_string()];
+        assert_eq!(pick_locale(candidates.into_iter()), None);
     }
 
     #[test]
