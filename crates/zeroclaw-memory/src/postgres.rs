@@ -43,11 +43,26 @@ impl<T: Send + 'static> DropOnThread<T> {
 
 impl<T: Send + 'static> Drop for DropOnThread<T> {
     fn drop(&mut self) {
-        if let Some(value) = self.0.take() {
-            std::thread::Builder::new()
-                .name("postgres-client-drop".to_string())
-                .spawn(move || drop(value))
-                .ok();
+        let Some(value) = self.0.take() else { return };
+        // Wrap in ManuallyDrop so the value is NOT dropped on the current
+        // thread if spawn fails — ManuallyDrop's own Drop is a no-op.
+        let slot = std::mem::ManuallyDrop::new(value);
+        if std::thread::Builder::new()
+            .name("postgres-client-drop".to_string())
+            .spawn(move || drop(std::mem::ManuallyDrop::into_inner(slot)))
+            .is_err()
+        {
+            // The OS refused to spawn a thread. Intentionally leak the value
+            // rather than drop it here: postgres::Client::drop calls
+            // Runtime::block_on, which panics on a Tokio runtime thread.
+            // A controlled leak is preferable to an unrecoverable panic.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "postgres-client-drop thread spawn failed; leaking client to avoid nested-runtime panic"
+            );
+            // `slot` is ManuallyDrop — T is intentionally not dropped.
         }
     }
 }
@@ -816,6 +831,38 @@ mod tests {
         assert_eq!(
             PostgresMemory::parse_category("custom_notes"),
             MemoryCategory::Custom("custom_notes".into())
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drop_on_thread_drops_value_on_plain_os_thread() {
+        // Regression for the nested-runtime drop path: DropOnThread must ensure
+        // its wrapped value's destructor runs on a plain OS thread, not on the
+        // Tokio runtime thread, even when dropped from within a runtime context.
+        //
+        // Before this patch, PostgresMemory::drop released the Arc<Mutex<Client>>
+        // inline, which called postgres::Client::drop → Runtime::block_on and
+        // panicked. This test fails on that old behavior and passes with DropOnThread.
+        let (tx, rx) = oneshot::channel::<bool>();
+
+        struct DropGuard(Option<oneshot::Sender<bool>>);
+        impl Drop for DropGuard {
+            fn drop(&mut self) {
+                // true  → dropped on a plain OS thread (no active Tokio runtime) ✓
+                // false → dropped on a Tokio runtime thread ✗
+                let on_plain_thread = tokio::runtime::Handle::try_current().is_err();
+                let _ = self.0.take().unwrap().send(on_plain_thread);
+            }
+        }
+
+        // Drop DropOnThread from inside the Tokio runtime — this is the
+        // scenario that caused the nested-runtime panic in production.
+        drop(DropOnThread::new(DropGuard(Some(tx))));
+
+        let on_plain_thread = rx.await.expect("DropGuard did not fire");
+        assert!(
+            on_plain_thread,
+            "DropOnThread must run Drop on a plain OS thread, not a Tokio runtime thread"
         );
     }
 
