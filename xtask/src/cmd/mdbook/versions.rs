@@ -64,11 +64,13 @@ fn parse_version(tag: &str) -> Option<Version> {
 }
 
 /// True when a gh-pages root directory name denotes a deployable docs version:
-/// `master`, `stable`, or a `vX.Y.Z[-pre]` tag. This is the single source of
-/// truth shared by `versions.json` generation and root pruning so the two can
-/// never disagree about what counts as a version.
+/// `master` or a `vX.Y.Z[-pre]` tag. `stable` is intentionally NOT a version
+/// dir. Stable resolves to a real version via the committed pointer, never a
+/// duplicate `stable/` tree. A leftover `stable/` from the old layout is treated
+/// as a non-version dir and pruned by `prune_root`. Single source of truth
+/// shared by versions.json generation, root pruning, and selector retrofit.
 pub fn is_version_dir(name: &str) -> bool {
-    name == "master" || name == "stable" || parse_version(name).is_some()
+    name == "master" || parse_version(name).is_some()
 }
 
 /// Root-level directories that are not version dirs but must survive pruning.
@@ -93,6 +95,82 @@ pub fn prune_root() -> anyhow::Result<()> {
         }
         println!("prune-root: removing orphaned dir {name}/");
         fs::remove_dir_all(entry.path())?;
+    }
+    Ok(())
+}
+
+/// Default number of final releases to retain on gh-pages, in addition to
+/// `master` and the stable-pointer target. Overridable via `DOCS_KEEP_VERSIONS`.
+const DEFAULT_KEEP_VERSIONS: usize = 3;
+
+fn keep_versions_limit() -> usize {
+    env::var("DOCS_KEEP_VERSIONS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_KEEP_VERSIONS)
+}
+
+/// Decide which version dirs survive a retention pass. `master` and the stable
+/// pointer target (when present) are always kept, regardless of recency, so the
+/// root redirect and "Stable (latest release)" entry can never point at a pruned
+/// dir. Among the remaining `vX.Y.Z` final releases, the newest `keep` survive;
+/// every pre-release and every older final is dropped. Pure decision over names
+/// so it is unit-testable without touching the filesystem.
+fn retained_versions(present: &[String], keep: usize, stable: Option<&str>) -> Vec<String> {
+    let mut kept: Vec<String> = present
+        .iter()
+        .filter(|n| n.as_str() == "master")
+        .cloned()
+        .collect();
+
+    if let Some(s) = stable
+        && present.iter().any(|n| n == s)
+        && !kept.iter().any(|n| n == s)
+    {
+        kept.push(s.to_string());
+    }
+
+    let mut finals: Vec<Version> = present
+        .iter()
+        .filter_map(|n| parse_version(n))
+        .filter(|v| v.pre.is_none())
+        .collect();
+    finals.sort_by(|a, b| b.cmp(a));
+    for v in finals.into_iter().take(keep) {
+        if !kept.contains(&v.tag) {
+            kept.push(v.tag);
+        }
+    }
+    kept
+}
+
+/// Retention pass for the ephemeral gh-pages tree: keep `master`, the stable
+/// pointer target, and the newest `DOCS_KEEP_VERSIONS` final releases; remove
+/// every other version dir (other pre-releases and older finals). Non-version
+/// root entries are left to `prune_root`. Operates on the gh-pages clone root.
+/// Every clone pays a roughly linear packed cost per retained version, so
+/// capping the set caps clone size.
+pub fn prune_versions() -> anyhow::Result<()> {
+    let keep = keep_versions_limit();
+    let mut present = Vec::new();
+    for entry in fs::read_dir(".")?.flatten() {
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if is_version_dir(&name) {
+            present.push(name);
+        }
+    }
+
+    let stable = resolve_stable(&present);
+    let retained = retained_versions(&present, keep, stable.as_deref());
+    for name in &present {
+        if retained.contains(name) {
+            continue;
+        }
+        println!("prune-versions: removing {name}/");
+        fs::remove_dir_all(Path::new(name))?;
     }
     Ok(())
 }
@@ -177,98 +255,119 @@ fn shared_prefix(file: &Path) -> Option<String> {
     Some("../".repeat(depth - 1))
 }
 
-pub fn run() -> anyhow::Result<()> {
-    let min_version_env = env::var("DOCS_MIN_VERSION").unwrap_or_default();
-    let min_parsed = if min_version_env.is_empty() {
-        None
-    } else {
-        parse_version(&min_version_env)
-    };
-
-    let mut dirs = Vec::new();
-    if let Ok(entries) = fs::read_dir(".") {
-        for entry in entries.flatten() {
-            if let Ok(file_type) = entry.file_type() {
-                if !file_type.is_dir() {
-                    continue;
-                }
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name == "master" || name == "stable" {
-                    dirs.push(name);
-                } else if parse_version(&name).is_some() {
-                    // Check floor
-                    if let Some(min) = &min_parsed
-                        && let Some(parsed) = parse_version(&name)
-                        && parsed < *min
-                    {
-                        continue;
-                    }
-                    dirs.push(name);
-                }
-            }
-        }
+/// Resolve the stable tag for the docs site. Source of truth is the committed
+/// pointer `docs/book/stable-version.txt`, copied to the gh-pages root as
+/// `stable-version.txt` at deploy. Running `bump-version` writes it, so it
+/// records the maintainer's explicit "this version is stable" decision rather
+/// than inferring it by numeric comparison. Returns None when absent or when
+/// the pointed-at version dir is not present in the deployed set.
+fn resolve_stable(present: &[String]) -> Option<String> {
+    let raw = fs::read_to_string("stable-version.txt").ok()?;
+    let tag = raw.trim().to_string();
+    if tag.is_empty() {
+        return None;
     }
+    present.contains(&tag).then_some(tag)
+}
 
-    // Sort: master, then stable, then tagged versions newest-first
+/// Build the versions.json payload from the version dirs present in the gh-pages
+/// root. `master` is labeled Development; the stable tag (from the committed
+/// pointer) is labeled "Stable (latest release)"; all other tags use their bare
+/// tag as label. There is no synthetic `stable` entry or `stable/` dir. Stable
+/// resolves to the real version dir, never a duplicate copy.
+fn build_versions_json(present: &[String], stable: Option<&str>) -> serde_json::Value {
+    let min_parsed = env::var("DOCS_MIN_VERSION")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| parse_version(&s));
+
+    let mut dirs: Vec<String> = present
+        .iter()
+        .filter(|name| {
+            if name.as_str() == "master" {
+                return true;
+            }
+            match (parse_version(name), &min_parsed) {
+                (Some(v), Some(min)) => v >= *min,
+                (Some(_), None) => true,
+                _ => false,
+            }
+        })
+        .cloned()
+        .collect();
+
     dirs.sort_by(|a, b| {
-        if a == "master" && b != "master" {
+        if a == "master" {
             return std::cmp::Ordering::Less;
         }
-        if b == "master" && a != "master" {
+        if b == "master" {
             return std::cmp::Ordering::Greater;
         }
-        if a == "stable" && b != "stable" {
-            return std::cmp::Ordering::Less;
-        }
-        if b == "stable" && a != "stable" {
-            return std::cmp::Ordering::Greater;
-        }
-
-        let ver_a = parse_version(a);
-        let ver_b = parse_version(b);
-        match (ver_a, ver_b) {
-            (Some(va), Some(vb)) => vb.cmp(&va), // Newest first
+        match (parse_version(a), parse_version(b)) {
+            (Some(va), Some(vb)) => vb.cmp(&va),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => a.cmp(b),
         }
     });
 
-    let mut versions = Vec::new();
-    let mut stable_tag = None;
+    let versions: Vec<_> = dirs
+        .iter()
+        .map(|tag| {
+            let label = if tag == "master" {
+                "Development (master)".to_string()
+            } else if Some(tag.as_str()) == stable {
+                "Stable (latest release)".to_string()
+            } else {
+                tag.clone()
+            };
+            json!({ "tag": tag, "label": label })
+        })
+        .collect();
 
-    for tag in &dirs {
-        let label = match tag.as_str() {
-            "master" => "Development (master)".to_string(),
-            "stable" => {
-                stable_tag = Some(tag.clone());
-                "Stable".to_string()
-            }
-            _ => tag.clone(),
-        };
-        versions.push(json!({
-            "tag": tag,
-            "label": label,
-        }));
-    }
+    json!({ "stable": stable, "versions": versions })
+}
 
-    if stable_tag.is_none() {
-        // Find latest stable version (no pre-release)
-        for tag in dirs.iter().rev() {
-            if let Some(v) = parse_version(tag)
-                && v.pre.is_none()
-            {
-                stable_tag = Some(tag.clone());
-                break;
+/// Emit the gh-pages root `index.html`: a redirect to the stable version's
+/// English landing page, or to master when no stable pointer resolves. Reads
+/// the same `stable-version.txt` pointer as `gen_versions`, so root and selector
+/// always agree on what Stable is. Prints HTML to stdout.
+pub fn gen_root_index() -> anyhow::Result<()> {
+    let mut present = Vec::new();
+    for entry in fs::read_dir(".")?.flatten() {
+        if entry.file_type()?.is_dir() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if is_version_dir(&name) {
+                present.push(name);
             }
         }
     }
+    let target = resolve_stable(&present).unwrap_or_else(|| "master".to_string());
+    let dest = format!("./{target}/en/");
+    print!(
+        "<!doctype html>\n\
+         <meta charset=\"utf-8\">\n\
+         <meta http-equiv=\"refresh\" content=\"0; url={dest}\">\n\
+         <link rel=\"canonical\" href=\"{dest}\">\n\
+         <title>ZeroClaw Docs</title>\n"
+    );
+    Ok(())
+}
 
-    let output = json!({
-        "stable": stable_tag,
-        "versions": versions,
-    });
-
+pub fn run() -> anyhow::Result<()> {
+    let mut present = Vec::new();
+    if let Ok(entries) = fs::read_dir(".") {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if is_version_dir(&name) {
+                    present.push(name);
+                }
+            }
+        }
+    }
+    let stable = resolve_stable(&present);
+    let output = build_versions_json(&present, stable.as_deref());
     println!("{}", serde_json::to_string_pretty(&output)?);
 
     Ok(())
@@ -300,14 +399,125 @@ mod tests {
 
     #[test]
     fn is_version_dir_accepts_only_real_versions() {
-        for ok in ["master", "stable", "v0.8.0", "v0.8.0-beta-2", "v1.2.3"] {
+        for ok in ["master", "v0.8.0", "v0.8.0-beta-2", "v1.2.3"] {
             assert!(is_version_dir(ok), "{ok} should be a version dir");
         }
-        for orphan in ["en", "fr", "zh-CN", "api", "_shared", "main", "v1.2"] {
+        for orphan in [
+            "en", "fr", "zh-CN", "api", "_shared", "main", "v1.2", "stable",
+        ] {
             assert!(
                 !is_version_dir(orphan),
                 "{orphan} must not be a version dir"
             );
         }
+    }
+
+    #[test]
+    fn retained_keeps_master_and_newest_finals() {
+        let present = vec![
+            "master".to_string(),
+            "v0.8.0".to_string(),
+            "v0.7.5".to_string(),
+            "v0.7.4".to_string(),
+            "v0.8.0-beta-1".to_string(),
+            "v0.8.0-beta-2".to_string(),
+        ];
+        let kept = retained_versions(&present, 2, None);
+        assert!(kept.contains(&"master".to_string()));
+        assert!(kept.contains(&"v0.8.0".to_string()));
+        assert!(kept.contains(&"v0.7.5".to_string()));
+        assert!(!kept.contains(&"v0.7.4".to_string()), "older final dropped");
+        assert!(
+            !kept.contains(&"v0.8.0-beta-1".to_string()),
+            "pre-release dropped"
+        );
+        assert!(
+            !kept.contains(&"v0.8.0-beta-2".to_string()),
+            "pre-release dropped"
+        );
+    }
+
+    #[test]
+    fn retained_drops_all_prereleases_even_when_no_final_matches() {
+        let present = vec![
+            "master".to_string(),
+            "v0.9.0-beta-1".to_string(),
+            "v0.9.0-beta-2".to_string(),
+        ];
+        let kept = retained_versions(&present, 3, None);
+        assert_eq!(kept, vec!["master".to_string()]);
+    }
+
+    #[test]
+    fn retained_keep_zero_keeps_only_master() {
+        let present = vec!["master".to_string(), "v1.0.0".to_string()];
+        let kept = retained_versions(&present, 0, None);
+        assert_eq!(kept, vec!["master".to_string()]);
+    }
+
+    #[test]
+    fn retained_always_keeps_stable_pointer_even_when_outside_window() {
+        // Pointer names an older final that the recency window would drop.
+        let present = vec![
+            "master".to_string(),
+            "v0.9.0".to_string(),
+            "v0.8.5".to_string(),
+            "v0.8.1".to_string(),
+        ];
+        let kept = retained_versions(&present, 2, Some("v0.8.1"));
+        assert!(kept.contains(&"master".to_string()));
+        assert!(kept.contains(&"v0.9.0".to_string()));
+        assert!(kept.contains(&"v0.8.5".to_string()));
+        assert!(
+            kept.contains(&"v0.8.1".to_string()),
+            "stable pointer target must survive retention"
+        );
+    }
+
+    #[test]
+    fn retained_no_duplicate_when_stable_within_window() {
+        let present = vec!["master".to_string(), "v0.9.0".to_string()];
+        let kept = retained_versions(&present, 3, Some("v0.9.0"));
+        let count = kept.iter().filter(|n| n.as_str() == "v0.9.0").count();
+        assert_eq!(count, 1, "stable in window must not be listed twice");
+    }
+
+    #[test]
+    fn retained_ignores_stable_pointer_not_present() {
+        let present = vec!["master".to_string(), "v0.9.0".to_string()];
+        let kept = retained_versions(&present, 1, Some("v0.8.1"));
+        assert!(!kept.contains(&"v0.8.1".to_string()));
+    }
+
+    #[test]
+    fn stable_label_applies_to_pointer_target_only() {
+        let present = vec![
+            "master".to_string(),
+            "v0.8.0".to_string(),
+            "v0.7.5".to_string(),
+        ];
+        let out = build_versions_json(&present, Some("v0.8.0"));
+        assert_eq!(out["stable"], "v0.8.0");
+        let versions = out["versions"].as_array().unwrap();
+        let labels: std::collections::HashMap<&str, &str> = versions
+            .iter()
+            .map(|v| (v["tag"].as_str().unwrap(), v["label"].as_str().unwrap()))
+            .collect();
+        assert_eq!(labels["master"], "Development (master)");
+        assert_eq!(labels["v0.8.0"], "Stable (latest release)");
+        assert_eq!(labels["v0.7.5"], "v0.7.5");
+    }
+
+    #[test]
+    fn no_synthetic_stable_entry_in_versions_list() {
+        let present = vec!["master".to_string(), "v0.8.0".to_string()];
+        let out = build_versions_json(&present, Some("v0.8.0"));
+        let tags: Vec<&str> = out["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["tag"].as_str().unwrap())
+            .collect();
+        assert!(!tags.contains(&"stable"), "no synthetic stable entry");
     }
 }
