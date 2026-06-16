@@ -11,7 +11,7 @@ use base64::Engine;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_config::schema::Config;
@@ -524,29 +524,37 @@ fn build_base_info() -> serde_json::Value {
     })
 }
 
-fn markdown_to_plain_text(text: &str) -> String {
-    // TODO: Cache these Regex values instead of compiling them on every send path.
-    let code_block_re = regex::Regex::new(r"```[^\n]*\n?([\s\S]*?)```").unwrap();
-    let image_re = regex::Regex::new(r"!\[[^\]]*\]\([^)]*\)").unwrap();
-    let link_re = regex::Regex::new(r"\[([^\]]+)\]\([^)]*\)").unwrap();
-    let heading_re = regex::Regex::new(r"(?m)^\s{0,3}#{1,6}\s+").unwrap();
-    let blockquote_re = regex::Regex::new(r"(?m)^>\s?").unwrap();
-    let bullet_re = regex::Regex::new(r"(?m)^\s*[-*+]\s+").unwrap();
-    let emphasis_re = regex::Regex::new(r"(\*\*|__|~~|`|\*)").unwrap();
-    let table_separator_re = regex::Regex::new(r"^\|[\s:|-]+\|$").unwrap();
-    let table_row_re = regex::Regex::new(r"^\|(.+)\|$").unwrap();
+static CODE_BLOCK_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"```[^\n]*\n?([\s\S]*?)```").unwrap());
+static IMAGE_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"!\[[^\]]*\]\([^)]*\)").unwrap());
+static LINK_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"\[([^\]]+)\]\([^)]*\)").unwrap());
+static HEADING_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?m)^\s{0,3}#{1,6}\s+").unwrap());
+static BLOCKQUOTE_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?m)^>\s?").unwrap());
+static BULLET_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?m)^\s*[-*+]\s+").unwrap());
+static EMPHASIS_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(\*\*|__|~~|`|\*)").unwrap());
+static TABLE_SEPARATOR_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"^\|[\s:|-]+\|$").unwrap());
+static TABLE_ROW_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"^\|(.+)\|$").unwrap());
 
-    let mut result = code_block_re.replace_all(text, "$1").into_owned();
-    result = image_re.replace_all(&result, "").into_owned();
-    result = link_re.replace_all(&result, "$1").into_owned();
+fn markdown_to_plain_text(text: &str) -> String {
+    let mut result = CODE_BLOCK_RE.replace_all(text, "$1").into_owned();
+    result = IMAGE_RE.replace_all(&result, "").into_owned();
+    result = LINK_RE.replace_all(&result, "$1").into_owned();
 
     let mut lines = Vec::new();
     for line in result.lines() {
-        if table_separator_re.is_match(line) {
+        if TABLE_SEPARATOR_RE.is_match(line) {
             continue;
         }
 
-        if let Some(captures) = table_row_re.captures(line) {
+        if let Some(captures) = TABLE_ROW_RE.captures(line) {
             let inner = captures.get(1).map(|value| value.as_str()).unwrap_or("");
             lines.push(
                 inner
@@ -562,10 +570,10 @@ fn markdown_to_plain_text(text: &str) -> String {
     }
 
     result = lines.join("\n");
-    result = heading_re.replace_all(&result, "").into_owned();
-    result = blockquote_re.replace_all(&result, "").into_owned();
-    result = bullet_re.replace_all(&result, "").into_owned();
-    result = emphasis_re.replace_all(&result, "").into_owned();
+    result = HEADING_RE.replace_all(&result, "").into_owned();
+    result = BLOCKQUOTE_RE.replace_all(&result, "").into_owned();
+    result = BULLET_RE.replace_all(&result, "").into_owned();
+    result = EMPHASIS_RE.replace_all(&result, "").into_owned();
 
     while result.contains("\n\n\n") {
         result = result.replace("\n\n\n", "\n\n");

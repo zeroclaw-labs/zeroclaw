@@ -14,10 +14,84 @@ use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolResult};
 
-/// Maximum execution time for a skill shell command (seconds).
+/// Default execution time for a skill shell command when the manifest does not
+/// set `timeout_secs` (seconds). A skill may raise this via `timeout_secs` in
+/// its SKILL.toml `[[tools]]` entry.
 const SKILL_SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1 MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
+
+/// Maximum provider function-name length. Anthropic's current client-tool
+/// contract is the strictest we rely on: `name` must match
+/// `^[a-zA-Z0-9_-]{1,64}$`. The server error captured in #6678 mentioned
+/// `{1,128}`, but the published provider contract is 64, so we target the
+/// stricter bound rather than baking the looser observed string into the
+/// runtime.
+const MAX_TOOL_NAME_LEN: usize = 64;
+
+fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+}
+
+/// Dependency-free, build-stable 64-bit FNV-1a hash, rendered as 16 hex chars.
+/// Used only to disambiguate names that had to be altered. A bounded 64-bit
+/// hash reduces accidental collisions among sanitized names; it is not a
+/// uniqueness proof and cannot make the mapping injective.
+fn short_hash(s: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// Compose a skill tool's provider-visible name (`skill__tool`) and route it
+/// through the single [`sanitize_tool_name`] rule. Every registration path
+/// (shell, script, builtin, HTTP) and the skills prompt must call this so the
+/// advertised tool spec and the name the model is told to invoke stay
+/// identical. Do not re-derive the `{skill}__{tool}` string anywhere else.
+///
+/// This guarantees provider-*validity*, not global *uniqueness*: the hash
+/// suffix only reduces accidental collisions, so registration must still treat
+/// two skills' composed names as potentially equal and resolve duplicates
+/// itself rather than assuming this function makes them distinct.
+pub(crate) fn composed_tool_name(skill_name: &str, tool_name: &str) -> String {
+    sanitize_tool_name(&format!("{skill_name}__{tool_name}"))
+}
+
+/// Sanitize a composed skill tool name so it satisfies provider function-name
+/// rules (`^[a-zA-Z0-9_-]{1,64}$`). The `__` separator is already safe, but a
+/// skill or tool name can itself contain illegal characters: dots, spaces, or
+/// colons (plugin-namespaced skills such as `pr-review-toolkit:code-reviewer`),
+/// or non-ASCII. Anthropic rejects non-conforming names outright (issue #6678).
+///
+/// Names that are already valid and within length are returned unchanged. Any
+/// name that must be altered (illegal characters or over-length) gets every
+/// disallowed character mapped to `_` and a short stable hash of the original
+/// composed name appended within the 64-char budget. The hash disambiguates
+/// common collisions: distinct inputs that would otherwise collapse to the same
+/// string, such as `a.b__run` vs `a:b__run`, or two tools under one skill name
+/// longer than 64 chars whose suffix would be truncated away, stay distinct. It
+/// is a strong reducer of accidental collisions, not a guarantee of injectivity.
+fn sanitize_tool_name(raw: &str) -> String {
+    let already_valid =
+        !raw.is_empty() && raw.len() <= MAX_TOOL_NAME_LEN && raw.chars().all(is_name_char);
+    if already_valid {
+        return raw.to_string();
+    }
+
+    let mapped: String = raw
+        .chars()
+        .map(|c| if is_name_char(c) { c } else { '_' })
+        .collect();
+
+    // Reserve room for `_<16 hex>` so the disambiguating hash always survives.
+    let suffix = format!("_{}", short_hash(raw));
+    let budget = MAX_TOOL_NAME_LEN - suffix.len();
+    let head: String = mapped.chars().take(budget).collect();
+    format!("{head}{suffix}")
+}
 
 /// A tool derived from a skill's `[[tools]]` section that executes shell commands.
 pub struct SkillShellTool {
@@ -26,6 +100,9 @@ pub struct SkillShellTool {
     command_template: String,
     args: HashMap<String, String>,
     security: Arc<SecurityPolicy>,
+    /// Resolved per-command timeout in seconds (manifest `timeout_secs`, or the
+    /// `SKILL_SHELL_TIMEOUT_SECS` default), clamped to a minimum of 1.
+    timeout_secs: u64,
 }
 
 impl SkillShellTool {
@@ -39,11 +116,12 @@ impl SkillShellTool {
         security: Arc<SecurityPolicy>,
     ) -> Self {
         Self {
-            tool_name: format!("{}__{}", skill_name, tool.name),
+            tool_name: composed_tool_name(skill_name, &tool.name),
             tool_description: tool.description.clone(),
             command_template: tool.command.clone(),
             args: tool.args.clone(),
             security,
+            timeout_secs: tool.timeout_secs.unwrap_or(SKILL_SHELL_TIMEOUT_SECS).max(1),
         }
     }
 
@@ -144,7 +222,7 @@ impl Tool for SkillShellTool {
         }
 
         let result =
-            tokio::time::timeout(Duration::from_secs(SKILL_SHELL_TIMEOUT_SECS), cmd.output()).await;
+            tokio::time::timeout(Duration::from_secs(self.timeout_secs), cmd.output()).await;
 
         match result {
             Ok(Ok(output)) => {
@@ -187,7 +265,8 @@ impl Tool for SkillShellTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Command timed out after {SKILL_SHELL_TIMEOUT_SECS}s and was killed"
+                    "Command timed out after {}s and was killed",
+                    self.timeout_secs
                 )),
             }),
         }
@@ -239,7 +318,7 @@ impl SkillBuiltinTool {
             .collect();
         let advertised_schema = narrow_schema(target_tool.parameters_schema(), &locked);
         Self {
-            tool_name: format!("{}__{}", skill_name, tool.name),
+            tool_name: composed_tool_name(skill_name, &tool.name),
             tool_description: tool.description.clone(),
             target_tool,
             locked_args: locked,
@@ -355,6 +434,7 @@ mod tests {
             args,
             target: None,
             locked_args: HashMap::new(),
+            timeout_secs: None,
         }
     }
 
@@ -362,6 +442,79 @@ mod tests {
     fn skill_shell_tool_name_is_prefixed() {
         let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security());
         assert_eq!(tool.name(), "my_skill__run_lint");
+    }
+
+    fn name_is_provider_valid(name: &str) -> bool {
+        !name.is_empty()
+            && name.len() <= 64
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }
+
+    #[test]
+    fn skill_tool_name_sanitized_for_provider_regex() {
+        // Plugin-namespaced skill names (colons), dotted names, spaces, and
+        // non-ASCII must all yield a provider-valid function name (#6678).
+        for (skill, tool_name) in [
+            ("pr-review-toolkit:code-reviewer", "run.lint"),
+            ("my skill", "do thing"),
+            ("skill.with.dots", "tool"),
+            ("ünïcode", "naïve"),
+        ] {
+            let mut st = sample_skill_tool();
+            st.name = tool_name.to_string();
+            let tool = SkillShellTool::new(skill, &st, test_security());
+            assert!(
+                name_is_provider_valid(tool.name()),
+                "illegal tool name `{}` from skill `{}`",
+                tool.name(),
+                skill
+            );
+        }
+    }
+
+    fn shell_tool_name(skill: &str, tool_name: &str) -> String {
+        let mut st = sample_skill_tool();
+        st.name = tool_name.to_string();
+        SkillShellTool::new(skill, &st, test_security())
+            .name()
+            .to_string()
+    }
+
+    #[test]
+    fn skill_tool_already_valid_name_is_unchanged() {
+        // The common case must not be perturbed (no spurious hash suffix).
+        let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security());
+        assert_eq!(tool.name(), "my_skill__run_lint");
+    }
+
+    #[test]
+    fn skill_tool_name_truncated_to_64_and_stays_distinct() {
+        // A raw composed name over 64 chars must be sanitized to <= 64 while
+        // two distinct tools under the same long skill name stay distinct, i.e.
+        // truncation must not collapse them (#6678). Anthropic's contract is
+        // `^[a-zA-Z0-9_-]{1,64}$`, so 64 is the bound, not 128.
+        let long = "a".repeat(200);
+        let a = shell_tool_name(&long, "alpha");
+        let b = shell_tool_name(&long, "beta");
+        assert!(
+            a.len() <= 64 && b.len() <= 64,
+            "sanitized names exceed the 64-char provider bound: {} / {}",
+            a.len(),
+            b.len()
+        );
+        assert!(name_is_provider_valid(&a) && name_is_provider_valid(&b));
+        assert_ne!(a, b, "distinct tools under a long skill name collided");
+    }
+
+    #[test]
+    fn skill_tool_name_sanitization_disambiguates_common_collisions() {
+        // Inputs differing only by illegal characters must not collide.
+        let a = shell_tool_name("a.b", "run");
+        let b = shell_tool_name("a:b", "run");
+        assert!(name_is_provider_valid(&a) && name_is_provider_valid(&b));
+        assert_ne!(a, b, "illegal-char variants collapsed to the same name");
     }
 
     #[test]
@@ -415,6 +568,7 @@ mod tests {
             args: HashMap::new(),
             target: None,
             locked_args: HashMap::new(),
+            timeout_secs: None,
         };
         let tool = SkillShellTool::new("s", &st, test_security());
         let schema = tool.parameters_schema();
@@ -433,11 +587,61 @@ mod tests {
             args: HashMap::new(),
             target: None,
             locked_args: HashMap::new(),
+            timeout_secs: None,
         };
         let tool = SkillShellTool::new("test", &st, test_security());
         let result = tool.execute(serde_json::json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("hello-skill"));
+    }
+
+    #[test]
+    fn skill_shell_tool_uses_default_timeout_when_unset() {
+        // `timeout_secs = None` in the manifest falls back to the 60s default.
+        let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security());
+        assert_eq!(tool.timeout_secs, SKILL_SHELL_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn skill_shell_tool_honors_manifest_timeout() {
+        // A manifest `timeout_secs` overrides the default — the fix for
+        // long-running skills that were killed at the 60s default.
+        let mut st = sample_skill_tool();
+        st.timeout_secs = Some(3600);
+        let tool = SkillShellTool::new("my_skill", &st, test_security());
+        assert_eq!(tool.timeout_secs, 3600);
+    }
+
+    #[test]
+    fn skill_shell_tool_clamps_zero_timeout_to_one() {
+        // A zero timeout would fire instantly and kill every command; clamp it.
+        let mut st = sample_skill_tool();
+        st.timeout_secs = Some(0);
+        let tool = SkillShellTool::new("my_skill", &st, test_security());
+        assert_eq!(tool.timeout_secs, 1);
+    }
+
+    #[test]
+    fn skill_tool_serde_parses_timeout_secs() {
+        // The manifest field deserializes; absent it defaults to None.
+        let with = r#"
+            name = "deploy"
+            description = "Deploy"
+            kind = "shell"
+            command = "deploy"
+            timeout_secs = 3600
+        "#;
+        let st: SkillTool = toml::from_str(with).unwrap();
+        assert_eq!(st.timeout_secs, Some(3600));
+
+        let without = r#"
+            name = "deploy"
+            description = "Deploy"
+            kind = "shell"
+            command = "deploy"
+        "#;
+        let st: SkillTool = toml::from_str(without).unwrap();
+        assert_eq!(st.timeout_secs, None);
     }
 
     #[test]
@@ -509,6 +713,7 @@ mod tests {
             args: HashMap::new(),
             target: Some("shell".to_string()),
             locked_args: HashMap::new(),
+            timeout_secs: None,
         }
     }
 
@@ -661,6 +866,7 @@ mod tests {
             args: HashMap::new(),
             target: Some("composio".to_string()),
             locked_args: locked.clone(),
+            timeout_secs: None,
         };
         let tool = SkillBuiltinTool::new("my_skill", &st, target, locked);
         // Caller passes only "input"; locked args provide action_name + app.
@@ -726,6 +932,7 @@ mod tests {
             args: HashMap::new(),
             target: Some(target.to_string()),
             locked_args: locked,
+            timeout_secs: None,
         }
     }
 
@@ -865,6 +1072,7 @@ mod tests {
                 args: HashMap::new(),
                 target: Some("shell".to_string()),
                 locked_args: HashMap::new(),
+                timeout_secs: None,
             }],
             prompts: vec![],
             location: None,

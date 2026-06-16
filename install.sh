@@ -225,17 +225,28 @@ shell_export_syntax() {
 
 # ── Platform / target triple detection ───────────────────────────
 
+detect_libc() {
+  if [ -e /lib/ld-musl-*.so.1 ] 2>/dev/null || \
+     ldd --version 2>&1 | grep -qi musl || \
+     { [ -r /etc/os-release ] && grep -qiE 'alpine|postmarket' /etc/os-release; }; then
+    echo "musl"
+  else
+    echo "gnu"
+  fi
+}
+
 detect_target_triple() {
-  local os arch
+  local os arch libc
   os=$(uname -s)
   arch=$(uname -m)
 
   case "$os" in
   Darwin) echo "aarch64-apple-darwin" ;; # presume M-series
   Linux)
+    libc=$(detect_libc)
     case "$arch" in
-    x86_64) echo "x86_64-unknown-linux-gnu" ;;
-    aarch64 | arm64) echo "aarch64-unknown-linux-gnu" ;;
+    x86_64) echo "x86_64-unknown-linux-${libc}" ;;
+    aarch64 | arm64) echo "aarch64-unknown-linux-${libc}" ;;
     armv7l) echo "armv7-unknown-linux-gnueabihf" ;;
     armv6l | arm*) echo "arm-unknown-linux-gnueabihf" ;;
     *) echo "" ;;
@@ -276,17 +287,7 @@ install_prebuilt() {
   echo
 
   # Resolve platform-correct web data directory to match gateway auto-detect
-  case "$(uname -s)" in
-  Darwin)
-    web_data_dir="${HOME}/Library/Application Support/zeroclaw/web/dist"
-    ;;
-  MINGW* | CYGWIN* | MSYS*)
-    web_data_dir="${LOCALAPPDATA}/zeroclaw/web/dist"
-    ;;
-  *)
-    web_data_dir="${XDG_DATA_HOME:-${PREFIX}/.local/share}/zeroclaw/web/dist"
-    ;;
-  esac
+  web_data_dir=$(resolve_web_data_dir)
 
   if [ "$DRY_RUN" = true ]; then
     info "[dry-run] Would download $asset_url"
@@ -587,14 +588,49 @@ interactive_feature_picker() {
   PICKED_APPS=$(printf '%s' "$selected_apps" | tr ' ' ',')
 }
 
+# Resolve the platform data directory the gateway auto-detects for the
+# dashboard bundle. Single source of truth so the prebuilt and source
+# install paths cannot drift.
+resolve_web_data_dir() {
+  case "$(uname -s)" in
+  Darwin)
+    printf '%s' "${HOME}/Library/Application Support/zeroclaw/web/dist"
+    ;;
+  MINGW* | CYGWIN* | MSYS*)
+    printf '%s' "${LOCALAPPDATA}/zeroclaw/web/dist"
+    ;;
+  *)
+    printf '%s' "${XDG_DATA_HOME:-${PREFIX}/.local/share}/zeroclaw/web/dist"
+    ;;
+  esac
+}
+
+# Copy a built web/dist into the gateway data directory so a
+# systemd-launched daemon finds it regardless of CWD.
+install_web_dist() {
+  src_dist="$1"
+  if [ ! -f "$src_dist/index.html" ]; then
+    return 0
+  fi
+  web_data_dir=$(resolve_web_data_dir)
+  if [ "$DRY_RUN" = true ]; then
+    info "[dry-run] Would install web dashboard to $web_data_dir"
+    return 0
+  fi
+  mkdir -p "$web_data_dir"
+  cp -r "$src_dist/." "$web_data_dir/"
+  info "Web dashboard installed to $web_data_dir"
+}
+
 # ── Web dashboard build for source installs ──────────────────────
 #
 # When a source build includes the `gateway` feature, the dashboard
 # (`web/dist`) needs to be built so the gateway can serve it. If Node.js
 # is on PATH we run `cargo web build` from the source root so the
-# generated API client is refreshed before TypeScript compiles. Without
-# Node.js we warn — the gateway still starts but the dashboard route
-# returns 404 until `web/dist` is populated.
+# generated API client is refreshed before TypeScript compiles, then the
+# built bundle is copied into the gateway data directory. Without Node.js
+# we warn and tell the user to re-run the installer once Node.js is
+# present — never to run cargo by hand.
 build_web_dashboard() {
   src_dir="$1"
   if [ ! -d "$src_dir/web" ]; then
@@ -603,8 +639,8 @@ build_web_dashboard() {
   fi
   if ! command -v npm >/dev/null 2>&1; then
     warn "npm not found — skipping dashboard build. The gateway will run"
-    warn "  in API-only mode until you build the dashboard:"
-    warn "  cd $src_dir && cargo web build"
+    warn "  in API-only mode. Install Node.js (npm) and re-run ./install.sh"
+    warn "  --source to build and install the dashboard."
     return 0
   fi
   # Always rebuild — a stale dist from a prior revision serves outdated
@@ -616,6 +652,7 @@ build_web_dashboard() {
     return 0
   }
   info "Web dashboard built at $src_dir/web/dist"
+  install_web_dist "$src_dir/web/dist"
 }
 
 # ── Low-memory build heuristic ────────────────────────────────────
@@ -1010,6 +1047,7 @@ See all available features:
   fi
   echo
 
+  # >>> generated:source-cargo-install by `cargo generate installers` - do not edit <<<
   if [ "$DRY_RUN" = true ]; then
     # shellcheck disable=SC2086
     info "[dry-run] Would run: cargo install --path . --locked --force $CARGO_FLAGS"
@@ -1017,6 +1055,7 @@ See all available features:
     # shellcheck disable=SC2086
     cargo install --path . --locked --force $CARGO_FLAGS
   fi
+  # >>> end generated:source-cargo-install <<<
 
   # ── Web dashboard (gateway feature only) ──────────────────────────
   # When the install includes the `gateway` feature, build `web/dist` so

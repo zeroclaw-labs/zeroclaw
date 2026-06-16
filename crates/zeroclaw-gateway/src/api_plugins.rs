@@ -30,21 +30,12 @@ pub mod plugin_routes {
         let config = state.config.read();
         let plugins_enabled = config.plugins.enabled;
         let plugins_dir = config.plugins.plugins_dir.clone();
+        let plugin_path = config.plugins.resolved_plugins_dir();
         drop(config);
 
         let plugins: Vec<serde_json::Value> = if plugins_enabled {
-            let plugin_path = if plugins_dir.starts_with("~/") {
-                directories::UserDirs::new()
-                    .map(|u| u.home_dir().join(&plugins_dir[2..]))
-                    .unwrap_or_else(|| std::path::PathBuf::from(&plugins_dir))
-            } else {
-                std::path::PathBuf::from(&plugins_dir)
-            };
-
             if plugin_path.exists() {
-                match zeroclaw_plugins::host::PluginHost::new(
-                    plugin_path.parent().unwrap_or(&plugin_path),
-                ) {
+                match zeroclaw_plugins::host::PluginHost::from_plugins_dir(&plugin_path) {
                     Ok(host) => host
                         .list_plugins()
                         .into_iter()
