@@ -4916,15 +4916,16 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_content_used_when_content_only_think_tags() {
-        let json = r#"{"choices":[{"message":{"content":"<think>secret</think>","reasoning_content":"Fallback text"}}]}"#;
+    fn reasoning_content_preserved_when_content_only_think_tags() {
+        // When content only has <think> tags (stripped to empty),
+        // effective_content returns "" — reasoning_content is preserved
+        // separately, not leaked into the response text.
+        let json = r#"{"choices":[{"message":{"content":"<think>secret</think>","reasoning_content":"Thinking text"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
-        assert_eq!(msg.effective_content(), "Fallback text");
-        assert_eq!(
-            msg.effective_content_optional().as_deref(),
-            Some("Fallback text")
-        );
+        assert_eq!(msg.effective_content(), "");
+        assert_eq!(msg.effective_content_optional(), None);
+        assert_eq!(msg.reasoning_content.as_deref(), Some("Thinking text"));
     }
 
     #[test]
