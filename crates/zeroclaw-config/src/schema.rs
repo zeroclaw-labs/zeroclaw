@@ -9433,7 +9433,7 @@ pub struct MemoryConfig {
     /// Delete daily memory rows older than this many days from the DB. Age is measured by `updated_at` (last write time). 0 = keep forever.
     #[serde(default = "default_zero_retention")]
     pub daily_retention_days: u32,
-    /// Delete core memory rows older than this many days from the DB. Age is measured by `created_at` (first-write time), not `updated_at`, so frequently-recalled memories are not protected from pruning — only rewrites refresh the clock. Set this to a generously large window for durable core memories. 0 = keep forever.
+    /// Delete core memory rows older than this many days from the DB. Age is measured by `created_at` (first-write time). Neither recall nor ordinary rewrites refresh `created_at` under the current SQLite upsert, so core retention is an absolute age limit from first write. Set this to a generously large window for durable core memories, or keep 0 = keep forever.
     #[serde(default = "default_zero_retention")]
     pub core_retention_days: u32,
     /// Source of embedding vectors for semantic search. `none` = keyword-only retrieval (no API calls, no vector cost); `openai` = OpenAI's embedding API; `custom:URL` = any OpenAI-compatible embedding endpoint (LiteLLM, local gateway, etc.).

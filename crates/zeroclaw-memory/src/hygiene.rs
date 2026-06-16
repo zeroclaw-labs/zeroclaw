@@ -357,8 +357,10 @@ fn prune_category_rows(
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
     let cutoff = (Local::now() - Duration::days(i64::from(retention_days))).to_rfc3339();
 
-    // Core memories use created_at so that frequently-recalled-but-never-rewritten
-    // entries are not pruned based on a stale updated_at (which only advances on write).
+    // Core memories use created_at (first-write time). Neither recall nor ordinary
+    // rewrites refresh created_at under the current SQLite upsert, so core retention
+    // is an absolute age limit from first write. Operators should set a large window
+    // or keep core_retention_days = 0 for durable core memory.
     // Conversation and daily rows use updated_at — those categories are write-heavy and
     // the distinction is immaterial.
     let timestamp_col = if use_created_at {
