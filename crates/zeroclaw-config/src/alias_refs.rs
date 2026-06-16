@@ -236,13 +236,13 @@ impl std::error::Error for CascadeError {}
 /// reference to the alias remains. `DryRun` computes the plan and mutates
 /// nothing. [`plan_delete`] is the read-only sibling.
 ///
-/// Implements the **model-provider** kind (`providers.models.<family>.<alias>`)
-/// and the **agent** kind (`agents.<alias>`). The agent arm cascades config
-/// references only; its owned non-config state (memory rows, workspace dir,
-/// cron/acp/session rows) is cascaded by the calling surface and is not yet
-/// reflected in `ImpactReport.owned_state`. TTS/transcription providers and
-/// channels return [`CascadeError::NotImplemented`] until their follow-up lands
-/// (#7175).
+/// Implements the **model-provider** (`providers.models.<family>.<alias>`),
+/// **agent** (`agents.<alias>`), and **channel** (`channels.<type>.<alias>`)
+/// kinds. The agent arm cascades config references only; its owned non-config
+/// state (memory rows, workspace dir, cron/acp/session rows) is cascaded by the
+/// calling surface and is not reflected in `ImpactReport.owned_state`.
+/// TTS/transcription providers return [`CascadeError::NotImplemented`] until
+/// their follow-up lands (#7175).
 pub fn delete_with_cascade(
     cfg: &mut Config,
     kind: &AliasKind,
@@ -258,9 +258,7 @@ pub fn delete_with_cascade(
             "TTS/transcription provider delete-with-cascade is not yet implemented".to_string(),
         )),
         AliasKind::Agent => delete_agent(cfg, alias, policy),
-        AliasKind::Channel { .. } => Err(CascadeError::NotImplemented(
-            "channel delete-with-cascade lands in a follow-up (#7175)".to_string(),
-        )),
+        AliasKind::Channel { channel_type } => delete_channel(cfg, channel_type, alias, policy),
     }
 }
 
@@ -428,6 +426,81 @@ fn scrub_agent_refs(cfg: &mut Config, alias: &str) {
     for group in cfg.peer_groups.values_mut() {
         group.agents.retain(|m| m.as_str() != alias); // raw
     }
+}
+
+fn delete_channel(
+    cfg: &mut Config,
+    channel_type: &str,
+    alias: &str,
+    policy: CascadePolicy,
+) -> Result<CascadeReport, CascadeError> {
+    let entry_path = format!("channels.{channel_type}.{alias}");
+    let section = format!("channels.{channel_type}");
+    let exists = cfg
+        .get_map_keys(&section)
+        .is_some_and(|keys| keys.iter().any(|k| k == alias));
+    if !exists {
+        return Err(CascadeError::NotFound(entry_path));
+    }
+
+    let kind = AliasKind::Channel {
+        channel_type: channel_type.to_string(),
+    };
+    let report = plan_delete(cfg, &kind, alias);
+
+    if policy == CascadePolicy::DryRun {
+        return Ok(CascadeReport {
+            plan: report,
+            applied: Vec::new(),
+            deleted_entry: None,
+        });
+    }
+    // HARD channel refs (see `collect_channel_refs`): a mandatory dotted
+    // `peer_groups.<g>.channel`, or a bare-type group member whose only
+    // `<type>.*` channel is the target (scrubbing it would orphan the member).
+    if !report.allowed {
+        return Err(CascadeError::Refused(Box::new(report)));
+    }
+
+    let applied = report.scrubs.clone();
+    let target = format!("{channel_type}.{alias}");
+    scrub_channel_refs(cfg, &target);
+    // Remove the `channels.<type>.<alias>` entry via the same generic map-key
+    // path the gateway/CLI use.
+    if let Err(e) = cfg.delete_map_key(&section, alias) {
+        return Err(CascadeError::PostCondition(format!(
+            "failed to remove {entry_path}: {e}"
+        )));
+    }
+
+    let remaining = find_all_references(cfg, &kind, alias);
+    if !remaining.is_empty() {
+        let paths: Vec<_> = remaining.iter().map(|s| s.path.as_str()).collect();
+        return Err(CascadeError::PostCondition(format!(
+            "{} dangling reference(s) to {target} remain: {}",
+            remaining.len(),
+            paths.join(", ")
+        )));
+    }
+
+    Ok(CascadeReport {
+        plan: report,
+        applied,
+        deleted_entry: Some(entry_path),
+    })
+}
+
+/// Mutating mirror of [`collect_channel_refs`]: drop the soft channel references
+/// to `target` (`"<type>.<alias>"`). `peer_groups.<g>.channel` is a HARD ref and
+/// is never scrubbed (a delete carrying one is refused before reaching here).
+/// Comparisons `.trim()` to mirror `find_all_references` and `validate()`.
+fn scrub_channel_refs(cfg: &mut Config, target: &str) {
+    for agent in cfg.agents.values_mut() {
+        agent.channels.retain(|ch| ch.trim() != target);
+    }
+    cfg.escalation
+        .alert_channels
+        .retain(|ch| ch.trim() != target);
 }
 
 // ── deterministic iteration over the alias-keyed maps ───────────────────────
@@ -1446,26 +1519,19 @@ mod tests {
 
     #[test]
     fn cascade_not_implemented_for_other_kinds() {
+        // Only TTS/transcription providers remain unimplemented now (model
+        // providers, agents, and channels are all wired).
         let mut cfg = empty_config();
-        assert!(matches!(
-            delete_with_cascade(
-                &mut cfg,
-                &AliasKind::Channel {
-                    channel_type: "discord".to_string()
-                },
-                "x",
-                CascadePolicy::RefuseOnHard,
-            ),
-            Err(CascadeError::NotImplemented(_))
-        ));
-        let tts = AliasKind::Provider {
-            category: ProviderCategory::Tts,
-            family: "elevenlabs".to_string(),
-        };
-        assert!(matches!(
-            delete_with_cascade(&mut cfg, &tts, "x", CascadePolicy::RefuseOnHard),
-            Err(CascadeError::NotImplemented(_))
-        ));
+        for category in [ProviderCategory::Tts, ProviderCategory::Transcription] {
+            let kind = AliasKind::Provider {
+                category,
+                family: "x".to_string(),
+            };
+            assert!(matches!(
+                delete_with_cascade(&mut cfg, &kind, "x", CascadePolicy::RefuseOnHard),
+                Err(CascadeError::NotImplemented(_))
+            ));
+        }
     }
 
     // ── delete_with_cascade (agents) ────────────────────────────────────────
@@ -1668,5 +1734,208 @@ mod tests {
         assert_eq!(report.deleted_entry.as_deref(), Some("agents.bot"));
         assert!(!cfg.agents.contains_key("bot"));
         assert!(find_all_references(&cfg, &AliasKind::Agent, "bot").is_empty());
+    }
+
+    // ── delete_with_cascade (channels) ──────────────────────────────────────
+
+    fn channel_kind() -> AliasKind {
+        AliasKind::Channel {
+            channel_type: "discord".to_string(),
+        }
+    }
+
+    fn has_channel(cfg: &Config, alias: &str) -> bool {
+        cfg.get_map_keys("channels.discord")
+            .unwrap_or_default()
+            .iter()
+            .any(|k| k == alias)
+    }
+
+    #[test]
+    fn cascade_channel_scrubs_soft_refs_and_removes_entry() {
+        let mut cfg = empty_config();
+        cfg.create_map_key("channels.discord", "main").unwrap();
+        cfg.agents.insert(
+            "ops".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["discord.main".into()],
+                ..Default::default()
+            },
+        );
+        cfg.escalation
+            .alert_channels
+            .push("discord.main".to_string());
+
+        let report = delete_with_cascade(
+            &mut cfg,
+            &channel_kind(),
+            "main",
+            CascadePolicy::RefuseOnHard,
+        )
+        .expect("soft-only channel delete succeeds");
+        assert_eq!(report.applied.len(), 2, "agent channel + alert_channel");
+        assert_eq!(
+            report.deleted_entry.as_deref(),
+            Some("channels.discord.main")
+        );
+        assert!(!has_channel(&cfg, "main"));
+        assert!(cfg.agents["ops"].channels.is_empty());
+        assert!(cfg.escalation.alert_channels.is_empty());
+        assert!(find_all_references(&cfg, &channel_kind(), "main").is_empty());
+    }
+
+    #[test]
+    fn cascade_channel_refuses_on_hard_peer_group_ref() {
+        let mut cfg = empty_config();
+        cfg.create_map_key("channels.discord", "main").unwrap();
+        cfg.peer_groups.insert(
+            "crew".to_string(),
+            PeerGroupConfig {
+                channel: "discord.main".into(),
+                ..Default::default()
+            },
+        );
+        let err = delete_with_cascade(
+            &mut cfg,
+            &channel_kind(),
+            "main",
+            CascadePolicy::RefuseOnHard,
+        )
+        .unwrap_err();
+        match err {
+            CascadeError::Refused(report) => {
+                assert_eq!(report.blockers[0].path, "peer_groups.crew.channel");
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert!(has_channel(&cfg, "main"), "no mutation on refuse");
+    }
+
+    #[test]
+    fn cascade_channel_dry_run_mutates_nothing() {
+        let mut cfg = empty_config();
+        cfg.create_map_key("channels.discord", "main").unwrap();
+        cfg.agents.insert(
+            "ops".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["discord.main".into()],
+                ..Default::default()
+            },
+        );
+        let report =
+            delete_with_cascade(&mut cfg, &channel_kind(), "main", CascadePolicy::DryRun).unwrap();
+        assert!(report.deleted_entry.is_none());
+        assert_eq!(report.plan.scrubs.len(), 1);
+        assert!(has_channel(&cfg, "main"));
+        assert_eq!(cfg.agents["ops"].channels.len(), 1);
+    }
+
+    #[test]
+    fn cascade_channel_not_found() {
+        let mut cfg = empty_config();
+        let err = delete_with_cascade(
+            &mut cfg,
+            &channel_kind(),
+            "ghost",
+            CascadePolicy::RefuseOnHard,
+        )
+        .unwrap_err();
+        assert!(matches!(err, CascadeError::NotFound(_)));
+    }
+
+    #[test]
+    fn cascade_channel_refuses_orphaning_bare_group_member() {
+        // BARE-type group ("discord", not "discord.main"). validate()
+        // (schema.rs:17461-17478) requires each member to keep some `discord.*`
+        // channel. `ops`'s only discord channel is the one being deleted, so the
+        // delete must REFUSE — scrubbing it would yield a config validate() rejects.
+        let mut cfg = empty_config();
+        cfg.create_map_key("channels.discord", "main").unwrap();
+        cfg.agents.insert(
+            "ops".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["discord.main".into()],
+                ..Default::default()
+            },
+        );
+        let mut group = PeerGroupConfig {
+            channel: "discord".into(), // bare type
+            ..Default::default()
+        };
+        group.agents.push(AgentAlias::new("ops"));
+        cfg.peer_groups.insert("crew".to_string(), group);
+
+        let err = delete_with_cascade(
+            &mut cfg,
+            &channel_kind(),
+            "main",
+            CascadePolicy::RefuseOnHard,
+        )
+        .unwrap_err();
+        match err {
+            CascadeError::Refused(report) => {
+                assert!(
+                    report
+                        .blockers
+                        .iter()
+                        .any(|b| b.path == "peer_groups.crew.agents[0]"),
+                    "bare-group member orphan must be a hard blocker, got {:?}",
+                    report.blockers
+                );
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert!(has_channel(&cfg, "main"), "no mutation on refuse");
+        assert_eq!(
+            cfg.agents["ops"].channels.len(),
+            1,
+            "member channel not scrubbed on refuse"
+        );
+    }
+
+    #[test]
+    fn cascade_channel_proceeds_when_bare_group_member_keeps_another() {
+        // Same bare-type group, but `ops` also has `discord.backup`. Deleting
+        // `discord.main` leaves it with a surviving `discord.*`, so membership
+        // stays valid and the delete proceeds (scrubbing only the main ref).
+        let mut cfg = empty_config();
+        cfg.create_map_key("channels.discord", "main").unwrap();
+        cfg.create_map_key("channels.discord", "backup").unwrap();
+        cfg.agents.insert(
+            "ops".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["discord.main".into(), "discord.backup".into()],
+                ..Default::default()
+            },
+        );
+        let mut group = PeerGroupConfig {
+            channel: "discord".into(), // bare type
+            ..Default::default()
+        };
+        group.agents.push(AgentAlias::new("ops"));
+        cfg.peer_groups.insert("crew".to_string(), group);
+
+        let report = delete_with_cascade(
+            &mut cfg,
+            &channel_kind(),
+            "main",
+            CascadePolicy::RefuseOnHard,
+        )
+        .expect("delete proceeds when a sibling channel keeps membership valid");
+        assert_eq!(
+            report.deleted_entry.as_deref(),
+            Some("channels.discord.main")
+        );
+        assert!(!has_channel(&cfg, "main"));
+        let remaining: Vec<&str> = cfg.agents["ops"]
+            .channels
+            .iter()
+            .map(|c| c.as_str())
+            .collect();
+        assert_eq!(
+            remaining,
+            vec!["discord.backup"],
+            "only the deleted channel is scrubbed; backup survives"
+        );
     }
 }
