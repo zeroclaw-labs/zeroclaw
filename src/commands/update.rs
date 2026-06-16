@@ -1178,8 +1178,8 @@ mod tests {
         {
             let cursor = std::io::Cursor::new(&mut zip_buf);
             let mut writer = zip::ZipWriter::new(cursor);
-            let options =
-                zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
             writer.start_file("zeroclaw.exe", options).unwrap();
             writer.write_all(fake_exe).unwrap();
             writer.finish().unwrap();
@@ -1205,9 +1205,11 @@ mod tests {
         {
             let cursor = std::io::Cursor::new(&mut zip_buf);
             let mut writer = zip::ZipWriter::new(cursor);
-            let options =
-                zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-            writer.start_file("zeroclaw-v0.9/zeroclaw.exe", options).unwrap();
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            writer
+                .start_file("zeroclaw-v0.9/zeroclaw.exe", options)
+                .unwrap();
             writer.write_all(fake_exe).unwrap();
             writer.finish().unwrap();
         }
@@ -1227,8 +1229,8 @@ mod tests {
         {
             let cursor = std::io::Cursor::new(&mut zip_buf);
             let mut writer = zip::ZipWriter::new(cursor);
-            let options =
-                zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
             writer.start_file("README.txt", options).unwrap();
             writer.write_all(b"hello").unwrap();
             writer.finish().unwrap();
