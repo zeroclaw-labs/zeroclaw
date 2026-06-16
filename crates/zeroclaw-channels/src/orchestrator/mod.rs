@@ -108,7 +108,7 @@ use parking_lot::RwLock;
 use portable_atomic::{AtomicU64, Ordering};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use std::fmt::Write;
+use std::fmt::{Display, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
@@ -1670,17 +1670,15 @@ fn proactive_trim_turns(turns: &mut Vec<ChatMessage>, budget: usize) -> usize {
     drop_count
 }
 
-fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
+async fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
     // Persist to JSONL before adding to in-memory history.
-    if let Some(ref store) = ctx.session_store
-        && let Err(e) = store.append(sender_key, &turn)
-    {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-            "Failed to persist session turn"
+    if let Some(store) = ctx.session_store.as_ref().map(Arc::clone) {
+        let sender_key = sender_key.to_string();
+        let persisted_turn = turn.clone();
+        log_session_store_spawn_result(
+            tokio::task::spawn_blocking(move || store.append(&sender_key, &persisted_turn)).await,
+            "Failed to persist session turn",
+            serde_json::json!({}),
         );
     }
 
@@ -1831,42 +1829,41 @@ fn is_native_tool_call_json(content: &str) -> bool {
         })
 }
 
-fn rollback_orphan_user_turn(
+async fn rollback_orphan_user_turn(
     ctx: &ChannelRuntimeContext,
     sender_key: &str,
     expected_content: &str,
 ) -> bool {
-    let mut histories = ctx
-        .conversation_histories
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let Some(turns) = histories.get_mut(sender_key) else {
-        return false;
-    };
+    {
+        let mut histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(turns) = histories.get_mut(sender_key) else {
+            return false;
+        };
 
-    let should_pop = turns
-        .last()
-        .is_some_and(|turn| turn.role == "user" && turn.content == expected_content);
-    if !should_pop {
-        return false;
-    }
+        let should_pop = turns
+            .last()
+            .is_some_and(|turn| turn.role == "user" && turn.content == expected_content);
+        if !should_pop {
+            return false;
+        }
 
-    turns.pop();
-    if turns.is_empty() {
-        histories.pop(sender_key);
+        turns.pop();
+        if turns.is_empty() {
+            histories.pop(sender_key);
+        }
     }
 
     // Also remove the orphan turn from the persisted JSONL session store so
     // it doesn't resurface after a daemon restart (fixes #3674).
-    if let Some(ref store) = ctx.session_store
-        && let Err(e) = store.remove_last(sender_key)
-    {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-            "Failed to rollback session store entry"
+    if let Some(store) = ctx.session_store.as_ref().map(Arc::clone) {
+        let sender_key = sender_key.to_string();
+        log_session_store_spawn_result(
+            tokio::task::spawn_blocking(move || store.remove_last(&sender_key)).await,
+            "Failed to rollback session store entry",
+            serde_json::json!({}),
         );
     }
 
@@ -2432,17 +2429,13 @@ async fn handle_runtime_command_if_needed(
         }
         ChannelRuntimeCommand::NewSession => {
             clear_sender_history(ctx, &sender_key);
-            if let Some(ref store) = ctx.session_store
-                && let Err(e) = store.delete_session(&sender_key)
-            {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"error": format!("{}", e), "sender_key": sender_key})
-                        ),
-                    "Failed to delete persisted session for"
+            if let Some(store) = ctx.session_store.as_ref().map(Arc::clone) {
+                let delete_sender_key = sender_key.clone();
+                log_session_store_spawn_result(
+                    tokio::task::spawn_blocking(move || store.delete_session(&delete_sender_key))
+                        .await,
+                    "Failed to delete persisted session for",
+                    serde_json::json!({"sender_key": sender_key}),
                 );
             }
             mark_sender_for_new_session(ctx, &sender_key);
@@ -3676,6 +3669,42 @@ fn log_worker_join_result(result: Result<(), tokio::task::JoinError>) {
     }
 }
 
+fn attrs_with_error<E: Display>(mut attrs: serde_json::Value, error: E) -> serde_json::Value {
+    if let Some(map) = attrs.as_object_mut() {
+        map.insert("error".to_string(), serde_json::json!(format!("{}", error)));
+        attrs
+    } else {
+        serde_json::json!({"error": format!("{}", error)})
+    }
+}
+
+fn log_session_store_spawn_result<T>(
+    result: Result<zeroclaw_infra::session_backend::SessionResult<T>, tokio::task::JoinError>,
+    message: &str,
+    attrs: serde_json::Value,
+) {
+    let (error, join_error) = match result {
+        Ok(Ok(_)) => return,
+        Ok(Err(error)) => (format!("{}", error), false),
+        Err(error) => (format!("{}", error), true),
+    };
+
+    // Distinguish a blocking-task panic/cancel (JoinError) from a backend
+    // persistence error so operators can tell the two apart in logs.
+    let mut attrs = attrs;
+    if let serde_json::Value::Object(ref mut map) = attrs {
+        map.insert("join_error".into(), serde_json::Value::Bool(join_error));
+    }
+
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(attrs_with_error(attrs, error)),
+        message
+    );
+}
+
 fn spawn_scoped_typing_task(
     channel: Arc<dyn Channel>,
     recipient: String,
@@ -3867,7 +3896,7 @@ async fn process_channel_message_body(
     }
 
     let history_key = conversation_history_key(&msg);
-    if let Some(ref store) = ctx.session_store {
+    if let Some(store) = ctx.session_store.as_ref().map(Arc::clone) {
         let channel_id = msg
             .channel_alias
             .as_deref()
@@ -3883,23 +3912,25 @@ async fn process_channel_message_body(
                 } else {
                     Some(target)
                 }
-            });
-        let context = zeroclaw_infra::session_backend::SessionContext {
-            channel_id: channel_id.as_deref(),
-            room_id,
-            sender_id: Some(msg.sender.as_str()).filter(|s| !s.is_empty()),
-        };
-        if let Err(e) = store.set_session_context(&history_key, context) {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(
-                        ::serde_json::json!({"history_key": history_key, "e": e.to_string()})
-                    ),
-                "Failed to stamp session routing context"
-            );
-        }
+            })
+            .map(ToOwned::to_owned);
+        let sender_id = Some(msg.sender.as_str())
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        let history_key_for_store = history_key.clone();
+        log_session_store_spawn_result(
+            tokio::task::spawn_blocking(move || {
+                let context = zeroclaw_infra::session_backend::SessionContext {
+                    channel_id: channel_id.as_deref(),
+                    room_id: room_id.as_deref(),
+                    sender_id: sender_id.as_deref(),
+                };
+                store.set_session_context(&history_key_for_store, context)
+            })
+            .await,
+            "Failed to stamp session routing context",
+            serde_json::json!({"history_key": history_key}),
+        );
     }
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
     let mut route = get_route_selection(ctx.as_ref(), &history_key, &runtime_defaults);
@@ -3992,7 +4023,8 @@ async fn process_channel_message_body(
         ctx.as_ref(),
         &history_key,
         ChatMessage::user(&timestamped_history_content),
-    );
+    )
+    .await;
 
     // Build history from per-sender conversation cache.
     let mut prior_turns_raw = if force_fresh_session {
@@ -4220,7 +4252,8 @@ async fn process_channel_message_body(
             ctx.as_ref(),
             &history_key,
             ChatMessage::assistant(&history_response),
-        );
+        )
+        .await;
         // Surface the no-reply decision in chat with an emoji on the user's
         // message so the chatter isn't left wondering whether the bot saw
         // the message. Same `ack_reactions` gate as the 👀 → ✅/⚠️ ack/done
@@ -4833,7 +4866,7 @@ async fn process_channel_message_body(
                 // assistant response that matches our delivered text.
                 let tool_messages: Vec<ChatMessage> = extract_current_turn_tool_messages(&history);
                 for tool_msg in tool_messages {
-                    append_sender_turn(ctx.as_ref(), &history_key, tool_msg);
+                    append_sender_turn(ctx.as_ref(), &history_key, tool_msg).await;
                 }
             }
 
@@ -4842,7 +4875,8 @@ async fn process_channel_message_body(
                 ctx.as_ref(),
                 &history_key,
                 ChatMessage::assistant(&history_response),
-            );
+            )
+            .await;
 
             // Strip tool-call messages from turns older than
             // keep_tool_context_turns to prevent unbounded growth.
@@ -5110,7 +5144,8 @@ async fn process_channel_message_body(
                         ctx.as_ref(),
                         &history_key,
                         &timestamped_history_content,
-                    );
+                    )
+                    .await;
 
                 if !rolled_back {
                     // Close the orphan user turn so subsequent messages don't
@@ -5119,7 +5154,8 @@ async fn process_channel_message_body(
                         ctx.as_ref(),
                         &history_key,
                         ChatMessage::assistant("[Task failed — not continuing this request]"),
-                    );
+                    )
+                    .await;
                 }
                 if let Some(channel) = target_channel.as_ref() {
                     if let Some(ref draft_id) = draft_message_id {
@@ -5168,7 +5204,8 @@ async fn process_channel_message_body(
                 ctx.as_ref(),
                 &history_key,
                 ChatMessage::assistant("[Task timed out — not continuing this request]"),
-            );
+            )
+            .await;
             if let Some(channel) = target_channel.as_ref() {
                 let error_text =
                     "⚠️ Request timed out while waiting for the model. Please try again.";
@@ -8954,7 +8991,24 @@ pub async fn start_channels(
     // owner are skipped so their history doesn't end up loaded into the
     // fallback agent (which wouldn't reply on that channel anyway).
     if let Some(ref store) = shared_session_store {
-        let mut metadata = store.list_sessions_with_metadata();
+        let store_for_metadata = Arc::clone(store);
+        let mut metadata = match tokio::task::spawn_blocking(move || {
+            store_for_metadata.list_sessions_with_metadata()
+        })
+        .await
+        {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "Failed to list persisted sessions during startup hydration"
+                );
+                Vec::new()
+            }
+        };
         metadata.sort_by_key(|m| std::cmp::Reverse(m.last_activity));
         // Budget proportional to the number of agents — each gets up to
         // `MAX_CONVERSATION_SENDERS` slots, so a multi-agent install
@@ -8981,7 +9035,26 @@ pub async fn start_channels(
                 Some(ctx) => ctx,
                 None => continue,
             };
-            let mut msgs = store.load(&m.key);
+            let store_for_load = Arc::clone(store);
+            let load_key = m.key.clone();
+            let mut msgs = match tokio::task::spawn_blocking(move || store_for_load.load(&load_key))
+                .await
+            {
+                Ok(msgs) => msgs,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "error": format!("{}", e),
+                                "session_key": m.key.as_str()
+                            })),
+                        "Failed to load persisted session during startup hydration"
+                    );
+                    Vec::new()
+                }
+            };
             if msgs.is_empty() {
                 continue;
             }
@@ -8991,13 +9064,38 @@ pub async fn start_channels(
             if msgs.last().is_some_and(|msg| msg.role == "user") {
                 let closure =
                     ChatMessage::assistant("[Session interrupted — not continuing this request]");
-                if let Err(e) = store.append(&m.key, &closure) {
-                    ::zeroclaw_log::record!(
-                        DEBUG,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                let store_for_append = Arc::clone(store);
+                let append_key = m.key.clone();
+                let closure_for_store = closure.clone();
+                match tokio::task::spawn_blocking(move || {
+                    store_for_append.append(&append_key, &closure_for_store)
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
                             .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        &format!("Failed to persist orphan closure for {}", m.key)
-                    );
+                            &format!("Failed to persist orphan closure for {}", m.key)
+                        );
+                    }
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            &format!("Failed to persist orphan closure for {}", m.key)
+                        );
+                    }
                 }
                 msgs.push(closure);
                 orphans_closed += 1;
@@ -10873,8 +10971,8 @@ api_key = "anthropic-key"
         assert_eq!(turns.len(), 1);
     }
 
-    #[test]
-    fn append_sender_turn_stores_single_turn_per_call() {
+    #[tokio::test]
+    async fn append_sender_turn_stores_single_turn_per_call() {
         let sender = "telegram_u2".to_string();
         let ctx = ChannelRuntimeContext {
             channels_by_name: Arc::new(HashMap::new()),
@@ -10947,7 +11045,7 @@ api_key = "anthropic-key"
             runtime_defaults_override: Arc::new(Mutex::new(None)),
         };
 
-        append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
+        append_sender_turn(&ctx, &sender, ChatMessage::user("hello")).await;
 
         let histories = ctx
             .conversation_histories
@@ -10975,8 +11073,8 @@ api_key = "anthropic-key"
         );
     }
 
-    #[test]
-    fn rollback_orphan_user_turn_removes_only_latest_matching_user_turn() {
+    #[tokio::test]
+    async fn rollback_orphan_user_turn_removes_only_latest_matching_user_turn() {
         let sender = "telegram_u3".to_string();
         let mut histories =
             lru::LruCache::new(std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap());
@@ -11057,7 +11155,7 @@ api_key = "anthropic-key"
             runtime_defaults_override: Arc::new(Mutex::new(None)),
         };
 
-        assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
+        assert!(rollback_orphan_user_turn(&ctx, &sender, "pending").await);
 
         let locked_histories = ctx
             .conversation_histories
@@ -11071,8 +11169,8 @@ api_key = "anthropic-key"
         assert_eq!(turns[1].content, "ok");
     }
 
-    #[test]
-    fn rollback_orphan_user_turn_also_removes_from_session_store() {
+    #[tokio::test]
+    async fn rollback_orphan_user_turn_also_removes_from_session_store() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store: Arc<dyn zeroclaw_infra::session_backend::SessionBackend> =
             Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
@@ -11171,11 +11269,10 @@ api_key = "anthropic-key"
             runtime_defaults_override: Arc::new(Mutex::new(None)),
         };
 
-        assert!(rollback_orphan_user_turn(
-            &ctx,
-            &sender,
-            "[IMAGE:/tmp/photo.jpg]\n\nDescribe this"
-        ));
+        assert!(
+            rollback_orphan_user_turn(&ctx, &sender, "[IMAGE:/tmp/photo.jpg]\n\nDescribe this")
+                .await
+        );
 
         // In-memory history should have 2 turns remaining.
         let locked = ctx
