@@ -2948,6 +2948,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dns-lookup"
+version = "3.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e39034cee21a2f5bbb66ba0e3689819c4bb5d00382a282006e802a7ffa6c41d"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "socket2 0.6.3",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
 name = "doc-comment"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14514,6 +14526,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "cap-std",
+ "dns-lookup",
  "extism",
  "reqwest 0.12.28",
  "ring",

@@ -37,6 +37,8 @@ pub struct ComponentTool {
     plugin_name: String,
     /// Plugin version string as self-reported by `plugin-info`. Source of truth.
     plugin_version: String,
+    /// Fine-grained sandbox permissions applied to each execute store.
+    permissions: Arc<Vec<crate::FineGrainedPermission>>,
 }
 
 impl ComponentTool {
@@ -45,9 +47,18 @@ impl ComponentTool {
     /// via `Linker::instantiate_pre`, and probing WIT metadata functions
     /// (`plugin-name`, `plugin-version`, `name`, `description`,
     /// `parameters-schema`) once with a throw-away store.
-    pub async fn from_bytes(engine: Arc<ComponentEngine>, bytes: &[u8]) -> anyhow::Result<Self> {
+    ///
+    /// `permissions` is stored and applied to every per-`execute` store so that
+    /// filesystem, TCP, UDP, and HTTP access are restricted to the declared
+    /// `fine_grained_permissions` list.
+    pub async fn from_bytes(
+        engine: Arc<ComponentEngine>,
+        bytes: &[u8],
+        permissions: Vec<crate::FineGrainedPermission>,
+    ) -> anyhow::Result<Self> {
         let component = engine.compile(bytes)?;
         let mut linker = wasmtime::component::Linker::<PluginLoggingHost>::new(engine.engine());
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(PluginError::from)?;
         logging::add_to_linker_tool(&mut linker)?;
 
         // Build the InstancePre once; only cheap per-instance wiring happens
@@ -96,6 +107,7 @@ impl ComponentTool {
             parameters_schema,
             plugin_name,
             plugin_version,
+            permissions: Arc::new(permissions),
         })
     }
 }
@@ -121,8 +133,10 @@ impl Tool for ComponentTool {
         let plugin_name = self.plugin_name.clone();
         let plugin_version = self.plugin_version.clone();
 
-        logging::wrap_plugin_call(&plugin_name, &plugin_version, "execute", async {
-            let mut store = wasmtime::Store::new(engine.engine(), PluginLoggingHost::default());
+        let permissions = Arc::clone(&self.permissions);
+        logging::wrap_plugin_call(&plugin_name, &plugin_version, "execute", async move {
+            let host = PluginLoggingHost::with_permissions(&permissions)?;
+            let mut store = wasmtime::Store::new(engine.engine(), host);
             let bindings = pre.instantiate(&mut store).map_err(PluginError::from)?;
             let exports = bindings.zeroclaw_plugin_tool();
 

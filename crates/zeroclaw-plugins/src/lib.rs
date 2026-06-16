@@ -16,6 +16,8 @@ pub mod component;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::error::PluginError;
+
 /// A plugin's declared manifest (loaded from manifest.toml alongside the .wasm).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
@@ -37,6 +39,12 @@ pub struct PluginManifest {
     /// Permissions this plugin requests
     #[serde(default)]
     pub permissions: Vec<PluginPermission>,
+    /// Fine-grained sandbox permissions for component-model (WASIP2) plugins.
+    ///
+    /// Enables per-directory filesystem access, and per-host TCP/UDP/HTTP
+    /// connectivity. Defaults to no access (fully sandboxed).
+    #[serde(default)]
+    pub fine_grained_permissions: Vec<FineGrainedPermission>,
     /// Ed25519 signature over the canonical manifest (base64url-encoded).
     /// Set by the plugin publisher when signing the manifest.
     #[serde(default)]
@@ -92,4 +100,289 @@ pub struct PluginInfo {
     /// Resolved path to the WASM file. `None` for skill-only plugins.
     pub wasm_path: Option<PathBuf>,
     pub loaded: bool,
+}
+
+// ── AddressString ─────────────────────────────────────────────────────────────
+
+/// A validated network address for use in plugin permissions.
+///
+/// Accepted forms:
+/// - IPv4 literal: `"192.0.2.1"`
+/// - IPv6 literal: `"2001:db8::1"`
+/// - Second-level domain: `"example.com"`
+/// - Subdomain: `"api.example.com"`
+/// - Wildcard subdomain (level 3 and above): `"*.example.com"`,
+///   `"id-*.docs.example.com"` — the TLD and SLD must not contain `*`.
+///
+/// When used in TCP/UDP/HTTP permissions the runtime enforces the address at
+/// connect time: IP literals and resolved-domain IPs are matched exactly;
+/// wildcard patterns are matched via a reverse-DNS lookup.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct AddressString(String);
+
+impl AddressString {
+    /// Parse and validate an address string.
+    pub fn new(s: impl Into<String>) -> Result<Self, PluginError> {
+        let s = s.into();
+        Self::validate(&s)?;
+        Ok(Self(s))
+    }
+
+    /// Returns the raw address string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Returns `true` if this address contains a wildcard label (`*`).
+    pub fn is_wildcard(&self) -> bool {
+        self.0.contains('*')
+    }
+
+    fn validate(s: &str) -> Result<(), PluginError> {
+        // IPv4
+        if s.parse::<std::net::Ipv4Addr>().is_ok() {
+            return Ok(());
+        }
+        // IPv6
+        if s.parse::<std::net::Ipv6Addr>().is_ok() {
+            return Ok(());
+        }
+        // Domain name
+        validate_domain(s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AddressString {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Self::new(s).map_err(serde::de::Error::custom)
+    }
+}
+
+impl std::fmt::Display for AddressString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+fn validate_domain(s: &str) -> Result<(), PluginError> {
+    let labels: Vec<&str> = s.split('.').collect();
+    // Allow 'localhost' as a special case for single-label domains
+    if labels.len() == 1 {
+        if labels[0].eq_ignore_ascii_case("localhost") {
+            validate_dns_label(labels[0], s)?;
+            return Ok(());
+        }
+        return Err(PluginError::AddressStringTooShort(s.to_string()));
+    }
+    if labels.len() < 2 {
+        return Err(PluginError::AddressStringTooShort(s.to_string()));
+    }
+    let n = labels.len();
+    for (i, &label) in labels.iter().enumerate() {
+        // Level from right: n-i (so rightmost is level 1 = TLD).
+        let level_from_right = n - i;
+        if level_from_right <= 2 {
+            // TLD and SLD must be plain DNS labels (no wildcards).
+            validate_dns_label(label, s)?;
+        } else {
+            // Level 3 and above may contain '*'.
+            validate_wildcard_label(label, s)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_dns_label(label: &str, ctx: &str) -> Result<(), PluginError> {
+    if label.is_empty() || label.len() > 63 {
+        return Err(PluginError::AddressStringInvalidLabel(label.to_string()));
+    }
+    if label.starts_with('-') || label.ends_with('-') {
+        return Err(PluginError::AddressStringInvalidLabel(label.to_string()));
+    }
+    if label.contains('*') {
+        return Err(PluginError::AddressStringWildcardNotAllowed(
+            ctx.to_string(),
+        ));
+    }
+    if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err(PluginError::AddressStringInvalidLabel(label.to_string()));
+    }
+    Ok(())
+}
+
+fn validate_wildcard_label(label: &str, _ctx: &str) -> Result<(), PluginError> {
+    if label.is_empty() {
+        return Err(PluginError::AddressStringInvalidLabel(label.to_string()));
+    }
+    // Remove all '*' characters; the remainder must be alphanumeric-or-hyphen.
+    let rest: String = label.chars().filter(|&c| c != '*').collect();
+    if !rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err(PluginError::AddressStringInvalidLabel(label.to_string()));
+    }
+    Ok(())
+}
+
+// ── PreopenedDir ──────────────────────────────────────────────────────────────
+
+/// A directory on the host to expose to the WASM plugin.
+///
+/// Fields mirror the parameters of `WasiCtxBuilder::preopened_dir`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreopenedDir {
+    /// Path to the directory on the host.
+    pub host_path: PathBuf,
+    /// Path the plugin sees (e.g. `"."` or `"/data"`).
+    pub guest_path: String,
+    /// Allow the plugin to list and read directory entries (default: `true`).
+    #[serde(default = "default_true")]
+    pub dir_read: bool,
+    /// Allow the plugin to create, rename, and delete directory entries (default: `false`).
+    #[serde(default)]
+    pub dir_write: bool,
+    /// Allow the plugin to read file contents (default: `true`).
+    #[serde(default = "default_true")]
+    pub file_read: bool,
+    /// Allow the plugin to write file contents (default: `false`).
+    #[serde(default)]
+    pub file_write: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+// ── FineGrainedPermission ─────────────────────────────────────────────────────
+
+/// Fine-grained sandbox permissions for WASM component-model plugins.
+///
+/// These are applied when building the per-store WASI context and provide
+/// narrower control than the coarse-grained [`PluginPermission`] flags.
+///
+/// - `Dir` — exposes a specific host directory to the plugin's filesystem.
+/// - `Http` — allows outbound HTTP connections to the given address.
+/// - `Tcp` — allows outbound TCP connections to the given address.
+/// - `Udp` — allows outbound UDP to the given address.
+///
+/// TCP (`TcpBind`) listening is never allowed regardless of permissions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FineGrainedPermission {
+    Dir(PreopenedDir),
+    Http(AddressString),
+    Tcp(AddressString),
+    Udp(AddressString),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── IP Address Tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_valid_ipv4() {
+        assert!(AddressString::new("127.0.0.1").is_ok());
+        assert!(AddressString::new("192.0.2.1").is_ok());
+    }
+
+    #[test]
+    fn test_valid_ipv6() {
+        assert!(AddressString::new("::1").is_ok());
+        assert!(AddressString::new("2001:db8::1").is_ok());
+    }
+
+    // ── Valid Domain Names ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_valid_domains() {
+        assert!(AddressString::new("localhost").is_ok());
+        assert!(AddressString::new("example.com").is_ok());
+        assert!(AddressString::new("api.example.com").is_ok());
+        assert!(AddressString::new("my-domain.com").is_ok());
+        assert!(AddressString::new("example123.com").is_ok());
+    }
+
+    #[test]
+    fn test_valid_wildcards() {
+        assert!(AddressString::new("*.example.com").is_ok());
+        assert!(AddressString::new("id-*.docs.example.com").is_ok());
+    }
+
+    // ── Invalid: Too Short ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_invalid_single_label() {
+        let err = AddressString::new("com").unwrap_err();
+        assert!(matches!(err, PluginError::AddressStringTooShort(_)));
+    }
+
+    // ── Invalid: Empty or Malformed Labels ────────────────────────────────
+
+    #[test]
+    fn test_invalid_empty_labels() {
+        assert!(AddressString::new(".example.com").is_err());
+        assert!(AddressString::new("example..com").is_err());
+        assert!(AddressString::new("").is_err());
+    }
+
+    #[test]
+    fn test_invalid_label_length() {
+        let long_label = "a".repeat(64);
+        assert!(AddressString::new(format!("{}.com", long_label)).is_err());
+
+        let max_label = "a".repeat(63);
+        assert!(AddressString::new(format!("{}.com", max_label)).is_ok());
+    }
+
+    #[test]
+    fn test_invalid_hyphen_position() {
+        assert!(AddressString::new("-example.com").is_err());
+        assert!(AddressString::new("example-.com").is_err());
+    }
+
+    // ── Invalid: Wildcard Restrictions ────────────────────────────────────
+
+    #[test]
+    fn test_invalid_wildcard_in_tld_or_sld() {
+        assert!(AddressString::new("example.*").is_err());
+        assert!(AddressString::new("*.com").is_err());
+    }
+
+    // ── Invalid: Invalid Characters ───────────────────────────────────────
+
+    #[test]
+    fn test_invalid_characters() {
+        assert!(AddressString::new("ex_ample.com").is_err());
+        assert!(AddressString::new("ex ample.com").is_err());
+        assert!(AddressString::new("ex@ample.com").is_err());
+    }
+
+    // ── AddressString Methods ──────────────────────────────────────────────
+
+    #[test]
+    fn test_address_string_methods() {
+        let addr = AddressString::new("example.com").unwrap();
+        assert_eq!(addr.as_str(), "example.com");
+        assert!(!addr.is_wildcard());
+
+        let wildcard = AddressString::new("*.example.com").unwrap();
+        assert!(wildcard.is_wildcard());
+    }
+
+    // ── Serialization ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_serde() {
+        let addr = AddressString::new("example.com").unwrap();
+        let json = serde_json::to_string(&addr).unwrap();
+        assert_eq!(json, "\"example.com\"");
+
+        let deserialized: AddressString = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, addr);
+
+        let invalid = serde_json::from_str::<AddressString>("\"com\"");
+        assert!(invalid.is_err());
+    }
 }

@@ -9,7 +9,7 @@ publish = false
 [features]
 default = ["plugins-wit-v0"]
 plugins-wit-v0 = []
-plugins-wasmtime = ["dep:wasmtime", "dep:wasmtime-wasi"]
+plugins-wasmtime = ["dep:dns-lookup", "dep:wasmtime", "dep:wasmtime-wasi"]
 plugins-wasm-cranelift = ["plugins-wasmtime", "wasmtime/cranelift"]
 plugins-wasm-pulley = ["plugins-wasmtime", "wasmtime/pulley"]
 
@@ -22,13 +22,21 @@ anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"
 cap-std = { version = "3", optional = true }
+dns-lookup = { version = "3", optional = true }
 ring = "0.17"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 extism = "1.21"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
+reqwest = { version = "0.12", default-features = false, features = [
+  "blocking",
+  "rustls-tls",
+] }
 thiserror = "2.0"
-tokio = { version = "1.50", default-features = false, features = ["sync", "macros", "rt"] }
+tokio = { version = "1.50", default-features = false, features = [
+  "macros",
+  "rt",
+  "sync",
+] }
 toml = "1.0"
 wasmtime = { version = "45", default-features = false, features = [
   "async",
@@ -36,7 +44,7 @@ wasmtime = { version = "45", default-features = false, features = [
   "runtime",
 ], optional = true }
 wasmtime-wasi = { version = "45", default-features = false, features = [
-  "p2",            # WASIP2 component-model streams/poll support
+  "p2",
 ], optional = true }
 
 [dev-dependencies]

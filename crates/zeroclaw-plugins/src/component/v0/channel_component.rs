@@ -60,15 +60,22 @@ impl ComponentChannel {
     /// Compile and instantiate a channel plugin from raw WASM bytes.
     ///
     /// Calls `get-channel-capabilities` once and stores the result.
+    ///
+    /// `permissions` is applied to the long-lived store so that filesystem,
+    /// TCP, UDP, and HTTP access are restricted to the declared
+    /// `fine_grained_permissions` list.
     pub fn from_bytes(
         alias: impl Into<String>,
         engine: Arc<ComponentEngine>,
         bytes: &[u8],
+        permissions: Vec<crate::FineGrainedPermission>,
     ) -> anyhow::Result<Self> {
         let component = engine.compile(bytes)?;
         let mut linker = wasmtime::component::Linker::<PluginLoggingHost>::new(engine.engine());
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(PluginError::from)?;
         logging::add_to_linker_channel(&mut linker)?;
-        let mut store = wasmtime::Store::new(engine.engine(), PluginLoggingHost::default());
+        let host = PluginLoggingHost::with_permissions(&permissions)?;
+        let mut store = wasmtime::Store::new(engine.engine(), host);
 
         let instance = linker
             .instantiate(&mut store, &component)

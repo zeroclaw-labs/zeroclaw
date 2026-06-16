@@ -37,6 +37,18 @@ pub enum PluginError {
     #[error("invalid plugin signature: {0}")]
     SignatureInvalid(String),
 
+    #[error("domain must have at least two labels (e.g. 'example.com'): {0}")]
+    AddressStringTooShort(String),
+
+    #[error("invalid DNS label (empty, too long, or illegal characters): {0}")]
+    AddressStringInvalidLabel(String),
+
+    #[error("wildcard '*' is only allowed at subdomain level 3 or higher (not in TLD or SLD): {0}")]
+    AddressStringWildcardNotAllowed(String),
+
+    #[error("address is not a valid IPv4, IPv6, or domain name: {0}")]
+    AddressStringInvalidAddress(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
