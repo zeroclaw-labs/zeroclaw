@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use portable_atomic::{AtomicBool, AtomicU64, Ordering};
+use portable_atomic::{AtomicU64, Ordering};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -34,7 +34,6 @@ pub struct AmqpChannel {
     durable_ack: bool,
     alias: String,
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
-    consuming: Arc<AtomicBool>,
 }
 
 /// Construction parameters for [`AmqpChannel`].
@@ -70,7 +69,6 @@ impl AmqpChannel {
             durable_ack: cfg.durable_ack,
             alias: cfg.alias,
             peer_resolver: cfg.peer_resolver,
-            consuming: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -166,6 +164,51 @@ impl AmqpChannel {
             password: PKCS12_PASSWORD.to_string(),
         }))
     }
+
+    async fn establish_consumer(&self) -> anyhow::Result<(Connection, lapin::Consumer)> {
+        let conn = self.connect().await?;
+        let channel = conn.create_channel().await?;
+
+        let queue_name = self.queue.clone().unwrap_or_default();
+        let queue = channel
+            .queue_declare(
+                &queue_name,
+                QueueDeclareOptions {
+                    exclusive: self.queue.is_none(),
+                    auto_delete: self.queue.is_none(),
+                    ..QueueDeclareOptions::default()
+                },
+                FieldTable::default(),
+            )
+            .await?;
+        let bound_queue = queue.name().as_str().to_string();
+
+        for routing_key in &self.routing_keys {
+            channel
+                .queue_bind(
+                    &bound_queue,
+                    &self.exchange,
+                    routing_key,
+                    QueueBindOptions::default(),
+                    FieldTable::default(),
+                )
+                .await?;
+        }
+
+        let consumer = channel
+            .basic_consume(
+                &bound_queue,
+                &format!("zeroclaw-{}", self.alias),
+                BasicConsumeOptions {
+                    no_ack: !self.durable_ack,
+                    ..BasicConsumeOptions::default()
+                },
+                FieldTable::default(),
+            )
+            .await?;
+
+        Ok((conn, consumer))
+    }
 }
 
 fn amqp_connection_properties() -> ConnectionProperties {
@@ -255,49 +298,9 @@ impl Channel for AmqpChannel {
     }
 
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
-        let conn = self.connect().await?;
-        let channel = conn.create_channel().await?;
-
-        let queue_name = self.queue.clone().unwrap_or_default();
-        let queue = channel
-            .queue_declare(
-                &queue_name,
-                QueueDeclareOptions {
-                    exclusive: self.queue.is_none(),
-                    auto_delete: self.queue.is_none(),
-                    ..QueueDeclareOptions::default()
-                },
-                FieldTable::default(),
-            )
-            .await?;
-        let bound_queue = queue.name().as_str().to_string();
-
-        for routing_key in &self.routing_keys {
-            channel
-                .queue_bind(
-                    &bound_queue,
-                    &self.exchange,
-                    routing_key,
-                    QueueBindOptions::default(),
-                    FieldTable::default(),
-                )
-                .await?;
-        }
-
-        let mut consumer = channel
-            .basic_consume(
-                &bound_queue,
-                &format!("zeroclaw-{}", self.alias),
-                BasicConsumeOptions {
-                    no_ack: !self.durable_ack,
-                    ..BasicConsumeOptions::default()
-                },
-                FieldTable::default(),
-            )
-            .await?;
+        let (_conn, mut consumer) = self.establish_consumer().await?;
 
         zeroclaw_runtime::health::mark_component_ok("amqp");
-        self.consuming.store(true, Ordering::Release);
         let _peers = (self.peer_resolver)();
 
         while let Some(delivery) = consumer.next().await {
@@ -326,7 +329,6 @@ impl Channel for AmqpChannel {
             };
 
             if tx.send(channel_msg).await.is_err() {
-                self.consuming.store(false, Ordering::Release);
                 return Ok(());
             }
 
@@ -335,12 +337,17 @@ impl Channel for AmqpChannel {
             }
         }
 
-        self.consuming.store(false, Ordering::Release);
         Ok(())
     }
 
     async fn health_check(&self) -> bool {
-        self.consuming.load(Ordering::Acquire)
+        match self.connect().await {
+            Ok(conn) => {
+                let _ = conn.close(200, "health check").await;
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     fn self_handle(&self) -> Option<String> {
@@ -423,7 +430,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_check_false_before_consuming() {
+    async fn health_check_false_when_broker_unreachable() {
         assert!(!channel_with("", "").health_check().await);
     }
 

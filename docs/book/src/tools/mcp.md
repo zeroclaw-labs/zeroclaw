@@ -58,4 +58,31 @@ MCP tool calls go through the same approval gate as every other tool, governed b
 - Otherwise, an MCP tool call prompts for approval unless its **prefixed** name (`<server>__<tool>`) is in the profile's `auto_approve` list. `auto_approve = ["*"]` approves everything; an exact entry like `auto_approve = ["filesystem__read_file"]` approves just that tool.
 - `always_ask` is the inverse: a name (or `"*"`) there always prompts, overriding `auto_approve`.
 
+Keep the exposure and approval controls separate:
+
+| Control | Scope | Use it for |
+|---|---|---|
+| `tool_filter_groups` | Prompt/context exposure | Decide which MCP tool schemas are visible to the model for a turn. |
+| `auto_approve` / `always_ask` | Approval policy | Decide whether a selected MCP tool call requires operator approval. |
+| `allowed_tools` / `excluded_tools` | Capability policy | Decide which prefixed tool names the risk profile may use at all. |
+
+For a hard allowlist, include the MCP tool's prefixed name in
+`allowed_tools` as well as any approval rule:
+
+```toml
+[risk_profiles.assistant]
+allowed_tools = [
+  "file_read",
+  "filesystem__read_file",
+]
+auto_approve = [
+  "filesystem__read_file",
+]
+```
+
+`auto_approve` alone does not hide a tool from the model; it only answers the
+approval question after the model selects that tool. Use `tool_filter_groups`
+to reduce prompt noise and `allowed_tools` / `excluded_tools` to enforce a
+capability boundary.
+
 See [Autonomy levels](../security/autonomy.md) for the full per-profile field surface, and the [Config reference](../reference/config.md#mcp) for every MCP field and default.
