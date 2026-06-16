@@ -42,9 +42,9 @@ The default `mode = "business"` does not apply the personal DM/group policy spli
 
 ## Restricting which groups (`allowed_groups`)
 
-`allowed_groups` (Web mode) scopes the bot to a named set of group chats by JID. It is independent of `mode` — it applies in both business and personal mode, and runs before the chat-type policy. An empty list (the default) permits every group, so existing configs are unchanged. A non-empty list drops every group message whose chat JID matches no entry. **Direct messages always bypass this filter.**
+`allowed_groups` (Web mode) scopes the bot to a named set of group chats by JID. It is independent of `mode` - it applies in both business and personal mode, and runs before the chat-type policy. An empty list (the default) permits every group, so existing configs are unchanged. A non-empty list drops every group message whose chat JID matches no entry. **Direct messages always bypass this filter.**
 
-Each entry matches either the full group JID (`123456789012345@g.us`) or the JID user part — the segment before `@` (`123456789012345`) — compared **exactly**, not as a string prefix (so `123` admits `123@g.us` but never `123999@g.us`). This gates group *identity*, which `group_policy` (chat type) and the sender allowlist (sender) do not.
+Each entry matches either the full group JID (`123456789012345@g.us`) or the JID user part - the segment before `@` (`123456789012345`) - compared **exactly**, not as a string prefix (so `123` admits `123@g.us` but never `123999@g.us`). This gates group *identity*, which `group_policy` (chat type) and the sender allowlist (sender) do not.
 
 ```toml
 [channels.whatsapp.myaccount]

@@ -12522,8 +12522,8 @@ pub struct WhatsAppConfig {
     /// Allowed group chats by JID (Web mode). An empty list (the default)
     /// permits all groups; a non-empty list drops every group message whose
     /// chat JID matches no entry. Each entry matches either the full group
-    /// JID (`123456789012345@g.us`) or the JID user part — the segment before
-    /// `@` (`123456789012345`) — compared exactly, not as a string prefix.
+    /// JID (`123456789012345@g.us`) or the JID user part - the segment before
+    /// `@` (`123456789012345`) - compared exactly, not as a string prefix.
     /// Direct messages bypass this filter regardless of list contents.
     /// Modeled on the Matrix channel's `allowed_rooms`; it gates group
     /// identity, which `dm_policy`/`group_policy` (chat type) and the

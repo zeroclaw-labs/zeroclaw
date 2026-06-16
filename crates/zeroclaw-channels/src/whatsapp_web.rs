@@ -1094,7 +1094,7 @@ fn fromme_outside_self_chat_is_operator_trigger(
 /// An empty list permits every group (current default). A non-empty list
 /// permits a group when some entry matches the chat JID exactly: an entry
 /// matches when it equals the full JID (`123@g.us`) or equals the JID's
-/// user part — the segment before `@` (`123`). Matching is exact, not a
+/// user part - the segment before `@` (`123`). Matching is exact, not a
 /// string prefix, so `"123"` admits `123@g.us` but never `123999@g.us`.
 /// Blank entries never match. Callers gate on `is_group` first, so direct
 /// messages bypass this check entirely.
