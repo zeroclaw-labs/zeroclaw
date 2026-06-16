@@ -503,6 +503,409 @@ fn scrub_channel_refs(cfg: &mut Config, target: &str) {
         .retain(|ch| ch.trim() != target);
 }
 
+// ── rename-with-cascade (#7468) ─────────────────────────────────────────────
+
+/// The agent alias reserved as the runtime fallback. `resolved_runtime_agent_alias`
+/// prefers it, so renaming it away — or onto it — would silently change which
+/// agent answers when no explicit target is given. Protected from rename. This
+/// guard is **agent-specific**: `default` is the conventional single-instance key
+/// for providers/channels (e.g. `providers.models.anthropic.default`,
+/// `channels.discord.default`), which operators rename/delete freely, so it is
+/// reserved only for the agent kind. (The `_deleted` archive marker is rejected
+/// as a new alias of any kind by `validate_alias_key`'s leading-underscore rule,
+/// which `rename_map_key` enforces — no separate guard needed here.)
+const RESERVED_DEFAULT_AGENT: &str = "default";
+
+/// Outcome of a successful [`rename_with_cascade`].
+#[derive(Debug, Clone)]
+pub struct RenameReport {
+    pub target_kind: AliasKind,
+    /// The previous alias (now gone from config).
+    pub old_alias: String,
+    /// The alias the entry now lives under.
+    pub new_alias: String,
+    /// Every dotted config path the rename mutated, **deduplicated and sorted**:
+    /// the renamed entry (old key — removed on disk; new key — added) plus the
+    /// entry/section path of each referrer that was rewritten. The persisting
+    /// surface must mark **each** of these dirty before saving — `save_dirty`
+    /// only writes marked paths, so a referrer in another entry that isn't
+    /// listed here would be rewritten in memory but left stale on disk. Paths are
+    /// at entry/section granularity (e.g. `agents.lead`, `peer_groups.crew`,
+    /// `heartbeat.agent`, `model_routes`, `providers.models.anthropic.default`)
+    /// so marking one re-serialises the whole changed subtree, capturing nested
+    /// edits like a `workspace.access` key rename.
+    pub dirty_paths: Vec<String>,
+}
+
+/// Why a [`rename_with_cascade`] did not complete. Unlike [`CascadeError`] there
+/// is no `Refused` variant: rename **rewrites** HARD references to follow the new
+/// name rather than refusing, so the only failures are bad inputs and the
+/// post-condition bug-guard.
+#[derive(Debug)]
+pub enum RenameError {
+    /// The source alias does not exist.
+    NotFound(String),
+    /// The new alias is unusable: fails `validate_alias_key`, collides with an
+    /// existing entry, or equals the current name. Carries the reason.
+    InvalidName(String),
+    /// The source or target alias is reserved (the `default` agent).
+    Reserved(String),
+    /// Bug guard: rewrite drifted from `find_all_references` and left a dangling
+    /// reference to the OLD alias. **The config WAS mutated** (key swapped + refs
+    /// rewritten) — the caller must NOT persist it. Unreachable while rewrite and
+    /// the collect_* walks mirror each other (same sites, same trim split).
+    PostCondition(String),
+}
+
+impl std::fmt::Display for RenameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(p) => write!(f, "alias not found: {p}"),
+            Self::InvalidName(m) => write!(f, "invalid new alias: {m}"),
+            Self::Reserved(a) => write!(f, "alias `{a}` is reserved and cannot be renamed"),
+            Self::PostCondition(m) => write!(f, "rename post-condition failed: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for RenameError {}
+
+/// Rename an aliased entry from `old_alias` to `new_alias`, rewriting every
+/// reference to it. The mutating inverse of [`delete_with_cascade`]'s scrub:
+/// where delete clears/drops soft refs (and refuses on hard ones), rename
+/// **rewrites** every ref — soft *and* hard — to name the new alias, so nothing
+/// is left dangling and no HARD ref blocks (an enabled `heartbeat.agent` or a
+/// `peer_groups.<g>.channel` simply follows the rename).
+///
+/// Steps: reject a no-op / reserved name, swap the entry key via
+/// `Config::rename_map_key` (which validates the new key, blocks the `_deleted`
+/// marker, and refuses a collision), rewrite the referrers, then verify
+/// `find_all_references(old_alias)` is empty. Implements every kind — agents,
+/// model / TTS / transcription providers, and channels (rename has no
+/// owned-state complications, so unlike delete it covers TTS/transcription too).
+/// Owned non-config state (memory rows, workspace dir, cron/acp/session rows) is
+/// re-pointed by the calling surface, which owns those stores.
+pub fn rename_with_cascade(
+    cfg: &mut Config,
+    kind: &AliasKind,
+    old_alias: &str,
+    new_alias: &str,
+) -> Result<RenameReport, RenameError> {
+    if old_alias == new_alias {
+        return Err(RenameError::InvalidName(
+            "new alias must differ from the current name".to_string(),
+        ));
+    }
+    // Reserved-name guard (agent-scoped): the `default` agent is the runtime
+    // fallback; renaming it away or onto it would silently change dispatch.
+    if matches!(kind, AliasKind::Agent)
+        && (old_alias == RESERVED_DEFAULT_AGENT || new_alias == RESERVED_DEFAULT_AGENT)
+    {
+        return Err(RenameError::Reserved(RESERVED_DEFAULT_AGENT.to_string()));
+    }
+
+    let section = section_path(kind);
+    // `rename_map_key` validates `new_alias` via `validate_alias_key` (whose
+    // leading-underscore rule also blocks the `_deleted` marker) and refuses a
+    // collision, then swaps the entry key. `Ok(false)` = the source key is absent.
+    match cfg.rename_map_key(&section, old_alias, new_alias) {
+        Ok(true) => {}
+        Ok(false) => return Err(RenameError::NotFound(entry_path(kind, old_alias))),
+        Err(e) => return Err(RenameError::InvalidName(e)),
+    }
+
+    // Rewrite every referrer old → new. Mirrors the `collect_*_refs` walks
+    // (same containers, same TRIM/RAW split) but replaces in place instead of
+    // scrubbing. HARD refs are rewritten too — rename never refuses. Each rewrite
+    // fn returns the entry/section paths it touched (for the surface to persist).
+    let mut dirty_paths = match kind {
+        AliasKind::Agent => rewrite_agent_refs(cfg, old_alias, new_alias),
+        AliasKind::Provider { category, family } => {
+            rewrite_provider_refs(cfg, *category, family, old_alias, new_alias)
+        }
+        AliasKind::Channel { channel_type } => {
+            rewrite_channel_refs(cfg, channel_type, old_alias, new_alias)
+        }
+    };
+    // The entry-key swap itself: the old key must be removed from disk and the
+    // new key written. (`rename_map_key` already moved it in memory.)
+    dirty_paths.push(entry_path(kind, old_alias));
+    dirty_paths.push(entry_path(kind, new_alias));
+    dirty_paths.sort();
+    dirty_paths.dedup();
+
+    // Post-condition: nothing may still reference the OLD alias. (Targeted, not a
+    // global `validate()` — same rationale as `delete_with_cascade`.)
+    let remaining = find_all_references(cfg, kind, old_alias);
+    if !remaining.is_empty() {
+        let paths: Vec<_> = remaining.iter().map(|s| s.path.as_str()).collect();
+        return Err(RenameError::PostCondition(format!(
+            "{} dangling reference(s) to {old_alias} remain after rewrite: {}",
+            remaining.len(),
+            paths.join(", ")
+        )));
+    }
+
+    Ok(RenameReport {
+        target_kind: kind.clone(),
+        old_alias: old_alias.to_string(),
+        new_alias: new_alias.to_string(),
+        dirty_paths,
+    })
+}
+
+/// The map-key section path for a kind — the `section_path` argument to
+/// `Config::rename_map_key` / `Config::delete_map_key`.
+fn section_path(kind: &AliasKind) -> String {
+    match kind {
+        AliasKind::Agent => "agents".to_string(),
+        AliasKind::Provider { category, family } => {
+            format!("providers.{}.{family}", provider_section(*category))
+        }
+        AliasKind::Channel { channel_type } => format!("channels.{channel_type}"),
+    }
+}
+
+fn provider_section(category: ProviderCategory) -> &'static str {
+    match category {
+        ProviderCategory::Models => "models",
+        ProviderCategory::Tts => "tts",
+        ProviderCategory::Transcription => "transcription",
+    }
+}
+
+/// The dotted entry path for a kind + alias (e.g. `agents.bot`,
+/// `providers.models.anthropic.default`, `channels.discord.main`).
+fn entry_path(kind: &AliasKind, alias: &str) -> String {
+    format!("{}.{alias}", section_path(kind))
+}
+
+/// Mutating mirror of [`collect_agent_refs`] for rename: rewrite every reference
+/// to `old` so it names `new`. Mirrors the collect TRIM/RAW split exactly — trim
+/// heartbeat / acp.default_agent / delegates; leave workspace.access /
+/// read_memory_from / peer_groups.agents raw — matching on the same comparison
+/// and writing the new value verbatim. `heartbeat.agent` is rewritten whether or
+/// not heartbeat is enabled (the pointer follows the rename either way). Includes
+/// the renamed agent itself, so a self-reference (`bot.delegates=["bot"]` under a
+/// bot→bot2 rename) is rewritten here too. Returns the entry/section dirty paths
+/// it touched (`heartbeat.agent`, `acp.default_agent`, `agents.<name>`,
+/// `peer_groups.<g>`) so the surface can persist exactly what changed.
+fn rewrite_agent_refs(cfg: &mut Config, old: &str, new: &str) -> Vec<String> {
+    use crate::multi_agent::AgentAlias;
+    let mut dirty = Vec::new();
+    if cfg.heartbeat.agent.trim() == old {
+        cfg.heartbeat.agent = new.to_string();
+        dirty.push("heartbeat.agent".to_string());
+    }
+    let hit_acp = cfg
+        .acp
+        .default_agent
+        .as_deref()
+        .is_some_and(|da| da.trim() == old);
+    if hit_acp {
+        cfg.acp.default_agent = Some(new.to_string());
+        dirty.push("acp.default_agent".to_string());
+    }
+    for (name, agent) in cfg.agents.iter_mut() {
+        let mut touched = false;
+        for d in agent.delegates.iter_mut() {
+            if d.trim() == old {
+                *d = new.to_string(); // trimmed (validate trims delegates)
+                touched = true;
+            }
+        }
+        // workspace.access map key (raw match) — re-key, preserving the AccessMode.
+        if let Some(mode) = agent.workspace.access.remove(&AgentAlias::new(old)) {
+            agent.workspace.access.insert(AgentAlias::new(new), mode);
+            touched = true;
+        }
+        // workspace.read_memory_from[] (raw match).
+        for m in agent.workspace.read_memory_from.iter_mut() {
+            if m.as_str() == old {
+                *m = AgentAlias::new(new);
+                touched = true;
+            }
+        }
+        if touched {
+            dirty.push(format!("agents.{name}"));
+        }
+    }
+    for (gname, group) in cfg.peer_groups.iter_mut() {
+        let mut touched = false;
+        for m in group.agents.iter_mut() {
+            if m.as_str() == old {
+                *m = AgentAlias::new(new);
+                touched = true;
+            }
+        }
+        if touched {
+            dirty.push(format!("peer_groups.{gname}"));
+        }
+    }
+    dirty
+}
+
+/// Dispatch the provider rewrite by category (mirrors the `collect_provider_refs`
+/// per-category arms).
+fn rewrite_provider_refs(
+    cfg: &mut Config,
+    category: ProviderCategory,
+    family: &str,
+    old: &str,
+    new: &str,
+) -> Vec<String> {
+    match category {
+        ProviderCategory::Models => rewrite_model_provider_refs(cfg, family, old, new),
+        ProviderCategory::Tts => rewrite_tts_provider_refs(cfg, family, old, new),
+        ProviderCategory::Transcription => {
+            rewrite_transcription_provider_refs(cfg, family, old, new)
+        }
+    }
+}
+
+/// Mutating mirror of the model-provider arm of [`collect_provider_refs`] for
+/// rename: rewrite the dotted `"<family>.<alias>"` refs from old → new across
+/// `model_provider` (HARD — rewritten, since rename never refuses),
+/// `classifier_provider`, every provider's `fallback[]`, and the model/embedding
+/// routes. All TRIM-matched (validate trims provider refs). Returns the touched
+/// entry/section dirty paths.
+fn rewrite_model_provider_refs(
+    cfg: &mut Config,
+    family: &str,
+    old: &str,
+    new: &str,
+) -> Vec<String> {
+    let old_target = format!("{family}.{old}");
+    let new_target = format!("{family}.{new}");
+    let mut dirty = Vec::new();
+    for (name, agent) in cfg.agents.iter_mut() {
+        let mut touched = false;
+        if agent.model_provider.trim() == old_target {
+            agent.model_provider = new_target.as_str().into();
+            touched = true;
+        }
+        if agent.classifier_provider.trim() == old_target {
+            agent.classifier_provider = new_target.as_str().into();
+            touched = true;
+        }
+        if touched {
+            dirty.push(format!("agents.{name}"));
+        }
+    }
+    for (ty, al, profile) in cfg.providers.models.iter_entries_mut() {
+        let mut touched = false;
+        for fb in profile.fallback.iter_mut() {
+            if fb.trim() == old_target {
+                *fb = new_target.as_str().into();
+                touched = true;
+            }
+        }
+        if touched {
+            dirty.push(format!("providers.models.{ty}.{al}"));
+        }
+    }
+    let mut routes_touched = false;
+    for r in cfg.model_routes.iter_mut() {
+        if r.model_provider.trim() == old_target {
+            r.model_provider = new_target.clone(); // String field
+            routes_touched = true;
+        }
+    }
+    if routes_touched {
+        dirty.push("model_routes".to_string());
+    }
+    let mut embed_touched = false;
+    for r in cfg.embedding_routes.iter_mut() {
+        if r.model_provider.trim() == old_target {
+            r.model_provider = new_target.clone();
+            embed_touched = true;
+        }
+    }
+    if embed_touched {
+        dirty.push("embedding_routes".to_string());
+    }
+    dirty
+}
+
+/// Rewrite the single optional `tts_provider` scalar (SOFT, TRIM-matched) from
+/// `"<family>.<old>"` to `"<family>.<new>"` across all agents. Returns touched
+/// `agents.<name>` paths.
+fn rewrite_tts_provider_refs(cfg: &mut Config, family: &str, old: &str, new: &str) -> Vec<String> {
+    let old_target = format!("{family}.{old}");
+    let new_target = format!("{family}.{new}");
+    let mut dirty = Vec::new();
+    for (name, agent) in cfg.agents.iter_mut() {
+        if agent.tts_provider.trim() == old_target {
+            agent.tts_provider = new_target.as_str().into();
+            dirty.push(format!("agents.{name}"));
+        }
+    }
+    dirty
+}
+
+/// Rewrite the single optional `transcription_provider` scalar (SOFT,
+/// TRIM-matched) from `"<family>.<old>"` to `"<family>.<new>"` across all agents.
+/// Returns touched `agents.<name>` paths.
+fn rewrite_transcription_provider_refs(
+    cfg: &mut Config,
+    family: &str,
+    old: &str,
+    new: &str,
+) -> Vec<String> {
+    let old_target = format!("{family}.{old}");
+    let new_target = format!("{family}.{new}");
+    let mut dirty = Vec::new();
+    for (name, agent) in cfg.agents.iter_mut() {
+        if agent.transcription_provider.trim() == old_target {
+            agent.transcription_provider = new_target.as_str().into();
+            dirty.push(format!("agents.{name}"));
+        }
+    }
+    dirty
+}
+
+/// Mutating mirror of [`collect_channel_refs`] for rename: rewrite the dotted
+/// `"<type>.<alias>"` refs from old → new across every agent's `channels[]`, the
+/// HARD `peer_groups.<g>.channel`, and `escalation.alert_channels[]`. All
+/// TRIM-matched. Note the bare-group-member orphan hazard that makes a channel
+/// *delete* refuse does NOT arise here: rewriting a member's channel keeps it a
+/// `<type>.*` channel, so group membership stays valid. Returns the touched
+/// entry/section dirty paths.
+fn rewrite_channel_refs(cfg: &mut Config, channel_type: &str, old: &str, new: &str) -> Vec<String> {
+    let old_target = format!("{channel_type}.{old}");
+    let new_target = format!("{channel_type}.{new}");
+    let mut dirty = Vec::new();
+    for (name, agent) in cfg.agents.iter_mut() {
+        let mut touched = false;
+        for ch in agent.channels.iter_mut() {
+            if ch.trim() == old_target {
+                *ch = new_target.as_str().into();
+                touched = true;
+            }
+        }
+        if touched {
+            dirty.push(format!("agents.{name}"));
+        }
+    }
+    for (gname, group) in cfg.peer_groups.iter_mut() {
+        if group.channel.trim() == old_target {
+            group.channel = new_target.as_str().into();
+            dirty.push(format!("peer_groups.{gname}"));
+        }
+    }
+    let mut alert_touched = false;
+    for ch in cfg.escalation.alert_channels.iter_mut() {
+        if ch.trim() == old_target {
+            *ch = new_target.clone(); // String field
+            alert_touched = true;
+        }
+    }
+    if alert_touched {
+        dirty.push("escalation.alert_channels".to_string());
+    }
+    dirty
+}
+
 // ── deterministic iteration over the alias-keyed maps ───────────────────────
 // `Config::agents` / `peer_groups` are HashMaps; sort by key so RefSite order
 // is stable across runs (tests + dashboard binding depend on it).
@@ -1937,5 +2340,300 @@ mod tests {
             vec!["discord.backup"],
             "only the deleted channel is scrubbed; backup survives"
         );
+    }
+
+    // ── rename_with_cascade (#7468) ─────────────────────────────────────────
+
+    #[test]
+    fn rename_agent_rewrites_every_ref_kind() {
+        let mut cfg = empty_config();
+        cfg.heartbeat.enabled = true;
+        cfg.heartbeat.agent = "bot".to_string(); // HARD ref — rename rewrites it
+        cfg.acp.default_agent = Some("bot".to_string());
+        // The renamed agent itself self-delegates (must be rewritten too).
+        let mut bot = AliasedAgentConfig {
+            delegates: vec!["bot".to_string()],
+            ..Default::default()
+        };
+        bot.workspace
+            .access
+            .insert(AgentAlias::new("bot"), AccessMode::Read);
+        cfg.agents.insert("bot".to_string(), bot);
+        // A referrer agent pointing at bot every which way.
+        let mut lead = AliasedAgentConfig {
+            delegates: vec!["bot".to_string()],
+            ..Default::default()
+        };
+        lead.workspace
+            .access
+            .insert(AgentAlias::new("bot"), AccessMode::Read);
+        lead.workspace.read_memory_from.push(AgentAlias::new("bot"));
+        cfg.agents.insert("lead".to_string(), lead);
+        let mut group = PeerGroupConfig::default();
+        group.agents.push(AgentAlias::new("bot"));
+        cfg.peer_groups.insert("crew".to_string(), group);
+
+        let report = rename_with_cascade(&mut cfg, &AliasKind::Agent, "bot", "bot2")
+            .expect("agent rename succeeds");
+        assert_eq!(report.new_alias, "bot2");
+        // entry moved
+        assert!(!cfg.agents.contains_key("bot"));
+        assert!(cfg.agents.contains_key("bot2"));
+        // every ref now names bot2
+        assert_eq!(cfg.heartbeat.agent, "bot2");
+        assert_eq!(cfg.acp.default_agent.as_deref(), Some("bot2"));
+        assert_eq!(cfg.agents["bot2"].delegates, vec!["bot2".to_string()]);
+        assert!(
+            cfg.agents["bot2"]
+                .workspace
+                .access
+                .contains_key(&AgentAlias::new("bot2"))
+        );
+        assert_eq!(cfg.agents["lead"].delegates, vec!["bot2".to_string()]);
+        assert!(
+            cfg.agents["lead"]
+                .workspace
+                .access
+                .contains_key(&AgentAlias::new("bot2"))
+        );
+        assert_eq!(
+            cfg.agents["lead"].workspace.read_memory_from,
+            vec![AgentAlias::new("bot2")]
+        );
+        assert_eq!(
+            cfg.peer_groups["crew"].agents,
+            vec![AgentAlias::new("bot2")]
+        );
+        // post-condition: nothing references the old alias
+        assert!(find_all_references(&cfg, &AliasKind::Agent, "bot").is_empty());
+        // dirty paths cover every touched entry/section + the entry-key swap, so
+        // the surface persists exactly what changed (and nothing stays stale).
+        for expected in [
+            "heartbeat.agent",
+            "acp.default_agent",
+            "agents.bot", // old entry removed on disk
+            "agents.bot2",
+            "agents.lead",
+            "peer_groups.crew",
+        ] {
+            assert!(
+                report.dirty_paths.iter().any(|p| p == expected),
+                "missing dirty path {expected:?} in {:?}",
+                report.dirty_paths
+            );
+        }
+        // sorted + deduplicated
+        let mut sorted = report.dirty_paths.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted, report.dirty_paths);
+    }
+
+    #[test]
+    fn rename_agent_not_found() {
+        let mut cfg = empty_config();
+        let err = rename_with_cascade(&mut cfg, &AliasKind::Agent, "ghost", "specter").unwrap_err();
+        assert!(matches!(err, RenameError::NotFound(_)));
+    }
+
+    #[test]
+    fn rename_agent_collision_is_invalid() {
+        let mut cfg = empty_config();
+        cfg.agents
+            .insert("bot".to_string(), AliasedAgentConfig::default());
+        cfg.agents
+            .insert("other".to_string(), AliasedAgentConfig::default());
+        let err = rename_with_cascade(&mut cfg, &AliasKind::Agent, "bot", "other").unwrap_err();
+        assert!(matches!(err, RenameError::InvalidName(_)));
+        // no mutation: both entries still present
+        assert!(cfg.agents.contains_key("bot"));
+        assert!(cfg.agents.contains_key("other"));
+    }
+
+    #[test]
+    fn rename_agent_noop_is_invalid() {
+        let mut cfg = empty_config();
+        cfg.agents
+            .insert("bot".to_string(), AliasedAgentConfig::default());
+        let err = rename_with_cascade(&mut cfg, &AliasKind::Agent, "bot", "bot").unwrap_err();
+        assert!(matches!(err, RenameError::InvalidName(_)));
+    }
+
+    #[test]
+    fn rename_default_agent_is_reserved_both_directions() {
+        let mut cfg = empty_config();
+        cfg.agents
+            .insert("default".to_string(), AliasedAgentConfig::default());
+        cfg.agents
+            .insert("bot".to_string(), AliasedAgentConfig::default());
+        // can't rename the default agent away
+        let from =
+            rename_with_cascade(&mut cfg, &AliasKind::Agent, "default", "primary").unwrap_err();
+        assert!(matches!(from, RenameError::Reserved(_)));
+        // can't rename another agent onto `default`
+        let onto = rename_with_cascade(&mut cfg, &AliasKind::Agent, "bot", "default").unwrap_err();
+        assert!(matches!(onto, RenameError::Reserved(_)));
+        // nothing mutated
+        assert!(cfg.agents.contains_key("default"));
+        assert!(cfg.agents.contains_key("bot"));
+    }
+
+    #[test]
+    fn rename_rejects_deleted_marker_target() {
+        // `_deleted` is blocked as a new alias by validate_alias_key (leading
+        // underscore) — surfaced as InvalidName via rename_map_key.
+        let mut cfg = empty_config();
+        cfg.agents
+            .insert("bot".to_string(), AliasedAgentConfig::default());
+        let err = rename_with_cascade(&mut cfg, &AliasKind::Agent, "bot", "_deleted").unwrap_err();
+        assert!(matches!(err, RenameError::InvalidName(_)));
+        assert!(cfg.agents.contains_key("bot"));
+    }
+
+    #[test]
+    fn rename_model_provider_rewrites_dotted_refs() {
+        let mut cfg = cfg_with_provider("anthropic", "default");
+        cfg.agents.insert(
+            "researcher".to_string(),
+            AliasedAgentConfig {
+                model_provider: "anthropic.default".into(), // HARD — rewritten, not refused
+                classifier_provider: "anthropic.default".into(),
+                ..Default::default()
+            },
+        );
+        // another provider whose fallback names the target
+        cfg.providers
+            .models
+            .ensure("openai", "fast")
+            .expect("ensure");
+        for (_t, al, p) in cfg.providers.models.iter_entries_mut() {
+            if al == "fast" {
+                p.fallback.push("anthropic.default".into());
+            }
+        }
+        cfg.model_routes.push(ModelRouteConfig {
+            hint: "deep".to_string(),
+            model_provider: "anthropic.default".to_string(),
+            model: "claude".to_string(),
+            api_key: None,
+        });
+
+        let kind = provider_kind("anthropic");
+        let report = rename_with_cascade(&mut cfg, &kind, "default", "prod")
+            .expect("provider rename succeeds");
+        assert_eq!(report.new_alias, "prod");
+        assert!(cfg.providers.models.find("anthropic", "default").is_none());
+        assert!(cfg.providers.models.find("anthropic", "prod").is_some());
+        assert_eq!(
+            cfg.agents["researcher"].model_provider.as_str(),
+            "anthropic.prod"
+        );
+        assert_eq!(
+            cfg.agents["researcher"].classifier_provider.as_str(),
+            "anthropic.prod"
+        );
+        assert_eq!(cfg.model_routes[0].model_provider, "anthropic.prod");
+        let fast_fallback: Vec<String> = cfg
+            .providers
+            .models
+            .iter_entries()
+            .filter(|(_, al, _)| *al == "fast")
+            .flat_map(|(_, _, p)| p.fallback.iter().map(|f| f.as_str().to_string()))
+            .collect();
+        assert_eq!(
+            fast_fallback,
+            vec!["anthropic.prod".to_string()],
+            "fallback rewritten"
+        );
+        assert!(find_all_references(&cfg, &kind, "default").is_empty());
+    }
+
+    #[test]
+    fn rename_channel_rewrites_refs_and_preserves_bare_group_membership() {
+        let mut cfg = empty_config();
+        cfg.create_map_key("channels.discord", "main").unwrap();
+        // member of a BARE-type group whose only discord channel is the target:
+        // delete would REFUSE (orphan), but rename keeps membership valid.
+        cfg.agents.insert(
+            "ops".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["discord.main".into()],
+                ..Default::default()
+            },
+        );
+        let mut group = PeerGroupConfig {
+            channel: "discord".into(), // bare type
+            ..Default::default()
+        };
+        group.agents.push(AgentAlias::new("ops"));
+        cfg.peer_groups.insert("crew".to_string(), group);
+        // also a dotted peer-group channel + an alert channel
+        cfg.peer_groups.insert(
+            "ops_team".to_string(),
+            PeerGroupConfig {
+                channel: "discord.main".into(), // dotted HARD ref — rewritten
+                ..Default::default()
+            },
+        );
+        cfg.escalation
+            .alert_channels
+            .push("discord.main".to_string());
+
+        let kind = channel_kind();
+        let report = rename_with_cascade(&mut cfg, &kind, "main", "primary")
+            .expect("channel rename succeeds (no orphan, unlike delete)");
+        assert_eq!(report.new_alias, "primary");
+        assert!(!has_channel(&cfg, "main"));
+        assert!(has_channel(&cfg, "primary"));
+        assert_eq!(
+            cfg.agents["ops"]
+                .channels
+                .iter()
+                .map(|c| c.as_str())
+                .collect::<Vec<_>>(),
+            vec!["discord.primary"],
+            "member still has a discord.* channel — membership preserved"
+        );
+        assert_eq!(
+            cfg.peer_groups["ops_team"].channel.as_str(),
+            "discord.primary"
+        );
+        assert_eq!(
+            cfg.escalation.alert_channels,
+            vec!["discord.primary".to_string()]
+        );
+        assert!(find_all_references(&cfg, &kind, "main").is_empty());
+    }
+
+    #[test]
+    fn rename_tts_provider_rewrites_scalar() {
+        let mut cfg = empty_config();
+        cfg.create_map_key("providers.tts.elevenlabs", "default")
+            .expect("create tts entry");
+        cfg.agents.insert(
+            "voice".to_string(),
+            AliasedAgentConfig {
+                tts_provider: "elevenlabs.default".into(),
+                ..Default::default()
+            },
+        );
+        let kind = AliasKind::Provider {
+            category: ProviderCategory::Tts,
+            family: "elevenlabs".to_string(),
+        };
+        let report = rename_with_cascade(&mut cfg, &kind, "default", "studio")
+            .expect("tts provider rename succeeds");
+        assert!(report.dirty_paths.iter().any(|p| p == "agents.voice"));
+        assert!(
+            report
+                .dirty_paths
+                .iter()
+                .any(|p| p == "providers.tts.elevenlabs.studio")
+        );
+        assert_eq!(
+            cfg.agents["voice"].tts_provider.as_str(),
+            "elevenlabs.studio"
+        );
+        assert!(find_all_references(&cfg, &kind, "default").is_empty());
     }
 }
