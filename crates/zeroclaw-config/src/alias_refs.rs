@@ -954,6 +954,65 @@ fn rewrite_channel_refs(cfg: &mut Config, channel_type: &str, old: &str, new: &s
     dirty
 }
 
+// ── skill bundles (#7468/#7175) ─────────────────────────────────────────────
+// A skill bundle (`[skill_bundles.<alias>]`) has a single SOFT referrer
+// container: each agent's `skill_bundles: Vec<String>` list (validate() trims,
+// schema.rs ~17272). There is no HARD ref (an agent runs fine with an empty
+// bundle list), so bundles don't warrant an `AliasKind` variant — these three
+// standalone fns mirror the channel arm, flattened to the one container.
+
+/// Enumerate every agent that references skill bundle `alias` (TRIM-matched, as
+/// `Config::validate()` does). All refs are SOFT (droppable from the list).
+#[must_use]
+pub fn find_bundle_refs(cfg: &Config, alias: &str) -> Vec<RefSite> {
+    let mut sites = Vec::new();
+    for (name, agent) in sorted_agents(cfg) {
+        for (i, b) in agent.skill_bundles.iter().enumerate() {
+            if b.trim() == alias {
+                sites.push(RefSite::soft(
+                    format!("agents.{name}.skill_bundles[{i}]"),
+                    ScrubAction::DropFromVec { index: i },
+                    b.as_str(),
+                ));
+            }
+        }
+    }
+    sites
+}
+
+/// Mutating mirror of [`find_bundle_refs`] for delete: drop `alias` from every
+/// agent's `skill_bundles` list. Returns the touched `agents.<name>` dirty paths.
+pub fn scrub_bundle_refs(cfg: &mut Config, alias: &str) -> Vec<String> {
+    let mut dirty = Vec::new();
+    for (name, agent) in cfg.agents.iter_mut() {
+        let before = agent.skill_bundles.len();
+        agent.skill_bundles.retain(|b| b.trim() != alias);
+        if agent.skill_bundles.len() != before {
+            dirty.push(format!("agents.{name}"));
+        }
+    }
+    dirty
+}
+
+/// Mutating mirror for rename: rewrite every agent's `skill_bundles` entry
+/// naming `old` to name `new`. Returns the touched `agents.<name>` dirty paths.
+pub fn rewrite_bundle_refs(cfg: &mut Config, old: &str, new: &str) -> Vec<String> {
+    let mut dirty = Vec::new();
+    for (name, agent) in cfg.agents.iter_mut() {
+        let mut touched = false;
+        for b in agent.skill_bundles.iter_mut() {
+            if b.trim() == old {
+                *b = new.to_string();
+                touched = true;
+            }
+        }
+        if touched {
+            dirty.push(format!("agents.{name}"));
+        }
+    }
+    dirty
+}
+
 // ── deterministic iteration over the alias-keyed maps ───────────────────────
 // `Config::agents` / `peer_groups` are HashMaps; sort by key so RefSite order
 // is stable across runs (tests + dashboard binding depend on it).
@@ -2751,5 +2810,46 @@ mod tests {
             dirty.contains(&"heartbeat.agent".to_string()),
             "cleared heartbeat: {dirty:?}"
         );
+    }
+
+    #[test]
+    fn bundle_refs_find_scrub_rewrite() {
+        let mut cfg = empty_config();
+        cfg.agents.insert(
+            "a".to_string(),
+            AliasedAgentConfig {
+                skill_bundles: vec!["util".to_string(), "web".to_string()],
+                ..Default::default()
+            },
+        );
+        cfg.agents.insert(
+            "b".to_string(),
+            AliasedAgentConfig {
+                skill_bundles: vec![" util ".to_string()], // padded — validate trims
+                ..Default::default()
+            },
+        );
+
+        // find (trim-matched across both agents)
+        let sites = find_bundle_refs(&cfg, "util");
+        assert_eq!(sites.len(), 2, "{sites:?}");
+        assert!(sites.iter().all(|s| s.strength == RefStrength::Soft));
+
+        // rewrite util -> tools
+        let dirty = rewrite_bundle_refs(&mut cfg, "util", "tools");
+        assert_eq!(dirty.len(), 2);
+        assert_eq!(
+            cfg.agents["a"].skill_bundles,
+            vec!["tools".to_string(), "web".to_string()]
+        );
+        assert_eq!(cfg.agents["b"].skill_bundles, vec!["tools".to_string()]);
+        assert!(find_bundle_refs(&cfg, "util").is_empty());
+
+        // scrub tools from all agents
+        let dirty = scrub_bundle_refs(&mut cfg, "tools");
+        assert_eq!(dirty.len(), 2);
+        assert_eq!(cfg.agents["a"].skill_bundles, vec!["web".to_string()]);
+        assert!(cfg.agents["b"].skill_bundles.is_empty());
+        assert!(find_bundle_refs(&cfg, "tools").is_empty());
     }
 }

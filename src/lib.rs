@@ -521,10 +521,21 @@ pub enum SkillBundleCommands {
         #[arg(long)]
         directory: Option<String>,
     },
-    /// Remove a configured skill bundle
+    /// Remove a configured skill bundle (archives its directory + strips it
+    /// from every agent's `skill_bundles` list)
     Remove {
         /// Bundle alias
         alias: String,
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Rename a skill bundle (moves its directory + rewrites agent references)
+    Rename {
+        /// Current alias
+        from: String,
+        /// New alias
+        to: String,
     },
     /// Show metadata + skill list for a bundle
     Show {
