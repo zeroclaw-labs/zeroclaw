@@ -1336,17 +1336,15 @@ mod tests {
         check_config_semantics(&config, &mut items);
 
         let invalid = items.iter().find(|i| {
-            i.message
-                .contains("model_provider \"custom.vllm\" is invalid")
+            i.message.contains("model_provider \"custom.vllm\" is invalid")
         });
         assert!(
             invalid.is_none(),
-            "custom provider with uri set must not be flagged invalid: {invalid:?}"
+            "custom provider with uri set must not be flagged invalid"
         );
-        let valid = items.iter().find(|i| {
-            i.message
-                .contains("model_provider \"custom.vllm\" is valid")
-        });
+        let valid = items
+            .iter()
+            .find(|i| i.message.contains("model_provider \"custom.vllm\" is valid"));
         assert!(valid.is_some(), "expected a valid diag for custom.vllm");
         assert_eq!(valid.unwrap().severity, Severity::Ok);
     }
@@ -1366,8 +1364,7 @@ mod tests {
         check_config_semantics(&config, &mut items);
 
         let invalid = items.iter().find(|i| {
-            i.message
-                .contains("model_provider \"custom.vllm\" is invalid")
+            i.message.contains("model_provider \"custom.vllm\" is invalid")
         });
         assert!(
             invalid.is_some(),
@@ -1402,12 +1399,11 @@ mod tests {
         check_config_semantics(&config, &mut items);
 
         let bad = items.iter().find(|i| {
-            i.message
-                .contains("agent \"coding\" uses invalid model_provider \"custom\"")
+            i.message.contains("agent \"coding\" uses invalid model_provider \"custom\"")
         });
         assert!(
             bad.is_none(),
-            "agent referencing custom.vllm with uri set must not be flagged: {bad:?}"
+            "agent referencing custom.vllm with uri set must not be flagged"
         );
     }
 
