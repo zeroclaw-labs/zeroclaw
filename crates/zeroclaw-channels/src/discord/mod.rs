@@ -18,6 +18,12 @@ use zeroclaw_api::channel::{
 use zeroclaw_api::media::MediaAttachment;
 use zeroclaw_runtime::i18n;
 
+mod types;
+// Keep the historical public path (`…::discord::DiscordSlashCommandSpec`) stable.
+pub use types::{DiscordSlashCommandResolver, DiscordSlashCommandSpec};
+// Contract types/codec/consts used throughout this module and its siblings.
+pub(crate) use types::*;
+
 /// Discord channel — connects via Gateway WebSocket for real-time messages
 pub struct DiscordChannel {
     bot_token: String,
@@ -120,27 +126,6 @@ struct DiscordGatewaySession {
     resume_gateway_url: Option<String>,
     sequence: Option<i64>,
 }
-
-#[derive(Debug)]
-pub(crate) struct DiscordListenerFatalError {
-    message: String,
-}
-
-impl DiscordListenerFatalError {
-    pub(crate) fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-impl std::fmt::Display for DiscordListenerFatalError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for DiscordListenerFatalError {}
 
 impl DiscordChannel {
     pub fn new(
@@ -1557,49 +1542,6 @@ async fn delete_discord_message(
 // All REST here is invoked from spawned tasks, never inline on the listen
 // loop, so it can't starve the gateway heartbeat.
 
-/// Reply-target sentinel prefix marking a ChannelMessage that must be answered
-/// via the interaction followup webhook rather than a normal channel message.
-pub(crate) const DISCORD_INTERACTION_PREFIX: &str = "interaction:";
-
-/// Build the sentinel reply target carrying only the interaction id. The
-/// bearer token deliberately never enters the reply target: reply targets
-/// flow into logs, session keys (and thus on-disk filenames), and memory
-/// rows — `send()` resolves the credentials from the channel-local
-/// `pending_interactions` store instead.
-fn discord_interaction_reply_target(interaction_id: &str) -> String {
-    format!("{DISCORD_INTERACTION_PREFIX}{interaction_id}")
-}
-
-/// Parse `interaction:{interaction_id}` back into the id. Rejects empty ids
-/// and anything with extra segments (the legacy `app:token` form must never
-/// round-trip as valid).
-pub(crate) fn parse_discord_interaction_target(target: &str) -> Option<&str> {
-    let id = target.strip_prefix(DISCORD_INTERACTION_PREFIX)?;
-    if id.is_empty() || id.contains(':') {
-        return None;
-    }
-    Some(id)
-}
-
-/// A slash command derived from an installed skill. `slug` is the Discord
-/// command name; `skill_name` is the skill's manifest name (sanitized of
-/// quotes and newlines at spec-build time, since it is interpolated into
-/// the synthesized agent prompt); `description` is truncated to Discord's
-/// 100-char limit.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiscordSlashCommandSpec {
-    pub skill_name: String,
-    pub slug: String,
-    pub description: String,
-}
-
-/// Resolves the current skill-derived command set from canonical state at
-/// READY/interaction time. No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE
-/// SOURCE OF TRUTH") — skills install/uninstall at runtime. The loader does
-/// blocking file IO, so callers must run it via `spawn_blocking`, never on
-/// the gateway listen loop.
-pub type DiscordSlashCommandResolver = Arc<dyn Fn() -> Vec<DiscordSlashCommandSpec> + Send + Sync>;
-
 /// Discord caps an application at 100 global commands; stay under it with
 /// headroom for `/ask` and future built-ins.
 const MAX_SKILL_SLASH_COMMANDS: usize = 90;
@@ -1800,16 +1742,6 @@ fn command_projection(cmd: &serde_json::Value) -> serde_json::Value {
 
 /// Discord REST base; injectable in `reconcile_slash_commands` for tests.
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
-
-/// Outcome of a slash-command reconcile pass.
-#[derive(Debug)]
-enum ReconcileOutcome {
-    /// The command set was reconciled (or was already current).
-    Reconciled,
-    /// Discord rate-limited the pass; the caller must persist this cooldown and
-    /// not retry until the given unix-seconds deadline.
-    RateLimited { until: i64 },
-}
 
 /// Turn a `429` response into a unix-seconds deadline before which no further
 /// reconcile should run, reading Discord's `retry_after` body / headers.
@@ -2127,10 +2059,6 @@ async fn discord_edit_interaction_response(
 
 const BASE64_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/// Discord's maximum message length for regular messages.
-///
-/// Discord rejects longer payloads with `50035 Invalid Form Body`.
-const DISCORD_MAX_MESSAGE_LENGTH: usize = 2000;
 /// Upper bound for an archived message entry once edit markers accrue.
 /// Edits are remote-controlled and unlimited; past this size the middle of
 /// the edit history is dropped (original text and latest edit retained).
