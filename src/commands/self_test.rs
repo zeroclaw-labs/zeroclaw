@@ -427,13 +427,11 @@ async fn check_websocket_handshake(config: &crate::config::Config) -> CheckResul
 
     let port = config.gateway.port;
     let (probe_host, _) = resolve_probe_host(&config.gateway.host);
-    let agent_alias = config
-        .agents
-        .keys()
-        .next()
-        .cloned()
-        .unwrap_or_else(|| "default".to_string());
-    let mut probe_url = format!("ws://{probe_host}:{port}/ws/chat?agent={agent_alias}");
+    let mut probe_url = if let Some(alias) = config.agents.keys().next() {
+        format!("ws://{probe_host}:{port}/ws/chat?agent={alias}")
+    } else {
+        format!("ws://{probe_host}:{port}/ws/chat")
+    };
     let display_url = format_probe_url("ws", &config.gateway.host, port, "/ws/chat");
 
     if config.gateway.require_pairing {
