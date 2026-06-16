@@ -93,6 +93,7 @@ struct TurnGuard {
     turn_id: Option<String>,
     turn_started_at: Instant,
     agent_alias: Option<String>,
+    channel_name: String,
     total_input_tokens: u64,
     total_output_tokens: u64,
     saw_usage: bool,
@@ -116,7 +117,7 @@ impl TurnGuard {
                 },
             ),
             cost_usd: None,
-            channel: None,
+            channel: Some(self.channel_name.clone()),
             agent_alias: self.agent_alias.clone(),
             turn_id: self.turn_id.clone(),
         });
@@ -202,6 +203,9 @@ pub struct Agent {
     /// at most once per session even though the multimodal pipeline re-walks
     /// the full conversation history on every turn and tool iteration.
     image_cache: zeroclaw_providers::multimodal::LocalImageCache,
+    /// Channel name stamped onto observer events to identify the calling surface
+    /// (e.g. "agent", "wss", "gateway"). Defaults to "agent" for direct Agent callers.
+    channel_name: String,
 }
 
 impl Drop for Agent {
@@ -318,6 +322,7 @@ pub struct AgentBuilder {
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
     approval_manager: Option<Arc<ApprovalManager>>,
     agent_alias: Option<String>,
+    channel_name: Option<String>,
     exclude_memory: bool,
 }
 
@@ -360,6 +365,7 @@ impl AgentBuilder {
             hook_runner: None,
             approval_manager: None,
             agent_alias: None,
+            channel_name: None,
             exclude_memory: false,
         }
     }
@@ -536,6 +542,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn channel_name(mut self, name: String) -> Self {
+        self.channel_name = Some(name);
+        self
+    }
+
     /// Exclude persistent memory from this agent. When set, the memory
     /// backend is replaced with `NoneMemory`, auto-save is forced off, and
     /// all `memory_*` tools are stripped from the tool set. Used by ACP
@@ -687,6 +698,7 @@ impl AgentBuilder {
             agent_alias: self.agent_alias.unwrap_or_default(),
             channel_handles: AgentChannelHandles::default(),
             image_cache: zeroclaw_providers::multimodal::LocalImageCache::new(),
+            channel_name: self.channel_name.unwrap_or_else(|| "agent".to_string()),
         })
     }
 }
@@ -704,6 +716,10 @@ impl Agent {
         }
 
         crate::agent::loop_::ToolLoopCostTrackingContext::usage_only()
+    }
+
+    pub fn set_channel_name(&mut self, name: String) {
+        self.channel_name = name;
     }
 
     fn new_turn_id() -> String {
@@ -1967,7 +1983,7 @@ impl Agent {
         self.observer.record_event(&ObserverEvent::AgentStart {
             model_provider: self.model_provider_name.clone(),
             model: effective_model.clone(),
-            channel: None,
+            channel: Some(self.channel_name.clone()),
             agent_alias: self.observer_agent_alias(),
             turn_id: Some(turn_id.clone()),
         });
@@ -1979,6 +1995,7 @@ impl Agent {
             turn_id: Some(turn_id.clone()),
             turn_started_at,
             agent_alias: self.observer_agent_alias(),
+            channel_name: self.channel_name.clone(),
             total_input_tokens: 0,
             total_output_tokens: 0,
             saw_usage: false,
@@ -2035,6 +2052,7 @@ impl Agent {
         let receipt_scope = crate::agent::tool_receipts::ReceiptScope::from_config(
             &self.config.resolved.tool_receipts,
         );
+        let agent_alias_for_loop = self.observer_agent_alias();
         let loop_result = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
                 Some(cost_context.clone()),
@@ -2077,7 +2095,7 @@ impl Agent {
                             },
                         ),
                         history: &mut loop_history,
-                        channel_name: "cli",
+                        channel_name: &self.channel_name,
                         channel_reply_target: None,
                         cancellation_token: None,
                         on_delta: None,
@@ -2093,8 +2111,11 @@ impl Agent {
                         // Phase 1: stamp Internal/Trusted. Real per-transport
                         // stamping is PR C (RFC #6971 §4).
                         ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                        agent_alias: agent_alias_for_loop.as_deref(),
+                        turn_id: &turn_id,
                     }),
                 ),
+            )
             )
             .await;
 
@@ -2332,7 +2353,7 @@ impl Agent {
         self.observer.record_event(&ObserverEvent::AgentStart {
             model_provider: self.model_provider_name.clone(),
             model: effective_model.clone(),
-            channel: None,
+            channel: Some(self.channel_name.clone()),
             agent_alias: self.observer_agent_alias(),
             turn_id: Some(turn_id.clone()),
         });
@@ -2344,6 +2365,7 @@ impl Agent {
             turn_id: Some(turn_id.clone()),
             turn_started_at,
             agent_alias: self.observer_agent_alias(),
+            channel_name: self.channel_name.clone(),
             total_input_tokens: 0,
             total_output_tokens: 0,
             saw_usage: false,
@@ -2403,6 +2425,7 @@ impl Agent {
         };
 
         let cost_context = self.tool_loop_cost_tracking_context();
+        let agent_alias_for_loop = self.observer_agent_alias();
 
         // Built once per turn so the HMAC key is stable across steering rounds
         // and the same collector accumulates every round's receipts. `None`
@@ -2494,7 +2517,7 @@ impl Agent {
                                 },
                             ),
                             history: &mut loop_history,
-                            channel_name: "cli",
+                            channel_name: &self.channel_name,
                             channel_reply_target: None,
                             cancellation_token: cancel_token.clone(),
                             on_delta: None,
@@ -2510,8 +2533,11 @@ impl Agent {
                             // Phase 1: stamp Internal/Trusted. Real per-transport
                             // stamping is PR C (RFC #6971 §4).
                             ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                            agent_alias: agent_alias_for_loop.as_deref(),
+                            turn_id: &turn_id,
                         }),
                     ),
+                )
                 )
                 .await;
 
@@ -2522,7 +2548,7 @@ impl Agent {
             if usage.input_tokens > 0 || usage.output_tokens > 0 {
                 guard.total_input_tokens = usage.input_tokens;
                 guard.total_output_tokens = usage.output_tokens;
-                guard.saw_usage = true;
+                guard.saw_usage = true
             }
 
             // Replay everything the loop appended this round into the
@@ -2740,7 +2766,7 @@ pub async fn run(
     agent.observer.record_event(&ObserverEvent::AgentStart {
         model_provider: provider_name.clone(),
         model: model_name.clone(),
-        channel: None,
+        channel: Some(agent.channel_name.clone()),
         agent_alias: None,
         turn_id: None,
     });
@@ -2752,6 +2778,7 @@ pub async fn run(
         turn_id: None,
         turn_started_at: start,
         agent_alias: None,
+        channel_name: agent.channel_name.clone(),
         total_input_tokens: 0,
         total_output_tokens: 0,
         saw_usage: false,
@@ -6820,8 +6847,69 @@ mod tests {
             | ObserverEvent::LlmRequest { turn_id, .. }
             | ObserverEvent::LlmResponse { turn_id, .. }
             | ObserverEvent::AgentEnd { turn_id, .. }
-            | ObserverEvent::ToolCall { turn_id, .. } => turn_id.as_deref(),
+            | ObserverEvent::ToolCall { turn_id, .. }
+            | ObserverEvent::ToolCallStart { turn_id, .. } => turn_id.as_deref(),
             _ => None,
+        }
+    }
+
+    fn assert_all_events_share_turn_id(
+        events: &[ObserverEvent],
+        expected_alias: Option<&str>,
+        expected_channel: Option<&str>,
+    ) {
+        let turn_ids: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                ObserverEvent::AgentStart { turn_id, .. }
+                | ObserverEvent::LlmRequest { turn_id, .. }
+                | ObserverEvent::LlmResponse { turn_id, .. }
+                | ObserverEvent::ToolCallStart { turn_id, .. }
+                | ObserverEvent::ToolCall { turn_id, .. }
+                | ObserverEvent::AgentEnd { turn_id, .. } => turn_id.clone(),
+                _ => None,
+            })
+            .collect();
+
+        assert!(!turn_ids.is_empty(), "expected turn events with turn_id");
+        let first = &turn_ids[0];
+        assert!(
+            turn_ids.iter().all(|id| id == first),
+            "all turn_ids should be consistent"
+        );
+
+        if let Some(alias) = expected_alias {
+            for e in events {
+                match e {
+                    ObserverEvent::LlmRequest { agent_alias, .. }
+                    | ObserverEvent::LlmResponse { agent_alias, .. }
+                    | ObserverEvent::ToolCallStart { agent_alias, .. }
+                    | ObserverEvent::ToolCall { agent_alias, .. } => {
+                        assert_eq!(
+                            agent_alias.as_deref(),
+                            Some(alias),
+                            "agent_alias should be consistent"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if let Some(channel) = expected_channel {
+            for e in events {
+                match e {
+                    ObserverEvent::AgentStart { channel: ch, .. }
+                    | ObserverEvent::LlmRequest { channel: ch, .. }
+                    | ObserverEvent::LlmResponse { channel: ch, .. }
+                    | ObserverEvent::ToolCallStart { channel: ch, .. }
+                    | ObserverEvent::ToolCall { channel: ch, .. }
+                    | ObserverEvent::AgentEnd { channel: ch, .. } => {
+                        assert_eq!(ch.as_deref(), Some(channel), "channel should be consistent");
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -7296,12 +7384,6 @@ mod tests {
         let _ = agent.turn("test").await.expect("turn should succeed");
 
         let events = capturing.events.lock();
-        let turn_ids: Vec<&str> = events.iter().filter_map(observer_event_turn_id).collect();
-        assert!(!turn_ids.is_empty(), "turn events should carry turn_id");
-        let first = turn_ids[0];
-        assert!(
-            turn_ids.iter().all(|turn_id| *turn_id == first),
-            "all turn_ids should be consistent"
-        );
+        assert_all_events_share_turn_id(&events, None, Some("agent"));
     }
 }
