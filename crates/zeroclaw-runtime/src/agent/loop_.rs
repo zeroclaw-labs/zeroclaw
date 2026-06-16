@@ -11265,9 +11265,7 @@ Let me check the result."#;
 
     #[tokio::test]
     async fn cost_tracking_records_usage_when_scoped() {
-        use super::{
-            TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, run_tool_call_loop,
-        };
+        use super::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
         use crate::cost::CostTracker;
         use crate::observability::noop::NoopObserver;
         use std::collections::HashMap;
@@ -11414,9 +11412,7 @@ Let me check the result."#;
 
     #[tokio::test]
     async fn cost_tracking_enforces_budget() {
-        use super::{
-            TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, run_tool_call_loop,
-        };
+        use super::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
         use crate::cost::CostTracker;
         use crate::observability::noop::NoopObserver;
         use std::collections::HashMap;
@@ -11497,7 +11493,6 @@ Let me check the result."#;
 
     #[tokio::test]
     async fn cost_tracking_is_noop_without_scope() {
-        use super::run_tool_call_loop;
         use crate::observability::noop::NoopObserver;
 
         // No TOOL_LOOP_COST_TRACKING_CONTEXT scoped — should run fine
