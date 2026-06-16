@@ -113,9 +113,10 @@ pub fn assemble(root: &std::path::Path, tag: Option<&str>) -> anyhow::Result<()>
     println!("==> Assembling site (rustdoc + locale redirect)");
     let book = book_dir(root);
     let tag_dir = tag.unwrap_or(DEFAULT_TAG);
-    let api_dest = book.join("book").join(tag_dir).join("api");
+    let api_dest = book.join("book").join("api");
     let _ = std::fs::remove_dir_all(&api_dest);
     copy_dir_all(doc_dir(root), &api_dest)?;
+    prune_rustdoc_source_view(&api_dest)?;
 
     const INDEX_HTML: &str = "<!doctype html>\n<meta charset=\"utf-8\">\n<meta http-equiv=\"refresh\" content=\"0; url=./en/\">\n<link rel=\"canonical\" href=\"./en/\">\n<title>ZeroClaw Docs</title>\n";
     let out_dir = book.join("book").join(tag_dir);
@@ -129,6 +130,26 @@ pub fn assemble(root: &std::path::Path, tag: Option<&str>) -> anyhow::Result<()>
     let shared_dir = book.join("book").join("_shared");
     extract_shared_chrome(&version_dir, &shared_dir)?;
     Ok(())
+}
+
+pub fn prune_rustdoc_source_view(api_dir: &Path) -> anyhow::Result<()> {
+    let src_view = api_dir.join("src");
+    if src_view.exists() {
+        std::fs::remove_dir_all(&src_view)?;
+    }
+    Ok(())
+}
+
+pub fn strip_chrome_hash(file_name: &str) -> Option<String> {
+    let pos = file_name.rfind('-')?;
+    let rel_dot = file_name[pos + 1..].find('.')?;
+    let ext_pos = pos + 1 + rel_dot;
+    let hash = &file_name[pos + 1..ext_pos];
+    if hash.len() == 8 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(format!("{}{}", &file_name[..pos], &file_name[ext_pos..]))
+    } else {
+        None
+    }
 }
 
 pub fn extract_shared_chrome(version_dir: &Path, shared_dir: &Path) -> anyhow::Result<()> {
@@ -158,6 +179,7 @@ pub fn extract_shared_chrome(version_dir: &Path, shared_dir: &Path) -> anyhow::R
         "favicon",
         "theme/pc-themes",
         "theme/pc-enhance",
+        "mermaid",
     ];
 
     let walk_dir = |dir: &Path| -> Vec<std::path::PathBuf> {
@@ -186,21 +208,14 @@ pub fn extract_shared_chrome(version_dir: &Path, shared_dir: &Path) -> anyhow::R
                 continue;
             }
             let file_name = file.file_name().unwrap().to_string_lossy();
-            if let Some(pos) = file_name.rfind('-')
-                && let Some(ext_pos) = file_name.rfind('.')
-                && pos < ext_pos
-            {
-                let hash = &file_name[pos + 1..ext_pos];
-                if hash.len() == 8 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
-                    let unhashed_name = format!("{}{}", &file_name[..pos], &file_name[ext_pos..]);
-                    let dest_rel = rel.parent().unwrap().join(unhashed_name);
-                    let dest = shared_dir.join(&dest_rel);
-                    std::fs::create_dir_all(dest.parent().unwrap())?;
-                    std::fs::copy(&file, &dest)?;
-                    let dest_rel_str = dest_rel.to_string_lossy().replace('\\', "/");
-                    // Store (locale-relative hashed path, unhashed shared-relative path).
-                    replacements.push((rel_str.clone(), dest_rel_str));
-                }
+            if let Some(unhashed_name) = strip_chrome_hash(&file_name) {
+                let dest_rel = rel.parent().unwrap().join(unhashed_name);
+                let dest = shared_dir.join(&dest_rel);
+                std::fs::create_dir_all(dest.parent().unwrap())?;
+                std::fs::copy(&file, &dest)?;
+                let dest_rel_str = dest_rel.to_string_lossy().replace('\\', "/");
+                // Store (locale-relative hashed path, unhashed shared-relative path).
+                replacements.push((rel_str.clone(), dest_rel_str));
             }
         }
     }
@@ -253,4 +268,37 @@ pub fn extract_shared_chrome(version_dir: &Path, shared_dir: &Path) -> anyhow::R
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_chrome_hash;
+
+    #[test]
+    fn strips_single_extension_hash() {
+        assert_eq!(
+            strip_chrome_hash("custom-abc12345.css").as_deref(),
+            Some("custom.css")
+        );
+    }
+
+    #[test]
+    fn strips_compound_extension_hash() {
+        assert_eq!(
+            strip_chrome_hash("mermaid-193ae996.min.js").as_deref(),
+            Some("mermaid.min.js")
+        );
+    }
+
+    #[test]
+    fn ignores_unhashed_names() {
+        assert_eq!(strip_chrome_hash("mermaid-init.js"), None);
+        assert_eq!(strip_chrome_hash("chrome.css"), None);
+    }
+
+    #[test]
+    fn ignores_non_hex_or_wrong_length() {
+        assert_eq!(strip_chrome_hash("foo-1234567.js"), None);
+        assert_eq!(strip_chrome_hash("foo-zzzzzzzz.js"), None);
+    }
 }
