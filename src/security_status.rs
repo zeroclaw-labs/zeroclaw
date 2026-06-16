@@ -74,7 +74,7 @@ pub fn build_report(config: &Config, agent_alias: &str) -> Result<SecurityStatus
     let sandbox_config = sandbox_config_from_policy(&resolved.policy);
     let sandbox = zeroclaw_runtime::security::sandbox_posture(
         &sandbox_config,
-        &config.runtime.kind,
+        config.runtime.kind.as_wire(),
         Some(&resolved.policy.workspace_dir),
     );
 
@@ -463,7 +463,7 @@ mod tests {
         config.agents.insert(
             agent.to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
-                risk_profile: profile_alias.to_string(),
+                risk_profile: profile_alias.into(),
                 ..Default::default()
             },
         );
@@ -525,14 +525,14 @@ mod tests {
         config.agents.insert(
             "docs".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
-                risk_profile: "ops-risk".to_string(),
+                risk_profile: "ops-risk".into(),
                 ..Default::default()
             },
         );
         config.agents.insert(
             "writer".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
-                risk_profile: "ops-risk".to_string(),
+                risk_profile: "ops-risk".into(),
                 ..Default::default()
             },
         );
