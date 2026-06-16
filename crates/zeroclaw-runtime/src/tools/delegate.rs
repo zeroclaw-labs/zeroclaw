@@ -565,7 +565,7 @@ impl DelegateTool {
 
         let mut resolved = agent_config.resolved.clone();
 
-        if let Some(profile) = self.runtime_profiles.get(&agent_config.runtime_profile) {
+        if let Some(profile) = self.runtime_profiles.get(agent_config.runtime_profile.as_str()) {
             if profile.max_tool_iterations > 0 {
                 resolved.max_tool_iterations = profile.max_tool_iterations;
             }
@@ -847,10 +847,10 @@ impl DelegateTool {
         };
 
         // Resolve profile references
-        let max_depth = self.resolve_max_depth(&agent_config.runtime_profile);
+        let max_depth = self.resolve_max_depth(agent_config.runtime_profile.as_str());
         let (provider_type, credential, model, temperature) =
             self.resolve_brain(&agent_config.model_provider);
-        let agentic = self.resolve_agentic(&agent_config.runtime_profile);
+        let agentic = self.resolve_agentic(agent_config.runtime_profile.as_str());
 
         // Check recursion depth (immutable — set at construction, incremented for sub-agents)
         if self.depth >= max_depth {
@@ -938,7 +938,7 @@ impl DelegateTool {
 
         // Wrap the model_provider call in a timeout to prevent indefinite blocking
         let timeout_secs = self
-            .resolve_delegation_timeout(&agent_config.runtime_profile)
+            .resolve_delegation_timeout(agent_config.runtime_profile.as_str())
             .unwrap_or(self.delegate_config.timeout_secs);
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
@@ -1013,7 +1013,7 @@ impl DelegateTool {
             }
         };
 
-        let max_depth = self.resolve_max_depth(&agent_config.runtime_profile);
+        let max_depth = self.resolve_max_depth(agent_config.runtime_profile.as_str());
         if self.depth >= max_depth {
             return Ok(ToolResult {
                 success: false,
@@ -1805,7 +1805,7 @@ impl DelegateTool {
         let noop_observer = NoopObserver;
 
         let agentic_timeout_secs = self
-            .resolve_agentic_timeout_secs(&agent_config.runtime_profile)
+            .resolve_agentic_timeout_secs(agent_config.runtime_profile.as_str())
             .unwrap_or(self.delegate_config.agentic_timeout_secs);
         // Forward the per-turn receipt scope from the parent loop so subagent
         // tool calls land in the same collector as the top-level turn. When
@@ -2322,7 +2322,7 @@ mod tests {
         AliasedAgentConfig {
             model_provider: "openrouter.agentic".into(),
             risk_profile: "agentic_test".to_string(),
-            runtime_profile: "agentic_test".to_string(),
+            runtime_profile: RuntimeProfileRef::new("agentic_test"),
             ..Default::default()
         }
     }
@@ -2440,7 +2440,7 @@ mod tests {
         let target_config = AliasedAgentConfig {
             model_provider: "custom.local".into(),
             risk_profile: "agentic_test".to_string(),
-            runtime_profile: "agentic_test".to_string(),
+            runtime_profile: RuntimeProfileRef::new("agentic_test"),
             ..AliasedAgentConfig::default()
         };
         root_config
@@ -4417,7 +4417,7 @@ mod tests {
             caller_alias.to_string(),
             AliasedAgentConfig {
                 risk_profile: "narrow".to_string(),
-                runtime_profile: "narrow".to_string(),
+                runtime_profile: RuntimeProfileRef::new("narrow"),
                 model_provider: "ollama.caller".into(),
                 ..AliasedAgentConfig::default()
             },
@@ -4426,7 +4426,7 @@ mod tests {
             target_alias.to_string(),
             AliasedAgentConfig {
                 risk_profile: pick(target_max_actions > caller_max_actions),
-                runtime_profile: pick(target_max_actions > caller_max_actions),
+                runtime_profile: RuntimeProfileRef::new(pick(target_max_actions > caller_max_actions)),
                 model_provider: "ollama.target".into(),
                 ..AliasedAgentConfig::default()
             },
