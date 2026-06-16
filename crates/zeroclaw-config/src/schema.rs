@@ -562,8 +562,9 @@ pub struct Config {
     /// Fluent `.ftl` locale files. Falls back to embedded English, then to
     /// hardcoded descriptions.
     ///
-    /// If omitted or empty, the locale is auto-detected from `ZEROCLAW_LOCALE`,
-    /// `LANG`, or `LC_ALL` environment variables (defaulting to `"en"`).
+    /// If omitted or empty, the locale is auto-detected from the
+    /// `ZEROCLAW_LOCALE`, `LC_ALL`, `LC_MESSAGES`, or `LANG` environment
+    /// variables, in that precedence order (defaulting to `"en"`).
     #[serde(default)]
     pub locale: Option<String>,
 

@@ -29,6 +29,7 @@ zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.8.0" }
 zerocode = { path = "apps/zerocode", version = "0.8.0-beta-2" }
 aardvark-sys = { path = "crates/aardvark-sys", version = "0.1.0" }
 directories = "6.0"
+sys-locale = "0.3"
 
 [package]
 name = "zeroclawlabs"

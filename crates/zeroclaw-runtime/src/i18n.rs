@@ -275,9 +275,50 @@ fn load_ftl_with_reader(
     None
 }
 
-/// Detect locale: config.toml → "en".
+/// Detect locale: config.toml → system locale env vars → "en".
 pub fn detect_locale() -> String {
-    locale_from_config().unwrap_or_else(|| "en".to_string())
+    locale_from_config()
+        .or_else(locale_from_system_env)
+        .unwrap_or_else(|| "en".to_string())
+}
+
+/// Auto-detect locale from the host environment when config sets none.
+/// Checked in gettext-style precedence: `ZEROCLAW_LOCALE` (an explicit
+/// app-level override) first, then the POSIX locale variables in their
+/// usual precedence order (`LC_ALL` > `LC_MESSAGES` > `LANG`). Falls back to
+/// an OS-level locale query for platforms (notably native Windows consoles)
+/// that don't set any of those env vars.
+fn locale_from_system_env() -> Option<String> {
+    ["ZEROCLAW_LOCALE", "LC_ALL", "LC_MESSAGES", "LANG"]
+        .into_iter()
+        .find_map(|var| {
+            std::env::var(var)
+                .ok()
+                .and_then(|v| normalized_env_locale(&v))
+        })
+        .or_else(locale_from_os)
+}
+
+/// Cross-platform OS locale query (Windows `GetUserDefaultLocaleName`, macOS
+/// `NSLocale`, Linux env vars) via `sys-locale` — catches hosts that skip the
+/// POSIX locale env vars entirely.
+fn locale_from_os() -> Option<String> {
+    sys_locale::get_locale().and_then(|raw| normalized_env_locale(&raw))
+}
+
+/// Pure: normalize a raw env-var locale value, rejecting the POSIX
+/// "no locale configured" sentinels ("", "C", "POSIX"). Split out from
+/// `locale_from_system_env` so it is testable without environment access —
+/// no test may touch real env vars to verify locale logic.
+fn normalized_env_locale(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("c")
+        || trimmed.eq_ignore_ascii_case("posix")
+    {
+        return None;
+    }
+    Some(normalize_locale(trimmed))
 }
 
 fn read_config_table() -> Option<toml::Table> {
@@ -600,6 +641,26 @@ mod tests {
         assert_eq!(normalize_locale("en_US.UTF-8"), "en-US");
         assert_eq!(normalize_locale("zh_CN.utf8"), "zh-CN");
         assert_eq!(normalize_locale("fr"), "fr");
+    }
+
+    #[test]
+    fn normalized_env_locale_rejects_posix_sentinels() {
+        assert_eq!(normalized_env_locale(""), None);
+        assert_eq!(normalized_env_locale("   "), None);
+        assert_eq!(normalized_env_locale("C"), None);
+        assert_eq!(normalized_env_locale("c"), None);
+        assert_eq!(normalized_env_locale("POSIX"), None);
+        assert_eq!(normalized_env_locale("posix"), None);
+    }
+
+    #[test]
+    fn normalized_env_locale_normalizes_posix_format() {
+        assert_eq!(
+            normalized_env_locale("zh_CN.UTF-8"),
+            Some("zh-CN".to_string())
+        );
+        assert_eq!(normalized_env_locale("fr_FR"), Some("fr-FR".to_string()));
+        assert_eq!(normalized_env_locale(" ja "), Some("ja".to_string()));
     }
 
     #[test]
