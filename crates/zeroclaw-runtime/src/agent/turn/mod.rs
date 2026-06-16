@@ -627,6 +627,7 @@ pub async fn run_tool_call_loop(
                 observer,
                 cancellation_token.as_ref(),
                 receipt_generator,
+                ctx.event_tx,
             )
             .await
         } else {
@@ -637,6 +638,7 @@ pub async fn run_tool_call_loop(
                 observer,
                 cancellation_token.as_ref(),
                 receipt_generator,
+                ctx.event_tx,
             )
             .await
         };
@@ -686,6 +688,26 @@ pub async fn run_tool_call_loop(
                             receipt: None,
                         },
                     ));
+                }
+            }
+            // Close the pending cards for executable calls that emitted a
+            // pending ToolCall at prep time but never produced a result
+            // (interrupted in flight or never dispatched). Without this the
+            // client leaves those tool cards spinning forever. The pinned
+            // tool_call_id matches the pending emit so the right card closes.
+            if let Some(tx) = ctx.event_tx {
+                for call in &executable_calls[completed..] {
+                    let call_id = events::resolve_tool_call_id(call);
+                    let interrupted = crate::agent::tool_execution::ToolExecutionOutcome {
+                        output: crate::i18n::get_required_cli_string(
+                            "turn-tool-interrupted-before-result",
+                        ),
+                        success: false,
+                        error_reason: None,
+                        duration: std::time::Duration::ZERO,
+                        receipt: None,
+                    };
+                    events::emit_tool_result(tx, &call_id, &call.name, &interrupted).await;
                 }
             }
         }

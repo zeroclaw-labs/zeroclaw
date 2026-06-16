@@ -3579,6 +3579,7 @@ mod tests {
             &observer,
             None,
             None,
+            None,
         )
         .await;
         assert!(result.is_ok(), "execute_one_tool should not panic or error");
@@ -3611,6 +3612,7 @@ mod tests {
             &observer,
             None,
             None, // receipt_generator
+            None, // event_tx
         )
         .await
         .expect("suffix alias should execute the unique activated tool");
@@ -3634,6 +3636,7 @@ mod tests {
             &observer,
             None,
             None, // receipt_generator
+            None, // event_tx
         )
         .await
         .expect("empty successful tool output should still execute");
