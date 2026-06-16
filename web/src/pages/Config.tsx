@@ -14,7 +14,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
-import { ArrowLeft, ChevronRight, Plus, Sparkles, Trash2 } from "lucide-react";
+import { ArrowLeft, ChevronRight, MessageSquare, Plus, Sparkles, Trash2 } from "lucide-react";
 import {
   ApiError,
   deleteMapKey,
@@ -36,12 +36,16 @@ import PersonalityEditor from "../components/sections/PersonalityEditor";
 import SkillsBundleEditor from "../components/sections/SkillsBundleEditor";
 import ReloadDaemonButton from "../components/sections/ReloadDaemonButton";
 import SectionPicker from "../components/sections/SectionPicker";
+import SectionNavigator from "../components/sections/SectionNavigator";
+import AddEntityDialog from "../components/sections/AddEntityDialog";
 import SectionTabs, {
   type SectionTabSpec,
 } from "../components/sections/SectionTabs";
 import CostRatesEditor, {
   type CostRatesCategory,
 } from "../components/sections/CostRatesEditor";
+import { Badge, Button, Card, PageHeader } from "@/components/ui";
+import { t } from "@/lib/i18n";
 
 // Display order for the curated sidebar groups. Each `SectionInfo.group`
 // from the gateway lands in one of these buckets (anything else falls
@@ -99,6 +103,11 @@ export default function Config() {
   useEffect(fetchDrift, [activeKey]);
 
   const [reloadKey, setReloadKey] = useState(0);
+  // Section whose "+ Add" affordance is open in the navigator (modal).
+  const [addSection, setAddSection] = useState<SectionInfo | null>(null);
+  // Bumped to make the navigator re-fetch its expanded sections' entities
+  // after an add / reload (so a new alias appears without a hard refresh).
+  const [navRefresh, setNavRefresh] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -119,7 +128,7 @@ export default function Config() {
           setError(`[${e.envelope.code}] ${e.envelope.message}`);
         } else {
           setError(
-            `Couldn't load sections: ${e instanceof Error ? e.message : String(e)}`,
+            `${t("config.load_sections_error")}${e instanceof Error ? e.message : String(e)}`,
           );
         }
       })
@@ -205,14 +214,7 @@ export default function Config() {
   if (error) {
     return (
       <div className="p-6">
-        <div
-          className="rounded-xl border p-4 text-sm"
-          style={{
-            background: "rgba(239, 68, 68, 0.08)",
-            borderColor: "rgba(239, 68, 68, 0.2)",
-            color: "#f87171",
-          }}
-        >
+        <div className="rounded-[var(--radius-md)] border border-status-error/25 bg-status-error/10 p-4 text-sm text-status-error">
           {error}
         </div>
       </div>
@@ -252,14 +254,15 @@ export default function Config() {
         : typeParam;
       return (
         <div className="flex flex-col gap-3 flex-1 min-h-0">
-          <button
-            type="button"
+          <Button
+            variant="ghost"
+            size="sm"
             onClick={() => navigate(-1)}
-            className="btn-secondary inline-flex items-center gap-2 text-sm px-3 py-1.5 self-start"
+            className="self-start"
           >
             <ArrowLeft className="h-4 w-4" />
-            Back
-          </button>
+            {t("common.back")}
+          </Button>
           <WireTabForm
             key={`${reloadKey}-${fieldsPrefix}`}
             prefix={fieldsPrefix}
@@ -285,7 +288,7 @@ export default function Config() {
         extraTabs.push(
           {
             key: "peer_groups",
-            label: "Peer Groups",
+            label: t("config.tab_peer_groups"),
             render: () => (
               <AgentPeerGroupsTab
                 key={`${reloadKey}-${typeParam}-peer_groups`}
@@ -296,7 +299,7 @@ export default function Config() {
           },
           {
             key: "personality",
-            label: "Personality",
+            label: t("config.tab_personality"),
             render: () => (
               <PersonalityEditor
                 key={`${reloadKey}-${typeParam}-personality`}
@@ -308,7 +311,7 @@ export default function Config() {
       } else if (isSkillBundle) {
         extraTabs.push({
           key: "skills",
-          label: "Skills",
+          label: t("config.tab_skills"),
           render: () => (
             <SkillsBundleEditor
               key={`${reloadKey}-${typeParam}-skills`}
@@ -320,16 +323,27 @@ export default function Config() {
 
       return (
         <div className="flex flex-col gap-3 flex-1 min-h-0">
-          <button
-            type="button"
-            onClick={() =>
-              navigate(`/config/${encodeURIComponent(activeSection.key)}`)
-            }
-            className="btn-secondary inline-flex items-center gap-2 text-sm px-3 py-1.5 self-start"
-          >
-            <ArrowLeft className="h-4 w-4" />
-            Back to {activeSection.label}
-          </button>
+          <div className="flex items-center justify-between gap-2">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() =>
+                navigate(`/config/${encodeURIComponent(activeSection.key)}`)
+              }
+              className="self-start"
+            >
+              <ArrowLeft className="h-4 w-4" />
+              {t("config.back_to")}{activeSection.label}
+            </Button>
+            {isAgent && (
+              <Link to={`/agent/${encodeURIComponent(typeParam)}`}>
+                <Button variant="ghost" size="sm">
+                  <MessageSquare className="h-4 w-4" />
+                  {t("config.open_chat")}
+                </Button>
+              </Link>
+            )}
+          </div>
           <WireTabForm
             key={`${reloadKey}-${fieldsPrefix}`}
             prefix={fieldsPrefix}
@@ -366,10 +380,10 @@ export default function Config() {
         return (
           <SectionTabs
             tabs={[
-              { key: "aliases", label: "Aliases", render: () => aliasListPane },
+              { key: "aliases", label: t("config.tab_aliases"), render: () => aliasListPane },
               {
                 key: "costs",
-                label: "Costs",
+                label: t("config.tab_costs"),
                 render: () => (
                   <CostRatesEditor
                     category={costsCategory}
@@ -390,16 +404,17 @@ export default function Config() {
       // Non-alias-tiered section with a type in the URL: treat as form
       return (
         <div className="flex flex-col gap-3 flex-1 min-h-0">
-          <button
-            type="button"
+          <Button
+            variant="ghost"
+            size="sm"
             onClick={() =>
               navigate(`/config/${encodeURIComponent(activeSection.key)}`)
             }
-            className="btn-secondary inline-flex items-center gap-2 text-sm px-3 py-1.5 self-start"
+            className="self-start"
           >
             <ArrowLeft className="h-4 w-4" />
-            Back to {activeSection.label}
-          </button>
+            {t("config.back_to")}{activeSection.label}
+          </Button>
           <FieldForm
             key={`${reloadKey}-${typeParam}`}
             prefix={typeParam}
@@ -477,7 +492,7 @@ export default function Config() {
 
   // Breadcrumb segments
   const crumbs: Array<{ label: string; url?: string }> = [
-    { label: "Config", url: "/config" },
+    { label: t("config.breadcrumb"), url: "/config" },
     {
       label: activeSection?.label ?? "",
       url: activeSection
@@ -495,138 +510,141 @@ export default function Config() {
     });
   if (aliasParam) crumbs.push({ label: aliasParam });
 
+  // A "real" selection exists only when the URL carries a section param.
+  // Bare /config (no params) shows the calm empty-state placeholder in the
+  // detail pane even though `activeKey` defaults to the first section (it's
+  // used by the navigator for highlight, not as a selection).
+  const hasSelection = Boolean(sectionParam);
+
   return (
     <div className="flex h-full overflow-hidden">
       {!lockedSection && (
-        <aside
-          className="w-56 flex-shrink-0 border-r overflow-y-auto"
-          style={{
-            borderColor: "var(--pc-border)",
-            background: "var(--pc-bg-surface)",
-          }}
-        >
-          <nav className="flex flex-col">
-            {GROUP_ORDER.map((groupName) => {
-              const known = new Set(GROUP_ORDER);
-              const items = sections
-                .filter((s) =>
-                  groupName === "Other"
-                    ? s.group === "Other" ||
-                      !known.has(s.group as (typeof GROUP_ORDER)[number])
-                    : s.group === groupName,
-                )
-                .sort((a, b) => {
-                  // Foundation: preserve server-provided canonical order
-                  // (driven by `QUICKSTART_SECTIONS` in the Rust config
-                  // crate). Other groups: alphabetize by label.
-                  if (groupName === "Foundation") {
-                    return sections.indexOf(a) - sections.indexOf(b);
-                  }
-                  return a.label.localeCompare(b.label);
-                });
-              if (items.length === 0) return null;
-              return (
-                <div key={groupName}>
-                  <div
-                    className="px-4 pt-4 pb-1.5 text-xs font-semibold uppercase tracking-wider"
-                    style={{ color: "var(--pc-text-secondary)" }}
-                  >
-                    {groupName}
-                  </div>
-                  {items.map((s) => (
-                    <button
-                      key={s.key}
-                      type="button"
-                      onClick={() => goToSection(s.key)}
-                      className="flex items-center justify-between gap-2 px-4 py-2 text-sm text-left transition-colors"
-                      style={{
-                        background:
-                          s.key === activeKey
-                            ? "var(--pc-accent-glow)"
-                            : "transparent",
-                        color:
-                          s.key === activeKey
-                            ? "var(--pc-accent)"
-                            : "var(--pc-text-primary)",
-                        fontWeight: s.key === activeKey ? 600 : 400,
-                        borderLeft:
-                          s.key === activeKey
-                            ? "2px solid var(--pc-accent)"
-                            : "2px solid transparent",
-                      }}
-                    >
-                      <span>{s.label}</span>
-                      {s.key === activeKey && (
-                        <ChevronRight className="h-3.5 w-3.5" />
-                      )}
-                    </button>
-                  ))}
-                </div>
-              );
-            })}
-          </nav>
-        </aside>
+        // Master navigator: searchable section → entity tree. Selecting an
+        // entity navigates to its existing form URL so the detail pane's
+        // dispatch (unchanged) renders the right editor.
+        <SectionNavigator
+          sections={sections}
+          groupOrder={GROUP_ORDER}
+          activeSectionKey={hasSelection ? activeKey : null}
+          selectedPath={location.pathname}
+          onNavigate={(url) => navigate(url)}
+          onSelectSection={(key) => goToSection(key)}
+          onAddToSection={(s) => setAddSection(s)}
+          refreshKey={navRefresh + reloadKey}
+          // Mobile: single-column. Show the navigator when nothing is
+          // selected; once an entity is open the detail pane takes over and
+          // the navigator hides (a "back to list" button returns here).
+          className={hasSelection ? "hidden md:flex" : "flex"}
+        />
       )}
 
-      <main className="flex-1 overflow-y-auto p-6">
-        {activeSection && (
+      {addSection && (
+        <AddEntityDialog
+          section={addSection}
+          onClose={() => setAddSection(null)}
+          onCreated={(url) => {
+            setAddSection(null);
+            setNavRefresh((n) => n + 1);
+            navigate(url);
+          }}
+        />
+      )}
+
+      <main
+        className={`flex-1 overflow-y-auto p-6 ${hasSelection ? "" : "hidden md:block"}`}
+      >
+        {!hasSelection ? (
+          // Empty state — no entity selected. Calm placeholder in the detail
+          // pane; the navigator on the left is the call to action.
+          <div className="flex h-full items-center justify-center">
+            <div className="text-center max-w-sm">
+              <Sparkles className="h-8 w-8 mx-auto mb-3 text-pc-text-faint" />
+              {/* i18n: reuse existing keys if present; otherwise these are
+                  the proposed new keys cfg.empty.title / cfg.empty.body
+                  (reported back to the owner of i18n.ts). */}
+              <p className="text-sm font-medium text-pc-text-secondary">
+                {t("config.empty_title")}
+              </p>
+              <p className="text-xs mt-1 text-pc-text-muted">
+                {t("config.empty_body")}
+              </p>
+            </div>
+          </div>
+        ) : (
+          activeSection && (
           <div className="flex flex-col gap-4 max-w-3xl min-h-full">
+            {/* Mobile-only: return to the navigator (single-column nav↔detail). */}
+            <Button
+              variant="ghost"
+              size="sm"
+              className="md:hidden self-start"
+              onClick={() => navigate("/config")}
+            >
+              <ArrowLeft className="h-4 w-4" />
+              {t("config.all_settings")}
+            </Button>
             {/* Layout note: every wrapper between <main> (the scroll
                 container) and FieldForm's save bar uses flex-1 + min-h-0
                 so the form stretches to the viewport bottom. Without
                 that chain, the save bar's `sticky bottom-0` anchors
                 to a content-height column and floats mid-viewport
                 instead of pinning to the bottom of the scroll area. */}
-            {/* Breadcrumb */}
-            <div className="flex items-center justify-between gap-3 flex-wrap">
-              <div
-                className="text-sm flex items-center gap-1.5 flex-wrap"
-                style={{ color: "var(--pc-text-muted)" }}
-              >
-                {crumbs.map((crumb, i) => (
-                  <span key={i} className="flex items-center gap-1.5">
-                    {i > 0 && <ChevronRight className="h-3 w-3" />}
-                    {crumb.url && i < crumbs.length - 1 ? (
-                      <span
-                        style={{
-                          color: "var(--pc-text-secondary)",
-                          cursor: "pointer",
-                        }}
-                        onClick={() => navigate(crumb.url!)}
-                      >
-                        {crumb.label}
-                      </span>
-                    ) : (
-                      <span
-                        style={{ color: "var(--pc-accent)", fontWeight: 600 }}
-                      >
-                        {crumb.label}
-                      </span>
-                    )}
-                  </span>
-                ))}
-              </div>
-              <div className="flex items-center gap-2">
-                <Link
-                  to="/quickstart"
-                  className="btn-secondary inline-flex items-center gap-1.5 text-xs px-3 py-1.5"
-                  title="Run Quickstart again"
-                >
-                  <Sparkles className="h-3.5 w-3.5" />
-                  Run Quickstart again
-                </Link>
-                <ReloadDaemonButton
-                  onReloaded={() => {
-                    goToSection(activeSection.key);
-                    fetchDrift();
-                    setReloadKey((n) => n + 1);
-                  }}
-                />
-              </div>
-            </div>
+            {/* Config header: section title + breadcrumb trail (as the
+                description slot) + the page-level actions. ReloadDaemonButton
+                keeps its own confirm modal — only the surrounding chrome is
+                restyled. */}
+            <PageHeader
+              title={activeSection.label}
+              description={
+                <span className="flex items-center gap-1.5 flex-wrap text-pc-text-muted">
+                  {crumbs.map((crumb, i) => (
+                    <span key={i} className="flex items-center gap-1.5">
+                      {i > 0 && (
+                        <ChevronRight className="h-3 w-3 text-pc-text-faint" />
+                      )}
+                      {crumb.url && i < crumbs.length - 1 ? (
+                        <button
+                          type="button"
+                          onClick={() => navigate(crumb.url!)}
+                          className="text-pc-text-secondary hover:text-pc-text transition-colors"
+                        >
+                          {crumb.label}
+                        </button>
+                      ) : (
+                        <span className="text-pc-text font-medium">
+                          {crumb.label}
+                        </span>
+                      )}
+                    </span>
+                  ))}
+                </span>
+              }
+              actions={
+                <>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => navigate("/quickstart")}
+                    title={t("cfg.header.quickstart")}
+                  >
+                    <Sparkles className="h-3.5 w-3.5" />
+                    {t("cfg.header.quickstart")}
+                  </Button>
+                  <ReloadDaemonButton
+                    onReloaded={() => {
+                      goToSection(activeSection.key);
+                      fetchDrift();
+                      setReloadKey((n) => n + 1);
+                      setNavRefresh((n) => n + 1);
+                    }}
+                  />
+                </>
+              }
+            />
 
             <div className="flex-1 min-h-0 flex flex-col">{mainContent}</div>
           </div>
+          )
         )}
       </main>
     </div>
@@ -641,29 +659,23 @@ export default function Config() {
 function ConfigAliasHelpBox() {
   return (
     <div
-      className="rounded-md border px-3 py-2 text-xs"
-      style={{
-        borderColor: "var(--pc-border)",
-        background: "var(--pc-bg-surface-subtle)",
-        color: "var(--pc-text-secondary)",
-      }}
+      className="rounded-[var(--radius-md)] border border-pc-border px-3 py-2 text-xs text-pc-text-secondary"
+      style={{ background: "var(--pc-bg-surface-subtle)" }}
     >
       <p className="mb-1">
-        <strong>Alias.</strong> A short stable name you’ll use everywhere else
-        in config to point at this entry (agents, routes, and per-channel
-        bindings reference it as{" "}
+        <strong>{t("config.alias_help_term")}</strong>{" "}
+        {t("config.alias_help_intro")}{" "}
         <code>
           {"<type>"}.{"<alias>"}
         </code>
-        ). Aliases let you have several entries of the same type — a{" "}
-        <code>work</code> credential and a <code>personal</code> one, for
-        example.
+        {t("config.alias_help_examples_pre")}{" "}
+        <code>work</code> {t("config.alias_help_examples_mid")}{" "}
+        <code>personal</code> {t("config.alias_help_examples_post")}
       </p>
       <p className="mb-0">
-        Rules: lowercase letters, digits, single underscores; 1–63 chars; no
-        leading/trailing/double underscores, no dots, hyphens, or spaces.{" "}
-        <strong>Aliases can’t be renamed in v0.8.0</strong> — pick something
-        you’ll keep, or delete and recreate.
+        {t("config.alias_help_rules")}{" "}
+        <strong>{t("config.alias_help_no_rename")}</strong>{" "}
+        {t("config.alias_help_rename_advice")}
       </p>
     </div>
   );
@@ -681,7 +693,7 @@ function suggestConfigAlias(aliases: string[]): string {
 
 function validateConfigAlias(alias: string): string | null {
   if (/^(?!_)(?!.*__)(?!.*_$)[a-z0-9_]{1,63}$/.test(alias)) return null;
-  return "Alias must use lowercase letters, digits, or single underscores only; no hyphens, dots, spaces, leading/trailing underscores, or double underscores.";
+  return t("config.alias_validation_error");
 }
 
 function AliasListView({
@@ -757,20 +769,18 @@ function AliasListView({
 
   return (
     <div className="flex flex-col gap-4">
-      <button
-        type="button"
+      <Button
+        variant="ghost"
+        size="sm"
         onClick={onBack}
-        className="btn-secondary inline-flex items-center gap-2 text-sm px-3 py-1.5 self-start"
+        className="self-start"
       >
         <ArrowLeft className="h-4 w-4" />
-        Back
-      </button>
+        {t("common.back")}
+      </Button>
 
       {sectionHelp && (
-        <p
-          className="text-sm leading-relaxed"
-          style={{ color: "var(--pc-text-secondary)" }}
-        >
+        <p className="text-sm leading-relaxed text-pc-text-secondary">
           {sectionHelp}
         </p>
       )}
@@ -778,14 +788,7 @@ function AliasListView({
       <ConfigAliasHelpBox />
 
       {error && (
-        <div
-          className="rounded-xl border p-3 text-sm"
-          style={{
-            background: "rgba(239,68,68,0.08)",
-            borderColor: "rgba(239,68,68,0.2)",
-            color: "#f87171",
-          }}
-        >
+        <div className="rounded-[var(--radius-md)] border border-status-error/25 bg-status-error/10 p-3 text-sm text-status-error">
           {error}
         </div>
       )}
@@ -801,10 +804,7 @@ function AliasListView({
           />
         </div>
       ) : (
-        <div
-          className="surface-panel divide-y"
-          style={{ borderColor: "var(--pc-border)" }}
-        >
+        <Card padded={false} className="divide-y divide-pc-border overflow-hidden">
           {aliases.map((alias) => (
             <AliasRow
               key={alias}
@@ -844,13 +844,14 @@ function AliasListView({
                   if (e.key === "Enter") void submit();
                 }}
               />
-              <button
-                type="button"
+              <Button
+                variant="primary"
+                size="sm"
                 onClick={() => void submit()}
-                className="btn-electric text-sm px-3 py-1.5 flex-shrink-0"
+                className="flex-shrink-0"
               >
-                Add
-              </button>
+                {t("config.add")}
+              </Button>
             </div>
             {aliasError && (
               <p
@@ -861,7 +862,7 @@ function AliasListView({
               </p>
             )}
           </div>
-        </div>
+        </Card>
       )}
     </div>
   );
@@ -1091,7 +1092,7 @@ function AgentPeerGroupsTab({
   if (loading) {
     return (
       <p className="text-sm" style={{ color: "var(--pc-text-muted)" }}>
-        Loading peer groups…
+        {t("config.loading_peer_groups")}
       </p>
     );
   }
@@ -1116,7 +1117,7 @@ function AgentPeerGroupsTab({
         style={{ background: "var(--pc-bg-elevated)" }}
       >
         <span className="text-xs" style={{ color: "var(--pc-text-muted)" }}>
-          Add this agent to:
+          {t("config.add_agent_to")}
         </span>
         <select
           value={pickerValue}
@@ -1125,7 +1126,9 @@ function AgentPeerGroupsTab({
           className="input-electric text-xs px-2 py-1 appearance-none cursor-pointer"
         >
           <option value="">
-            {nonMembers.length === 0 ? "no other groups" : "select a group…"}
+            {nonMembers.length === 0
+              ? t("config.no_other_groups")
+              : t("config.select_a_group")}
           </option>
           {nonMembers.map((g) => (
             <option key={g} value={g}>
@@ -1139,14 +1142,14 @@ function AgentPeerGroupsTab({
           disabled={!pickerValue || adding}
           className="btn-electric text-xs px-3 py-1 rounded-lg disabled:opacity-50"
         >
-          {adding ? "Adding…" : "Add"}
+          {adding ? t("config.adding") : t("config.add")}
         </button>
         <Link
           to="/config/peer_groups"
           className="text-xs ml-auto hover:underline"
           style={{ color: "var(--pc-text-muted)" }}
         >
-          Create new →
+          {t("config.create_new")}
         </Link>
       </div>
 
@@ -1158,7 +1161,8 @@ function AgentPeerGroupsTab({
             background: "var(--pc-bg-elevated)",
           }}
         >
-          {agentAlias} is not a member of any peer group.
+          {agentAlias}
+          {t("config.not_member_suffix")}
         </p>
       ) : (
         memberOf.map((pg) => (
@@ -1183,9 +1187,9 @@ function AgentPeerGroupsTab({
                 onClick={() => removeFromGroup(pg)}
                 className="text-xs hover:underline"
                 style={{ color: "var(--color-status-error)" }}
-                title={`Remove ${agentAlias} from peer_groups.${pg}`}
+                title={`${t("config.remove_member_prefix")}${agentAlias}${t("config.remove_member_mid")}peer_groups.${pg}`}
               >
-                Remove from group
+                {t("config.remove_from_group")}
               </button>
             </div>
             <div className="p-4">
@@ -1270,45 +1274,32 @@ function AliasRow({
   };
 
   return (
-    <div className="w-full flex items-center justify-between gap-3 px-4 py-3 text-sm hover:opacity-90">
+    <div className="w-full flex items-center justify-between gap-3 px-4 py-3 text-sm transition-colors hover:bg-pc-elevated/50">
       <button
         type="button"
         onClick={onSelect}
         className="flex-1 min-w-0 flex items-center justify-between gap-3 text-left"
       >
         <div className="min-w-0">
-          <span style={{ color: "var(--pc-text-primary)", fontWeight: 500 }}>
-            {alias}
-          </span>
-          <code
-            className="block text-xs mt-0.5"
-            style={{ color: "var(--pc-text-faint)" }}
-          >
+          <span className="font-medium text-pc-text">{alias}</span>
+          <code className="block text-xs mt-0.5 text-pc-text-faint">
             {mapPath}.{alias}
           </code>
         </div>
-        <ChevronRight
-          className="h-4 w-4 flex-shrink-0"
-          style={{ color: "var(--pc-text-muted)" }}
-        />
+        <ChevronRight className="h-4 w-4 flex-shrink-0 text-pc-text-muted" />
       </button>
       <button
         type="button"
         onClick={onTrashClick}
         disabled={deleting}
-        title={armed ? "Click again to confirm delete" : "Delete this alias"}
-        className="btn-icon flex-shrink-0"
-        style={
-          armed
-            ? {
-                color: "var(--color-status-error, #f87171)",
-                borderColor: "var(--color-status-error, #f87171)",
-              }
-            : undefined
-        }
+        title={armed ? t("config.confirm_delete_title") : t("config.delete_alias_title")}
+        className={[
+          "btn-icon flex-shrink-0",
+          armed ? "text-status-error border-status-error/40" : "",
+        ].join(" ")}
       >
         {armed ? (
-          <span className="text-xs px-1">Confirm</span>
+          <span className="text-xs px-1">{t("common.confirm")}</span>
         ) : (
           <Trash2 className="h-4 w-4" />
         )}
@@ -1357,7 +1348,7 @@ function SectionOverview({
         <FieldForm
           key={`${section.key}-fields`}
           prefix={section.key}
-          title={`${section.label} settings`}
+          title={`${section.label}${t("config.settings_suffix")}`}
           includePath={excludePicker}
         />
       </div>
@@ -1367,14 +1358,15 @@ function SectionOverview({
   if (showPicker) {
     return (
       <div className="flex flex-col gap-3">
-        <button
-          type="button"
+        <Button
+          variant="ghost"
+          size="sm"
           onClick={() => setShowPicker(false)}
-          className="btn-secondary inline-flex items-center gap-2 text-sm px-3 py-1.5 self-start"
+          className="self-start"
         >
           <ArrowLeft className="h-4 w-4" />
-          Back to {section.label}
-        </button>
+          {t("config.back_to")}{section.label}
+        </Button>
         <SectionPicker
           sectionKey={section.key}
           help={section.help}
@@ -1390,18 +1382,17 @@ function SectionOverview({
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex items-center justify-between">
-        <p className="text-sm" style={{ color: "var(--pc-text-secondary)" }}>
-          {section.help}
-        </p>
-        <button
-          type="button"
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-sm text-pc-text-secondary">{section.help}</p>
+        <Button
+          variant="primary"
+          size="md"
           onClick={() => setShowPicker(true)}
-          className="btn-electric flex items-center gap-2 text-sm px-3 py-2 flex-shrink-0"
+          className="flex-shrink-0"
         >
           <Plus className="h-4 w-4" />
-          Add
-        </button>
+          {t("config.add")}
+        </Button>
       </div>
       <ConfiguredOnlyPicker
         section={section}
@@ -1448,7 +1439,7 @@ function ConfiguredOnlyPicker({
             setError(`[${e.envelope.code}] ${e.envelope.message}`);
           } else {
             setError(
-              `Couldn't load configured items: ${e instanceof Error ? e.message : String(e)}`,
+              `${t("config.load_items_error")}${e instanceof Error ? e.message : String(e)}`,
             );
           }
         })
@@ -1475,14 +1466,7 @@ function ConfiguredOnlyPicker({
 
   if (error) {
     return (
-      <div
-        className="rounded-xl border p-3 text-sm"
-        style={{
-          background: "rgba(239, 68, 68, 0.08)",
-          borderColor: "rgba(239, 68, 68, 0.2)",
-          color: "#f87171",
-        }}
-      >
+      <div className="rounded-[var(--radius-md)] border border-status-error/25 bg-status-error/10 p-3 text-sm text-status-error">
         {error}
       </div>
     );
@@ -1490,48 +1474,42 @@ function ConfiguredOnlyPicker({
 
   if (items.length === 0) {
     return (
-      <div
-        className="surface-panel p-8 text-center text-sm"
-        style={{ color: "var(--pc-text-muted)" }}
-      >
-        Nothing configured under <strong>{section.label}</strong> yet. Click{" "}
-        <strong>+ Add</strong> to get started.
-      </div>
+      <Card className="p-8 text-center text-sm text-pc-text-muted">
+        {t("config.nothing_configured_pre")} <strong>{section.label}</strong>{" "}
+        {t("config.nothing_configured_mid")}{" "}
+        <strong>{t("config.add_with_plus")}</strong>{" "}
+        {t("config.nothing_configured_post")}
+      </Card>
     );
   }
 
   return (
-    <div
-      className="surface-panel divide-y"
-      style={{ borderColor: "var(--pc-border)" }}
-    >
+    <Card padded={false} className="divide-y divide-pc-border overflow-hidden">
       {items.map((item) => (
         <button
           key={item.key}
           type="button"
           onClick={() => onPickType(item.key)}
-          className="w-full flex items-center justify-between gap-3 px-4 py-3 text-left transition-colors hover:opacity-90"
+          className="w-full flex items-center justify-between gap-3 px-4 py-3 text-left transition-colors hover:bg-pc-elevated/50"
         >
           <div className="flex-1 min-w-0">
-            <div
-              className="text-sm font-medium"
-              style={{ color: "var(--pc-text-primary)" }}
-            >
+            <div className="text-sm font-medium text-pc-text">
               {item.label}
             </div>
-            <code
-              className="block text-xs mt-0.5"
-              style={{ color: "var(--pc-text-faint)" }}
-            >
+            <code className="block text-xs mt-0.5 text-pc-text-faint">
               {item.key}
             </code>
           </div>
-          <ChevronRight
-            className="h-4 w-4 flex-shrink-0"
-            style={{ color: "var(--pc-text-muted)" }}
-          />
+          <div className="flex items-center gap-2 flex-shrink-0">
+            {item.badge && (
+              <Badge tone={item.badge === "active" ? "ok" : "neutral"}>
+                {item.badge}
+              </Badge>
+            )}
+            <ChevronRight className="h-4 w-4 text-pc-text-muted" />
+          </div>
         </button>
       ))}
-    </div>
+    </Card>
   );
 }
