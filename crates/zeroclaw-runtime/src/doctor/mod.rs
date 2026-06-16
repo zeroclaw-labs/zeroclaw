@@ -506,7 +506,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         for (family, alias, entry) in config.providers.models.iter_entries() {
             found_any = true;
             let label = format!("{family}.{alias}");
-            if let Some(reason) = provider_validation_error(family) {
+            if let Some(reason) = provider_validation_error(Some((config, alias)), family) {
                 items.push(DiagItem::error(
                     cat,
                     format!("model_provider \"{label}\" is invalid: {reason}"),
@@ -581,7 +581,22 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         if route.hint.is_empty() {
             items.push(DiagItem::warn(cat, "model route with empty hint"));
         }
-        if let Some(reason) = provider_validation_error(&route.model_provider) {
+        // Resolve dotted provider refs through the config, same as
+        // the agent check above — configured custom.<alias> entries
+        // must be validated alias-aware.
+        let (route_provider_type, route_maybe_config) = route
+            .model_provider
+            .split_once('.')
+            .map(|(family, alias)| {
+                let config_ctx = config
+                    .providers
+                    .models
+                    .find(family, alias)
+                    .map(|_entry| (config, alias));
+                (family, config_ctx)
+            })
+            .unwrap_or((route.model_provider.as_str(), None));
+        if let Some(reason) = provider_validation_error(route_maybe_config, route_provider_type) {
             items.push(DiagItem::warn(
                 cat,
                 format!(
@@ -672,14 +687,26 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     agent_names.sort();
     for name in agent_names {
         let agent = config.agents.get(name).unwrap();
-        let provider_type = agent
-            .model_provider
-            .split_once('.')
-            .map_or(agent.model_provider.as_str(), |(t, _)| t);
-        if provider_type.is_empty() {
+        if agent.model_provider.is_empty() {
             continue;
         }
-        if let Some(reason) = provider_validation_error(provider_type) {
+        // Resolve dotted provider refs (e.g. "custom.vllm") through the
+        // config so that configured `[providers.models.custom.<alias>]`
+        // entries are validated alias-aware instead of falling through to
+        // the config-free factory path that would flag them as invalid.
+        let (provider_type, maybe_config) = agent
+            .model_provider
+            .split_once('.')
+            .map(|(family, alias)| {
+                let config_ctx = config
+                    .providers
+                    .models
+                    .find(family, alias)
+                    .map(|_entry| (config, alias));
+                (family, config_ctx)
+            })
+            .unwrap_or((agent.model_provider.as_str(), None));
+        if let Some(reason) = provider_validation_error(maybe_config, provider_type) {
             items.push(DiagItem::warn(
                 cat,
                 format!(
@@ -733,8 +760,14 @@ fn web_dist_dir_expansion_reason_key(value: &str) -> Option<&'static str> {
     }
 }
 
-fn provider_validation_error(name: &str) -> Option<String> {
-    match zeroclaw_providers::create_model_provider(name, None) {
+fn provider_validation_error(config: Option<(&Config, &str)>, name: &str) -> Option<String> {
+    let result = if let Some((config, alias)) = config {
+        let options = zeroclaw_providers::ModelProviderRuntimeOptions::default();
+        zeroclaw_providers::create_model_provider_for_alias(config, name, alias, None, &options)
+    } else {
+        zeroclaw_providers::create_model_provider(name, None)
+    };
+    match result {
         Ok(_) => None,
         Err(err) => Some(
             err.to_string()
@@ -1160,14 +1193,14 @@ mod tests {
 
     #[test]
     fn provider_validation_checks_custom_url_shape() {
-        assert!(provider_validation_error("openrouter").is_none());
-        assert!(provider_validation_error("custom:https://example.com").is_none());
-        assert!(provider_validation_error("anthropic-custom:https://example.com").is_none());
+        assert!(provider_validation_error(None, "openrouter").is_none());
+        assert!(provider_validation_error(None, "custom:https://example.com").is_none());
+        assert!(provider_validation_error(None, "anthropic-custom:https://example.com").is_none());
 
-        let invalid_custom = provider_validation_error("custom:").unwrap_or_default();
+        let invalid_custom = provider_validation_error(None, "custom:").unwrap_or_default();
         assert!(invalid_custom.contains("requires a URL"));
 
-        let invalid_unknown = provider_validation_error("totally-fake").unwrap_or_default();
+        let invalid_unknown = provider_validation_error(None, "totally-fake").unwrap_or_default();
         assert!(invalid_unknown.contains("Unknown model_provider"));
     }
 
@@ -1268,7 +1301,7 @@ mod tests {
             "broken".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "totally-fake.default".into(),
-                risk_profile: "default".into(),
+                risk_profile: "default".to_string(),
                 ..Default::default()
             },
         );
@@ -1634,5 +1667,54 @@ mod tests {
         assert_eq!(agent_messages.len(), 2);
         assert!(agent_messages[0].contains("agent \"alpha\""));
         assert!(agent_messages[1].contains("agent \"zeta\""));
+    }
+
+    /// Regression: #7439 — a configured `[providers.models.custom.vllm]`
+    /// with a URI must not produce invalid-provider Doctor diagnostics for
+    /// the provider entry, agent refs, or route refs. The fix routes dotted
+    /// provider refs through `config.providers.models.find(family, alias)`
+    /// before falling back to config-free family-level validation.
+    #[test]
+    fn check_config_semantics_custom_provider_no_diagnostics() {
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .ensure("custom", "vllm")
+            .expect("custom typed slot accepts vllm alias")
+            .uri = Some("http://localhost:8080/v1".to_string());
+        config.agents.insert(
+            "tester".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "custom.vllm".into(),
+                ..Default::default()
+            },
+        );
+        config
+            .model_routes
+            .push(zeroclaw_config::schema::ModelRouteConfig {
+                hint: "vllm-fast".into(),
+                model_provider: "custom.vllm".into(),
+                model: "vllm-model-7b".into(),
+                api_key: None,
+            });
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+
+        let invalid_provider_items: Vec<_> = items
+            .iter()
+            .filter(|i| {
+                i.message.contains("invalid")
+                    && (i.message.contains("model_provider")
+                        || i.message.contains("Custom model_provider"))
+            })
+            .collect();
+
+        assert!(
+            invalid_provider_items.is_empty(),
+            "configured custom.vllm must not produce invalid-provider diagnostics; got: {:#?}",
+            invalid_provider_items
+        );
     }
 }
