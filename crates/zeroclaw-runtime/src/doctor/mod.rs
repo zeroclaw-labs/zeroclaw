@@ -688,6 +688,16 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
             ));
         }
     }
+
+    // Non-fatal config warnings — dangling fallback refs, wire_api misuse, etc.
+    // Source of truth: `Config::collect_warnings()` (same signal as gateway API
+    // and `Config::validate()` tracing). Do not duplicate checks here.
+    for warning in config.collect_warnings() {
+        items.push(DiagItem::warn(
+            cat,
+            format!("{} (at {})", warning.message, warning.path),
+        ));
+    }
 }
 
 /// Flag `gateway.web_dist_dir` values that rely on shell-style expansion
@@ -1354,6 +1364,40 @@ mod tests {
         });
         assert!(route_item.is_some());
         assert_eq!(route_item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn config_validation_surfaces_dangling_fallback_ref() {
+        use zeroclaw_config::schema::{ModelProviderConfig, NvidiaModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.nvidia.insert(
+            "nvidia".to_string(),
+            NvidiaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("stepfun-ai/step-3.5-flash".into()),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "deepseek-ai/deepseek-v4-flash",
+                    )],
+                    ..Default::default()
+                },
+            },
+        );
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        let fallback_item = items.iter().find(|item| {
+            item.message
+                .contains("does not resolve to a configured providers.models entry")
+                && item
+                    .message
+                    .contains("providers.models.nvidia.nvidia.fallback[0]")
+        });
+        assert!(
+            fallback_item.is_some(),
+            "doctor should surface dangling fallback refs"
+        );
+        assert_eq!(fallback_item.unwrap().severity, Severity::Warn);
     }
 
     #[test]
