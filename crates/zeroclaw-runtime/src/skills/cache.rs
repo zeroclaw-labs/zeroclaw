@@ -8,10 +8,23 @@
 //! disk has changed.
 //!
 //! This module memoizes the result keyed by `(canonical dir, allow_scripts, tag)`
-//! and validates freshness with a cheap, **stat-only** directory signature: any
-//! add / remove / rename / content edit changes a file's mtime or length (or a
-//! symlink's target), which changes the signature and forces a re-audit. A stale
-//! "clean" audit verdict can therefore never be served from cache.
+//! and validates freshness with a **content digest** of the directory: it hashes
+//! the bytes of every file reachable under `dir` (plus each symlink's target),
+//! never following symlinks so it can't loop. Because the digest covers file
+//! *content*, any change the auditor would care about — an edited `SKILL.md`, a
+//! flipped script, a retargeted symlink, altered TOML — produces a different
+//! signature and forces a re-audit. This matters specifically because the cache
+//! sits in front of the security audit: serving a cached "clean" verdict for
+//! content that has since changed would defeat the audit, so the freshness key is
+//! deliberately tied to the audited bytes rather than to metadata (mtime/length),
+//! which an edit can preserve. (The only residual risk is a 64-bit hash
+//! collision, which is not a practical forgery vector.)
+//!
+//! The digest reads each file once, but a cache *hit* then skips the audit's
+//! content scan, its regex/script/symlink checks, and the Markdown/TOML parsing —
+//! work the loader otherwise repeats (re-reading files) on every prompt build and
+//! every `read_skill` call. So the cache stays a net win without weakening the
+//! audit boundary.
 //!
 //! [`invalidate`] gives the [`super::SkillsService`] an explicit hook to drop the
 //! cache immediately after a write, so an added/edited/removed skill is picked up
@@ -21,14 +34,6 @@
 //! to a falsey value (`0` / `false` / `no` / `off`) forces every load to re-walk
 //! and re-audit, i.e. the exact pre-cache behavior. This is a runtime off-ramp if
 //! the cache is ever suspected of serving stale results.
-//!
-//! Caveat: the signature trusts filesystem metadata, so a deliberate edit that
-//! preserves both mtime and length (e.g. an attacker resetting mtime via
-//! `utimes`) would not be detected. This matches the staleness model of build
-//! tools like `cargo`/`make`; anyone with write access to the skills directory
-//! already controls which skills exist, so the audit is a guard against
-//! accidental/unreviewed content rather than against an attacker who can forge
-//! inode metadata.
 
 use super::Skill;
 use std::collections::hash_map::DefaultHasher;
@@ -36,7 +41,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
-use std::time::UNIX_EPOCH;
 
 #[derive(PartialEq, Eq, Hash, Clone)]
 struct CacheKey {
@@ -81,20 +85,21 @@ fn cache_enabled() -> bool {
     cache_enabled_from_env(std::env::var(CACHE_ENABLED_ENV).ok().as_deref())
 }
 
-/// Stat-only fingerprint of everything reachable under `dir` (recursive). Hashes
-/// each entry's relative path plus the cheap metadata that changes on any real
-/// edit — file mtime + length, and symlink target. Never follows symlinks, so it
-/// cannot loop on a cycle and matches the auditor's no-follow stance. Returns
-/// `None` when `dir` is absent or unreadable; callers treat that as "do not
-/// cache" and just run the loader (which yields an empty result anyway).
+/// Content fingerprint of everything reachable under `dir` (recursive). Hashes
+/// each entry's path plus a digest of its *bytes* (files) or link target
+/// (symlinks). Never follows symlinks, so it can't loop on a cycle and matches
+/// the auditor's no-follow stance. Tying the key to content — not metadata an edit
+/// can preserve — is what keeps a cached "clean" audit verdict from outliving the
+/// bytes it audited. Returns `None` when `dir` is absent or any entry can't be
+/// read; callers treat that as "do not cache" rather than trust a partial digest.
 fn dir_signature(dir: &Path) -> Option<u64> {
     if !dir.exists() {
         return None;
     }
 
     // BTreeMap keyed by path → deterministic hash order regardless of read_dir
-    // ordering. Value encodes the per-entry fingerprint.
-    let mut entries: BTreeMap<PathBuf, (u8, u64, u64)> = BTreeMap::new();
+    // ordering. Value: (kind, content-or-target digest).
+    let mut entries: BTreeMap<PathBuf, (u8, u64)> = BTreeMap::new();
     let mut stack = vec![dir.to_path_buf()];
 
     while let Some(current) = stack.pop() {
@@ -108,29 +113,16 @@ fn dir_signature(dir: &Path) -> Option<u64> {
 
             if file_type.is_symlink() {
                 // Hash the link target string; a retargeted symlink is a change.
-                let target_hash = std::fs::read_link(&path)
-                    .ok()
-                    .map(|t| {
-                        let mut h = DefaultHasher::new();
-                        t.hash(&mut h);
-                        h.finish()
-                    })
-                    .unwrap_or(0);
-                entries.insert(path, (2, target_hash, 0));
+                let target = std::fs::read_link(&path).ok()?;
+                let mut h = DefaultHasher::new();
+                target.hash(&mut h);
+                entries.insert(path, (2, h.finish()));
             } else if file_type.is_dir() {
                 stack.push(path);
             } else {
-                // DirEntry::metadata does not follow symlinks.
-                let Ok(meta) = entry.metadata() else {
-                    return None;
-                };
-                let mtime = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0);
-                entries.insert(path, (1, mtime, meta.len()));
+                // Decline to cache rather than fingerprint a file we can't read.
+                let digest = hash_file_contents(&path)?;
+                entries.insert(path, (1, digest));
             }
         }
     }
@@ -139,6 +131,26 @@ fn dir_signature(dir: &Path) -> Option<u64> {
     for (path, fingerprint) in &entries {
         path.hash(&mut hasher);
         fingerprint.hash(&mut hasher);
+    }
+    Some(hasher.finish())
+}
+
+/// Stream a file's full contents through a hasher (chunked, so a large bundled
+/// asset doesn't get slurped whole). `None` on any read error — the caller then
+/// declines to cache instead of trusting an incomplete digest.
+fn hash_file_contents(path: &Path) -> Option<u64> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut hasher = DefaultHasher::new();
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.write(&buf[..n]),
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
     }
     Some(hasher.finish())
 }
@@ -177,7 +189,7 @@ pub(super) fn cached_load(
 
     // Miss: load outside the write lock would be cleaner, but the loader is fast
     // relative to lock contention here and we want a single store. If the dir
-    // mutates during `load`, the change bumps mtime/len so the *next* call's
+    // mutates during `load`, its content digest changes, so the *next* call's
     // signature differs from what we store and the entry self-heals.
     let skills = load();
     let mut guard = cache().write().unwrap_or_else(|e| e.into_inner());
@@ -287,6 +299,51 @@ mod tests {
             calls.load(Ordering::SeqCst),
             2,
             "editing skill content must bust the cache"
+        );
+    }
+
+    // Audit-boundary regression (review of #7786): the cache sits in front of the
+    // security audit, so an edit that preserves BOTH length and mtime — exactly the
+    // case a metadata-only signature would miss — must still force a re-audit. This
+    // would fail on the original mtime+length signature and passes because the key
+    // is now a content digest.
+    #[test]
+    fn same_length_same_mtime_edit_still_busts_cache() {
+        invalidate();
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        write(&skills_dir, "alpha", "AAAA\n");
+        let skill_md = skills_dir.join("alpha/SKILL.md");
+        let original_mtime =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&skill_md).unwrap());
+
+        let calls = AtomicUsize::new(0);
+        let load = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Vec::<Skill>::new()
+        };
+
+        cached_load(&skills_dir, false, "test", load);
+
+        // Rewrite with same byte length, then forcibly restore the original mtime
+        // so length + mtime are byte-for-byte identical to the cached state.
+        std::fs::write(&skill_md, "BBBB\n").unwrap();
+        filetime::set_file_mtime(&skill_md, original_mtime).unwrap();
+        let after =
+            filetime::FileTime::from_last_modification_time(&std::fs::metadata(&skill_md).unwrap());
+        assert_eq!(after, original_mtime, "test precondition: mtime restored");
+        assert_eq!(
+            std::fs::metadata(&skill_md).unwrap().len(),
+            5,
+            "test precondition: length unchanged"
+        );
+
+        cached_load(&skills_dir, false, "test", load);
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "content change under identical mtime+length must re-audit"
         );
     }
 
