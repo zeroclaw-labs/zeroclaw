@@ -18,6 +18,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::attachment::PendingAttachment;
 use crate::clipboard;
@@ -748,7 +749,7 @@ impl InputBarState {
         self.update_autocomplete();
     }
 
-    /// Delete the character immediately before the cursor (backspace).
+    /// Delete the grapheme cluster immediately before the cursor (backspace).
     pub fn pop_input_char(&mut self) {
         if self.selection.is_some() {
             self.delete_selection();
@@ -756,13 +757,14 @@ impl InputBarState {
             return;
         }
         if self.cursor > 0 {
-            let prev = self.input[..self.cursor]
-                .char_indices()
-                .next_back()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            self.input.remove(prev);
-            self.cursor = prev;
+            let prev_grapheme = self.input[..self.cursor]
+                .graphemes(true)
+                .rev()
+                .next()
+                .unwrap_or("");
+            let prev_start = self.cursor - prev_grapheme.len();
+            self.input.replace_range(prev_start..self.cursor, "");
+            self.cursor = prev_start;
             self.update_autocomplete();
         }
     }
@@ -770,19 +772,23 @@ impl InputBarState {
     pub fn move_cursor_left(&mut self) {
         self.clear_selection();
         if self.cursor > 0 {
-            self.cursor = self.input[..self.cursor]
-                .char_indices()
-                .next_back()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
+            let prev_grapheme = self.input[..self.cursor]
+                .graphemes(true)
+                .rev()
+                .next()
+                .unwrap_or("");
+            self.cursor -= prev_grapheme.len();
         }
     }
 
     pub fn move_cursor_right(&mut self) {
         self.clear_selection();
         if self.cursor < self.input.len() {
-            let c = self.input[self.cursor..].chars().next().unwrap();
-            self.cursor += c.len_utf8();
+            let next_grapheme = self.input[self.cursor..]
+                .graphemes(true)
+                .next()
+                .unwrap_or("");
+            self.cursor += next_grapheme.len();
         }
     }
 
