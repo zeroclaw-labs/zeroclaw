@@ -3739,6 +3739,46 @@ async fn process_channel_message(
     .await;
 }
 
+/// Resolve the effective `ack_reactions` value for a channel message.
+///
+/// Per-channel overrides (e.g. `[channels.lark.work].ack_reactions`)
+/// take precedence over the global `[channels].ack_reactions` setting.
+/// This mirrors the resolution performed during channel construction
+/// (see `with_ack_reactions`), so the orchestrator's reaction gates
+/// agree with the channel's own internal gate.
+fn resolve_channel_ack_reactions(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> bool {
+    let Some(ref alias) = msg.channel_alias else {
+        return ctx.ack_reactions;
+    };
+    match msg.channel.as_str() {
+        "lark" | "feishu" => ctx
+            .prompt_config
+            .channels
+            .lark
+            .get(alias)
+            .and_then(|c| c.ack_reactions)
+            .unwrap_or(ctx.ack_reactions),
+        "telegram" => ctx
+            .prompt_config
+            .channels
+            .telegram
+            .get(alias)
+            .and_then(|c| c.ack_reactions)
+            .unwrap_or(ctx.ack_reactions),
+        "matrix" => ctx
+            .prompt_config
+            .channels
+            .matrix
+            .get(alias)
+            .and_then(|c| c.ack_reactions)
+            .unwrap_or(ctx.ack_reactions),
+        _ => ctx.ack_reactions,
+    }
+}
+
 async fn process_channel_message_body(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
@@ -4227,7 +4267,11 @@ async fn process_channel_message_body(
         // pattern so operators with reactions disabled don't suddenly see
         // them. Best-effort: log on failure, never propagate. Channels that
         // don't implement add_reaction get the trait's no-op default.
-        if ctx.ack_reactions
+        //
+        // Resolve per-channel overrides: channels like Lark, Telegram,
+        // and Matrix allow `<channel>.ack_reactions` to take precedence
+        // over the global `[channels].ack_reactions`.
+        if resolve_channel_ack_reactions(&ctx, &msg)
             && let Some(channel) = target_channel.as_ref()
         {
             let emoji = kind.emoji();
@@ -4365,7 +4409,7 @@ async fn process_channel_message_body(
     };
 
     // React with 👀 to acknowledge the incoming message
-    if ctx.ack_reactions
+    if resolve_channel_ack_reactions(&ctx, &msg)
         && let Some(channel) = target_channel.as_ref()
         && let Err(e) = channel
             .add_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
@@ -5189,7 +5233,7 @@ async fn process_channel_message_body(
     }
 
     // Swap 👀 → ✅ (or ⚠️ on error) to signal processing is complete
-    if ctx.ack_reactions
+    if resolve_channel_ack_reactions(&ctx, &msg)
         && let Some(channel) = target_channel.as_ref()
     {
         let _ = channel
