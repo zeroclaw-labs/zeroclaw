@@ -2746,11 +2746,15 @@ enum ModelCommands {
         #[arg(long)]
         force: bool,
     },
-    /// List cached models for a model_provider
+    /// List the models configured in config.toml
     List {
-        /// ModelProvider name (defaults to configured default model_provider)
+        /// ModelProvider name (defaults to all configured entries)
         #[arg(long)]
         model_provider: Option<String>,
+
+        /// Verify each configured model against the provider's live catalog
+        #[arg(long)]
+        check: bool,
     },
     /// Set the default model in config
     Set {
@@ -4060,10 +4064,19 @@ async fn main() -> Result<()> {
                     "Observability"
                 )
             );
-            println!(
+            let trace_storage_mode = config.observability.log_persistence.as_wire().to_string();
+            let trace_storage_path = config.observability.log_persistence_path.to_string();
+            let trace_storage_fallback = format!(
                 "🧾 Trace storage:  {} ({})",
-                config.observability.log_persistence.as_wire(),
-                config.observability.log_persistence_path
+                trace_storage_mode, trace_storage_path
+            );
+            println!(
+                "{}",
+                ta(
+                    "cli-status-trace-storage",
+                    &[("mode", &trace_storage_mode), ("path", &trace_storage_path),],
+                    &trace_storage_fallback
+                )
             );
             // Per-agent autonomy: each enabled agent picks its own
             // risk_profile, so list them rather than collapsing to one.
@@ -4115,18 +4128,46 @@ async fn main() -> Result<()> {
                 );
             }
             let effective_memory_backend = config.resolve_active_storage().kind();
+            let heartbeat_value = if config.heartbeat.enabled {
+                let interval_minutes = config.heartbeat.interval_minutes.to_string();
+                let heartbeat_every_fallback = format!("every {}min", interval_minutes);
+                ta(
+                    "cli-status-heartbeat-every-minutes",
+                    &[("minutes", &interval_minutes)],
+                    &heartbeat_every_fallback,
+                )
+            } else {
+                t("cli-status-word-disabled", "disabled")
+            };
+            let heartbeat_fallback = format!("💓 Heartbeat:      {}", heartbeat_value);
             println!(
-                "💓 Heartbeat:      {}",
-                if config.heartbeat.enabled {
-                    format!("every {}min", config.heartbeat.interval_minutes)
-                } else {
-                    "disabled".into()
-                }
+                "{}",
+                ta(
+                    "cli-status-heartbeat",
+                    &[("v", &heartbeat_value)],
+                    &heartbeat_fallback
+                )
+            );
+            let memory_backend = effective_memory_backend.to_string();
+            let memory_auto_save = if config.memory.auto_save {
+                t("cli-status-word-on", "on")
+            } else {
+                t("cli-status-word-off", "off")
+            };
+            let memory_fallback = format!(
+                "🧠 Memory:         {} (auto-save: {})",
+                memory_backend, memory_auto_save
             );
             println!(
-                "🧠 Memory:         {} (auto-save: {})",
-                effective_memory_backend,
-                if config.memory.auto_save { "on" } else { "off" }
+                "{}",
+                ta(
+                    "cli-status-memory",
+                    &[
+                        ("backend", &memory_backend),
+                        ("auto_save", &memory_auto_save),
+                    ],
+                    &memory_fallback
+                )
             );
 
             println!();
@@ -4155,17 +4196,30 @@ async fn main() -> Result<()> {
                         "Workspace only"
                     )
                 );
+                let allowed_roots = if profile.allowed_roots.is_empty() {
+                    t("cli-status-word-none", "(none)")
+                } else {
+                    profile.allowed_roots.join(", ")
+                };
+                let allowed_roots_fallback = format!("  Allowed roots:     {}", allowed_roots);
                 println!(
-                    "  Allowed roots:     {}",
-                    if profile.allowed_roots.is_empty() {
-                        "(none)".to_string()
-                    } else {
-                        profile.allowed_roots.join(", ")
-                    }
+                    "{}",
+                    ta(
+                        "cli-status-allowed-roots",
+                        &[("v", &allowed_roots)],
+                        &allowed_roots_fallback
+                    )
                 );
+                let allowed_commands = profile.allowed_commands.join(", ");
+                let allowed_commands_fallback =
+                    format!("  Allowed commands:  {}", allowed_commands);
                 println!(
-                    "  Allowed commands:  {}",
-                    profile.allowed_commands.join(", ")
+                    "{}",
+                    ta(
+                        "cli-status-allowed-commands",
+                        &[("v", &allowed_commands)],
+                        &allowed_commands_fallback
+                    )
                 );
                 let actions_cap = config
                     .runtime_profile_for_agent(alias)
@@ -4179,13 +4233,19 @@ async fn main() -> Result<()> {
                     )
                 );
             }
+            let cost_tracking = if config.cost.enabled {
+                t("cli-status-word-enabled", "enabled")
+            } else {
+                t("cli-status-word-disabled", "disabled")
+            };
+            let cost_tracking_fallback = format!("  Cost tracking:     {}", cost_tracking);
             println!(
-                "  Cost tracking:     {}",
-                if config.cost.enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
+                "{}",
+                ta(
+                    "cli-status-cost-tracking",
+                    &[("v", &cost_tracking)],
+                    &cost_tracking_fallback
+                )
             );
             println!(
                 "{}",
@@ -4207,13 +4267,29 @@ async fn main() -> Result<()> {
                 match cost::CostTracker::new(config.cost.clone(), &config.data_dir) {
                     Ok(tracker) => match tracker.get_summary() {
                         Ok(summary) => {
+                            let spent_today = format!("{:.4}", summary.daily_cost_usd);
+                            let daily_limit = format!("{:.2}", config.cost.daily_limit_usd);
+                            let spent_today_fallback =
+                                format!("  Spent today:       ${spent_today} / ${daily_limit}");
                             println!(
-                                "  Spent today:       ${:.4} / ${:.2}",
-                                summary.daily_cost_usd, config.cost.daily_limit_usd
+                                "{}",
+                                ta(
+                                    "cli-status-spent-today",
+                                    &[("spent", &spent_today), ("limit", &daily_limit)],
+                                    &spent_today_fallback
+                                )
                             );
+                            let spent_month = format!("{:.4}", summary.monthly_cost_usd);
+                            let monthly_limit = format!("{:.2}", config.cost.monthly_limit_usd);
+                            let spent_month_fallback =
+                                format!("  Spent this month:  ${spent_month} / ${monthly_limit}");
                             println!(
-                                "  Spent this month:  ${:.4} / ${:.2}",
-                                summary.monthly_cost_usd, config.cost.monthly_limit_usd
+                                "{}",
+                                ta(
+                                    "cli-status-spent-month",
+                                    &[("spent", &spent_month), ("limit", &monthly_limit)],
+                                    &spent_month_fallback
+                                )
                             );
                         }
                         Err(e) => {
@@ -4259,25 +4335,36 @@ async fn main() -> Result<()> {
             println!("{}", t("cli-status-channels", "Channels:"));
             println!("{}", t("cli-status-cli-always", "  CLI:      ✅ always"));
             for entry in zeroclaw_channels::listing::compiled_channels(&config.channels) {
+                let channel_status = if entry.configured {
+                    t("cli-status-word-configured", "configured")
+                } else {
+                    t("cli-status-word-not-configured", "not configured")
+                };
                 println!(
                     "  {:9} {}",
                     entry.name,
                     if entry.configured {
-                        "✅ configured"
+                        format!("✅ {}", channel_status)
                     } else {
-                        "❌ not configured"
+                        format!("❌ {}", channel_status)
                     }
                 );
             }
             println!();
             println!("{}", t("cli-status-peripherals", "Peripherals:"));
+            let peripherals_enabled = if config.peripherals.enabled {
+                t("cli-status-word-yes", "yes")
+            } else {
+                t("cli-status-word-no", "no")
+            };
+            let peripherals_enabled_fallback = format!("  Enabled:   {}", peripherals_enabled);
             println!(
-                "  Enabled:   {}",
-                if config.peripherals.enabled {
-                    "yes"
-                } else {
-                    "no"
-                }
+                "{}",
+                ta(
+                    "cli-status-peripherals-enabled",
+                    &[("v", &peripherals_enabled)],
+                    &peripherals_enabled_fallback
+                )
             );
             println!(
                 "{}",
@@ -4300,14 +4387,16 @@ async fn main() -> Result<()> {
 
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
-        Commands::Models { model_command } => {
-            let (model_provider, show_names) = match &model_command {
-                ModelCommands::Refresh { model_provider, .. } => (model_provider.as_deref(), false),
-                ModelCommands::List { model_provider } => (model_provider.as_deref(), true),
-                _ => (None, false),
-            };
-            doctor::run_models(&config, model_provider, false, show_names).await
-        }
+        Commands::Models { model_command } => match &model_command {
+            ModelCommands::List {
+                model_provider,
+                check,
+            } => doctor::run_configured_models(&config, model_provider.as_deref(), *check).await,
+            ModelCommands::Refresh { model_provider, .. } => {
+                doctor::run_models(&config, model_provider.as_deref(), false, false).await
+            }
+            _ => doctor::run_models(&config, None, false, false).await,
+        },
 
         Commands::Providers => {
             let model_providers = zeroclaw_providers::list_model_providers();
@@ -4358,8 +4447,8 @@ async fn main() -> Result<()> {
         Commands::Doctor { doctor_command } => match doctor_command {
             Some(DoctorCommands::Models {
                 model_provider,
-                use_cache,
-            }) => doctor::run_models(&config, model_provider.as_deref(), use_cache, false).await,
+                use_cache: _,
+            }) => doctor::run_configured_models(&config, model_provider.as_deref(), true).await,
             Some(DoctorCommands::Traces {
                 id,
                 event,
