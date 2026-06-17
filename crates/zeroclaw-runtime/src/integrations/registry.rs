@@ -88,15 +88,15 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
             status: bool_to_status(info.configured),
         });
 
-    let toggles = config
-        .integration_descriptors()
-        .into_iter()
-        .map(|d| IntegrationEntry {
+    let toggles = config.integration_descriptors().into_iter().map(|d| {
+        let category = parse_category(d.category);
+        IntegrationEntry {
             name: d.display_name.to_string(),
             description: d.description.to_string(),
-            category: parse_category(d.category),
+            category,
             status: bool_to_status(d.active),
-        });
+        }
+    });
 
     let providers = zeroclaw_providers::list_model_providers()
         .into_iter()
