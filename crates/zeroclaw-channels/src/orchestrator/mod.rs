@@ -202,7 +202,7 @@ impl Observer for ChannelNotifyObserver {
 /// Per-sender conversation history for channel messages.
 /// Bounded by `MAX_CONVERSATION_SENDERS` — oldest-accessed senders are evicted.
 type ConversationHistoryMap = Arc<Mutex<lru::LruCache<String, Vec<ChatMessage>>>>;
-/// Senders that requested `/new` and must force a fresh prompt on their next message.
+/// Senders that requested `/new` or `/clear` and must force a fresh prompt on their next message.
 type PendingNewSessionSet = Arc<Mutex<HashSet<String>>>;
 /// Maximum conversation senders kept in memory (LRU eviction beyond this).
 const MAX_CONVERSATION_SENDERS: usize = 1000;
@@ -1136,8 +1136,15 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         .to_ascii_lowercase();
 
     match base_command.as_str() {
-        // `/new` is available on every channel — no model-switch gate.
+        // `/new` and bare `/clear` are available on every channel — no model-switch gate.
         "/new" => Some(ChannelRuntimeCommand::NewSession),
+        "/clear" => {
+            if parts.next().is_none() {
+                Some(ChannelRuntimeCommand::NewSession)
+            } else {
+                None
+            }
+        }
         // Model/model_provider switching is channel-gated.
         "/models" if supports_runtime_model_switch(channel_name) => {
             if let Some(model_provider) = parts.next() {
@@ -5677,6 +5684,7 @@ fn build_channel_by_id(
                     tg.mention_only,
                 )
                 .with_persistence(config_arc.clone())
+                .with_api_base(tg.api_base_url.clone())
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_transcription(config.transcription.clone())
@@ -6672,6 +6680,7 @@ fn collect_configured_channels(
                         tg.mention_only,
                     )
                     .with_persistence(config_arc.clone())
+                    .with_api_base(tg.api_base_url.clone())
                     .with_ack_reactions(ack)
                     .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                     .with_transcription(config.transcription.clone())
@@ -9279,7 +9288,8 @@ pub async fn deliver_announcement(
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
             let ch =
-                TelegramChannel::new(tg.bot_token.clone(), alias, peer_resolver, tg.mention_only);
+                TelegramChannel::new(tg.bot_token.clone(), alias, peer_resolver, tg.mention_only)
+                    .with_api_base(tg.api_base_url.clone());
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(not(feature = "channel-telegram"))]
@@ -9497,7 +9507,9 @@ pub async fn deliver_announcement(
                 .get(alias)
                 .ok_or_else(not_configured)?;
             if !wa.is_web_config() {
-                anyhow::bail!("WhatsApp channel send requires Web mode (session_path must be set)");
+                anyhow::bail!(
+                    "WhatsApp channel send requires Web mode (set session_path, pair_phone, or mode = personal)"
+                );
             }
             let peers = config.channel_external_peers("whatsapp", alias);
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
@@ -16047,6 +16059,19 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    #[test]
+    fn parse_runtime_command_maps_clear_to_new_session() {
+        assert_eq!(
+            parse_runtime_command("telegram", "/clear"),
+            Some(ChannelRuntimeCommand::NewSession)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/clear@zeroclaw_bot"),
+            Some(ChannelRuntimeCommand::NewSession)
+        );
+        assert_eq!(parse_runtime_command("telegram", "/clear all"), None);
+    }
+
     /// `/models <family>` must resolve to a configured alias-backed ref so the
     /// switched provider uses the alias entry's key/URI — never construct a bare
     /// family provider that ignores `[providers.models.<family>.<alias>]`.
@@ -19421,6 +19446,7 @@ This is an example JSON object for profile settings."#;
             zeroclaw_config::schema::TelegramConfig {
                 enabled: true,
                 bot_token: "test-token".to_string(),
+                api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::Off,
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
@@ -20605,6 +20631,42 @@ Done."#;
         assert!(
             msg.contains("[channels.whatsapp.default] not configured"),
             "whatsapp.default must report the real config table; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn deliver_announcement_rejects_whatsapp_non_web_config_clearly() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.whatsapp.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                access_token: Some("test-token".to_string()),
+                phone_number_id: Some("phone-number-id".to_string()),
+                verify_token: Some("verify-token".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let err = deliver_announcement(&config, "whatsapp.default", "+15551234567", None, "hi")
+            .await
+            .expect_err("expected WhatsApp Cloud config to be rejected for cron delivery");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("WhatsApp channel send requires Web mode"),
+            "whatsapp.default must clearly explain the Web mode requirement; got: {msg}"
+        );
+        assert!(
+            msg.contains("session_path")
+                && msg.contains("pair_phone")
+                && msg.contains("mode = personal"),
+            "whatsapp.default must name the Web selectors accepted by cron delivery; got: {msg}"
+        );
+        assert!(
+            !msg.contains("unsupported delivery channel")
+                && !msg.contains("[channels.whatsapp.default] not configured"),
+            "whatsapp.default must reject the configured non-Web mode, not fall through; got: {msg}"
         );
     }
 

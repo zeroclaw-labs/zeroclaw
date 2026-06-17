@@ -228,6 +228,7 @@ pub enum ModelProviderKind {
     Avian,
     Deepmyst,
     Venice,
+    Nearai,
     Novita,
     Nvidia,
     Vercel,

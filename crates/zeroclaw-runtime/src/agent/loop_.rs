@@ -817,6 +817,17 @@ fn agent_provider_composite(
         .map(|(ty, alias, _)| format!("{ty}.{alias}"))
 }
 
+/// Return the owned agent config direct-turn setup needs, with runtime-profile
+/// values baked into `resolved`.
+fn resolved_agent_for_turn(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> Result<zeroclaw_config::schema::AliasedAgentConfig> {
+    config
+        .resolved_agent_config(agent_alias)
+        .with_context(|| format!("agents.{agent_alias} is not configured"))
+}
+
 /// Resolve (api_key, uri) for `provider_name`, preferring the alias-specific
 /// config when `provider_name` is a dotted `<family>.<alias>` reference.
 /// Falls back to `fallback` (the agent's configured provider) for bare family
@@ -857,10 +868,7 @@ pub async fn run(
     overrides: AgentRunOverrides,
 ) -> Result<String> {
     use ::zeroclaw_log::Instrument;
-    let agent = config
-        .agent(agent_alias)
-        .with_context(|| format!("agents.{agent_alias} is not configured"))?
-        .clone();
+    let agent = resolved_agent_for_turn(&config, agent_alias)?;
     crate::agent::thinking::validate_thinking_config(&agent.resolved.thinking);
     let risk_profile = config
         .risk_profile_for_agent(agent_alias)
@@ -900,14 +908,11 @@ pub async fn run(
         let agent_alias: &str = __zc_alias.as_str();
         // ── Effective per-agent runtime tunables ──────────────────────
         // Profile values (when set) override the agent's inline fields.
-        // See `Config::effective_*` helpers for precedence rules.
-        let _eff_max_tool_iterations = config.effective_max_tool_iterations(agent_alias);
-        let eff_max_history_messages = config.effective_max_history_messages(agent_alias);
-        let eff_max_context_tokens = config.effective_max_context_tokens(agent_alias);
-        let eff_compact_context = config.effective_compact_context(agent_alias);
-        let eff_max_system_prompt_chars = config.effective_max_system_prompt_chars(agent_alias);
-        let _eff_max_tool_result_chars = config.effective_max_tool_result_chars(agent_alias);
-        let _eff_tool_call_dedup_exempt = config.effective_tool_call_dedup_exempt(agent_alias);
+        // See `Config::resolved_agent_config` for precedence rules.
+        let eff_max_history_messages = agent.resolved.max_history_messages;
+        let eff_max_context_tokens = agent.resolved.max_context_tokens;
+        let eff_compact_context = agent.resolved.compact_context;
+        let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
         let base_observer = observability::create_observer(&config.observability);
         let observer: Arc<dyn Observer> = Arc::from(base_observer);
         let runtime: Arc<dyn platform::RuntimeAdapter> =
@@ -2421,10 +2426,7 @@ pub async fn process_message(
     session_id: Option<&str>,
 ) -> Result<String> {
     use ::zeroclaw_log::Instrument;
-    let agent = config
-        .agent(agent_alias)
-        .with_context(|| format!("agents.{agent_alias} is not configured"))?
-        .clone();
+    let agent = resolved_agent_for_turn(&config, agent_alias)?;
     crate::agent::thinking::validate_thinking_config(&agent.resolved.thinking);
     let risk_profile = config
         .risk_profile_for_agent(agent_alias)
@@ -2469,14 +2471,9 @@ pub async fn process_message(
 
         // ── Effective per-agent runtime tunables ──────────────────────
         // Profile values (when set) override the agent's inline fields.
-        // See `Config::effective_*` helpers for precedence rules.
-        let _eff_max_tool_iterations = config.effective_max_tool_iterations(agent_alias);
-        let _eff_max_history_messages = config.effective_max_history_messages(agent_alias);
-        let _eff_max_context_tokens = config.effective_max_context_tokens(agent_alias);
-        let eff_compact_context = config.effective_compact_context(agent_alias);
-        let eff_max_system_prompt_chars = config.effective_max_system_prompt_chars(agent_alias);
-        let _eff_max_tool_result_chars = config.effective_max_tool_result_chars(agent_alias);
-        let _eff_tool_call_dedup_exempt = config.effective_tool_call_dedup_exempt(agent_alias);
+        // See `Config::resolved_agent_config` for precedence rules.
+        let eff_compact_context = agent.resolved.compact_context;
+        let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
 
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
@@ -11300,6 +11297,37 @@ Let me check the result."#;
             Some("openai"),
             "bare family name would bypass the alias-aware factory path and drop \
              requires_openai_auth from the config, routing to the wrong provider"
+        );
+    }
+
+    #[test]
+    fn direct_turn_agent_config_resolves_runtime_profile_tunables() {
+        use zeroclaw_config::providers::RuntimeProfileRef;
+        use zeroclaw_config::schema::{AliasedAgentConfig, RuntimeProfileConfig};
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.runtime_profiles.insert(
+            "long".to_string(),
+            RuntimeProfileConfig {
+                max_tool_iterations: 25,
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "default".to_string(),
+            AliasedAgentConfig {
+                runtime_profile: RuntimeProfileRef::new("long"),
+                ..Default::default()
+            },
+        );
+
+        let agent = super::resolved_agent_for_turn(&config, "default")
+            .expect("configured agent should resolve for direct turns");
+
+        assert_eq!(
+            agent.resolved.max_tool_iterations, 25,
+            "direct agent turns must honor runtime_profiles.*.max_tool_iterations \
+             instead of the skipped AliasedAgentConfig::resolved default"
         );
     }
 

@@ -2007,6 +2007,33 @@ pub struct VeniceModelProviderConfig {
     pub base: ModelProviderConfig,
 }
 
+// ── NEAR AI Cloud ──
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum NearaiEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for NearaiEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://cloud-api.near.ai/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.nearai"]
+pub struct NearaiModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
 // ── Novita ──
 
 #[derive(
@@ -3125,6 +3152,7 @@ impl_default_family_endpoint! {
     AvianModelProviderConfig,
     DeepmystModelProviderConfig,
     VeniceModelProviderConfig,
+    NearaiModelProviderConfig,
     NovitaModelProviderConfig,
     NvidiaModelProviderConfig,
     TelnyxModelProviderConfig,
@@ -3454,7 +3482,7 @@ pub struct ChannelAliasInfo {
 }
 
 impl Config {
-    /// Resolve the configured alias values valid for an [`AliasSource`].
+    /// Resolve the configured alias values valid for an [`crate::traits::AliasSource`].
     /// Two-tier sources return dotted `<type>.<alias>` keys; flat sources
     /// return bare alias keys. The single resolver every surface uses for
     /// `PropKind::AliasRef` pickers and validation.
@@ -8585,6 +8613,45 @@ fn validate_proxy_url(field: &str, url: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_http_base_url(field: &str, url: &str) -> Result<()> {
+    if url.trim().is_empty() {
+        validation_bail!(
+            RequiredFieldEmpty,
+            field.to_string(),
+            "{field} must not be empty"
+        );
+    }
+
+    let parsed = match reqwest::Url::parse(url) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            validation_bail!(
+                InvalidFormat,
+                field.to_string(),
+                "{field} must be a valid URL: {err}"
+            );
+        }
+    };
+
+    if !matches!(parsed.scheme(), "http" | "https") {
+        validation_bail!(
+            InvalidFormat,
+            field.to_string(),
+            "{field} must use http:// or https://"
+        );
+    }
+
+    if parsed.host_str().is_none() {
+        validation_bail!(
+            InvalidFormat,
+            field.to_string(),
+            "{field} must include a host"
+        );
+    }
+
+    Ok(())
+}
+
 fn set_proxy_env_pair(key: &str, value: Option<&str>) {
     let lowercase_key = key.to_ascii_lowercase();
     if let Some(value) = value.and_then(|candidate| normalize_proxy_url_option(Some(candidate))) {
@@ -11634,6 +11701,12 @@ fn default_telegram_approval_timeout_secs() -> u64 {
     120
 }
 
+pub const TELEGRAM_OFFICIAL_API_BASE_URL: &str = "https://api.telegram.org";
+
+fn default_telegram_api_base_url() -> String {
+    TELEGRAM_OFFICIAL_API_BASE_URL.to_string()
+}
+
 fn default_channel_approval_timeout_secs() -> u64 {
     300
 }
@@ -11643,7 +11716,7 @@ fn default_matrix_draft_update_interval_ms() -> u64 {
 }
 
 /// Telegram bot channel configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.telegram"]
 pub struct TelegramConfig {
@@ -11659,6 +11732,11 @@ pub struct TelegramConfig {
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub bot_token: String,
+    /// Telegram Bot API base URL. Defaults to the official Telegram endpoint;
+    /// set to a local Bot API server URL when self-hosting Telegram's bot API.
+    #[tab(Connection)]
+    #[serde(default = "default_telegram_api_base_url")]
+    pub api_base_url: String,
     /// Streaming mode for progressive response delivery via message edits.
     #[tab(Behavior)]
     #[serde(default)]
@@ -11710,6 +11788,26 @@ pub struct TelegramConfig {
     /// newest send is dropped and a `WARN` is logged.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
+}
+
+impl Default for TelegramConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bot_token: String::new(),
+            api_base_url: default_telegram_api_base_url(),
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: default_draft_update_interval_ms(),
+            interrupt_on_new_message: false,
+            mention_only: false,
+            ack_reactions: None,
+            proxy_url: None,
+            approval_timeout_secs: default_telegram_approval_timeout_secs(),
+            excluded_tools: Vec::new(),
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
+        }
+    }
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -16302,6 +16400,13 @@ impl Config {
             }
         }
 
+        for (alias, tg) in &self.channels.telegram {
+            validate_http_base_url(
+                &format!("channels.telegram.{alias}.api_base_url"),
+                &tg.api_base_url,
+            )?;
+        }
+
         for name in self.http_request.secrets.keys() {
             if name.is_empty()
                 || name.len() > 64
@@ -19230,6 +19335,72 @@ enabled = true
     }
 
     #[test]
+    async fn telegram_api_base_url_default_uses_official_endpoint() {
+        assert_eq!(
+            TelegramConfig::default().api_base_url,
+            "https://api.telegram.org"
+        );
+    }
+
+    #[test]
+    async fn telegram_api_base_url_missing_toml_defaults_to_official_endpoint() {
+        let parsed: TelegramConfig = toml::from_str(r#"bot_token = "tok""#).unwrap();
+
+        assert_eq!(parsed.api_base_url, "https://api.telegram.org");
+    }
+
+    #[test]
+    async fn telegram_api_base_url_parses_custom_endpoint() {
+        let parsed: TelegramConfig = toml::from_str(
+            r#"
+bot_token = "tok"
+api_base_url = "http://127.0.0.1:8081"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.api_base_url, "http://127.0.0.1:8081");
+    }
+
+    #[test]
+    async fn validate_rejects_empty_telegram_api_base_url() {
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "default".to_string(),
+            TelegramConfig {
+                bot_token: "tok".into(),
+                api_base_url: "   ".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("empty Telegram API base URL must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("channels.telegram.default.api_base_url"));
+    }
+
+    #[test]
+    async fn validate_rejects_malformed_telegram_api_base_url() {
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "default".to_string(),
+            TelegramConfig {
+                bot_token: "tok".into(),
+                api_base_url: "not a url".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("malformed Telegram API base URL must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("channels.telegram.default.api_base_url"));
+    }
+
+    #[test]
     async fn observability_enums_deserialize_legacy_string_values() {
         // Backward compat: TOML configs written before the enum conversion
         // stored these as bare strings. They must still parse.
@@ -19756,6 +19927,7 @@ auto_save = true
                     TelegramConfig {
                         enabled: true,
                         bot_token: "123:ABC".into(),
+                        api_base_url: default_telegram_api_base_url(),
                         stream_mode: StreamMode::default(),
                         draft_update_interval_ms: default_draft_update_interval_ms(),
                         interrupt_on_new_message: false,
@@ -20989,6 +21161,7 @@ default_temperature = 0.7
         let tc = TelegramConfig {
             enabled: true,
             bot_token: "123:XYZ".into(),
+            api_base_url: default_telegram_api_base_url(),
             stream_mode: StreamMode::Partial,
             draft_update_interval_ms: 500,
             interrupt_on_new_message: true,
@@ -21015,6 +21188,7 @@ default_temperature = 0.7
         assert_eq!(parsed.stream_mode, StreamMode::Off);
         assert_eq!(parsed.draft_update_interval_ms, 1000);
         assert!(!parsed.interrupt_on_new_message);
+        assert_eq!(parsed.api_base_url, "https://api.telegram.org");
     }
 
     #[test]
@@ -24652,6 +24826,7 @@ require_otp_to_resume = true
             TelegramConfig {
                 enabled: true,
                 bot_token: plaintext_token.into(),
+                api_base_url: default_telegram_api_base_url(),
                 stream_mode: StreamMode::default(),
                 draft_update_interval_ms: default_draft_update_interval_ms(),
                 interrupt_on_new_message: false,
