@@ -1736,7 +1736,7 @@ impl QuickstartPane {
                             // rules (no leading/trailing `_`, no `__`,
                             // 63-char cap) are enforced at submit time.
                             let normalized = c.to_ascii_lowercase();
-                            if matches!(normalized, 'a'..='z' | '0'..='9' | '_') {
+                            if zeroclaw_config::helpers::is_valid_alias_char(normalized) {
                                 a.name.push(normalized);
                             }
                         }
