@@ -563,4 +563,53 @@ This body-only browser automation phrase must not be used for matching.
         assert!(suggestion.is_some());
         assert!(body_only_match.is_none());
     }
+
+    /// Regression: a capability in the raw registry but absent from the
+    /// effective tool set must not suppress install suggestions.
+    ///
+    /// Before the fix, `process_message` built `runtime_capability_names`
+    /// from the raw `tools_registry` (all registered tools regardless of
+    /// exclusion). A tool excluded for the current turn was still treated
+    /// as "installed", causing `suggest_missing_skill_install` to skip the
+    /// suggestion. Using `effective_tool_names` instead ensures that only
+    /// tools available for this turn suppress suggestions.
+    ///
+    /// This test demonstrates the two outcomes:
+    /// - passing the raw name suppresses the suggestion (old behavior);
+    /// - omitting it (as the effective set does) returns the suggestion.
+    #[test]
+    fn excluded_tool_does_not_suppress_missing_skill_suggestion() {
+        let catalog = vec![catalog_entry("calendar", &["calendar", "google calendar"])];
+
+        // With the excluded tool in runtime capabilities (old behavior: raw
+        // registry), the suggestion is suppressed because "calendar" is
+        // treated as already installed.
+        let suppressed = suggest_missing_skill_install(
+            "please use google calendar to schedule this meeting",
+            &[],
+            &["calendar"],
+            &catalog,
+        );
+        assert!(
+            suppressed.is_none(),
+            "raw registry including excluded tool should suppress suggestion — this is the old bug"
+        );
+
+        // Without the excluded tool in runtime capabilities (new behavior:
+        // effective tool set), the suggestion is returned because "calendar"
+        // is not considered available for this turn.
+        let suggestion = suggest_missing_skill_install(
+            "please use google calendar to schedule this meeting",
+            &[],
+            &["shell", "file_read"],
+            &catalog,
+        );
+        assert!(
+            suggestion.is_some(),
+            "effective tool set excluding the capability must return the suggestion"
+        );
+        let suggestion = suggestion.expect("suggestion should be present");
+        assert_eq!(suggestion.name, "calendar");
+        assert!(suggestion.render_user_message().contains("calendar"));
+    }
 }
