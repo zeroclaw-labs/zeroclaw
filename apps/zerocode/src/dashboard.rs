@@ -11,8 +11,8 @@ use ratatui::{
 use std::sync::Arc;
 
 use crate::client::{
-    AgentStatusEntry, CostSummaryResult, CronJobEntry, CronSchedule, MemoryEntryResult,
-    MessageEntry, RpcClient, SessionEntry, StatusResult, TuiListEntry,
+    AgentStatusEntry, CostSummaryResult, CronJobEntry, CronRunEntry, CronSchedule,
+    MemoryEntryResult, MessageEntry, RpcClient, SessionEntry, StatusResult, TuiListEntry,
 };
 use crate::mouse;
 use crate::theme;
@@ -82,6 +82,11 @@ pub(crate) struct Dashboard {
     agents: Vec<AgentStatusEntry>,
     cost: Option<CostSummaryResult>,
     cron_jobs: Vec<CronJobEntry>,
+    cron_runs: Vec<CronRunEntry>,
+    cron_runs_job_id: Option<String>,
+    cron_runs_error: Option<String>,
+    cron_trigger_job_id: Option<String>,
+    cron_trigger_message: Option<String>,
     memories: Vec<MemoryEntryResult>,
     memory_error: Option<String>,
     cost_error: Option<String>,
@@ -146,6 +151,11 @@ impl Dashboard {
             agents: Vec::new(),
             cost: None,
             cron_jobs: Vec::new(),
+            cron_runs: Vec::new(),
+            cron_runs_job_id: None,
+            cron_runs_error: None,
+            cron_trigger_job_id: None,
+            cron_trigger_message: None,
             memories: Vec::new(),
             memory_error: None,
             cost_error: None,
@@ -294,6 +304,9 @@ impl Dashboard {
             Tab::Cron => {
                 if let Ok(c) = self.rpc.cron_list().await {
                     self.cron_jobs = c.jobs;
+                    if self.detail_open {
+                        self.load_cron_runs().await;
+                    }
                 }
             }
         }
@@ -1620,6 +1633,70 @@ impl Dashboard {
             }
         }
 
+        if self.cron_trigger_job_id.as_deref() == Some(j.id.as_str())
+            && let Some(message) = &self.cron_trigger_message
+        {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                crate::i18n::t("zc-dashboard-section-manual-run"),
+                theme::heading_style(),
+            )));
+            for l in message.lines() {
+                lines.push(Line::from(Span::styled(l.to_string(), theme::body_style())));
+            }
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            crate::i18n::t("zc-dashboard-section-recent-runs"),
+            theme::heading_style(),
+        )));
+        if self.cron_runs_job_id.as_deref() != Some(j.id.as_str()) {
+            lines.push(Line::from(Span::styled(
+                crate::i18n::t("zc-dashboard-loading-runs"),
+                theme::dim_style(),
+            )));
+        } else if let Some(error) = &self.cron_runs_error {
+            lines.push(Line::from(Span::styled(
+                format!("{}: {error}", crate::i18n::t("zc-dashboard-runs-error")),
+                theme::error_style(),
+            )));
+        } else if self.cron_runs.is_empty() {
+            lines.push(Line::from(Span::styled(
+                crate::i18n::t("zc-dashboard-no-runs"),
+                theme::dim_style(),
+            )));
+        } else {
+            for run in &self.cron_runs {
+                let status_style = cron_run_status_style(&run.status);
+                let run_window = if run.finished_at.trim().is_empty() {
+                    run.started_at.clone()
+                } else {
+                    format!("{} -> {}", run.started_at, run.finished_at)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("#{} ", run.id), theme::dim_style()),
+                    Span::styled(
+                        format!("{} ", truncate(&run.job_id, 24)),
+                        theme::dim_style(),
+                    ),
+                    Span::styled(format!("{:<10}", run.status), status_style),
+                    Span::styled(
+                        format!("{}  {}", run_window, format_duration_ms(run.duration_ms)),
+                        theme::dim_style(),
+                    ),
+                ]));
+                if let Some(output) = run.output.as_deref().filter(|s| !s.trim().is_empty()) {
+                    for l in output.lines().take(3) {
+                        lines.push(Line::from(Span::styled(
+                            format!("  {}", truncate(l, 96)),
+                            theme::body_style(),
+                        )));
+                    }
+                }
+            }
+        }
+
         let para = Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((self.detail_scroll, 0));
@@ -1709,6 +1786,11 @@ impl Dashboard {
                 self.memory_detail_key = None;
                 self.session_messages.clear();
                 self.session_messages_id = None;
+                self.cron_runs.clear();
+                self.cron_runs_job_id = None;
+                self.cron_runs_error = None;
+                self.cron_trigger_job_id = None;
+                self.cron_trigger_message = None;
             }
             // Shift+J / Shift+K scroll the detail pane
             Some(DashboardTabAction::DetailScrollDown) => {
@@ -1762,6 +1844,9 @@ impl Dashboard {
                     self.last_poll = None;
                 }
             }
+            Some(DashboardTabAction::TriggerCron) if self.tab == Tab::Cron => {
+                self.trigger_selected_cron().await;
+            }
             _ => {}
         }
         false
@@ -1802,6 +1887,9 @@ impl Dashboard {
             }
             Some(DashboardTabAction::Refresh) => {
                 self.poll_data().await;
+            }
+            Some(DashboardTabAction::TriggerCron) if self.tab == Tab::Cron => {
+                self.trigger_selected_cron().await;
             }
             Some(DashboardTabAction::JumpEnd) => self.jump_to_end(),
             Some(DashboardTabAction::JumpStart) => self.jump_to_start(),
@@ -1845,6 +1933,72 @@ impl Dashboard {
         if self.tab == Tab::Memories && self.detail_open {
             self.load_memory_detail().await;
         }
+        if self.tab == Tab::Cron && self.detail_open {
+            self.load_cron_runs().await;
+        }
+    }
+
+    async fn load_cron_runs(&mut self) {
+        let Some(idx) = self.selected_cron_index() else {
+            self.cron_runs.clear();
+            self.cron_runs_job_id = None;
+            self.cron_runs_error = None;
+            return;
+        };
+        let job_id = self.cron_jobs[idx].id.clone();
+        self.cron_runs_job_id = Some(job_id.clone());
+        match self.rpc.cron_runs(&job_id, Some(20)).await {
+            Ok(res) => {
+                if self.cron_runs_job_id.as_deref() == Some(job_id.as_str()) {
+                    self.cron_runs = res.runs;
+                    self.cron_runs_error = None;
+                }
+            }
+            Err(e) => {
+                if self.cron_runs_job_id.as_deref() == Some(job_id.as_str()) {
+                    self.cron_runs.clear();
+                    self.cron_runs_error = Some(e.to_string());
+                }
+            }
+        }
+    }
+
+    async fn trigger_selected_cron(&mut self) {
+        let Some(idx) = self.selected_cron_index() else {
+            self.cron_trigger_job_id = None;
+            self.cron_trigger_message = Some(crate::i18n::t("zc-dashboard-no-job"));
+            return;
+        };
+        let job_id = self.cron_jobs[idx].id.clone();
+        self.cron_trigger_job_id = Some(job_id.clone());
+        match self.rpc.cron_trigger(&job_id).await {
+            Ok(result) => {
+                let status = if result.success {
+                    crate::i18n::t("zc-dashboard-run-succeeded")
+                } else {
+                    crate::i18n::t("zc-dashboard-run-failed")
+                };
+                let output = result.output.trim();
+                self.cron_trigger_message = Some(if output.is_empty() {
+                    format!("{status}: {}", result.id)
+                } else {
+                    format!("{status}: {}\n{}", result.id, output)
+                });
+            }
+            Err(e) => {
+                self.cron_trigger_message = Some(format!(
+                    "{}: {e}",
+                    crate::i18n::t("zc-dashboard-run-failed")
+                ));
+            }
+        }
+        if let Ok(c) = self.rpc.cron_list().await {
+            self.cron_jobs = c.jobs;
+        }
+        if self.detail_open {
+            self.load_cron_runs().await;
+        }
+        self.last_poll = None;
     }
 
     /// Lazy-load the full memory entry for the currently-selected row
@@ -1975,6 +2129,11 @@ impl Dashboard {
         self.detail_scroll = 0;
         self.health_scroll = 0;
         self.cost_scroll = 0;
+        self.cron_runs.clear();
+        self.cron_runs_job_id = None;
+        self.cron_runs_error = None;
+        self.cron_trigger_job_id = None;
+        self.cron_trigger_message = None;
         // Force immediate data fetch for new tab
         self.last_poll = None;
     }
@@ -2097,6 +2256,8 @@ impl crate::widgets::HelpContext for Dashboard {
             ];
             if self.tab == Tab::Sessions {
                 detail.push(D::KillSession);
+            } else if self.tab == Tab::Cron {
+                detail.push(D::TriggerCron);
             }
             return HelpNode::entries(entries_for(detail));
         }
@@ -2117,6 +2278,9 @@ impl crate::widgets::HelpContext for Dashboard {
                     D::OpenDetail,
                     D::BeginSearch,
                 ]));
+                if self.tab == Tab::Cron {
+                    entries.extend(entries_for([D::TriggerCron]));
+                }
             }
         }
         HelpNode::entries(entries)
@@ -2131,6 +2295,31 @@ fn detail_line(label: &str, value: &str) -> Line<'static> {
         Span::styled(format!("{label}{}", " ".repeat(pad)), theme::dim_style()),
         Span::styled(value.to_string(), theme::body_style()),
     ])
+}
+
+fn cron_run_status_style(status: &str) -> Style {
+    if status.eq_ignore_ascii_case("ok") || status.eq_ignore_ascii_case("success") {
+        Style::default().fg(Color::Green)
+    } else if status.eq_ignore_ascii_case("error") || status.eq_ignore_ascii_case("failed") {
+        theme::error_style()
+    } else if status.eq_ignore_ascii_case("degraded") || status.eq_ignore_ascii_case("warning") {
+        theme::warn_style()
+    } else {
+        theme::body_style()
+    }
+}
+
+fn format_duration_ms(duration_ms: Option<i64>) -> String {
+    let Some(ms) = duration_ms else {
+        return "-".to_string();
+    };
+    if ms < 1_000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    } else {
+        format!("{:.1}m", ms as f64 / 60_000.0)
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -2248,5 +2437,13 @@ mod tests {
     #[test]
     fn truncate_uses_first_line_only() {
         assert_eq!(truncate("first\nsecond", 40), "first");
+    }
+
+    #[test]
+    fn format_duration_ms_scales_units() {
+        assert_eq!(format_duration_ms(None), "-");
+        assert_eq!(format_duration_ms(Some(42)), "42ms");
+        assert_eq!(format_duration_ms(Some(1_500)), "1.5s");
+        assert_eq!(format_duration_ms(Some(90_000)), "1.5m");
     }
 }
