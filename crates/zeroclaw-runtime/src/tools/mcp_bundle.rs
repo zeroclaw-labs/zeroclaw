@@ -10,11 +10,12 @@
 /// - otherwise — union the `servers` lists from each named bundle, subtract
 ///   every name in any bundle's `exclude` list, and return only the matching
 ///   `McpServerConfig` entries
-// Both production call sites in `crates/zeroclaw-runtime/src/agent/loop_.rs`
-// (the main agent turn loop and the persistent-message loop) MUST route through
-// this helper. If either site is reverted to `&config.mcp.servers`, the
-// `mcp_bundles` scoping will silently stop working — the unit tests below will
-// not catch that regression because they test the helper directly.
+// THREE production call sites MUST route through this helper:
+//   1. crates/zeroclaw-runtime/src/agent/loop_.rs — main agent turn loop (run)
+//   2. crates/zeroclaw-runtime/src/agent/loop_.rs — persistent-message loop (process_message)
+//   3. crates/zeroclaw-runtime/src/agent/agent.rs — from_config_with_session_cwd_and_mcp_approval_mode
+// If any site is reverted to `&config.mcp.servers`, mcp_bundles scoping will silently stop
+// working — the unit tests below will not catch that regression because they test this helper directly.
 pub fn resolve_mcp_servers_for_agent(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
@@ -214,5 +215,30 @@ mod tests {
         );
         let result = resolve_mcp_servers_for_agent(&config, "alice");
         assert!(result.is_empty());
+    }
+
+    // Regression guard for the agent.rs / from_config path.
+    //
+    // `from_config_with_session_cwd_and_mcp_approval_mode` passes `config` and
+    // `agent_alias` directly to `resolve_mcp_servers_for_agent` — we can't call
+    // `from_config` in unit tests (requires a live model provider), so we verify
+    // the resolver contract directly using the same config shape that path would
+    // supply.  A revert of the agent.rs wiring makes this test vacuously pass
+    // (the site would call connect_all with all servers, not the filtered slice),
+    // but the protective comment above names agent.rs explicitly so reviewers and
+    // grep catch any revert.
+    #[test]
+    fn from_config_path_agent_with_bundle_excludes_sensitive_server() {
+        // config.mcp.servers has two entries: "public" and "sensitive"
+        // agent "bob" has mcp_bundles=["safe_only"] which includes only "public"
+        let config = make_config(
+            vec![make_stdio_server("public"), make_stdio_server("sensitive")],
+            HashMap::from([("safe_only".to_string(), bundle(vec!["public"], vec![]))]),
+            HashMap::from([("bob".to_string(), make_agent(vec!["safe_only"]))]),
+        );
+        let result = resolve_mcp_servers_for_agent(&config, "bob");
+        let names: Vec<_> = result.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["public"]);
+        assert!(!names.contains(&"sensitive"));
     }
 }

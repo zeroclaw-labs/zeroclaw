@@ -1222,16 +1222,17 @@ impl Agent {
         let mut activated_tools: Option<Arc<std::sync::Mutex<tools::ActivatedToolSet>>> = None;
         // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
         let mut mcp_elevation_arcs: Vec<Arc<dyn tools::Tool>> = Vec::new();
-        if initialize_mcp && config.mcp.enabled && !config.mcp.servers.is_empty() {
+        let agent_mcp_servers = tools::resolve_mcp_servers_for_agent(config, agent_alias);
+        if initialize_mcp && config.mcp.enabled && !agent_mcp_servers.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 &format!(
                     "Initializing MCP client — {} server(s) configured",
-                    config.mcp.servers.len()
+                    agent_mcp_servers.len()
                 )
             );
-            match tools::McpRegistry::connect_all(&config.mcp.servers).await {
+            match tools::McpRegistry::connect_all(&agent_mcp_servers).await {
                 Ok(registry) => {
                     let registry = std::sync::Arc::new(registry);
                     mcp_elevation_arcs = tools::collect_mcp_elevation_arcs(&registry).await;
