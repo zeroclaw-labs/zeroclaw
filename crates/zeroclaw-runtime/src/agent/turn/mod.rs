@@ -642,32 +642,37 @@ pub async fn run_tool_call_loop(
             )
             .await
         };
-        let executed_outcomes = match execution_result {
-            Ok(outcomes) => outcomes,
-            // Cancelled mid-batch (parallel path): no per-call outcomes
-            // survive; every call synthesizes as interrupted below.
-            Err(e) if is_tool_loop_cancelled(&e) => Vec::new(),
+        let executed_slots = match execution_result {
+            Ok(slots) => slots,
+            Err(e) if is_tool_loop_cancelled(&e) => {
+                (0..executable_calls.len()).map(|_| None).collect()
+            }
             Err(e) => return Err(e),
         };
 
-        // Cancelled mid-batch: the round still persists atomically below
-        // (assistant tool-call message + per-call results, completed
-        // outcomes kept, never-ran calls synthesized as interrupted —
-        // #1043 semantics), and the completed prefix is recorded exactly
-        // like a finished batch: those tools RAN, so their TurnEvent
-        // pairs, `after_tool_call` hooks, and result logs must fire even
-        // though the cancellation surfaces right after.
-        let cancelled_mid_batch = executed_outcomes.len() < executable_calls.len();
+        let cancelled_mid_batch = executed_slots.iter().any(Option::is_none);
 
-        // Record the completed outcomes (the full set when the batch
-        // finished; the executed prefix when cancelled mid-batch — the
-        // sequential executor returns completed outcomes in call order).
-        let completed = executed_outcomes.len();
+        let mut executed_completed_indices: Vec<usize> = Vec::new();
+        let mut executed_completed_calls = Vec::new();
+        let mut executed_completed_outcomes = Vec::new();
+        for (slot, (call_idx, call)) in executed_slots.into_iter().zip(
+            executable_indices
+                .iter()
+                .copied()
+                .zip(executable_calls.iter()),
+        ) {
+            if let Some(outcome) = slot {
+                executed_completed_indices.push(call_idx);
+                executed_completed_calls.push(call.clone());
+                executed_completed_outcomes.push(outcome);
+            }
+        }
+
         record_executed_outcomes(
             &ctx,
-            &executable_indices[..completed],
-            &executable_calls[..completed],
-            executed_outcomes,
+            &executed_completed_indices,
+            &executed_completed_calls,
+            executed_completed_outcomes,
             &mut ordered_results,
             iteration,
         )
@@ -690,13 +695,17 @@ pub async fn run_tool_call_loop(
                     ));
                 }
             }
-            // Close the pending cards for executable calls that emitted a
-            // pending ToolCall at prep time but never produced a result
-            // (interrupted in flight or never dispatched). Without this the
-            // client leaves those tool cards spinning forever. The pinned
-            // tool_call_id matches the pending emit so the right card closes.
+            // Close pending cards only for executable calls whose terminal
+            // ToolResult was never emitted by the executor. A parallel call that
+            // completed before the cancellation already emitted its real result;
+            // re-emitting here would flip its card from completed to interrupted.
             if let Some(tx) = ctx.event_tx {
-                for call in &executable_calls[completed..] {
+                let completed: std::collections::HashSet<usize> =
+                    executed_completed_indices.iter().copied().collect();
+                for (call_idx, call) in executable_indices.iter().zip(executable_calls.iter()) {
+                    if completed.contains(call_idx) {
+                        continue;
+                    }
                     let call_id = events::resolve_tool_call_id(call);
                     let interrupted = crate::agent::tool_execution::ToolExecutionOutcome {
                         output: crate::i18n::get_required_cli_string(

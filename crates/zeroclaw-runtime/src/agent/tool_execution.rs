@@ -340,6 +340,11 @@ pub fn should_execute_tools_in_parallel(
 
 // ── Parallel execution ───────────────────────────────────────────────────
 
+/// Concurrent batch executor. Returns one slot per call: `Some` when the call
+/// completed and already emitted its terminal `ToolResult`, `None` when that
+/// future was cancelled in flight. Collapsing the mixed set to one `Err` would
+/// drop completed siblings and let cleanup emit a second terminal update for an
+/// already-closed `tool_call_id`. Non-cancellation errors still abort.
 pub async fn execute_tools_parallel(
     tool_calls: &[ParsedToolCall],
     tools_registry: &[Box<dyn Tool>],
@@ -348,7 +353,7 @@ pub async fn execute_tools_parallel(
     cancellation_token: Option<&CancellationToken>,
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
     event_tx: Option<&Sender<TurnEvent>>,
-) -> Result<Vec<ToolExecutionOutcome>> {
+) -> Result<Vec<Option<ToolExecutionOutcome>>> {
     let futures: Vec<_> = tool_calls
         .iter()
         .map(|call| {
@@ -367,17 +372,24 @@ pub async fn execute_tools_parallel(
         .collect();
 
     let results = futures_util::future::join_all(futures).await;
-    results.into_iter().collect()
+    let mut slots = Vec::with_capacity(results.len());
+    for result in results {
+        match result {
+            Ok(outcome) => slots.push(Some(outcome)),
+            Err(e) if is_tool_loop_cancelled(&e) => slots.push(None),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(slots)
 }
 
 // ── Sequential execution ─────────────────────────────────────────────────
 
-/// Cancellation contract: a cancel mid-batch stops dispatch and returns
-/// `Ok` with the outcomes of the calls that completed (a strict prefix of
-/// `tool_calls`) — never an error. The token is checked before each call so
-/// a tool that fires the token never lets a later call start, and a cancel
-/// that interrupts a running tool drops that call's outcome. Callers detect
-/// the cut-short batch by comparing lengths.
+/// Cancellation contract: a cancel mid-batch stops dispatch and returns `Ok`
+/// with one slot per call — `Some` for completed calls (a strict prefix), `None`
+/// for the cut-short tail. Never an error. The token is checked before each call
+/// so a tool that fires the token never lets a later call start, and a cancel
+/// that interrupts a running tool leaves that call's slot `None`.
 pub async fn execute_tools_sequential(
     tool_calls: &[ParsedToolCall],
     tools_registry: &[Box<dyn Tool>],
@@ -386,8 +398,8 @@ pub async fn execute_tools_sequential(
     cancellation_token: Option<&CancellationToken>,
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
     event_tx: Option<&Sender<TurnEvent>>,
-) -> Result<Vec<ToolExecutionOutcome>> {
-    let mut outcomes = Vec::with_capacity(tool_calls.len());
+) -> Result<Vec<Option<ToolExecutionOutcome>>> {
+    let mut slots: Vec<Option<ToolExecutionOutcome>> = Vec::with_capacity(tool_calls.len());
 
     for call in tool_calls {
         if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
@@ -410,8 +422,9 @@ pub async fn execute_tools_sequential(
             Err(e) if is_tool_loop_cancelled(&e) => break,
             Err(e) => return Err(e),
         };
-        outcomes.push(outcome);
+        slots.push(Some(outcome));
     }
 
-    Ok(outcomes)
+    slots.resize_with(tool_calls.len(), || None);
+    Ok(slots)
 }
