@@ -214,6 +214,7 @@ pub async fn run_tool_call_loop(
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
     let mut malformed_tool_protocol_retries: usize = 0;
+    let mut prompt_approval_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
     // Shared-ref context for the turn step functions. Every `&mut` the loop
     // owns stays a loop local passed as an explicit argument (RUN_SHEET
@@ -614,10 +615,11 @@ pub async fn run_tool_call_loop(
             &ctx,
             &tool_calls,
             &mut seen_tool_signatures,
+            &mut prompt_approval_tool_signatures,
             iteration,
             knobs.dedup_enabled,
         )
-        .await;
+        .await?;
 
         let execution_result = if allow_parallel_execution && executable_calls.len() > 1 {
             execute_tools_parallel(
