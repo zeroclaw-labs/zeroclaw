@@ -134,10 +134,51 @@ pub fn assemble(root: &std::path::Path, tag: Option<&str>) -> anyhow::Result<()>
 
 pub fn prune_rustdoc_source_view(api_dir: &Path) -> anyhow::Result<()> {
     let src_view = api_dir.join("src");
-    if src_view.exists() {
-        std::fs::remove_dir_all(&src_view)?;
+    if !src_view.exists() {
+        return Ok(());
     }
+    let mut stack = vec![api_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if dir == src_view {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(ty) if ty.is_dir() => stack.push(path),
+                Ok(_) if path.extension().is_some_and(|e| e == "html") => {
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        let stripped = strip_source_anchors(&content);
+                        if stripped != content {
+                            std::fs::write(&path, stripped)?;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    std::fs::remove_dir_all(&src_view)?;
     Ok(())
+}
+
+pub fn strip_source_anchors(html: &str) -> String {
+    let needle = "<a class=\"src\"";
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(start) = rest.find(needle) {
+        let after = &rest[start..];
+        let Some(end) = after.find("</a>") else {
+            break;
+        };
+        out.push_str(&rest[..start]);
+        rest = &after[end + "</a>".len()..];
+    }
+    out.push_str(rest);
+    out
 }
 
 pub fn strip_chrome_hash(file_name: &str) -> Option<String> {
@@ -272,7 +313,7 @@ pub fn extract_shared_chrome(version_dir: &Path, shared_dir: &Path) -> anyhow::R
 
 #[cfg(test)]
 mod tests {
-    use super::strip_chrome_hash;
+    use super::{strip_chrome_hash, strip_source_anchors};
 
     #[test]
     fn strips_single_extension_hash() {
@@ -300,5 +341,27 @@ mod tests {
     fn ignores_non_hex_or_wrong_length() {
         assert_eq!(strip_chrome_hash("foo-1234567.js"), None);
         assert_eq!(strip_chrome_hash("foo-zzzzzzzz.js"), None);
+    }
+
+    #[test]
+    fn strips_rustdoc_source_anchor() {
+        let html = r#"<div><a class="src" href="../../src/zeroclaw_tools/x.rs.html#146-177">Source</a></div>"#;
+        assert_eq!(strip_source_anchors(html), "<div></div>");
+    }
+
+    #[test]
+    fn strips_multiple_source_anchors() {
+        let html = concat!(
+            r#"<a class="src" href="../src/a.rs.html#1">Source</a>"#,
+            "middle",
+            r#"<a class="src" href="../src/b.rs.html#2">Source</a>"#,
+        );
+        assert_eq!(strip_source_anchors(html), "middle");
+    }
+
+    #[test]
+    fn leaves_non_source_anchors_intact() {
+        let html = r#"<a href="../../src/foo">keep</a> and <a class="docblock">keep</a>"#;
+        assert_eq!(strip_source_anchors(html), html);
     }
 }
