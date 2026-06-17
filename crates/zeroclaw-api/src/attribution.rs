@@ -194,7 +194,6 @@ pub enum ModelProviderKind {
     KiloCli,
     Kilo,
     Router,
-    Reliable,
     Moonshot,
     Qwen,
     Minimax,

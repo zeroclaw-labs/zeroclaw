@@ -2,6 +2,8 @@ use async_trait::async_trait;
 use serde_json::json;
 use zeroclaw_api::tool::{Tool, ToolResult};
 
+const MAX_ROUND_DECIMALS: i64 = 15;
+
 pub struct CalculatorTool;
 
 impl CalculatorTool {
@@ -263,7 +265,10 @@ fn calc_round(args: &serde_json::Value) -> Result<String, String> {
     if decimals < 0 {
         return Err("decimals must be non-negative".to_string());
     }
-    let multiplier = 10_f64.powi(i32::try_from(decimals).unwrap_or(i32::MAX));
+    if decimals > MAX_ROUND_DECIMALS {
+        return Err(format!("decimals must be at most {MAX_ROUND_DECIMALS}"));
+    }
+    let multiplier = 10_f64.powi(decimals as i32);
     Ok(format_num((x * multiplier).round() / multiplier))
 }
 
@@ -575,6 +580,17 @@ mod tests {
             .unwrap();
         assert!(result.success);
         assert_eq!(result.output, "2.72");
+    }
+
+    #[tokio::test]
+    async fn test_round_rejects_excessive_decimals() {
+        let tool = CalculatorTool::new();
+        let result = tool
+            .execute(json!({"function": "round", "x": 2.715, "decimals": 1_000_000}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_ref().unwrap().contains("at most"));
     }
 
     #[tokio::test]

@@ -96,7 +96,11 @@ async fn probe_models(config: &Config) -> Vec<DiagResult> {
 
     for provider_name in &targets {
         let result = match create_doctor_model_provider(config, provider_name) {
-            Ok(handle) => handle.list_models().await,
+            Ok(handle) => {
+                zeroclaw_providers::ProviderDispatch::from_ref(&*handle)
+                    .list_models()
+                    .await
+            }
             Err(e) => Err(e),
         };
         match result {
@@ -291,7 +295,11 @@ pub async fn run_models(
         println!("  [{}]", provider_name);
 
         let outcome = match create_doctor_model_provider(config, provider_name) {
-            Ok(handle) => handle.list_models().await,
+            Ok(handle) => {
+                zeroclaw_providers::ProviderDispatch::from_ref(&*handle)
+                    .list_models()
+                    .await
+            }
             Err(e) => Err(e),
         };
 

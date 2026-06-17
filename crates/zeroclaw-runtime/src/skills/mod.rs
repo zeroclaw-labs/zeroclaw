@@ -14,6 +14,7 @@ use zip::ZipArchive;
 
 pub mod audit;
 pub mod bundle;
+pub mod cache;
 pub mod constants;
 pub mod creator;
 pub mod document;
@@ -519,6 +520,12 @@ fn load_workspace_skills(workspace_dir: &Path, allow_scripts: bool) -> Vec<Skill
 }
 
 pub fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
+    cache::cached_load(skills_dir, allow_scripts, "workspace", || {
+        load_skills_from_directory_uncached(skills_dir, allow_scripts)
+    })
+}
+
+fn load_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
     if !skills_dir.exists() {
         return Vec::new();
     }
@@ -612,6 +619,12 @@ fn finalize_open_skill(mut skill: Skill) -> Skill {
 }
 
 fn load_open_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
+    cache::cached_load(skills_dir, allow_scripts, "open-skills", || {
+        load_open_skills_from_directory_uncached(skills_dir, allow_scripts)
+    })
+}
+
+fn load_open_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
     if !skills_dir.exists() {
         return Vec::new();
     }
