@@ -131,12 +131,16 @@ pub struct Config {
     /// model_provider + model combos.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[credential_class = "requires_follow_up"]
+    #[nested]
+    #[natural_key = "hint"]
     pub model_routes: Vec<ModelRouteConfig>,
 
     /// Embedding-routing rules — route `hint:<name>` to specific
     /// model_provider + model combos for embedding requests.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[credential_class = "requires_follow_up"]
+    #[nested]
+    #[natural_key = "hint"]
     pub embedding_routes: Vec<EmbeddingRouteConfig>,
 
     /// Observability backend configuration (`[observability]`).
@@ -10649,17 +10653,23 @@ impl Default for SchedulerConfig {
 /// ```
 ///
 /// Usage: pass `hint:reasoning` as the model parameter to route the request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "model_routes"]
 pub struct ModelRouteConfig {
     /// Task hint name (e.g. "reasoning", "fast", "code", "summarize")
+    #[serde(default)]
     pub hint: String,
     /// Dotted provider profile ref to route to (must resolve to `providers.models.<type>.<alias>`)
+    #[serde(default)]
     pub model_provider: String,
     /// Provider-local model identifier to use with that provider profile
+    #[serde(default)]
     pub model: String,
     /// Optional API key override for this route's model provider
     #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
     pub api_key: Option<String>,
 }
 
@@ -10677,20 +10687,26 @@ pub struct ModelRouteConfig {
 /// [memory]
 /// embedding_model = "hint:semantic"
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "embedding_routes"]
 pub struct EmbeddingRouteConfig {
     /// Route hint name (e.g. "semantic", "archive", "faq")
+    #[serde(default)]
     pub hint: String,
     /// Dotted embedding-capable provider profile ref
+    #[serde(default)]
     pub model_provider: String,
     /// Provider-local embedding model identifier to use with that provider profile
+    #[serde(default)]
     pub model: String,
     /// Optional embedding dimension override for this route
     #[serde(default)]
     pub dimensions: Option<usize>,
     /// Optional API key override for this route's model_provider
     #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
     pub api_key: Option<String>,
 }
 
@@ -28181,13 +28197,37 @@ allowed_users = []
             class_for("channels.matrix.default.access_token"),
             Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
         );
+        // model_routes and embedding_routes are now #[nested] Vec fields —
+        // they are surfaced via map_key_sections(), not as flat prop_fields.
+        // After adding a route entry, its api_key sub-field appears in
+        // prop_fields with EncryptedSecret classification (from #[secret]).
+        config.model_routes.push(ModelRouteConfig {
+            hint: "reasoning".into(),
+            model_provider: "openai.default".into(),
+            model: "gpt-4".into(),
+            api_key: None,
+        });
+        config.embedding_routes.push(EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            model_provider: "openai.embeddings".into(),
+            model: "text-embedding-3-small".into(),
+            dimensions: None,
+            api_key: None,
+        });
+        let nested_fields = config.prop_fields();
+        let nested_class_for = |name: &str| {
+            nested_fields
+                .iter()
+                .find(|field| field.name == name)
+                .and_then(|field| field.credential_class)
+        };
         assert_eq!(
-            class_for("model_routes"),
-            Some(crate::config::CredentialSurfaceClass::RequiresFollowUp)
+            nested_class_for("model_routes.reasoning.api_key"),
+            Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
         );
         assert_eq!(
-            class_for("embedding_routes"),
-            Some(crate::config::CredentialSurfaceClass::RequiresFollowUp)
+            nested_class_for("embedding_routes.semantic.api_key"),
+            Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
         );
         assert!(Config::prop_is_secret(
             "providers.tts.openai.default.api_key"

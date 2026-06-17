@@ -986,8 +986,6 @@ mod tests {
             "escalation",
             "locale",
             "microsoft365",
-            "model_routes",
-            "embedding_routes",
             "file_upload",
             "file_upload_bundle",
             "file_download",
