@@ -2080,7 +2080,7 @@ fn render(f: &mut Frame, state: &mut ChatState, area: Rect) {
     // hands its full area to the input bar here.
     let input_area = area;
 
-    let queue_paused_hint = if state.queue_paused() {
+    let queue_paused_hint = if state.queue_paused() && state.queue_len() > 0 {
         Some(crate::i18n::t_args(
             "zc-queue-paused-ghost",
             &[("key", &resume_queue_chord_label())],
@@ -4090,7 +4090,7 @@ impl ChatState {
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
         self.input_bar.cleanup_temps();
-        if !clean && !self.resume_override {
+        if !clean && !self.resume_override && !self.message_queue.is_empty() {
             self.queue_paused = true;
         }
         self.resume_override = false;
@@ -5616,6 +5616,17 @@ mod tests {
         s.clear_queue_cmd(Some(9));
         s.clear_queue_cmd(Some(0));
         assert_eq!(s.queue_len(), 1);
+    }
+
+    #[test]
+    fn non_clean_commit_with_empty_queue_does_not_pause() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.commit_turn(String::new(), false);
+        assert!(
+            !s.queue_paused(),
+            "cancel/fail with no queued backlog must not show queue-paused state"
+        );
     }
 
     #[test]
