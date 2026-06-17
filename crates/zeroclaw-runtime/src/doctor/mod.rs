@@ -1586,8 +1586,6 @@ mod tests {
 
         let invalid = items.iter().find(|i| {
             i.message.contains("model_provider \"custom.vllm\" is invalid")
-            i.message
-                .contains("model_provider \"custom.vllm\" is invalid")
         });
         assert!(
             invalid.is_some(),
@@ -1623,8 +1621,6 @@ mod tests {
 
         let bad = items.iter().find(|i| {
             i.message.contains("agent \"coding\" uses invalid model_provider \"custom\"")
-            i.message
-                .contains("agent \"coding\" uses invalid model_provider \"custom\"")
         });
         assert!(
             bad.is_none(),
