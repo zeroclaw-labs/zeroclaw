@@ -7,6 +7,8 @@ const AUTO_DELIVERY_DEFAULT_CHANNELS: &[&str] = &[
     "mattermost",
     "matrix",
     "dingtalk",
+    "lark",
+    "feishu",
 ];
 
 pub(crate) fn maybe_inject_channel_delivery_defaults(

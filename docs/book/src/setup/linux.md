@@ -176,6 +176,18 @@ zeroclaw service restart
 
 ## Uninstall
 
+If you installed with the bootstrap script, use the same script to uninstall:
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+./install.sh --uninstall
+```
+
+</div>
+
 Stop and remove the service:
 
 <div class="os-tabs-src">

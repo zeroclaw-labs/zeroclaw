@@ -102,6 +102,9 @@ export interface CronRun {
 export interface Integration {
   name: string;
   description: string;
+  /** Stable enum-variant key (e.g. `"ToolsAutomation"`); use for grouping and
+   *  filtering, not display. Human labels resolve client-side via
+   *  CATEGORY_LABEL_KEYS in Integrations.tsx (see zeroclaw-labs/zeroclaw#6490). */
   category: string;
   status: "Available" | "Active";
 }

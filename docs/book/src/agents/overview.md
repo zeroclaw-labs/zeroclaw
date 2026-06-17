@@ -57,7 +57,8 @@ channels, and keep entirely separate memory.
 Agents reach each other two ways, each gated separately: they can **message**
 on a channel where they share a [peer group](../channels/peer-groups.md), and
 they can **[delegate](./delegation.md)** a task to one another only when the caller's risk profile
-permits delegation and both agents share the same risk profile (see
+permits delegation and the target is in the caller's reachable set (a same-profile
+peer, or an explicit cross-profile entry in the caller's `delegates` list; see
 [Running agents](./operating.md#coexistence-and-isolation)).
 
 ```text

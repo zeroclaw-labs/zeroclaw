@@ -276,6 +276,9 @@ pub async fn run(
     let socket_client_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let need_rpc_ctx = registry.has_socket_start() || registry.has_wss_start();
 
+    // Extract shared SOP engine from registry for RpcContext.
+    let (sop_engine, sop_audit) = registry.take_sop_engine();
+
     let rpc_ctx = if need_rpc_ctx {
         use crate::rpc::context::RpcContext;
         use crate::rpc::session::SessionStore;
@@ -382,6 +385,8 @@ pub async fn run(
             ),
             tui_registry,
             acp_session_store,
+            sop_engine,
+            sop_audit,
         }))
     } else {
         None
@@ -1502,6 +1507,9 @@ mod tests {
                 draft_update_interval_ms: 0,
                 multi_message_delay_ms: 0,
                 stall_timeout_secs: 0,
+                slash_commands: false,
+                intents_mask: None,
+                reaction_notifications: zeroclaw_config::schema::DiscordReactionScope::Off,
                 interrupt_on_new_message: false,
                 archive: false,
                 approval_timeout_secs: 0,
@@ -1524,6 +1532,9 @@ mod tests {
                 draft_update_interval_ms: 0,
                 multi_message_delay_ms: 0,
                 stall_timeout_secs: 0,
+                slash_commands: false,
+                intents_mask: None,
+                reaction_notifications: zeroclaw_config::schema::DiscordReactionScope::Off,
                 interrupt_on_new_message: false,
                 archive: false,
                 approval_timeout_secs: 0,
@@ -1544,6 +1555,7 @@ mod tests {
             zeroclaw_config::schema::TelegramConfig {
                 enabled: true,
                 bot_token: "token".into(),
+                api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
@@ -1724,6 +1736,7 @@ mod tests {
             zeroclaw_config::schema::TelegramConfig {
                 enabled: true,
                 bot_token: "bot-token".into(),
+                api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
@@ -1751,6 +1764,7 @@ mod tests {
             zeroclaw_config::schema::TelegramConfig {
                 enabled: true,
                 bot_token: "bot-token".into(),
+                api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
@@ -1769,7 +1783,7 @@ mod tests {
         config.peer_groups.insert(
             "telegram_default".to_string(),
             PeerGroupConfig {
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 external_peers: vec![PeerUsername::new("user123")],
                 ..PeerGroupConfig::default()
             },
