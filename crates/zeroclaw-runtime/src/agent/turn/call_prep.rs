@@ -163,7 +163,7 @@ pub(crate) async fn prepare_tool_calls(
             .unwrap_or(false);
         let reentrant_agent_tool =
             crate::tools::REENTRANT_AGENT_TOOLS.contains(&tool_name.as_str());
-        if requires_prompt && !reentrant_agent_tool {
+        if requires_prompt && tool_name == "shell" && !reentrant_agent_tool {
             let prompt_signature = tool_call_signature(&tool_name, &tool_args);
             if !prompt_approval_tool_signatures_this_round.insert(prompt_signature.clone()) {
                 let duplicate =
