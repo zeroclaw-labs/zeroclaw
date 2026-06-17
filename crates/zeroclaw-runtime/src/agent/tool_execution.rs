@@ -66,7 +66,11 @@ pub async fn execute_one_tool(
 
     let static_tool = find_tool(tools_registry, call_name);
     let activated_arc = if static_tool.is_none() {
-        activated_tools.and_then(|at| at.lock().unwrap_or_else(|e| e.into_inner()).get_resolved(call_name))
+        activated_tools.and_then(|at| {
+            at.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_resolved(call_name)
+        })
     } else {
         None
     };
