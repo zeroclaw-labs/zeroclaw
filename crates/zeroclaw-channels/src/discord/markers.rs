@@ -177,14 +177,23 @@ pub(crate) fn parse_embed_markers(message: &str) -> (String, Vec<EmbedSpec>) {
             break;
         };
         let tag_start = cursor + rel;
-        match parse_one_embed(message, tag_start) {
-            Some((spec, end)) => {
+        match scan_one_embed(message, tag_start) {
+            Some((end, Some(spec))) => {
                 cleaned.push_str(&message[cursor..tag_start]);
                 specs.push(spec);
                 cursor = end;
             }
+            Some((end, None)) => {
+                // A structurally-complete `[EMBED:{…}]` whose JSON failed to
+                // deserialize. Keep the whole span verbatim so the author sees
+                // it failed, and skip PAST it — never re-scan inside the
+                // rejected JSON (a nested `[EMBED:` there must not be parsed).
+                cleaned.push_str(&message[cursor..end]);
+                cursor = end;
+            }
             None => {
-                // Keep the `[` literal and re-scan from just past it.
+                // Not a structural marker: keep the `[` literal and re-scan
+                // from just past it.
                 cleaned.push_str(&message[cursor..=tag_start]);
                 cursor = tag_start + 1;
             }
@@ -196,9 +205,13 @@ pub(crate) fn parse_embed_markers(message: &str) -> (String, Vec<EmbedSpec>) {
     (cleaned.trim().to_string(), specs)
 }
 
-/// Parse a single `[EMBED:{json}]` whose `[` is at `tag_start`. On success
-/// returns the spec and the byte index just past the closing `]`.
-fn parse_one_embed(message: &str, tag_start: usize) -> Option<(EmbedSpec, usize)> {
+/// Scan a single `[EMBED:{json}]` whose `[` is at `tag_start`. Locates the
+/// structural span first (so a serde rejection can still be skipped over as a
+/// unit), then attempts to deserialize. Returns:
+/// * `None` — not a structural marker (no `{`, unbalanced braces, no `]`),
+/// * `Some((end, Some(spec)))` — a valid marker ending just past `]` at `end`,
+/// * `Some((end, None))` — a structural span whose JSON was invalid.
+fn scan_one_embed(message: &str, tag_start: usize) -> Option<(usize, Option<EmbedSpec>)> {
     let after_tag = tag_start + EMBED_TAG.len();
     let brace = next_non_ws(message, after_tag)?;
     if message.as_bytes().get(brace) != Some(&b'{') {
@@ -209,8 +222,8 @@ fn parse_one_embed(message: &str, tag_start: usize) -> Option<(EmbedSpec, usize)
     if message.as_bytes().get(close) != Some(&b']') {
         return None;
     }
-    let spec = serde_json::from_str::<EmbedSpec>(&message[brace..obj_end]).ok()?;
-    Some((spec, close + 1))
+    let spec = serde_json::from_str::<EmbedSpec>(&message[brace..obj_end]).ok();
+    Some((close + 1, spec))
 }
 
 /// Byte index of the next non-whitespace char at or after `from`.
@@ -657,6 +670,25 @@ mod embed_tests {
         let (cleaned, specs) = parse_embed_markers("keep [EMBED:{not json] here");
         assert!(specs.is_empty());
         assert_eq!(cleaned, "keep [EMBED:{not json] here");
+    }
+
+    #[test]
+    fn serde_rejected_span_is_kept_verbatim_and_not_rescanned_inside() {
+        // The outer footer is missing its required `text`, so serde rejects the
+        // whole (structurally complete) marker. The scanner must skip PAST the
+        // span — not re-enter it and extract the nested `[EMBED:` sitting inside
+        // the description string as a spurious embed.
+        let msg = r#"x [EMBED:{"footer":{"icon_url":"u"},"description":"see [EMBED:{\"title\":\"INNER\"}] now"}] y"#;
+        let (cleaned, specs) = parse_embed_markers(msg);
+        assert!(
+            specs.is_empty(),
+            "no embed parsed: outer invalid, inner not re-scanned"
+        );
+        assert_eq!(
+            cleaned,
+            msg.trim(),
+            "the whole rejected span is preserved verbatim"
+        );
     }
 
     #[test]

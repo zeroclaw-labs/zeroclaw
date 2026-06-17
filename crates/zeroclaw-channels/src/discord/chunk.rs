@@ -192,25 +192,31 @@ pub(crate) fn budget_embeds(embeds: &mut Vec<DiscordEmbed>) -> bool {
             truncate_chars(&mut field.name, EMBED_MAX_FIELD_NAME);
             truncate_chars(&mut field.value, EMBED_MAX_FIELD_VALUE);
         }
-
-        // Per-embed character sum: shave the description to bring the embed
-        // under Discord's 6000-char ceiling rather than letting it 400.
-        let total = embed_char_count(embed);
-        if total > EMBED_MAX_TOTAL_CHARS {
-            let excess = total - EMBED_MAX_TOTAL_CHARS;
-            if let Some(description) = embed.description.as_mut() {
-                let target = description.chars().count().saturating_sub(excess);
-                truncate_chars(description, target);
-            }
-            overflow = true;
-        }
     }
 
-    // Cross-embed character sum: drop trailing embeds until the message total
-    // fits, but always keep at least one.
-    while embeds.len() > 1 && total_embed_chars(embeds) > EMBED_MAX_TOTAL_CHARS {
-        embeds.pop();
+    // Discord caps the character SUM across *all* of a message's embeds at 6000.
+    // Drop whole trailing embeds until the message total fits; if a single
+    // surviving embed still overflows (one embed alone can exceed 6000 via a
+    // full description + footer, or many fields), shrink it to fit — shave the
+    // description, then drop trailing fields. Title+footer+author alone can't
+    // exceed 2560, so this always converges.
+    while total_embed_chars(embeds) > EMBED_MAX_TOTAL_CHARS {
+        if embeds.len() > 1 {
+            embeds.pop();
+            overflow = true;
+            continue;
+        }
+        let embed = &mut embeds[0];
+        let excess = embed_char_count(embed).saturating_sub(EMBED_MAX_TOTAL_CHARS);
+        if let Some(description) = embed.description.as_mut() {
+            let target = description.chars().count().saturating_sub(excess);
+            truncate_chars(description, target);
+        }
+        while embed_char_count(embed) > EMBED_MAX_TOTAL_CHARS && !embed.fields.is_empty() {
+            embed.fields.pop();
+        }
         overflow = true;
+        break;
     }
 
     overflow
@@ -253,7 +259,7 @@ fn truncate_chars(s: &mut String, max: usize) {
 #[cfg(test)]
 mod embed_budget_tests {
     use super::super::embed::{DiscordEmbed, EmbedField, EmbedFooter};
-    use super::budget_embeds;
+    use super::{budget_embeds, embed_char_count};
 
     #[test]
     fn description_over_limit_is_trimmed_without_flagging_overflow() {
@@ -309,6 +315,30 @@ mod embed_budget_tests {
         let mut embeds = vec![big(), big()];
         assert!(budget_embeds(&mut embeds));
         assert_eq!(embeds.len(), 1);
+    }
+
+    #[test]
+    fn single_embed_with_oversized_fields_is_shrunk_to_fit() {
+        // The overflow lives entirely in fields (no description to shave), so
+        // the budgeter must drop trailing fields to fit the 6000 cap — else the
+        // embed reaches Discord oversized and the whole message 400s.
+        let fields: Vec<EmbedField> = (0..25)
+            .map(|i| EmbedField {
+                name: format!("{i:0<256}"),
+                value: "v".repeat(1024),
+                inline: false,
+            })
+            .collect();
+        let mut embeds = vec![DiscordEmbed {
+            fields,
+            ..Default::default()
+        }];
+        assert!(budget_embeds(&mut embeds));
+        assert!(
+            embed_char_count(&embeds[0]) <= 6000,
+            "single embed must fit the 6000 message-wide cap, got {}",
+            embed_char_count(&embeds[0])
+        );
     }
 
     #[test]
