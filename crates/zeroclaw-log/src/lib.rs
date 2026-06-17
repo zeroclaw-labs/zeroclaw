@@ -80,3 +80,27 @@ pub use tool_io::{ToolIoCapture, capture_tool_input, capture_tool_output};
 pub use writer::{init_from_config, record_event, runtime_trace_path};
 
 mod r#macro;
+
+/// Test-only re-export of the writer-test mutex. Returns an opaque RAII
+/// guard so peer crates need not name `parking_lot`. Workspace crates
+/// that exercise the `record!` → `LogCaptureLayer` → broadcast hook
+/// path in `#[cfg(test)]` need to serialize against `writer::tests`
+/// and the broadcast tests; without this guard, a parallel
+/// `writer::tests` run can see this test's event land in its tempdir.
+#[doc(hidden)]
+#[must_use]
+pub fn __private_test_writer_lock() -> impl Drop {
+    crate::writer::WRITER_TEST_LOCK.lock()
+}
+
+/// Test-only re-export of the broadcast-hook mutex. Returns an opaque
+/// RAII guard. The broadcast module's own tests clear/install the
+/// global hook under this lock; peer crates exercising the hook
+/// must hold it for the duration of their assertions, otherwise a
+/// parallel `clear_broadcast_hook` drops the test's events and the
+/// search times out.
+#[doc(hidden)]
+#[must_use]
+pub fn __private_test_hook_lock() -> impl Drop {
+    crate::broadcast::HOOK_TEST_LOCK.lock()
+}
