@@ -109,42 +109,62 @@ pub fn discord_slash_specs_from_skills(
 }
 
 /// Map a skill's `[[skill.slash_options]]` declarations into Discord option
-/// specs. An option with an unknown `type` is dropped with a WARN rather than
-/// registering a bad type. Names are lower-cased and length-capped to Discord's
-/// option-name charset; required options are sorted first (Discord rejects a
-/// required option that follows an optional one).
+/// specs. Every authoring mistake is sanitised or dropped with a WARN rather
+/// than passed through to Discord, because an invalid registration body is
+/// rejected with a 400 and `reconcile_slash_commands` would then retry it on
+/// every READY (a re-registration loop). Specifically: an unknown `type` drops
+/// the option; the name is slugged to Discord's option-name charset (dropped if
+/// it slugs to empty) and de-duplicated within the command; numeric choices
+/// whose value doesn't parse to the option type are dropped; inverted `min`/
+/// `max` bounds are dropped. Required options are sorted first (Discord rejects
+/// a required option that follows an optional one).
 fn map_skill_slash_options(skill: &zeroclaw_runtime::skills::Skill) -> Vec<OptionSpec> {
     let mut options = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for decl in &skill.slash_options {
         let Some(kind) = OptKind::from_manifest(&decl.kind) else {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "skill": skill.name,
-                        "option": decl.name,
-                        "type": decl.kind,
-                    })),
-                "skipping skill slash option with unknown type"
-            );
+            warn_drop_option(skill, &decl.name, "unknown type");
             continue;
         };
+        // Option names share the command-name charset; slug + de-dup so a name
+        // with spaces/punctuation/case can never 400 the whole command.
+        let name = discord_command_slug(&decl.name);
+        if name.is_empty() || !seen.insert(name.clone()) {
+            warn_drop_option(skill, &decl.name, "empty or duplicate option name");
+            continue;
+        }
+        // Drop choices whose value doesn't fit the option type (a string value
+        // on an int/number option is rejected by Discord).
+        let choices = decl
+            .choices
+            .iter()
+            .filter(|c| match kind {
+                OptKind::Integer => c.value.parse::<i64>().is_ok(),
+                OptKind::Number => c.value.parse::<f64>().is_ok(),
+                _ => true,
+            })
+            .map(|c| Choice {
+                name: c.name.clone(),
+                value: c.value.clone(),
+            })
+            .collect();
+        // Drop inverted numeric bounds rather than letting Discord 400 the command.
+        let (mut min, mut max) = (decl.min, decl.max);
+        if let (Some(lo), Some(hi)) = (min, max)
+            && lo > hi
+        {
+            warn_drop_option(skill, &decl.name, "min greater than max; dropping bounds");
+            min = None;
+            max = None;
+        }
         options.push(OptionSpec {
-            name: decl.name.to_ascii_lowercase().chars().take(32).collect(),
+            name,
             description: decl.description.chars().take(100).collect(),
             kind,
             required: decl.required,
-            choices: decl
-                .choices
-                .iter()
-                .map(|c| Choice {
-                    name: c.name.clone(),
-                    value: c.value.clone(),
-                })
-                .collect(),
-            min: decl.min,
-            max: decl.max,
+            choices,
+            min,
+            max,
             min_length: decl.min_length,
             max_length: decl.max_length,
         });
@@ -153,6 +173,54 @@ fn map_skill_slash_options(skill: &zeroclaw_runtime::skills::Skill) -> Vec<Optio
     // keeps declaration order within each group.
     options.sort_by_key(|o| !o.required);
     options
+}
+
+fn warn_drop_option(skill: &zeroclaw_runtime::skills::Skill, option: &str, reason: &str) {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({
+                "skill": skill.name,
+                "option": option,
+                "reason": reason,
+            })),
+        "dropping invalid skill slash option"
+    );
+}
+
+/// Build the agent prompt for a skill slash command: the legacy single `input`
+/// for an untyped command, or the submitted `name: value` lines for a typed
+/// one. Returns `None` only when an *untyped* command was invoked with empty
+/// input — a typed command, even an all-optional one invoked with no arguments,
+/// still invokes the skill (rendering an empty argument list).
+pub(crate) fn skill_command_prompt(
+    spec: &DiscordSlashCommandSpec,
+    input: &str,
+    submitted: &[(String, String)],
+) -> Option<String> {
+    if spec.options.is_empty() {
+        if input.is_empty() {
+            return None;
+        }
+        return Some(format!(
+            "Use the '{}' skill for this request: {input}",
+            spec.skill_name
+        ));
+    }
+    let rendered = submitted
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(if rendered.is_empty() {
+        format!("Use the '{}' skill for this request.", spec.skill_name)
+    } else {
+        format!(
+            "Use the '{}' skill for this request:\n{rendered}",
+            spec.skill_name
+        )
+    })
 }
 
 /// Apply the per-application command cap, logging the dropped slugs.
@@ -601,5 +669,100 @@ mod typed_option_tests {
         assert_eq!(mapped[0].name, "req", "required first + name lower-cased");
         assert!(mapped[0].required);
         assert_eq!(mapped[1].name, "opt");
+    }
+
+    fn sso(name: &str, kind: &str) -> zeroclaw_runtime::skills::SkillSlashOption {
+        zeroclaw_runtime::skills::SkillSlashOption {
+            name: name.to_string(),
+            description: "d".to_string(),
+            kind: kind.to_string(),
+            required: false,
+            choices: Vec::new(),
+            min: None,
+            max: None,
+            min_length: None,
+            max_length: None,
+        }
+    }
+
+    fn skill_with(
+        slash_options: Vec<zeroclaw_runtime::skills::SkillSlashOption>,
+    ) -> zeroclaw_runtime::skills::Skill {
+        zeroclaw_runtime::skills::Skill {
+            name: "s".to_string(),
+            description: "d".to_string(),
+            version: "0".to_string(),
+            author: None,
+            tags: vec!["slash".to_string()],
+            tools: Vec::new(),
+            prompts: Vec::new(),
+            slash_options,
+            location: None,
+        }
+    }
+
+    #[test]
+    fn map_slugs_option_names_and_dedups() {
+        let mapped = map_skill_slash_options(&skill_with(vec![
+            sso("My Option", "string"), // -> "my-option"
+            sso("dup", "string"),
+            sso("DUP", "string"), // slugs to "dup" -> dropped as duplicate
+        ]));
+        assert_eq!(mapped.len(), 2);
+        assert_eq!(mapped[0].name, "my-option");
+        assert_eq!(mapped[1].name, "dup");
+    }
+
+    #[test]
+    fn map_drops_a_nonparsing_numeric_choice() {
+        let mut o = sso("n", "integer");
+        o.choices = vec![
+            zeroclaw_runtime::skills::SkillSlashChoice {
+                name: "ok".to_string(),
+                value: "10".to_string(),
+            },
+            zeroclaw_runtime::skills::SkillSlashChoice {
+                name: "bad".to_string(),
+                value: "3.14".to_string(),
+            },
+        ];
+        let mapped = map_skill_slash_options(&skill_with(vec![o]));
+        assert_eq!(
+            mapped[0].choices.len(),
+            1,
+            "the non-integer choice is dropped"
+        );
+        assert_eq!(mapped[0].choices[0].value, "10");
+    }
+
+    #[test]
+    fn map_drops_inverted_bounds() {
+        let mut o = sso("n", "integer");
+        o.min = Some(50.0);
+        o.max = Some(1.0);
+        let mapped = map_skill_slash_options(&skill_with(vec![o]));
+        assert!(mapped[0].min.is_none() && mapped[0].max.is_none());
+    }
+
+    #[test]
+    fn prompt_legacy_typed_and_all_optional() {
+        let legacy = spec_with(Vec::new());
+        assert_eq!(skill_command_prompt(&legacy, "", &[]), None);
+        assert_eq!(
+            skill_command_prompt(&legacy, "do it", &[]).unwrap(),
+            "Use the 's' skill for this request: do it"
+        );
+
+        let typed = spec_with(vec![opt("q", OptKind::String, true)]);
+        // all-optional / no args STILL invokes the skill (the bug fix)
+        assert_eq!(
+            skill_command_prompt(&typed, "", &[]).unwrap(),
+            "Use the 's' skill for this request."
+        );
+        let submitted = vec![("q".to_string(), "rust".to_string())];
+        assert_eq!(
+            skill_command_prompt(&typed, "", &submitted).unwrap(),
+            "Use the 's' skill for this request:\nq: rust"
+        );
     }
 }

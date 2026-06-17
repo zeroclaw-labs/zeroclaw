@@ -153,6 +153,10 @@ fn number_value(v: f64, kind: OptKind) -> Value {
 /// the order Discord sent them. The value is stringified by JSON kind (string
 /// as-is; number/bool to text) for folding into the synthesized agent prompt.
 /// This generalises the single-`input` extractor for typed commands.
+///
+/// Limitation: user/channel/role/mentionable options yield the raw snowflake id
+/// (Discord puts the resolved entity in `data.resolved`, which is not consulted
+/// here) — resolving ids to display names/mentions is a follow-on.
 pub fn extract_submitted_options(data: &Value) -> Vec<(String, String)> {
     data.get("data")
         .and_then(|d| d.get("options"))

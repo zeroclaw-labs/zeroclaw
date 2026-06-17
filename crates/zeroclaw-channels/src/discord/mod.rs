@@ -2095,34 +2095,8 @@ impl Channel for DiscordChannel {
                                                 None => Vec::new(),
                                             };
                                             match specs.into_iter().find(|spec| spec.slug == command) {
-                                                Some(spec) if spec.options.is_empty() => {
-                                                    // Legacy single free-text `input` option.
-                                                    if input.is_empty() {
-                                                        None // known command, empty input
-                                                    } else {
-                                                        Some(format!(
-                                                            "Use the '{}' skill for this request: {input}",
-                                                            spec.skill_name
-                                                        ))
-                                                    }
-                                                }
                                                 Some(spec) => {
-                                                    // Typed options: fold the submitted name/value pairs
-                                                    // (extracted above) into the prompt (Discord enforces
-                                                    // the required ones).
-                                                    if submitted.is_empty() {
-                                                        None
-                                                    } else {
-                                                        let rendered = submitted
-                                                            .iter()
-                                                            .map(|(n, v)| format!("{n}: {v}"))
-                                                            .collect::<Vec<_>>()
-                                                            .join("\n");
-                                                        Some(format!(
-                                                            "Use the '{}' skill for this request:\n{rendered}",
-                                                            spec.skill_name
-                                                        ))
-                                                    }
+                                                    skill_command_prompt(&spec, &input, &submitted)
                                                 }
                                                 None => None, // stale or foreign command
                                             }
