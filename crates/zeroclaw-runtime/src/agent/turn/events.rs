@@ -2,6 +2,7 @@
 //! loop's `TurnEvent` emission helpers (#7415 consolidation).
 
 use super::outcome::ToolLoopCancelled;
+use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use anyhow::Result;
 use tokio::sync::mpsc::Sender;
@@ -87,7 +88,7 @@ pub(crate) async fn emit_tool_call_pair(
         .send(TurnEvent::ToolResult {
             id: call_id,
             name: call.name.clone(),
-            output: outcome.output.clone(),
+            output: scrub_credentials(&outcome.output),
         })
         .await;
 }
@@ -170,5 +171,30 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    /// The UI-facing `ToolResult` event is scrubbed at the rendering boundary,
+    /// even though the source outcome carries raw bytes on the data path.
+    #[tokio::test]
+    async fn tool_result_event_is_scrubbed_for_rendering() {
+        let outcome = ToolExecutionOutcome {
+            output: "api_key = \"sk-live-abcd1234efgh5678\"".into(),
+            success: true,
+            error_reason: None,
+            duration: Duration::ZERO,
+            receipt: None,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        emit_tool_call_pair(&tx, &parsed_call(Some("c1")), &outcome).await;
+        drop(tx);
+        let mut saw_result = false;
+        while let Some(ev) = rx.recv().await {
+            if let TurnEvent::ToolResult { output, .. } = ev {
+                saw_result = true;
+                assert!(output.contains("[REDACTED]"));
+                assert!(!output.contains("abcd1234efgh5678"));
+            }
+        }
+        assert!(saw_result, "a ToolResult event must be emitted");
     }
 }

@@ -73,22 +73,21 @@ pub async fn execute_one_tool(
     let Some(tool) = static_tool.or(activated_arc.as_deref()) else {
         let reason = format!("Unknown tool: {call_name}");
         let duration = start.elapsed();
-        let scrubbed_reason = scrub_credentials(&reason);
         observer.record_event(&ObserverEvent::ToolCall {
             tool: call_name.to_string(),
             tool_call_id: tool_call_id_owned.clone(),
             duration,
             success: false,
             arguments: Some(full_args.clone()),
-            result: Some(scrubbed_reason.clone()),
+            result: Some(scrub_credentials(&reason)),
             channel: None,
             agent_alias: None,
             turn_id: None,
         });
         return Ok(ToolExecutionOutcome {
-            output: reason,
+            output: reason.clone(),
             success: false,
-            error_reason: Some(scrubbed_reason),
+            error_reason: Some(reason),
             duration,
             receipt: None,
         });
@@ -172,9 +171,8 @@ pub async fn execute_one_tool(
                 } else {
                     &r.output
                 };
-                let output = scrub_credentials(normalized_output);
                 let receipt = receipt_generator.map(|receipt_gen| {
-                    receipt_gen.generate_now(call_name, &call_arguments, &output)
+                    receipt_gen.generate_now(call_name, &call_arguments, normalized_output)
                 });
                 observer.record_event(&ObserverEvent::ToolCall {
                     tool: call_name.to_string(),
@@ -182,13 +180,13 @@ pub async fn execute_one_tool(
                     duration,
                     success: true,
                     arguments: Some(full_args.clone()),
-                    result: Some(output.clone()),
+                    result: Some(scrub_credentials(normalized_output)),
                     channel: None,
                     agent_alias: None,
                     turn_id: None,
                 });
                 Ok(ToolExecutionOutcome {
-                    output,
+                    output: normalized_output.to_string(),
                     success: true,
                     error_reason: None,
                     duration,
@@ -196,14 +194,13 @@ pub async fn execute_one_tool(
                 })
             } else {
                 let reason = r.error.unwrap_or(r.output);
-                let scrubbed_reason = scrub_credentials(&reason);
                 observer.record_event(&ObserverEvent::ToolCall {
                     tool: call_name.to_string(),
                     tool_call_id: tool_call_id_owned.clone(),
                     duration,
                     success: false,
                     arguments: Some(full_args.clone()),
-                    result: Some(scrubbed_reason.clone()),
+                    result: Some(scrub_credentials(&reason)),
                     channel: None,
                     agent_alias: None,
                     turn_id: None,
@@ -211,7 +208,7 @@ pub async fn execute_one_tool(
                 Ok(ToolExecutionOutcome {
                     output: format!("Error: {reason}"),
                     success: false,
-                    error_reason: Some(scrubbed_reason),
+                    error_reason: Some(reason),
                     duration,
                     receipt: None,
                 })
@@ -234,22 +231,21 @@ pub async fn execute_one_tool(
                 format!("tool error: {call_name}")
             );
             let reason = format!("Error executing {call_name}: {e}");
-            let scrubbed_reason = scrub_credentials(&reason);
             observer.record_event(&ObserverEvent::ToolCall {
                 tool: call_name.to_string(),
                 tool_call_id: tool_call_id_owned.clone(),
                 duration,
                 success: false,
                 arguments: Some(full_args.clone()),
-                result: Some(scrubbed_reason.clone()),
+                result: Some(scrub_credentials(&reason)),
                 channel: None,
                 agent_alias: None,
                 turn_id: None,
             });
             Ok(ToolExecutionOutcome {
-                output: reason,
+                output: reason.clone(),
                 success: false,
-                error_reason: Some(scrubbed_reason),
+                error_reason: Some(reason),
                 duration,
                 receipt: None,
             })

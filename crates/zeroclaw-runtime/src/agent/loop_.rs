@@ -3069,6 +3069,7 @@ mod tests {
 
     zeroclaw_api::mock_tool_attribution!(
         CountingTool,
+        CredentialOutputTool,
         EmptySuccessTool,
         RecordingArgsTool,
         DelayTool,
@@ -3638,6 +3639,59 @@ mod tests {
         assert!(outcome.success);
         assert_eq!(outcome.output, "(no output)");
         assert!(outcome.error_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_keeps_data_path_raw_and_scrubs_only_observer() {
+        struct CapturingResults {
+            results: std::sync::Mutex<Vec<Option<String>>>,
+        }
+        impl crate::observability::Observer for CapturingResults {
+            fn record_event(&self, event: &crate::observability::ObserverEvent) {
+                if let crate::observability::ObserverEvent::ToolCall { result, .. } = event {
+                    self.results.lock().unwrap().push(result.clone());
+                }
+            }
+            fn record_metric(&self, _metric: &crate::observability::traits::ObserverMetric) {}
+            fn name(&self) -> &str {
+                "capturing-results"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn flush(&self) {}
+        }
+
+        let observer = CapturingResults {
+            results: std::sync::Mutex::new(Vec::new()),
+        };
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(CredentialOutputTool)];
+
+        let outcome = execute_one_tool(
+            "credential_output",
+            serde_json::json!({}),
+            None,
+            &tools,
+            None,
+            &observer,
+            None,
+            None, // receipt_generator
+        )
+        .await
+        .expect("tool should execute");
+
+        // Data path (fed to the model and HMAC receipts) carries raw bytes.
+        assert_eq!(outcome.output, "api_key = \"sk-live-abcd1234efgh5678\"");
+        assert!(!outcome.output.contains("[REDACTED]"));
+
+        // Observer (human-facing log/dashboard render) is scrubbed.
+        let captured = observer.results.lock().unwrap();
+        let result = captured
+            .first()
+            .and_then(|r| r.as_deref())
+            .expect("observer must receive a tool result");
+        assert!(result.contains("[REDACTED]"));
+        assert!(!result.contains("abcd1234efgh5678"));
     }
     use crate::observability::NoopObserver;
     use tempfile::TempDir;
@@ -4282,6 +4336,37 @@ mod tests {
             Ok(crate::tools::ToolResult {
                 success: true,
                 output: format!("counted:{value}"),
+                error: None,
+            })
+        }
+    }
+
+    struct CredentialOutputTool;
+
+    #[async_trait]
+    impl Tool for CredentialOutputTool {
+        fn name(&self) -> &str {
+            "credential_output"
+        }
+
+        fn description(&self) -> &str {
+            "Returns success with a credential-shaped value in its output"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "api_key = \"sk-live-abcd1234efgh5678\"".to_string(),
                 error: None,
             })
         }
