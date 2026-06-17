@@ -43,6 +43,7 @@ impl SkillDocument {
         write_optional(&mut out, "author", self.frontmatter.author.as_deref());
         write_optional(&mut out, "version", self.frontmatter.version.as_deref());
         write_optional(&mut out, "category", self.frontmatter.category.as_deref());
+        write_tags(&mut out, &self.frontmatter.tags);
         out.push_str("---\n");
         if !self.body.is_empty() {
             if !self.body.starts_with('\n') {
@@ -78,6 +79,7 @@ pub fn split_frontmatter(content: &str) -> Option<(String, String)> {
 fn parse_frontmatter(src: &str) -> Result<SkillFrontmatter, DocumentParseError> {
     let mut fm = SkillFrontmatter::default();
     let mut multiline: Option<(String, Vec<String>)> = None;
+    let mut collecting_tags = false;
 
     let flush = |fm: &mut SkillFrontmatter, key: &str, parts: &[String]| {
         let val = parts.join(" ");
@@ -98,6 +100,20 @@ fn parse_frontmatter(src: &str) -> Result<SkillFrontmatter, DocumentParseError> 
             flush(&mut fm, &key_owned, &parts_owned);
             multiline = None;
         }
+        // YAML block list under `tags:` — consume `- item` continuation lines
+        // until a non-list line. Mirrors the loader's parser so both readers
+        // agree on tag shape (zeroclaw-labs/zeroclaw#7490 reads the same tags).
+        if collecting_tags {
+            let trimmed = line.trim();
+            if let Some(item) = trimmed.strip_prefix("- ") {
+                let tag = item.trim().trim_matches('"').trim_matches('\'');
+                if !tag.is_empty() {
+                    fm.tags.push(tag.to_string());
+                }
+                continue;
+            }
+            collecting_tags = false;
+        }
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
@@ -105,6 +121,21 @@ fn parse_frontmatter(src: &str) -> Result<SkillFrontmatter, DocumentParseError> 
         let value = value.trim().trim_matches('"').trim_matches('\'');
         if matches!(value, ">-" | ">" | "|" | "|-") {
             multiline = Some((key.to_string(), Vec::new()));
+            continue;
+        }
+        if key == "tags" {
+            if value.is_empty() {
+                // Block list (`tags:` then `  - item` lines) follows.
+                collecting_tags = true;
+            } else {
+                // Inline flow list: `[a, b, c]` (or a bare comma list).
+                let inner = value.trim_start_matches('[').trim_end_matches(']');
+                fm.tags = inner
+                    .split(',')
+                    .map(|t| t.trim().trim_matches('"').trim_matches('\'').to_string())
+                    .filter(|t| !t.is_empty())
+                    .collect();
+            }
             continue;
         }
         assign(&mut fm, key, value);
@@ -159,6 +190,16 @@ fn write_optional(out: &mut String, key: &str, value: Option<&str>) {
     {
         write_field(out, key, v);
     }
+}
+
+/// Serialize tags as an inline flow list (`tags: [a, b]`) — compact and parsed
+/// identically by both this reader and the loader's `parse_simple_frontmatter`.
+/// Empty tags are omitted so a tagless skill stays byte-identical.
+fn write_tags(out: &mut String, tags: &[String]) {
+    if tags.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "tags: [{}]", tags.join(", "));
 }
 
 #[cfg(test)]
@@ -244,10 +285,35 @@ mod tests {
                 author: Some("zeroclaw-labs".into()),
                 version: Some("0.2.0".into()),
                 category: Some("coding".into()),
+                tags: vec!["slash".into(), "ops".into()],
             },
             body: "# Code Review\n\nReviews diffs.\n".into(),
         };
         let parsed = SkillDocument::parse(&original.serialize()).unwrap();
         assert_eq!(parsed.frontmatter, original.frontmatter);
+    }
+
+    #[test]
+    fn parses_inline_and_block_tags() {
+        let inline = "---\nname: x\ndescription: y\ntags: [slash, ops]\n---\n";
+        assert_eq!(
+            SkillDocument::parse(inline).unwrap().frontmatter.tags,
+            vec!["slash", "ops"]
+        );
+        let block = "---\nname: x\ndescription: y\ntags:\n  - slash\n  - ops\n---\n";
+        assert_eq!(
+            SkillDocument::parse(block).unwrap().frontmatter.tags,
+            vec!["slash", "ops"]
+        );
+    }
+
+    #[test]
+    fn editing_preserves_tags() {
+        // Regression for the strip-on-save bug: parse -> serialize -> parse
+        // keeps the tags instead of dropping them.
+        let original = "---\nname: x\ndescription: y\ntags: [slash, open-skills]\n---\n# Body\n";
+        let doc = SkillDocument::parse(original).unwrap();
+        let reparsed = SkillDocument::parse(&doc.serialize()).unwrap();
+        assert_eq!(reparsed.frontmatter.tags, vec!["slash", "open-skills"]);
     }
 }

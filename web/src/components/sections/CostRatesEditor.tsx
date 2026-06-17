@@ -18,6 +18,7 @@
 
 import { useEffect, useState } from 'react';
 import { ChevronRight, Plus, Trash2 } from 'lucide-react';
+import { t } from '@/lib/i18n';
 import {
   ApiError,
   createMapKey,
@@ -172,10 +173,9 @@ function SingleResourceEditor({
     return (
       <div className="flex flex-col gap-3">
         <p className="text-sm" style={{ color: 'var(--pc-text-secondary)' }}>
-          No rate sheet entry yet for{' '}
+          {t('cost_rates.no_entry_yet_for')}{' '}
           <code className="font-mono">{composite(category, providerType, fixedResource)}</code>.
-          Adding one lets the orchestrator price token usage at this rate
-          instead of falling back to <code>cost.usd_per_1k_input</code>.
+          {' '}{t('cost_rates.no_entry_fallback_prefix')} <code>cost.usd_per_1k_input</code>.
         </p>
         {error && <ErrorBanner msg={error} />}
         <button
@@ -185,7 +185,7 @@ function SingleResourceEditor({
           className="btn-electric flex items-center gap-2 text-sm px-3 py-2 self-start"
         >
           <Plus className="h-4 w-4" />
-          {busy ? 'Adding…' : 'Add rates'}
+          {busy ? t('cost_rates.adding') : t('cost_rates.add_rates')}
         </button>
       </div>
     );
@@ -194,9 +194,9 @@ function SingleResourceEditor({
   return (
     <div className="flex flex-col gap-3">
       <p className="text-sm" style={{ color: 'var(--pc-text-secondary)' }}>
-        Rate sheet for{' '}
+        {t('cost_rates.rate_sheet_for')}{' '}
         <code className="font-mono">{composite(category, providerType, fixedResource)}</code>{' '}
-        — path <code className="font-mono">{fullPath}</code>.
+        {t('cost_rates.path_label')} <code className="font-mono">{fullPath}</code>.
       </p>
       {error && <ErrorBanner msg={error} />}
       <FieldForm
@@ -310,8 +310,8 @@ function ResourceListEditor({
             className="p-4 text-sm text-center"
             style={{ color: 'var(--pc-text-muted)' }}
           >
-            No rates configured under{' '}
-            <code className="font-mono">{basePath}</code>. Add one below.
+            {t('cost_rates.no_rates_under')}{' '}
+            <code className="font-mono">{basePath}</code>. {t('cost_rates.add_one_below')}
           </div>
         ) : (
           resources.map((resource) => (
@@ -360,13 +360,13 @@ function ResourceListEditor({
               className="btn-electric text-sm px-3 py-1.5 flex items-center gap-1"
             >
               <Plus className="h-4 w-4" />
-              {adding ? 'Adding…' : 'Add'}
+              {adding ? t('cost_rates.adding') : t('cost_rates.add')}
             </button>
           </div>
           {suggestions.filter((s) => !resources.includes(s)).length > 0 && (
             <div className="flex items-center gap-1.5 flex-wrap">
               <span className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
-                From <code className="font-mono">providers.{category}.{providerType}</code>:
+                {t('cost_rates.from_label')} <code className="font-mono">providers.{category}.{providerType}</code>:
               </span>
               {suggestions
                 .filter((s) => !resources.includes(s))
@@ -394,8 +394,7 @@ function ResourceListEditor({
         className="text-xs"
         style={{ color: 'var(--pc-text-faint)' }}
       >
-        Resource id is the upstream model / voice / pipeline name as it
-        appears in usage telemetry, not the local alias. Rates emit at{' '}
+        {t('cost_rates.resource_id_help')} {t('cost_rates.rates_emit_at')}{' '}
         <code className="font-mono">{basePath}.&lt;resource&gt;</code>.
       </p>
     </div>
@@ -474,8 +473,8 @@ function ResourceRow({
           }}
           title={
             armed
-              ? `Click again to delete ${composite(category, providerType, resource)}`
-              : `Delete ${composite(category, providerType, resource)}`
+              ? `${t('cost_rates.click_again_to_delete')} ${composite(category, providerType, resource)}`
+              : `${t('common.delete')} ${composite(category, providerType, resource)}`
           }
           className="btn-icon flex-shrink-0"
           style={
@@ -488,7 +487,7 @@ function ResourceRow({
           }
         >
           {armed ? (
-            <span className="text-xs px-1">Confirm</span>
+            <span className="text-xs px-1">{t('common.confirm')}</span>
           ) : (
             <Trash2 className="h-4 w-4" />
           )}

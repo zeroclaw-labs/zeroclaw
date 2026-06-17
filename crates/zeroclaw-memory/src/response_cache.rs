@@ -203,6 +203,10 @@ impl ResponseCache {
 
     /// Promote an entry to the in-memory hot cache, evicting the oldest if full.
     fn promote_to_hot(&self, key: &str, response: &str, token_count: u32) {
+        if self.max_entries == 0 {
+            return;
+        }
+
         let mut hot = self.hot_cache.lock();
 
         // If already present, just update (keep original created_at for TTL)
@@ -494,6 +498,18 @@ mod tests {
 
         let (count, _, _) = cache.stats().unwrap();
         assert_eq!(count, 0, "cache with max_entries=0 should evict everything");
+    }
+
+    #[test]
+    fn max_entries_zero_does_not_return_hot_hit() {
+        let tmp = TempDir::new().unwrap();
+        let cache = ResponseCache::new(tmp.path(), 60, 0).unwrap();
+
+        let key = ResponseCache::cache_key("gpt-4", None, "test");
+        cache.put(&key, "gpt-4", "response", 10).unwrap();
+
+        let result = cache.get(&key).unwrap();
+        assert_eq!(result, None, "zero-capacity cache must not hit hot cache");
     }
 
     #[test]
