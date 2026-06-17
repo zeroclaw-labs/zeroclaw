@@ -6,35 +6,31 @@
 
 use std::sync::Arc;
 
+use super::embed::DiscordEmbed;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Outbound message envelope
 //
 // The single payload the channel-message REST builders collapse onto. The
 // builders already route through `text()`/`to_rest_json()` (EPIC A Phase 2), so
 // the struct and its methods are live; `to_rest_json` is byte-identical to the
-// historical `json!({ "content": content })` (proven by the tests below and by
-// the existing wiremock send tests) because only `content` is populated today.
-// EPIC C fills `embeds`, EPIC B fills `components`/`flags` — until then those
-// three fields stay unread, so the `#[allow(dead_code)]` is scoped to just them.
+// historical `json!({ "content": content })` when only `content` is populated
+// (proven by the tests below). EPIC C now fills `embeds` (serialized here);
+// EPIC B fills `components`/`flags` — until then those two stay unread, so the
+// `#[allow(dead_code)]` is scoped to just them.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct DiscordOutgoing {
     pub(crate) content: Option<String>,
-    // Unread until EPIC C/B wire these into `to_rest_json`; the allow is on the
-    // placeholder fields only, leaving the struct itself under dead-code analysis.
-    #[allow(dead_code)]
     pub(crate) embeds: Vec<DiscordEmbed>,
+    // Unread until EPIC B wires these into `to_rest_json`; the allow is on the
+    // placeholder fields only, leaving the struct itself under dead-code analysis.
     #[allow(dead_code)]
     pub(crate) components: Vec<DiscordActionRow>,
     #[allow(dead_code)]
     pub(crate) flags: DiscordMessageFlags,
 }
-
-/// Placeholder — filled by EPIC C (rich content / embeds).
-#[allow(dead_code)]
-#[derive(Debug, Default, Clone)]
-pub(crate) struct DiscordEmbed;
 
 /// Placeholder — filled by EPIC B (components).
 #[allow(dead_code)]
@@ -69,7 +65,12 @@ impl DiscordOutgoing {
                 serde_json::Value::String(content.clone()),
             );
         }
-        // EPIC B/C add `embeds`/`components`/`flags` here; empty → omitted.
+        if !self.embeds.is_empty() {
+            let embeds: Vec<serde_json::Value> =
+                self.embeds.iter().map(DiscordEmbed::to_api).collect();
+            obj.insert("embeds".to_string(), serde_json::Value::Array(embeds));
+        }
+        // EPIC B adds `components`/`flags` here; empty → omitted.
         serde_json::Value::Object(obj)
     }
 
@@ -204,6 +205,37 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(out.to_rest_json(), serde_json::json!({ "content": "" }));
+    }
+
+    #[test]
+    fn populated_embeds_serialize_through_the_chokepoint() {
+        let out = DiscordOutgoing {
+            content: Some("see below".to_string()),
+            embeds: vec![DiscordEmbed {
+                title: Some("Report".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            out.to_rest_json(),
+            serde_json::json!({
+                "content": "see below",
+                "embeds": [{ "title": "Report" }]
+            })
+        );
+    }
+
+    #[test]
+    fn empty_embeds_vec_omits_the_key_preserving_byte_identity() {
+        // An explicitly-empty embeds vec must not grow an `"embeds"` key, or the
+        // EPIC A content-only byte-identity invariant breaks.
+        let out = DiscordOutgoing {
+            content: Some("hi".to_string()),
+            embeds: Vec::new(),
+            ..Default::default()
+        };
+        assert_eq!(out.to_rest_json(), serde_json::json!({ "content": "hi" }));
     }
 
     #[test]

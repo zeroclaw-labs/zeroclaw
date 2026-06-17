@@ -15,6 +15,12 @@ use zeroclaw_api::channel::{
 use zeroclaw_api::media::MediaAttachment;
 use zeroclaw_runtime::i18n;
 
+// Contract tier: `embed` holds the embed value object that `types`'
+// `DiscordOutgoing` envelope carries; both are contract modules (no impl
+// imports), so the layer stays acyclic. Consumers import `super::embed::…`
+// explicitly; a parent re-export is added in the phase that wires `mod.rs`.
+mod embed;
+
 mod types;
 // Keep the historical public path (`…::discord::DiscordSlashCommandSpec`) stable.
 pub use types::{DiscordSlashCommandResolver, DiscordSlashCommandSpec};
