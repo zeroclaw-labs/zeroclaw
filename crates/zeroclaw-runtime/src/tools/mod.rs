@@ -32,6 +32,7 @@ pub mod security_ops;
 pub mod send_message_to_peer;
 pub mod shell;
 pub mod skill_http;
+pub mod skill_manage;
 pub mod skill_tool;
 pub mod sop_advance;
 pub mod sop_approve;
@@ -61,6 +62,8 @@ pub use zeroclaw_tools::composio::ComposioTool;
 pub use zeroclaw_tools::content_search::ContentSearchTool;
 pub use zeroclaw_tools::data_management::DataManagementTool;
 pub use zeroclaw_tools::discord_search::DiscordSearchTool;
+pub use zeroclaw_tools::email_read::EmailReadTool;
+pub use zeroclaw_tools::email_search::EmailSearchTool;
 pub use zeroclaw_tools::escalate::EscalateToHumanTool;
 pub use zeroclaw_tools::file_download::FileDownloadTool;
 pub use zeroclaw_tools::file_edit::FileEditTool;
@@ -154,10 +157,12 @@ pub const REENTRANT_AGENT_TOOLS: &[&str] = &[SpawnSubagentTool::NAME, DelegateTo
 
 use crate::platform::{NativeRuntime, RuntimeAdapter};
 use crate::security::{SecurityPolicy, create_sandbox};
+use crate::sop::audit::SopAuditLogger;
+use crate::sop::engine::SopEngine;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 use zeroclaw_memory::Memory;
 
@@ -462,6 +467,8 @@ pub fn all_tools(
         canvas_store,
         is_subagent_caller,
         tui_env,
+        None,
+        None,
     )
 }
 
@@ -490,10 +497,12 @@ pub fn all_tools_with_runtime(
     canvas_store: Option<CanvasStore>,
     is_subagent_caller: bool,
     tui_env: Option<HashMap<String, String>>,
+    sop_engine: Option<Arc<Mutex<SopEngine>>>,
+    sop_audit: Option<Arc<SopAuditLogger>>,
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
-    let runtime_kind = root_config.runtime.kind.as_str();
+    let runtime_kind = root_config.runtime.kind.as_wire();
     let sandbox_cfg = risk_profile.sandbox_config();
     let sandbox = create_sandbox(&sandbox_cfg, runtime_kind, Some(&security.workspace_dir));
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
@@ -603,7 +612,12 @@ pub fn all_tools_with_runtime(
     // bot/server set); the search tool reads from a shared archive DB
     // so it's enabled when at least one alias archives.
     if root_config.channels.discord.values().any(|d| d.archive) {
-        match zeroclaw_memory::SqliteMemory::new_named("sqlite", workspace_dir, "discord") {
+        // Read from the SHARED store (`config.data_dir`) the channel archive
+        // writer persists to (orchestrator builds `discord.db` under
+        // `&config.data_dir`), NOT the per-agent `workspace_dir` — otherwise the
+        // tool opens an empty DB and litters a stray `memory/discord.db` under
+        // every agent workspace.
+        match zeroclaw_memory::SqliteMemory::new_named("sqlite", &config.data_dir, "discord") {
             Ok(discord_mem) => {
                 tool_arcs.push(Arc::new(DiscordSearchTool::new(Arc::new(discord_mem))));
             }
@@ -616,6 +630,39 @@ pub fn all_tools_with_runtime(
                     "discord_search: failed to open discord.db"
                 );
             }
+        }
+    }
+
+    // email_search — registered when at least one email channel is enabled
+    {
+        let email_configs: std::collections::HashMap<
+            String,
+            zeroclaw_config::scattered_types::EmailConfig,
+        > = root_config
+            .channels
+            .email
+            .iter()
+            .filter(|(_, c)| c.enabled)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        if !email_configs.is_empty() {
+            let auth_service = if email_configs.values().any(|c| c.oauth2.is_some()) {
+                Some(Arc::new(
+                    zeroclaw_providers::auth::AuthService::from_config(root_config),
+                ))
+            } else {
+                None
+            };
+            let configs = Arc::new(email_configs);
+            tool_arcs.push(Arc::new(EmailSearchTool::new(
+                Arc::clone(&configs),
+                auth_service.clone(),
+            )));
+            tool_arcs.push(Arc::new(EmailReadTool::new(
+                Arc::clone(&configs),
+                auth_service,
+            )));
         }
     }
 
@@ -996,8 +1043,12 @@ pub fn all_tools_with_runtime(
     // created via /ws/chat was invisible to `sessions_list` /
     // `sessions_history`. Routing both call sites through the factory
     // closes that gap and honors the operator's configured backend.
+    // Read from the SHARED sessions store (`config.data_dir`) the gateway/daemon
+    // write to (they build the backend under `&config.data_dir`), NOT the
+    // per-agent `workspace_dir` — otherwise `sessions_list`/`sessions_history`
+    // miss real sessions and a stray `sessions/sessions.db` is created per agent.
     if let Ok(backend) =
-        zeroclaw_infra::make_session_backend(workspace_dir, &config.channels.session_backend)
+        zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels.session_backend)
     {
         tool_arcs.push(Arc::new(SessionsCurrentTool::new(backend.clone())));
         tool_arcs.push(Arc::new(SessionsListTool::new(backend.clone())));
@@ -1084,16 +1135,25 @@ pub fn all_tools_with_runtime(
         Arc::clone(&poll_handle),
     )));
 
-    // SOP tools (registered when sops_dir is configured)
-    if root_config.sop.sops_dir.is_some() {
-        let mut engine = crate::sop::SopEngine::new(root_config.sop.clone());
-        engine.reload(workspace_dir);
-        let sop_engine = Arc::new(std::sync::Mutex::new(engine));
-        tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(&sop_engine))));
-        tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(&sop_engine))));
-        tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(&sop_engine))));
-        tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(&sop_engine))));
-        tool_arcs.push(Arc::new(SopStatusTool::new(Arc::clone(&sop_engine))));
+    // SOP tools (registered when engine handle is provided)
+    if let Some(ref sop_engine) = sop_engine {
+        tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(sop_engine))));
+        if let Some(ref sop_audit) = sop_audit {
+            tool_arcs.push(Arc::new(
+                SopExecuteTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
+            ));
+            tool_arcs.push(Arc::new(
+                SopAdvanceTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
+            ));
+            tool_arcs.push(Arc::new(
+                SopApproveTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
+            ));
+        } else {
+            tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(sop_engine))));
+            tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(sop_engine))));
+            tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(sop_engine))));
+        }
+        tool_arcs.push(Arc::new(SopStatusTool::new(Arc::clone(sop_engine))));
     }
 
     if let Some(key) = composio_key
@@ -1299,20 +1359,10 @@ pub fn all_tools_with_runtime(
     // ── WASM plugin tools (requires plugins-wasm feature) ──
     #[cfg(feature = "plugins-wasm")]
     {
-        let plugin_dir = config.plugins.plugins_dir.clone();
-        let plugin_path = if plugin_dir.starts_with("~/") {
-            let home = directories::UserDirs::new()
-                .map(|u| u.home_dir().to_path_buf())
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
-            home.join(plugin_dir.strip_prefix("~/").unwrap())
-        } else {
-            std::path::PathBuf::from(&plugin_dir)
-        };
+        let plugin_path = config.plugins.resolved_plugins_dir();
 
         if plugin_path.exists() && config.plugins.enabled {
-            match zeroclaw_plugins::host::PluginHost::new(
-                plugin_path.parent().unwrap_or(&plugin_path),
-            ) {
+            match zeroclaw_plugins::host::PluginHost::from_plugins_dir(&plugin_path) {
                 Ok(host) => {
                     let details = host.tool_plugin_details();
                     let count = details.len();
@@ -1340,6 +1390,22 @@ pub fn all_tools_with_runtime(
                         "Failed to load WASM plugins"
                     );
                 }
+            }
+        }
+
+        // Surface plugins stranded in a legacy install dir so they aren't
+        // silently ignored — the user can relocate them with `plugin migrate`.
+        if config.plugins.enabled {
+            for legacy in zeroclaw_config::schema::legacy_plugin_dirs_with_entries(&config) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "legacy_dir": legacy.display().to_string()
+                        })),
+                    "Plugins in a legacy directory are not loaded; run `zeroclaw plugin migrate`"
+                );
             }
         }
     }
@@ -1383,6 +1449,355 @@ mod tests {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
         assert_eq!(tools.len(), 6);
+    }
+
+    /// Regression: SOP tools must NOT appear in the tool registry when the
+    /// engine handle is not provided (i.e. no `sops_dir` configured).
+    /// Proves the production gating path at `all_tools_with_runtime`.
+    #[test]
+    fn sop_tools_absent_when_engine_not_provided() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig {
+            enabled: false,
+            allowed_domains: vec![],
+            session_name: None,
+            ..BrowserConfig::default()
+        };
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
+
+        let tools = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+        )
+        .tools;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+
+        let sop_tool_names = [
+            "sop_list",
+            "sop_execute",
+            "sop_advance",
+            "sop_approve",
+            "sop_status",
+        ];
+        for name in &sop_tool_names {
+            assert!(
+                !names.contains(name),
+                "SOP tool '{name}' must not be registered when engine is absent"
+            );
+        }
+    }
+
+    /// SOP tools MUST appear in the tool registry when an engine handle is
+    /// provided, regardless of config. Proves the parameter-passing path
+    /// works end-to-end.
+    #[test]
+    fn sop_tools_present_when_engine_provided() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig {
+            enabled: false,
+            allowed_domains: vec![],
+            session_name: None,
+            ..BrowserConfig::default()
+        };
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
+
+        // Build a minimal SOP engine — no sops_dir needed for this test.
+        let engine = Arc::new(Mutex::new(SopEngine::new(
+            zeroclaw_config::schema::SopConfig::default(),
+        )));
+
+        let tools = all_tools_with_runtime(
+            Arc::new(Config::default()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            Some(engine),
+            None,
+        )
+        .tools;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+
+        let sop_tool_names = [
+            "sop_list",
+            "sop_execute",
+            "sop_advance",
+            "sop_approve",
+            "sop_status",
+        ];
+        for name in &sop_tool_names {
+            assert!(
+                names.contains(name),
+                "SOP tool '{name}' must be registered when engine is provided"
+            );
+        }
+    }
+
+    /// Regression for #6687: two tool registries built from clones of the same
+    /// engine `Arc` must reference the same underlying `SopEngine`. This is the
+    /// property the daemon relies on so MQTT-triggered runs are visible to
+    /// `sop_status`/`sop_approve`/`sop_advance` invoked from agent sessions.
+    #[test]
+    fn shared_sop_engine_arc_is_observed_by_multiple_registrations() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let cfg = test_config(&tmp);
+        let browser = BrowserConfig::default();
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let web = zeroclaw_config::schema::WebFetchConfig::default();
+        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
+
+        let shared_engine = Arc::new(Mutex::new(SopEngine::new(
+            zeroclaw_config::schema::SopConfig::default(),
+        )));
+        let shared_audit = Arc::new(crate::sop::SopAuditLogger::new(mem.clone()));
+
+        // Two independent registrations using clones of the same Arc — the
+        // pattern the daemon uses when wiring gateway, channels, MQTT, and
+        // RPC sessions from one engine pair.
+        let session_a = all_tools_with_runtime(
+            Arc::new(Config::default()),
+            &security,
+            &risk,
+            "session-a",
+            Arc::new(NativeRuntime::new()),
+            mem.clone(),
+            None,
+            None,
+            &browser,
+            &http,
+            &web,
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            Some(shared_engine.clone()),
+            Some(shared_audit.clone()),
+        );
+        let session_b = all_tools_with_runtime(
+            Arc::new(Config::default()),
+            &security,
+            &risk,
+            "session-b",
+            Arc::new(NativeRuntime::new()),
+            mem.clone(),
+            None,
+            None,
+            &browser,
+            &http,
+            &web,
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            Some(shared_engine.clone()),
+            Some(shared_audit.clone()),
+        );
+
+        for tools in [&session_a.tools, &session_b.tools] {
+            assert!(tools.iter().any(|t| t.name() == "sop_status"));
+        }
+
+        // Outer Arc + both registrations = 3+ strong refs. Confirms the
+        // registries kept references to the same instance instead of
+        // copying state.
+        assert!(Arc::strong_count(&shared_engine) >= 3);
+        assert!(Arc::strong_count(&shared_audit) >= 3);
+    }
+
+    /// Regression: `discord_search` and the `sessions_*` tools must open their
+    /// SQLite stores under the SHARED `config.data_dir` (where the channel
+    /// orchestrator / gateway WRITE them), not the per-agent `workspace_dir`.
+    /// Reading the per-agent dir made the tools see empty DBs and litter a
+    /// stray `memory/discord.db` + `sessions/sessions.db` into every agent
+    /// workspace. With `data_dir` and `workspace_dir` deliberately distinct,
+    /// nothing must be created under the workspace.
+    #[test]
+    fn shared_store_tools_open_data_dir_not_per_agent_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data"); // shared store (writers' dir)
+        let workspace_dir = tmp.path().join("agent-ws"); // per-agent, intentionally distinct
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig::default();
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let web = zeroclaw_config::schema::WebFetchConfig::default();
+        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
+
+        // root_config: shared data_dir + a Discord alias that archives (this is
+        // what gates discord_search registration).
+        let mut root_config = test_config(&tmp);
+        root_config.data_dir = data_dir.clone();
+        root_config.channels.discord.insert(
+            "oracle".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                archive: true,
+                ..Default::default()
+            },
+        );
+
+        // `config` (arg 1) carries the canonical shared data_dir — exactly how
+        // the production callers pass it (a clone of the runtime config).
+        let config = Config {
+            data_dir: data_dir.clone(),
+            ..Config::default()
+        };
+
+        let tools = all_tools_with_runtime(
+            Arc::new(config),
+            &security,
+            &risk,
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &web,
+            workspace_dir.as_path(), // DIFFERENT from data_dir
+            &HashMap::new(),
+            None,
+            &root_config,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .tools;
+
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(
+            names.contains(&"discord_search"),
+            "discord_search must register when a Discord alias archives"
+        );
+        assert!(
+            names.iter().any(|n| n.starts_with("sessions")),
+            "session tools must register"
+        );
+
+        // The fix: both stores open under the shared data_dir, never the
+        // per-agent workspace. Pre-fix the readers created `memory/discord.db`
+        // and `sessions/sessions.db` under the workspace_dir.
+        assert!(
+            !workspace_dir.join("memory").exists(),
+            "discord_search must not open/create a store under the per-agent workspace_dir"
+        );
+        assert!(
+            !workspace_dir.join("sessions").exists(),
+            "session tools must not open/create a store under the per-agent workspace_dir"
+        );
+    }
+
+    /// Regression for #6687 blocker: a config with `sop.sops_dir` set but no
+    /// `agents.default` must not fail SOP engine construction. The per-agent
+    /// paths now use `agent_alias` instead of the hardcoded `"default"` string.
+    #[tokio::test]
+    async fn sop_audit_memory_uses_agent_alias_not_default() {
+        let tmp = TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        std::fs::create_dir_all(&sops_dir).unwrap();
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "ops".to_string(),
+            AliasedAgentConfig {
+                ..Default::default()
+            },
+        );
+
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            sop: zeroclaw_config::schema::SopConfig {
+                sops_dir: Some(sops_dir.to_string_lossy().into_owned()),
+                ..zeroclaw_config::schema::SopConfig::default()
+            },
+            agents: agents.clone(),
+            ..Config::default()
+        };
+
+        // Using the session alias ("ops") must succeed even with no "default" agent.
+        let mem = zeroclaw_memory::create_memory_for_agent(&config, "ops", None).await;
+        assert!(
+            mem.is_ok(),
+            "create_memory_for_agent with session alias should succeed"
+        );
+
+        // The old hardcoded "default" must fail — proving the fix is load-bearing.
+        let mem_default = zeroclaw_memory::create_memory_for_agent(&config, "default", None).await;
+        assert!(
+            mem_default.is_err(),
+            "create_memory_for_agent(\"default\") must fail when agents.default is absent"
+        );
     }
 
     /// A runtime that reports an ephemeral workspace (no host persistence) while
@@ -1587,6 +2002,88 @@ mod tests {
         assert!(names.contains(&"model_routing_config"));
         assert!(names.contains(&"pushover"));
         assert!(names.contains(&"proxy_config"));
+    }
+
+    /// Wiring guard for issue #6689: SOP tools registered via `all_tools` must
+    /// carry a real audit logger, so a tool-driven run persists the documented
+    /// `sop_run_*` Memory key. The per-tool unit tests prove `with_audit` works;
+    /// this is the only test proving registration actually wires it. Without the
+    /// `.with_audit(...)` calls in the SOP block, the audit trail is silently a
+    /// no-op on the agent path (the path the AMQP/sop_execute deployment uses).
+    #[tokio::test]
+    async fn registered_sop_tools_persist_audit_trail() {
+        let tmp = TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        let sop_subdir = sops_dir.join("canary");
+        std::fs::create_dir_all(&sop_subdir).unwrap();
+        std::fs::write(
+            sop_subdir.join("SOP.toml"),
+            "[sop]\nname = \"canary\"\ndescription = \"audit wiring guard\"\nversion = \"1.0.0\"\n\n[[triggers]]\ntype = \"manual\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            sop_subdir.join("SOP.md"),
+            "## Steps\n\n1. **Resolve** Do the first step\n   - tools: shell\n",
+        )
+        .unwrap();
+
+        let mem_cfg = MemoryConfig {
+            backend: "sqlite".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let security = Arc::new(SecurityPolicy::default());
+        let mut cfg = test_config(&tmp);
+        cfg.sop.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
+
+        let tools = {
+            let mut engine = crate::sop::SopEngine::new(cfg.sop.clone());
+            engine.reload(tmp.path());
+            let sop_engine = Arc::new(std::sync::Mutex::new(engine));
+            let sop_audit = Arc::new(crate::sop::SopAuditLogger::new(mem.clone()));
+            all_tools_with_runtime(
+                Arc::new(Config::default()),
+                &security,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+                "test-agent",
+                Arc::new(NativeRuntime::new()),
+                mem.clone(),
+                None,
+                None,
+                &BrowserConfig::default(),
+                &zeroclaw_config::schema::HttpRequestConfig::default(),
+                &zeroclaw_config::schema::WebFetchConfig::default(),
+                tmp.path(),
+                &HashMap::new(),
+                None,
+                &cfg,
+                None,
+                false,
+                None,
+                Some(sop_engine),
+                Some(sop_audit),
+            )
+            .tools
+        };
+
+        let execute = tools
+            .iter()
+            .find(|t| t.name() == "sop_execute")
+            .expect("sop_execute must be registered when sops_dir is set");
+        let result = execute
+            .execute(serde_json::json!({"name": "canary"}))
+            .await
+            .unwrap();
+        assert!(result.success, "sop_execute failed: {result:?}");
+
+        let audit = crate::sop::SopAuditLogger::new(mem.clone());
+        let run_keys = audit.list_runs().await.unwrap();
+        assert!(
+            !run_keys.is_empty(),
+            "registered sop_execute must persist a sop_run_* audit entry; got none (audit not wired)"
+        );
     }
 
     #[test]

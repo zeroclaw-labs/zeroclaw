@@ -1,26 +1,25 @@
-use crate::agent::dispatcher::{
-    NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
-};
+use crate::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher, XmlToolDispatcher};
 use crate::agent::eval::AutoClassifyExt;
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
-use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalRequirement, ApprovalResponse};
+use crate::approval::ApprovalManager;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::SecurityPolicy;
-use crate::tools::{self, Tool, ToolSpec};
+use crate::sop::{SopAuditLogger, SopEngine};
+use crate::tools::{self, Tool};
 use anyhow::{Context, Result};
 use chrono::{Datelike, Timelike};
-use std::collections::{HashMap, VecDeque};
-use std::io::Write as IoWrite;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
+#[cfg(test)]
+use zeroclaw_providers::ChatRequest;
 use zeroclaw_providers::{
-    self, ChatMessage, ChatRequest, ConversationMessage, ModelProvider, ToolResultMessage,
+    self, ChatMessage, ConversationMessage, ModelProvider, ToolResultMessage,
 };
-use zeroclaw_tool_call_parser::strip_think_tags;
 
 // Re-export TurnEvent from zeroclaw-types for backwards compatibility.
 pub use zeroclaw_api::agent::TurnEvent;
@@ -130,10 +129,24 @@ impl Drop for TurnGuard {
     }
 }
 
+/// Resolve the tool dispatcher with the same provider-capability fallback
+/// used by fresh agent construction.
+#[must_use]
+pub fn tool_dispatcher_for_provider(
+    agent_cfg: &zeroclaw_config::schema::AliasedAgentConfig,
+    model_provider: &dyn ModelProvider,
+) -> Box<dyn ToolDispatcher> {
+    match agent_cfg.resolved.tool_dispatcher.as_str() {
+        "native" => Box::new(NativeToolDispatcher),
+        "xml" => Box::new(XmlToolDispatcher),
+        _ if model_provider.supports_native_tools() => Box::new(NativeToolDispatcher),
+        _ => Box::new(XmlToolDispatcher),
+    }
+}
+
 pub struct Agent {
     model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,
-    tool_specs: Vec<ToolSpec>,
     memory: Arc<dyn Memory>,
     observer: Arc<dyn Observer>,
     prompt_builder: SystemPromptBuilder,
@@ -159,8 +172,6 @@ pub struct Agent {
     classification_config: zeroclaw_config::schema::QueryClassificationConfig,
     available_hints: Vec<String>,
     route_model_by_hint: HashMap<String, String>,
-    #[allow(dead_code)] // WIP: stored for future runtime tool filtering
-    allowed_tools: Option<Vec<String>>,
     response_cache: Option<Arc<zeroclaw_memory::response_cache::ResponseCache>>,
     /// Pre-rendered security policy summary injected into the system prompt
     /// so the LLM knows the concrete constraints before making tool calls.
@@ -186,14 +197,10 @@ pub struct Agent {
     /// `start_channels`; this is the alternate path for environments that
     /// build an Agent directly without `start_channels`.
     channel_handles: AgentChannelHandles,
-    /// When `true`, the agent was constructed without persistent memory.
-    /// Memory backend is `NoneMemory`, auto-save is off, and memory tools
-    /// are stripped from the tool set. Used by ACP sessions.
-    #[allow(dead_code)]
-    exclude_memory: bool,
-    /// Per-session cache for resolved local image data URIs.
-    /// Avoids re-reading the same image file on every turn/tool-iteration
-    /// when the multimodal pipeline re-walks the full conversation history.
+    /// Per-session cache for resolved local image data URIs, threaded into
+    /// the turn loop so each unique local image file is read + base64-encoded
+    /// at most once per session even though the multimodal pipeline re-walks
+    /// the full conversation history on every turn and tool iteration.
     image_cache: zeroclaw_providers::multimodal::LocalImageCache,
 }
 
@@ -560,7 +567,6 @@ impl AgentBuilder {
             tools.retain(|t| !zeroclaw_tools::MEMORY_TOOL_NAMES.contains(&t.name()));
         }
 
-        let tool_specs = tools.iter().map(|tool| tool.spec()).collect();
         let workspace_dir = self
             .workspace_dir
             .clone()
@@ -600,7 +606,6 @@ impl AgentBuilder {
                 anyhow::Error::msg("model_provider is required")
             })?,
             tools,
-            tool_specs,
             memory: memory.clone(),
             observer: self.observer.ok_or_else(|| {
                 ::zeroclaw_log::record!(
@@ -669,7 +674,6 @@ impl AgentBuilder {
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
             route_model_by_hint: self.route_model_by_hint.unwrap_or_default(),
-            allowed_tools: allowed,
             response_cache: self.response_cache,
             security_summary: self.security_summary,
             autonomy_level: self
@@ -680,7 +684,6 @@ impl AgentBuilder {
             approval_manager: self.approval_manager,
             agent_alias: self.agent_alias.unwrap_or_default(),
             channel_handles: AgentChannelHandles::default(),
-            exclude_memory,
             image_cache: zeroclaw_providers::multimodal::LocalImageCache::new(),
         })
     }
@@ -789,24 +792,6 @@ impl Agent {
         ))
     }
 
-    fn drain_steering_messages(
-        steering_rx: &mut Option<&mut tokio::sync::mpsc::Receiver<String>>,
-    ) -> Vec<String> {
-        let Some(rx) = steering_rx.as_deref_mut() else {
-            return Vec::new();
-        };
-
-        let mut messages = Vec::new();
-        loop {
-            match rx.try_recv() {
-                Ok(message) => messages.push(message),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-            }
-        }
-        messages
-    }
-
     async fn append_streamed_user_message_to_history(
         &mut self,
         user_message: &str,
@@ -814,12 +799,17 @@ impl Agent {
     ) {
         let context = self
             .memory_strategy
-            .load_context(user_message, self.memory_session_id.as_deref())
+            .load_context(
+                &*self.observer,
+                user_message,
+                self.memory_session_id.as_deref(),
+            )
             .await
             .unwrap_or_default();
 
         if self.auto_save {
-            let _ = self
+            let store_start = std::time::Instant::now();
+            let store_result = self
                 .memory
                 .store(
                     "user_msg",
@@ -828,6 +818,12 @@ impl Agent {
                     self.memory_session_id.as_deref(),
                 )
                 .await;
+            self.observer.record_event(&ObserverEvent::MemoryStore {
+                category: MemoryCategory::Conversation.to_string(),
+                backend: self.memory.name().to_string(),
+                duration: store_start.elapsed(),
+                success: store_result.is_ok(),
+            });
         }
 
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
@@ -840,94 +836,6 @@ impl Agent {
         let user_msg = ConversationMessage::Chat(ChatMessage::user(enriched));
         new_msgs.push(user_msg.clone());
         self.history.push(user_msg);
-    }
-
-    fn marked_partial_response(partial: &str, marker: &str) -> String {
-        if partial.is_empty() {
-            marker.to_string()
-        } else {
-            format!("{partial}\n\n{marker}")
-        }
-    }
-
-    /// Forward a turn event to the consumer without ever blocking the turn on a
-    /// stalled receiver. The streamed `event_tx` is bounded; if the consumer
-    /// stops draining (e.g. it is itself blocked on a contended write) a bare
-    /// `send().await` would park here forever, and because these sends sit
-    /// outside the turn's `select!` arms a fired cancel token could never
-    /// interrupt them — the turn would wedge on "working" with no cancel path.
-    /// Racing the send against the cancel token guarantees the producer yields
-    /// the moment cancellation fires. Returns `false` when cancellation won the
-    /// race (the event was not delivered); the send error itself is intentionally
-    /// ignored — a gone consumer is not a turn failure.
-    async fn send_turn_event(
-        event_tx: &tokio::sync::mpsc::Sender<TurnEvent>,
-        cancel_token: Option<&tokio_util::sync::CancellationToken>,
-        event: TurnEvent,
-    ) -> bool {
-        match cancel_token {
-            Some(token) => {
-                tokio::select! {
-                    biased;
-                    () = token.cancelled() => false,
-                    _ = event_tx.send(event) => true,
-                }
-            }
-            None => {
-                let _ = event_tx.send(event).await;
-                true
-            }
-        }
-    }
-
-    fn append_streamed_assistant_message_to_history(
-        &mut self,
-        content: String,
-        new_msgs: &mut Vec<ConversationMessage>,
-        committed_response: &mut String,
-    ) {
-        let assistant_msg = ConversationMessage::Chat(ChatMessage::assistant(content.clone()));
-        new_msgs.push(assistant_msg.clone());
-        self.history.push(assistant_msg);
-        committed_response.push_str(&content);
-    }
-
-    fn synthesize_cancelled_tool_results(
-        &mut self,
-        completed: Vec<ToolResultMessage>,
-        remaining: &[zeroclaw_providers::ToolCall],
-        new_msgs: &mut Vec<ConversationMessage>,
-    ) {
-        let mut results = completed;
-        results.extend(remaining.iter().map(|call| ToolResultMessage {
-            tool_call_id: call.id.clone(),
-            content: "[interrupted by user before this tool produced a result]".to_string(),
-        }));
-        if results.is_empty() {
-            return;
-        }
-        let msg = ConversationMessage::ToolResults(results);
-        new_msgs.push(msg.clone());
-        self.history.push(msg);
-    }
-
-    fn should_send_tool_specs(&self) -> bool {
-        self.tool_dispatcher.should_send_tool_specs() && !self.tool_specs.is_empty()
-    }
-
-    fn parse_response_for_effective_tools(
-        &self,
-        response: &zeroclaw_providers::ChatResponse,
-    ) -> (String, Vec<ParsedToolCall>) {
-        if self.tool_specs.is_empty() {
-            return (strip_think_tags(response.text_or_empty()), Vec::new());
-        }
-
-        if self.config.resolved.strict_tool_parsing && response.tool_calls.is_empty() {
-            return (strip_think_tags(response.text_or_empty()), Vec::new());
-        }
-
-        self.tool_dispatcher.parse_response(response)
     }
 
     pub fn set_memory_session_id(&mut self, session_id: Option<String>) {
@@ -953,6 +861,10 @@ impl Agent {
 
     pub fn set_model_provider_name(&mut self, model_provider_name: String) {
         self.model_provider_name = model_provider_name;
+    }
+
+    pub fn set_tool_dispatcher(&mut self, tool_dispatcher: Box<dyn ToolDispatcher>) {
+        self.tool_dispatcher = tool_dispatcher;
     }
 
     /// Return the names of all registered tools.  Test-only — avoids
@@ -1047,6 +959,8 @@ impl Agent {
             false,
             false,
             None,
+            None,
+            None,
         )
         .await
     }
@@ -1057,12 +971,18 @@ impl Agent {
     /// When `exclude_memory` is `true`, the agent is constructed without
     /// persistent memory: `NoneMemory` backend, auto-save off, and all
     /// `memory_*` tools stripped. ACP sessions pass `true`.
+    ///
+    /// `sop_engine` and `sop_audit` are optional shared handles from the daemon.
+    /// When `Some`, the agent session uses the daemon's unified SOP engine.
+    /// When `None`, the agent builds its own engine from config (CLI/standalone).
     pub async fn from_config_with_session_cwd_and_mcp_backchannel(
         config: &Config,
         agent_alias: &str,
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
         exclude_memory: bool,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
     ) -> Result<Self> {
         Self::from_config_with_session_cwd_and_mcp_approval_mode(
             config,
@@ -1072,6 +992,8 @@ impl Agent {
             true,
             exclude_memory,
             None,
+            sop_engine,
+            sop_audit,
         )
         .await
     }
@@ -1087,6 +1009,8 @@ impl Agent {
         initialize_mcp: bool,
         exclude_memory: bool,
         tui_env: Option<std::collections::HashMap<String, String>>,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
     ) -> Result<Self> {
         Self::from_config_with_session_cwd_and_mcp_approval_mode(
             config,
@@ -1096,6 +1020,8 @@ impl Agent {
             true,
             exclude_memory,
             tui_env,
+            sop_engine,
+            sop_audit,
         )
         .await
     }
@@ -1108,6 +1034,8 @@ impl Agent {
         approval_backchannel: bool,
         exclude_memory: bool,
         tui_env: Option<std::collections::HashMap<String, String>>,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
     ) -> Result<Self> {
         let agent_cfg = config
             .agent(agent_alias)
@@ -1200,6 +1128,22 @@ impl Agent {
             None
         };
 
+        // Build SOP engine when sops_dir is configured so SOP tools are
+        // available on this path (WebSocket/daemon sessions).
+        // If caller provided an engine (daemon path), use it; otherwise
+        // build our own (CLI/standalone path).
+        let (sop_engine, sop_audit) = match (sop_engine, sop_audit) {
+            (Some(engine), Some(audit)) => (Some(engine), Some(audit)),
+            (None, None) if config.sop.sops_dir.is_some() => {
+                let mem: Arc<dyn zeroclaw_memory::Memory> =
+                    zeroclaw_memory::create_memory_for_agent(config, agent_alias, None).await?;
+                let (engine, audit) =
+                    crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, mem);
+                (Some(engine), Some(audit))
+            }
+            _ => (None, None),
+        };
+
         let all_tools_result = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
@@ -1219,6 +1163,8 @@ impl Agent {
             None,
             false,
             tui_env,
+            sop_engine,
+            sop_audit,
         );
         let mut tools = all_tools_result.tools;
         let delegate_handle = all_tools_result.delegate_handle;
@@ -1401,13 +1347,7 @@ impl Agent {
                 &provider_runtime_options,
             )?;
 
-        let dispatcher_choice = agent_cfg.resolved.tool_dispatcher.as_str();
-        let tool_dispatcher: Box<dyn ToolDispatcher> = match dispatcher_choice {
-            "native" => Box::new(NativeToolDispatcher),
-            "xml" => Box::new(XmlToolDispatcher),
-            _ if model_provider.supports_native_tools() => Box::new(NativeToolDispatcher),
-            _ => Box::new(XmlToolDispatcher),
-        };
+        let tool_dispatcher = tool_dispatcher_for_provider(agent_cfg, model_provider.as_ref());
 
         let route_model_by_hint: HashMap<String, String> = config
             .model_routes
@@ -1442,7 +1382,7 @@ impl Agent {
         // Bundle-aware so `[agents.<alias>].skill_bundles` aliases resolve
         // through to `[skill_bundles.<alias>].directory` (defaulting to
         // `<install>/shared/skills/<alias>/`).
-        let skills = crate::skills::load_skills_for_agent(&config.data_dir, config, agent_alias);
+        let skills = crate::skills::load_skills_for_agent_from_config(config, agent_alias);
         // Resolution registry = built-in arcs + resolution-only MCP wrappers, so
         // skill elevation (kind = "builtin" / "mcp") can resolve either target.
         let skill_resolution_registry: Vec<Arc<dyn tools::Tool>> = all_tools_result
@@ -1702,353 +1642,7 @@ impl Agent {
         self.prompt_builder.build(&ctx)
     }
 
-    async fn prepare_provider_messages(
-        &mut self,
-        messages: &[ChatMessage],
-    ) -> Result<Vec<ChatMessage>> {
-        let prepared = zeroclaw_providers::multimodal::prepare_messages_for_provider_cached(
-            messages,
-            &self.multimodal_config,
-            &mut self.image_cache,
-        )
-        .await?;
-        Ok(prepared.messages)
-    }
-
-    async fn execute_tool_call(&self, call: &ParsedToolCall, turn_id: &str) -> ToolExecutionResult {
-        let start = Instant::now();
-
-        // ── Hook: before_tool_call (modifying) ──────────────────
-        // Mirrors the hook pipeline in run_tool_call_loop (loop_.rs) so that
-        // library-integrated runs honour the same hook chain.
-        let mut tool_name = call.name.clone();
-        let mut tool_args = call.arguments.clone();
-        if let Some(ref hooks) = self.hook_runner {
-            match hooks
-                .run_before_tool_call(tool_name.clone(), tool_args.clone())
-                .await
-            {
-                crate::hooks::HookResult::Continue((n, a)) => {
-                    tool_name = n;
-                    tool_args = a;
-                }
-                crate::hooks::HookResult::Cancel(reason) => {
-                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"tool": call.name, "reason": reason.to_string()})), "tool call cancelled by hook");
-                    return ToolExecutionResult {
-                        name: call.name.clone(),
-                        output: format!("Cancelled by hook: {reason}"),
-                        success: false,
-                        tool_call_id: call.tool_call_id.clone(),
-                    };
-                }
-            }
-        }
-
-        super::set_runtime_approved_arg(&tool_name, &mut tool_args, false);
-
-        // ── Approval hook ──────────────────────────────────────
-        // The ACP/WebSocket Agent path executes tools directly instead of
-        // going through run_tool_call_loop. Keep its policy behavior aligned
-        // with the shared loop by honoring auto_approve / always_ask here too.
-        let mut approval_requirement = self
-            .approval_manager
-            .as_deref()
-            .map(|mgr| mgr.approval_requirement(&tool_name))
-            .unwrap_or(ApprovalRequirement::NotRequired);
-        if let Some(mgr) = self.approval_manager.as_deref()
-            && approval_requirement == ApprovalRequirement::Prompt
-        {
-            let request = ApprovalRequest {
-                tool_name: tool_name.clone(),
-                arguments: tool_args.clone(),
-            };
-
-            let (decision, decision_channel) = if mgr.is_non_interactive() {
-                // Iterate every registered channel looking for one that can
-                // handle the approval request. The first Ok(Some(_)) wins.
-                // This avoids hard-coding a channel name (e.g. "acp") and
-                // naturally supports WS sessions or any future back-channel.
-                let ch_request = zeroclaw_api::channel::ChannelApprovalRequest {
-                    tool_name: request.tool_name.clone(),
-                    arguments_summary: crate::approval::summarize_args(&request.arguments),
-                    raw_arguments: Some(request.arguments.clone()),
-                };
-                let mut channel_decision: Option<zeroclaw_api::channel::ChannelApprovalResponse> =
-                    None;
-                let mut decision_channel_name = String::new();
-                // Collect channels while holding the lock briefly, then drop
-                // the lock before any await points so the guard is not Send.
-                let channels: Vec<(String, Arc<dyn zeroclaw_api::channel::Channel>)> = self
-                    .channel_handles
-                    .ask_user
-                    .as_ref()
-                    .map(|h| {
-                        h.read()
-                            .iter()
-                            .map(|(k, v)| (k.clone(), Arc::clone(v)))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                for (ch_name, ch) in &channels {
-                    match ch.request_approval("", &ch_request).await {
-                        Ok(Some(r)) => {
-                            decision_channel_name = ch_name.clone();
-                            channel_decision = Some(r);
-                            break;
-                        }
-                        Ok(None) => continue,
-                        Err(e) => {
-                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"tool": tool_name, "channel": ch_name, "error": format!("{}", e)})), "channel approval request failed");
-                        }
-                    }
-                }
-                let approval = match channel_decision {
-                    Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve) => {
-                        ApprovalResponse::Yes
-                    }
-                    Some(zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove) => {
-                        ApprovalResponse::Always
-                    }
-                    Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny) => {
-                        ApprovalResponse::No
-                    }
-                    Some(zeroclaw_api::channel::ChannelApprovalResponse::DenyWithEdit {
-                        replacement,
-                    }) => ApprovalResponse::ReplaceWith(replacement),
-                    None => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"tool": tool_name})),
-                            "no approval channel handled this request — denying. \
-                             Configure a back-channel (ACP or WS) that implements \
-                             request_approval to enable interactive approval."
-                        );
-                        ApprovalResponse::No
-                    }
-                };
-                (approval, decision_channel_name)
-            } else {
-                (mgr.prompt_cli(&request), String::new())
-            };
-
-            mgr.record_decision(&tool_name, &tool_args, &decision, &decision_channel);
-
-            if decision == ApprovalResponse::No {
-                return ToolExecutionResult {
-                    name: tool_name,
-                    output: "Denied by user.".to_string(),
-                    success: false,
-                    tool_call_id: call.tool_call_id.clone(),
-                };
-            }
-
-            if let ApprovalResponse::ReplaceWith(replacement) = &decision {
-                return ToolExecutionResult {
-                    name: tool_name,
-                    output: crate::approval::sanitize_tool_replacement(replacement),
-                    success: true,
-                    tool_call_id: call.tool_call_id.clone(),
-                };
-            }
-
-            if matches!(decision, ApprovalResponse::Yes | ApprovalResponse::Always) {
-                approval_requirement = ApprovalRequirement::Approved;
-            }
-        }
-        super::set_runtime_approved_arg(
-            &tool_name,
-            &mut tool_args,
-            approval_requirement == ApprovalRequirement::Approved,
-        );
-
-        // Serialize arguments once (after hooks may have mutated them) and
-        // use the same string on the observer event so OTel exporters can
-        // attach the actual JSON payload to the tool span.
-        let args_json = tool_args.to_string();
-        let tool_call_id = call.tool_call_id.clone();
-
-        // Emit invoke log — visible in the TUI Logs pane.
-        ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Invoke)
-                .with_category(::zeroclaw_log::EventCategory::Tool)
-                .with_attrs(::serde_json::json!({
-                    "tool": tool_name,
-                    "tool_call_id": tool_call_id,
-                    "input": args_json,
-                })),
-            format!("tool call: {tool_name}")
-        );
-
-        // First try to find tool in static registry, then in activated MCP tools.
-        let (result, success) =
-            if let Some(tool) = self.tools.iter().find(|t| t.name() == tool_name) {
-                match tool.execute(tool_args.clone()).await {
-                    Ok(r) => {
-                        let (outcome_text, ok) = if r.success {
-                            (r.output, true)
-                        } else {
-                            (format!("Error: {}", r.error.unwrap_or(r.output)), false)
-                        };
-                        self.observer.record_event(&ObserverEvent::ToolCall {
-                            tool: tool_name.clone(),
-                            tool_call_id: tool_call_id.clone(),
-                            duration: start.elapsed(),
-                            success: ok,
-                            arguments: Some(args_json.clone()),
-                            result: Some(super::loop_::scrub_credentials(&outcome_text)),
-                            channel: None,
-                            agent_alias: self.observer_agent_alias(),
-                            turn_id: Some(turn_id.to_string()),
-                        });
-                        (outcome_text, ok)
-                    }
-                    Err(e) => {
-                        let err_text = format!("Error executing {}: {e}", tool_name);
-                        self.observer.record_event(&ObserverEvent::ToolCall {
-                            tool: tool_name.clone(),
-                            tool_call_id: tool_call_id.clone(),
-                            duration: start.elapsed(),
-                            success: false,
-                            arguments: Some(args_json.clone()),
-                            result: Some(super::loop_::scrub_credentials(&err_text)),
-                            channel: None,
-                            agent_alias: self.observer_agent_alias(),
-                            turn_id: Some(turn_id.to_string()),
-                        });
-                        (err_text, false)
-                    }
-                }
-            } else if let Some(activated_arc) = self.activated_tools.as_ref() {
-                let activated_opt = activated_arc.lock().unwrap().get_resolved(&tool_name);
-                if let Some(tool) = activated_opt {
-                    match tool.execute(tool_args.clone()).await {
-                        Ok(r) => {
-                            let (outcome_text, ok) = if r.success {
-                                (r.output, true)
-                            } else {
-                                (format!("Error: {}", r.error.unwrap_or(r.output)), false)
-                            };
-                            self.observer.record_event(&ObserverEvent::ToolCall {
-                                tool: tool_name.clone(),
-                                tool_call_id: tool_call_id.clone(),
-                                duration: start.elapsed(),
-                                success: ok,
-                                arguments: Some(args_json.clone()),
-                                result: Some(super::loop_::scrub_credentials(&outcome_text)),
-                                channel: None,
-                                agent_alias: self.observer_agent_alias(),
-                                turn_id: Some(turn_id.to_string()),
-                            });
-                            (outcome_text, ok)
-                        }
-                        Err(e) => {
-                            let err_text = format!("Error executing {}: {e}", tool_name);
-                            self.observer.record_event(&ObserverEvent::ToolCall {
-                                tool: tool_name.clone(),
-                                tool_call_id: tool_call_id.clone(),
-                                duration: start.elapsed(),
-                                success: false,
-                                arguments: Some(args_json.clone()),
-                                result: Some(super::loop_::scrub_credentials(&err_text)),
-                                channel: None,
-                                agent_alias: self.observer_agent_alias(),
-                                turn_id: Some(turn_id.to_string()),
-                            });
-                            (err_text, false)
-                        }
-                    }
-                } else {
-                    (format!("Unknown tool: {}", tool_name), false)
-                }
-            } else {
-                (format!("Unknown tool: {}", tool_name), false)
-            };
-
-        let duration = start.elapsed();
-
-        // Emit result log — visible in the TUI Logs pane.
-        if success {
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
-                    .with_category(::zeroclaw_log::EventCategory::Tool)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                    .with_duration(duration.as_millis() as u64)
-                    .with_attrs(::serde_json::json!({
-                        "tool": tool_name,
-                        "tool_call_id": tool_call_id,
-                        "input": args_json,
-                        "output": result,
-                    })),
-                format!("tool result: {tool_name}")
-            );
-        } else {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_category(::zeroclaw_log::EventCategory::Tool)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_duration(duration.as_millis() as u64)
-                    .with_attrs(::serde_json::json!({
-                        "tool": tool_name,
-                        "tool_call_id": tool_call_id,
-                        "input": args_json,
-                        "output": result,
-                    })),
-                format!("tool failed: {tool_name}")
-            );
-        }
-
-        // ── Hook: after_tool_call (void) ─────────────────────────
-        if let Some(ref hooks) = self.hook_runner {
-            let tool_result_obj = crate::tools::ToolResult {
-                success,
-                output: result.clone(),
-                error: None,
-            };
-            hooks
-                .fire_after_tool_call(&tool_name, &tool_result_obj, duration)
-                .await;
-        }
-
-        ToolExecutionResult {
-            name: tool_name,
-            output: result,
-            success,
-            tool_call_id: call.tool_call_id.clone(),
-        }
-    }
-
-    async fn execute_tools(
-        &self,
-        calls: &[ParsedToolCall],
-        turn_id: &str,
-    ) -> Vec<ToolExecutionResult> {
-        let approval_required = self.approval_manager.as_deref().is_some_and(|mgr| {
-            calls
-                .iter()
-                .any(|call| mgr.needs_approval(call.name.as_str()))
-        });
-        if !self.config.resolved.parallel_tools || approval_required {
-            let mut results = Vec::with_capacity(calls.len());
-            for call in calls {
-                results.push(self.execute_tool_call(call, turn_id).await);
-            }
-            return results;
-        }
-
-        let futs: Vec<_> = calls
-            .iter()
-            .map(|call| self.execute_tool_call(call, turn_id))
-            .collect();
-        futures_util::future::join_all(futs).await
-    }
+    // Superseded by the loop's prepare/approve/execute pipeline (#7415).
 
     fn classify_model(&self, user_message: &str) -> String {
         if let Some(decision) =
@@ -2076,6 +1670,114 @@ impl Agent {
         }
 
         self.model_name.clone()
+    }
+
+    /// Reconstruct [`ConversationMessage`]s from the loop's provider-transcript
+    /// encodings so wrapper-maintained histories keep their structured shape.
+    ///
+    /// Assistant messages carrying the loop's JSON tool-call encoding
+    /// (`{"content", "tool_calls", "reasoning_content"?}`) round-trip into
+    /// [`ConversationMessage::AssistantToolCalls`]; `role=tool` messages carry
+    /// JSON tool results (an array for native parallel calls, a single object
+    /// per call otherwise), and consecutive ones merge into a single
+    /// [`ConversationMessage::ToolResults`] entry per tool round — the shape
+    /// the dispatchers always produced; everything else round-trips as a
+    /// plain chat message.
+    fn replay_loop_messages(loop_messages: &[ChatMessage]) -> Vec<ConversationMessage> {
+        let mut replayed: Vec<ConversationMessage> = Vec::with_capacity(loop_messages.len());
+        let push_tool_results = |replayed: &mut Vec<ConversationMessage>,
+                                 results: Vec<ToolResultMessage>| {
+            if let Some(ConversationMessage::ToolResults(previous)) = replayed.last_mut() {
+                previous.extend(results);
+            } else {
+                replayed.push(ConversationMessage::ToolResults(results));
+            }
+        };
+        for msg in loop_messages {
+            if msg.role == "assistant"
+                && let Ok(serde_json::Value::Object(obj)) =
+                    serde_json::from_str::<serde_json::Value>(&msg.content)
+                && let Some(calls) = obj.get("tool_calls").and_then(|c| c.as_array())
+                && !calls.is_empty()
+                && calls.iter().all(|c| {
+                    c.get("id").is_some_and(serde_json::Value::is_string)
+                        && c.get("name").is_some_and(serde_json::Value::is_string)
+                })
+            {
+                let tool_calls = calls
+                    .iter()
+                    .map(|c| zeroclaw_providers::ToolCall {
+                        id: c
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        name: c
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        arguments: c
+                            .get("arguments")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        extra_content: None,
+                    })
+                    .collect();
+                replayed.push(ConversationMessage::AssistantToolCalls {
+                    text: obj
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    tool_calls,
+                    reasoning_content: obj
+                        .get("reasoning_content")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                });
+                continue;
+            }
+            if msg.role == "tool" {
+                if let Ok(vals) = serde_json::from_str::<Vec<serde_json::Value>>(&msg.content) {
+                    let results: Vec<ToolResultMessage> = vals
+                        .into_iter()
+                        .filter_map(|v| {
+                            Some(ToolResultMessage {
+                                tool_call_id: v.get("tool_call_id")?.as_str()?.to_string(),
+                                content: v
+                                    .get("content")
+                                    .and_then(|c| c.as_str())
+                                    .unwrap_or_default()
+                                    .to_string(),
+                            })
+                        })
+                        .collect();
+                    if !results.is_empty() {
+                        push_tool_results(&mut replayed, results);
+                        continue;
+                    }
+                }
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&msg.content) {
+                    let result = ToolResultMessage {
+                        tool_call_id: v
+                            .get("tool_call_id")
+                            .and_then(|id| id.as_str())
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        content: v
+                            .get("content")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    };
+                    push_tool_results(&mut replayed, vec![result]);
+                    continue;
+                }
+            }
+            replayed.push(ConversationMessage::Chat(msg.clone()));
+        }
+        replayed
     }
 
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
@@ -2116,12 +1818,17 @@ impl Agent {
 
         let context = self
             .memory_strategy
-            .load_context(user_message, self.memory_session_id.as_deref())
+            .load_context(
+                &*self.observer,
+                user_message,
+                self.memory_session_id.as_deref(),
+            )
             .await
             .unwrap_or_default();
 
         if self.auto_save {
-            let _ = self
+            let store_start = std::time::Instant::now();
+            let store_result = self
                 .memory
                 .store(
                     "user_msg",
@@ -2130,6 +1837,12 @@ impl Agent {
                     self.memory_session_id.as_deref(),
                 )
                 .await;
+            self.observer.record_event(&ObserverEvent::MemoryStore {
+                category: MemoryCategory::Conversation.to_string(),
+                backend: self.memory.name().to_string(),
+                duration: store_start.elapsed(),
+                success: store_result.is_ok(),
+            });
         }
 
         let now = chrono::Local::now();
@@ -2174,174 +1887,134 @@ impl Agent {
             done: false,
         };
 
-        for _ in 0..self.config.resolved.max_tool_iterations {
-            let messages = self.tool_dispatcher.to_provider_messages(&self.history);
-            let prepared_messages = self.prepare_provider_messages(&messages).await?;
+        // Response cache: check once before entering the loop (only for
+        // deterministic, text-only prompts). The key must include the whole
+        // provider-visible transcript, not just the last user message,
+        // otherwise distinct conversations can collide when their final
+        // prompt matches. Keyed on the raw provider transcript — multimodal
+        // preparation is a per-iteration loop concern now.
+        let provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+        let cache_key = self.response_cache_key_for_messages(&provider_messages, &effective_model);
 
-            // Response cache: check before LLM call (only for deterministic, text-only prompts).
-            // The key must include the whole provider-visible transcript, not just the last user
-            // message, otherwise distinct conversations can collide when their final prompt matches.
-            let cache_key =
-                self.response_cache_key_for_messages(&prepared_messages, &effective_model);
-
-            if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
-                if let Ok(Some(cached)) = cache.get(key) {
-                    self.observer.record_event(&ObserverEvent::CacheHit {
-                        cache_type: "response".into(),
-                        tokens_saved: 0,
-                    });
-                    self.history
-                        .push(ConversationMessage::Chat(ChatMessage::assistant(
-                            cached.clone(),
-                        )));
-                    self.trim_history();
-                    return Ok(cached);
-                }
-                self.observer.record_event(&ObserverEvent::CacheMiss {
+        if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
+            if let Ok(Some(cached)) = cache.get(key) {
+                self.observer.record_event(&ObserverEvent::CacheHit {
                     cache_type: "response".into(),
+                    tokens_saved: 0,
                 });
-            }
-
-            // Outbound prompt size diagnostic — see streaming site for notes.
-            {
-                let msg_count = prepared_messages.len();
-                let content_chars: usize = prepared_messages.iter().map(|m| m.content.len()).sum();
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
-                        .with_attrs(::serde_json::json!({
-                            "msg_count": msg_count,
-                            "content_chars": content_chars,
-                            "approx_tokens": content_chars / 4,
-                            "model": effective_model,
-                        })),
-                    "agent: outbound prompt size (non-streaming)"
-                );
-            }
-
-            let llm_started_at = Instant::now();
-            self.observer.record_event(&ObserverEvent::LlmRequest {
-                model_provider: self.model_provider_name.clone(),
-                model: effective_model.clone(),
-                messages_count: messages.len(),
-                channel: None,
-                agent_alias: self.observer_agent_alias(),
-                turn_id: Some(turn_id.clone()),
-            });
-
-            let response = match self
-                .model_provider
-                .chat(
-                    ChatRequest {
-                        messages: &prepared_messages,
-                        tools: if self.should_send_tool_specs() {
-                            Some(&self.tool_specs)
-                        } else {
-                            None
-                        },
-                        thinking: None,
-                    },
-                    &effective_model,
-                    self.temperature,
-                )
-                .await
-            {
-                Ok(resp) => {
-                    let (resp_input_tokens, resp_output_tokens) = resp
-                        .usage
-                        .as_ref()
-                        .map(|u| (u.input_tokens, u.output_tokens))
-                        .unwrap_or((None, None));
-                    if let Some(input) = resp_input_tokens {
-                        guard.total_input_tokens = guard.total_input_tokens.saturating_add(input);
-                        guard.saw_usage = true;
-                    }
-                    if let Some(output) = resp_output_tokens {
-                        guard.total_output_tokens =
-                            guard.total_output_tokens.saturating_add(output);
-                        guard.saw_usage = true;
-                    }
-                    self.observer.record_event(&ObserverEvent::LlmResponse {
-                        model_provider: self.model_provider_name.clone(),
-                        model: effective_model.clone(),
-                        duration: llm_started_at.elapsed(),
-                        success: true,
-                        error_message: None,
-                        input_tokens: resp_input_tokens,
-                        output_tokens: resp_output_tokens,
-                        channel: None,
-                        agent_alias: self.observer_agent_alias(),
-                        turn_id: Some(turn_id.clone()),
-                    });
-                    resp
-                }
-                Err(err) => {
-                    let safe_error = zeroclaw_providers::sanitize_api_error(&err.to_string());
-                    self.observer.record_event(&ObserverEvent::LlmResponse {
-                        model_provider: self.model_provider_name.clone(),
-                        model: effective_model.clone(),
-                        duration: llm_started_at.elapsed(),
-                        success: false,
-                        error_message: Some(safe_error),
-                        input_tokens: None,
-                        output_tokens: None,
-                        channel: None,
-                        agent_alias: self.observer_agent_alias(),
-                        turn_id: Some(turn_id.clone()),
-                    });
-                    return Err(err);
-                }
-            };
-
-            let (text, calls) = self.parse_response_for_effective_tools(&response);
-            if calls.is_empty() {
-                let final_text = if text.is_empty() && !self.tool_specs.is_empty() {
-                    response.text.unwrap_or_default()
-                } else {
-                    text
-                };
-
-                // Store in response cache (text-only, no tool calls)
-                if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
-                    let token_count = response
-                        .usage
-                        .as_ref()
-                        .and_then(|u| u.output_tokens)
-                        .unwrap_or(0);
-                    #[allow(clippy::cast_possible_truncation)]
-                    let _ = cache.put(key, &effective_model, &final_text, token_count as u32);
-                }
-
                 self.history
                     .push(ConversationMessage::Chat(ChatMessage::assistant(
-                        final_text.clone(),
+                        cached.clone(),
                     )));
                 self.trim_history();
-
-                return Ok(final_text);
+                return Ok(cached);
             }
-
-            if !text.is_empty() {
-                print!("{text}");
-                let _ = std::io::stdout().flush();
-            }
-
-            self.history.push(ConversationMessage::AssistantToolCalls {
-                text: response.text.clone(),
-                tool_calls: response.tool_calls.clone(),
-                reasoning_content: response.reasoning_content.clone(),
+            self.observer.record_event(&ObserverEvent::CacheMiss {
+                cache_type: "response".into(),
             });
-
-            let results = self.execute_tools(&calls, &turn_id).await;
-            let formatted = self.tool_dispatcher.format_results(&results);
-            self.history.push(formatted);
-            self.trim_history();
         }
 
-        anyhow::bail!(
-            "Agent exceeded maximum tool iterations ({})",
-            self.config.resolved.max_tool_iterations
-        )
+        let mut loop_history = provider_messages;
+        let mut loop_new_messages: Vec<ChatMessage> = Vec::new();
+
+        let knobs = crate::agent::loop_::LoopKnobs {
+            dedup_enabled: false,
+            max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::ErrorAtCap,
+            detect_protocol_without_tools: false,
+        };
+        // E3 never had pattern-based loop detection; default pacing turns it
+        // on. Keep the embedder contract (an N-step identical-args tool chain
+        // completes) until the Agent surface grows a pacing config of its own.
+        let pacing = zeroclaw_config::schema::PacingConfig {
+            loop_detection_enabled: false,
+            ..zeroclaw_config::schema::PacingConfig::default()
+        };
+
+        // Usage-only cost context: the loop's per-call recording accumulates
+        // token totals here so AgentEnd keeps reporting them, without
+        // persisting cost records or enforcing budgets (this path never did
+        // either). The loop call below must stay a plain `.await` on this
+        // task — caller-scoped task-locals (thread id, session key, tool
+        // choice / thinking overrides) silently vanish across a spawn.
+        let cost_context = crate::agent::loop_::ToolLoopCostTrackingContext::usage_only();
+        let loop_result = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(cost_context.clone()),
+                crate::agent::loop_::run_tool_call_loop(
+                    self.model_provider.as_ref(),
+                    &mut loop_history,
+                    &self.tools,
+                    self.observer.as_ref(),
+                    &self.model_provider_name,
+                    &effective_model,
+                    self.temperature,
+                    false,
+                    self.approval_manager.as_deref(),
+                    "cli",
+                    None,
+                    &self.multimodal_config,
+                    self.config.resolved.max_tool_iterations,
+                    None,
+                    None,
+                    self.hook_runner.as_deref(),
+                    &[],
+                    &self.config.resolved.tool_call_dedup_exempt,
+                    self.activated_tools.as_ref(),
+                    None,
+                    &pacing,
+                    self.config.resolved.strict_tool_parsing,
+                    self.config.resolved.parallel_tools,
+                    self.config.resolved.max_tool_result_chars,
+                    self.config.resolved.max_context_tokens,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&mut loop_new_messages),
+                    &knobs,
+                    Some(&mut self.image_cache),
+                ),
+            )
+            .await;
+
+        // Feed the accumulated per-call usage into the AgentEnd guard before
+        // any return below drops it — including the error path, which must
+        // still report usage from calls that succeeded earlier in the turn.
+        let usage = cost_context.snapshot_turn_usage();
+        if usage.input_tokens > 0 || usage.output_tokens > 0 {
+            guard.total_input_tokens = usage.input_tokens;
+            guard.total_output_tokens = usage.output_tokens;
+            guard.saw_usage = true;
+        }
+        // Replay the loop's transcript additions into the conversation
+        // history BEFORE propagating any loop error: rounds that already
+        // executed carry side effects (tools ran), and the pre-consolidation
+        // engine pushed them into `self.history` incrementally per iteration,
+        // so they survived a later-iteration provider failure. The loop's
+        // `new_messages_out` append-log is populated on error exits too;
+        // `replay_loop_messages` reverses the loop's provider encodings back
+        // into structured `ConversationMessage`s.
+        for replayed in Self::replay_loop_messages(&loop_new_messages) {
+            self.history.push(replayed);
+        }
+        let response = loop_result?;
+
+        // Store in the response cache only when the turn was a single
+        // tool-free exchange (exactly one assistant message), mirroring the
+        // old "no tool calls" put condition.
+        if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key)
+            && loop_new_messages.len() == 1
+            && loop_new_messages[0].role == "assistant"
+        {
+            #[allow(clippy::cast_possible_truncation)]
+            let _ = cache.put(key, &effective_model, &response, usage.output_tokens as u32);
+        }
+
+        self.trim_history();
+
+        Ok(response)
     }
 
     /// Execute a single agent turn while streaming intermediate events.
@@ -2394,6 +2067,100 @@ impl Agent {
         cancel_token: Option<tokio_util::sync::CancellationToken>,
         mut steering_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
     ) -> std::result::Result<StreamedTurnSuccess, StreamedTurnError> {
+        /// Routes the loop's single-channel approval callback through every
+        /// registered ask_user back-channel — the first decisive answer wins —
+        /// preserving the multi-channel iteration of the old direct execution
+        /// path (ACP and WS sessions register their approval back-channels
+        /// here at session start; hard-coding one name would break the other).
+        struct AskUserApprovalBridge {
+            handles: tools::PerToolChannelHandle,
+            // The back-channel that answered the most recent request, so the
+            // approval audit records the deciding surface (WS, ACP, …) rather
+            // than the loop's static "cli" channel name. See
+            // `last_decision_channel` below and `gate_tool_approval`.
+            last_decision: parking_lot::Mutex<Option<String>>,
+        }
+
+        impl ::zeroclaw_api::attribution::Attributable for AskUserApprovalBridge {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Channel(
+                    ::zeroclaw_api::attribution::ChannelKind::Cli,
+                )
+            }
+            fn alias(&self) -> &str {
+                "agent-approval-bridge"
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl zeroclaw_api::channel::Channel for AskUserApprovalBridge {
+            fn name(&self) -> &str {
+                "agent-approval-bridge"
+            }
+
+            fn last_decision_channel(&self) -> Option<String> {
+                self.last_decision.lock().clone()
+            }
+
+            async fn send(
+                &self,
+                _message: &zeroclaw_api::channel::SendMessage,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn request_approval(
+                &self,
+                recipient: &str,
+                request: &zeroclaw_api::channel::ChannelApprovalRequest,
+            ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>>
+            {
+                let channels: Vec<(String, Arc<dyn zeroclaw_api::channel::Channel>)> = self
+                    .handles
+                    .read()
+                    .iter()
+                    .map(|(name, channel)| (name.clone(), Arc::clone(channel)))
+                    .collect();
+                // Clear the previous decision's attribution; only a decisive
+                // answer below sets it, so an all-`None` fan-out leaves it unset
+                // and the gate falls back to the loop's channel name.
+                *self.last_decision.lock() = None;
+                for (channel_name, channel) in &channels {
+                    match channel.request_approval(recipient, request).await {
+                        Ok(Some(response)) => {
+                            *self.last_decision.lock() = Some(channel_name.clone());
+                            return Ok(Some(response));
+                        }
+                        Ok(None) => continue,
+                        Err(e) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({
+                                    "tool": request.tool_name,
+                                    "channel": channel_name,
+                                    "error": format!("{}", e),
+                                })),
+                                "channel approval request failed"
+                            );
+                        }
+                    }
+                }
+                Ok(None)
+            }
+        }
+
         // See `Agent::turn` for the rationale. Same guard: blank input would
         // push a timestamp-only user message into history and the model would
         // narrate the trailing prompt-template sentinel instead of replying.
@@ -2462,737 +2229,261 @@ impl Agent {
             done: false,
         };
 
-        // ── Turn loop ──────────────────────────────────────────────────
-        for _ in 0..self.config.resolved.max_tool_iterations {
-            // Early exit if the caller cancelled this turn (e.g. user abort)
-            if cancel_token
-                .as_ref()
-                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
-            {
-                self.append_streamed_assistant_message_to_history(
-                    "[interrupted by user]".to_string(),
-                    &mut new_msgs,
-                    &mut committed_response,
-                );
-                return Err(StreamedTurnError {
-                    error: crate::agent::loop_::ToolLoopCancelled.into(),
-                    committed_response,
-                    new_messages: new_msgs,
-                });
-            }
+        // Response cache: check once before the round loop, keyed on the full
+        // provider-visible transcript (matches `Agent::turn`; the old code
+        // re-checked every iteration, but only a transcript identical to a
+        // previously cached single-exchange turn can ever hit).
+        let provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
+        let cache_key = self.response_cache_key_for_messages(&provider_messages, &effective_model);
 
-            for steering_message in Self::drain_steering_messages(&mut steering_rx) {
-                self.append_streamed_user_message_to_history(&steering_message, &mut new_msgs)
-                    .await;
-            }
-
-            let messages = self.tool_dispatcher.to_provider_messages(&self.history);
-            let prepared_messages = match self.prepare_provider_messages(&messages).await {
-                Ok(messages) => messages,
-                Err(error) => {
-                    return Err(StreamedTurnError {
-                        error,
-                        committed_response,
-                        new_messages: new_msgs,
-                    });
-                }
-            };
-
-            // Response cache check (same as turn): include the full provider-visible transcript.
-            let cache_key =
-                self.response_cache_key_for_messages(&prepared_messages, &effective_model);
-
-            if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
-                if let Ok(Some(cached)) = cache.get(key) {
-                    self.observer.record_event(&ObserverEvent::CacheHit {
-                        cache_type: "response".into(),
-                        tokens_saved: 0,
-                    });
-                    let cached_msg =
-                        ConversationMessage::Chat(ChatMessage::assistant(cached.clone()));
-                    new_msgs.push(cached_msg.clone());
-                    self.history.push(cached_msg);
-                    self.trim_history();
-                    self.observer.record_event(&ObserverEvent::TurnComplete);
-                    committed_response.push_str(&cached);
-                    return Ok(StreamedTurnSuccess {
-                        response: committed_response,
-                        new_messages: new_msgs,
-                    });
-                }
-                self.observer.record_event(&ObserverEvent::CacheMiss {
+        if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
+            if let Ok(Some(cached)) = cache.get(key) {
+                self.observer.record_event(&ObserverEvent::CacheHit {
                     cache_type: "response".into(),
+                    tokens_saved: 0,
                 });
-            }
-
-            // Log outbound prompt size so it can be diffed against the
-            // provider's reported usage. `content_chars` is the raw character
-            // count of message bodies (tool defs/system prompt are added by
-            // the provider adapter and not counted here, but messages are by
-            // far the largest contributor in long sessions). Rough rule of
-            // thumb: 1 token ≈ 4 chars; treat with care.
-            {
-                let msg_count = prepared_messages.len();
-                let content_chars: usize = prepared_messages.iter().map(|m| m.content.len()).sum();
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
-                        .with_attrs(::serde_json::json!({
-                            "msg_count": msg_count,
-                            "content_chars": content_chars,
-                            "approx_tokens": content_chars / 4,
-                            "model": effective_model,
-                        })),
-                    "agent: outbound prompt size (streaming)"
-                );
-            }
-
-            // ── Streaming LLM call ────────────────────────────────────
-            // Try streaming first; if the model_provider returns content we
-            // forward deltas.  Otherwise fall back to non-streaming chat.
-            use futures_util::StreamExt;
-
-            let llm_started_at = Instant::now();
-            self.observer.record_event(&ObserverEvent::LlmRequest {
-                model_provider: self.model_provider_name.clone(),
-                model: effective_model.clone(),
-                messages_count: messages.len(),
-                channel: None,
-                agent_alias: self.observer_agent_alias(),
-                turn_id: Some(turn_id.clone()),
-            });
-
-            let stream_opts = zeroclaw_providers::traits::StreamOptions::new(
-                self.model_provider.supports_streaming(),
-            );
-            let mut stream = self.model_provider.stream_chat(
-                zeroclaw_providers::ChatRequest {
-                    messages: &prepared_messages,
-                    tools: if self.should_send_tool_specs() {
-                        Some(&self.tool_specs)
-                    } else {
-                        None
-                    },
-                    thinking: None,
-                },
-                &effective_model,
-                self.temperature,
-                stream_opts,
-            );
-
-            let mut streamed_text = String::new();
-            let mut streamed_reasoning = String::new();
-            let mut streamed_tool_calls: Vec<zeroclaw_providers::traits::ToolCall> = Vec::new();
-            let mut streamed_usage: Option<zeroclaw_providers::traits::TokenUsage> = None;
-            let mut got_stream = false;
-            let mut visible_streamed_output = false;
-            let mut stream_error: Option<String> = None;
-            let mut pre_executed_call_ids: HashMap<String, VecDeque<String>> = HashMap::new();
-            let mut was_cancelled = false;
-
-            // Consume the stream, checking for cancellation between chunks.
-            // We use a manual loop with `tokio::select!` so that a cancel
-            // signal interrupts even while waiting for the next SSE event
-            // from the model_provider.
-            loop {
-                let next_item = stream.next();
-                let item = if let Some(ref token) = cancel_token {
-                    tokio::select! {
-                        biased;
-                        () = token.cancelled() => {
-                            was_cancelled = true;
-                            ::zeroclaw_log::record!(
-                                INFO,
-                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel)
-                                    .with_category(::zeroclaw_log::EventCategory::Agent)
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                                    .with_attrs(::serde_json::json!({
-                                        "streamed_text_len": streamed_text.len(),
-                                        "got_stream": got_stream,
-                                    })),
-                                "turn: cancel token fired mid-stream — breaking consume loop, dropping stream to abort parser"
-                            );
-                            break;
-                        }
-                        item = next_item => item,
-                    }
-                } else {
-                    next_item.await
-                };
-
-                let Some(item) = item else { break };
-                match item {
-                    Ok(event) => match event {
-                        zeroclaw_providers::traits::StreamEvent::TextDelta(chunk) => {
-                            if let Some(reasoning) = chunk.reasoning
-                                && !reasoning.is_empty()
-                            {
-                                // Accumulate for signed-block round-trip on
-                                // providers that carry signatures in this
-                                // field (Anthropic native-thinking fallback).
-                                streamed_reasoning.push_str(&reasoning);
-                                Self::send_turn_event(
-                                    &event_tx,
-                                    cancel_token.as_ref(),
-                                    TurnEvent::Thinking { delta: reasoning },
-                                )
-                                .await;
-                                visible_streamed_output = true;
-                            }
-                            if !chunk.delta.is_empty() {
-                                got_stream = true;
-                                streamed_text.push_str(&chunk.delta);
-                                Self::send_turn_event(
-                                    &event_tx,
-                                    cancel_token.as_ref(),
-                                    TurnEvent::Chunk { delta: chunk.delta },
-                                )
-                                .await;
-                                visible_streamed_output = true;
-                            }
-                        }
-                        zeroclaw_providers::traits::StreamEvent::ToolCall(tc) => {
-                            got_stream = true;
-                            // ToolCall event is sent later (after parse_response) to
-                            // avoid duplicates; just collect here.
-                            streamed_tool_calls.push(tc);
-                        }
-                        zeroclaw_providers::traits::StreamEvent::PreExecutedToolCall {
-                            name,
-                            args,
-                        } => {
-                            let call_id = uuid::Uuid::new_v4().to_string();
-                            pre_executed_call_ids
-                                .entry(name.clone())
-                                .or_default()
-                                .push_back(call_id.clone());
-                            Self::send_turn_event(
-                                &event_tx,
-                                cancel_token.as_ref(),
-                                TurnEvent::ToolCall {
-                                    id: call_id,
-                                    name,
-                                    args: serde_json::from_str(&args).unwrap_or_default(),
-                                },
-                            )
-                            .await;
-                            visible_streamed_output = true;
-                            // NOT pushed to streamed_tool_calls — already executed by proxy
-                        }
-                        zeroclaw_providers::traits::StreamEvent::PreExecutedToolResult {
-                            name,
-                            output,
-                        } => {
-                            let result_id = pre_executed_call_ids
-                                .get_mut(&name)
-                                .and_then(|ids| ids.pop_front())
-                                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                            Self::send_turn_event(
-                                &event_tx,
-                                cancel_token.as_ref(),
-                                TurnEvent::ToolResult {
-                                    id: result_id,
-                                    name,
-                                    output,
-                                },
-                            )
-                            .await;
-                            visible_streamed_output = true;
-                        }
-                        zeroclaw_providers::traits::StreamEvent::Usage(usage) => {
-                            streamed_usage = Some(usage);
-                        }
-                        zeroclaw_providers::traits::StreamEvent::Final => break,
-                    },
-                    Err(error) => {
-                        stream_error = Some(error.to_string());
-                        break;
-                    }
-                }
-            }
-            // Drop the stream so we release the borrow on model_provider.
-            drop(stream);
-
-            // If cancelled during streaming, return partial content with
-            // the interruption marker appended. The caller (ws.rs) will
-            // persist this truncated message and send an abort frame.
-            if was_cancelled {
-                let partial =
-                    Self::marked_partial_response(&streamed_text, "[interrupted by user]");
-                self.append_streamed_assistant_message_to_history(
-                    partial,
-                    &mut new_msgs,
-                    &mut committed_response,
-                );
-                self.observer.record_event(&ObserverEvent::LlmResponse {
-                    model_provider: self.model_provider_name.clone(),
-                    model: effective_model.clone(),
-                    duration: llm_started_at.elapsed(),
-                    success: false,
-                    error_message: Some("request cancelled by user".into()),
-                    input_tokens: None,
-                    output_tokens: None,
-                    channel: None,
-                    agent_alias: self.observer_agent_alias(),
-                    turn_id: Some(turn_id.clone()),
-                });
-                return Err(StreamedTurnError {
-                    error: crate::agent::loop_::ToolLoopCancelled.into(),
-                    committed_response,
-                    new_messages: new_msgs,
-                });
-            }
-
-            if stream_error.is_some() && visible_streamed_output {
-                if !streamed_text.is_empty() {
-                    let partial =
-                        Self::marked_partial_response(&streamed_text, "[stream interrupted]");
-                    self.append_streamed_assistant_message_to_history(
-                        partial,
-                        &mut new_msgs,
-                        &mut committed_response,
-                    );
-                }
-                let safe_error = zeroclaw_providers::sanitize_api_error(
-                    stream_error.as_deref().unwrap_or_default(),
-                );
-                self.observer.record_event(&ObserverEvent::LlmResponse {
-                    model_provider: self.model_provider_name.clone(),
-                    model: effective_model.clone(),
-                    duration: llm_started_at.elapsed(),
-                    success: false,
-                    error_message: Some(safe_error),
-                    input_tokens: None,
-                    output_tokens: None,
-                    channel: None,
-                    agent_alias: self.observer_agent_alias(),
-                    turn_id: Some(turn_id.clone()),
-                });
-                return Err(StreamedTurnError {
-                    error: anyhow::Error::msg(stream_error.unwrap_or_default()),
-                    committed_response,
-                    new_messages: new_msgs,
-                });
-            }
-
-            // If streaming completed cleanly and produced text, use it as the
-            // response and check for tool calls via the dispatcher. If the
-            // stream errored before emitting visible output, fall back to
-            // non-streaming chat so provider error text does not become the
-            // final answer.
-            let response = if got_stream && stream_error.is_none() {
-                // Build a synthetic ChatResponse from streamed text.
-                // `streamed_reasoning` carries signed thinking blocks from
-                // providers that emit them via `StreamChunk.reasoning`
-                // (Anthropic's native-thinking non-streaming fallback), so
-                // the signature round-trip survives into conversation history.
-                zeroclaw_providers::ChatResponse {
-                    text: Some(streamed_text),
-                    tool_calls: streamed_tool_calls,
-                    usage: streamed_usage.clone(),
-                    reasoning_content: if streamed_reasoning.is_empty() {
-                        None
-                    } else {
-                        Some(streamed_reasoning)
-                    },
-                }
-            } else {
-                if let Some(error) = stream_error.as_ref() {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({
-                                "model": effective_model.as_str(),
-                                "error": zeroclaw_providers::sanitize_api_error(error),
-                            })),
-                        "turn_streamed provider stream failed; falling back to non-streaming chat"
-                    );
-                }
-                // Fall back to non-streaming chat, with cancellation guard
-                let chat_fut = self.model_provider.chat(
-                    ChatRequest {
-                        messages: &prepared_messages,
-                        tools: if self.should_send_tool_specs() {
-                            Some(&self.tool_specs)
-                        } else {
-                            None
-                        },
-                        thinking: None,
-                    },
-                    &effective_model,
-                    self.temperature,
-                );
-                let chat_result = if let Some(ref token) = cancel_token {
-                    tokio::select! {
-                        biased;
-                        () = token.cancelled() => {
-                            let partial = if streamed_text.is_empty() {
-                                "[interrupted by user]".to_string()
-                            } else {
-                                Self::marked_partial_response(
-                                    &streamed_text,
-                                    "[interrupted by user]",
-                                )
-                            };
-                            self.append_streamed_assistant_message_to_history(
-                                partial,
-                                &mut new_msgs,
-                                &mut committed_response,
-                            );
-                            self.observer.record_event(&ObserverEvent::LlmResponse {
-                                model_provider: self.model_provider_name.clone(),
-                                model: effective_model.clone(),
-                                duration: llm_started_at.elapsed(),
-                                success: false,
-                                error_message: Some("request cancelled by user".into()),
-                                input_tokens: None,
-                                output_tokens: None,
-                                channel: None,
-                                agent_alias: self.observer_agent_alias(),
-                                turn_id: Some(turn_id.clone()),
-                            });
-                                return Err(StreamedTurnError {
-                                error: crate::agent::loop_::ToolLoopCancelled.into(),
-                                committed_response,
-                                new_messages: new_msgs,
-                            });
-                        }
-                        result = chat_fut => result,
-                    }
-                } else {
-                    chat_fut.await
-                };
-                match chat_result {
-                    Ok(resp) => resp,
-                    Err(error) => {
-                        let safe_error = zeroclaw_providers::sanitize_api_error(&error.to_string());
-                        self.observer.record_event(&ObserverEvent::LlmResponse {
-                            model_provider: self.model_provider_name.clone(),
-                            model: effective_model.clone(),
-                            duration: llm_started_at.elapsed(),
-                            success: false,
-                            error_message: Some(safe_error),
-                            input_tokens: None,
-                            output_tokens: None,
-                            channel: None,
-                            agent_alias: self.observer_agent_alias(),
-                            turn_id: Some(turn_id.clone()),
-                        });
-                        if got_stream && !streamed_text.is_empty() {
-                            let partial = Self::marked_partial_response(
-                                &streamed_text,
-                                "[stream interrupted]",
-                            );
-                            self.append_streamed_assistant_message_to_history(
-                                partial,
-                                &mut new_msgs,
-                                &mut committed_response,
-                            );
-                        }
-                        return Err(StreamedTurnError {
-                            error,
-                            committed_response,
-                            new_messages: new_msgs,
-                        });
-                    }
-                }
-            };
-
-            let (resp_input_tokens, resp_output_tokens) = response
-                .usage
-                .as_ref()
-                .map(|u| (u.input_tokens, u.output_tokens))
-                .unwrap_or((None, None));
-            if let Some(input) = resp_input_tokens {
-                guard.total_input_tokens = guard.total_input_tokens.saturating_add(input);
-                guard.saw_usage = true;
-            }
-            if let Some(output) = resp_output_tokens {
-                guard.total_output_tokens = guard.total_output_tokens.saturating_add(output);
-                guard.saw_usage = true;
-            }
-            self.observer.record_event(&ObserverEvent::LlmResponse {
-                model_provider: self.model_provider_name.clone(),
-                model: effective_model.clone(),
-                duration: llm_started_at.elapsed(),
-                success: true,
-                error_message: None,
-                input_tokens: resp_input_tokens,
-                output_tokens: resp_output_tokens,
-                channel: None,
-                agent_alias: self.observer_agent_alias(),
-                turn_id: Some(turn_id.clone()),
-            });
-
-            // Forward per-call token usage so the WS gateway (and any other
-            // consumer) can include aggregated usage in the final done frame
-            // and write costs.jsonl. Absent when the provider does not surface
-            // usage in streaming responses.
-            if let Some(ref usage) = response.usage {
-                Self::send_turn_event(
-                    &event_tx,
-                    cancel_token.as_ref(),
-                    TurnEvent::Usage {
-                        input_tokens: usage.input_tokens,
-                        cached_input_tokens: usage.cached_input_tokens,
-                        output_tokens: usage.output_tokens,
-                        cost_usd: None,
-                    },
-                )
-                .await;
-            }
-
-            let (text, mut calls) = self.parse_response_for_effective_tools(&response);
-            if calls.is_empty() {
-                let final_text = if text.is_empty() && !self.tool_specs.is_empty() {
-                    response.text.unwrap_or_default()
-                } else {
-                    text
-                };
-
-                let steering_messages = Self::drain_steering_messages(&mut steering_rx);
-                if !steering_messages.is_empty() {
-                    if !final_text.is_empty() {
-                        let assistant_msg =
-                            ConversationMessage::Chat(ChatMessage::assistant(final_text.clone()));
-                        new_msgs.push(assistant_msg.clone());
-                        self.history.push(assistant_msg);
-                        committed_response.push_str(&final_text);
-                        self.trim_history();
-                    }
-
-                    for steering_message in steering_messages {
-                        self.append_streamed_user_message_to_history(
-                            &steering_message,
-                            &mut new_msgs,
-                        )
-                        .await;
-                    }
-                    continue;
-                }
-
-                // Store in response cache
-                if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
-                    let token_count = response
-                        .usage
-                        .as_ref()
-                        .and_then(|u| u.output_tokens)
-                        .unwrap_or(0);
-                    #[allow(clippy::cast_possible_truncation)]
-                    let _ = cache.put(key, &effective_model, &final_text, token_count as u32);
-                }
-
-                // If we didn't stream, send the full response as a single chunk
-                if !got_stream && !final_text.is_empty() {
-                    Self::send_turn_event(
-                        &event_tx,
-                        cancel_token.as_ref(),
-                        TurnEvent::Chunk {
-                            delta: final_text.clone(),
-                        },
-                    )
-                    .await;
-                }
-
-                new_msgs.push(ConversationMessage::Chat(ChatMessage::assistant(
-                    final_text.clone(),
-                )));
-                self.history
-                    .push(ConversationMessage::Chat(ChatMessage::assistant(
-                        final_text.clone(),
-                    )));
-                committed_response.push_str(&final_text);
+                let cached_msg = ConversationMessage::Chat(ChatMessage::assistant(cached.clone()));
+                new_msgs.push(cached_msg.clone());
+                self.history.push(cached_msg);
                 self.trim_history();
                 self.observer.record_event(&ObserverEvent::TurnComplete);
+                committed_response.push_str(&cached);
                 return Ok(StreamedTurnSuccess {
                     response: committed_response,
                     new_messages: new_msgs,
                 });
             }
+            self.observer.record_event(&ObserverEvent::CacheMiss {
+                cache_type: "response".into(),
+            });
+        }
 
-            // Pre-assign stable IDs to tool calls that don't have one
-            for call in &mut calls {
-                if call.tool_call_id.is_none() {
-                    call.tool_call_id = Some(uuid::Uuid::new_v4().to_string());
+        let mut loop_history = provider_messages;
+
+        let approval_bridge: Option<Box<dyn zeroclaw_api::channel::Channel>> =
+            self.channel_handles.ask_user.as_ref().map(|handles| {
+                Box::new(AskUserApprovalBridge {
+                    handles: Arc::clone(handles),
+                    last_decision: parking_lot::Mutex::new(None),
+                }) as Box<dyn zeroclaw_api::channel::Channel>
+            });
+
+        let knobs = crate::agent::loop_::LoopKnobs {
+            dedup_enabled: false,
+            max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::GracefulSummary,
+            detect_protocol_without_tools: false,
+        };
+        // The streaming engine never had pattern-based loop detection; default
+        // pacing turns it on. Keep the embedder contract until this surface
+        // grows a pacing config of its own (matches `Agent::turn`).
+        let pacing = zeroclaw_config::schema::PacingConfig {
+            loop_detection_enabled: false,
+            ..zeroclaw_config::schema::PacingConfig::default()
+        };
+
+        // Usage-only cost context, as in `Agent::turn`: per-call token totals
+        // feed the AgentEnd guard without persisting cost records or
+        // enforcing budgets (this path never did either). One context spans
+        // every round, so its snapshot is cumulative. The loop calls below
+        // must stay plain `.await`s on this task — caller-scoped task-locals
+        // (ws.rs session key, rpc thread id, tool-choice/thinking overrides)
+        // silently vanish across a spawn.
+        let cost_context = crate::agent::loop_::ToolLoopCostTrackingContext::usage_only();
+
+        // ── Round loop: one tool-call-loop run per steering round ──────────
+        for round in 0..self.config.resolved.max_tool_iterations {
+            // Early exit if the caller cancelled this turn (e.g. user abort)
+            if cancel_token
+                .as_ref()
+                .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+            {
+                let marker = crate::i18n::get_required_cli_string("turn-interrupted-by-user");
+                let interruption =
+                    ConversationMessage::Chat(ChatMessage::assistant(marker.clone()));
+                new_msgs.push(interruption.clone());
+                self.history.push(interruption);
+                committed_response.push_str(&marker);
+                return Err(StreamedTurnError {
+                    error: crate::agent::loop_::ToolLoopCancelled.into(),
+                    committed_response,
+                    new_messages: new_msgs,
+                });
+            }
+
+            // Steering drain: each accepted mid-turn message becomes its own
+            // enriched user turn in both transcripts before the next round.
+            for steering_message in crate::agent::loop_::drain_steering_messages(&mut steering_rx) {
+                self.append_streamed_user_message_to_history(&steering_message, &mut new_msgs)
+                    .await;
+                if let Some(ConversationMessage::Chat(user_msg)) = new_msgs.last() {
+                    loop_history.push(user_msg.clone());
                 }
             }
 
-            // ── Tool calls ─────────────────────────────────────────────
-            let tool_call_msg = ConversationMessage::AssistantToolCalls {
-                text: response.text.clone(),
-                tool_calls: response.tool_calls.clone(),
-                reasoning_content: response.reasoning_content.clone(),
-            };
-            new_msgs.push(tool_call_msg.clone());
-            // History push is deferred: tool_call_msg is pushed atomically with
-            // ToolResults in every exit path below to prevent an orphaned
-            // AssistantToolCalls entry that would cause a 400 from the Responses API.
+            // Per-round append-log: the loop mirrors every message it adds to
+            // `loop_history` into this capture at push time, on success AND
+            // error exits — never derived from history indices, which the
+            // loop's own preflight pruning can invalidate.
+            let mut round_added: Vec<ChatMessage> = Vec::new();
+            let loop_result = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(
+                    Some(cost_context.clone()),
+                    crate::agent::loop_::run_tool_call_loop(
+                        self.model_provider.as_ref(),
+                        &mut loop_history,
+                        &self.tools,
+                        self.observer.as_ref(),
+                        &self.model_provider_name,
+                        &effective_model,
+                        self.temperature,
+                        true,
+                        self.approval_manager.as_deref(),
+                        "cli",
+                        None,
+                        &self.multimodal_config,
+                        self.config.resolved.max_tool_iterations,
+                        cancel_token.clone(),
+                        None,
+                        self.hook_runner.as_deref(),
+                        &[],
+                        &self.config.resolved.tool_call_dedup_exempt,
+                        self.activated_tools.as_ref(),
+                        None,
+                        &pacing,
+                        self.config.resolved.strict_tool_parsing,
+                        self.config.resolved.parallel_tools,
+                        self.config.resolved.max_tool_result_chars,
+                        self.config.resolved.max_context_tokens,
+                        None,
+                        approval_bridge.as_deref(),
+                        None,
+                        None,
+                        Some(event_tx.clone()),
+                        None,
+                        Some(&mut round_added),
+                        &knobs,
+                        Some(&mut self.image_cache),
+                    ),
+                )
+                .await;
 
-            // When parallel execution is disabled, the turn must look and behave
-            // serially end to end: emit a tool-call start event, run that one
-            // call, emit its result, then move to the next. Emitting every
-            // start event up front and only then executing makes a multi-call
-            // turn appear as a simultaneous batch in the front end and floods
-            // the ACP/RPC channel — large batches have overrun the IPC and
-            // crashed the TUI. Parallel mode keeps the batched dispatch so
-            // concurrent execution can overlap.
-            let serial_dispatch =
-                !self.config.resolved.parallel_tools || self.approval_manager.is_some();
+            // Feed cumulative usage into the AgentEnd guard before any return
+            // below drops it — the error paths must still report usage from
+            // calls that succeeded earlier in the turn.
+            let usage = cost_context.snapshot_turn_usage();
+            if usage.input_tokens > 0 || usage.output_tokens > 0 {
+                guard.total_input_tokens = usage.input_tokens;
+                guard.total_output_tokens = usage.output_tokens;
+                guard.saw_usage = true;
+            }
 
-            let results = if serial_dispatch {
-                let mut serial_results: Vec<ToolExecutionResult> = Vec::with_capacity(calls.len());
-                for (idx, call) in calls.iter().enumerate() {
-                    if let Some(ref token) = cancel_token
-                        && token.is_cancelled()
+            // Replay everything the loop appended this round into the
+            // conversation history and the persistence capture.
+            let single_text_exchange =
+                round == 0 && round_added.len() == 1 && round_added[0].role == "assistant";
+            for replayed in Self::replay_loop_messages(&round_added) {
+                new_msgs.push(replayed.clone());
+                self.history.push(replayed);
+            }
+
+            match loop_result {
+                Ok(response) => {
+                    // Commit-before-drain: this round's assistant output is in
+                    // history/new_msgs (replay above) and committed_response
+                    // before any steering continuation is folded in.
+                    committed_response.push_str(&response);
+                    self.trim_history();
+
+                    let has_more_steering =
+                        steering_rx.as_deref_mut().is_some_and(|rx| !rx.is_empty());
+                    if has_more_steering {
+                        continue;
+                    }
+
+                    // Cache put only when the turn was a single tool-free
+                    // exchange, mirroring the old "no tool calls" condition.
+                    if single_text_exchange
+                        && let (Some(cache), Some(key)) = (&self.response_cache, &cache_key)
                     {
-                        self.history.push(tool_call_msg.clone());
-                        self.synthesize_cancelled_tool_results(
-                            vec![],
-                            &response.tool_calls,
-                            &mut new_msgs,
-                        );
-                        self.append_streamed_assistant_message_to_history(
-                            "[interrupted by user]".to_string(),
-                            &mut new_msgs,
-                            &mut committed_response,
-                        );
+                        #[allow(clippy::cast_possible_truncation)]
+                        let _ =
+                            cache.put(key, &effective_model, &response, usage.output_tokens as u32);
+                    }
+
+                    self.observer.record_event(&ObserverEvent::TurnComplete);
+                    return Ok(StreamedTurnSuccess {
+                        response: committed_response,
+                        new_messages: new_msgs,
+                    });
+                }
+                Err(error) => {
+                    self.trim_history();
+                    // Rebuild the committed text from the failed round's plain
+                    // assistant output (e.g. a persisted stream partial) when
+                    // no prior round committed anything.
+                    if committed_response.is_empty() {
+                        for replayed in Self::replay_loop_messages(&round_added) {
+                            if let ConversationMessage::Chat(message) = &replayed
+                                && message.role == "assistant"
+                            {
+                                committed_response.push_str(&message.content);
+                            }
+                        }
+                    }
+                    if crate::agent::loop_::is_tool_loop_cancelled(&error) {
+                        // When the cancel arrived after event-visible
+                        // streamed text, the error itself carries the
+                        // partial the loop persisted (replayed into
+                        // history/new_msgs above, and into
+                        // committed_response by the empty-committed
+                        // rebuild). Provenance, not content sniffing:
+                        // model-authored text can end with the marker
+                        // literal, so suffix-matching round_added would
+                        // misfire. Synthesize the bare marker only when no
+                        // interruption text was persisted this round.
+                        let marker =
+                            crate::i18n::get_required_cli_string("turn-interrupted-by-user");
+                        let persisted_interruption = error
+                            .downcast_ref::<crate::agent::loop_::StreamCancelledAfterOutput>()
+                            .map(|cancelled| format!("{}\n\n{marker}", cancelled.partial_text));
+                        match persisted_interruption {
+                            Some(text) => {
+                                if !committed_response.ends_with(&marker) {
+                                    if !committed_response.is_empty() {
+                                        committed_response.push_str("\n\n");
+                                    }
+                                    committed_response.push_str(&text);
+                                }
+                            }
+                            None => {
+                                committed_response.push_str(&marker);
+                                let interruption = ConversationMessage::Chat(
+                                    ChatMessage::assistant(marker.clone()),
+                                );
+                                new_msgs.push(interruption.clone());
+                                self.history.push(interruption);
+                            }
+                        }
                         return Err(StreamedTurnError {
                             error: crate::agent::loop_::ToolLoopCancelled.into(),
                             committed_response,
                             new_messages: new_msgs,
                         });
                     }
-
-                    let call_id = call.tool_call_id.as_ref().unwrap().clone();
-                    Self::send_turn_event(
-                        &event_tx,
-                        cancel_token.as_ref(),
-                        TurnEvent::ToolCall {
-                            id: call_id,
-                            name: call.name.clone(),
-                            args: call.arguments.clone(),
-                        },
-                    )
-                    .await;
-
-                    let single = std::slice::from_ref(call);
-                    let result = if let Some(ref token) = cancel_token {
-                        tokio::select! {
-                            biased;
-                            () = token.cancelled() => {
-                                let completed: Vec<ToolResultMessage> = serial_results
-                                    .iter()
-                                    .map(|r| ToolResultMessage {
-                                        tool_call_id: r.tool_call_id.clone().unwrap_or_default(),
-                                        content: r.output.clone(),
-                                    })
-                                    .collect();
-                                self.history.push(tool_call_msg.clone());
-                                self.synthesize_cancelled_tool_results(
-                                    completed,
-                                    &response.tool_calls[idx..],
-                                    &mut new_msgs,
-                                );
-                                self.append_streamed_assistant_message_to_history(
-                                    "[interrupted by user]".to_string(),
-                                    &mut new_msgs,
-                                    &mut committed_response,
-                                );
-                                return Err(StreamedTurnError {
-                                    error: crate::agent::loop_::ToolLoopCancelled.into(),
-                                    committed_response,
-                                    new_messages: new_msgs,
-                                });
-                            }
-                            mut r = self.execute_tools(single, &turn_id) => r.pop().expect("one call yields one result"),
-                        }
-                    } else {
-                        self.execute_tools(single, &turn_id)
-                            .await
-                            .pop()
-                            .expect("one call yields one result")
-                    };
-
-                    let result_id = result.tool_call_id.as_ref().unwrap().clone();
-                    Self::send_turn_event(
-                        &event_tx,
-                        cancel_token.as_ref(),
-                        TurnEvent::ToolResult {
-                            id: result_id,
-                            name: result.name.clone(),
-                            output: result.output.clone(),
-                        },
-                    )
-                    .await;
-
-                    serial_results.push(result);
-                }
-                serial_results
-            } else {
-                for call in &calls {
-                    let call_id = call.tool_call_id.as_ref().unwrap().clone();
-                    Self::send_turn_event(
-                        &event_tx,
-                        cancel_token.as_ref(),
-                        TurnEvent::ToolCall {
-                            id: call_id,
-                            name: call.name.clone(),
-                            args: call.arguments.clone(),
-                        },
-                    )
-                    .await;
-                }
-
-                let results = if let Some(ref token) = cancel_token {
-                    tokio::select! {
-                        biased;
-                        () = token.cancelled() => {
-                            self.history.push(tool_call_msg.clone());
-                            self.synthesize_cancelled_tool_results(
-                                vec![],
-                                &response.tool_calls,
-                                &mut new_msgs,
-                            );
-                            self.append_streamed_assistant_message_to_history(
-                                "[interrupted by user]".to_string(),
-                                &mut new_msgs,
-                                &mut committed_response,
-                            );
-                            return Err(StreamedTurnError {
-                                error: crate::agent::loop_::ToolLoopCancelled.into(),
-                                committed_response,
-                                new_messages: new_msgs,
-                            });
-                        }
-                        results = self.execute_tools(&calls, &turn_id) => results,
+                    // Mark the interruption only when nothing was committed —
+                    // prior-round text must round-trip unmodified.
+                    if committed_response.is_empty() {
+                        committed_response.push_str(&crate::i18n::get_required_cli_string(
+                            "turn-stream-interrupted",
+                        ));
                     }
-                } else {
-                    self.execute_tools(&calls, &turn_id).await
-                };
-
-                for result in &results {
-                    let result_id = result.tool_call_id.as_ref().unwrap().clone();
-                    Self::send_turn_event(
-                        &event_tx,
-                        cancel_token.as_ref(),
-                        TurnEvent::ToolResult {
-                            id: result_id,
-                            name: result.name.clone(),
-                            output: result.output.clone(),
-                        },
-                    )
-                    .await;
+                    return Err(StreamedTurnError {
+                        error,
+                        committed_response,
+                        new_messages: new_msgs,
+                    });
                 }
-
-                results
-            };
-
-            let formatted = self.tool_dispatcher.format_results(&results);
-            new_msgs.push(formatted.clone());
-            self.history.push(tool_call_msg);
-            self.history.push(formatted);
-            self.trim_history();
+            }
         }
 
         Err(StreamedTurnError {
@@ -3327,6 +2618,12 @@ pub async fn run(
     Ok(())
 }
 
+// #7415 safety net (child module so fixtures can reach Agent internals the
+// same way `mod tests` does).
+#[cfg(test)]
+#[path = "safety_net.rs"]
+mod safety_net;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3360,13 +2657,7 @@ mod tests {
         );
     }
 
-    zeroclaw_api::mock_tool_attribution!(
-        CountingTool,
-        NamedMockTool,
-        MockTool,
-        SlowTool,
-        CapturingApprovalArgTool,
-    );
+    zeroclaw_api::mock_tool_attribution!(CountingTool, NamedMockTool, MockTool, SlowTool,);
 
     struct MockModelProvider {
         responses: Mutex<Vec<zeroclaw_providers::ChatResponse>>,
@@ -3857,81 +3148,6 @@ mod tests {
         }
     }
 
-    struct CapturingApprovalArgTool {
-        name: &'static str,
-        output: &'static str,
-        calls: Arc<AtomicUsize>,
-        last_args: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
-    }
-
-    #[async_trait]
-    impl Tool for CapturingApprovalArgTool {
-        fn name(&self) -> &str {
-            self.name
-        }
-
-        fn description(&self) -> &str {
-            self.name
-        }
-
-        fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object"})
-        }
-
-        async fn execute(&self, args: serde_json::Value) -> Result<crate::tools::ToolResult> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            *self.last_args.lock().unwrap() = Some(args);
-            Ok(crate::tools::ToolResult {
-                success: true,
-                output: self.output.into(),
-                error: None,
-            })
-        }
-    }
-
-    struct ApprovalChannel {
-        response: zeroclaw_api::channel::ChannelApprovalResponse,
-        requests: Arc<AtomicUsize>,
-    }
-
-    impl ::zeroclaw_api::attribution::Attributable for ApprovalChannel {
-        fn role(&self) -> ::zeroclaw_api::attribution::Role {
-            ::zeroclaw_api::attribution::Role::Channel(
-                ::zeroclaw_api::attribution::ChannelKind::AcpChannel,
-            )
-        }
-        fn alias(&self) -> &str {
-            "test"
-        }
-    }
-
-    #[async_trait]
-    impl zeroclaw_api::channel::Channel for ApprovalChannel {
-        fn name(&self) -> &str {
-            "acp"
-        }
-
-        async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        async fn request_approval(
-            &self,
-            _recipient: &str,
-            _request: &zeroclaw_api::channel::ChannelApprovalRequest,
-        ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
-            self.requests.fetch_add(1, Ordering::SeqCst);
-            Ok(Some(self.response.clone()))
-        }
-    }
-
     #[tokio::test]
     async fn turn_without_tools_returns_text() {
         let model_provider = Box::new(MockModelProvider {
@@ -4072,405 +3288,6 @@ mod tests {
         assert!(xml_prompt.contains("## Tools"));
         assert!(xml_prompt.contains("echo"));
         assert!(xml_prompt.contains("## Tool Use Protocol"));
-    }
-
-    #[tokio::test]
-    async fn direct_agent_tool_execution_requests_acp_approval() {
-        let model_provider = Box::new(MockModelProvider {
-            responses: Mutex::new(vec![]),
-        });
-        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
-            backend: "none".into(),
-            ..zeroclaw_config::schema::MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
-                .expect("memory creation should succeed with valid config"),
-        );
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let tool_calls = Arc::new(AtomicUsize::new(0));
-        let approval_requests = Arc::new(AtomicUsize::new(0));
-        let approval_cfg = zeroclaw_config::schema::RiskProfileConfig {
-            always_ask: vec!["echo".into()],
-            ..zeroclaw_config::schema::RiskProfileConfig::default()
-        };
-        let mut agent = Agent::builder()
-            .model_provider(model_provider)
-            .tools(vec![Box::new(CountingTool {
-                calls: Arc::clone(&tool_calls),
-            })])
-            .memory(mem)
-            .observer(observer)
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
-            .approval_manager(Some(Arc::new(ApprovalManager::for_non_interactive(
-                &approval_cfg,
-            ))))
-            .build()
-            .expect("agent builder should succeed with valid config");
-
-        let handle: tools::PerToolChannelHandle =
-            Arc::new(parking_lot::RwLock::new(HashMap::new()));
-        agent.channel_handles.ask_user = Some(Arc::clone(&handle));
-        let channel: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(ApprovalChannel {
-            response: zeroclaw_api::channel::ChannelApprovalResponse::Approve,
-            requests: Arc::clone(&approval_requests),
-        });
-        agent.channel_handles().register_channel("acp", channel);
-
-        let result = agent
-            .execute_tool_call(
-                &ParsedToolCall {
-                    name: "echo".into(),
-                    arguments: serde_json::json!({"message": "hi"}),
-                    tool_call_id: Some("tc1".into()),
-                },
-                "test-turn",
-            )
-            .await;
-
-        assert!(result.success);
-        assert_eq!(result.output, "tool-out");
-        assert_eq!(approval_requests.load(Ordering::SeqCst), 1);
-        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn direct_agent_tool_execution_denies_when_acp_rejects() {
-        let model_provider = Box::new(MockModelProvider {
-            responses: Mutex::new(vec![]),
-        });
-        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
-            backend: "none".into(),
-            ..zeroclaw_config::schema::MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
-                .expect("memory creation should succeed with valid config"),
-        );
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let tool_calls = Arc::new(AtomicUsize::new(0));
-        let approval_requests = Arc::new(AtomicUsize::new(0));
-        let approval_cfg = zeroclaw_config::schema::RiskProfileConfig {
-            always_ask: vec!["echo".into()],
-            ..zeroclaw_config::schema::RiskProfileConfig::default()
-        };
-        let mut agent = Agent::builder()
-            .model_provider(model_provider)
-            .tools(vec![Box::new(CountingTool {
-                calls: Arc::clone(&tool_calls),
-            })])
-            .memory(mem)
-            .observer(observer)
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
-            .approval_manager(Some(Arc::new(ApprovalManager::for_non_interactive(
-                &approval_cfg,
-            ))))
-            .build()
-            .expect("agent builder should succeed with valid config");
-
-        let handle: tools::PerToolChannelHandle =
-            Arc::new(parking_lot::RwLock::new(HashMap::new()));
-        agent.channel_handles.ask_user = Some(Arc::clone(&handle));
-        let channel: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(ApprovalChannel {
-            response: zeroclaw_api::channel::ChannelApprovalResponse::Deny,
-            requests: Arc::clone(&approval_requests),
-        });
-        agent.channel_handles().register_channel("acp", channel);
-
-        let result = agent
-            .execute_tool_call(
-                &ParsedToolCall {
-                    name: "echo".into(),
-                    arguments: serde_json::json!({"message": "hi"}),
-                    tool_call_id: Some("tc1".into()),
-                },
-                "test-turn",
-            )
-            .await;
-
-        assert!(!result.success);
-        assert_eq!(result.output, "Denied by user.");
-        assert_eq!(approval_requests.load(Ordering::SeqCst), 1);
-        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn direct_agent_shell_does_not_trust_model_supplied_approved_arg() {
-        let provider = Box::new(MockModelProvider {
-            responses: Mutex::new(vec![]),
-        });
-        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
-            backend: "none".into(),
-            ..zeroclaw_config::schema::MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
-                .expect("memory creation should succeed with valid config"),
-        );
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let tool_calls = Arc::new(AtomicUsize::new(0));
-        let approval_requests = Arc::new(AtomicUsize::new(0));
-        let captured_args = Arc::new(std::sync::Mutex::new(None));
-        let approval_cfg = zeroclaw_config::schema::RiskProfileConfig::default();
-        let mut agent = Agent::builder()
-            .model_provider(provider)
-            .tools(vec![Box::new(CapturingApprovalArgTool {
-                name: "shell",
-                output: "shell-out",
-                calls: Arc::clone(&tool_calls),
-                last_args: Arc::clone(&captured_args),
-            })])
-            .memory(mem)
-            .observer(observer)
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
-            .approval_manager(Some(Arc::new(
-                ApprovalManager::for_non_interactive_backchannel(&approval_cfg),
-            )))
-            .build()
-            .expect("agent builder should succeed with valid config");
-
-        let handle: tools::PerToolChannelHandle =
-            Arc::new(parking_lot::RwLock::new(HashMap::new()));
-        agent.channel_handles.ask_user = Some(Arc::clone(&handle));
-        let channel: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(ApprovalChannel {
-            response: zeroclaw_api::channel::ChannelApprovalResponse::Deny,
-            requests: Arc::clone(&approval_requests),
-        });
-        agent.channel_handles().register_channel("acp", channel);
-
-        let result = agent
-            .execute_tool_call(
-                &ParsedToolCall {
-                    name: "shell".into(),
-                    arguments: serde_json::json!({
-                        "command": "touch should-not-run",
-                        "approved": true
-                    }),
-                    tool_call_id: Some("tc1".into()),
-                },
-                "test-turn",
-            )
-            .await;
-
-        assert!(!result.success);
-        assert_eq!(result.output, "Denied by user.");
-        assert_eq!(approval_requests.load(Ordering::SeqCst), 1);
-        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
-        assert!(captured_args.lock().unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn direct_agent_shell_marks_args_approved_after_backchannel_approval() {
-        let provider = Box::new(MockModelProvider {
-            responses: Mutex::new(vec![]),
-        });
-        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
-            backend: "none".into(),
-            ..zeroclaw_config::schema::MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
-                .expect("memory creation should succeed with valid config"),
-        );
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let tool_calls = Arc::new(AtomicUsize::new(0));
-        let approval_requests = Arc::new(AtomicUsize::new(0));
-        let captured_args = Arc::new(std::sync::Mutex::new(None));
-        let approval_cfg = zeroclaw_config::schema::RiskProfileConfig::default();
-        let mut agent = Agent::builder()
-            .model_provider(provider)
-            .tools(vec![Box::new(CapturingApprovalArgTool {
-                name: "shell",
-                output: "shell-out",
-                calls: Arc::clone(&tool_calls),
-                last_args: Arc::clone(&captured_args),
-            })])
-            .memory(mem)
-            .observer(observer)
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
-            .approval_manager(Some(Arc::new(
-                ApprovalManager::for_non_interactive_backchannel(&approval_cfg),
-            )))
-            .build()
-            .expect("agent builder should succeed with valid config");
-
-        let handle: tools::PerToolChannelHandle =
-            Arc::new(parking_lot::RwLock::new(HashMap::new()));
-        agent.channel_handles.ask_user = Some(Arc::clone(&handle));
-        let channel: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(ApprovalChannel {
-            response: zeroclaw_api::channel::ChannelApprovalResponse::Approve,
-            requests: Arc::clone(&approval_requests),
-        });
-        agent.channel_handles().register_channel("acp", channel);
-
-        let result = agent
-            .execute_tool_call(
-                &ParsedToolCall {
-                    name: "shell".into(),
-                    arguments: serde_json::json!({
-                        "command": "touch should-run-after-human-approval",
-                        "approved": false
-                    }),
-                    tool_call_id: Some("tc1".into()),
-                },
-                "test-turn",
-            )
-            .await;
-
-        assert!(result.success);
-        assert_eq!(result.output, "shell-out");
-        assert_eq!(approval_requests.load(Ordering::SeqCst), 1);
-        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
-        let args = captured_args
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("shell tool should capture executed args");
-        assert_eq!(args["approved"], true);
-    }
-
-    #[tokio::test]
-    async fn direct_agent_shell_keeps_runtime_approval_from_always_allowlist() {
-        let provider = Box::new(MockModelProvider {
-            responses: Mutex::new(vec![]),
-        });
-        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
-            backend: "none".into(),
-            ..zeroclaw_config::schema::MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
-                .expect("memory creation should succeed with valid config"),
-        );
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let tool_calls = Arc::new(AtomicUsize::new(0));
-        let approval_requests = Arc::new(AtomicUsize::new(0));
-        let captured_args = Arc::new(std::sync::Mutex::new(None));
-        let approval_cfg = zeroclaw_config::schema::RiskProfileConfig::default();
-        let mut agent = Agent::builder()
-            .model_provider(provider)
-            .tools(vec![Box::new(CapturingApprovalArgTool {
-                name: "shell",
-                output: "shell-out",
-                calls: Arc::clone(&tool_calls),
-                last_args: Arc::clone(&captured_args),
-            })])
-            .memory(mem)
-            .observer(observer)
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
-            .approval_manager(Some(Arc::new(
-                ApprovalManager::for_non_interactive_backchannel(&approval_cfg),
-            )))
-            .build()
-            .expect("agent builder should succeed with valid config");
-
-        let handle: tools::PerToolChannelHandle =
-            Arc::new(parking_lot::RwLock::new(HashMap::new()));
-        agent.channel_handles.ask_user = Some(Arc::clone(&handle));
-        let channel: Arc<dyn zeroclaw_api::channel::Channel> = Arc::new(ApprovalChannel {
-            response: zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove,
-            requests: Arc::clone(&approval_requests),
-        });
-        agent.channel_handles().register_channel("acp", channel);
-
-        let first_result = agent
-            .execute_tool_call(
-                &ParsedToolCall {
-                    name: "shell".into(),
-                    arguments: serde_json::json!({
-                        "command": "touch should-run-after-always-approval",
-                        "approved": false
-                    }),
-                    tool_call_id: Some("tc1".into()),
-                },
-                "test-turn",
-            )
-            .await;
-        let second_result = agent
-            .execute_tool_call(
-                &ParsedToolCall {
-                    name: "shell".into(),
-                    arguments: serde_json::json!({
-                        "command": "touch should-run-from-allowlist",
-                        "approved": false
-                    }),
-                    tool_call_id: Some("tc2".into()),
-                },
-                "test-turn",
-            )
-            .await;
-
-        assert!(first_result.success);
-        assert!(second_result.success);
-        assert_eq!(approval_requests.load(Ordering::SeqCst), 1);
-        assert_eq!(tool_calls.load(Ordering::SeqCst), 2);
-        let args = captured_args
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("shell tool should capture executed args");
-        assert_eq!(args["approved"], true);
-    }
-
-    #[tokio::test]
-    async fn direct_agent_cron_add_does_not_trust_model_supplied_approved_arg() {
-        let provider = Box::new(MockModelProvider {
-            responses: Mutex::new(vec![]),
-        });
-        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
-            backend: "none".into(),
-            ..zeroclaw_config::schema::MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
-                .expect("memory creation should succeed with valid config"),
-        );
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let tool_calls = Arc::new(AtomicUsize::new(0));
-        let captured_args = Arc::new(std::sync::Mutex::new(None));
-        let agent = Agent::builder()
-            .model_provider(provider)
-            .tools(vec![Box::new(CapturingApprovalArgTool {
-                name: "cron_add",
-                output: "cron-out",
-                calls: Arc::clone(&tool_calls),
-                last_args: Arc::clone(&captured_args),
-            })])
-            .memory(mem)
-            .observer(observer)
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
-            .build()
-            .expect("agent builder should succeed with valid config");
-
-        let result = agent
-            .execute_tool_call(
-                &ParsedToolCall {
-                    name: "cron_add".into(),
-                    arguments: serde_json::json!({
-                        "command": "echo should-not-be-model-approved",
-                        "approved": true
-                    }),
-                    tool_call_id: Some("tc1".into()),
-                },
-                "test-turn",
-            )
-            .await;
-
-        assert!(result.success);
-        assert_eq!(result.output, "cron-out");
-        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
-        let args = captured_args
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("cron_add tool should capture executed args");
-        assert_eq!(args["approved"], false);
     }
 
     #[tokio::test]
@@ -4672,7 +3489,7 @@ mod tests {
         );
         let agent_cfg = zeroclaw_config::schema::AliasedAgentConfig {
             model_provider: "custom.default".into(),
-            risk_profile: "test-profile".to_string(),
+            risk_profile: "test-profile".into(),
             ..zeroclaw_config::schema::AliasedAgentConfig::default()
         };
         config.agents.insert("test-agent".to_string(), agent_cfg);
@@ -4738,7 +3555,7 @@ mod tests {
             "test-agent".to_string(),
             AliasedAgentConfig {
                 model_provider: "openai.codex".into(),
-                risk_profile: "test-profile".to_string(),
+                risk_profile: "test-profile".into(),
                 ..AliasedAgentConfig::default()
             },
         );
@@ -4779,8 +3596,8 @@ mod tests {
             .build()
             .expect("agent builder should succeed with valid config");
 
-        assert_eq!(agent.tool_specs.len(), 1);
-        assert_eq!(agent.tool_specs[0].name, "echo");
+        assert_eq!(agent.tools.len(), 1);
+        assert_eq!(agent.tools[0].name(), "echo");
     }
 
     #[test]
@@ -4811,7 +3628,7 @@ mod tests {
             .expect("agent builder should succeed with valid config");
 
         assert!(
-            agent.tool_specs.is_empty(),
+            agent.tools.is_empty(),
             "No tools should match a non-existent allowlist entry"
         );
     }
@@ -5218,6 +4035,14 @@ mod tests {
             true
         }
 
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
         fn stream_chat(
             &self,
             _request: ChatRequest<'_>,
@@ -5378,6 +4203,10 @@ mod tests {
                 usage: None,
                 reasoning_content: None,
             })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
         }
 
         fn stream_chat(
@@ -6124,87 +4953,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cancel_synthesizes_paired_tool_results_for_orphaned_calls() {
-        use zeroclaw_providers::ToolCall;
-
-        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
-            backend: "none".into(),
-            ..zeroclaw_config::schema::MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
-                .expect("memory creation should succeed with valid config"),
-        );
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = Agent::builder()
-            .model_provider(Box::new(MockModelProvider {
-                responses: Mutex::new(vec![]),
-            }))
-            .tools(vec![Box::new(MockTool)])
-            .memory(mem)
-            .observer(observer)
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
-            .config(zeroclaw_config::schema::AliasedAgentConfig::default())
-            .build()
-            .expect("agent builder should succeed with valid config");
-
-        // Mirror the cancellation path: an AssistantToolCalls is committed,
-        // then the turn is interrupted before results land. The synthesized
-        // results must key off the same tool_calls stored in the
-        // AssistantToolCalls — two calls, to catch any count/order drift.
-        let tool_calls = vec![
-            ToolCall {
-                id: "tc-cancel-1".into(),
-                name: "shell".into(),
-                arguments: "{}".into(),
-                extra_content: None,
-            },
-            ToolCall {
-                id: "tc-cancel-2".into(),
-                name: "shell".into(),
-                arguments: "{}".into(),
-                extra_content: None,
-            },
-        ];
-        agent.history.push(ConversationMessage::AssistantToolCalls {
-            text: None,
-            tool_calls: tool_calls.clone(),
-            reasoning_content: None,
-        });
-
-        let mut new_msgs = Vec::new();
-        agent.synthesize_cancelled_tool_results(vec![], &tool_calls, &mut new_msgs);
-
-        // The synthesized ToolResults must answer every pending call by id, in
-        // both the canonical history and the new_messages persistence vec.
-        let last = agent.history.last().expect("history not empty");
-        match last {
-            ConversationMessage::ToolResults(results) => {
-                assert_eq!(results.len(), 2);
-                assert_eq!(results[0].tool_call_id, "tc-cancel-1");
-                assert_eq!(results[1].tool_call_id, "tc-cancel-2");
-            }
-            other => panic!("expected ToolResults, got {other:?}"),
-        }
-        assert!(matches!(
-            new_msgs.last(),
-            Some(ConversationMessage::ToolResults(r)) if r.len() == 2
-        ));
-
-        // Invariant: every AssistantToolCalls is immediately followed by
-        // ToolResults — no orphan that would 400 on replay.
-        for window in agent.history.windows(2) {
-            if matches!(&window[0], ConversationMessage::AssistantToolCalls { .. }) {
-                assert!(
-                    matches!(&window[1], ConversationMessage::ToolResults(_)),
-                    "orphaned AssistantToolCalls after cancel synthesis"
-                );
-            }
-        }
-    }
-
     // ── Duplicate narration guard ────────────────────────────────────
 
     /// When the model returns narration text alongside tool calls, the agent
@@ -6720,7 +5468,7 @@ mod tests {
         );
         assert!(
             !outcome.new_messages.iter().any(|msg| {
-                matches!(msg, ConversationMessage::Chat(message) if message.role == "assistant" && message.content.contains("[stream interrupted]"))
+                matches!(msg, ConversationMessage::Chat(message) if message.role == "assistant" && message.content.contains(&crate::i18n::get_english_cli_string_with_args("turn-stream-interrupted", &[])))
             }),
             "successful fallback should not persist interrupted stream text"
         );
@@ -6792,7 +5540,11 @@ mod tests {
             err.error
         );
         assert!(
-            err.committed_response.contains("[stream interrupted]"),
+            err.committed_response
+                .contains(&crate::i18n::get_english_cli_string_with_args(
+                    "turn-stream-interrupted",
+                    &[]
+                )),
             "persisted partial text should mark that the visible stream was interrupted"
         );
         assert!(
@@ -6854,10 +5606,13 @@ mod tests {
             "unexpected error: {}",
             err.error
         );
-        assert_eq!(err.committed_response, "[interrupted by user]");
+        assert_eq!(
+            err.committed_response,
+            crate::i18n::get_english_cli_string_with_args("turn-interrupted-by-user", &[])
+        );
         assert!(
             err.new_messages.iter().any(|msg| {
-                matches!(msg, ConversationMessage::Chat(message) if message.role == "assistant" && message.content == "[interrupted by user]")
+                matches!(msg, ConversationMessage::Chat(message) if message.role == "assistant" && message.content == crate::i18n::get_english_cli_string_with_args("turn-interrupted-by-user", &[]))
             }),
             "pre-output fallback cancellation should include an interruption marker"
         );
@@ -6907,10 +5662,13 @@ mod tests {
             "unexpected error: {}",
             err.error
         );
-        assert_eq!(err.committed_response, "[interrupted by user]");
+        assert_eq!(
+            err.committed_response,
+            crate::i18n::get_english_cli_string_with_args("turn-interrupted-by-user", &[])
+        );
         assert!(
             err.new_messages.iter().any(|msg| {
-                matches!(msg, ConversationMessage::Chat(message) if message.role == "assistant" && message.content == "[interrupted by user]")
+                matches!(msg, ConversationMessage::Chat(message) if message.role == "assistant" && message.content == crate::i18n::get_english_cli_string_with_args("turn-interrupted-by-user", &[]))
             }),
             "cancelled turn should include an assistant interruption marker for persistence"
         );
@@ -6955,7 +5713,12 @@ mod tests {
 
         assert!(
             err.committed_response.contains("draft")
-                && err.committed_response.contains("[stream interrupted]"),
+                && err
+                    .committed_response
+                    .contains(&crate::i18n::get_english_cli_string_with_args(
+                        "turn-stream-interrupted",
+                        &[]
+                    )),
             "unexpected committed_response: {}",
             err.committed_response
         );
@@ -7183,6 +5946,7 @@ mod tests {
                     args: std::collections::HashMap::new(),
                     target: None,
                     locked_args: std::collections::HashMap::new(),
+                    timeout_secs: None,
                 })
                 .collect(),
             prompts: vec![],
@@ -7271,6 +6035,7 @@ mod tests {
                 args: std::collections::HashMap::new(),
                 target: Some("shell".to_string()),
                 locked_args: std::collections::HashMap::new(),
+                timeout_secs: None,
             }],
             prompts: vec![],
             location: None,
@@ -7517,6 +6282,7 @@ mod tests {
                 .expect("memory creation should succeed with valid config"),
         );
 
+        let ws_dir = tmp.path().to_path_buf();
         let mut agent_a = Agent::builder()
             .model_provider(Box::new(MockModelProvider {
                 responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
@@ -7535,7 +6301,7 @@ mod tests {
             .observer(Arc::from(crate::observability::NoopObserver {}) as Arc<dyn Observer>)
             .response_cache(Some(cache.clone()))
             .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .workspace_dir(ws_dir.clone())
             .model_name("test-model".into())
             .temperature(Some(0.0))
             .build()
@@ -7559,7 +6325,7 @@ mod tests {
             .observer(observer)
             .response_cache(Some(cache))
             .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .workspace_dir(ws_dir)
             .model_name("test-model".into())
             .temperature(Some(0.0))
             .build()

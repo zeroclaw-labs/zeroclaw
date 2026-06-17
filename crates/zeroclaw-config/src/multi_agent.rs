@@ -150,7 +150,7 @@ pub struct PeerGroupConfig {
     /// Either a channel type (`"telegram"`) or a dotted channel alias
     /// (`"telegram.work"`). A bare type applies to every alias of that
     /// type; a dotted form scopes the group to that single instance.
-    pub channel: String,
+    pub channel: crate::providers::ChannelRef,
     /// Member agents by alias.
     pub agents: Vec<AgentAlias>,
     /// Non-agent members by channel-native username.

@@ -56,6 +56,7 @@ jobs:
           toolchain: 1.93.0
           components: clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        id: rust-cache
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
@@ -64,13 +65,44 @@ jobs:
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Clippy
-        run: >
-          cargo clippy
-          --workspace
-          --exclude zeroclaw-desktop
-          --all-targets
-          --features ci-all
-          -- -D warnings
+        shell: bash
+        run: |
+          set +e
+          cargo_log="${RUNNER_TEMP}/cargo-clippy.log"
+          SECONDS=0
+          cargo clippy \
+            --workspace \
+            --exclude zeroclaw-desktop \
+            --all-targets \
+            --features ci-all \
+            -- -D warnings 2>&1 | tee "$cargo_log"
+          cargo_status=${PIPESTATUS[0]}
+          duration_seconds=$SECONDS
+          set -e
+
+          workspace_path_compiles="$(grep -E -c 'Compiling.*\([^)]*zeroclaw' "$cargo_log" || true)"
+          total_compiles="$(grep -c 'Compiling' "$cargo_log" || true)"
+          downloaded_crates="$(grep -c 'Downloaded' "$cargo_log" || true)"
+          cache_hit="${RUST_CACHE_HIT:-unknown}"
+          summary_file="${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+          {
+            echo "### Lint diagnostics"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Runner OS | \`${{ runner.os }}\` |"
+            echo "| Rust cache exact hit | \`${cache_hit}\` |"
+            echo "| Clippy duration | \`${duration_seconds}s\` |"
+            echo "| Clippy status | \`${cargo_status}\` |"
+            echo "| Workspace path compile lines | \`${workspace_path_compiles}\` |"
+            echo "| Total compile lines | \`${total_compiles}\` |"
+            echo "| Downloaded crate lines | \`${downloaded_crates}\` |"
+          } >> "$summary_file"
+
+          exit "$cargo_status"
+        env:
+          RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
       - name: Config-write isolation guard
         run: cargo test --test architecture tests_that_persist_config_isolate_the_path
       - name: Fluent coverage guard (no bare user-facing strings)
@@ -79,7 +111,7 @@ jobs:
   # ── Post-format build + check fan-out ─────────────────────────────────────
 
   build:
-    name: Build ${{ matrix.target }}
+    name: ${{ matrix.label }} ${{ matrix.target }}
     needs: [fmt]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
@@ -89,10 +121,16 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            cmd: build
+            label: Build
           - os: macos-14
             target: aarch64-apple-darwin
+            cmd: check
+            label: Check
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            cmd: check
+            label: Check
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
@@ -100,19 +138,55 @@ jobs:
           toolchain: 1.93.0
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        id: rust-cache
         with:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install mold linker
         if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y mold
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
+            /etc/apt/sources.list.d/azure-cli.list
+          sudo apt-get update -qq
+          sudo apt-get install -y mold
       - name: Ensure web/dist placeholder exists
         shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
-      - name: Build
+      - name: ${{ matrix.label }}
         shell: bash
-        run: cargo build --profile ci --locked --target ${{ matrix.target }}
+        run: |
+          set +e
+          cargo_log="${RUNNER_TEMP}/cargo-build-${{ matrix.target }}.log"
+          SECONDS=0
+          cargo ${{ matrix.cmd }} --profile ci --locked --target ${{ matrix.target }} 2>&1 | tee "$cargo_log"
+          cargo_status=${PIPESTATUS[0]}
+          duration_seconds=$SECONDS
+          set -e
+
+          workspace_path_compiles="$(grep -E -c 'Compiling.*\([^)]*zeroclaw' "$cargo_log" || true)"
+          total_compiles="$(grep -c 'Compiling' "$cargo_log" || true)"
+          downloaded_crates="$(grep -c 'Downloaded' "$cargo_log" || true)"
+          cache_hit="${RUST_CACHE_HIT:-unknown}"
+          summary_file="${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+          {
+            echo "### ${{ matrix.label }} diagnostics: ${{ matrix.target }}"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Target | \`${{ matrix.target }}\` |"
+            echo "| Runner OS | \`${{ runner.os }}\` |"
+            echo "| Rust cache exact hit | \`${cache_hit}\` |"
+            echo "| Cargo duration | \`${duration_seconds}s\` |"
+            echo "| Cargo status | \`${cargo_status}\` |"
+            echo "| Workspace path compile lines | \`${workspace_path_compiles}\` |"
+            echo "| Total compile lines | \`${total_compiles}\` |"
+            echo "| Downloaded crate lines | \`${downloaded_crates}\` |"
+          } >> "$summary_file"
+
+          exit "$cargo_status"
         env:
+          RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
@@ -208,7 +282,11 @@ jobs:
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Install mold linker
-        run: sudo apt-get update -qq && sudo apt-get install -y mold
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
+            /etc/apt/sources.list.d/azure-cli.list
+          sudo apt-get update -qq
+          sudo apt-get install -y mold
       - name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
       - name: Run tests
@@ -269,6 +347,20 @@ jobs:
           BASE_SHA: ${{ steps.base.outputs.sha }}
         run: bash scripts/ci/docs_quality_gate.sh
 
+  installer-drift:
+    name: Installer Drift
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.93.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Check generated install surfaces are in sync with the spec
+        run: cargo generate installers --check
+
   # ── Required gate ─────────────────────────────────────────────────────────
   # Branch protection requires only this single job — internal structure
   # can change without touching branch protection settings.
@@ -276,7 +368,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, lint, build, check, check-32bit, bench, test, security, nix-eval, docs-style]
+    needs: [fmt, lint, build, check, check-32bit, bench, test, security, nix-eval, docs-style, installer-drift]
     runs-on: ubuntu-latest
     steps:
       - name: Check results

@@ -18,15 +18,13 @@ see the colors before applying.
 
 ### Available themes
 
-Two themes are authored directly in zerocode because they have no registry
-entry:
+One theme is authored directly in zerocode because it has no registry entry:
 
 - **`terminal`**: inherits your terminal's own colors. Every role is left to
   the terminal default and the app skips painting a background, so a tuned shell
   palette shows through untouched.
-- **`icy_blue`**: the default on non-macOS platforms.
 
-The remaining themes are generated at build time from the dashboard theme
+The real color palettes are generated at build time from the dashboard theme
 registry (`web/src/contexts/themes.json`), the single source of truth zerocode,
 the React dashboard, and these docs all read. The list below is produced by
 `cargo xtask mdbook themes` and included at build time. It is never committed:
