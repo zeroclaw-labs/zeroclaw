@@ -113,7 +113,9 @@ pub async fn check(target_version: Option<&str>) -> Result<UpdateInfo> {
 /// Run the full 6-phase update pipeline.
 ///
 /// If `target_version` is `Some`, fetch that specific version instead of latest.
-pub async fn run(target_version: Option<&str>) -> Result<()> {
+/// When `force` is set, install the target even if it is not newer than the
+/// current version (reinstall, or downgrade/pin to a specific `--version`).
+pub async fn run(target_version: Option<&str>, force: bool) -> Result<()> {
     // Phase 1: Preflight
     ::zeroclaw_log::record!(
         INFO,
@@ -122,7 +124,7 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
     );
     let update_info = check(target_version).await?;
 
-    if !update_info.is_newer {
+    if !should_install(update_info.is_newer, force) {
         println!(
             "{}",
             update_already_current_message(&update_info.current_version)
@@ -130,10 +132,18 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
         return Ok(());
     }
 
-    println!(
-        "Update available: v{} -> v{}",
-        update_info.current_version, update_info.latest_version
-    );
+    if update_info.is_newer {
+        println!(
+            "Update available: v{} -> v{}",
+            update_info.current_version, update_info.latest_version
+        );
+    } else {
+        // --force on a version that is not newer: reinstall or downgrade/pin.
+        println!(
+            "Forcing reinstall: v{} -> v{}",
+            update_info.current_version, update_info.latest_version
+        );
+    }
 
     let download_url = update_info
         .download_url
@@ -328,6 +338,14 @@ fn version_is_newer(current: &str, candidate: &str) -> bool {
     let cur = parse(current);
     let cand = parse(candidate);
     cand > cur
+}
+
+/// Decide whether to proceed with the install. A newer version always installs;
+/// a non-newer one (same or older) installs only with `--force`, which enables
+/// reinstalling the current version or downgrading/pinning to a specific
+/// `--version`.
+fn should_install(is_newer: bool, force: bool) -> bool {
+    is_newer || force
 }
 
 async fn download_binary(url: &str, sha256sums_url: Option<&str>, dest: &Path) -> Result<()> {
@@ -771,6 +789,14 @@ async fn smoke_test(binary: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_install_requires_newer_or_force() {
+        assert!(should_install(true, false)); // newer → install
+        assert!(should_install(true, true)); // newer + force → install
+        assert!(!should_install(false, false)); // not newer → skip
+        assert!(should_install(false, true)); // not newer + force → reinstall/downgrade
+    }
 
     #[test]
     fn test_version_comparison() {
