@@ -1553,9 +1553,7 @@ mod tests {
         check_config_semantics(&config, &mut items);
 
         let invalid = items.iter().find(|i| {
-            i.message.contains("model_provider \"custom.vllm\" is invalid")
-            i.message
-                .contains("model_provider \"custom.vllm\" is invalid")
+            i.message.contains("model_provider \"custom.vllm\" is invalid");
         });
         assert!(
             invalid.is_none(),
