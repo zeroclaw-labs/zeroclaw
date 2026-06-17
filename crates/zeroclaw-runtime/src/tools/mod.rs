@@ -612,7 +612,12 @@ pub fn all_tools_with_runtime(
     // bot/server set); the search tool reads from a shared archive DB
     // so it's enabled when at least one alias archives.
     if root_config.channels.discord.values().any(|d| d.archive) {
-        match zeroclaw_memory::SqliteMemory::new_named("sqlite", workspace_dir, "discord") {
+        // Read from the SHARED store (`config.data_dir`) the channel archive
+        // writer persists to (orchestrator builds `discord.db` under
+        // `&config.data_dir`), NOT the per-agent `workspace_dir` — otherwise the
+        // tool opens an empty DB and litters a stray `memory/discord.db` under
+        // every agent workspace.
+        match zeroclaw_memory::SqliteMemory::new_named("sqlite", &config.data_dir, "discord") {
             Ok(discord_mem) => {
                 tool_arcs.push(Arc::new(DiscordSearchTool::new(Arc::new(discord_mem))));
             }
@@ -1038,8 +1043,12 @@ pub fn all_tools_with_runtime(
     // created via /ws/chat was invisible to `sessions_list` /
     // `sessions_history`. Routing both call sites through the factory
     // closes that gap and honors the operator's configured backend.
+    // Read from the SHARED sessions store (`config.data_dir`) the gateway/daemon
+    // write to (they build the backend under `&config.data_dir`), NOT the
+    // per-agent `workspace_dir` — otherwise `sessions_list`/`sessions_history`
+    // miss real sessions and a stray `sessions/sessions.db` is created per agent.
     if let Ok(backend) =
-        zeroclaw_infra::make_session_backend(workspace_dir, &config.channels.session_backend)
+        zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels.session_backend)
     {
         tool_arcs.push(Arc::new(SessionsCurrentTool::new(backend.clone())));
         tool_arcs.push(Arc::new(SessionsListTool::new(backend.clone())));
@@ -1653,6 +1662,99 @@ mod tests {
         // copying state.
         assert!(Arc::strong_count(&shared_engine) >= 3);
         assert!(Arc::strong_count(&shared_audit) >= 3);
+    }
+
+    /// Regression: `discord_search` and the `sessions_*` tools must open their
+    /// SQLite stores under the SHARED `config.data_dir` (where the channel
+    /// orchestrator / gateway WRITE them), not the per-agent `workspace_dir`.
+    /// Reading the per-agent dir made the tools see empty DBs and litter a
+    /// stray `memory/discord.db` + `sessions/sessions.db` into every agent
+    /// workspace. With `data_dir` and `workspace_dir` deliberately distinct,
+    /// nothing must be created under the workspace.
+    #[test]
+    fn shared_store_tools_open_data_dir_not_per_agent_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join("data"); // shared store (writers' dir)
+        let workspace_dir = tmp.path().join("agent-ws"); // per-agent, intentionally distinct
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig::default();
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let web = zeroclaw_config::schema::WebFetchConfig::default();
+        let risk = zeroclaw_config::schema::RiskProfileConfig::default();
+
+        // root_config: shared data_dir + a Discord alias that archives (this is
+        // what gates discord_search registration).
+        let mut root_config = test_config(&tmp);
+        root_config.data_dir = data_dir.clone();
+        root_config.channels.discord.insert(
+            "oracle".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                archive: true,
+                ..Default::default()
+            },
+        );
+
+        // `config` (arg 1) carries the canonical shared data_dir — exactly how
+        // the production callers pass it (a clone of the runtime config).
+        let config = Config {
+            data_dir: data_dir.clone(),
+            ..Config::default()
+        };
+
+        let tools = all_tools_with_runtime(
+            Arc::new(config),
+            &security,
+            &risk,
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &web,
+            workspace_dir.as_path(), // DIFFERENT from data_dir
+            &HashMap::new(),
+            None,
+            &root_config,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .tools;
+
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(
+            names.contains(&"discord_search"),
+            "discord_search must register when a Discord alias archives"
+        );
+        assert!(
+            names.iter().any(|n| n.starts_with("sessions")),
+            "session tools must register"
+        );
+
+        // The fix: both stores open under the shared data_dir, never the
+        // per-agent workspace. Pre-fix the readers created `memory/discord.db`
+        // and `sessions/sessions.db` under the workspace_dir.
+        assert!(
+            !workspace_dir.join("memory").exists(),
+            "discord_search must not open/create a store under the per-agent workspace_dir"
+        );
+        assert!(
+            !workspace_dir.join("sessions").exists(),
+            "session tools must not open/create a store under the per-agent workspace_dir"
+        );
     }
 
     /// Regression for #6687 blocker: a config with `sop.sops_dir` set but no
