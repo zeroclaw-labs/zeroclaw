@@ -296,6 +296,26 @@ pub async fn run_tool_call_loop(
             .into());
         }
 
+        // Modifying hook before LLM call (may rewrite messages/model or cancel).
+        // Runs before the framework's vision-provider routing and message
+        // preparation so user-defined strategies take priority over runtime
+        // fallbacks such as image-marker stripping.
+        let mut active_model = model.to_string();
+        if let Some(hooks) = hooks {
+            match hooks.run_before_llm_call(history, &mut active_model).await {
+                crate::hooks::HookResult::Continue(()) => {}
+                crate::hooks::HookResult::Cancel(reason) => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"reason": reason.to_string()})),
+                        "llm call cancelled by hook"
+                    );
+                    return Err(crate::agent::loop_::ToolLoopCancelled.into());
+                }
+            }
+        }
+
         let iteration_tool_specs = build_iteration_tool_specs(
             model_provider,
             tools_registry,
@@ -320,10 +340,13 @@ pub async fn run_tool_call_loop(
                 .vision_model_provider
                 .as_deref()
                 .unwrap_or(provider_name);
-            let vm = multimodal_config.vision_model.as_deref().unwrap_or(model);
+            let vm = multimodal_config
+                .vision_model
+                .as_deref()
+                .unwrap_or(&active_model);
             (vp_box.as_ref(), vp_name, vm)
         } else {
-            (model_provider, provider_name, model)
+            (model_provider, provider_name, &active_model)
         };
 
         let prepared_messages = prepare_messages_for_iteration(
