@@ -3547,6 +3547,7 @@ dependencies = [
  "toml 0.8.23",
  "xtask",
  "zeroclaw-api",
+ "zeroclaw-providers",
 ]
 
 [[package]]
@@ -14263,6 +14264,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-eval"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "zeroclaw-api",
+ "zeroclaw-config",
+ "zeroclaw-memory",
+ "zeroclaw-runtime",
+]
+
+[[package]]
 name = "zeroclaw-gateway"
 version = "0.8.0"
 dependencies = [
@@ -14415,6 +14433,7 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-config",
  "zeroclaw-log",
+ "zeroclaw-providers",
  "zeroclaw-spawn",
 ]
 
@@ -14515,6 +14534,7 @@ dependencies = [
  "dialoguer",
  "directories",
  "encoding_rs",
+ "filetime",
  "flate2",
  "fluent",
  "futures-util",
@@ -14734,6 +14754,7 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-channels",
  "zeroclaw-config",
+ "zeroclaw-eval",
  "zeroclaw-gateway",
  "zeroclaw-hardware",
  "zeroclaw-infra",

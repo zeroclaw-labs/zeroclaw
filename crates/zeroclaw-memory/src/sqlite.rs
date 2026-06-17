@@ -1226,8 +1226,14 @@ impl Memory for SqliteMemory {
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
             let conn = conn.lock();
+            // `agent_alias` is the human alias, but `memories.agent_id` holds
+            // the agent's UUID (FK → agents.id). Resolve alias → id via the same
+            // subselect the insert path uses (`store_with_agent`); binding the
+            // alias straight into agent_id matches zero rows and silently
+            // no-ops. An unknown alias yields a NULL subselect → matches
+            // nothing, which is the correct outcome.
             let affected = conn.execute(
-                "DELETE FROM memories WHERE agent_id = ?1",
+                "DELETE FROM memories WHERE agent_id = (SELECT id FROM agents WHERE alias = ?1 LIMIT 1)",
                 params![agent_alias],
             )?;
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
@@ -1692,6 +1698,54 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, "alpha-allowed");
+    }
+
+    #[tokio::test]
+    async fn sqlite_purge_agent_deletes_only_that_agents_rows() {
+        let (_tmp, mem) = temp_sqlite();
+        let alpha = mem.ensure_agent_uuid("alpha").await.unwrap();
+        let rogue = mem.ensure_agent_uuid("rogue").await.unwrap();
+
+        for idx in 0..3 {
+            mem.store_with_agent(
+                &format!("alpha-{idx}"),
+                "alpha row",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(&alpha),
+            )
+            .await
+            .unwrap();
+        }
+        for idx in 0..2 {
+            mem.store_with_agent(
+                &format!("rogue-{idx}"),
+                "rogue row",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(&rogue),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(mem.count().await.unwrap(), 5);
+
+        // Purge by ALIAS (not UUID). The regression: purge_agent bound the
+        // alias straight into the agent_id column, matched zero rows, and
+        // returned Ok(0) — so deleting an agent silently kept its memories.
+        // The fix resolves alias → id and must delete exactly alpha's rows.
+        let purged = mem.purge_agent("alpha").await.unwrap();
+        assert_eq!(purged, 3, "purge_agent must delete exactly alpha's rows");
+        assert_eq!(mem.count().await.unwrap(), 2, "rogue's rows must survive");
+
+        // Unknown alias → NULL id subselect → deletes nothing, returns 0.
+        let purged_ghost = mem.purge_agent("ghost").await.unwrap();
+        assert_eq!(purged_ghost, 0);
+        assert_eq!(mem.count().await.unwrap(), 2);
     }
 
     #[tokio::test]

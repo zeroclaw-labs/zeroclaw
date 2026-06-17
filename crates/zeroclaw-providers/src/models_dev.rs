@@ -77,9 +77,23 @@ pub(crate) fn filter_models(catalog: &Catalog, provider_key: &str) -> Result<Vec
 ///
 /// First call fetches the catalog; subsequent calls hit the cache. The
 /// returned list is sorted for stable menu rendering.
+///
+/// Attribution: the models.dev catalog is a global, pre-authentication
+/// metadata source with no concrete `Attributable` thing of its own.
+/// We wrap the body with `scope!(model_provider_type: "models_dev",
+/// model_provider_alias: "catalog", …)` so the `filter_models` warning
+/// (and any future record! inside `fetch_catalog`) lands with the
+/// model_provider_type and model_provider_alias slots populated.
 pub async fn list_models_for(provider_key: &str) -> Result<Vec<String>> {
-    let catalog = CACHED_CATALOG.get_or_try_init(fetch_catalog).await?;
-    filter_models(catalog, provider_key)
+    ::zeroclaw_log::scope!(
+        model_provider_type: "models_dev",
+        model_provider_alias: "catalog",
+        => async move {
+            let catalog = CACHED_CATALOG.get_or_try_init(fetch_catalog).await?;
+            filter_models(catalog, provider_key)
+        }
+    )
+    .await
 }
 
 #[cfg(test)]
