@@ -9,6 +9,7 @@
 
 use serde_json::json;
 
+use super::slash_options::{Choice, OptKind, OptionSpec};
 use super::types::{DiscordSlashCommandSpec, ReconcileOutcome};
 
 /// Discord caps an application at 100 global commands; stay under it with
@@ -99,9 +100,63 @@ pub fn discord_slash_specs_from_skills(
             skill_name,
             slug,
             description: description.chars().take(100).collect(),
+            options: map_skill_slash_options(skill),
         });
     }
     specs.sort_by(|a, b| a.slug.cmp(&b.slug));
+    map_options_cap(&mut specs);
+    specs
+}
+
+/// Map a skill's `[[skill.slash_options]]` declarations into Discord option
+/// specs. An option with an unknown `type` is dropped with a WARN rather than
+/// registering a bad type. Names are lower-cased and length-capped to Discord's
+/// option-name charset; required options are sorted first (Discord rejects a
+/// required option that follows an optional one).
+fn map_skill_slash_options(skill: &zeroclaw_runtime::skills::Skill) -> Vec<OptionSpec> {
+    let mut options = Vec::new();
+    for decl in &skill.slash_options {
+        let Some(kind) = OptKind::from_manifest(&decl.kind) else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "skill": skill.name,
+                        "option": decl.name,
+                        "type": decl.kind,
+                    })),
+                "skipping skill slash option with unknown type"
+            );
+            continue;
+        };
+        options.push(OptionSpec {
+            name: decl.name.to_ascii_lowercase().chars().take(32).collect(),
+            description: decl.description.chars().take(100).collect(),
+            kind,
+            required: decl.required,
+            choices: decl
+                .choices
+                .iter()
+                .map(|c| Choice {
+                    name: c.name.clone(),
+                    value: c.value.clone(),
+                })
+                .collect(),
+            min: decl.min,
+            max: decl.max,
+            min_length: decl.min_length,
+            max_length: decl.max_length,
+        });
+    }
+    // Discord requires required options to precede optional ones; stable sort
+    // keeps declaration order within each group.
+    options.sort_by_key(|o| !o.required);
+    options
+}
+
+/// Apply the per-application command cap, logging the dropped slugs.
+fn map_options_cap(specs: &mut Vec<DiscordSlashCommandSpec>) {
     if specs.len() > MAX_SKILL_SLASH_COMMANDS {
         let dropped: Vec<&str> = specs[MAX_SKILL_SLASH_COMMANDS..]
             .iter()
@@ -116,7 +171,6 @@ pub fn discord_slash_specs_from_skills(
         );
         specs.truncate(MAX_SKILL_SLASH_COMMANDS);
     }
-    specs
 }
 
 /// The desired global-command set: `/ask` plus one command per skill spec,
@@ -138,16 +192,27 @@ pub(crate) fn slash_command_registration_body(
         }]
     })];
     for spec in specs {
-        commands.push(json!({
-            "name": spec.slug,
-            "description": spec.description,
-            "type": 1, // CHAT_INPUT
-            "options": [{
+        // A skill that declares no typed options keeps the legacy single
+        // required string `input` (backward-compatible + the ownership marker
+        // for reaping); one that declares options registers them instead.
+        let options: Vec<serde_json::Value> = if spec.options.is_empty() {
+            vec![json!({
                 "name": "input",
                 "description": SKILL_COMMAND_OPTION_DESCRIPTION,
                 "type": 3, // STRING
                 "required": true
-            }]
+            })]
+        } else {
+            spec.options
+                .iter()
+                .map(OptionSpec::to_registration_json)
+                .collect()
+        };
+        commands.push(json!({
+            "name": spec.slug,
+            "description": spec.description,
+            "type": 1, // CHAT_INPUT
+            "options": options,
         }));
     }
     serde_json::Value::Array(commands)
@@ -171,6 +236,13 @@ pub(crate) const SKILL_COMMAND_OPTION_DESCRIPTION: &str = "What to send to the s
 /// each other's commands as reap candidates (commands are
 /// application-global, desired sets are per-alias). Enable slash commands
 /// on at most one alias per bot application.
+///
+/// Limitation (typed options): this recognizes only the legacy single-`input`
+/// shape. A skill command that declares typed options has a different shape and
+/// is therefore NOT auto-reaped when its skill is uninstalled — it is still
+/// upserted/updated normally while installed. This is deliberately conservative
+/// (it never risks deleting a foreign command); durable reaping of typed
+/// commands (persisting the registered slug set) is a follow-on.
 pub(crate) fn is_skill_command_shape(cmd: &serde_json::Value) -> bool {
     let Some(opts) = cmd.get("options").and_then(|o| o.as_array()) else {
         return false;
@@ -186,9 +258,14 @@ pub(crate) fn is_skill_command_shape(cmd: &serde_json::Value) -> bool {
 }
 
 /// Comparable projection of a command for change detection: description plus
-/// (name, type, required, description) per option. Discord decorates listed
-/// commands with server-side fields (id, version, default_member_permissions,
-/// …) that must not defeat the comparison.
+/// per-option (name, type, required, description) and, for typed options, the
+/// (choices, min/max value, min/max length) constraints. Discord decorates
+/// listed commands with server-side fields (id, version,
+/// default_member_permissions, …) that must not defeat the comparison; the
+/// numeric constraints are normalised (numbers → f64, lengths → u64, choice
+/// values → number-or-string) so an int-vs-float representation difference
+/// between what we send and what Discord echoes back doesn't force a spurious
+/// re-registration.
 pub(crate) fn command_projection(cmd: &serde_json::Value) -> serde_json::Value {
     json!({
         "description": cmd.get("description").cloned().unwrap_or_default(),
@@ -203,12 +280,40 @@ pub(crate) fn command_projection(cmd: &serde_json::Value) -> serde_json::Value {
                             "type": o.get("type").cloned().unwrap_or_default(),
                             "required": o.get("required").cloned().unwrap_or(json!(false)),
                             "description": o.get("description").cloned().unwrap_or_default(),
+                            "choices": o
+                                .get("choices")
+                                .and_then(|c| c.as_array())
+                                .map(|cs| {
+                                    cs.iter()
+                                        .map(|c| {
+                                            json!({
+                                                "name": c.get("name").cloned().unwrap_or_default(),
+                                                "value": normalize_scalar(c.get("value")),
+                                            })
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default(),
+                            "min_value": o.get("min_value").and_then(serde_json::Value::as_f64),
+                            "max_value": o.get("max_value").and_then(serde_json::Value::as_f64),
+                            "min_length": o.get("min_length").and_then(serde_json::Value::as_u64),
+                            "max_length": o.get("max_length").and_then(serde_json::Value::as_u64),
                         })
                     })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default(),
     })
+}
+
+/// Normalise a choice value for projection: a JSON number becomes an `f64`
+/// (so `10` and `10.0` compare equal), anything else is kept as-is.
+fn normalize_scalar(v: Option<&serde_json::Value>) -> serde_json::Value {
+    match v {
+        Some(serde_json::Value::Number(n)) => json!(n.as_f64()),
+        Some(other) => other.clone(),
+        None => serde_json::Value::Null,
+    }
 }
 
 /// Discord REST base; injectable in `reconcile_slash_commands` for tests.
@@ -368,4 +473,133 @@ pub(crate) async fn reconcile_slash_commands(
         );
     }
     Ok(ReconcileOutcome::Reconciled)
+}
+
+#[cfg(test)]
+mod typed_option_tests {
+    use super::super::slash_options::{OptKind, OptionSpec};
+    use super::*;
+
+    fn spec_with(options: Vec<OptionSpec>) -> DiscordSlashCommandSpec {
+        DiscordSlashCommandSpec {
+            skill_name: "s".to_string(),
+            slug: "s".to_string(),
+            description: "d".to_string(),
+            options,
+        }
+    }
+
+    fn opt(name: &str, kind: OptKind, required: bool) -> OptionSpec {
+        OptionSpec {
+            name: name.to_string(),
+            description: name.to_string(),
+            kind,
+            required,
+            choices: Vec::new(),
+            min: None,
+            max: None,
+            min_length: None,
+            max_length: None,
+        }
+    }
+
+    #[test]
+    fn no_options_falls_back_to_the_legacy_input() {
+        let body = slash_command_registration_body(&[spec_with(Vec::new())]);
+        let cmd = &body.as_array().unwrap()[1]; // [0] is /ask
+        let opts = cmd["options"].as_array().unwrap();
+        assert_eq!(opts.len(), 1);
+        assert_eq!(opts[0]["name"], json!("input"));
+        assert_eq!(opts[0]["type"], json!(3));
+        assert_eq!(
+            opts[0]["description"],
+            json!(SKILL_COMMAND_OPTION_DESCRIPTION)
+        );
+    }
+
+    #[test]
+    fn typed_options_replace_the_legacy_input() {
+        let mut limit = opt("limit", OptKind::Integer, false);
+        limit.min = Some(1.0);
+        limit.max = Some(50.0);
+        let mut query = opt("query", OptKind::String, true);
+        query.min_length = Some(1);
+        let body = slash_command_registration_body(&[spec_with(vec![query, limit])]);
+        let opts = body.as_array().unwrap()[1]["options"].as_array().unwrap();
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[0]["name"], json!("query"));
+        assert_eq!(opts[0]["type"], json!(3));
+        assert_eq!(opts[0]["min_length"], json!(1));
+        assert_eq!(opts[1]["name"], json!("limit"));
+        assert_eq!(opts[1]["type"], json!(4));
+        assert_eq!(opts[1]["min_value"], json!(1));
+        assert_eq!(opts[1]["max_value"], json!(50));
+    }
+
+    #[test]
+    fn projection_is_stable_across_int_vs_float_bounds() {
+        // What we send (integer min/max) vs what Discord might echo back (float),
+        // plus Discord's server-side decorations — must project equal.
+        let sent = json!({ "description": "d", "options": [
+            { "name": "limit", "type": 4, "required": false, "description": "l", "min_value": 1, "max_value": 50 }
+        ]});
+        let echoed = json!({ "description": "d", "id": "9", "version": "v", "options": [
+            { "name": "limit", "type": 4, "required": false, "description": "l", "min_value": 1.0, "max_value": 50.0 }
+        ]});
+        assert_eq!(command_projection(&sent), command_projection(&echoed));
+    }
+
+    #[test]
+    fn map_drops_unknown_kinds_and_sorts_required_first() {
+        let skill = zeroclaw_runtime::skills::Skill {
+            name: "s".to_string(),
+            description: "d".to_string(),
+            version: "0".to_string(),
+            author: None,
+            tags: vec!["slash".to_string()],
+            tools: Vec::new(),
+            prompts: Vec::new(),
+            slash_options: vec![
+                zeroclaw_runtime::skills::SkillSlashOption {
+                    name: "opt".to_string(),
+                    description: "o".to_string(),
+                    kind: "string".to_string(),
+                    required: false,
+                    choices: Vec::new(),
+                    min: None,
+                    max: None,
+                    min_length: None,
+                    max_length: None,
+                },
+                zeroclaw_runtime::skills::SkillSlashOption {
+                    name: "Req".to_string(),
+                    description: "r".to_string(),
+                    kind: "integer".to_string(),
+                    required: true,
+                    choices: Vec::new(),
+                    min: None,
+                    max: None,
+                    min_length: None,
+                    max_length: None,
+                },
+                zeroclaw_runtime::skills::SkillSlashOption {
+                    name: "bad".to_string(),
+                    description: "b".to_string(),
+                    kind: "bogus".to_string(),
+                    required: false,
+                    choices: Vec::new(),
+                    min: None,
+                    max: None,
+                    min_length: None,
+                    max_length: None,
+                },
+            ],
+            location: None,
+        };
+        let mapped = map_skill_slash_options(&skill);
+        assert_eq!(mapped.len(), 2, "the unknown-kind option is dropped");
+        assert_eq!(mapped[0].name, "req", "required first + name lower-cased");
+        assert!(mapped[0].required);
+        assert_eq!(mapped[1].name, "opt");
+    }
 }

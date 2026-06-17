@@ -21,6 +21,11 @@ pub use types::{DiscordSlashCommandResolver, DiscordSlashCommandSpec};
 // Contract types/codec/consts used throughout this module and its siblings.
 pub(crate) use types::*;
 
+// Contract tier: the typed slash-command option model the command spec carries.
+// Consumers (`types`, `slash`, dispatch) import `super::slash_options::…`
+// explicitly — no crate-wide re-export needed.
+mod slash_options;
+
 mod chunk;
 pub(crate) use chunk::*;
 
@@ -3235,6 +3240,7 @@ mod tests {
             skill_name: "deploy status".to_string(),
             slug: "deploy-status".to_string(),
             description: "Check deploy state".to_string(),
+            options: Vec::new(),
         }];
         let body = slash_command_registration_body(&specs);
         let commands = body.as_array().unwrap();
