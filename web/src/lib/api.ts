@@ -633,6 +633,9 @@ export interface SkillFrontmatter {
   author?: string | null;
   version?: string | null;
   category?: string | null;
+  /** Free-form skill tags. The `slash` tag opts the skill into Discord slash
+   *  commands (zeroclaw-labs/zeroclaw#7490); `open-skills` is loader-managed. */
+  tags?: string[];
 }
 
 export interface SkillBundleEntry {
