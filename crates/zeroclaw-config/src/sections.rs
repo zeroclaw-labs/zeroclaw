@@ -449,8 +449,9 @@ sections! {
         key:   "channels",
         shape: TypedFamilyMap,
         group: Foundation,
-        help:  "Pick which chat platforms ZeroClaw should listen on. You can \
-                configure multiple — each channel gets its own alias.",
+        help:  "Pick which chat platforms ZeroClaw should listen on. Global \
+                channel settings live on [channels]; each configured platform \
+                still gets its own alias.",
     },
     Hardware => {
         key:   "hardware",
