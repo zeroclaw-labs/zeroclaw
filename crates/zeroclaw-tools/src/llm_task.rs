@@ -11,6 +11,7 @@ use zeroclaw_api::model_provider::ModelProvider;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
+use zeroclaw_providers::ProviderDispatch;
 
 /// Tool that runs a single prompt through an LLM and optionally validates
 /// the response against a JSON Schema. No tools are provided to the LLM —
@@ -163,7 +164,7 @@ impl Tool for LlmTaskTool {
         // Make the LLM call (no tools, no agent loop). `temperature` is
         // already Option<f64>; pass straight through. None omits the field
         // on the wire so the provider applies its own default.
-        let response = match model_provider
+        let response = match ProviderDispatch::from_ref(&*model_provider)
             .simple_chat(&effective_prompt, model, temperature)
             .await
         {
