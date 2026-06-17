@@ -3070,6 +3070,90 @@ mod tests {
         }
     }
 
+    #[test]
+    fn direct_agent_turn_does_not_write_intermediate_native_text_to_stdout() {
+        let current_exe = std::env::current_exe().expect("current test binary path");
+        let output = std::process::Command::new(current_exe)
+            .args([
+                "direct_agent_turn_stdout_boundary_helper_4721",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .expect("helper test process should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            output.status.success(),
+            "helper failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            stdout,
+            stderr
+        );
+        assert!(
+            !stdout.contains("intermediate native narration"),
+            "intermediate native narration leaked to stdout:\n{stdout}"
+        );
+        assert!(
+            stderr.contains("intermediate native narration"),
+            "intermediate native narration was not routed to stderr:\n{stderr}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "subprocess helper for stdout/stderr boundary regression"]
+    async fn direct_agent_turn_stdout_boundary_helper_4721() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![
+                zeroclaw_providers::ChatResponse {
+                    text: Some("intermediate native narration".into()),
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: "tc1".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                zeroclaw_providers::ChatResponse {
+                    text: Some("final answer".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]),
+        });
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let answer = agent
+            .turn("run the tool")
+            .await
+            .expect("turn should finish");
+        assert_eq!(answer, "final answer");
+    }
+
     struct FailingModelProvider;
 
     #[async_trait]
