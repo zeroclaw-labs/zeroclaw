@@ -526,6 +526,26 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
             .map((e) => e.path)
             .filter((p) => /^providers\.models\.[^.]+\.[^.]+\.model$/.test(p))
             .map((p) => p.replace(/^providers\.models\./, '').replace(/\.model$/, ''));
+          // Also discover model-provider refs from [[model_routes]] entries
+          // (#7701). Each route carries a `model_provider` dotted ref
+          // (e.g. "openrouter.default") that the model selector should offer
+          // as a switch target even when no provider has a `model` field set.
+          try {
+            const routesList = await listProps('model_routes');
+            if (!cancelled) {
+              for (const entry of routesList.entries ?? []) {
+                if (
+                  /^model_routes\.\d+\.model_provider$/.test(entry.path) &&
+                  typeof entry.value === 'string' &&
+                  entry.value.length > 0
+                ) {
+                  refs.push(entry.value);
+                }
+              }
+            }
+          } catch {
+            // model_routes may not be present in all configs
+          }
           const unique = Array.from(new Set(refs));
           setAvailableModels(unique.length > 0 ? unique : activeRef ? [activeRef] : []);
         } catch {
