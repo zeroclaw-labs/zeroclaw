@@ -54,6 +54,14 @@ Both tokens are secrets, so set them through a surface that encrypts them:
 
 Set `app_token` the same way (it's the `xapp-` token from step 3).
 
+**Environment-variable alternative.** Both tokens can be supplied from the
+daemon's environment instead of the config file: `bot_token` is resolved from
+`ZEROCLAW_SLACK_BOT_TOKEN`, then `SLACK_BOT_TOKEN`; `app_token` from
+`ZEROCLAW_SLACK_APP_TOKEN`, then `SLACK_APP_TOKEN`. A value in the config file
+takes precedence over the environment. This lets you omit `bot_token` from
+`config.toml` entirely (e.g. for secret managers that inject env vars) without
+the config failing to load.
+
 ### 6. Invite the bot and test
 
 In Slack, go to a channel and type `/invite @YourBotName`. Then send a message

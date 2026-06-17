@@ -388,7 +388,8 @@ async fn handle_socket(
         }
     }
 
-    let session_cwd = match resolve_session_cwd(requested_cwd.as_deref(), &config.data_dir) {
+    let session_cwd = match resolve_ws_session_cwd(requested_cwd.as_deref(), &config, &agent_alias)
+    {
         Ok(cwd) => cwd,
         Err(e) => {
             let err = serde_json::json!({
@@ -419,6 +420,8 @@ async fn handle_socket(
             Some(&session_cwd),
             true,
             false,
+            state.sop_engine.clone(),
+            state.sop_audit.clone(),
             Some(state.canvas_store.clone()),
         )
         .await
@@ -736,6 +739,34 @@ fn resolve_session_cwd(
             cwd.display()
         ))
     })
+}
+
+fn resolve_ws_session_cwd(
+    requested_cwd: Option<&str>,
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> anyhow::Result<PathBuf> {
+    let agent_workspace = config.agent_workspace_dir(agent_alias);
+    if requested_cwd.is_none() {
+        std::fs::create_dir_all(&agent_workspace).map_err(|e| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "agent": agent_alias,
+                        "cwd": agent_workspace.display().to_string(),
+                        "error": format!("{}", e),
+                    })),
+                "ws agent workspace cwd rejected"
+            );
+            anyhow::Error::msg(format!(
+                "cwd is not a usable directory ({}): {e}",
+                agent_workspace.display()
+            ))
+        })?;
+    }
+    resolve_session_cwd(requested_cwd, &agent_workspace)
 }
 
 fn session_queue_ws_error_code(error: &crate::session_queue::SessionQueueError) -> &'static str {
@@ -1761,6 +1792,55 @@ mod tests {
         let resolved = resolve_session_cwd(None, fallback.path()).unwrap();
 
         assert_eq!(resolved, fallback.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_ws_session_cwd_defaults_to_agent_workspace_without_request() {
+        use tempfile::TempDir;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config
+            .agents
+            .insert("web".to_string(), AliasedAgentConfig::default());
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let agent_workspace = config.agent_workspace_dir("web");
+        assert!(!agent_workspace.exists());
+
+        let resolved = resolve_ws_session_cwd(None, &config, "web").unwrap();
+
+        assert!(agent_workspace.exists());
+        assert_eq!(resolved, agent_workspace.canonicalize().unwrap());
+        assert_ne!(resolved, config.data_dir.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_ws_session_cwd_keeps_requested_cwd_strict() {
+        use tempfile::TempDir;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config
+            .agents
+            .insert("web".to_string(), AliasedAgentConfig::default());
+        let agent_workspace = config.agent_workspace_dir("web");
+        let missing_requested = tmp.path().join("missing");
+
+        let err = resolve_ws_session_cwd(Some(missing_requested.to_str().unwrap()), &config, "web")
+            .expect_err("explicit missing cwd should be rejected");
+
+        assert!(!agent_workspace.exists());
+        assert!(err.to_string().contains("cwd is not a usable directory"));
     }
 
     #[test]

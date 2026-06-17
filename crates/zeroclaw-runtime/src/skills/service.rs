@@ -157,6 +157,7 @@ impl<'a> SkillsService<'a> {
             return Err(ServiceError::NotFound(target.to_string()));
         }
         std::fs::write(dir.join(SKILL_MANIFEST_FILENAME), doc.serialize())?;
+        super::cache::invalidate();
         Ok(())
     }
 
@@ -167,13 +168,10 @@ impl<'a> SkillsService<'a> {
         frontmatter: SkillFrontmatter,
         opts: ScaffoldOptions,
     ) -> Result<PathBuf, ServiceError> {
-        Ok(scaffold::scaffold_skill(
-            self.config,
-            &self.install_root,
-            target,
-            frontmatter,
-            opts,
-        )?)
+        let path =
+            scaffold::scaffold_skill(self.config, &self.install_root, target, frontmatter, opts)?;
+        super::cache::invalidate();
+        Ok(path)
     }
 
     /// Archive or purge a skill directory.
@@ -199,6 +197,7 @@ impl<'a> SkillsService<'a> {
                 std::fs::rename(&dir, archive_root.join(archive_name))?;
             }
         }
+        super::cache::invalidate();
         Ok(())
     }
 

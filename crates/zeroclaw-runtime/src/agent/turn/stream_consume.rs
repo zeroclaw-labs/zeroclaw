@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::model_provider::StreamEvent;
-use zeroclaw_providers::{ChatMessage, ChatRequest, ModelProvider, ToolCall};
+use zeroclaw_providers::{ChatMessage, ChatRequest, ModelProvider, ProviderDispatch, ToolCall};
 
 #[derive(Debug, Default)]
 pub(crate) struct StreamedChatOutcome {
@@ -40,7 +40,7 @@ pub(crate) async fn consume_provider_streaming_response(
     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
     strict_tool_parsing: bool,
 ) -> Result<StreamedChatOutcome> {
-    let mut provider_stream = model_provider.stream_chat(
+    let mut provider_stream = ProviderDispatch::from_ref(model_provider).stream_chat(
         ChatRequest {
             messages,
             tools: request_tools,
