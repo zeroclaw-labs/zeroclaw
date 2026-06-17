@@ -16,6 +16,8 @@ use zeroclaw_api::tool::{Tool, ToolResult};
 /// Default maximum number of search results.
 const DEFAULT_MAX_RESULTS: usize = 5;
 
+type ActivationHook = Arc<dyn Fn(Arc<dyn Tool>) + Send + Sync>;
+
 /// Tool-level access policy applied at discovery time.
 ///
 /// When set on `ToolSearchTool`, deferred tools that fail this check are
@@ -74,6 +76,7 @@ pub struct ToolSearchTool {
     deferred: DeferredMcpToolSet,
     activated: Arc<Mutex<ActivatedToolSet>>,
     access_policy: Option<ToolAccessPolicy>,
+    activation_hook: Option<ActivationHook>,
 }
 
 impl ToolSearchTool {
@@ -82,6 +85,7 @@ impl ToolSearchTool {
             deferred,
             activated,
             access_policy: None,
+            activation_hook: None,
         }
     }
 
@@ -90,10 +94,23 @@ impl ToolSearchTool {
         self
     }
 
+    pub fn with_activation_hook(mut self, hook: ActivationHook) -> Self {
+        self.activation_hook = Some(hook);
+        self
+    }
+
     fn is_allowed(&self, tool_name: &str) -> bool {
         self.access_policy
             .as_ref()
             .is_none_or(|p| p.is_tool_allowed(tool_name))
+    }
+
+    fn notify_activated(&self, tools: Vec<Arc<dyn Tool>>) {
+        if let Some(hook) = &self.activation_hook {
+            for tool in tools {
+                hook(tool);
+            }
+        }
     }
 }
 
@@ -175,7 +192,23 @@ impl Tool for ToolSearchTool {
         let mut output = String::from("<functions>\n");
         let mut activated_count = 0;
         let mut returned_count = 0;
-        let mut guard = self.activated.lock().unwrap();
+        let mut newly_activated = Vec::new();
+        let mut guard = match self.activated.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "query": query,
+                            "mode": "keyword_search",
+                        })),
+                    "tool_search activated-tool lock poisoned during keyword activation; recovering guard"
+                );
+                poisoned.into_inner()
+            }
+        };
 
         for stub in &results {
             if returned_count >= max_results {
@@ -196,7 +229,9 @@ impl Tool for ToolSearchTool {
                 if !guard.is_activated(&stub.prefixed_name)
                     && let Some(tool) = self.deferred.activate(&stub.prefixed_name)
                 {
-                    guard.activate(stub.prefixed_name.clone(), Arc::from(tool));
+                    let tool: Arc<dyn Tool> = Arc::from(tool);
+                    guard.activate(stub.prefixed_name.clone(), Arc::clone(&tool));
+                    newly_activated.push(tool);
                     activated_count += 1;
                 }
                 let _ = writeln!(
@@ -212,6 +247,7 @@ impl Tool for ToolSearchTool {
 
         output.push_str("</functions>\n");
         drop(guard);
+        self.notify_activated(newly_activated);
 
         ::zeroclaw_log::record!(
             DEBUG,
@@ -235,7 +271,23 @@ impl ToolSearchTool {
         let mut output = String::from("<functions>\n");
         let mut not_found = Vec::new();
         let mut activated_count = 0;
-        let mut guard = self.activated.lock().unwrap();
+        let mut newly_activated = Vec::new();
+        let mut guard = match self.activated.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "requested_names": names,
+                            "mode": "select",
+                        })),
+                    "tool_search activated-tool lock poisoned during select activation; recovering guard"
+                );
+                poisoned.into_inner()
+            }
+        };
 
         for name in names {
             if name.is_empty() {
@@ -255,7 +307,9 @@ impl ToolSearchTool {
                     if !guard.is_activated(name)
                         && let Some(tool) = self.deferred.activate(name)
                     {
-                        guard.activate(String::from(*name), Arc::from(tool));
+                        let tool: Arc<dyn Tool> = Arc::from(tool);
+                        guard.activate(String::from(*name), Arc::clone(&tool));
+                        newly_activated.push(tool);
                         activated_count += 1;
                     }
                     let _ = writeln!(
@@ -274,6 +328,7 @@ impl ToolSearchTool {
 
         output.push_str("</functions>\n");
         drop(guard);
+        self.notify_activated(newly_activated);
 
         if !not_found.is_empty() {
             let _ = write!(output, "\nNot found: {}", not_found.join(", "));
@@ -316,6 +371,16 @@ mod tests {
             input_schema: serde_json::json!({"type": "object", "properties": {}}),
         };
         DeferredMcpToolStub::new(name.to_string(), def)
+    }
+
+    fn assert_poisoned_activated_contains(
+        activated: &Arc<Mutex<ActivatedToolSet>>,
+        tool_name: &str,
+    ) {
+        let guard = activated
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(guard.is_activated(tool_name));
     }
 
     #[tokio::test]
@@ -388,6 +453,31 @@ mod tests {
         assert!(activated.lock().unwrap().is_activated("fs__read"));
     }
 
+    #[tokio::test]
+    async fn keyword_search_recovers_poisoned_activated_lock() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let poisoned = Arc::clone(&activated);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().expect("test mutex should lock");
+            panic!("poison activated-tools lock");
+        })
+        .join();
+        let tool = ToolSearchTool::new(
+            make_deferred_set(vec![make_stub("fs__read", "Read a file from disk")]).await,
+            Arc::clone(&activated),
+        );
+
+        let result = tool
+            .execute(serde_json::json!({"query": "read file"}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("<function>"));
+        assert!(result.output.contains("fs__read"));
+        assert_poisoned_activated_contains(&activated, "fs__read");
+    }
+
     /// Verify tool_search works with stubs from multiple MCP servers,
     /// simulating a daemon-mode setup where several servers are deferred.
     #[tokio::test]
@@ -453,6 +543,32 @@ mod tests {
         assert_eq!(guard.tool_specs().len(), 2);
     }
 
+    #[tokio::test]
+    async fn select_recovers_poisoned_activated_lock() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let poisoned = Arc::clone(&activated);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().expect("test mutex should lock");
+            panic!("poison activated-tools lock");
+        })
+        .join();
+        let stubs = vec![
+            make_stub("srv__tool_a", "Tool A"),
+            make_stub("srv__tool_b", "Tool B"),
+        ];
+        let tool = ToolSearchTool::new(make_deferred_set(stubs).await, Arc::clone(&activated));
+
+        let result = tool
+            .execute(serde_json::json!({"query": "select:srv__tool_a"}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("<function>"));
+        assert!(result.output.contains("srv__tool_a"));
+        assert_poisoned_activated_contains(&activated, "srv__tool_a");
+    }
+
     /// Verify re-activating an already-activated tool does not duplicate it.
     #[tokio::test]
     async fn reactivation_is_idempotent() {
@@ -470,6 +586,29 @@ mod tests {
             .unwrap();
 
         assert_eq!(activated.lock().unwrap().tool_specs().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn activation_hook_receives_newly_activated_tools_once() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_hook = Arc::clone(&seen);
+        let tool = ToolSearchTool::new(
+            make_deferred_set(vec![make_stub("srv__tool", "A tool")]).await,
+            Arc::clone(&activated),
+        )
+        .with_activation_hook(Arc::new(move |tool| {
+            seen_hook.lock().unwrap().push(tool.name().to_string());
+        }));
+
+        tool.execute(serde_json::json!({"query": "select:srv__tool"}))
+            .await
+            .unwrap();
+        tool.execute(serde_json::json!({"query": "select:srv__tool"}))
+            .await
+            .unwrap();
+
+        assert_eq!(seen.lock().unwrap().as_slice(), ["srv__tool"]);
     }
 
     #[test]
