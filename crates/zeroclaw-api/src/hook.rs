@@ -54,10 +54,10 @@ pub trait HookHandler: Send + Sync {
 
     async fn before_llm_call(
         &self,
-        messages: Vec<ChatMessage>,
-        model: String,
-    ) -> HookResult<(Vec<ChatMessage>, String)> {
-        HookResult::Continue((messages, model))
+        _messages: &mut Vec<ChatMessage>,
+        _model: &mut String,
+    ) -> HookResult<()> {
+        HookResult::Continue(())
     }
 
     async fn before_tool_call(&self, name: String, args: Value) -> HookResult<(String, Value)> {

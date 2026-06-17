@@ -121,7 +121,7 @@ use zeroclaw_api::session_keys::sanitize_session_key;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
-use zeroclaw_providers::{self, ChatMessage, ModelProvider};
+use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
 use zeroclaw_runtime::agent::loop_::{
     LoopKnobs, apply_policy_tool_filter, apply_text_tool_prompt_policy,
     build_tool_instructions_for_names, clear_model_switch_request, get_model_switch_state,
@@ -202,7 +202,7 @@ impl Observer for ChannelNotifyObserver {
 /// Per-sender conversation history for channel messages.
 /// Bounded by `MAX_CONVERSATION_SENDERS` — oldest-accessed senders are evicted.
 type ConversationHistoryMap = Arc<Mutex<lru::LruCache<String, Vec<ChatMessage>>>>;
-/// Senders that requested `/new` and must force a fresh prompt on their next message.
+/// Senders that requested `/new` or `/clear` and must force a fresh prompt on their next message.
 type PendingNewSessionSet = Arc<Mutex<HashSet<String>>>;
 /// Maximum conversation senders kept in memory (LRU eviction beyond this).
 const MAX_CONVERSATION_SENDERS: usize = 1000;
@@ -543,11 +543,9 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
     // after a restart; otherwise hydration loads sessions under the on-disk
     // (sanitized) name while lookup keeps producing the un-sanitized form.
     let thread_scope = match msg.thread_ts.as_deref() {
-        // Matrix root events can be self-anchored when `reply_in_thread`
-        // is enabled so outbound replies open a thread. That anchor is a
-        // delivery detail, not a conversation-history boundary; otherwise
-        // every top-level Matrix message becomes a fresh session.
-        Some(tid) if is_matrix_channel_name(&msg.channel) && tid == msg.id => None,
+        // Matrix thread_ts is a delivery anchor, not a topic boundary: root
+        // and follow-ups must share one sender+room session. See #7700.
+        Some(_) if is_matrix_channel_name(&msg.channel) => None,
         other => other,
     };
     let raw = match thread_scope {
@@ -816,7 +814,12 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Structure longer answers with bold headers, not raw markdown ## headers\n\
              - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n\
-             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
+             - When a question needs current, real-time, or external information \
+               (prices, news, weather, web pages, lookups, etc.), use your tools — \
+               e.g. web_search_tool and web_fetch — to obtain it before answering; \
+               never guess or answer from memory alone when a tool can verify it.\n\
+             - Present the final answer to the latest user message directly from the \
+               tool results, without narrating delayed/internal tool-execution bookkeeping.",
         ),
         "qq" => Some(
             "When responding on QQ:\n\
@@ -1133,8 +1136,15 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         .to_ascii_lowercase();
 
     match base_command.as_str() {
-        // `/new` is available on every channel — no model-switch gate.
+        // `/new` and bare `/clear` are available on every channel — no model-switch gate.
         "/new" => Some(ChannelRuntimeCommand::NewSession),
+        "/clear" => {
+            if parts.next().is_none() {
+                Some(ChannelRuntimeCommand::NewSession)
+            } else {
+                None
+            }
+        }
         // Model/model_provider switching is channel-gated.
         "/models" if supports_runtime_model_switch(channel_name) => {
             if let Some(model_provider) = parts.next() {
@@ -1445,7 +1455,10 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     )?;
     let model_provider_instance: Arc<dyn ModelProvider> = Arc::from(model_provider_instance);
 
-    if let Err(err) = model_provider_instance.warmup().await {
+    if let Err(err) = ProviderDispatch::from_ref(&*model_provider_instance)
+        .warmup()
+        .await
+    {
         if zeroclaw_providers::reliable::is_non_retryable(&err) {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": next_defaults.default_model_provider, "model": next_defaults.model, "err": err.to_string()})), "Rejecting config reload: model not available (non-retryable)");
             return Ok(());
@@ -2057,7 +2070,7 @@ async fn get_or_create_provider(
     .await?;
     let model_provider: Arc<dyn ModelProvider> = Arc::from(model_provider);
 
-    if let Err(err) = model_provider.warmup().await {
+    if let Err(err) = ProviderDispatch::from_ref(&*model_provider).warmup().await {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -2799,7 +2812,7 @@ async fn classify_channel_reply_intent(
         let _ = writeln!(convo, "[{role}] {safe_content}");
     }
 
-    let response = model_provider
+    let response = ProviderDispatch::from_ref(model_provider)
         .chat_with_system(Some(system_prompt), &convo, model, temperature)
         .await?;
     Ok(parse_reply_intent(&response))
@@ -4154,7 +4167,11 @@ async fn process_channel_message_body(
     // ── Reply-intent precheck ────────────────────────────────────────
     let explicit_channel_address =
         is_explicitly_addressed_channel_message(&msg.channel, &msg.content);
-    let classifier_intent = if explicit_channel_address {
+    let direct_message = target_channel
+        .as_ref()
+        .map(|c| c.is_direct_message(&msg))
+        .unwrap_or(false);
+    let classifier_intent = if explicit_channel_address || direct_message {
         AssistantChannelOutcome::Reply(String::new())
     } else {
         let (classifier_provider_arc, classifier_model_owned, classifier_temperature): (
@@ -5492,7 +5509,7 @@ pub async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<(
         .peer_groups
         .entry(group_name.clone())
         .or_insert_with(|| PeerGroupConfig {
-            channel: "telegram.default".to_string(),
+            channel: "telegram.default".into(),
             ..PeerGroupConfig::default()
         });
 
@@ -5624,6 +5641,18 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
     Ok(false)
 }
 
+#[cfg(any(
+    test,
+    feature = "channel-discord",
+    feature = "channel-matrix",
+    feature = "channel-slack",
+    feature = "channel-telegram",
+    feature = "channel-wechat",
+))]
+fn one_shot_channel_workspace_dir(config: &Config, channel_type: &str, alias: &str) -> PathBuf {
+    config.channel_workspace_dir(&format!("{channel_type}.{alias}"))
+}
+
 /// Build a single channel instance by config section name (e.g. "telegram").
 fn build_channel_by_id(
     config_arc: &Arc<RwLock<Config>>,
@@ -5646,6 +5675,7 @@ fn build_channel_by_id(
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_external_peers("telegram", &alias))
             };
+            let workspace_dir = one_shot_channel_workspace_dir(&config, "telegram", &alias);
             Ok(Arc::new(
                 TelegramChannel::new(
                     tg.bot_token.clone(),
@@ -5654,12 +5684,13 @@ fn build_channel_by_id(
                     tg.mention_only,
                 )
                 .with_persistence(config_arc.clone())
+                .with_api_base(tg.api_base_url.clone())
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_transcription(config.transcription.clone())
                 .with_tts(&config)
                 .with_voice_peer_prefs(&config, "telegram", alias)
-                .with_workspace_dir(config.data_dir.clone())
+                .with_workspace_dir(workspace_dir)
                 .with_approval_timeout_secs(tg.approval_timeout_secs),
             ))
         }
@@ -5680,6 +5711,7 @@ fn build_channel_by_id(
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_external_peers("discord", &alias))
             };
+            let workspace_dir = one_shot_channel_workspace_dir(&config, "discord", &alias);
             Ok(Arc::new(
                 DiscordChannel::new(
                     dc.bot_token.clone(),
@@ -5690,7 +5722,7 @@ fn build_channel_by_id(
                     dc.mention_only,
                 )
                 .with_channel_ids(dc.channel_ids.clone())
-                .with_workspace_dir(config.data_dir.clone())
+                .with_workspace_dir(workspace_dir)
                 .with_streaming(
                     dc.stream_mode,
                     dc.draft_update_interval_ms,
@@ -5699,7 +5731,8 @@ fn build_channel_by_id(
                 .with_transcription(config.transcription.clone())
                 .with_stall_timeout(dc.stall_timeout_secs)
                 .with_approval_timeout_secs(dc.approval_timeout_secs)
-                .with_intents_mask(dc.intents_mask),
+                .with_intents_mask(dc.intents_mask)
+                .with_reaction_notifications(dc.reaction_notifications),
             ))
         }
         #[cfg(not(feature = "channel-discord"))]
@@ -5719,6 +5752,7 @@ fn build_channel_by_id(
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_external_peers("slack", &alias))
             };
+            let workspace_dir = one_shot_channel_workspace_dir(&config, "slack", &alias);
             Ok(Arc::new(
                 SlackChannel::new(
                     sl.bot_token.clone(),
@@ -5727,7 +5761,7 @@ fn build_channel_by_id(
                     alias,
                     peer_resolver,
                 )
-                .with_workspace_dir(config.data_dir.clone())
+                .with_workspace_dir(workspace_dir)
                 .with_markdown_blocks(sl.use_markdown_blocks)
                 .with_transcription(config.transcription.clone())
                 .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms)
@@ -5819,10 +5853,11 @@ fn build_channel_by_id(
                     Arc::new(move || cfg_arc.read().channel_external_peers("matrix", &alias))
                 };
                 let ack = mx.ack_reactions.unwrap_or(config.channels.ack_reactions);
+                let workspace_dir = one_shot_channel_workspace_dir(&config, "matrix", &alias);
                 Ok(Arc::new(
                     MatrixChannel::new(mx.clone(), alias, peer_resolver, state_dir)?
                         .with_transcription(config.transcription.clone())
-                        .with_workspace_dir(config.data_dir.clone())
+                        .with_workspace_dir(workspace_dir)
                         .with_ack_reactions(ack),
                 ))
             }
@@ -5841,7 +5876,7 @@ fn build_channel_by_id(
                     .context("WhatsApp channel is not configured")?;
                 if !wa.is_web_config() {
                     anyhow::bail!(
-                        "WhatsApp channel send requires Web mode (session_path must be set)"
+                        "WhatsApp channel send requires Web mode (set session_path, pair_phone, or mode = personal)"
                     );
                 }
                 let alias = "default".to_string();
@@ -6022,6 +6057,7 @@ fn build_channel_by_id(
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_external_peers("wechat", &alias))
             };
+            let workspace_dir = one_shot_channel_workspace_dir(&config, "wechat", &alias);
             Ok(Arc::new(
                 WeChatChannel::new(
                     alias,
@@ -6031,7 +6067,7 @@ fn build_channel_by_id(
                     wc.state_dir.as_ref().map(|s| expand_tilde_in_path(s)),
                 )?
                 .with_persistence(config_arc.clone())
-                .with_workspace_dir(config.data_dir.clone()),
+                .with_workspace_dir(workspace_dir),
             ))
         }
         #[cfg(not(feature = "channel-wechat"))]
@@ -6644,6 +6680,7 @@ fn collect_configured_channels(
                         tg.mention_only,
                     )
                     .with_persistence(config_arc.clone())
+                    .with_api_base(tg.api_base_url.clone())
                     .with_ack_reactions(ack)
                     .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                     .with_transcription(config.transcription.clone())
@@ -6702,7 +6739,37 @@ fn collect_configured_channels(
         .with_transcription(config.transcription.clone())
         .with_stall_timeout(dc.stall_timeout_secs)
         .with_approval_timeout_secs(dc.approval_timeout_secs)
-        .with_intents_mask(dc.intents_mask);
+        .with_slash_commands(dc.slash_commands)
+        .with_intents_mask(dc.intents_mask)
+        .with_reaction_notifications(dc.reaction_notifications);
+        if dc.slash_commands {
+            // Skill-derived commands: resolved from canonical state at
+            // READY/interaction time (no cache), scoped to the agent that
+            // owns this channel alias. Orphan channels resolve to none —
+            // they register `/ask` only. The config is cloned out of the
+            // read guard before any skill IO: the loader hits the
+            // filesystem (and may sync the open-skills repo), and holding
+            // a read guard across that would stall every config consumer
+            // behind a queued writer.
+            let cfg_arc_for_slash = config_arc.clone();
+            let channel_ref = format!("discord.{alias}");
+            discord_ch = discord_ch.with_slash_command_resolver(std::sync::Arc::new(move || {
+                let config = { cfg_arc_for_slash.read().clone() };
+                let Some(agent_alias) = config
+                    .agent_for_channel(&channel_ref)
+                    .map(ToString::to_string)
+                else {
+                    return Vec::new();
+                };
+                let workspace = config.agent_workspace_dir(&agent_alias);
+                let skills = zeroclaw_runtime::skills::load_skills_for_agent(
+                    &workspace,
+                    &config,
+                    &agent_alias,
+                );
+                crate::discord::discord_slash_specs_from_skills(&skills)
+            }));
+        }
         if dc.archive {
             match zeroclaw_memory::SqliteMemory::new_named("sqlite", &config.data_dir, "discord") {
                 Ok(mem) => {
@@ -6986,7 +7053,7 @@ fn collect_configured_channels(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                "WhatsApp config has both phone_number_id and session_path set; preferring Cloud API mode. Remove one selector to avoid ambiguity."
+                "WhatsApp config has both phone_number_id (Cloud) and a Web selector (session_path/pair_phone/pair_code/ws_url/mode=personal) set; preferring Cloud API mode. Remove one selector to avoid ambiguity."
             );
         }
         // Runtime negotiation: detect backend type from config
@@ -8192,6 +8259,8 @@ pub async fn start_channels(
     config: Config,
     canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
     cancel: tokio_util::sync::CancellationToken,
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 ) -> Result<()> {
     // Wrap into the canonical shared handle so channels and persistence
     // paths share one source of truth. The local `config` shadowing
@@ -8347,7 +8416,7 @@ pub async fn start_channels(
             .await?,
         );
 
-        if let Err(e) = model_provider.warmup().await {
+        if let Err(e) = ProviderDispatch::from_ref(&*model_provider).warmup().await {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -8406,6 +8475,8 @@ pub async fn start_channels(
             canvas_store.clone(),
             false,
             None,
+            sop_engine.clone(),
+            sop_audit.clone(),
         );
         let mut built_tools = all_tools_result_ch.tools;
         let delegate_handle_ch = all_tools_result_ch.delegate_handle;
@@ -9217,7 +9288,8 @@ pub async fn deliver_announcement(
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
             let ch =
-                TelegramChannel::new(tg.bot_token.clone(), alias, peer_resolver, tg.mention_only);
+                TelegramChannel::new(tg.bot_token.clone(), alias, peer_resolver, tg.mention_only)
+                    .with_api_base(tg.api_base_url.clone());
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(not(feature = "channel-telegram"))]
@@ -9409,6 +9481,45 @@ pub async fn deliver_announcement(
                 .get(alias)
                 .ok_or_else(not_configured)?;
             anyhow::bail!("wecom_ws channel is not connected");
+        }
+        #[cfg(feature = "channel-email")]
+        "email" => {
+            let em = config
+                .channels
+                .email
+                .get(alias)
+                .ok_or_else(not_configured)?;
+            let peers = config.channel_external_peers("email", alias);
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+                Arc::new(move || peers.clone());
+            let ch = EmailChannel::new(em.clone(), alias.to_string(), peer_resolver);
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+        }
+        #[cfg(not(feature = "channel-email"))]
+        "email" => {
+            anyhow::bail!("Email channel requires the `channel-email` feature");
+        }
+        #[cfg(feature = "whatsapp-web")]
+        "whatsapp" | "whatsapp-web" | "whatsapp_web" => {
+            let wa = config
+                .channels
+                .whatsapp
+                .get(alias)
+                .ok_or_else(not_configured)?;
+            if !wa.is_web_config() {
+                anyhow::bail!(
+                    "WhatsApp channel send requires Web mode (set session_path, pair_phone, or mode = personal)"
+                );
+            }
+            let peers = config.channel_external_peers("whatsapp", alias);
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+                Arc::new(move || peers.clone());
+            let ch = WhatsAppWebChannel::new(wa, alias.to_string(), peer_resolver);
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+        }
+        #[cfg(not(feature = "whatsapp-web"))]
+        "whatsapp" | "whatsapp-web" | "whatsapp_web" => {
+            anyhow::bail!("WhatsApp channel requires the `whatsapp-web` feature");
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
@@ -12414,7 +12525,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-42".to_string(),
                 content: "What is the BTC price now?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -12529,7 +12640,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-42".to_string(),
                 content: "Which session is this?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -12654,7 +12765,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-42".to_string(),
                 content: "What is the BTC price now?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -12802,7 +12913,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-42".to_string(),
                 content: "What is the BTC price now?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -12919,7 +13030,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-42".to_string(),
                 content: "What is the BTC price now?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -13052,7 +13163,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-telegram".to_string(),
                 content: "What is the BTC price now?".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -13173,7 +13284,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-raw".to_string(),
                 content: "What is the BTC price now?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 3,
                 thread_ts: None,
@@ -13279,7 +13390,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "bob".to_string(),
                 reply_target: "chat-84".to_string(),
                 content: "What is the BTC price now?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: None,
@@ -13405,7 +13516,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "/models openrouter".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -13548,7 +13659,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "hello routed model_provider".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: None,
@@ -13623,7 +13734,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-precheck".to_string(),
                 content: "background chatter".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -13754,7 +13865,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "hello cached default model_provider".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 3,
                 thread_ts: None,
@@ -13858,7 +13969,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-iter-success".to_string(),
                 content: "Loop until done".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -13969,7 +14080,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "bob".to_string(),
                 reply_target: "chat-iter-fail".to_string(),
                 content: "Loop forever".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: None,
@@ -14335,7 +14446,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sender: "alice".to_string(),
             reply_target: "alice".to_string(),
             content: "hello".to_string(),
-            channel: "test-channel".to_string(),
+            channel: "test-channel".into(),
             channel_alias: None,
             timestamp: 1,
             thread_ts: None,
@@ -14350,7 +14461,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sender: "bob".to_string(),
             reply_target: "bob".to_string(),
             content: "world".to_string(),
-            channel: "test-channel".to_string(),
+            channel: "test-channel".into(),
             channel_alias: None,
             timestamp: 2,
             thread_ts: None,
@@ -14476,7 +14587,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "forwarded content".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -14492,7 +14603,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "summarize this".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: None,
@@ -14626,7 +14737,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "U123".to_string(),
                 reply_target: "C123".to_string(),
                 content: "first question".to_string(),
-                channel: "slack".to_string(),
+                channel: "slack".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: Some("1741234567.100001".to_string()),
@@ -14642,7 +14753,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "U123".to_string(),
                 reply_target: "C123".to_string(),
                 content: "second question".to_string(),
-                channel: "slack".to_string(),
+                channel: "slack".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: Some("1741234567.100001".to_string()),
@@ -14779,7 +14890,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "15555550123".to_string(),
                 reply_target: "15555550123".to_string(),
                 content: "first WhatsApp question".to_string(),
-                channel: "whatsapp".to_string(),
+                channel: "whatsapp".into(),
                 channel_alias: Some("default".to_string()),
                 timestamp: 1,
                 thread_ts: None,
@@ -14795,7 +14906,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "15555550123".to_string(),
                 reply_target: "15555550123".to_string(),
                 content: "second WhatsApp question".to_string(),
-                channel: "whatsapp".to_string(),
+                channel: "whatsapp".into(),
                 channel_alias: Some("default".to_string()),
                 timestamp: 2,
                 thread_ts: None,
@@ -14922,7 +15033,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "first chat".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -14938,7 +15049,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-2".to_string(),
                 content: "second chat".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: None,
@@ -15047,7 +15158,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-typing".to_string(),
                 content: "hello".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -15153,7 +15264,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-react".to_string(),
                 content: "hello".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -15403,6 +15514,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 args: HashMap::new(),
                 target: None,
                 locked_args: std::collections::HashMap::new(),
+                timeout_secs: None,
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
             location: None,
@@ -15443,6 +15555,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 args: HashMap::new(),
                 target: None,
                 locked_args: std::collections::HashMap::new(),
+                timeout_secs: None,
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
             location: None,
@@ -15493,6 +15606,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 args: HashMap::new(),
                 target: None,
                 locked_args: std::collections::HashMap::new(),
+                timeout_secs: None,
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
             location: None,
@@ -15881,12 +15995,12 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn matrix_thread_conversation_history_key_uses_thread_root() {
-        let msg = zeroclaw_api::channel::ChannelMessage {
-            id: "$reply:server".into(),
+    fn matrix_thread_follow_up_shares_root_session_key() {
+        let root = zeroclaw_api::channel::ChannelMessage {
+            id: "$root:server".into(),
             sender: "@alice:server".into(),
             reply_target: "!room:server".into(),
-            content: "thread reply".into(),
+            content: "open the thread".into(),
             channel: "matrix".into(),
             channel_alias: None,
             timestamp: 1,
@@ -15895,10 +16009,19 @@ BTC is currently around $65,000 based on latest tool output."#
             attachments: vec![],
             subject: None,
         };
+        let follow_up = zeroclaw_api::channel::ChannelMessage {
+            id: "$reply:server".into(),
+            content: "thread reply".into(),
+            timestamp: 2,
+            thread_ts: Some("$root:server".into()),
+            interruption_scope_id: Some("$root:server".into()),
+            ..root.clone()
+        };
 
-        let key = conversation_history_key(&msg);
-        assert!(key.contains("_root_server"));
-        assert!(!key.contains("_reply_server"));
+        let root_key = conversation_history_key(&root);
+        assert_eq!(root_key, conversation_history_key(&follow_up));
+        assert!(!root_key.contains("$root:server"));
+        assert!(!root_key.contains("$reply:server"));
     }
 
     #[test]
@@ -15934,6 +16057,19 @@ BTC is currently around $65,000 based on latest tool output."#
             parse_runtime_command("wecom_ws", "/model qwen-max"),
             Some(ChannelRuntimeCommand::SetModel("qwen-max".into()))
         );
+    }
+
+    #[test]
+    fn parse_runtime_command_maps_clear_to_new_session() {
+        assert_eq!(
+            parse_runtime_command("telegram", "/clear"),
+            Some(ChannelRuntimeCommand::NewSession)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/clear@zeroclaw_bot"),
+            Some(ChannelRuntimeCommand::NewSession)
+        );
+        assert_eq!(parse_runtime_command("telegram", "/clear all"), None);
     }
 
     /// `/models <family>` must resolve to a configured alias-backed ref so the
@@ -16473,7 +16609,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "hello".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -16492,7 +16628,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "follow up".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: None,
@@ -16639,7 +16775,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-refresh".to_string(),
                 content: "hello".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -16675,7 +16811,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-refresh".to_string(),
                 content: "/new".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: None,
@@ -16716,7 +16852,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-refresh".to_string(),
                 content: "hello again".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 3,
                 thread_ts: None,
@@ -16795,7 +16931,7 @@ BTC is currently around $65,000 based on latest tool output."#
         prompt_config.peer_groups.insert(
             "current-room".to_string(),
             zeroclaw_config::multi_agent::PeerGroupConfig {
-                channel: "test-channel.default".to_string(),
+                channel: "test-channel.default".into(),
                 agents: vec![
                     zeroclaw_config::multi_agent::AgentAlias::new("test-agent"),
                     zeroclaw_config::multi_agent::AgentAlias::new("peer-agent"),
@@ -16807,7 +16943,7 @@ BTC is currently around $65,000 based on latest tool output."#
         prompt_config.peer_groups.insert(
             "other-room".to_string(),
             zeroclaw_config::multi_agent::PeerGroupConfig {
-                channel: "other-channel.default".to_string(),
+                channel: "other-channel.default".into(),
                 agents: vec![
                     zeroclaw_config::multi_agent::AgentAlias::new("test-agent"),
                     zeroclaw_config::multi_agent::AgentAlias::new("other-agent"),
@@ -16836,7 +16972,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-ctx".to_string(),
                 content: "hello".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -16925,7 +17061,7 @@ BTC is currently around $65,000 based on latest tool output."#
         prompt_config.peer_groups.insert(
             "current-room".to_string(),
             zeroclaw_config::multi_agent::PeerGroupConfig {
-                channel: "test-channel.default".to_string(),
+                channel: "test-channel.default".into(),
                 agents: vec![
                     zeroclaw_config::multi_agent::AgentAlias::new("test-agent"),
                     zeroclaw_config::multi_agent::AgentAlias::new("peer-agent"),
@@ -16947,7 +17083,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-ctx".to_string(),
                 content: "hello".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -17061,7 +17197,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-image".to_string(),
                 content: "please inspect this".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -17202,7 +17338,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-telegram".to_string(),
                 content: "hello".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -17260,6 +17396,44 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             block.contains("[IMAGE:<absolute-path>]"),
             "discord block must show the absolute-path marker form"
+        );
+    }
+
+    // Regression guard for #6646: web_search_tool / web_fetch never fired via
+    // the Telegram channel because the delivery-instructions block told the
+    // model to "answer the latest user message directly" and to "use tool
+    // results silently". On a small OpenAI-compatible local model that reads as
+    // "answer from memory, do not call tools", so the agent hallucinated with
+    // zero tool activity — while the identical query worked via CLI and the web
+    // dashboard, which do not inject this Telegram-only block. The block must
+    // encourage tool use for real-time/external information and must not tell
+    // the model to answer directly *instead of* using tools.
+    #[test]
+    fn channel_delivery_instructions_for_telegram_encourage_tool_use() {
+        let block = channel_delivery_instructions("telegram")
+            .expect("telegram channel must have a delivery-instructions block");
+        assert!(
+            block.contains("When responding on Telegram:"),
+            "telegram block must identify itself"
+        );
+        // Positive: it must actively steer the model toward its tools for
+        // real-time/external information.
+        assert!(
+            block.contains("use your tools"),
+            "telegram block must instruct the model to use its tools"
+        );
+        assert!(
+            block.contains("web_search_tool") && block.contains("web_fetch"),
+            "telegram block must name the real-time tools so the model knows to reach for them"
+        );
+        assert!(
+            block.contains("never guess or answer from memory alone"),
+            "telegram block must forbid answering from memory when a tool can verify"
+        );
+        // Negative: the exact regressed phrasing must never come back.
+        assert!(
+            !block.contains("Use tool results silently: answer the latest user message directly"),
+            "telegram block must not tell the model to answer directly instead of using tools (#6646)"
         );
     }
 
@@ -18278,7 +18452,7 @@ This is an example JSON object for profile settings."#;
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-photo".to_string(),
                 content: "[IMAGE:/tmp/workspace/photo_99_1.jpg]\n\nWhat is this?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -18390,7 +18564,7 @@ This is an example JSON object for profile settings."#;
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-photo".to_string(),
                 content: "[IMAGE:/tmp/workspace/photo_99_1.jpg]\n\nWhat is this?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -18409,7 +18583,7 @@ This is an example JSON object for profile settings."#;
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-photo".to_string(),
                 content: "What is WAL?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: None,
@@ -18543,7 +18717,7 @@ This is an example JSON object for profile settings."#;
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-format".to_string(),
                 content: "trigger format error".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -18562,7 +18736,7 @@ This is an example JSON object for profile settings."#;
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-format".to_string(),
                 content: "What is WAL?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: None,
@@ -18626,6 +18800,31 @@ This is an example JSON object for profile settings."#;
             }
             Ok(_) => panic!("should fail for unknown channel"),
         }
+    }
+
+    #[test]
+    fn one_shot_channel_workspace_dir_uses_owning_agent_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.agents.insert(
+            "alice".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![zeroclaw_config::providers::ChannelRef(
+                    "telegram.default".to_string(),
+                )],
+                ..Default::default()
+            },
+        );
+
+        let resolved = one_shot_channel_workspace_dir(&config, "telegram", "default");
+
+        assert_eq!(resolved, config.agent_workspace_dir("alice"));
+        assert_ne!(resolved, config.data_dir);
     }
 
     // ── Query classification in channel message processing ─────────
@@ -18744,7 +18943,7 @@ This is an example JSON object for profile settings."#;
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "please analyze-image from the dataset".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -18890,7 +19089,7 @@ This is an example JSON object for profile settings."#;
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "please analyze-image from the dataset".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -19028,7 +19227,7 @@ This is an example JSON object for profile settings."#;
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "just a regular text message".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -19186,7 +19385,7 @@ This is an example JSON object for profile settings."#;
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "write some code for me".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -19247,6 +19446,7 @@ This is an example JSON object for profile settings."#;
             zeroclaw_config::schema::TelegramConfig {
                 enabled: true,
                 bot_token: "test-token".to_string(),
+                api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::Off,
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
@@ -19584,7 +19784,7 @@ This is an example JSON object for profile settings."#;
                 sender: "alice".to_string(),
                 reply_target: "C123".to_string(),
                 content: "thread-a question".to_string(),
-                channel: "slack".to_string(),
+                channel: "slack".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: Some("1741234567.100001".to_string()),
@@ -19600,7 +19800,7 @@ This is an example JSON object for profile settings."#;
                 sender: "alice".to_string(),
                 reply_target: "C123".to_string(),
                 content: "thread-b question".to_string(),
-                channel: "slack".to_string(),
+                channel: "slack".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: Some("1741234567.200002".to_string()),
@@ -20394,6 +20594,80 @@ Done."#;
                 "{channel} must report the real config table [channels.lark.default]; got: {msg}"
             );
         }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-email")]
+    async fn deliver_announcement_routes_email_to_email_arm() {
+        let config = zeroclaw_config::schema::Config::default();
+
+        let err = deliver_announcement(&config, "email.default", "user@example.com", None, "hi")
+            .await
+            .expect_err("expected email.default to bail because channel is not configured");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("unsupported delivery channel"),
+            "email.default must route to the email arm, not fall through; got: {msg}"
+        );
+        assert!(
+            msg.contains("[channels.email.default] not configured"),
+            "email.default must report the real config table; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn deliver_announcement_routes_whatsapp_to_whatsapp_arm() {
+        let config = zeroclaw_config::schema::Config::default();
+
+        let err = deliver_announcement(&config, "whatsapp.default", "+15551234567", None, "hi")
+            .await
+            .expect_err("expected whatsapp.default to bail because channel is not configured");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("unsupported delivery channel"),
+            "whatsapp.default must route to the whatsapp arm, not fall through; got: {msg}"
+        );
+        assert!(
+            msg.contains("[channels.whatsapp.default] not configured"),
+            "whatsapp.default must report the real config table; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn deliver_announcement_rejects_whatsapp_non_web_config_clearly() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.whatsapp.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                access_token: Some("test-token".to_string()),
+                phone_number_id: Some("phone-number-id".to_string()),
+                verify_token: Some("verify-token".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let err = deliver_announcement(&config, "whatsapp.default", "+15551234567", None, "hi")
+            .await
+            .expect_err("expected WhatsApp Cloud config to be rejected for cron delivery");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("WhatsApp channel send requires Web mode"),
+            "whatsapp.default must clearly explain the Web mode requirement; got: {msg}"
+        );
+        assert!(
+            msg.contains("session_path")
+                && msg.contains("pair_phone")
+                && msg.contains("mode = personal"),
+            "whatsapp.default must name the Web selectors accepted by cron delivery; got: {msg}"
+        );
+        assert!(
+            !msg.contains("unsupported delivery channel")
+                && !msg.contains("[channels.whatsapp.default] not configured"),
+            "whatsapp.default must reject the configured non-Web mode, not fall through; got: {msg}"
+        );
     }
 
     #[tokio::test]
