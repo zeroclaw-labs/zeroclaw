@@ -55,6 +55,7 @@ serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 sha2 = "0.10"
 shellexpand = "3.1"
+sys-locale.workspace = true
 tar = "0.4"
 tempfile = "3.26"
 thiserror = "2.0"
@@ -108,10 +109,12 @@ sandbox-bubblewrap = []
 
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+encoding_rs = "0.8"
 rcgen = "0.13"
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 scopeguard = "1.2"
+filetime = "0.2"
 
 # Channel features (forwarded to zeroclaw-channels)
 

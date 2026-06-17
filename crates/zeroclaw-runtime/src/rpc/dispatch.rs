@@ -42,6 +42,7 @@ pub enum Method {
     Initialize,
     Status,
     Health,
+    DoctorRun,
 
     // Sessions (agent chat lives here — session/prompt + session/update
     // notifications is the RPC equivalent of the gateway's ws/chat)
@@ -146,6 +147,7 @@ impl Method {
         (Method::Initialize, "initialize"),
         (Method::Status, "status"),
         (Method::Health, "health"),
+        (Method::DoctorRun, "doctor/run"),
         // Sessions
         (Method::SessionNew, "session/new"),
         (Method::SessionClose, "session/close"),
@@ -266,6 +268,23 @@ fn not_yet_implemented(method: Method) -> RpcResult {
         INTERNAL_ERROR,
         format!("{}: not yet implemented", method.wire_name()),
     ))
+}
+
+fn doctor_summary(results: &[DiagResult]) -> DoctorSummary {
+    DoctorSummary {
+        ok: results
+            .iter()
+            .filter(|r| r.severity == crate::doctor::Severity::Ok)
+            .count(),
+        warnings: results
+            .iter()
+            .filter(|r| r.severity == crate::doctor::Severity::Warn)
+            .count(),
+        errors: results
+            .iter()
+            .filter(|r| r.severity == crate::doctor::Severity::Error)
+            .count(),
+    }
 }
 
 fn personality_template_context(
@@ -430,6 +449,7 @@ impl RpcDispatcher {
             Method::Initialize => self.handle_initialize(&req.params).await,
             Method::Status => self.handle_status().await,
             Method::Health => self.handle_health(),
+            Method::DoctorRun => self.handle_doctor_run().await,
 
             // Sessions
             Method::SessionNew => self.handle_session_new(&req.params).await,
@@ -659,6 +679,13 @@ impl RpcDispatcher {
             );
         }
         Ok(val)
+    }
+
+    async fn handle_doctor_run(&self) -> RpcResult {
+        let config = self.ctx.config.read().clone();
+        let results = crate::doctor::run_structured(&config).await;
+        let summary = doctor_summary(&results);
+        to_result(DoctorRunResult { results, summary })
     }
 
     // ── TUI handlers ─────────────────────────────────────────────
@@ -3493,6 +3520,15 @@ mod tests {
         serde_json::from_str(s).unwrap()
     }
 
+    fn make_approval_test_dispatcher() -> RpcDispatcher {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(zeroclaw_config::schema::Config::default(), sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        RpcDispatcher::new(ctx, tx, "test-peer-approval:pid=1".into())
+    }
+
     #[test]
     fn method_from_wire_roundtrip() {
         for (method, wire) in Method::ALL {
@@ -3511,11 +3547,95 @@ mod tests {
     }
 
     #[test]
+    fn doctor_run_method_is_registered() {
+        assert_eq!(Method::from_wire("doctor/run"), Some(Method::DoctorRun));
+        assert_eq!(Method::DoctorRun.wire_name(), "doctor/run");
+    }
+
+    #[test]
+    fn doctor_summary_counts_each_severity_bucket() {
+        let results = vec![
+            DiagResult {
+                severity: crate::doctor::Severity::Ok,
+                category: "config".to_string(),
+                message: "ok".to_string(),
+            },
+            DiagResult {
+                severity: crate::doctor::Severity::Warn,
+                category: "config".to_string(),
+                message: "warning".to_string(),
+            },
+            DiagResult {
+                severity: crate::doctor::Severity::Warn,
+                category: "runtime".to_string(),
+                message: "warning".to_string(),
+            },
+            DiagResult {
+                severity: crate::doctor::Severity::Error,
+                category: "workspace".to_string(),
+                message: "error".to_string(),
+            },
+        ];
+
+        let summary = doctor_summary(&results);
+
+        assert_eq!(summary.ok, 1);
+        assert_eq!(summary.warnings, 2);
+        assert_eq!(summary.errors, 1);
+    }
+
+    #[test]
     fn method_all_no_duplicates() {
         let mut seen = std::collections::HashSet::new();
         for (_, wire) in Method::ALL {
             assert!(seen.insert(*wire), "duplicate wire name: {wire}");
         }
+    }
+
+    #[test]
+    fn session_approve_resolves_pending_request() {
+        let dispatcher = make_approval_test_dispatcher();
+        let (tx, mut rx) =
+            tokio::sync::oneshot::channel::<zeroclaw_api::channel::ChannelApprovalResponse>();
+        dispatcher
+            .ctx
+            .approval_pending
+            .insert("req-allow".to_string(), tx);
+
+        let result = dispatcher
+            .handle_session_approve(&json!({
+                "session_id": "sess-1",
+                "request_id": "req-allow",
+                "decision": "allow_once"
+            }))
+            .unwrap();
+
+        assert_eq!(result["session_id"], "sess-1");
+        assert_eq!(result["request_id"], "req-allow");
+        assert_eq!(result["acknowledged"], true);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            zeroclaw_api::channel::ChannelApprovalResponse::Approve
+        );
+        assert!(!dispatcher.ctx.approval_pending.contains("req-allow"));
+    }
+
+    #[test]
+    fn session_approve_unknown_request_is_acknowledged_noop() {
+        let dispatcher = make_approval_test_dispatcher();
+
+        let result = dispatcher
+            .handle_session_approve(&json!({
+                "session_id": "sess-1",
+                "request_id": "timed-out-req",
+                "decision": "allow_once"
+            }))
+            .unwrap();
+
+        assert_eq!(result["session_id"], "sess-1");
+        assert_eq!(result["request_id"], "timed-out-req");
+        assert_eq!(result["acknowledged"], true);
+        assert!(!dispatcher.ctx.approval_pending.contains("timed-out-req"));
     }
 
     #[test]

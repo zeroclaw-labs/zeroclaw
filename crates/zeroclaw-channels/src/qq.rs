@@ -48,6 +48,17 @@ struct QQMediaAttachment {
     target: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QQVoiceDedupPart {
+    source_id: String,
+    transcript: String,
+}
+
+struct QQComposedMessage {
+    content: String,
+    voice_dedup_parts: Vec<QQVoiceDedupPart>,
+}
+
 /// Response from QQ media upload API.
 #[derive(Debug, Deserialize)]
 struct QQUploadResponse {
@@ -274,6 +285,8 @@ fn now_secs() -> u64 {
 
 /// Deduplication set capacity — evict half of entries when full.
 const DEDUP_CAPACITY: usize = 10_000;
+
+const VOICE_REDELIVERY_DEDUP_WINDOW_SECS: u64 = 5 * 60;
 
 /// Maximum number of retry attempts when fetching the access token.
 const AUTH_RETRY_MAX_ATTEMPTS: u32 = 4;
@@ -565,6 +578,30 @@ impl QQChannel {
         Ok(url)
     }
 
+    async fn record_dedup_key(&self, key: String) -> bool {
+        let mut dedup = self.dedup.write().await;
+
+        if dedup.contains(&key) {
+            return true;
+        }
+
+        Self::evict_dedup_if_full(&mut dedup);
+
+        dedup.insert(key);
+        false
+    }
+
+    fn evict_dedup_if_full(dedup: &mut HashSet<String>) {
+        if dedup.len() < DEDUP_CAPACITY {
+            return;
+        }
+
+        let to_remove: Vec<String> = dedup.iter().take(DEDUP_CAPACITY / 2).cloned().collect();
+        for key in to_remove {
+            dedup.remove(&key);
+        }
+    }
+
     /// Check and insert message ID for deduplication.
     async fn is_duplicate(&self, msg_id: &str) -> bool {
         if msg_id.is_empty() {
@@ -577,16 +614,140 @@ impl QQChannel {
             return true;
         }
 
-        // Evict oldest half when at capacity
-        if dedup.len() >= DEDUP_CAPACITY {
-            let to_remove: Vec<String> = dedup.iter().take(DEDUP_CAPACITY / 2).cloned().collect();
-            for key in to_remove {
-                dedup.remove(&key);
-            }
-        }
+        Self::evict_dedup_if_full(&mut dedup);
 
         dedup.insert(msg_id.to_string());
         false
+    }
+
+    async fn record_gateway_sequence(&self, sequence: i64) {
+        if sequence >= 0 {
+            *self.last_sequence.write().await = Some(sequence);
+        }
+    }
+
+    fn normalize_voice_transcript(transcript: &str) -> Option<String> {
+        let normalized = transcript.split_whitespace().collect::<Vec<_>>().join(" ");
+        if normalized.is_empty() {
+            None
+        } else {
+            Some(normalized)
+        }
+    }
+
+    fn voice_redelivery_dedup_hash(
+        event_type: &str,
+        reply_target: &str,
+        sender: &str,
+        parts: &[QQVoiceDedupPart],
+    ) -> Option<String> {
+        if parts.is_empty() {
+            return None;
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(event_type.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(reply_target.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(sender.as_bytes());
+        for part in parts {
+            hasher.update(b"\0");
+            hasher.update(part.source_id.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(part.transcript.as_bytes());
+        }
+
+        Some(format!("{:x}", hasher.finalize()))
+    }
+
+    fn voice_redelivery_dedup_key(bucket: u64, hash: &str) -> String {
+        format!("qq_voice:{bucket}:{hash}")
+    }
+
+    async fn is_duplicate_voice_redelivery(
+        &self,
+        event_type: &str,
+        reply_target: &str,
+        sender: &str,
+        parts: &[QQVoiceDedupPart],
+    ) -> bool {
+        let Some(hash) = Self::voice_redelivery_dedup_hash(event_type, reply_target, sender, parts)
+        else {
+            return false;
+        };
+
+        let bucket = now_secs() / VOICE_REDELIVERY_DEDUP_WINDOW_SECS;
+        let key = Self::voice_redelivery_dedup_key(bucket, &hash);
+
+        self.record_dedup_key(key).await
+    }
+
+    fn is_voice_attachment(content_type: &str, filename: &str) -> bool {
+        let marker_type = infer_attachment_marker(content_type, filename);
+        content_type == "voice" || content_type.starts_with("audio/") || marker_type == "VOICE"
+    }
+
+    fn normalized_voice_source_id(url: &str) -> String {
+        let fixed = fix_qq_url(url);
+        let end = fixed
+            .char_indices()
+            .find_map(|(idx, ch)| (ch == '?' || ch == '#').then_some(idx))
+            .unwrap_or(fixed.len());
+        fixed[..end].to_string()
+    }
+
+    fn voice_attachment_source_id(att: &serde_json::Value) -> Option<String> {
+        let content_type = att
+            .get("content_type")
+            .and_then(|ct| ct.as_str())
+            .unwrap_or("");
+        let filename = att
+            .get("filename")
+            .and_then(|f| f.as_str())
+            .unwrap_or("attachment");
+
+        if !Self::is_voice_attachment(content_type, filename) {
+            return None;
+        }
+
+        let source_url = att
+            .get("voice_wav_url")
+            .and_then(|u| u.as_str())
+            .filter(|u| !u.trim().is_empty())
+            .or_else(|| {
+                att.get("url")
+                    .and_then(|u| u.as_str())
+                    .filter(|u| !u.trim().is_empty())
+            })?;
+
+        Some(format!(
+            "{}:{}:{}",
+            content_type.trim().to_ascii_lowercase(),
+            filename.trim(),
+            Self::normalized_voice_source_id(source_url)
+        ))
+    }
+
+    fn platform_voice_dedup_parts(payload: &serde_json::Value) -> Vec<QQVoiceDedupPart> {
+        let Some(attachments) = payload.get("attachments").and_then(|a| a.as_array()) else {
+            return Vec::new();
+        };
+
+        attachments
+            .iter()
+            .filter_map(|att| {
+                let source_id = Self::voice_attachment_source_id(att)?;
+                let transcript = att
+                    .get("asr_refer_text")
+                    .and_then(|t| t.as_str())
+                    .and_then(Self::normalize_voice_transcript)?;
+                Some(QQVoiceDedupPart {
+                    source_id,
+                    transcript,
+                })
+            })
+            .collect()
     }
 
     /// Build upload cache key from file content hash.
@@ -835,11 +996,7 @@ impl QQChannel {
         Ok(())
     }
 
-    /// Compose message content from an incoming QQ event payload.
-    ///
-    /// Handles all attachment types (not just images), downloads to workspace
-    /// if configured, and generates appropriate `[TYPE:path]` markers.
-    async fn compose_message_content(&self, payload: &serde_json::Value) -> Option<String> {
+    async fn compose_qq_message(&self, payload: &serde_json::Value) -> Option<QQComposedMessage> {
         let text = payload
             .get("content")
             .and_then(|c| c.as_str())
@@ -848,6 +1005,7 @@ impl QQChannel {
 
         let mut markers: Vec<String> = Vec::new();
         let mut voice_transcripts: Vec<String> = Vec::new();
+        let mut voice_dedup_parts: Vec<QQVoiceDedupPart> = Vec::new();
 
         if let Some(attachments) = payload.get("attachments").and_then(|a| a.as_array()) {
             for att in attachments {
@@ -870,9 +1028,7 @@ impl QQChannel {
                 // For voice attachments, prefer voice_wav_url (WAV format) over
                 // the default url (AMR/SILK). QQ provides this for direct use
                 // without transcoding. (aligned with openclaw-qqbot behavior)
-                let is_voice = content_type == "voice"
-                    || content_type.starts_with("audio/")
-                    || marker_type == "VOICE";
+                let is_voice = Self::is_voice_attachment(content_type, filename);
                 let (download_url, save_filename) = if is_voice {
                     if let Some(wav_url) = att
                         .get("voice_wav_url")
@@ -923,20 +1079,31 @@ impl QQChannel {
                     // openclaw-qqbot format: "[语音消息] transcribed text")
                     // Also keep the file path marker for future multimodal support
                     markers.push(format!("[{marker_type}:{location}]"));
-                    if let Some(asr_text) = att
+                    let voice_transcript = if let Some(asr_text) = att
                         .get("asr_refer_text")
                         .and_then(|t| t.as_str())
-                        .map(|t| t.trim())
-                        .filter(|t| !t.is_empty())
+                        .and_then(Self::normalize_voice_transcript)
                     {
-                        voice_transcripts.push(asr_text.to_string());
+                        Some(asr_text)
                     } else if let Some(audio_data) = local_audio_data.as_deref()
                         && let Some(transcript) = self
                             .try_transcribe_audio_data(audio_data, &save_filename)
                             .await
                     {
-                        voice_transcripts.push(transcript);
-                    }
+                        Self::normalize_voice_transcript(&transcript)
+                    } else {
+                        None
+                    };
+
+                    if let Some(transcript) = voice_transcript {
+                        voice_transcripts.push(transcript.clone());
+                        if let Some(source_id) = Self::voice_attachment_source_id(att) {
+                            voice_dedup_parts.push(QQVoiceDedupPart {
+                                source_id,
+                                transcript,
+                            });
+                        }
+                    };
                 } else {
                     markers.push(format!("[{marker_type}:{location}]"));
                 }
@@ -975,7 +1142,10 @@ impl QQChannel {
             return None;
         }
 
-        Some(parts.join("\n"))
+        Some(QQComposedMessage {
+            content: parts.join("\n"),
+            voice_dedup_parts,
+        })
     }
 
     /// Download an attachment to the local workspace directory.
@@ -1339,6 +1509,7 @@ impl Channel for QQChannel {
                     // Track sequence number
                     if let Some(s) = event.get("s").and_then(serde_json::Value::as_i64) {
                         sequence = s;
+                        self.record_gateway_sequence(s).await;
                     }
 
                     let op = event.get("op").and_then(serde_json::Value::as_u64).unwrap_or(0);
@@ -1408,10 +1579,6 @@ impl Channel for QQChannel {
                                 continue;
                             }
 
-                            let Some(content) = self.compose_message_content(d).await else {
-                                continue;
-                            };
-
                             let author_id = d.get("author").and_then(|a| a.get("id")).and_then(|i| i.as_str()).unwrap_or("unknown");
                             // For QQ, user_openid is the identifier
                             let user_openid = d.get("author").and_then(|a| a.get("user_openid")).and_then(|u| u.as_str()).unwrap_or(author_id);
@@ -1422,12 +1589,45 @@ impl Channel for QQChannel {
                             }
 
                             let chat_id = format!("user:{user_openid}");
+                            let platform_voice_dedup_parts = Self::platform_voice_dedup_parts(d);
+                            if self
+                                .is_duplicate_voice_redelivery(
+                                    event_type,
+                                    &chat_id,
+                                    user_openid,
+                                    &platform_voice_dedup_parts,
+                                )
+                                .await
+                            {
+                                continue;
+                            }
+
+                            let Some(composed) = self.compose_qq_message(d).await else {
+                                continue;
+                            };
+                            let fallback_voice_dedup_parts: Vec<QQVoiceDedupPart> = composed
+                                .voice_dedup_parts
+                                .iter()
+                                .filter(|part| !platform_voice_dedup_parts.contains(part))
+                                .cloned()
+                                .collect();
+                            if self
+                                .is_duplicate_voice_redelivery(
+                                    event_type,
+                                    &chat_id,
+                                    user_openid,
+                                    &fallback_voice_dedup_parts,
+                                )
+                                .await
+                            {
+                                continue;
+                            }
 
                             let channel_msg = ChannelMessage {
                                 id: Uuid::new_v4().to_string(),
                                 sender: user_openid.to_string(),
                                 reply_target: chat_id,
-                                content,
+                                content: composed.content,
                                 channel: "qq".to_string(),
                 channel_alias: Some(self.alias.clone()),
                                 timestamp: std::time::SystemTime::now()
@@ -1452,10 +1652,6 @@ impl Channel for QQChannel {
                                 continue;
                             }
 
-                            let Some(content) = self.compose_message_content(d).await else {
-                                continue;
-                            };
-
                             let author_id = d.get("author").and_then(|a| a.get("member_openid")).and_then(|m| m.as_str()).unwrap_or("unknown");
 
                             if !self.is_user_allowed(author_id) {
@@ -1465,12 +1661,45 @@ impl Channel for QQChannel {
 
                             let group_openid = d.get("group_openid").and_then(|g| g.as_str()).unwrap_or("unknown");
                             let chat_id = format!("group:{group_openid}");
+                            let platform_voice_dedup_parts = Self::platform_voice_dedup_parts(d);
+                            if self
+                                .is_duplicate_voice_redelivery(
+                                    event_type,
+                                    &chat_id,
+                                    author_id,
+                                    &platform_voice_dedup_parts,
+                                )
+                                .await
+                            {
+                                continue;
+                            }
+
+                            let Some(composed) = self.compose_qq_message(d).await else {
+                                continue;
+                            };
+                            let fallback_voice_dedup_parts: Vec<QQVoiceDedupPart> = composed
+                                .voice_dedup_parts
+                                .iter()
+                                .filter(|part| !platform_voice_dedup_parts.contains(part))
+                                .cloned()
+                                .collect();
+                            if self
+                                .is_duplicate_voice_redelivery(
+                                    event_type,
+                                    &chat_id,
+                                    author_id,
+                                    &fallback_voice_dedup_parts,
+                                )
+                                .await
+                            {
+                                continue;
+                            }
 
                             let channel_msg = ChannelMessage {
                                 id: Uuid::new_v4().to_string(),
                                 sender: author_id.to_string(),
                                 reply_target: chat_id,
-                                content,
+                                content: composed.content,
                                 channel: "qq".to_string(),
                 channel_alias: Some(self.alias.clone()),
                                 timestamp: std::time::SystemTime::now()
@@ -1638,6 +1867,118 @@ mod tests {
         );
         assert!(!ch.is_duplicate("").await);
         assert!(!ch.is_duplicate("").await);
+    }
+
+    #[tokio::test]
+    async fn gateway_sequence_is_persisted_as_dispatch_frames_arrive() {
+        let ch = QQChannel::new(
+            "id".into(),
+            "secret".into(),
+            "qq_test_alias",
+            Arc::new(Vec::new),
+        );
+
+        ch.record_gateway_sequence(42).await;
+
+        assert_eq!(*ch.last_sequence.read().await, Some(42));
+    }
+
+    #[tokio::test]
+    async fn voice_redelivery_with_new_msg_id_is_deduped_by_transcript() {
+        let ch = QQChannel::new(
+            "id".into(),
+            "secret".into(),
+            "qq_test_alias",
+            Arc::new(Vec::new),
+        );
+
+        let payload = json!({
+            "attachments": [{
+                "content_type": "voice",
+                "filename": "voice.amr",
+                "url": "https://cdn.example.com/voice.amr?sig=first",
+                "voice_wav_url": "https://cdn.example.com/voice.wav?sig=first",
+                "asr_refer_text": "哈喽哈喽，你在干嘛？"
+            }]
+        });
+        let redelivered = json!({
+            "attachments": [{
+                "content_type": "voice",
+                "filename": "voice.amr",
+                "url": "https://cdn.example.com/voice.amr?sig=second",
+                "voice_wav_url": "https://cdn.example.com/voice.wav?sig=second",
+                "asr_refer_text": " 哈喽哈喽，你在干嘛？ "
+            }]
+        });
+        let ordinary_text = json!({
+            "content": "<VOICE_TRANSCRIPTION>哈喽哈喽，你在干嘛？</VOICE_TRANSCRIPTION>"
+        });
+
+        assert!(
+            !ch.is_duplicate_voice_redelivery(
+                "C2C_MESSAGE_CREATE",
+                "user:qq_user",
+                "qq_user",
+                &QQChannel::platform_voice_dedup_parts(&payload),
+            )
+            .await
+        );
+        assert!(
+            ch.is_duplicate_voice_redelivery(
+                "C2C_MESSAGE_CREATE",
+                "user:qq_user",
+                "qq_user",
+                &QQChannel::platform_voice_dedup_parts(&redelivered),
+            )
+            .await
+        );
+        assert!(
+            !ch.is_duplicate_voice_redelivery(
+                "C2C_MESSAGE_CREATE",
+                "user:qq_user",
+                "qq_user",
+                &QQChannel::platform_voice_dedup_parts(&ordinary_text),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_redelivery_dedup_keeps_distinct_audio_sources() {
+        let ch = QQChannel::new(
+            "id".into(),
+            "secret".into(),
+            "qq_test_alias",
+            Arc::new(Vec::new),
+        );
+
+        let first = vec![QQVoiceDedupPart {
+            source_id: "voice:voice.amr:https://cdn.example.com/first.wav".into(),
+            transcript: "yes".into(),
+        }];
+        let second = vec![QQVoiceDedupPart {
+            source_id: "voice:voice.amr:https://cdn.example.com/second.wav".into(),
+            transcript: "yes".into(),
+        }];
+
+        assert!(
+            !ch.is_duplicate_voice_redelivery(
+                "C2C_MESSAGE_CREATE",
+                "user:qq_user",
+                "qq_user",
+                &first,
+            )
+            .await
+        );
+        assert!(
+            !ch.is_duplicate_voice_redelivery(
+                "C2C_MESSAGE_CREATE",
+                "user:qq_user",
+                "qq_user",
+                &second,
+            )
+            .await
+        );
     }
 
     #[test]
@@ -1863,6 +2204,12 @@ allowed_users = ["user1"]
         }
     }
 
+    async fn composed_content(ch: &QQChannel, payload: &serde_json::Value) -> Option<String> {
+        ch.compose_qq_message(payload)
+            .await
+            .map(|message| message.content)
+    }
+
     #[tokio::test]
     async fn test_compose_message_content_text_only() {
         let ch = QQChannel::new(
@@ -1873,7 +2220,7 @@ allowed_users = ["user1"]
         );
         let payload = json!({ "content": "  hello world  " });
         assert_eq!(
-            ch.compose_message_content(&payload).await,
+            composed_content(&ch, &payload).await,
             Some("hello world".to_string())
         );
     }
@@ -1894,7 +2241,7 @@ allowed_users = ["user1"]
             }]
         });
         assert_eq!(
-            ch.compose_message_content(&payload).await,
+            composed_content(&ch, &payload).await,
             Some("[IMAGE:https://cdn.example.com/a.jpg]".to_string())
         );
     }
@@ -1915,7 +2262,7 @@ allowed_users = ["user1"]
             ]
         });
         assert_eq!(
-            ch.compose_message_content(&payload).await,
+            composed_content(&ch, &payload).await,
             Some(
                 "Here is an image\n[IMAGE:https://cdn.example.com/a.png]\n[IMAGE:https://cdn.example.com/b.jpeg]"
                     .to_string()
@@ -1940,7 +2287,7 @@ allowed_users = ["user1"]
                 { "content_type": "application/pdf", "url": "https://cdn.example.com/d.pdf" }
             ]
         });
-        let result = ch.compose_message_content(&payload).await.unwrap();
+        let result = composed_content(&ch, &payload).await.unwrap();
         assert!(result.contains("[IMAGE:"));
         assert!(result.contains("[VOICE:"));
         assert!(result.contains("[VIDEO:"));
@@ -1992,7 +2339,7 @@ allowed_users = ["user1"]
             }]
         });
 
-        let result = ch.compose_message_content(&payload).await.unwrap();
+        let result = composed_content(&ch, &payload).await.unwrap();
         assert!(
             result.contains("<VOICE_TRANSCRIPTION>configured transcript</VOICE_TRANSCRIPTION>")
         );
@@ -2045,7 +2392,7 @@ allowed_users = ["user1"]
             }]
         });
 
-        let result = ch.compose_message_content(&payload).await.unwrap();
+        let result = composed_content(&ch, &payload).await.unwrap();
         assert!(result.contains("<VOICE_TRANSCRIPTION>platform transcript</VOICE_TRANSCRIPTION>"));
         assert!(!result.contains("fallback"));
     }
@@ -2065,7 +2412,7 @@ allowed_users = ["user1"]
                 "url": "//cdn.example.com/a.png"
             }]
         });
-        let result = ch.compose_message_content(&payload).await.unwrap();
+        let result = composed_content(&ch, &payload).await.unwrap();
         assert!(result.contains("https://cdn.example.com/a.png"));
         // Ensure the raw `//` prefix was replaced with `https:`
         assert!(!result.starts_with("[IMAGE://"));
@@ -2088,7 +2435,7 @@ allowed_users = ["user1"]
                 "url": "https://cdn.example.com/report.pdf"
             }]
         });
-        let result = ch.compose_message_content(&payload).await.unwrap();
+        let result = composed_content(&ch, &payload).await.unwrap();
         assert!(result.contains("[DOCUMENT:https://cdn.example.com/report.pdf]"));
     }
 
@@ -2107,7 +2454,7 @@ allowed_users = ["user1"]
                 "url": "   "
             }]
         });
-        assert_eq!(ch.compose_message_content(&payload).await, None);
+        assert_eq!(composed_content(&ch, &payload).await, None);
     }
 
     // --- Markdown send body test ---
