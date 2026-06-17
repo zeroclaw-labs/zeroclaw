@@ -2427,7 +2427,15 @@ fn prompt_for_field(
             .allow_empty_password(true)
             .interact()
         {
-            Ok(pw) => return Ok(Some(pw)),
+            Ok(pw) => {
+                if !pw.is_empty() {
+                    eprintln!(
+                        "  \u{2713} Secret received ({})",
+                        pw.len()
+                    );
+                }
+                return Ok(Some(pw));
+            }
             Err(e) => {
                 let io: std::io::Error = e.into();
                 if io.kind() == std::io::ErrorKind::Interrupted {
@@ -5041,6 +5049,12 @@ async fn main() -> Result<()> {
                         .with_prompt(format!("Enter value for {path}"))
                         .interact()?;
                     let secret_value = secret_value.trim().to_string();
+                    if !secret_value.is_empty() {
+                        eprintln!(
+                            "  \u{2713} Secret received ({})",
+                            secret_value.len()
+                        );
+                    }
                     if secret_value.is_empty() {
                         anyhow::bail!("Value cannot be empty.");
                     }
@@ -5824,6 +5838,10 @@ fn handle_estop_command(
                         .with_prompt("Enter OTP code")
                         .allow_empty_password(false)
                         .interact()?;
+                    eprintln!(
+                        "  \u{2713} OTP received ({})",
+                        entered.len()
+                    );
                     otp_code = Some(entered);
                 }
 
@@ -6413,7 +6431,14 @@ fn read_auth_input(prompt: &str) -> Result<String> {
         .with_prompt(prompt)
         .allow_empty_password(false)
         .interact()?;
-    Ok(input.trim().to_string())
+    let trimmed = input.trim().to_string();
+    if !trimmed.is_empty() {
+        eprintln!(
+            "  \u{2713} Secret received ({})",
+            trimmed.len()
+        );
+    }
+    Ok(trimmed)
 }
 
 #[cfg(feature = "agent-runtime")]
