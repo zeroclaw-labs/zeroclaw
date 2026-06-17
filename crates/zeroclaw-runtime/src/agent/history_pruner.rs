@@ -1,4 +1,6 @@
 use zeroclaw_api::model_provider::ChatMessage;
+#[cfg(test)]
+use zeroclaw_api::model_provider::{PRUNED_CONTEXT_SEPARATOR, PRUNED_TOOL_EXCHANGE_SUMMARY_PREFIX};
 
 pub use zeroclaw_config::scattered_types::HistoryPrunerConfig;
 
@@ -65,9 +67,7 @@ pub struct PrunedOrphans {
     pub orphan_tool_call_ids: Vec<String>,
 }
 
-fn is_tool_exchange_summary(content: &str) -> bool {
-    content.starts_with("[Tool exchange:") && content.contains("results collapsed]")
-}
+const MAX_SYNTHETIC_TOOL_SUMMARIES: usize = 3;
 
 fn assistant_tool_calls_have_immediate_results(
     messages: &[ChatMessage],
@@ -151,7 +151,7 @@ pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> PrunedO
         if let Some(doomed_ids) = assistant_tool_call_ids
             && i > 0
             && messages[i - 1].role == "assistant"
-            && ((is_tool_exchange_summary(&messages[i - 1].content)
+            && ((messages[i - 1].is_pruned_tool_exchange_summary()
                 && !assistant_tool_calls_have_immediate_results(messages, i, &doomed_ids))
                 || assistant_is_unresolved_dispatch(messages, i - 1, i))
         {
@@ -292,11 +292,9 @@ pub fn prune_history(messages: &mut Vec<ChatMessage>, config: &HistoryPrunerConf
                     tool_count += 1;
                 }
                 if tool_count > 0 && !any_tool_protected {
-                    let summary =
-                        format!("[Tool exchange: {tool_count} tool call(s) — results collapsed]");
                     messages[i] = ChatMessage {
                         role: "assistant".to_string(),
-                        content: summary,
+                        content: ChatMessage::pruned_tool_exchange_summary(tool_count),
                     };
                     for _ in 0..tool_count {
                         messages.remove(i + 1);
@@ -366,15 +364,39 @@ pub fn prune_history(messages: &mut Vec<ChatMessage>, config: &HistoryPrunerConf
         }
     }
 
-    // Phase 3 – merge consecutive synthetic tool-exchange summaries. GLM/Z.AI
+    // Phase 3 – keep synthetic summaries from dominating long tool-heavy
+    // histories. A wall of assistant-authored "Tool exchange collapsed" text
+    // can make the next provider request look like the assistant already
+    // completed the task, even though these are only pruning placeholders.
+    // Cap before merging so one merged summary cannot hide dozens of old
+    // collapsed exchanges inside a single provider-visible message.
+    let mut summaries_to_drop = messages
+        .iter()
+        .filter(|message| message.is_pruned_tool_exchange_summary())
+        .count()
+        .saturating_sub(MAX_SYNTHETIC_TOOL_SUMMARIES);
+    if summaries_to_drop > 0 {
+        let before = messages.len();
+        messages.retain(|message| {
+            if summaries_to_drop > 0 && message.is_pruned_tool_exchange_summary() {
+                summaries_to_drop -= 1;
+                false
+            } else {
+                true
+            }
+        });
+        dropped_messages += before - messages.len();
+    }
+
+    // Phase 4 – merge consecutive synthetic tool-exchange summaries. GLM/Z.AI
     // reject adjacent assistant messages, but these summaries are safe to
     // combine because they are both pruner-generated placeholders.
     let mut i = 0;
     while i + 1 < messages.len() {
         if messages[i].role == "assistant"
             && messages[i + 1].role == "assistant"
-            && is_tool_exchange_summary(&messages[i].content)
-            && is_tool_exchange_summary(&messages[i + 1].content)
+            && messages[i].is_pruned_tool_exchange_summary()
+            && messages[i + 1].is_pruned_tool_exchange_summary()
         {
             let next = messages.remove(i + 1);
             messages[i].content = format!("{}\n\n{}", messages[i].content, next.content);
@@ -384,22 +406,29 @@ pub fn prune_history(messages: &mut Vec<ChatMessage>, config: &HistoryPrunerConf
         }
     }
 
-    // Phase 4 – remove orphaned tool messages left behind by phases 1-3.
+    // Phase 5 – remove orphaned tool messages left behind by phases 1-4.
     dropped_messages += remove_orphaned_tool_messages(messages).removed;
 
-    // Phase 5 – separate any remaining adjacent assistant messages. These can
+    // Phase 6 – separate any remaining adjacent assistant messages. These can
     // happen when a protected assistant(tool_calls) group follows a collapsed
-    // summary. Insert a tiny user boundary rather than dropping protected data.
+    // summary. Prefer dropping the synthetic placeholder over inventing a user
+    // turn; the live assistant/tool-call message carries real conversation
+    // state, while the summary is only a lossy pruning artifact.
     let mut i = 1;
     while i < messages.len() {
         if messages[i - 1].role == "assistant" && messages[i].role == "assistant" {
-            messages.insert(
-                i,
-                ChatMessage {
-                    role: "user".to_string(),
-                    content: "[context continues]".to_string(),
-                },
-            );
+            if messages[i - 1].is_pruned_tool_exchange_summary() {
+                messages.remove(i - 1);
+                dropped_messages += 1;
+                i = i.saturating_sub(1).max(1);
+                continue;
+            }
+            if messages[i].is_pruned_tool_exchange_summary() {
+                messages.remove(i);
+                dropped_messages += 1;
+                continue;
+            }
+            messages.insert(i, ChatMessage::pruned_context_separator());
             i += 2;
         } else {
             i += 1;
@@ -792,8 +821,8 @@ mod tests {
         assert!(
             messages
                 .iter()
-                .any(|m| m.role == "user" && m.content == "[context continues]"),
-            "Phase 5 should separate collapsed summary from live assistant"
+                .all(|m| m.content != PRUNED_CONTEXT_SEPARATOR),
+            "pruning should not invent a user turn to separate a synthetic summary"
         );
         assert!(
             messages
@@ -900,7 +929,7 @@ mod tests {
             messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>(),
             vec!["system", "assistant", "user", "assistant"]
         );
-        assert_eq!(messages[2].content, "[context continues]");
+        assert_eq!(messages[2].content, PRUNED_CONTEXT_SEPARATOR);
     }
 
     // -----------------------------------------------------------------------
@@ -1221,6 +1250,104 @@ mod tests {
             "a tool message protected by keep_recent must survive; \
              got roles {:?}",
             messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn prune_keeps_synthetic_tool_summaries_from_dominating_long_history() {
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg(
+                "user",
+                "Build the A2A implementation and keep working until it is done.",
+            ),
+        ];
+
+        for i in 0..40 {
+            messages.push(msg(
+                "assistant",
+                &format!(
+                    r#"{{"content":null,"tool_calls":[{{"id":"old_{i}","name":"file_read","arguments":"{{}}"}}]}}"#
+                ),
+            ));
+            messages.push(msg(
+                "tool",
+                &format!(
+                    r#"{{"tool_call_id":"old_{i}","content":"{}"}}"#,
+                    "old tool output ".repeat(120)
+                ),
+            ));
+            messages.push(msg("user", &format!("Continue with slice {i}.")));
+        }
+
+        messages.push(msg(
+            "assistant",
+            r#"{"content":null,"tool_calls":[{"id":"live","name":"file_read","arguments":"{}"}]}"#,
+        ));
+        messages.push(msg(
+            "tool",
+            r#"{"tool_call_id":"live","content":"recent result"}"#,
+        ));
+        messages.push(msg("user", "Continue from the current state."));
+
+        let config = HistoryPrunerConfig {
+            enabled: true,
+            max_tokens: 2_000,
+            keep_recent: 4,
+            collapse_tool_results: true,
+        };
+
+        prune_history(&mut messages, &config);
+
+        let synthetic_summaries = messages
+            .iter()
+            .filter(|m| m.is_pruned_tool_exchange_summary())
+            .count();
+        assert!(
+            synthetic_summaries <= 3,
+            "provider-visible history should not be dominated by synthetic tool summaries; \
+             found {synthetic_summaries} in roles {:?}",
+            messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.role == "user" && m.content == "Continue from the current state."),
+            "the current user intent must survive pruning"
+        );
+    }
+
+    #[test]
+    fn prune_bounds_summary_lines_before_merging_adjacent_summaries() {
+        let mut messages = vec![msg("system", "sys")];
+        for i in 0..12 {
+            messages.push(ChatMessage::assistant(
+                ChatMessage::pruned_tool_exchange_summary(i + 1),
+            ));
+        }
+        messages.push(msg("user", "Continue from the current state."));
+
+        let config = HistoryPrunerConfig {
+            enabled: true,
+            max_tokens: 100_000,
+            keep_recent: 1,
+            collapse_tool_results: true,
+        };
+
+        prune_history(&mut messages, &config);
+
+        let summary_lines = messages
+            .iter()
+            .map(|m| {
+                m.content
+                    .matches(PRUNED_TOOL_EXCHANGE_SUMMARY_PREFIX)
+                    .count()
+            })
+            .sum::<usize>();
+        assert!(
+            summary_lines <= MAX_SYNTHETIC_TOOL_SUMMARIES,
+            "merged summaries should remain bounded; found {summary_lines} summary lines in \
+             {messages:?}"
         );
     }
 }

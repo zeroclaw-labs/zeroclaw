@@ -23,6 +23,7 @@ pub mod bedrock;
 pub mod catalog;
 pub mod compatible;
 pub mod copilot;
+pub mod dispatch;
 pub mod factory;
 pub mod gemini;
 pub mod gemini_cli;
@@ -42,6 +43,7 @@ pub(crate) mod stream_guard;
 pub mod telnyx;
 pub mod traits;
 
+pub use dispatch::{ProviderDispatch, ProviderDispatchRef};
 #[allow(unused_imports)]
 pub use traits::{
     ChatMessage, ChatRequest, ChatResponse, ConversationMessage, ModelProvider,
@@ -1723,11 +1725,12 @@ pub fn default_model_provider_url(name: &str) -> Option<&'static str> {
         HuggingfaceModelProviderConfig, HyperbolicModelProviderConfig,
         InceptionModelProviderConfig, LambdaAiModelProviderConfig, LeptonModelProviderConfig,
         LitellmModelProviderConfig, MistralModelProviderConfig, MorphModelProviderConfig,
-        NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
-        OpencodeModelProviderConfig, PerplexityModelProviderConfig, RekaModelProviderConfig,
-        SambanovaModelProviderConfig, SglangModelProviderConfig, SiliconflowModelProviderConfig,
-        SyntheticModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
-        VercelModelProviderConfig, VllmModelProviderConfig, YiModelProviderConfig,
+        NearaiModelProviderConfig, NebiusModelProviderConfig, NovitaModelProviderConfig,
+        NscaleModelProviderConfig, OpencodeModelProviderConfig, PerplexityModelProviderConfig,
+        RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
+        SiliconflowModelProviderConfig, SyntheticModelProviderConfig, TogetherModelProviderConfig,
+        UpstageModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
+        YiModelProviderConfig,
     };
 
     match name {
@@ -1775,6 +1778,7 @@ pub fn default_model_provider_url(name: &str) -> Option<&'static str> {
         "arcee" => Some(<ArceeModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "lambda_ai" => Some(<LambdaAiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "inception" => Some(<InceptionModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
+        "nearai" => Some(<NearaiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "baichuan" => Some(<BaichuanModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "yi" => Some(<YiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         _ => None,
@@ -1832,6 +1836,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
         ModelProviderCategory::OpenAiCompatible,
         &[
             ("venice", "Venice", false),
+            ("nearai", "NEAR AI Cloud", false),
             ("vercel", "Vercel AI Gateway", false),
             ("cloudflare", "Cloudflare AI", false),
             ("moonshot", "Moonshot", false),
@@ -2176,6 +2181,17 @@ mod tests {
         assert!(
             !model_provider.capabilities().native_tool_calling,
             "Venice should use prompt-guided tools, not native tool calling"
+        );
+    }
+
+    #[test]
+    fn factory_nearai() {
+        let model_provider = create_model_provider("nearai", Some("nearai-key")).unwrap();
+        // NEAR AI Cloud is OpenAI-protocol-compatible: default Bearer auth +
+        // native OpenAI-style tool calling. No .without_native_tools() override.
+        assert!(
+            model_provider.capabilities().native_tool_calling,
+            "NEAR AI Cloud should use OpenAI-compatible native tool calling"
         );
     }
 
@@ -3043,6 +3059,7 @@ mod tests {
             "ollama",
             "gemini",
             "venice",
+            "nearai",
             "vercel",
             "cloudflare",
             "moonshot",

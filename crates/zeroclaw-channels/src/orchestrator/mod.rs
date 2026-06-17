@@ -121,7 +121,7 @@ use zeroclaw_api::session_keys::sanitize_session_key;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
-use zeroclaw_providers::{self, ChatMessage, ModelProvider};
+use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
 use zeroclaw_runtime::agent::loop_::{
     LoopKnobs, apply_policy_tool_filter, apply_text_tool_prompt_policy,
     build_tool_instructions_for_names, clear_model_switch_request, get_model_switch_state,
@@ -202,7 +202,7 @@ impl Observer for ChannelNotifyObserver {
 /// Per-sender conversation history for channel messages.
 /// Bounded by `MAX_CONVERSATION_SENDERS` — oldest-accessed senders are evicted.
 type ConversationHistoryMap = Arc<Mutex<lru::LruCache<String, Vec<ChatMessage>>>>;
-/// Senders that requested `/new` and must force a fresh prompt on their next message.
+/// Senders that requested `/new` or `/clear` and must force a fresh prompt on their next message.
 type PendingNewSessionSet = Arc<Mutex<HashSet<String>>>;
 /// Maximum conversation senders kept in memory (LRU eviction beyond this).
 const MAX_CONVERSATION_SENDERS: usize = 1000;
@@ -543,11 +543,9 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
     // after a restart; otherwise hydration loads sessions under the on-disk
     // (sanitized) name while lookup keeps producing the un-sanitized form.
     let thread_scope = match msg.thread_ts.as_deref() {
-        // Matrix root events can be self-anchored when `reply_in_thread`
-        // is enabled so outbound replies open a thread. That anchor is a
-        // delivery detail, not a conversation-history boundary; otherwise
-        // every top-level Matrix message becomes a fresh session.
-        Some(tid) if is_matrix_channel_name(&msg.channel) && tid == msg.id => None,
+        // Matrix thread_ts is a delivery anchor, not a topic boundary: root
+        // and follow-ups must share one sender+room session. See #7700.
+        Some(_) if is_matrix_channel_name(&msg.channel) => None,
         other => other,
     };
     let raw = match thread_scope {
@@ -1138,8 +1136,15 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         .to_ascii_lowercase();
 
     match base_command.as_str() {
-        // `/new` is available on every channel — no model-switch gate.
+        // `/new` and bare `/clear` are available on every channel — no model-switch gate.
         "/new" => Some(ChannelRuntimeCommand::NewSession),
+        "/clear" => {
+            if parts.next().is_none() {
+                Some(ChannelRuntimeCommand::NewSession)
+            } else {
+                None
+            }
+        }
         // Model/model_provider switching is channel-gated.
         "/models" if supports_runtime_model_switch(channel_name) => {
             if let Some(model_provider) = parts.next() {
@@ -1450,7 +1455,10 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     )?;
     let model_provider_instance: Arc<dyn ModelProvider> = Arc::from(model_provider_instance);
 
-    if let Err(err) = model_provider_instance.warmup().await {
+    if let Err(err) = ProviderDispatch::from_ref(&*model_provider_instance)
+        .warmup()
+        .await
+    {
         if zeroclaw_providers::reliable::is_non_retryable(&err) {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": next_defaults.default_model_provider, "model": next_defaults.model, "err": err.to_string()})), "Rejecting config reload: model not available (non-retryable)");
             return Ok(());
@@ -2062,7 +2070,7 @@ async fn get_or_create_provider(
     .await?;
     let model_provider: Arc<dyn ModelProvider> = Arc::from(model_provider);
 
-    if let Err(err) = model_provider.warmup().await {
+    if let Err(err) = ProviderDispatch::from_ref(&*model_provider).warmup().await {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -2804,7 +2812,7 @@ async fn classify_channel_reply_intent(
         let _ = writeln!(convo, "[{role}] {safe_content}");
     }
 
-    let response = model_provider
+    let response = ProviderDispatch::from_ref(model_provider)
         .chat_with_system(Some(system_prompt), &convo, model, temperature)
         .await?;
     Ok(parse_reply_intent(&response))
@@ -5676,6 +5684,7 @@ fn build_channel_by_id(
                     tg.mention_only,
                 )
                 .with_persistence(config_arc.clone())
+                .with_api_base(tg.api_base_url.clone())
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_transcription(config.transcription.clone())
@@ -5722,7 +5731,8 @@ fn build_channel_by_id(
                 .with_transcription(config.transcription.clone())
                 .with_stall_timeout(dc.stall_timeout_secs)
                 .with_approval_timeout_secs(dc.approval_timeout_secs)
-                .with_intents_mask(dc.intents_mask),
+                .with_intents_mask(dc.intents_mask)
+                .with_reaction_notifications(dc.reaction_notifications),
             ))
         }
         #[cfg(not(feature = "channel-discord"))]
@@ -6677,6 +6687,7 @@ fn collect_configured_channels(
                         tg.mention_only,
                     )
                     .with_persistence(config_arc.clone())
+                    .with_api_base(tg.api_base_url.clone())
                     .with_ack_reactions(ack)
                     .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                     .with_transcription(config.transcription.clone())
@@ -6735,7 +6746,37 @@ fn collect_configured_channels(
         .with_transcription(config.transcription.clone())
         .with_stall_timeout(dc.stall_timeout_secs)
         .with_approval_timeout_secs(dc.approval_timeout_secs)
-        .with_intents_mask(dc.intents_mask);
+        .with_slash_commands(dc.slash_commands)
+        .with_intents_mask(dc.intents_mask)
+        .with_reaction_notifications(dc.reaction_notifications);
+        if dc.slash_commands {
+            // Skill-derived commands: resolved from canonical state at
+            // READY/interaction time (no cache), scoped to the agent that
+            // owns this channel alias. Orphan channels resolve to none —
+            // they register `/ask` only. The config is cloned out of the
+            // read guard before any skill IO: the loader hits the
+            // filesystem (and may sync the open-skills repo), and holding
+            // a read guard across that would stall every config consumer
+            // behind a queued writer.
+            let cfg_arc_for_slash = config_arc.clone();
+            let channel_ref = format!("discord.{alias}");
+            discord_ch = discord_ch.with_slash_command_resolver(std::sync::Arc::new(move || {
+                let config = { cfg_arc_for_slash.read().clone() };
+                let Some(agent_alias) = config
+                    .agent_for_channel(&channel_ref)
+                    .map(ToString::to_string)
+                else {
+                    return Vec::new();
+                };
+                let workspace = config.agent_workspace_dir(&agent_alias);
+                let skills = zeroclaw_runtime::skills::load_skills_for_agent(
+                    &workspace,
+                    &config,
+                    &agent_alias,
+                );
+                crate::discord::discord_slash_specs_from_skills(&skills)
+            }));
+        }
         if dc.archive {
             match zeroclaw_memory::SqliteMemory::new_named("sqlite", &config.data_dir, "discord") {
                 Ok(mem) => {
@@ -8401,7 +8442,7 @@ pub async fn start_channels(
             .await?,
         );
 
-        if let Err(e) = model_provider.warmup().await {
+        if let Err(e) = ProviderDispatch::from_ref(&*model_provider).warmup().await {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -9273,7 +9314,8 @@ pub async fn deliver_announcement(
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
             let ch =
-                TelegramChannel::new(tg.bot_token.clone(), alias, peer_resolver, tg.mention_only);
+                TelegramChannel::new(tg.bot_token.clone(), alias, peer_resolver, tg.mention_only)
+                    .with_api_base(tg.api_base_url.clone());
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(not(feature = "channel-telegram"))]
@@ -9498,7 +9540,9 @@ pub async fn deliver_announcement(
                 .get(alias)
                 .ok_or_else(not_configured)?;
             if !wa.is_web_config() {
-                anyhow::bail!("WhatsApp channel send requires Web mode (session_path must be set)");
+                anyhow::bail!(
+                    "WhatsApp channel send requires Web mode (set session_path, pair_phone, or mode = personal)"
+                );
             }
             let peers = config.channel_external_peers("whatsapp", alias);
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
@@ -15984,12 +16028,12 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn matrix_thread_conversation_history_key_uses_thread_root() {
-        let msg = zeroclaw_api::channel::ChannelMessage {
-            id: "$reply:server".into(),
+    fn matrix_thread_follow_up_shares_root_session_key() {
+        let root = zeroclaw_api::channel::ChannelMessage {
+            id: "$root:server".into(),
             sender: "@alice:server".into(),
             reply_target: "!room:server".into(),
-            content: "thread reply".into(),
+            content: "open the thread".into(),
             channel: "matrix".into(),
             channel_alias: None,
             timestamp: 1,
@@ -15998,10 +16042,19 @@ BTC is currently around $65,000 based on latest tool output."#
             attachments: vec![],
             subject: None,
         };
+        let follow_up = zeroclaw_api::channel::ChannelMessage {
+            id: "$reply:server".into(),
+            content: "thread reply".into(),
+            timestamp: 2,
+            thread_ts: Some("$root:server".into()),
+            interruption_scope_id: Some("$root:server".into()),
+            ..root.clone()
+        };
 
-        let key = conversation_history_key(&msg);
-        assert!(key.contains("_root_server"));
-        assert!(!key.contains("_reply_server"));
+        let root_key = conversation_history_key(&root);
+        assert_eq!(root_key, conversation_history_key(&follow_up));
+        assert!(!root_key.contains("$root:server"));
+        assert!(!root_key.contains("$reply:server"));
     }
 
     #[test]
@@ -16037,6 +16090,19 @@ BTC is currently around $65,000 based on latest tool output."#
             parse_runtime_command("wecom_ws", "/model qwen-max"),
             Some(ChannelRuntimeCommand::SetModel("qwen-max".into()))
         );
+    }
+
+    #[test]
+    fn parse_runtime_command_maps_clear_to_new_session() {
+        assert_eq!(
+            parse_runtime_command("telegram", "/clear"),
+            Some(ChannelRuntimeCommand::NewSession)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/clear@zeroclaw_bot"),
+            Some(ChannelRuntimeCommand::NewSession)
+        );
+        assert_eq!(parse_runtime_command("telegram", "/clear all"), None);
     }
 
     /// `/models <family>` must resolve to a configured alias-backed ref so the
@@ -19413,6 +19479,7 @@ This is an example JSON object for profile settings."#;
             zeroclaw_config::schema::TelegramConfig {
                 enabled: true,
                 bot_token: "test-token".to_string(),
+                api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::Off,
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
@@ -20597,6 +20664,42 @@ Done."#;
         assert!(
             msg.contains("[channels.whatsapp.default] not configured"),
             "whatsapp.default must report the real config table; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn deliver_announcement_rejects_whatsapp_non_web_config_clearly() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.whatsapp.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                access_token: Some("test-token".to_string()),
+                phone_number_id: Some("phone-number-id".to_string()),
+                verify_token: Some("verify-token".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let err = deliver_announcement(&config, "whatsapp.default", "+15551234567", None, "hi")
+            .await
+            .expect_err("expected WhatsApp Cloud config to be rejected for cron delivery");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("WhatsApp channel send requires Web mode"),
+            "whatsapp.default must clearly explain the Web mode requirement; got: {msg}"
+        );
+        assert!(
+            msg.contains("session_path")
+                && msg.contains("pair_phone")
+                && msg.contains("mode = personal"),
+            "whatsapp.default must name the Web selectors accepted by cron delivery; got: {msg}"
+        );
+        assert!(
+            !msg.contains("unsupported delivery channel")
+                && !msg.contains("[channels.whatsapp.default] not configured"),
+            "whatsapp.default must reject the configured non-Web mode, not fall through; got: {msg}"
         );
     }
 
