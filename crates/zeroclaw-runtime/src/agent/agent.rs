@@ -2719,6 +2719,80 @@ mod tests {
         }
     }
 
+    const BLANK_TURN_ERROR: &str = "empty user message: refusing to dispatch a blank turn";
+
+    fn blank_input_agent(model_provider: Box<dyn ModelProvider>) -> Agent {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        Agent::builder()
+            .model_provider(model_provider)
+            .tools(Vec::new())
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config")
+    }
+
+    #[tokio::test]
+    async fn turn_rejects_blank_input() {
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(Vec::new()),
+        });
+        let mut agent = blank_input_agent(model_provider);
+        let err = agent.turn("").await.expect_err("blank turn must fail");
+        assert_eq!(err.to_string(), BLANK_TURN_ERROR);
+    }
+
+    #[tokio::test]
+    async fn turn_rejects_whitespace_only_input() {
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(Vec::new()),
+        });
+        let mut agent = blank_input_agent(model_provider);
+        let err = agent
+            .turn("   \n\t")
+            .await
+            .expect_err("whitespace-only turn must fail");
+        assert_eq!(err.to_string(), BLANK_TURN_ERROR);
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_rejects_blank_input() {
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(Vec::new()),
+        });
+        let mut agent = blank_input_agent(model_provider);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
+        let err = agent
+            .turn_streamed("", event_tx, None)
+            .await
+            .expect_err("blank streamed turn must fail");
+        assert_eq!(err.to_string(), BLANK_TURN_ERROR);
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_rejects_whitespace_only_input() {
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(Vec::new()),
+        });
+        let mut agent = blank_input_agent(model_provider);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
+        let err = agent
+            .turn_streamed("  \n", event_tx, None)
+            .await
+            .expect_err("whitespace-only streamed turn must fail");
+        assert_eq!(err.to_string(), BLANK_TURN_ERROR);
+    }
+
     struct ModelCaptureModelProvider {
         responses: Mutex<Vec<zeroclaw_providers::ChatResponse>>,
         seen_models: Arc<Mutex<Vec<String>>>,
