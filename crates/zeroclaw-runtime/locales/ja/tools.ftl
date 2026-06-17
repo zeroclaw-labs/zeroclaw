@@ -18,6 +18,7 @@ tool-file-edit = 完全一致する文字列を新しいコンテンツに置き
 tool-file-read = 行番号付きのファイルコンテンツを読み込み。offsetとlimitによる部分読み込みをサポート。PDFからテキストを抽出します。その他のバイナリファイルはロッシーUTF-8変換で読み込まれます。
 tool-file-write = ワークスペース内のファイルにコンテンツを書き込み
 tool-git-operations = 構造化されたGit操作（status、diff、log、branch、commit、add、checkout、stash）を実行。解析されたJSON出力を提供し、自律性制御のためのセキュリティポリシーと統合します。
+tool-git-operations-error-not-in-repo = '{ $path }' はGitリポジトリ内にありません。Gitワークツリー内のパスを選択し、リポジトリのサブディレクトリに 'path' を渡すか、git_operationsを実行する前にリポジトリを初期化してください。
 tool-glob-search = ワークスペース内でglobパターンにマッチするファイルを検索。ワークスペースルートに対する相対パスの、ソート済みマッチングファイルパスのリストを返します。例：'**/*.rs'（すべてのRustファイル）、'src/**/mod.rs'（src内のすべてのmod.rs）。
 tool-google-workspace = gws CLIを経由してGoogle Workspaceサービス（Drive、Gmail、Calendar、Sheets、Docs等）と相互作用します。gwsがインストール済みで認証されている必要があります。
 tool-hardware-board-info = 接続されたハードウェアの完全なボード情報（チップ、アーキテクチャ、メモリマップ）を返す。用途：ユーザーが「board info」、「what board do I have」、「connected hardware」、「chip info」、「what hardware」、または「memory map」を尋ねる場合。

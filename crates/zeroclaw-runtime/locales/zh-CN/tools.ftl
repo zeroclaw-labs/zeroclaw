@@ -18,6 +18,7 @@ tool-file-edit = 通过将精确匹配的字符串替换为新内容来编辑文
 tool-file-read = 读取带行号的文件内容。支持通过 offset 和 limit 进行部分读取。可从 PDF 提取文本；其他二进制文件以有损 UTF-8 转换方式读取。
 tool-file-write = 将内容写入工作区中的文件
 tool-git-operations = 执行结构化的 Git 操作（status、diff、log、branch、commit、add、checkout、stash）。提供解析后的 JSON 输出，并与安全策略集成以实现自主控制。
+tool-git-operations-error-not-in-repo = 当前路径 '{ $path }' 不在 Git 仓库中。请选择一个 Git 工作树内的路径，通过 'path' 参数指定仓库子目录，或在运行 git_operations 前初始化一个仓库。
 tool-glob-search = 在工作区内搜索匹配 glob 模式的文件。返回相对于工作区根目录的匹配文件路径排序列表。示例：'**/*.rs'（所有 Rust 文件）、'src/**/mod.rs'（src 中所有的 mod.rs）。
 tool-google-workspace = 通过 gws CLI 与 Google Workspace 服务（Drive、Gmail、Calendar、Sheets、Docs 等）交互。需要已安装并通过认证的 gws。
 tool-hardware-board-info = 返回已连接硬件的完整开发板信息（芯片、架构、内存映射）。适用场景：用户询问 'board info'、'我有什么开发板'、'已连接硬件'、'芯片信息'、'什么硬件' 或 'memory map'。

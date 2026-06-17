@@ -981,10 +981,15 @@ impl Tool for GitOperationsTool {
             }
 
             if !found_git {
+                let path_display = working_dir.display().to_string();
+                let error_msg = crate::i18n::get_required_tool_string_with_args(
+                    "tool-git-operations-error-not-in-repo",
+                    &[("path", &path_display)],
+                );
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some("Not in a git repository".into()),
+                    error: Some(error_msg),
                 });
             }
         }
