@@ -5,13 +5,13 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use zeroclaw::agent::agent::Agent;
 use zeroclaw::agent::dispatcher::{NativeToolDispatcher, XmlToolDispatcher};
-use zeroclaw::agent::memory_loader::MemoryLoader;
 use zeroclaw::config::MemoryConfig;
 use zeroclaw::memory;
 use zeroclaw::memory::Memory;
 use zeroclaw::observability::{NoopObserver, Observer};
 use zeroclaw::providers::{ChatResponse, ModelProvider, ToolCall};
 use zeroclaw::tools::Tool;
+use zeroclaw_api::memory_traits::MemoryStrategy;
 
 /// Create an in-memory "none" backend for tests.
 pub fn make_memory() -> Arc<dyn Memory> {
@@ -73,11 +73,11 @@ pub fn build_agent_xml(model_provider: Box<dyn ModelProvider>, tools: Vec<Box<dy
         .unwrap()
 }
 
-/// Build an agent with optional custom `MemoryLoader`.
+/// Build an agent with optional custom `MemoryStrategy`.
 pub fn build_recording_agent(
     model_provider: Box<dyn ModelProvider>,
     tools: Vec<Box<dyn Tool>>,
-    memory_loader: Option<Box<dyn MemoryLoader>>,
+    memory_strategy: Option<Arc<dyn MemoryStrategy>>,
 ) -> Agent {
     let mut builder = Agent::builder()
         .model_provider(model_provider)
@@ -87,8 +87,8 @@ pub fn build_recording_agent(
         .tool_dispatcher(Box::new(NativeToolDispatcher))
         .workspace_dir(std::env::temp_dir());
 
-    if let Some(loader) = memory_loader {
-        builder = builder.memory_loader(loader);
+    if let Some(strategy) = memory_strategy {
+        builder = builder.memory_strategy(strategy);
     }
 
     builder.build().unwrap()
@@ -116,12 +116,12 @@ pub fn build_agent_with_sqlite_memory(
         .unwrap()
 }
 
-/// Mock memory loader that returns a static context string.
-pub struct StaticMemoryLoader {
+/// Mock memory strategy that returns a static context string.
+pub struct StaticMemoryStrategy {
     context: String,
 }
 
-impl StaticMemoryLoader {
+impl StaticMemoryStrategy {
     pub fn new(context: &str) -> Self {
         Self {
             context: context.to_string(),
@@ -130,13 +130,28 @@ impl StaticMemoryLoader {
 }
 
 #[async_trait]
-impl MemoryLoader for StaticMemoryLoader {
+impl MemoryStrategy for StaticMemoryStrategy {
     async fn load_context(
         &self,
-        _memory: &dyn Memory,
-        _user_message: &str,
+        _observer: &dyn Observer,
+        _query: &str,
         _session_id: Option<&str>,
-    ) -> Result<String> {
+    ) -> anyhow::Result<String> {
         Ok(self.context.clone())
+    }
+
+    async fn consolidate_turn(
+        &self,
+        _user_message: &str,
+        _assistant_response: &str,
+        _provider: &dyn ModelProvider,
+        _model: &str,
+        _temperature: Option<f64>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn run_governance(&self) -> anyhow::Result<()> {
+        Ok(())
     }
 }

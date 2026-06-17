@@ -179,6 +179,19 @@ rpc_type! {
 }
 
 rpc_type! {
+    pub struct SessionKillParams {
+        pub session_id: String,
+    }
+}
+
+rpc_type! {
+    pub struct SessionKillResult {
+        pub session_id: String,
+        pub killed: bool,
+    }
+}
+
+rpc_type! {
     pub struct SessionPromptParams {
         pub session_id: String,
         pub prompt: String,
@@ -224,6 +237,8 @@ rpc_type! {
         pub session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub branch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub hash: Option<String>,
     }
 }
 
@@ -313,20 +328,6 @@ rpc_type! {
     pub struct SessionDeleteResult {
         pub session_id: String,
         pub deleted: bool,
-    }
-}
-
-rpc_type! {
-    pub struct SessionRenameParams {
-        pub session_id: String,
-        pub name: String,
-    }
-}
-
-rpc_type! {
-    pub struct SessionRenameResult {
-        pub session_id: String,
-        pub name: String,
     }
 }
 
@@ -618,6 +619,19 @@ rpc_type! {
 }
 
 rpc_type! {
+    pub struct ConfigResolveAliasSourceParams {
+        pub source: zeroclaw_config::traits::AliasSource,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigResolveAliasSourceResult {
+        pub source: zeroclaw_config::traits::AliasSource,
+        pub values: Vec<String>,
+    }
+}
+
+rpc_type! {
     pub struct ConfigMapKeyCreateParams {
         pub path: String,
         pub key: String,
@@ -715,7 +729,10 @@ rpc_type! {
     pub struct AgentStatusEntry {
         pub alias: String,
         pub enabled: bool,
-        pub active_sessions: usize,
+        #[serde(default)]
+        pub live_sessions: usize,
+        #[serde(default)]
+        pub persisted_sessions: usize,
         #[serde(default)]
         pub channels: Vec<String>,
     }
@@ -963,6 +980,11 @@ rpc_type! {
     pub struct CatalogModelsResult {
         pub model_provider: String,
         pub models: Vec<String>,
+        /// Optional pricing data keyed by model id. Populated when the
+        /// provider's `/models` endpoint returns pricing (Kilo Gateway,
+        /// OpenRouter, etc.). Absent for catalog fallbacks without pricing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub pricing: Option<std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing>>,
         pub local: bool,
         pub live: bool,
     }

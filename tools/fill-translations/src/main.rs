@@ -17,7 +17,7 @@ struct Args {
     /// Entries per API call
     #[arg(long, default_value = "50")]
     batch: usize,
-    /// ModelProvider alias from [providers.models.<kind>.<alias>] in config.toml
+    /// ModelProvider alias from `[providers.models.<kind>.<alias>]` in config.toml
     #[arg(long)]
     model_provider: String,
     /// Config directory holding config.toml and .secret-key (default:
@@ -359,7 +359,7 @@ async fn translate_batch(
 
     let mut out = Vec::with_capacity(batch.len());
     for source in batch {
-        let content = provider
+        let content = zeroclaw_providers::ProviderDispatch::from_ref(provider)
             .chat_with_system(Some(&system), source, model, None)
             .await
             .map_err(|e| fail(e, String::new()))?;

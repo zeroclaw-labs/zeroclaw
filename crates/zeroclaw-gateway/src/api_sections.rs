@@ -66,10 +66,12 @@ pub async fn handle_catalog_models(
     }
     let _ = state;
     let local = zeroclaw_runtime::quickstart::model_provider_is_local(&q.model_provider);
-    let (models, live) = zeroclaw_runtime::quickstart::model_catalog(&q.model_provider).await;
+    let (models, pricing, live) =
+        zeroclaw_runtime::quickstart::model_catalog(&q.model_provider).await;
     axum::Json(CatalogModelsResult {
         model_provider: q.model_provider,
         models,
+        pricing,
         local,
         live,
     })
@@ -240,25 +242,9 @@ pub struct AgentOptionsResponse {
 /// underscore-bearing field silently returns `None` → empty `Vec` →
 /// dashboard renders "No X configured yet" even though X is configured.
 pub fn build_agent_options(cfg: &zeroclaw_config::schema::Config) -> AgentOptionsResponse {
-    fn dotted_aliases(cfg: &zeroclaw_config::schema::Config, prefix: &str) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        for f in cfg.prop_fields() {
-            if let Some(rest) = f.name.strip_prefix(&format!("{prefix}.")) {
-                let mut parts = rest.splitn(3, '.');
-                if let (Some(ty), Some(alias), Some(_)) = (parts.next(), parts.next(), parts.next())
-                {
-                    let dotted = format!("{ty}.{alias}");
-                    if !out.contains(&dotted) {
-                        out.push(dotted);
-                    }
-                }
-            }
-        }
-        out.sort();
-        out
-    }
+    use zeroclaw_config::traits::AliasSource;
 
-    let channels = dotted_aliases(cfg, "channels");
+    let channels = cfg.resolve_alias_source(AliasSource::Channels);
     let mut channel_types: Vec<String> = channels
         .iter()
         .filter_map(|d| d.split_once('.').map(|(t, _)| t.to_string()))
@@ -269,13 +255,13 @@ pub fn build_agent_options(cfg: &zeroclaw_config::schema::Config) -> AgentOption
     AgentOptionsResponse {
         channels,
         channel_types,
-        model_providers: dotted_aliases(cfg, "providers.models"),
-        risk_profiles: cfg.get_map_keys("risk_profiles").unwrap_or_default(),
-        runtime_profiles: cfg.get_map_keys("runtime_profiles").unwrap_or_default(),
-        skill_bundles: cfg.get_map_keys("skill_bundles").unwrap_or_default(),
-        knowledge_bundles: cfg.get_map_keys("knowledge_bundles").unwrap_or_default(),
-        mcp_bundles: cfg.get_map_keys("mcp_bundles").unwrap_or_default(),
-        agents: cfg.get_map_keys("agents").unwrap_or_default(),
+        model_providers: cfg.resolve_alias_source(AliasSource::ModelProviders),
+        risk_profiles: cfg.resolve_alias_source(AliasSource::RiskProfiles),
+        runtime_profiles: cfg.resolve_alias_source(AliasSource::RuntimeProfiles),
+        skill_bundles: cfg.resolve_alias_source(AliasSource::SkillBundles),
+        knowledge_bundles: cfg.resolve_alias_source(AliasSource::KnowledgeBundles),
+        mcp_bundles: cfg.resolve_alias_source(AliasSource::McpBundles),
+        agents: cfg.resolve_alias_source(AliasSource::Agents),
     }
 }
 
@@ -418,7 +404,7 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
             ConfigSectionEntry {
                 completed: completed.contains(&key),
                 ready: section_ready(&cfg, &key, completed.contains(&key)),
-                label: humanize_section(&key),
+                label: zeroclaw_config::sections::humanize_section_key(&key),
                 help: section_help(&key).to_string(),
                 has_picker,
                 group: section_group(&key).to_string(),
@@ -462,69 +448,18 @@ const HIDDEN_TOP_LEVEL: &[&str] = &[
     "pre_override_snapshots",
 ];
 
-/// Humanize a section key for display (`google_workspace` → `Google workspace`).
-/// Keeps things simple and predictable; specific wording overrides go in
-/// the section-help table or per-section labels if/when we add them.
-fn humanize_section(key: &str) -> String {
-    match key {
-        "providers.models" => return "Model providers".to_string(),
-        "providers.tts" => return "TTS providers".to_string(),
-        "providers.transcription" => return "Transcription providers".to_string(),
-        _ => {}
-    }
-    let mut s = key.replace(['_', '-'], " ");
-    if let Some(c) = s.get_mut(0..1) {
-        c.make_ascii_uppercase();
-    }
-    s
-}
-
-/// Display group for a section. Hand-curated until v3 / #5947 lands a
-/// schema attribute that encodes grouping declaratively. Unknown keys
-/// fall into `Other` so new schema additions still surface — they just
-/// land in the catch-all bucket until someone curates them.
+/// Display group for a section. Delegates to
+/// `zeroclaw_config::sections::section_group_for_key` — grouping lives
+/// in the `sections!` table (curated rows) plus its long-tail map, so
+/// the dashboard, the RPC `config/sections` handler, and the TUI all
+/// read one source. Unknown keys fall into `Other` so new schema
+/// additions still surface — they just land in the catch-all bucket
+/// until someone curates them.
 ///
 /// Group order in the dashboard sidebar is governed by the frontend (see
-/// `Config.tsx`), not this list.
+/// `Config.tsx`), mirroring `zeroclaw_config::sections::SECTION_GROUPS`.
 fn section_group(key: &str) -> &'static str {
-    match key {
-        "providers.models" | "channels" | "memory" | "hardware" | "tunnel" | "agents"
-        | "skills" | "skill_bundles" | "risk_profiles" | "runtime_profiles" | "peer_groups" => {
-            "Foundation"
-        }
-        // Agent loop, scheduling, and orchestration.
-        "agent"
-        | "cron"
-        | "heartbeat"
-        | "hooks"
-        | "pacing"
-        | "pipeline"
-        | "query_classification"
-        | "reliability"
-        | "runtime"
-        | "scheduler"
-        | "sop"
-        | "verifiable_intent" => "Agent",
-        // Multi-agent / delegation.
-        "delegate" => "Multi-agent",
-        // Tool integrations.
-        "browser" | "browser_delegate" | "http_request" | "image_gen" | "knowledge"
-        | "link_enricher" | "mcp" | "media_pipeline" | "multimodal" | "plugins"
-        | "project_intel" | "shell_tool" | "text_browser" | "transcription" | "tts"
-        | "web_fetch" | "web_search" => "Tools",
-        // External services / vendor integrations. ACP is included because
-        // it is always client-paired — you cannot use it without a client.
-        "acp" | "claude_code" | "claude_code_runner" | "codex_cli" | "composio" | "gemini_cli"
-        | "google_workspace" | "jira" | "linkedin" | "notion" | "opencode_cli" => "Integrations",
-        // Networking / multi-node infrastructure.
-        "gateway" | "node_transport" | "nodes" | "proxy" => "Network",
-        // Storage, identity, secrets.
-        "identity" | "secrets" | "storage" => "Storage",
-        // Operations / monitoring / safety / cost.
-        "backup" | "cloud_ops" | "conversational_ai" | "cost" | "data_retention"
-        | "observability" | "peripherals" | "security" | "security_ops" | "trust" => "Operations",
-        _ => "Other",
-    }
+    zeroclaw_config::sections::section_group_for_key(key).label()
 }
 
 /// Help text for a section. Delegates to `zeroclaw_config::sections::section_help`
@@ -645,6 +580,7 @@ fn picker_items_for(
         // `<section>.<alias>` (operator-named keys, no closed kind set).
         Section::PeerGroups
         | Section::Cron
+        | Section::McpServers
         | Section::McpBundles
         | Section::KnowledgeBundles
         | Section::SkillBundles
@@ -923,12 +859,12 @@ fn apply_first_run_agent_defaults(cfg: &mut zeroclaw_config::schema::Config, ali
     if agent.risk_profile.trim().is_empty()
         && let Some(risk_profile) = risk_profile
     {
-        agent.risk_profile = risk_profile;
+        agent.risk_profile = risk_profile.into();
     }
     if agent.runtime_profile.trim().is_empty()
         && let Some(runtime_profile) = runtime_profile
     {
-        agent.runtime_profile = runtime_profile;
+        agent.runtime_profile = runtime_profile.into();
     }
 }
 
@@ -1108,6 +1044,7 @@ pub async fn handle_section_select(
         Section::Agents
         | Section::PeerGroups
         | Section::Cron
+        | Section::McpServers
         | Section::McpBundles
         | Section::KnowledgeBundles
         | Section::SkillBundles

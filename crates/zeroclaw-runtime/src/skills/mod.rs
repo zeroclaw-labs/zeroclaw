@@ -14,12 +14,14 @@ use zip::ZipArchive;
 
 pub mod audit;
 pub mod bundle;
+pub mod cache;
 pub mod constants;
 pub mod creator;
 pub mod document;
 pub mod frontmatter;
 pub mod improver;
 pub mod reference;
+pub mod review;
 pub mod scaffold;
 pub mod service;
 mod suggestions;
@@ -103,6 +105,12 @@ pub struct SkillTool {
     /// action). Accepts the legacy key `default_args` for compatibility.
     #[serde(default, alias = "default_args")]
     pub locked_args: HashMap<String, String>,
+    /// For `kind = "shell"` / `kind = "script"`: maximum execution time in
+    /// seconds before the command is killed. Unset falls back to the built-in
+    /// `SKILL_SHELL_TIMEOUT_SECS` (60s) default; long-running skills (e.g. a
+    /// build pipeline) raise it via `timeout_secs` in SKILL.toml.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 /// Skill manifest parsed from SKILL.toml
@@ -453,6 +461,25 @@ pub fn load_skills_for_agent(
     skills
 }
 
+/// Production helper: loads skills for an agent using the correct per-agent
+/// workspace directory. This is the single call site that all runtime paths
+/// (agent boot, message processing, WebSocket/daemon) must use to ensure
+/// skills are loaded from `<install>/agents/<alias>/workspace/skills/`
+/// rather than `config.data_dir`.
+///
+/// Source of truth for the workspace directory is `config.agent_workspace_dir(agent_alias)`;
+/// this helper resolves it on every call so config reloads take effect.
+pub fn load_skills_for_agent_from_config(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> Vec<Skill> {
+    load_skills_for_agent(
+        &config.agent_workspace_dir(agent_alias),
+        config,
+        agent_alias,
+    )
+}
+
 /// Load skills using explicit open-skills settings.
 pub fn load_skills_with_open_skills_settings(
     workspace_dir: &Path,
@@ -493,6 +520,12 @@ fn load_workspace_skills(workspace_dir: &Path, allow_scripts: bool) -> Vec<Skill
 }
 
 pub fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
+    cache::cached_load(skills_dir, allow_scripts, "workspace", || {
+        load_skills_from_directory_uncached(skills_dir, allow_scripts)
+    })
+}
+
+fn load_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
     if !skills_dir.exists() {
         return Vec::new();
     }
@@ -586,6 +619,12 @@ fn finalize_open_skill(mut skill: Skill) -> Skill {
 }
 
 fn load_open_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
+    cache::cached_load(skills_dir, allow_scripts, "open-skills", || {
+        load_open_skills_from_directory_uncached(skills_dir, allow_scripts)
+    })
+}
+
+fn load_open_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
     if !skills_dir.exists() {
         return Vec::new();
     }
@@ -1090,7 +1129,10 @@ fn parse_simple_frontmatter(s: &str) -> SkillMarkdownMeta {
     for line in s.lines() {
         // Collect indented continuation lines for YAML block scalars (>- or |)
         if let Some(ref key) = collecting_multiline {
-            if line.starts_with(' ') || line.starts_with('\t') {
+            // A blank/whitespace-only line is a paragraph break *inside* the
+            // block scalar, not a terminator — keep collecting. Only a
+            // non-indented, non-empty line (a real next key) ends the scalar.
+            if line.starts_with(' ') || line.starts_with('\t') || line.trim().is_empty() {
                 multiline_parts.push(line.trim().to_string());
                 continue;
             }
@@ -1309,7 +1351,10 @@ pub fn skills_to_prompt_with_mode(
                         &mut prompt,
                         8,
                         "name",
-                        &format!("{}__{}", skill.name, tool.name),
+                        // Must match the registered tool spec's name exactly
+                        // (same sanitizer), or the model is told to call a name
+                        // that no tool exposes (#6678).
+                        &crate::tools::skill_tool::composed_tool_name(&skill.name, &tool.name),
                     );
                     write_xml_text_element(&mut prompt, 8, "description", &tool.description);
                     let _ = writeln!(prompt, "      </tool>");
@@ -2145,19 +2190,15 @@ pub fn load_plugin_skills_from_config(config: &zeroclaw_config::schema::Config) 
         return Vec::new();
     }
 
-    let plugins_dir = expand_plugins_dir(&config.plugins.plugins_dir);
-    let parent = match plugins_dir.parent() {
-        Some(p) => p.to_path_buf(),
-        None => return Vec::new(),
-    };
+    let plugins_dir = config.plugins.resolved_plugins_dir();
 
     let signature_mode = zeroclaw_plugins::host::PluginHost::parse_signature_mode(
         &config.plugins.security.signature_mode,
     );
     let trusted_keys = config.plugins.security.trusted_publisher_keys.clone();
 
-    let host = match zeroclaw_plugins::host::PluginHost::with_security(
-        &parent,
+    let host = match zeroclaw_plugins::host::PluginHost::from_plugins_dir_with_security(
+        &plugins_dir,
         signature_mode,
         trusted_keys,
     ) {
@@ -2185,16 +2226,6 @@ pub fn load_plugin_skills_from_config(config: &zeroclaw_config::schema::Config) 
 }
 
 #[cfg(feature = "plugins-wasm")]
-fn expand_plugins_dir(plugins_dir: &str) -> PathBuf {
-    if let Some(rest) = plugins_dir.strip_prefix("~/")
-        && let Some(dirs) = UserDirs::new()
-    {
-        return dirs.home_dir().join(rest);
-    }
-    PathBuf::from(plugins_dir)
-}
-
-#[cfg(feature = "plugins-wasm")]
 fn namespace_plugin_skill(plugin_name: &str, mut skill: Skill) -> Skill {
     let qualified = format!("plugin:{}/{}", plugin_name, skill.name);
     skill.name = qualified;
@@ -2208,6 +2239,33 @@ fn namespace_plugin_skill(plugin_name: &str, mut skill: Skill) -> Skill {
 #[cfg(test)]
 mod registry_tests {
     use super::*;
+
+    #[test]
+    fn parse_simple_frontmatter_keeps_blank_line_in_block_scalar() {
+        // A blank line is a paragraph break *inside* a YAML block scalar, not a
+        // terminator. The parser must not truncate the description at it.
+        let frontmatter = "name: x\ndescription: >-\n  para one\n\n  para two\n";
+        let meta = parse_simple_frontmatter(frontmatter);
+        let desc = meta.description.expect("description should be parsed");
+        assert!(
+            desc.contains("para one"),
+            "first paragraph missing: {desc:?}"
+        );
+        assert!(
+            desc.contains("para two"),
+            "second paragraph after blank line was truncated: {desc:?}"
+        );
+        assert_eq!(meta.name.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn parse_simple_frontmatter_block_scalar_stops_at_next_key() {
+        // A real, non-indented next key must still terminate the block scalar.
+        let frontmatter = "description: >-\n  hello\n  world\nversion: 1.2.3\n";
+        let meta = parse_simple_frontmatter(frontmatter);
+        assert_eq!(meta.description.as_deref(), Some("hello world"));
+        assert_eq!(meta.version.as_deref(), Some("1.2.3"));
+    }
 
     #[test]
     fn test_is_registry_source_accepts_bare_names() {
@@ -2775,6 +2833,202 @@ description = "fine"
         assert!(
             !names.contains(&"bad-open"),
             "bad open-skill must be skipped, not silently accepted; got: {names:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod prompt_callable_name_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn tool(name: &str, kind: &str) -> SkillTool {
+        SkillTool {
+            name: name.to_string(),
+            description: "desc".to_string(),
+            kind: kind.to_string(),
+            command: "echo hi".to_string(),
+            args: HashMap::new(),
+            target: None,
+            locked_args: HashMap::new(),
+            timeout_secs: None,
+        }
+    }
+
+    /// The skills prompt must advertise the exact same callable name the tool
+    /// spec registers (both via `composed_tool_name`). A plugin-namespaced skill
+    /// with a dotted tool name would otherwise render a raw `skill__tool` the
+    /// model cannot invoke, which is the prompt half of #6678.
+    #[test]
+    fn prompt_callable_name_matches_registered_tool_name() {
+        let skill = Skill {
+            name: "pr-review-toolkit:code-reviewer".to_string(),
+            description: "review".to_string(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![tool("run.lint", "shell")],
+            prompts: Vec::new(),
+            location: None,
+        };
+
+        let prompt = skills_to_prompt_with_mode(
+            std::slice::from_ref(&skill),
+            Path::new("/tmp"),
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+        );
+
+        let registered =
+            crate::tools::skill_tool::composed_tool_name(&skill.name, &skill.tools[0].name);
+        assert!(
+            prompt.contains(&format!("<name>{registered}</name>")),
+            "prompt is missing the sanitized callable name `{registered}`:\n{prompt}",
+        );
+        // The raw, provider-invalid composed name must never reach the prompt.
+        assert!(
+            !prompt.contains("pr-review-toolkit:code-reviewer__run.lint"),
+            "prompt advertised the raw, unsanitized composed name:\n{prompt}",
+        );
+    }
+}
+
+#[cfg(test)]
+mod workspace_dir_regression_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn make_config_with_agent_workspace(
+        install_root: &Path,
+        data_dir: &Path,
+        agent_alias: &str,
+        workspace_path: PathBuf,
+    ) -> zeroclaw_config::schema::Config {
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: install_root.join("config.toml"),
+            data_dir: data_dir.to_path_buf(),
+            ..Default::default()
+        };
+
+        let agent = zeroclaw_config::schema::AliasedAgentConfig {
+            workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                path: Some(workspace_path),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        config.agents.insert(agent_alias.to_string(), agent);
+        config
+    }
+
+    fn write_test_skill(workspace: &Path, skill_name: &str) {
+        let skill_dir = workspace.join("skills").join(skill_name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            format!(
+                r#"[skill]
+name = "{skill_name}"
+description = "regression test skill"
+version = "0.1.0"
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Regression test for #7236: `load_skills_for_agent_from_config` must
+    /// load skills from the per-agent workspace directory, not from `data_dir`.
+    ///
+    /// The bug: three call sites passed `&config.data_dir` instead of
+    /// `&config.agent_workspace_dir(agent_alias)`, causing skills placed in
+    /// `<install>/agents/<alias>/workspace/skills/` to be silently ignored.
+    ///
+    /// This test constructs a config where `data_dir` and
+    /// `agent_workspace_dir(agent_alias)` are distinct paths, places a skill
+    /// only in the agent workspace, and verifies:
+    /// 1. `load_skills_for_agent_from_config` finds the skill (correct behavior)
+    /// 2. Calling `load_skills_for_agent` with `data_dir` does NOT find the skill (the bug)
+    ///
+    /// The test would fail if `load_skills_for_agent_from_config` reverted to
+    /// using `config.data_dir` instead of `config.agent_workspace_dir(agent_alias)`.
+    #[test]
+    fn load_skills_for_agent_from_config_uses_workspace_dir_not_data_dir() {
+        let install_root = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let agent_workspace = TempDir::new().unwrap();
+
+        let agent_alias = "test-agent";
+        let skill_name = "workspace-only-regression-skill";
+
+        write_test_skill(agent_workspace.path(), skill_name);
+
+        let config = make_config_with_agent_workspace(
+            install_root.path(),
+            data_dir.path(),
+            agent_alias,
+            agent_workspace.path().to_path_buf(),
+        );
+
+        let workspace_dir = config.agent_workspace_dir(agent_alias);
+        assert_eq!(
+            workspace_dir,
+            agent_workspace.path(),
+            "agent_workspace_dir must resolve to the custom workspace path"
+        );
+        assert_ne!(
+            workspace_dir, config.data_dir,
+            "workspace_dir and data_dir must be distinct for this test to be meaningful"
+        );
+
+        // Test the production helper — this is what the three call sites use.
+        let skills_from_helper = load_skills_for_agent_from_config(&config, agent_alias);
+        let helper_skill_names: Vec<&str> =
+            skills_from_helper.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            helper_skill_names.contains(&skill_name),
+            "load_skills_for_agent_from_config must load skills from agent workspace; got: {helper_skill_names:?}"
+        );
+
+        // Verify that using data_dir directly would NOT find the skill (the bug).
+        let skills_from_data_dir = load_skills_for_agent(&config.data_dir, &config, agent_alias);
+        let data_dir_skill_names: Vec<&str> = skills_from_data_dir
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !data_dir_skill_names.contains(&skill_name),
+            "skill in agent workspace must NOT be loaded when passing data_dir (this was the bug); got: {data_dir_skill_names:?}"
+        );
+    }
+
+    /// Verifies that `load_skills_for_agent_from_config` with an empty
+    /// `skill_bundles` list falls back to the install-wide skill set from
+    /// the workspace dir. This pins the contract that the helper resolves
+    /// the correct workspace directory regardless of bundle configuration.
+    #[test]
+    fn load_skills_for_agent_from_config_empty_bundles_uses_workspace_dir() {
+        let install_root = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let agent_workspace = TempDir::new().unwrap();
+
+        let agent_alias = "bundle-fallback-agent";
+        let skill_name = "workspace-fallback-skill";
+
+        write_test_skill(agent_workspace.path(), skill_name);
+
+        let config = make_config_with_agent_workspace(
+            install_root.path(),
+            data_dir.path(),
+            agent_alias,
+            agent_workspace.path().to_path_buf(),
+        );
+
+        let skills = load_skills_for_agent_from_config(&config, agent_alias);
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&skill_name),
+            "with empty skill_bundles, workspace skills must still load; got: {names:?}"
         );
     }
 }

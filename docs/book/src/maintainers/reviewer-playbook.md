@@ -23,11 +23,11 @@ Use [PR lanes](./pr-workflow.md#pr-lanes) for routing expectations; use this pla
 |---|---|---|---|
 | `risk: low` | Docs, tests, chore, isolated non-runtime | 1 reviewer + CI gate | Coherent local validation, no behavior ambiguity |
 | `risk: medium` | `crates/zeroclaw-providers/`, `crates/zeroclaw-channels/`, `crates/zeroclaw-memory/`, `crates/zeroclaw-config/` | 1 subsystem-aware reviewer + behavior verification | Focused scenario proof, explicit side effects |
-| `risk: high` | `crates/zeroclaw-runtime/src/security/`, the rest of `crates/zeroclaw-runtime/`, `crates/zeroclaw-gateway/`, `crates/zeroclaw-tools/`, `.github/workflows/` | Fast triage + deep review + rollback readiness | Security and failure-mode checks, rollback clarity |
+| `risk: high` | The [canonical high-risk path set](./labels.md#risk-labels) (runtime, gateway, tools, security, `.github/workflows/`) | Fast triage + deep review + rollback readiness | Security and failure-mode checks, rollback clarity |
 
 When uncertain, treat as higher risk.
 
-If the path-labeler's risk inference is contextually wrong, apply `risk: manual` and set the final `risk:*` label explicitly — manual freezes any future automated recalculation.
+Risk labels are currently manual. If future risk automation is restored, follow the [labels automation contract](./labels.md#automation-contract): apply `risk: manual` when a maintainer correction should not be overwritten on the next pushed update.
 
 Labels are maintainer metadata. If the correct label is obvious and you have permission, fix it yourself before finalizing the review. Ask the author only when the right label choice is ambiguous or nobody with label permissions is available.
 
@@ -38,12 +38,12 @@ Labels are maintainer metadata. If the correct label is obvious and you have per
 For every new PR, before reading any code:
 
 1. Confirm the PR template is complete: summary, validation evidence, security & privacy, compatibility, rollback (for medium/high).
-2. Confirm labels are present and plausible — `size:*`, `risk:*`, scope labels, contributor tier where applicable.
+2. Confirm labels are present and plausible: `size:*`, `risk:*`, scope labels, contributor tier where applicable.
 3. Confirm `CI Required Gate` signal status.
 4. Confirm scope is one concern. Mixed-feature mega-PRs go back for a split unless the mix is explicitly justified.
 5. Confirm privacy / data-hygiene rules. See [Privacy](../contributing/privacy.md) for the full rulebook.
 
-If any intake check fails, leave one actionable checklist comment and stop. Don't deep-review a PR that hasn't passed intake — the back-and-forth is cheaper at this layer than after the diff has been reasoned about.
+If any intake check fails, leave one actionable checklist comment and stop. Don't deep-review a PR that hasn't passed intake: the back-and-forth is cheaper at this layer than after the diff has been reasoned about.
 
 ### Fast-lane checklist (every PR)
 
@@ -51,7 +51,7 @@ If any intake check fails, leave one actionable checklist comment and stop. Don'
 - Validation commands are present and the results are coherent.
 - User-facing behavior changes are documented.
 - Author demonstrates understanding of behavior and blast radius (especially for AI-assisted PRs).
-- Rollback path is concrete — "revert" is not concrete.
+- Rollback path is concrete; "revert" is not concrete.
 - Compatibility and migration impact is clear.
 - No personal or sensitive data leaked into diff artifacts; tests use neutral, project-scoped placeholders.
 - Naming and architecture boundaries follow project contracts (`AGENTS.md`, [Extension examples](../developing/extension-examples.md)).
@@ -91,9 +91,11 @@ Issue `risk:*` labels describe likely fix blast radius from the report. PR `risk
 | `status:accepted` | The team has accepted the RFC or work item. Add `status:no-stale` only when the issue also needs stale protection. |
 | `status:blocked` | Valid work is waiting on an external dependency, maintainer decision, or linked prerequisite. Record the blocker; this is stale protection only while that blocker remains unresolved. |
 | `status:in-progress` | An open PR is actively targeting the issue. Re-check live PR state before relying on it during stale passes. |
-| `status:no-stale` | Accepted or otherwise long-lived work should stay open and is not already protected by another stale exclusion. Record the reason in a maintainer comment, issue body, or tracker entry. |
+| `status:no-stale` | Accepted or otherwise long-lived work should stay open and is not already protected by another stale exclusion. Record the reason and routing evidence using the contributor-visible sources in the [Project board contract](./pr-workflow.md#issue-routing-evidence). Active release trackers and active RFC or design trackers may use the tracker itself as the visible reason and routing surface while they remain active. |
 | `good first issue` | XS/S, self-contained, documented work with clear acceptance criteria, relevant code or docs links, a named mentor or contact, and low onboarding risk. |
 | `help wanted` | Actionable, unblocked work maintainers want external help on and can review. Do not use it as a generic valid/unowned marker. |
+
+Assignee means active work. Routing evidence records why an issue needs special stale protection, tracker treatment, or a deferred maintainer decision. `status:blocked` only needs the recorded unresolved blocker unless it also needs separate `status:no-stale` protection. The [Project board contract](./pr-workflow.md#issue-routing-evidence) defines the accepted evidence sources and routing outcomes. Labels can identify the likely area, but labels alone are not ownership or stale protection.
 
 ### Resolution labels
 
@@ -104,6 +106,20 @@ For duplicates, link the canonical target before closing or redirecting discussi
 For replaced PRs or issue paths, use [Superseding PRs](./superseding.md) and preserve contributor attribution when relevant.
 
 If logs or payloads in the report contain personal identifiers or sensitive data, request redaction before deeper triage. The triage process must not propagate the exposure.
+
+## Discussions stewardship
+
+Discussions are a maintained community surface only when a steward or review cadence exists. The default cadence is a weekly maintainer pass over new and recently active threads. A named steward may own that surface pass, but the steward maintains the surface; they do not become the owner of every question, idea, or implementation that appears there.
+
+During each Discussions pass:
+
+1. Check new and recently active threads for category fit, unanswered Q&A, spam, sensitive data, and threads that have produced a concrete project outcome.
+2. Keep lightweight community conversation in Discussions when it is still exploratory, answerable there, or useful as a showcase, demo, poll, announcement, or broad-feedback thread.
+3. Promote concrete outcomes to the owning tracked surface: bugs and accepted feature scopes to issues, architecture proposals to RFC issues, PR-specific details to PR comments, durable operating rules to maintainer or contributor docs.
+4. Close the loop in the originating Discussion with a short summary and link to the issue, RFC, PR, or doc that now owns the outcome. Mark an answer only when the category and result make that accurate.
+5. Redirect security-sensitive threads to the private vulnerability path in [Security issues](../contributing/communication.md#security-issues), handle sensitive data under [Privacy](../contributing/privacy.md), and close pure advertising or not-project-relevant threads. Preserve useful project-related demos or integrations as community showcase material when they are not asking maintainers to track work.
+
+If Discussions are not being reviewed on the documented cadence, do not present them as a required intake path. Treat them as a passive archive until a steward or cadence is restored.
 
 ### PR backlog pruning
 
@@ -118,10 +134,10 @@ When review demand exceeds capacity:
 
 Use this when automation output creates review side effects:
 
-1. **Incorrect risk label** — add `risk: manual`, then set the intended `risk:*` label.
-2. **Incorrect auto-close on issue triage** — reopen, remove the route label, leave one clarifying comment.
-3. **Label spam or noise** — keep one canonical maintainer comment, remove redundant route labels.
-4. **Ambiguous PR scope** — request a split before deep review; don't try to review across two concerns at once.
+1. **Incorrect risk label**: set the intended `risk:*` label. If future risk automation is active, also follow the [labels automation contract](./labels.md#automation-contract) for `risk: manual`.
+2. **Incorrect auto-close on issue triage**: reopen, remove the route label, leave one clarifying comment.
+3. **Label spam or noise**: keep one canonical maintainer comment, remove redundant route labels.
+4. **Ambiguous PR scope**: request a split before deep review; don't try to review across two concerns at once.
 
 ## Handoff
 
@@ -137,8 +153,8 @@ This keeps context loss low and avoids the next reviewer redoing the same fetche
 
 ## Weekly queue hygiene
 
-- Walk the stale queue. Apply `status:no-stale` only when accepted or otherwise long-lived work has a recorded reason to stay open and is not already protected by another stale exclusion.
+- Walk the stale queue. Apply `status:no-stale` only under the rules in the [Project board contract](./pr-workflow.md#issue-routing-evidence): when accepted or otherwise long-lived work has a recorded reason to stay open, contributor-visible routing evidence, and no other stale exclusion already applies. Active release trackers and active RFC or design trackers may keep stale protection by default when the issue itself clearly identifies the active coordination or decision surface; revisit them when the milestone closes, the tracker drifts from live state, the RFC reaches a decision, is superseded, or closes, or the issue stops representing an active project decision surface. Until the stale-exemption audit lands, treat existing `status:no-stale` issues missing those facts as audit findings rather than automatic stale candidates.
 - Prioritize `size: XS/S` bug and security PRs first.
 - Convert recurring support questions into docs improvements and auto-response guidance.
 
-The goal is a queue where every open PR is either being actively reviewed, blocked on the author, or blocked on something external — never just sitting because nobody got to it.
+The goal is a queue where every open PR is either being actively reviewed, blocked on the author, or blocked on something external, never just sitting because nobody got to it.

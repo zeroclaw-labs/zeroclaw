@@ -6,7 +6,6 @@ import {
   ChevronRight,
   Cpu,
   FileText,
-  Gauge,
   HardDrive,
   Plus,
   Radio,
@@ -27,6 +26,15 @@ import {
   quickstartDismiss,
   quickstartFields,
 } from "@/lib/api";
+import { Badge, Button, Card, PageHeader } from "@/components/ui";
+import { t } from "@/lib/i18n";
+
+// Shared tokenized field control classes. Calm input surface with an accent
+// focus ring — replaces the legacy `input-electric` utility.
+const INPUT_CLASS =
+  "w-full h-9 px-3 rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-sm text-pc-text placeholder:text-pc-text-faint focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-pc-accent/40 focus-visible:border-pc-accent/40";
+const TEXTAREA_CLASS =
+  "w-full px-3 py-2 rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-sm text-pc-text placeholder:text-pc-text-faint focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-pc-accent/40 focus-visible:border-pc-accent/40";
 
 interface StagedProvider {
   provider_type: string;
@@ -110,7 +118,23 @@ export default function Quickstart() {
     void (async () => {
       try {
         const s = await getQuickstartState();
-        if (!cancelled) setState(s);
+        if (!cancelled) {
+          setState(s);
+          // Default the runtime profile to the previously-hardcoded value
+          // ("unbounded") so behaviour is unchanged unless the user picks
+          // another preset. Fall back to the first preset if the daemon ever
+          // drops "unbounded" from the list. Don't clobber a user choice.
+          const defaultRuntime =
+            s.runtime_presets.find((p) => p.preset_name === "unbounded") ??
+            s.runtime_presets[0];
+          if (defaultRuntime) {
+            setForm((f) =>
+              f.runtime
+                ? f
+                : { ...f, runtime: { preset_name: defaultRuntime.preset_name } },
+            );
+          }
+        }
       } catch {
         /* surfaces empty pickers + error on submit */
       }
@@ -146,7 +170,10 @@ export default function Quickstart() {
     const res = await quickstartApply({
       model_provider: { mode: "fresh", value: form.provider! },
       risk_profile: { mode: "fresh", value: form.risk!.preset_name },
-      runtime_profile: { mode: "fresh", value: form.runtime!.preset_name },
+      runtime_profile: {
+        mode: "fresh",
+        value: form.runtime?.preset_name ?? "unbounded",
+      },
       memory: { mode: "fresh", value: form.memory!.preset_name },
       channels: form.channels.map((c) =>
         c.mode === "existing"
@@ -182,26 +209,60 @@ export default function Quickstart() {
   };
 
   const providerDone = form.provider !== null;
-  const allDone =
-    providerDone &&
-    form.risk !== null &&
-    form.runtime !== null &&
-    form.memory !== null &&
-    form.agentName.trim() !== "";
+  const riskDone = form.risk !== null;
+  const memoryDone = form.memory !== null;
+  const agentDone = form.agentName.trim() !== "";
+  const allDone = providerDone && riskDone && memoryDone && agentDone;
+
+  // Required-step progress for the wizard stepper. Channels / peer groups /
+  // personality files are optional and intentionally excluded from the gate.
+  const steps = [
+    { label: t("quickstart.step_provider"), done: providerDone },
+    { label: t("quickstart.step_risk"), done: riskDone },
+    { label: t("quickstart.step_memory"), done: memoryDone },
+    { label: t("quickstart.step_agent"), done: agentDone },
+  ];
+  const completedCount = steps.filter((s) => s.done).length;
 
   return (
     <div className="max-w-3xl mx-auto px-6 py-8 space-y-5">
-      <header className="space-y-1">
-        <h1 className="text-2xl font-semibold">Quickstart</h1>
-        <p className="text-sm" style={MUTED}>
-          Create one working agent end-to-end. Pick a provider, choose your
-          profiles, and start chatting.
-        </p>
-      </header>
+      <PageHeader
+        title={t("quickstart.title")}
+        description={t("quickstart.description")}
+        actions={
+          <div className="flex items-center gap-3">
+            <Badge tone={allDone ? "ok" : "neutral"}>
+              {completedCount}/{steps.length} {t("quickstart.required")}
+            </Badge>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                // Treat an explicit exit like an abandon: record the dismissal
+                // so the daemon stops treating this run as in-flight, then leave
+                // to the dashboard. `submittedRef` short-circuits the duplicate
+                // dismiss the unmount/`beforeunload` handler would otherwise fire.
+                submittedRef.current = true;
+                quickstartDismiss({
+                  run_id: runIdRef.current,
+                  surface: "web",
+                  last_step: lastStepRef.current,
+                });
+                navigate("/");
+              }}
+              title={t("quickstart.skip_setup_title")}
+            >
+              {t("quickstart.skip_setup")}
+            </Button>
+          </div>
+        }
+      />
+
+      <Stepper steps={steps} />
 
       <Section
         icon={<Cpu className="h-4 w-4" />}
-        title="Model provider"
+        title={t("quickstart.model_provider_title")}
         done={providerDone}
         summary={
           form.provider
@@ -212,7 +273,7 @@ export default function Quickstart() {
         {form.provider ? (
           <StagedRow
             label={`${form.provider.provider_type}.${form.provider.alias}`}
-            sub={`model: ${form.provider.model}`}
+            sub={`${t("quickstart.model_prefix")}${form.provider.model}`}
             onRemove={() => setForm((f) => ({ ...f, provider: null }))}
           />
         ) : (
@@ -228,7 +289,7 @@ export default function Quickstart() {
 
       <PresetSection
         icon={<ShieldCheck className="h-4 w-4" />}
-        title="Risk profile"
+        title={t("quickstart.risk_profile_title")}
         rows={(state?.risk_presets ?? []).map((p) => ({
           value: p.preset_name,
           label: p.label,
@@ -242,8 +303,8 @@ export default function Quickstart() {
       />
 
       <PresetSection
-        icon={<Gauge className="h-4 w-4" />}
-        title="Runtime profile"
+        icon={<Cpu className="h-4 w-4" />}
+        title={t("quickstart.runtime_profile_title")}
         rows={(state?.runtime_presets ?? []).map((p) => ({
           value: p.preset_name,
           label: p.label,
@@ -258,7 +319,7 @@ export default function Quickstart() {
 
       <PresetSection
         icon={<HardDrive className="h-4 w-4" />}
-        title="Memory"
+        title={t("quickstart.memory_title")}
         rows={(state?.memory_kinds ?? []).map((k) => ({
           value: k,
           label: k,
@@ -273,12 +334,12 @@ export default function Quickstart() {
 
       <Section
         icon={<Radio className="h-4 w-4" />}
-        title="Channels"
+        title={t("quickstart.channels_title")}
         done={true}
         summary={
           form.channels.length === 0
-            ? "none — reachable via CLI"
-            : `${form.channels.length} configured`
+            ? t("quickstart.channels_none")
+            : `${form.channels.length} ${t("quickstart.configured_suffix")}`
         }
       >
         <ChannelsList
@@ -308,12 +369,12 @@ export default function Quickstart() {
 
       <Section
         icon={<Users className="h-4 w-4" />}
-        title="Peer groups"
+        title={t("quickstart.peer_groups_title")}
         done={true}
         summary={
           form.peerGroups.length === 0
-            ? "none — channels accept no peers"
-            : `${form.peerGroups.length} configured`
+            ? t("quickstart.peer_groups_none")
+            : `${form.peerGroups.length} ${t("quickstart.configured_suffix")}`
         }
       >
         <PeerGroupsList
@@ -334,29 +395,29 @@ export default function Quickstart() {
 
       <Section
         icon={<Bot className="h-4 w-4" />}
-        title="Agent"
+        title={t("quickstart.agent_title")}
         done={form.agentName.trim() !== ""}
         summary={form.agentName.trim() || null}
       >
         <LabeledInput
-          label="Name"
+          label={t("common.name")}
           value={form.agentName}
           onChange={(v) => {
             setForm((f) => ({ ...f, agentName: v }));
             recordStep("agent");
           }}
-          placeholder="some_nickname"
+          placeholder={t("quickstart.agent_name_placeholder")}
         />
       </Section>
 
       <Section
         icon={<FileText className="h-4 w-4" />}
-        title="Personality files"
+        title={t("quickstart.personality_files_title")}
         done={true}
         summary={
           form.personalityFiles.length === 0
-            ? "none — agent uses bootstrap defaults"
-            : `${form.personalityFiles.length} staged`
+            ? t("quickstart.personality_files_none")
+            : `${form.personalityFiles.length} ${t("quickstart.staged_suffix")}`
         }
       >
         <PersonalityFilesList
@@ -382,7 +443,7 @@ export default function Quickstart() {
       </Section>
 
       {errors.length > 0 && (
-        <ul className="card p-4 space-y-1 text-sm" style={ERROR}>
+        <ul className="rounded-[var(--radius-md)] border border-status-error/20 bg-status-error/10 p-4 space-y-1 text-sm text-status-error">
           {errors.map((e, i) => (
             <li key={i}>
               <code>
@@ -396,15 +457,60 @@ export default function Quickstart() {
       )}
 
       <div className="flex justify-end pt-2">
-        <button
-          className="btn-primary px-6 py-2"
+        <Button
+          size="md"
+          className="px-6"
           disabled={busy || !allDone}
           onClick={() => void submit()}
         >
-          {busy ? "Creating..." : "Create"}
-        </button>
+          {busy ? t("quickstart.creating") : t("quickstart.create")}
+        </Button>
       </div>
     </div>
+  );
+}
+
+function Stepper({ steps }: { steps: { label: string; done: boolean }[] }) {
+  // The first not-yet-done step is treated as the "active" cursor so the
+  // accent lands on what the operator should fill in next.
+  const activeIdx = steps.findIndex((s) => !s.done);
+  return (
+    <ol className="flex items-center gap-2" aria-label={t("quickstart.setup_progress")}>
+      {steps.map((step, i) => {
+        const active = i === activeIdx;
+        const state = step.done
+          ? "bg-pc-accent/10 border-pc-accent/30 text-pc-accent"
+          : active
+            ? "bg-pc-elevated border-pc-border-strong text-pc-text"
+            : "bg-pc-surface border-pc-border text-pc-text-muted";
+        return (
+          <li key={step.label} className="flex items-center gap-2 flex-1 min-w-0">
+            <div
+              className={`flex items-center gap-2 px-3 py-1.5 rounded-[var(--radius-md)] border text-xs font-medium min-w-0 ${state}`}
+            >
+              <span
+                className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[11px] ${
+                  step.done
+                    ? "bg-pc-accent/20 text-pc-accent"
+                    : active
+                      ? "bg-pc-accent text-[#0b1220]"
+                      : "bg-pc-elevated text-pc-text-muted"
+                }`}
+              >
+                {step.done ? <Check className="h-3 w-3" /> : i + 1}
+              </span>
+              <span className="truncate">{step.label}</span>
+            </div>
+            {i < steps.length - 1 && (
+              <span
+                className={`h-px flex-1 ${step.done ? "bg-pc-accent/30" : "bg-pc-border"}`}
+                aria-hidden="true"
+              />
+            )}
+          </li>
+        );
+      })}
+    </ol>
   );
 }
 
@@ -422,26 +528,19 @@ function Section({
   children: React.ReactNode;
 }) {
   return (
-    <section className="card p-5 space-y-4">
+    <Card className="p-5 space-y-4">
       <header className="flex items-center gap-3">
         <span
-          className="flex h-7 w-7 items-center justify-center rounded-lg"
-          style={{
-            background: done
-              ? "rgba(0, 230, 138, 0.12)"
-              : "var(--pc-bg-elevated)",
-            color: done ? "var(--color-status-success)" : MUTED.color,
-          }}
+          className={`flex h-7 w-7 items-center justify-center rounded-[var(--radius-md)] ${
+            done
+              ? "bg-status-success/10 text-status-success"
+              : "bg-pc-elevated text-pc-text-muted"
+          }`}
         >
           {icon}
         </span>
-        <h2 className="font-semibold flex-1 flex items-center gap-2">
-          {done && (
-            <Check
-              className="h-4 w-4"
-              style={{ color: "var(--color-status-success)" }}
-            />
-          )}
+        <h2 className="font-semibold flex-1 flex items-center gap-2 text-pc-text">
+          {done && <Check className="h-4 w-4 text-status-success" />}
           {title}
         </h2>
         {summary && (
@@ -451,7 +550,7 @@ function Section({
         )}
       </header>
       <div className="space-y-3">{children}</div>
-    </section>
+    </Card>
   );
 }
 
@@ -477,40 +576,37 @@ function PresetSection({
     >
       {rows.length === 0 ? (
         <div className="text-xs" style={MUTED}>
-          Loading…
+          {t("common.loading")}
         </div>
       ) : (
-        <div
-          className="surface-panel divide-y rounded-xl overflow-hidden"
-          style={{ borderColor: "var(--pc-border)" }}
-        >
-          {rows.map((r) => (
-            <button
-              key={r.value}
-              type="button"
-              onClick={() => onChange(r.value)}
-              className="w-full flex items-center gap-3 px-4 py-3 text-left text-sm hover:opacity-90"
-              style={{
-                background:
-                  r.value === value ? "rgba(0,128,255,0.08)" : "transparent",
-              }}
-            >
-              <div className="flex-1 min-w-0">
-                <div style={{ fontWeight: 500 }}>{r.label}</div>
-                {r.help && (
-                  <div className="text-xs mt-0.5" style={MUTED}>
-                    {r.help}
-                  </div>
+        <div className="rounded-[var(--radius-md)] border border-pc-border bg-pc-base divide-y divide-pc-border overflow-hidden">
+          {rows.map((r) => {
+            const selected = r.value === value;
+            return (
+              <button
+                key={r.value}
+                type="button"
+                onClick={() => onChange(r.value)}
+                className={`w-full flex items-center gap-3 px-4 py-3 text-left text-sm transition-colors ${
+                  selected
+                    ? "bg-pc-accent/[0.08] text-pc-text"
+                    : "text-pc-text hover:bg-[var(--pc-hover)]"
+                }`}
+              >
+                <div className="flex-1 min-w-0">
+                  <div className="font-medium">{r.label}</div>
+                  {r.help && (
+                    <div className="text-xs mt-0.5" style={MUTED}>
+                      {r.help}
+                    </div>
+                  )}
+                </div>
+                {selected && (
+                  <ChevronRight className="h-4 w-4 flex-shrink-0 text-pc-accent" />
                 )}
-              </div>
-              {r.value === value && (
-                <ChevronRight
-                  className="h-4 w-4 flex-shrink-0"
-                  style={{ color: "var(--pc-accent)" }}
-                />
-              )}
-            </button>
-          ))}
+              </button>
+            );
+          })}
         </div>
       )}
     </Section>
@@ -527,21 +623,18 @@ function StagedRow({
   onRemove: () => void;
 }) {
   return (
-    <div
-      className="flex items-center justify-between gap-3 px-4 py-3 rounded-xl"
-      style={{ background: "var(--pc-bg-elevated)" }}
-    >
+    <div className="flex items-center justify-between gap-3 px-4 py-3 rounded-[var(--radius-md)] bg-pc-elevated">
       <div className="min-w-0">
-        <div style={{ fontWeight: 500 }}>{label}</div>
+        <div className="font-medium text-pc-text">{label}</div>
         {sub && (
           <code className="block text-xs mt-0.5" style={FAINT}>
             {sub}
           </code>
         )}
       </div>
-      <button type="button" onClick={onRemove} className="btn-icon" title="Clear">
+      <Button variant="ghost" size="sm" onClick={onRemove} title={t("quickstart.clear")}>
         <Trash2 className="h-4 w-4" />
-      </button>
+      </Button>
     </div>
   );
 }
@@ -575,14 +668,14 @@ function LabeledInput({
       ) : null}
       {multiline ? (
         <textarea
-          className="input-electric w-full px-3 py-2 min-h-24"
+          className={`${TEXTAREA_CLASS} min-h-24`}
           value={value}
           onChange={(e) => onChange(e.target.value)}
           placeholder={placeholder}
         />
       ) : (
         <input
-          className="input-electric w-full px-3 py-2"
+          className={INPUT_CLASS}
           type={type}
           value={value}
           onChange={(e) => onChange(e.target.value)}
@@ -681,10 +774,10 @@ function ProviderForm({
     <>
       <label className="block">
         <div className="text-xs uppercase tracking-wider mb-1" style={MUTED}>
-          Provider type
+          {t("quickstart.provider_type")}
         </div>
         <select
-          className="input-electric w-full px-3 py-2"
+          className={INPUT_CLASS}
           value={type}
           onChange={(e) => {
             const next = e.target.value;
@@ -693,29 +786,29 @@ function ProviderForm({
           }}
         >
           <option value="" disabled>
-            — pick a provider —
+            {t("quickstart.pick_provider")}
           </option>
           {state?.model_provider_types.map((opt) => (
             <option key={opt.kind} value={opt.kind}>
               {opt.display_name}
-              {opt.local ? " (local)" : ""}
+              {opt.local ? ` ${t("quickstart.local_suffix")}` : ""}
             </option>
           ))}
         </select>
       </label>
 
-      <LabeledInput label="alias" value={alias} onChange={setAlias} />
+      <LabeledInput label={t("quickstart.alias")} value={alias} onChange={setAlias} />
 
       <label className="block">
         <div className="text-xs uppercase tracking-wider mb-1" style={MUTED}>
-          model
+          {t("quickstart.model")}
         </div>
         <input
-          className="input-electric w-full px-3 py-2"
+          className={INPUT_CLASS}
           value={model}
           onChange={(e) => setModel(e.target.value)}
           list="qs-model-catalog"
-          placeholder={type ? "pick or type a model id" : ""}
+          placeholder={type ? t("quickstart.model_placeholder") : ""}
         />
         <datalist id="qs-model-catalog">
           {catalog?.live &&
@@ -740,9 +833,8 @@ function ProviderForm({
         ))}
 
       <div className="flex justify-end">
-        <button
-          type="button"
-          className="btn-primary px-4 py-2 text-sm inline-flex items-center gap-2"
+        <Button
+          size="sm"
           disabled={!canAdd}
           onClick={() => {
             const fields: Record<string, string> = {};
@@ -761,8 +853,8 @@ function ProviderForm({
           }}
         >
           <Plus className="h-3.5 w-3.5" />
-          Add
-        </button>
+          {t("quickstart.add")}
+        </Button>
       </div>
     </>
   );
@@ -794,30 +886,23 @@ function ChannelsList({
   return (
     <>
       {staged.length > 0 && (
-        <div
-          className="surface-panel divide-y rounded-xl overflow-hidden"
-          style={{ borderColor: "var(--pc-border)" }}
-        >
+        <div className="rounded-[var(--radius-md)] border border-pc-border bg-pc-base divide-y divide-pc-border overflow-hidden">
           {staged.map((c, i) => (
             <div
               key={`${c.channel_type}.${c.alias}.${i}`}
               className="flex items-center justify-between gap-3 px-4 py-3 text-sm"
             >
               <div className="min-w-0">
-                <span style={{ fontWeight: 500 }}>
+                <span className="font-medium text-pc-text">
                   {c.channel_type}.{c.alias}
                 </span>
                 <span className="ml-2 text-xs" style={MUTED}>
-                  {c.mode === "existing" ? "reuse" : "new"}
+                  {c.mode === "existing" ? t("quickstart.reuse") : t("quickstart.new")}
                 </span>
               </div>
-              <button
-                type="button"
-                className="btn-icon"
-                onClick={() => onRemove(i)}
-              >
+              <Button variant="ghost" size="sm" onClick={() => onRemove(i)}>
                 <Trash2 className="h-4 w-4" />
-              </button>
+              </Button>
             </div>
           ))}
         </div>
@@ -836,14 +921,10 @@ function ChannelsList({
           onCancel={() => setAdding(false)}
         />
       ) : (
-        <button
-          type="button"
-          className="btn-secondary px-4 py-2 text-sm inline-flex items-center gap-2"
-          onClick={() => setAdding(true)}
-        >
+        <Button variant="ghost" size="md" onClick={() => setAdding(true)}>
           <Plus className="h-3.5 w-3.5" />
-          Add channel
-        </button>
+          {t("quickstart.add_channel")}
+        </Button>
       )}
     </>
   );
@@ -918,47 +999,37 @@ function ChannelAddForm({
   };
 
   return (
-    <div
-      className="card p-4 space-y-3"
-      style={{ background: "var(--pc-bg-elevated)" }}
-    >
+    <Card className="p-4 space-y-3 bg-pc-elevated">
       <div className="flex gap-2">
-        <button
-          type="button"
-          className={mode === "existing" ? "btn-primary" : "btn-secondary"}
+        <Button
+          variant={mode === "existing" ? "primary" : "ghost"}
+          size="sm"
           disabled={reusable.length === 0}
           onClick={() => setMode("existing")}
-          style={{ padding: "0.4rem 0.8rem", fontSize: "0.85rem" }}
         >
-          Use existing
-        </button>
-        <button
-          type="button"
-          className={mode === "fresh" ? "btn-primary" : "btn-secondary"}
+          {t("quickstart.use_existing")}
+        </Button>
+        <Button
+          variant={mode === "fresh" ? "primary" : "ghost"}
+          size="sm"
           onClick={() => setMode("fresh")}
-          style={{ padding: "0.4rem 0.8rem", fontSize: "0.85rem" }}
         >
-          Create new
-        </button>
+          {t("quickstart.create_new")}
+        </Button>
         <div className="flex-1" />
-        <button
-          type="button"
-          className="btn-secondary"
-          onClick={onCancel}
-          style={{ padding: "0.4rem 0.8rem", fontSize: "0.85rem" }}
-        >
-          Cancel
-        </button>
+        <Button variant="ghost" size="sm" onClick={onCancel}>
+          {t("common.cancel")}
+        </Button>
       </div>
 
       {mode === "existing" ? (
         reusable.length === 0 ? (
           <div className="text-xs" style={MUTED}>
-            No unassigned channels available.
+            {t("quickstart.no_unassigned_channels")}
           </div>
         ) : (
           <select
-            className="input-electric w-full px-3 py-2"
+            className={INPUT_CLASS}
             value={existingRef}
             onChange={(e) => setExistingRef(e.target.value)}
           >
@@ -973,10 +1044,10 @@ function ChannelAddForm({
         <>
           <label className="block">
             <div className="text-xs uppercase tracking-wider mb-1" style={MUTED}>
-              Channel type
+              {t("quickstart.channel_type")}
             </div>
             <select
-              className="input-electric w-full px-3 py-2"
+              className={INPUT_CLASS}
               value={type}
               onChange={(e) => {
                 const next = e.target.value;
@@ -986,7 +1057,7 @@ function ChannelAddForm({
               }}
             >
               <option value="" disabled>
-                — pick a channel type —
+                {t("quickstart.pick_channel_type")}
               </option>
               {state?.channel_types.map((opt) => (
                 <option key={opt.kind} value={opt.kind}>
@@ -996,10 +1067,10 @@ function ChannelAddForm({
             </select>
           </label>
 
-          <LabeledInput label="Alias" value={alias} onChange={setAlias} />
+          <LabeledInput label={t("quickstart.alias_label")} value={alias} onChange={setAlias} />
           {conflict && (
             <div className="text-xs" style={ERROR}>
-              <code>{freshRef}</code> already exists.
+              <code>{freshRef}</code> {t("quickstart.already_exists")}
             </div>
           )}
 
@@ -1017,17 +1088,12 @@ function ChannelAddForm({
       )}
 
       <div className="flex justify-end">
-        <button
-          type="button"
-          className="btn-primary px-4 py-2 text-sm inline-flex items-center gap-2"
-          disabled={!canAdd}
-          onClick={submit}
-        >
+        <Button size="sm" disabled={!canAdd} onClick={submit}>
           <Plus className="h-3.5 w-3.5" />
-          Add
-        </button>
+          {t("quickstart.add")}
+        </Button>
       </div>
-    </div>
+    </Card>
   );
 }
 
@@ -1067,31 +1133,25 @@ function PeerGroupsList({
   return (
     <>
       {stagedPeerGroups.length > 0 && (
-        <div
-          className="surface-panel divide-y rounded-xl overflow-hidden"
-          style={{ borderColor: "var(--pc-border)" }}
-        >
+        <div className="rounded-[var(--radius-md)] border border-pc-border bg-pc-base divide-y divide-pc-border overflow-hidden">
           {stagedPeerGroups.map((pg, i) => (
             <div
               key={`${pg.name}.${i}`}
               className="flex items-center justify-between gap-3 px-4 py-3 text-sm"
             >
               <div className="min-w-0">
-                <div style={{ fontWeight: 500 }}>{pg.name}</div>
+                <div className="font-medium text-pc-text">{pg.name}</div>
                 <code className="block text-xs mt-0.5" style={FAINT}>
-                  channel: {pg.channel}
+                  {t("quickstart.channel_prefix")}
+                  {pg.channel}
                   {pg.external_peers.length > 0
-                    ? ` · ${pg.external_peers.length} peers`
-                    : " · no peers"}
+                    ? ` · ${pg.external_peers.length} ${t("quickstart.peers_suffix")}`
+                    : ` · ${t("quickstart.no_peers")}`}
                 </code>
               </div>
-              <button
-                type="button"
-                className="btn-icon"
-                onClick={() => onRemove(i)}
-              >
+              <Button variant="ghost" size="sm" onClick={() => onRemove(i)}>
                 <Trash2 className="h-4 w-4" />
-              </button>
+              </Button>
             </div>
           ))}
         </div>
@@ -1100,8 +1160,8 @@ function PeerGroupsList({
       {available.length === 0 ? (
         <div className="text-xs" style={MUTED}>
           {stagedChannels.length === 0
-            ? "Stage at least one channel above to authorize peers."
-            : "Every available channel has a peer-group staged."}
+            ? t("quickstart.stage_channel_first")
+            : t("quickstart.all_channels_staged")}
         </div>
       ) : adding ? (
         <PeerGroupAddForm
@@ -1113,14 +1173,10 @@ function PeerGroupsList({
           onCancel={() => setAdding(false)}
         />
       ) : (
-        <button
-          type="button"
-          className="btn-secondary px-4 py-2 text-sm inline-flex items-center gap-2"
-          onClick={() => setAdding(true)}
-        >
+        <Button variant="ghost" size="md" onClick={() => setAdding(true)}>
           <Plus className="h-3.5 w-3.5" />
-          Add peer group
-        </button>
+          {t("quickstart.add_peer_group")}
+        </Button>
       )}
     </>
   );
@@ -1158,16 +1214,13 @@ function PeerGroupAddForm({
   const canAdd = channel !== "" && name !== "";
 
   return (
-    <div
-      className="card p-4 space-y-3"
-      style={{ background: "var(--pc-bg-elevated)" }}
-    >
+    <Card className="p-4 space-y-3 bg-pc-elevated">
       <label className="block">
         <div className="text-xs uppercase tracking-wider mb-1" style={MUTED}>
-          Channel
+          {t("quickstart.channel_label")}
         </div>
         <select
-          className="input-electric w-full px-3 py-2"
+          className={INPUT_CLASS}
           value={channel}
           onChange={(e) => setChannel(e.target.value)}
         >
@@ -1180,7 +1233,7 @@ function PeerGroupAddForm({
       </label>
 
       <LabeledInput
-        label="External peers (one per line or comma-separated)"
+        label={t("quickstart.external_peers_label")}
         value={peersBuf}
         onChange={setPeersBuf}
         multiline
@@ -1188,29 +1241,24 @@ function PeerGroupAddForm({
       />
 
       <div className="text-xs" style={MUTED}>
-        Peer group will be named <code>{name || "—"}</code>.
+        {t("quickstart.peer_group_named_prefix")}
+        <code>{name || "—"}</code>.
       </div>
 
       <div className="flex justify-end gap-2">
-        <button
-          type="button"
-          className="btn-secondary"
-          onClick={onCancel}
-          style={{ padding: "0.4rem 0.8rem", fontSize: "0.85rem" }}
-        >
-          Cancel
-        </button>
-        <button
-          type="button"
-          className="btn-primary px-4 py-2 text-sm inline-flex items-center gap-2"
+        <Button variant="ghost" size="sm" onClick={onCancel}>
+          {t("common.cancel")}
+        </Button>
+        <Button
+          size="sm"
           disabled={!canAdd}
           onClick={() => onAdd({ name, channel, external_peers: peers })}
         >
           <Plus className="h-3.5 w-3.5" />
-          Add
-        </button>
+          {t("quickstart.add")}
+        </Button>
       </div>
-    </div>
+    </Card>
   );
 }
 
@@ -1256,17 +1304,14 @@ function PersonalityFilesList({
   if (filenames.length === 0) {
     return (
       <div className="text-xs" style={MUTED}>
-        Loading…
+        {t("common.loading")}
       </div>
     );
   }
 
   return (
     <div className="space-y-3">
-      <div
-        className="surface-panel divide-y rounded-xl overflow-hidden"
-        style={{ borderColor: "var(--pc-border)" }}
-      >
+      <div className="rounded-[var(--radius-md)] border border-pc-border bg-pc-base divide-y divide-pc-border overflow-hidden">
         {filenames.map((fn) => {
           const isStaged = stagedByFilename.has(fn);
           const isEditing = editing === fn;
@@ -1274,28 +1319,27 @@ function PersonalityFilesList({
             <div key={fn} className="px-4 py-3 text-sm space-y-2">
               <div className="flex items-center justify-between gap-3">
                 <div className="min-w-0">
-                  <span style={{ fontWeight: 500 }}>{fn}</span>
+                  <span className="font-medium text-pc-text">{fn}</span>
                   {isStaged && (
                     <span className="ml-2 text-xs" style={MUTED}>
-                      staged
+                      {t("quickstart.staged_badge")}
                     </span>
                   )}
                 </div>
                 <div className="flex gap-2">
                   {isStaged && (
-                    <button
-                      type="button"
-                      className="btn-icon"
+                    <Button
+                      variant="ghost"
+                      size="sm"
                       onClick={() => onRemove(fn)}
-                      title="Discard"
+                      title={t("quickstart.discard")}
                     >
                       <Trash2 className="h-4 w-4" />
-                    </button>
+                    </Button>
                   )}
-                  <button
-                    type="button"
-                    className="btn-secondary"
-                    style={{ padding: "0.3rem 0.7rem", fontSize: "0.8rem" }}
+                  <Button
+                    variant="ghost"
+                    size="sm"
                     onClick={async () => {
                       const map = await loadTemplates();
                       const content = map[fn] ?? "";
@@ -1303,14 +1347,13 @@ function PersonalityFilesList({
                         onStage({ filename: fn, content });
                       }
                     }}
-                    title="Stage the default template content for this file"
+                    title={t("quickstart.use_template_title")}
                   >
-                    Use template
-                  </button>
-                  <button
-                    type="button"
-                    className="btn-secondary"
-                    style={{ padding: "0.3rem 0.7rem", fontSize: "0.8rem" }}
+                    {t("quickstart.use_template")}
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
                     onClick={() => {
                       if (isEditing) {
                         if (buf.trim() === "") {
@@ -1325,16 +1368,20 @@ function PersonalityFilesList({
                       }
                     }}
                   >
-                    {isEditing ? "Save" : isStaged ? "Edit" : "Add"}
-                  </button>
+                    {isEditing
+                      ? t("common.save")
+                      : isStaged
+                        ? t("common.edit")
+                        : t("quickstart.add")}
+                  </Button>
                 </div>
               </div>
               {isEditing && (
                 <textarea
-                  className="input-electric w-full px-3 py-2 min-h-32 font-mono text-xs"
+                  className={`${TEXTAREA_CLASS} min-h-32 font-mono text-xs`}
                   value={buf}
                   onChange={(e) => setBuf(e.target.value)}
-                  placeholder={`Contents of ${fn}…`}
+                  placeholder={`${t("quickstart.contents_of_prefix")}${fn}…`}
                 />
               )}
             </div>

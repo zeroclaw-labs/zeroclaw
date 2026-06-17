@@ -1,205 +1,153 @@
-# ZeroClaw v0.8.0-beta-2
+# ZeroClaw v0.8.0
 
-This is the second beta of the v0.8.0 line, and the largest release since v0.7.5. Its headline is **zerocode** — a brand-new, full-featured terminal UI for running and operating your agents without leaving the terminal. Around it, this release ships the multi-agent runtime and schema V3, a rebuilt Quickstart onboarding flow that works identically across the CLI, zerocode, and the web dashboard, and a deny-with-edit approval mode that lets you rewrite a tool result inline. Hundreds of fixes harden the credential boundary, token accounting, sandboxing, and channel delivery.
+ZeroClaw v0.8.0 is the big one. One daemon now runs many named agents, each with its own workspace, memory, model provider, security policy, channels, and personality, coordinated by a rewritten configuration schema that migrates your existing setup automatically. The release spans 439 commits (not including the squashes) from over 100 contributors since v0.7.5, and also introduces the zerocode terminal UI, a unified logging and attribution pipeline, and a hardened security posture across channels, tools, and the gateway.
 
-Because this beta consolidates two milestones, the **What's New** section is framed twice: everything **since v0.7.5** (the last stable release) and the subset that is new **since v0.8.0-beta-1**. Contributor credits below cover the v0.8.0-beta-1 → beta-2 window.
-
-## Meet zerocode
-
-**zerocode is a complete terminal interface for ZeroClaw** — a standalone binary that connects to a daemon and gives you a five-pane workspace for everything from chatting with an agent to editing config to reading live logs. It speaks to the daemon over a filesystem-permission-gated local socket (Unix domain socket or Windows named pipe) or a remote WSS connection, and it can spin up its own ephemeral daemon if one isn't already running.
-
-What you can do in zerocode:
-
-- **Chat** with any configured agent — streaming responses, an agent picker, an inline approval overlay for supervised tool calls, and a `/toggle-thinking` command to show or hide the model's reasoning.
-- **Code** in an ACP (agent-coding) session against any working directory you pick, with syntax-highlighted `file_edit` / `file_write` diffs (tree-sitter via inkjet), absolute line numbers, and a deny-with-edit flow that lets you rewrite a proposed change before it's applied.
-- **Configure** the whole daemon from a live config manager: nested navigation, kind-aware editors (enum selects, list editors, masked secret fields), `$EDITOR` integration for long values, fuzzy filtering, and composite editors generated from the wire-level schema — no hardcoded forms.
-- **Watch** structured, alias-attributed logs with stacking filters, attribute search, a follow toggle, and a resizable detail view.
-- **Operate** from a Dashboard with per-agent status, a one-keystroke daemon reload, connection status with reconnect, and a roster of connected TUIs.
-
-It's built to feel native: full mouse support (selection, scrollbar drag, multi-select, pane cycling), a reusable input bar with soft-wrap and clipboard paste, per-OS key dispatch, locally-configurable themes and keybindings (with presets and chord serialization), and an HMAC-signed session identity that survives reconnects. Strings route through an independent Fluent catalogue, so zerocode is localizable from day one.
-
-### One daemon, as many TUIs as you want
-
-The daemon is the single source of truth; zerocode is just a client. **Open as many zerocode windows as you like against one daemon** — every connected TUI shares the same agents, sessions, and config, and each appears in the others' "Connected TUIs" roster. Those clients can be a mix of local (Unix socket / named pipe) and remote (WSS) connections to the same daemon, so you can drive a long-lived daemon on a server from several terminals at once.
-
-If you launch `zerocode` and no daemon is running, it **spins up its own ephemeral daemon** automatically (`--ephemeral`). That daemon's lifetime follows its clients: it stays up as long as at least one TUI is connected, and when the last one disconnects it waits a short grace period (so a quick reconnect doesn't kill it) and then shuts down on its own — no orphaned background process. A daemon you start yourself (`zeroclaw daemon`) is the opposite: it persists until you stop it, and TUIs come and go against it freely.
-
-### Your settings stay local
-
-zerocode keeps its own client config in `<config_dir>/zerocode-config.toml` — your theme, keybindings, and locale — **completely independent of the daemon's `config.toml`**. It's read locally regardless of what you connect to, so the same preferences apply whether you're driving a local socket session or a remote daemon over WSS. Settings layer `defaults → file → ZEROCODE_* env`, so you can override any of them per-invocation without editing the file.
-
-### How the local socket works
-
-Local connections use a platform-native, permission-gated endpoint — no TCP port, no token:
-
-- **Unix-like (Linux/macOS):** a Unix domain socket at `<data_dir>/daemon.sock`, created with `0600` permissions so only the owning user can connect. On Linux the daemon reads the peer's PID/UID via `SO_PEERCRED` for the connection label.
-- **Windows:** a named pipe at `\\.\pipe\zeroclaw-<hash>`, where `<hash>` is derived from the data directory so each install gets its own pipe in the kernel object namespace.
-
-The endpoint is auto-derived from the daemon's `data_dir` (override with `$ZEROCLAW_SOCKET`), and the same JSON-RPC line protocol runs over the local socket and over WSS — remote access is the same surface, just tunneled over TLS.
-
-### Your shell environment comes with you
-
-When zerocode connects over the local socket, it captures your real shell environment and sends it in the handshake. The daemon then **overlays that environment onto any shell subprocess it runs on your behalf** (your `PATH`, `SSH_AUTH_SOCK`, `GPG_TTY`, and the like take precedence over whatever the daemon process inherited). The practical payoff: hardware-backed credentials **just work** — if your `ssh-agent` is fronting a **YubiKey** (or any FIDO/PIV token), an agent that runs `git push` or an SSH command authenticates through your key exactly as if you'd typed the command yourself, with no key material ever stored in the daemon. Because the forwarded variables come straight from your terminal session, vars like `SSH_AUTH_SOCK` reach the subprocess even though they aren't on the daemon's default safe-env list — that's deliberate, and it's why the integration is seamless.
+With the big sweeping code changes behind us, expect the v0.8.x series to ship at a more regular pace from here.
 
 ## Highlights
 
-- **zerocode** — a new terminal UI for ZeroClaw. A standalone binary with a five-pane workspace (Chat, Code, Config, Logs, Dashboard) that connects to a local or remote daemon and lets you run agents, edit config, approve tool calls, and read live logs without leaving the terminal. Open as many windows as you want against one daemon — local or over WSS — and if none is running, zerocode spins up an ephemeral one that cleans itself up when you're done. See **Meet zerocode** above.
-- **Multi-agent runtime + schema V3**: run several named agents from one daemon, each with its own model provider, risk profile, runtime profile, channels, and memory namespace.
-- **Quickstart**, a rebuilt onboarding flow that replaces `onboard`: one backend-authored field shape drives CLI, TUI, and web with no duplicated picker rows, live model catalog, personality-file templates, and an atomic apply.
-- **Deny-with-edit approvals**: when a tool call needs approval, you can edit the proposed result inline and hand the edited value back to the agent as the tool result, with the substitution recorded in the audit trail.
-- **Filesystem-permission-gated RPC socket** replaces pairing-token auth for local IPC — the socket path is the trust boundary.
-- **Internationalization**: CLI and TUI user-facing strings now route through Fluent, with on-disk catalogue loading and per-user locale selection.
+- **[Multi-agent runtime](https://docs.zeroclawlabs.ai/master/en/agents/overview.html)**: run any number of named agents from one daemon, each with isolated workspace, memory, skills, model provider, and risk profile. Channels, cron jobs, webhooks, and ACP sessions all dispatch to a specific agent.
+- **Schema V3 with automatic migration**: existing configs migrate in place on first load. Provider entries support multiple named aliases per provider, and a single malformed entry no longer wipes its neighbors.
+- **[zerocode](https://docs.zeroclawlabs.ai/master/en/zerocode/overview.html)**: a new terminal UI with dedicated Chat, Code, Dashboard, Config, Quickstart, and Logs panes. **One daemon, many zerocode TUIs:** attach from as many terminals as you want, each with its own identity and sessions. The Code pane speaks ACP with no configuration required.
+- **[Security hardening](https://docs.zeroclawlabs.ai/master/en/security/overview.html)**: per-agent tool allowlists enforced at every dispatch path, bearer-token revocation on device rotation and deletion, secret redaction extended to nested config shapes, private-host allowlists for outbound HTTP tools, and a fix for a Canvas iframe token-theft advisory (GHSA-f385-f6h2-3gqj).
+- **[Observability rework](https://docs.zeroclawlabs.ai/master/en/ops/observability.html)**: a unified structured logging pipeline carries agent, model, and session attribution through every span, streaming to a new Logs page in the dashboard and a gateway logs endpoint.
+- **[Lean default channel bundle](https://docs.zeroclawlabs.ai/master/en/channels/overview.html)**: prebuilt binaries now ship the core channels by default with the rest available as opt-in build features. Check the docs if a channel you use is missing after upgrade.
 
-## What's New since v0.7.5
+## Since v0.7.5
 
-### Agent & Runtime
+### Multi-agent (the star of the show)
 
-- Multi-agent runtime and schema V3: multiple named agents per daemon, each with independent provider/profile/channel/memory configuration (#6398).
-- New `rpc/` dispatch layer with a shared turn executor and a single `Method` enum as the source of truth (#6837).
-- `--ephemeral` daemon mode for TUI auto-spawned daemons (#6818).
-- Streaming turns are bounded by an idle-timeout freeze guard so a stalled stream can't wedge a session.
-- Per-agent `classifier_provider` routes the reply-intent precheck to a cheaper model (#6945); per-agent memory-recall limit is configurable via the runtime profile.
-- `MemoryStrategy` trait with a `DefaultMemoryStrategy` for pluggable context loading (#6907).
-- Delegation is gated on a shared risk profile and the caller's `delegation_policy`; the advertised roster is filtered to same-profile peers.
+You can now run a [whole team of agents](https://docs.zeroclawlabs.ai/master/en/agents/overview.html) from a single daemon (#6398): a coding agent with full shell access in one workspace, a locked-down family assistant on Telegram in another, a research agent with its own memory and a cheaper model in a third. Each agent is a first-class identity through the entire stack:
 
-### zerocode & the RPC layer
+- **Per-agent everything**: [workspace directories](https://docs.zeroclawlabs.ai/master/en/agents/filesystem.html), memory stores with per-agent isolation across the SQLite, Postgres, and Qdrant backends, skill bundles, persona files, and per-agent model-provider resolution in every chat path.
+- **[Channels](https://docs.zeroclawlabs.ai/master/en/channels/overview.html)**: each channel binds to an owning agent, with per-agent runtime contexts, structured session routing, identity injection so an agent knows who it is on each channel, and media uploads routed into the owning agent's workspace.
+- **[Security policy per agent](https://docs.zeroclawlabs.ai/master/en/security/autonomy.html)**: each agent's policy can allow or exclude individual tools, enforced at the dispatch site; every risk-profile setting now propagates into the live policy; SubAgents are depth-capped and gated by the parent agent's risk profile.
+- **Cron**: scheduled jobs are bound to a specific agent with delivery-channel scoping, and the old implicit default-agent fallback is gone.
+- **[ACP](https://docs.zeroclawlabs.ai/master/en/channels/acp.html)**: sessions select an agent explicitly, auto-select when only one is configured, respect configurable session limits, and the bridge accepts a custom config location.
+- **[Dashboard](https://docs.zeroclawlabs.ai/master/en/gateway/web-dashboard.html)**: a multi-agent rework with per-agent status and memory views, RAM and CPU widgets, a Memories tab, and a sandboxed per-agent workspace file explorer.
+- **[Cost tracking](https://docs.zeroclawlabs.ai/master/en/ops/cost-tracking.html)**: rates are organized per provider and model, cached-input tokens are captured, and the dashboard shows per-agent and per-model cost splits with an editable rate sheet.
 
-zerocode is covered in depth in **Meet zerocode** above; the daemon-side groundwork that makes it possible:
+### zerocode terminal UI
 
-- A new `rpc/` dispatch layer with a shared turn executor and a single `Method` enum as the source of truth — every RPC method is compiler-checked, no string-literal dispatch (#6837, #6817).
-- Filesystem-permission-gated local IPC over a Unix domain socket, with Windows feature parity via named pipes; pairing-token auth removed in favour of the socket as the trust boundary (#6837).
-- An `--ephemeral` daemon mode so zerocode can auto-spawn a daemon when none is running (#6818); WSS transport for remote connections; an `file/attach` RPC method with base64 + path modes for inline attachments.
-- Shared API types so the gateway, RPC dispatch, and zerocode all read one definition; config-introspection methods that drive the live config manager (#6825).
+v0.8.0 ships [zerocode](https://docs.zeroclawlabs.ai/master/en/zerocode/overview.html), a full terminal UI for ZeroClaw (#6848). It talks to the daemon over a new RPC transport with [persistent sessions](https://docs.zeroclawlabs.ai/master/en/zerocode/running.html) (#7182) and rides out daemon restarts by reconnecting in place (#7158).
 
-### Quickstart & Onboarding
+#### Connection: local socket or remote WSS
 
-- Quickstart lands end-to-end and retires the legacy `onboard` surface — a single shared field-shape API consumed by CLI, TUI, and web with no hardcoded labels.
-- Atomic apply for agents, peer-groups, personality files, and skills FTUE; live model picker across all three surfaces; explicit template/scratch/skip choice per personality file.
-- CLI rebuilt as a step-by-step checklist; provider/channel picker rows driven from canonical registries; humane failure messages.
+Locally, zerocode connects over a Unix domain socket (a named pipe on Windows) with no setup at all. For a daemon on another machine, a [TLS WebSocket transport](https://docs.zeroclawlabs.ai/master/en/zerocode/remote.html) connects your workstation to a Raspberry Pi, home server, or VPS with a self-signed certificate and a token. **One daemon serves many zerocode instances at once:** each connecting TUI gets its own signed identity and environment snapshot in the daemon's registry, sessions are tmux-style persistent (#7182) so closing your laptop and reconnecting an hour later from a different network finds your session intact.
 
-### Channels
+#### Shell environment pass-through
 
-- New WeCom AI Bot WebSocket channel (#6680); Lark/Feishu approval requests (#6852) and Lark as a cron delivery channel (#6851).
-- Selective channel builds — compile only the channels you need and filter the channel list by compiled features (#6866).
-- Webhook retry with exponential backoff (#5838); Signal outbound emoji reactions (#6840); separate IMAP/SMTP credentials (#6666); Nextcloud Talk draft-update streaming (#6048).
-- `channel_send` tool with a `default_target` (#6665); `message_id` exposed in agent channel context (#6843); honest channel readiness reporting in the gateway (#6985).
+A daemon started as a service has a stripped-down environment; your terminal has the real one. On a local socket connection, zerocode [forwards its full shell environment](https://docs.zeroclawlabs.ai/master/en/zerocode/environment.html) to the daemon at handshake, and every shell subprocess your agents spawn gets it overlaid on top of the daemon's safe baseline, with zerocode's values winning on conflict. Your PATH, SSH agent socket, and credential helpers just work, no configuration required.
 
-### Providers
+#### Themes
 
-- GitHub Models (#6445), Morph (#6440), Manifest open-source router (#6268), and atomic-chat local provider (#6513); MiniMax split into Global and China entries (#6758); llama.cpp as a dedicated provider kind (#6417).
-- Native extended thinking for Anthropic and Bedrock (#5652); OpenRouter prompt caching (#6008); Codex native Responses tool calls (#6117); Ollama `num_ctx`/`num_predict`/temperature tuning (#6178).
+[Named color themes](https://docs.zeroclawlabs.ai/master/en/zerocode/themes.html) with per-agent overrides in the Code and Chat panes, inline palette previews before you apply, automatic adaptation to your terminal's color depth, and a `terminal` theme that inherits your shell's own colors (#7249).
 
-### Tools
+#### Keybindings
 
-- New tools: `file_upload` (#6773), `file_upload_bundle`, `file_download` (#6957), and a `result` mode for `execute_pipeline` (#7009).
-- Jira `list_transitions` / `transition_ticket` / `create_ticket` (#6481); Jina AI as a web_search provider (#6833); deferred MCP tools filtered by access policy (#6920); scoped tool elevation for built-in and MCP tools; `git stash push` gains `keep_index` / `paths` / `include_untracked`.
+Four built-in presets (default, vim, emacs, arrows-only) plus per-action rebinding through an in-app capture modal. Changes apply live, no restart. **Press `?` on any pane for context-aware help showing the bindings that apply right where you are.**
 
-### Security & Approvals
+#### Chat
 
-- Deny-with-edit approval variant across `zeroclaw-api`, runtime, channels, and the TUI overlay, with a `ReplaceWith` audit entry (#6820).
-- Pairing-token auth removed from the RPC socket transport in favour of filesystem permissions (#6837); `#[secret]` generalized via a `SecretField` trait (#6918).
-- Runtime profile now enforced in channel-driven agent paths; Canvas iframe sandbox tightened against token theft via XSS (GHSA-f385-f6h2-3gqj, #6942); bubblewrap sandbox binds `/lib64`/`/lib` conditionally (#6902); Groq API keys detected in the leak scanner (#6812).
+Conversational sessions with any of your agents: full memory, skills, channel-style context, live model and provider switching mid-conversation (#7209), and an outbound message queue so you can keep typing while a turn is in flight (#7190).
 
-### Configuration
+#### Code
 
-- Config get/set accepts snake_case field names (#6837 schema family); `max_image_turns` added to `MultimodalConfig`; lean default channel bundle (#6904).
-- Registry-driven installer: `--apps` flag, a sectioned interactive picker that shows all features with defaults pre-checked, and apps discovered from `apps/*/`.
+A coding workspace built on [ACP](https://docs.zeroclawlabs.ai/master/en/channels/acp.html), the same protocol that powers editor integrations, with zero configuration required: open the pane and it just works. Code sessions are tuned for the job: memory tools are excluded server-side (#7177) so your coding agent stays focused on the tree in front of it instead of consolidating chatter, sessions persist and survive kills cleanly (#7258), and the working directory, branch, and commit are always visible (#7159).
 
-### Web Dashboard
+#### Dashboard
 
-- Tool-approval UI for supervised-mode execution (#6603); minimum-browser floor with an unsupported-browser fallback banner (#6936); websocket steering transcript preserved (#6933); version shown in `/api/status` and the sidebar footer (#6367).
+Live per-agent status with RAM and CPU for the daemon process, distinguishing loading, error, and live states at a glance.
+
+#### Config
+
+The entire configuration in a split-pane editor with built-in, registry-driven help for every field. Edit agents, providers, channels, and policies without touching a text editor.
+
+#### Quickstart
+
+Guided agent creation end to end: pick a provider, paste a key, choose a model from the live catalog, set a personality, and land directly in Chat with your new agent.
+
+#### Logs
+
+The daemon's structured log stream, filterable and attribution-aware, in the same terminal you work in.
 
 ### Observability
 
-- OTel tool spans enriched with `gen_ai.tool.*` semantic-convention attributes (#6009); `--log-llm` payload tracing restored (#6709); recording floor split from terminal display.
+- **OTel memory and RAG observability** — every agent turn now produces visible
+  `memory.recall`, `memory.store`, and `rag.retrieve` spans plus five OTel meter
+  instruments (`zeroclaw.memory.recall.{count,duration}`, `zeroclaw.memory.store.count`,
+  `zeroclaw.rag.retrieve.{count,duration}`). The recall/retrieve spans set
+  `gen_ai.operation.name = "retrieval"` and carry a scrubbed/truncated `query_summary`
+  on `input.value`; the store span uses `db.system` / `db.operation = "INSERT"`. These
+  are partial GenAI-compatible attributes: `SpanKind::Internal` is used, and span names
+  are `memory.recall` / `rag.retrieve` / `memory.store` for compatibility with the
+  existing ZeroClaw / Langfuse retrieval views. New spans and instruments live behind
+  the existing `observability-otel` feature gate (#6190).
 
-### Internationalization
+### Providers
 
-- CLI and TUI strings routed through Fluent with on-disk catalogue loading and per-user locale selection; zerocode ships an independent Fluent catalogue; skill install output localized (#6674).
+- [New providers](https://docs.zeroclawlabs.ai/master/en/providers/catalog.html): Kilo AI Gateway, GitHub Models (#6445), Morph (#6440), Manifest (#6268), atomic-chat (#6513), a dedicated llama.cpp provider (#6417), seven more OpenAI-compatible providers (#7260), and MiniMax split into Global and China entries (#6758).
+- Native extended thinking for Anthropic and Bedrock (#5652), prompt caching for OpenRouter (#6008), native Responses-protocol tool calls for Codex (#6117), [automatic fallback to a secondary provider on failure](https://docs.zeroclawlabs.ai/master/en/providers/routing.html) (#7178), and the Responses wire protocol honored across custom, OpenAI-compatible, and llama.cpp providers (#7180, #7172, #7418).
 
-### Installation & Distribution
+### Channels
 
-- NixOS module + test for `services.zeroclaw.instances` (#6562); Tauri desktop permission onboarding for Linux/Windows (#6710) and a macOS onboarding wizard (#6506); `take_screenshot` / `run_applescript` desktop commands (#6507).
+- [New channels](https://docs.zeroclawlabs.ai/master/en/channels/overview.html): Twitch chat (#7275), WeCom AI Bot (#6680), AMQP with mutual TLS (#7369), and multi-tenant Linq with per-agent routing (#7041).
+- Per-recipient reply pacing across nine channels (#6389), a configurable in-flight message budget (#7391), webhook retry with exponential backoff (#5838), a reply-intent precheck that can route to a cheaper per-agent classifier model (#6068, #6945), and selective channel builds behind the new lean default bundle (#6866, #6904).
 
-## What's New since v0.8.0-beta-1
+### Tools and plugins
 
-Nearly all of the above landed after beta-1. The items that are specifically new in this beta:
+- [New tools](https://docs.zeroclawlabs.ai/master/en/tools/overview.html) for downloading remote files into the workspace (#6957), uploading single files and bundles over HTTP (#6773), sending messages to channels directly from the agent loop (#6665), reading and writing binary files (#7004), and authenticated outbound HTTP requests (#7354). Jina AI joins as a web-search backend (#6833).
+- [WASM plugin interfaces](https://docs.zeroclawlabs.ai/master/en/developing/index.html) are now formally defined for tools, channels, and memory (#7060), with new plugins for Office document extraction (#7454), LanguageTool grammar checking (#7326), and self-hosted Stable Diffusion image generation (#7325).
 
-- **Delegation hardening**: `delegation_policy` simplified to a mode-only (`allow`/`forbidden`) enum editable in the config UI; delegation gated on shared risk profile; advertised roster filtered to same-profile peers.
-- **Installer overhaul**: `--apps` flag and a sectioned Apps/Features/Channels picker, registry-driven from `apps/*/` and the Cargo feature set, with crate defaults pre-checked.
-- **Quickstart polish**: agent modal with personality + templates, peer-group selector, Esc-to-go-back through the personality stack, and a cleaner CLI checklist.
-- **zerocode reaches feature-complete for beta**: the Config, Code, Chat, Logs, and Dashboard panes are all live, with syntax-highlighted diffs (inkjet/tree-sitter), markdown rendering in chat, locally-configurable themes and keybindings, per-OS key dispatch, an independent Fluent catalogue with a download-from-upstream locale tab, and a `--version` flag that flags daemon-version mismatches.
-- **New tools**: `file_download`, `file_upload_bundle`, and `execute_pipeline` result mode; honest gateway channel readiness (#6985); `channel_send` with `default_target` (#6665).
-- **CLI Fluent routing** with per-user locale fetch and on-disk catalogue loading.
+### Memory
 
-## Bug Fixes
+A [pluggable memory strategy](https://docs.zeroclawlabs.ai/master/en/agents/internals.html) now routes agent-turn, gateway, and channel consolidation through one path (#6907, #7053, #7234); time-windowed recall works correctly for markdown-backed memories (#7192); Postgres backend initialization is fixed (#7451).
 
-| Area | Fix |
-|---|---|
-| Security | Runtime profile enforced on channel-driven agent sessions; Canvas iframe sandbox tightened (GHSA-f385-f6h2-3gqj, #6942); bubblewrap `/lib64`/`/lib` conditional bind (#6902); Groq key leak detection (#6812); device-redirect path policy (#6236) |
-| Tokens & cost | Stop double-counting cached input tokens across provider/gateway/dispatch; sum all three Anthropic input buckets per the documented formula; include cached input in TUI context usage; Gemini usage propagated to the cost tracker (#6575) |
-| Agent & runtime | Apply SecurityPolicy tool filter in `process_message()` (#6960); resolve runtime-profile budgets when constructing the security policy; recover reaped sessions instead of killing them; stop ACP turns wedging on a stalled token-count write |
-| Providers | Preserve provider aliases for Codex OAuth (#6938); Codex subscription auth for OpenAI (#6908); `--prompt` for gemini-cli (#6614); doctor uses configured provider credentials (#6838) |
-| Channels | Slack `bot_token` optional and env-loaded at startup (#6287); WeChat context_tokens persisted + tilde expansion (#6238); Matrix duplicate inbound replies dropped (#6306); ignore blank SMTP credential overrides (#6979) |
-| Gateway | `/ws/nodes` 404 when nodes disabled + reject unauthenticated combo (#6885); boot-time quickstart URLs include the configured host and port |
-| Memory | Tolerate concurrent SQLite schema migrations (#6432); fix a migration guard that missed a missing UNIQUE constraint |
-| Windows | Remove manual MANIFEST linker flags fixing CVT1100/LNK1123 (#6987); local IPC parity via named pipes |
-| Onboarding | onboard `--help` no longer advertises removed flags; quickstart `expect()` replaced with proper error propagation; deny-with-edit replacement sanitized before reuse |
+### Voice, desktop, hardware, docs
 
-## Breaking Changes
+- [Voice notes](https://docs.zeroclawlabs.ai/master/en/channels/voice.html) transcode to OGG/Opus for Telegram and WhatsApp (#7050).
+- Desktop onboarding wizards for macOS, Linux, and Windows permissions (#6506, #6710).
+- Smart-room named-device tools and ESP32 simulator harnesses (#7045, #7048, #7363).
+- [Versioned documentation](https://docs.zeroclawlabs.ai/master/en/introduction.html) with a version selector (#7023), a full book rework that derives provider and config reference pages from source (#7365), a [FreeBSD setup guide](https://docs.zeroclawlabs.ai/master/en/setup/freebsd.html) with service files (#7161), [Podman guidance](https://docs.zeroclawlabs.ai/master/en/setup/container.html), a [NixOS module](https://docs.zeroclawlabs.ai/master/en/setup/nixos.html) (#6562), and a fully static container build pipeline (#7176).
 
-- **`onboard` is removed in favour of `quickstart`.** The legacy section-by-section wizard and its flags (`--quick`, `--api-key`, `--model-provider`, `--<section>-only`, positional section subcommands) now error. Run `zeroclaw quickstart` instead.
-- **Schema V3 (multi-agent).** Configs are auto-migrated from V2; run `zeroclaw config migrate` to write the upgraded file explicitly. Agent-level fields that duplicated runtime-profile settings now resolve through the runtime profile.
-- **`zeroclaw-tui` renamed to `zerocode`** across the workspace; the TUI is installed as a standalone app (`cargo install --path apps/zerocode`) rather than a feature of the main binary. The `tui-onboarding` feature is removed.
-- **RPC pairing-token auth removed.** Local IPC is gated by filesystem permissions on the socket; remote access uses WSS (#6837).
-- **`delegation_policy` is now `{ mode = "allow" | "forbidden" }`** — the previous per-agent allow-list is gone; reachable delegates are determined by shared risk profile.
+## Security
 
-## Known Limitations
+- **Canvas token theft (GHSA-f385-f6h2-3gqj)**: the dashboard Canvas iframe sandbox is tightened so injected content can no longer exfiltrate the pairing token (#6942).
+- **Bearer-token revocation**: rotating or deleting a paired device now actually invalidates its token at the gateway (#6988).
+- **Secret handling**: redaction now covers every credential-shaped config surface, including nested shapes (#6918, #6982, #7261), and the channel orchestrator no longer falls back to another provider's credentials (#7066).
+- **Outbound request guards**: private-host allowlists for the HTTP request tool (#6981) and for fetches whose DNS resolves to private addresses (#6974).
+- **Tool gating**: per-agent tool allowlists are enforced when channels start (#7064) and on every message (#6960); scheduled agent jobs can no longer modify the scheduler itself by default (#7189); internal telemetry is blocked from the chat WebSocket by default (#7221).
+- **[Sandboxing](https://docs.zeroclawlabs.ai/master/en/security/sandboxing.html)**: tighter library binds in the Linux sandbox (#6902), and interactive subprocesses can no longer hijack the controlling terminal (#7120).
+- **Dependency advisories**: mail library updated for RUSTSEC-2026-0141 (#6662), the web frontend router bumped to clear five advisories (#7198), and Groq API keys added to the leak scanner (#6812).
+- A partially invalid config can no longer silently default security-critical settings during daemon startup (#7160).
 
-This is a beta. The following are known and will be addressed before the full v0.8.0 release:
+## Since v0.8.0-beta-2
 
-- **Daemon resident memory does not fully return to baseline** (#6826). Each open zerocode Code (ACP) or Chat session holds its agent and conversation history in RAM; concurrently held sessions are additive, in practice topping out around ~200 MB. glibc arena fragmentation means resident memory does not fully return to the pre-session baseline even after sessions close. Restarting the daemon reclaims it fully.
-- **Daemon restart / reconnect hangs** (#7043). Disconnecting the daemon and reconnecting TUIs across a daemon restart can leave a TUI hung. If this happens, quit and relaunch zerocode.
-- **`onboard` is deprecated.** The legacy onboarding command no longer configures anything — invoking it prints a notice pointing at `zeroclaw quickstart`, and any legacy flags error. Use `zeroclaw quickstart` for setup.
-- **Shell commands can "poison" a single tool call's TTY.** Certain shell invocations can corrupt the pseudo-terminal for *that one tool call* — garbage character output, an unresponsive command — of the kind `stty sane` would normally clear. It's scoped to the affected tool call only: cancelling and issuing another shell tool call runs clean. Not fixed for the beta period (any shell would fail on such commands).
-- **Model-provider fallback is being rewired** (#7059, #6295). All legacy cross-provider fallback behaviors were intentionally removed for the beta. Today, a failing call retries the **same** model and provider three times before it counts as a complete failure; broader routing/fallback is planned before the full release.
+For those tracking the beta line, the 184 commits since beta-2 concentrate on stabilization:
+
+- **Config correctness**: the unbounded and yolo quickstart presets actually allow what they advertise (#7371), incremental saves no longer leave a stale schema-version label (#7274), the webhook channel gets a sensible default port (#7193), one malformed provider entry no longer wipes the rest of your providers on load (#7491), config browsing no longer leaks similarly named sibling agents (#7471), and a crash on multi-byte characters in CLI flags is fixed (#7154).
+- **Channel delivery**: only the final assistant turn reaches channels (#7239), internal tool-result markup is stripped from replies (#5796), truncated tool-call fragments are dropped at delivery (#7370), webp images are normalized for vision models (#7135), Telegram preserves code fences across message splits (#6701) and restores forwarded-message attribution (#7251), WhatsApp delivery and reply-mentions work for the new ID format (#7008, #7226), and Matrix keeps separate session state per configured account while repairing key backups (#7388).
+- **Cron**: disabling startup catch-up actually skips overdue jobs (#7348), one-shot reminders can be scheduled relative to now (#7188), schedules set in the past get a clear diagnostic (#7165), and DingTalk is available as a delivery channel (#7091).
+- **Runtime**: history trimming can no longer empty the conversation entirely (#7403), parallel SubAgents and delegates return reliably (#7442), writing files into a container with no mounted workspace fails loudly instead of silently (#7129), and the gateway survives transient connection-accept errors instead of crashing (#7402).
+
+## Breaking changes
+
+- **[Schema V3](https://docs.zeroclawlabs.ai/master/en/reference/config.html)** (#6398): configs migrate automatically on first load. Profile settings are split between runtime behavior and risk policy, cost rates are reorganized per provider, and scheduled jobs must name the agent they run as.
+- **[Lean default channel bundle](https://docs.zeroclawlabs.ai/master/en/channels/overview.html)** (#6904): prebuilt binaries ship a core channel set; social channels move to opt-in build features.
+- **[Logging](https://docs.zeroclawlabs.ai/master/en/architecture/logging.html)** (#6398 train): the legacy trace-event path is retired in favor of the unified structured logging pipeline; third-party logging macros are banned workspace-wide.
+- **Observer events** (#6190): `zeroclaw_api::observability::ObserverEvent` is now `#[non_exhaustive]` and adds `MemoryRecall`, `MemoryStore`, and `RagRetrieve`. Out-of-tree observers that exhaustively match events must add a wildcard arm.
+- **Memory observability hook** (#6190): `MemoryStrategy::load_context` now receives an observer reference so the runtime can emit `MemoryRecall` events at the implicit recall boundary. Out-of-tree strategy implementations must update their signature; implementations that do not emit observability can ignore the parameter.
 
 ## Contributors
 
-Thanks to everyone who contributed between v0.8.0-beta-1 and v0.8.0-beta-2:
+### Join in
 
-@abhinavmathur-atlan
-@alexandme
-@alex-nax
-@Alix-007
-@Audacity88
-@BernardKuo
-@drbparadise
-@easyteacher
-@FTDGRT
-@h03-xydt
-@jokemanfire
-@JordanTheJet
-@kanmars
-@kristofferkoch
-@locnh-ssid
-@mov-xound-glitch
-@nixosclaw
-@perlowja
-@puneetdixit200
-@r4mmer
-@rareba
-@rifuki
-@singlerider
-@theonlyhennygod
-@tidux
-@tmigone
-@tylerjenningsw
-@whtiehack
-@XiaoliangWang1991
-@yijunyu
+Over 100 people landed work in this release, most of them for the first time. If ZeroClaw does something almost right for you, that gap is a great first PR: a fix, a doc correction, a channel quirk, a provider you wish existed. Start with the [contributing guide](https://docs.zeroclawlabs.ai/master/en/contributing/index.html), open an issue if you want a sanity check first, and we will review it. The review queue moves daily.
+
+### One of us
+
+@0disoft, @abhinavmathur-atlan, @AbubakrSamsodien, @alex-nax, @alexandme, @aliasliao, @Alix-007, @arucil, @ATECHPCS, @Audacity88, @BernardKuo, @bheatwole, @bitscrafts, @casualjim, @chengzhichao-xydt, @ConYel, @DaBlitzStein, @drbparadise, @eastriverlee, @easyteacher, @eldar702, @fanchanghu, @flyin1600, @forsakenyang, @fresh-fx59, @FTDGRT, @g0ne150, @garacio, @guitaripod, @h03-xydt, @hanZeng-08, @IftekharUddin, @ilteoood, @itripn, @jeffjhunter, @joe2643, @johnrspeer83-png, @jokemanfire, @JordanTheJet, @jstar0, @kanmars, @kapelame, @kitswas, @kmsquire, @kristofferkoch, @locnh-ssid, @LuaniiMM, @markuman, @mastwet, @metalmon, @michidk, @mminkus, @mn13, @mov-xound-glitch, @nebullii, @Nillth, @ninenox, @NiuBlibing, @nixosclaw, @ozzyfly, @patrickzzz, @perlowja, @Project516, @puneetdixit200, @r4mmer, @rareba, @Rhoahndur, @rifuki, @roywong10, @RyanHoldren, @sbenedetto, @SebConejo, @sentinel-nnet, @silas-qiao, @SimianAstronaut7, @singlerider, @spacelobster88, @SpectreMercury, @Stealinglight, @Tenith01, @TeoConnexioh, @TheBlindM, @theonlyhennygod, @theredspoon, @thezillo, @tidux, @TJUEZ, @tmigone, @tylerjenningsw, @vernonstinebaker, @vrurg, @WareWolf-MoonWall, @whtiehack, @xianshishan, @XiaoliangWang1991, @xydigit-sj, @xydigitLybnnnn, @yanalialiuk, @yexca, @yijunyu, @Yyukan, @zwffff
 
 ---
 
-*Full diff since last stable: `git log v0.7.5..v0.8.0-beta-2 --oneline`*
-*Since last beta: `git log v0.8.0-beta-1..v0.8.0-beta-2 --oneline`*
+Full diff: https://github.com/zeroclaw-labs/zeroclaw/compare/v0.7.5...v0.8.0

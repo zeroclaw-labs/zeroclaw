@@ -530,6 +530,21 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(true)
     }
 
+    /// Cheap existence probe used by the gateway to skip cancelled-append
+    /// writes against a session the user just deleted (#7126). Mirrors the
+    /// row that `delete_session` wipes — once the metadata row is gone the
+    /// session is considered deleted, even if a stray DELETE on the
+    /// `sessions` table might still race ahead.
+    fn session_exists(&self, session_key: &str) -> bool {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT 1 FROM session_metadata WHERE session_key = ?1 LIMIT 1",
+            params![session_key],
+            |_| Ok(()),
+        )
+        .is_ok()
+    }
+
     fn set_session_name(&self, session_key: &str, name: &str) -> std::io::Result<()> {
         let conn = self.conn.lock();
         let name_val = if name.is_empty() { None } else { Some(name) };
@@ -1115,6 +1130,25 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
         assert!(!backend.delete_session("nonexistent").unwrap());
+    }
+
+    /// #7126: `session_exists` must reflect the same row that
+    /// `delete_session` wipes, so the gateway's cancelled-append guard
+    /// stops resurrecting just-deleted sessions.
+    #[test]
+    fn session_exists_tracks_metadata_row() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        assert!(!backend.session_exists("ghost"));
+
+        backend
+            .append("ghost", &ChatMessage::user("first"))
+            .unwrap();
+        assert!(backend.session_exists("ghost"));
+
+        assert!(backend.delete_session("ghost").unwrap());
+        assert!(!backend.session_exists("ghost"));
     }
 
     #[test]

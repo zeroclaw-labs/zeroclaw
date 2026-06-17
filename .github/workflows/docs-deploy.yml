@@ -10,6 +10,9 @@ name: Deploy mdBook docs to Pages
 
 env:
   DOCS_MIN_VERSION: v0.7.5
+  # gh-pages is ephemeral: keep master, stable, and the newest N final
+  # releases. Lower this to shrink clone size; raise to keep more pinned docs.
+  DOCS_KEEP_VERSIONS: "3"
 
 on:
   push:
@@ -43,9 +46,65 @@ jobs:
   deploy:
     runs-on: ubuntu-24.04-arm
     steps:
+      # A push to master may flip the stable pointer (docs/book/stable-version.txt).
+      # The pointed-at release was already deployed when its tag was pushed, so its
+      # version dir already exists on gh-pages; flipping the pointer does NOT need
+      # to rebuild it. The master deploy below copies the new pointer file and
+      # regenerates the root redirect + versions.json, which is all that is needed
+      # to make that existing dir resolve as Stable. This step only validates the
+      # pointer when it changed, so a malformed or premature flip fails loudly
+      # instead of silently redirecting the site root to dev docs.
+      - name: Validate stable-pointer change
+        id: stableptr
+        if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          REPO_URL: https://github.com/${{ github.repository }}.git
+        run: |
+          set -euo pipefail
+          PTR="docs/book/stable-version.txt"
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            echo "No before-SHA (new branch); skipping stable-pointer validation."
+            exit 0
+          fi
+          # Page through compare files (.files caps at 300 per response) so a large
+          # squash-merge cannot hide the pointer change.
+          changed=false
+          page=1
+          while :; do
+            BATCH=$(gh api \
+              "repos/${GITHUB_REPOSITORY}/compare/${BEFORE}...${AFTER}?per_page=100&page=${page}" \
+              --jq '.files[].filename' 2>/dev/null || true)
+            [ -z "$BATCH" ] && break
+            if printf '%s\n' "$BATCH" | grep -qx "$PTR"; then changed=true; break; fi
+            page=$((page + 1))
+            [ "$page" -gt 50 ] && break
+          done
+          if [ "$changed" != true ]; then
+            echo "Stable pointer unchanged in this push."
+            exit 0
+          fi
+          PTR_TAG=$(gh api "repos/${GITHUB_REPOSITORY}/contents/${PTR}?ref=${AFTER}" \
+            --jq '.content' | base64 -d | tr -d '[:space:]')
+          if ! printf '%s' "$PTR_TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9._-]+)?$'; then
+            echo "::error::stable-version.txt holds '${PTR_TAG}', not a vX.Y.Z[-pre] tag."
+            exit 1
+          fi
+          if ! git ls-remote --exit-code --tags "$REPO_URL" "refs/tags/${PTR_TAG}" >/dev/null 2>&1; then
+            echo "::error::stable pointer names '${PTR_TAG}' but that git tag does not exist. Cut and push the release tag (which deploys its docs) before flipping the pointer."
+            exit 1
+          fi
+          if ! git ls-remote --exit-code "$REPO_URL" "refs/heads/gh-pages" >/dev/null 2>&1; then
+            echo "gh-pages does not exist yet; pointer target presence is checked at deploy time."
+          fi
+          echo "Stable pointer validated -> ${PTR_TAG} (its docs dir is expected on gh-pages from the tag deploy)."
+
       - name: Determine version tag
         id: version
         run: |
+          set -euo pipefail
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             TAG="${{ github.event.inputs.tag }}"
             # Validate: must be 'master' or a semver tag like v0.7.5 / v0.8.0-beta-1.
@@ -56,6 +115,10 @@ jobs:
           elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
             TAG="${{ github.ref_name }}"
           else
+            # Master push: always deploy master. A pointer flip in the same push is
+            # already validated above; the master deploy refreshes the pointer file
+            # and root redirect so the already-present release dir resolves as
+            # Stable. No separate rebuild of the release is needed.
             TAG="master"
           fi
 
@@ -68,15 +131,16 @@ jobs:
             fi
           fi
 
-          echo "TAG=$TAG" >> $GITHUB_OUTPUT
+          echo "TAG=$TAG" >> "$GITHUB_OUTPUT"
           echo "Building docs for TAG=$TAG"
 
-      # Checks out the version being built. For workflow_dispatch with an old
-      # release tag, this replaces the workspace with that tag's source tree,
-      # which may predate the deploy helpers introduced in this PR.
+      # Checks out the version being built. TAG is 'master', a release tag from
+      # a tag push / dispatch, or the stable-pointer's named release. For an old
+      # release tag this replaces the workspace with that tag's source tree,
+      # which may predate the deploy helpers (fetched separately below).
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ steps.version.outputs.TAG }}
           fetch-depth: 1
 
       # Always fetch the deploy-helper scripts from the commit that triggered
@@ -154,6 +218,7 @@ jobs:
           GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.version.outputs.TAG }}
+          DOCS_KEEP_VERSIONS: ${{ env.DOCS_KEEP_VERSIONS }}
         run: |
           set -euo pipefail
           REPO="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
@@ -173,52 +238,130 @@ jobs:
             popd > /dev/null
           fi
 
-          # Copy built tag docs into gh-pages under '<tag>/'
-          mkdir -p "$CLONE_DIR/$TAG"
-          if [ -d "docs/book/book/$TAG" ]; then
-            rsync -a --delete "docs/book/book/$TAG/" "$CLONE_DIR/$TAG/"
+          # Normalize the build output into a single versioned source dir so the
+          # initial sync and every retry copy from the same place. Old tags that
+          # still build into the pre-versioned layout (`docs/book/book/` with no
+          # `$TAG/` inside) get wrapped into `$TAG/` once, here — the retry path
+          # must not re-derive this, or a concurrent push rejection on an old tag
+          # would leave it with nothing to re-apply.
+          BUILD_ROOT="${GITHUB_WORKSPACE}/docs/book/book"
+          if [ -d "$BUILD_ROOT/$TAG" ]; then
+            TAG_SRC="$BUILD_ROOT/$TAG"
           else
             echo "Old docs layout detected (unversioned). Restructuring to $TAG/..."
-            mkdir -p "docs/book/book_temp/$TAG"
-            rsync -a docs/book/book/ "docs/book/book_temp/$TAG/"
-            rsync -a --delete "docs/book/book_temp/$TAG/" "$CLONE_DIR/$TAG/"
-            rm -rf docs/book/book_temp
+            TAG_SRC="$(mktemp -d)/$TAG"
+            mkdir -p "$TAG_SRC"
+            rsync -a "$BUILD_ROOT/" "$TAG_SRC/"
           fi
 
-          # If this is a stable release (no pre-release suffix), also copy to /stable/
-          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            mkdir -p "$CLONE_DIR/stable"
-            rsync -a --delete "$CLONE_DIR/$TAG/" "$CLONE_DIR/stable/"
-          fi
-
-          # Generate versions.json by scanning gh-pages root for version directories
           pushd "$CLONE_DIR" > /dev/null
 
-          # Persist custom domain — must be present on every push to gh-pages
-          # or GitHub Pages will remove it (re-introduced fix from #6142).
-          echo "docs.zeroclawlabs.ai" > CNAME
+          MDBOOK_XTASK="cargo run --manifest-path ${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml -p xtask --bin mdbook --"
 
-          SCRIPTS="${GITHUB_WORKSPACE}/.workflow-scripts/.github/scripts"
-          
-          # Sync shared chrome — new xtask produces book/_shared/
-          if [ -d "${GITHUB_WORKSPACE}/docs/book/book/_shared" ]; then
-            mkdir -p "$CLONE_DIR/_shared"
-            rsync -a --delete "${GITHUB_WORKSPACE}/docs/book/book/_shared/" "$CLONE_DIR/_shared/"
-          else
-            # Old-tag fallback: extract chrome from the deployed version content
-            cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- extract-chrome "$CLONE_DIR/$TAG" "$CLONE_DIR/_shared"
-          fi
+          # apply_run_slice re-applies THIS run's deliverables onto whatever tree
+          # is currently checked out (initial clone or a retry re-clone), then
+          # runs every idempotent finalizer. Single source of truth for both the
+          # first push and the concurrent-retry path so the two can never drift.
+          apply_run_slice() {
+            # Copy built tag docs into '<tag>/'.
+            mkdir -p "$TAG"
+            rsync -a --delete "$TAG_SRC/" "$TAG/"
 
-          cargo run --manifest-path "${GITHUB_WORKSPACE}/.workflow-scripts/Cargo.toml" -p xtask --bin mdbook -- gen-versions > versions.json
+            # No stable/ tree: Stable is a pointer to a real version dir, never a
+            # duplicate copy. The committed pointer (docs/book/stable-version.txt)
+            # is published to the gh-pages root as stable-version.txt; gen-versions,
+            # gen-root-index, and prune-versions read it. The pointer is GLOBAL
+            # state for the whole site, so only master writes it. An old release
+            # tag carries whatever pointer was committed at that tag and must not
+            # regress the live pointer (same hazard as _shared below). master is
+            # the single writer; tag deploys leave the existing gh-pages pointer
+            # untouched so the version it names keeps resolving and survives prune.
+            if [ "$TAG" = "master" ] && [ -f "${GITHUB_WORKSPACE}/docs/book/stable-version.txt" ]; then
+              cp "${GITHUB_WORKSPACE}/docs/book/stable-version.txt" stable-version.txt
+            fi
 
-          # Ensure root index.html points to /stable/en/ if stable docs exist, otherwise /master/en/
-          if [ -d "stable" ]; then
-            bash "${SCRIPTS}/gen-index-stable.sh"
-          else
-            bash "${SCRIPTS}/gen-index-master.sh"
-          fi
+            # Shared chrome (_shared/) is owned by master: every version's pages
+            # reference /_shared/, so an older tag overwriting it would regress
+            # the chrome for ALL versions. master is the single writer; a tag
+            # only seeds _shared when bootstrapping the very first deploy.
+            if [ "$TAG" = "master" ]; then
+              if [ -d "${GITHUB_WORKSPACE}/docs/book/book/_shared" ]; then
+                mkdir -p _shared
+                rsync -a --delete "${GITHUB_WORKSPACE}/docs/book/book/_shared/" "_shared/"
+              else
+                $MDBOOK_XTASK extract-chrome "$TAG" "_shared"
+              fi
+            elif [ ! -d "_shared" ]; then
+              $MDBOOK_XTASK extract-chrome "$TAG" "_shared"
+            fi
 
-          git add --all
-          git -c user.name="$GIT_AUTHOR_NAME" -c user.email="$GIT_AUTHOR_EMAIL" commit -m "docs: update docs for $TAG (from $GITHUB_SHA)" || true
-          git push "$REPO" gh-pages
-          popd >/dev/null
+            # Persist custom domain (#6142) and disable Jekyll on every push, or
+            # Pages drops the CNAME and 404s every underscore-prefixed path.
+            echo "docs.zeroclawlabs.ai" > CNAME
+            touch .nojekyll
+
+            # Drop pre-versioned orphan dirs (including any legacy stable/), then
+            # enforce retention (master, the stable-pointer target, and the newest
+            # DOCS_KEEP_VERSIONS finals). gen-versions runs AFTER pruning so
+            # versions.json never lists a dropped version; gen-root-index points /
+            # at the stable pointer target (or master when none resolves).
+            $MDBOOK_XTASK prune-root
+            $MDBOOK_XTASK prune-versions
+            $MDBOOK_XTASK gen-versions > versions.json
+            $MDBOOK_XTASK retrofit-selector
+            $MDBOOK_XTASK gen-root-index > index.html
+
+            # Guard: if a pointer is set but its version dir is absent, the root
+            # would silently redirect to /master/. Fail loudly instead. (Absent
+            # only when the release tag's deploy never landed its dir on gh-pages.)
+            # Use exit, not return: this function is invoked bare and inside the
+            # retry `until` loop body, and bash suppresses errexit for commands in
+            # a tested context, so a `return 1` could be swallowed and the broken
+            # tree pushed anyway. A missing pointer target is fatal and must abort
+            # the whole step regardless of call context, retry would not help.
+            if [ -s stable-version.txt ]; then
+              WANT="$(tr -d '[:space:]' < stable-version.txt)"
+              if [ -n "$WANT" ] && [ ! -d "$WANT" ]; then
+                echo "::error::stable pointer '${WANT}' has no version dir on gh-pages. Deploy ${WANT} (push its tag) before it can be Stable."
+                exit 1
+              fi
+            fi
+          }
+
+          # gh-pages is ephemeral: it must never accumulate history, or every
+          # superseded build artifact (per-locale searchindex, old version
+          # trees) stays reachable forever and bloats every clone. Each deploy
+          # collapses the finalized tree into a SINGLE orphan commit and
+          # force-pushes it. gh-pages is regenerable artifact written only by
+          # this workflow, which the `concurrency: gh-pages` group serializes, so
+          # a plain force-push is safe: there is no other writer and nothing
+          # irreplaceable to lose. There is no history to rewrite later.
+          flatten_and_push() {
+            # Re-root onto a single orphan commit: discard all ancestry.
+            git checkout -q --orphan ghp-flat
+            git add --all
+            git -c user.name="$GIT_AUTHOR_NAME" -c user.email="$GIT_AUTHOR_EMAIL" \
+              commit -q -m "docs: publish site for $TAG (from $GITHUB_SHA)"
+            git push --force "$REPO" ghp-flat:gh-pages
+          }
+
+          apply_run_slice
+
+          # The push only fails on transient network/auth errors (force-push is
+          # not rejected on divergence). Retry a few times in a fresh clone, then
+          # give up. Each retry runs in its own clone dir, balanced with a popd.
+          push_attempts=0
+          until flatten_and_push; do
+            push_attempts=$((push_attempts + 1))
+            if [ "$push_attempts" -ge 5 ]; then
+              echo "::error::gh-pages push failed after ${push_attempts} attempts"
+              exit 1
+            fi
+            echo "Push failed (attempt ${push_attempts}); re-cloning latest gh-pages and retrying"
+            popd > /dev/null
+            RETRY_DIR=$(mktemp -d)
+            git clone --depth 1 --branch gh-pages "$REPO" "$RETRY_DIR"
+            pushd "$RETRY_DIR" > /dev/null
+            apply_run_slice
+          done
+          popd > /dev/null

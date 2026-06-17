@@ -43,7 +43,7 @@ parking_lot = "0.12"
 portable-atomic = "1"
 rand = "0.10"
 regex = "1.10"
-rumqttc = "0.25"
+rumqttc = { version = "0.25", default-features = false, features = ["use-rustls-no-provider"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider", "__rustls-ring", "blocking", "multipart", "stream", "socks"] }
 ring = "0.17"
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -112,6 +112,7 @@ rcgen = "0.13"
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 scopeguard = "1.2"
+filetime = "0.2"
 
 # Channel features (forwarded to zeroclaw-channels)
 

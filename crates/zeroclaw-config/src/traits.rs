@@ -14,6 +14,51 @@ pub struct SecretFieldInfo {
     pub is_set: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AliasSource {
+    ModelProviders,
+    TtsProviders,
+    TranscriptionProviders,
+    Channels,
+    RiskProfiles,
+    RuntimeProfiles,
+    Agents,
+    SkillBundles,
+    KnowledgeBundles,
+    McpBundles,
+}
+
+impl AliasSource {
+    #[must_use]
+    pub const fn section_path(self) -> &'static str {
+        match self {
+            Self::ModelProviders => "providers.models",
+            Self::TtsProviders => "providers.tts",
+            Self::TranscriptionProviders => "providers.transcription",
+            Self::Channels => "channels",
+            Self::RiskProfiles => "risk_profiles",
+            Self::RuntimeProfiles => "runtime_profiles",
+            Self::Agents => "agents",
+            Self::SkillBundles => "skill_bundles",
+            Self::KnowledgeBundles => "knowledge_bundles",
+            Self::McpBundles => "mcp_bundles",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_two_tier(self) -> bool {
+        matches!(
+            self,
+            Self::ModelProviders
+                | Self::TtsProviders
+                | Self::TranscriptionProviders
+                | Self::Channels
+        )
+    }
+}
+
 /// Runtime type classification for config property values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -24,6 +69,8 @@ pub enum PropKind {
     Float,
     /// An enum or other serde-serializable type (parsed as TOML string).
     Enum,
+    /// A reference to a configured alias; `alias_source` names the namespace.
+    AliasRef,
     /// A `Vec<String>` field; set via comma-separated input.
     StringArray,
     /// A `Vec<T>` field where `T` is a serializable struct (e.g. `Vec<McpServerConfig>`,
@@ -46,6 +93,16 @@ pub enum PropKind {
 /// else as `PropKind::Enum`.
 pub trait HasPropKind {
     const PROP_KIND: PropKind;
+
+    const ALIAS_SOURCE: Option<AliasSource> = None;
+
+    /// Terminal field names whose values must be redacted when this type is
+    /// displayed as an object/object-array prop. Most prop kinds have no
+    /// nested secret surface; Configurable object-array element types can
+    /// override this by delegating to their generated `secret_field_terminals`.
+    fn display_secret_terminals() -> Vec<&'static str> {
+        Vec::new()
+    }
 }
 
 macro_rules! impl_prop_kind {
@@ -78,16 +135,31 @@ impl HasPropKind for Vec<String> {
 // serialize as plain strings; the schema-tooling layer treats them as
 // strings too.
 impl HasPropKind for crate::providers::ModelProviderRef {
-    const PROP_KIND: PropKind = PropKind::String;
+    const PROP_KIND: PropKind = PropKind::AliasRef;
+    const ALIAS_SOURCE: Option<AliasSource> = Some(AliasSource::ModelProviders);
+}
+impl HasPropKind for Vec<crate::providers::ModelProviderRef> {
+    const PROP_KIND: PropKind = PropKind::StringArray;
 }
 impl HasPropKind for crate::providers::TtsProviderRef {
-    const PROP_KIND: PropKind = PropKind::String;
+    const PROP_KIND: PropKind = PropKind::AliasRef;
+    const ALIAS_SOURCE: Option<AliasSource> = Some(AliasSource::TtsProviders);
 }
 impl HasPropKind for crate::providers::TranscriptionProviderRef {
-    const PROP_KIND: PropKind = PropKind::String;
+    const PROP_KIND: PropKind = PropKind::AliasRef;
+    const ALIAS_SOURCE: Option<AliasSource> = Some(AliasSource::TranscriptionProviders);
 }
 impl HasPropKind for crate::providers::ChannelRef {
-    const PROP_KIND: PropKind = PropKind::String;
+    const PROP_KIND: PropKind = PropKind::AliasRef;
+    const ALIAS_SOURCE: Option<AliasSource> = Some(AliasSource::Channels);
+}
+impl HasPropKind for crate::providers::RiskProfileRef {
+    const PROP_KIND: PropKind = PropKind::AliasRef;
+    const ALIAS_SOURCE: Option<AliasSource> = Some(AliasSource::RiskProfiles);
+}
+impl HasPropKind for crate::providers::RuntimeProfileRef {
+    const PROP_KIND: PropKind = PropKind::AliasRef;
+    const ALIAS_SOURCE: Option<AliasSource> = Some(AliasSource::RuntimeProfiles);
 }
 impl HasPropKind for Vec<crate::providers::ChannelRef> {
     const PROP_KIND: PropKind = PropKind::StringArray;
@@ -97,7 +169,8 @@ impl HasPropKind for Vec<crate::providers::ChannelRef> {
 // PeerUsername round-trip as plain strings; AccessMode and
 // MemoryBackendKind are enums.
 impl HasPropKind for crate::multi_agent::AgentAlias {
-    const PROP_KIND: PropKind = PropKind::String;
+    const PROP_KIND: PropKind = PropKind::AliasRef;
+    const ALIAS_SOURCE: Option<AliasSource> = Some(AliasSource::Agents);
 }
 impl HasPropKind for crate::multi_agent::PeerGroupName {
     const PROP_KIND: PropKind = PropKind::String;
@@ -127,6 +200,10 @@ impl HasPropKind
     const PROP_KIND: PropKind = PropKind::Object;
 }
 
+impl HasPropKind for crate::scattered_types::EmailOAuth2Config {
+    const PROP_KIND: PropKind = PropKind::Object;
+}
+
 // Vec<struct> fields are surfaced as PropKind::ObjectArray — each
 // element renders as a per-row sub-form on the dashboard rather than a
 // chip. The Configurable derive routes `<Vec<T> as HasPropKind>::PROP_KIND`
@@ -145,6 +222,10 @@ impl HasPropKind for Vec<crate::schema::GoogleWorkspaceAllowedOperation> {
 }
 impl HasPropKind for Vec<crate::schema::McpServerConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
+
+    fn display_secret_terminals() -> Vec<&'static str> {
+        crate::schema::McpServerConfig::secret_field_terminals()
+    }
 }
 impl HasPropKind for Vec<crate::schema::ModelRouteConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
@@ -157,6 +238,17 @@ impl HasPropKind for Vec<crate::schema::PeripheralBoardConfig> {
 }
 impl HasPropKind for Vec<crate::schema::ToolFilterGroup> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
+}
+
+/// Security classification for credential-shaped config surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialSurfaceClass {
+    EncryptedSecret,
+    PathOnlyReference,
+    PublicValue,
+    ExternalAuthStore,
+    LegacyEnvPath,
+    RequiresFollowUp,
 }
 
 /// Tab grouping for config fields and UI surfaces. Each variant maps to a
@@ -280,9 +372,13 @@ pub struct PropFieldInfo {
     /// Subject to the same write-only / no-readback rules as `#[secret]`.
     /// Reserved for future schema additions; currently no fields are derived.
     pub derived_from_secret: bool,
+    /// Explicit security classification for credential-shaped surfaces.
+    pub credential_class: Option<CredentialSurfaceClass>,
     /// Tab grouping for this field. `ConfigTab::None` when the field has
     /// no tab annotation (flat display, no tab bar).
     pub tab: ConfigTab,
+    /// Alias namespace for `PropKind::AliasRef` fields; `None` otherwise.
+    pub alias_source: Option<AliasSource>,
 }
 
 impl PropKind {
@@ -296,6 +392,7 @@ impl PropKind {
             Self::Integer => "integer",
             Self::Float => "float",
             Self::Enum => "enum",
+            Self::AliasRef => "alias_ref",
             Self::StringArray => "string_array",
             Self::ObjectArray => "object_array",
             Self::Object => "object",
@@ -315,6 +412,8 @@ impl std::fmt::Debug for PropFieldInfo {
             .field("name", &self.name)
             .field("kind", &self.kind)
             .field("is_secret", &self.is_secret)
+            .field("credential_class", &self.credential_class)
+            .field("tab", &self.tab)
             .finish_non_exhaustive()
     }
 }
@@ -424,6 +523,8 @@ impl SecretField for String {
         field: &str,
     ) -> anyhow::Result<()> {
         use anyhow::Context;
+        // `is_encrypted` also includes external secret references (`op://`):
+        // encryption must preserve them, while decryption resolves them for use.
         if !self.is_empty() && !crate::security::SecretStore::is_encrypted(self) {
             *self = store
                 .encrypt(self)
@@ -641,6 +742,21 @@ pub struct MapKeySection {
     /// Doc comment on the field (flattened to one line). What the user sees
     /// when picking which kind of thing to add.
     pub description: &'static str,
+    /// For `Kind::List` Vec sections that declared `#[natural_key = "<f>"]`
+    /// (the per-element editor opt-in shipped with the `mcp.servers`
+    /// per-field editor), this is the snake_case field name on the inner
+    /// type that holds the alias used to address each element — e.g.
+    /// `"name"` for `[[mcp.servers]]`. The incremental TOML writer
+    /// (`apply_dirty_path` in `schema.rs`) reads this to walk a
+    /// `<section>.<alias>.<inner>` dirty path through an array of tables.
+    /// Without it, the writer flat-faceplants on `as_table()` at the
+    /// alias segment and silently drops the edit on the floor.
+    ///
+    /// `None` for HashMap sections (alias *is* the TOML key, no further
+    /// hint needed) and for plain `Vec<T>` sections without
+    /// `#[natural_key]` (legacy whole-array `ObjectArray` round-trip,
+    /// no per-element addressing).
+    pub natural_key: Option<&'static str>,
 }
 
 /// Serializable wire representation of a config field for API consumers
@@ -668,6 +784,8 @@ pub struct ConfigFieldEntry {
     /// Tab grouping. `ConfigTab::None` = no tab grouping (flat display).
     #[serde(default, skip_serializing_if = "ConfigTab::is_none")]
     pub tab: ConfigTab,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias_source: Option<AliasSource>,
 }
 
 impl ConfigFieldEntry {
@@ -699,6 +817,7 @@ impl ConfigFieldEntry {
             description: info.description.to_string(),
             section,
             tab: info.tab,
+            alias_source: info.alias_source,
         }
     }
 }
@@ -742,7 +861,7 @@ pub struct IntegrationDescriptor {
     pub active: bool,
 }
 
-/// Metadata for one channel type, as returned by [`ChannelsConfig::channels`].
+/// Metadata for one channel type, as returned by [`crate::schema::ChannelsConfig::channels`].
 #[derive(Debug, Clone)]
 pub struct ChannelInfo {
     /// Canonical kebab-case identifier used in config TOML
@@ -788,6 +907,16 @@ mod secret_field_tests {
         assert_eq!(s, enc1);
         s.decrypt_in_place(&store, "test.s").unwrap();
         assert_eq!(s, "sk-abc");
+    }
+
+    #[test]
+    fn string_op_reference_is_preserved_by_encrypt_in_place() {
+        let (_tmp, store) = store();
+        let mut s = String::from("op://vault/item/field");
+
+        s.encrypt_in_place(&store, "test.s").unwrap();
+
+        assert_eq!(s, "op://vault/item/field");
     }
 
     #[test]

@@ -102,6 +102,8 @@ mod tests {
             proxy_url: None,
             approval_timeout_secs: 120,
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
 
         let discord = DiscordConfig {
@@ -118,8 +120,13 @@ mod tests {
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
+            slash_commands: false,
+            intents_mask: None,
+            reaction_notifications: zeroclaw_config::schema::DiscordReactionScope::Off,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
         };
 
         let lark = LarkConfig {
@@ -134,6 +141,10 @@ mod tests {
             port: None,
             proxy_url: None,
             excluded_tools: vec![],
+            approval_timeout_secs: 300,
+            per_user_session: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
         };
         let nextcloud_talk = NextcloudTalkConfig {
             enabled: true,
