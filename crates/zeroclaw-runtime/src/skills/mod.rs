@@ -1254,9 +1254,21 @@ fn resolve_skill_location(skill: &Skill, workspace_dir: &Path) -> PathBuf {
 fn render_skill_location(skill: &Skill, workspace_dir: &Path, prefer_relative: bool) -> String {
     let location = resolve_skill_location(skill, workspace_dir);
     if prefer_relative && let Ok(relative) = location.strip_prefix(workspace_dir) {
-        return relative.display().to_string();
+        return display_skill_location(relative);
     }
-    location.display().to_string()
+    display_skill_location(&location)
+}
+
+fn display_skill_location(path: &Path) -> String {
+    let rendered = path.display().to_string();
+    #[cfg(target_os = "windows")]
+    {
+        rendered.replace('\\', "/")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        rendered
+    }
 }
 
 /// Build the "Available Skills" system prompt section with full skill instructions.
@@ -1457,15 +1469,30 @@ pub fn skills_to_tools_with_context(
     security: std::sync::Arc<crate::security::SecurityPolicy>,
     unfiltered_registry: &[std::sync::Arc<dyn zeroclaw_api::tool::Tool>],
 ) -> Vec<Box<dyn zeroclaw_api::tool::Tool>> {
+    skills_to_tools_with_context_and_runtime(
+        skills,
+        security,
+        unfiltered_registry,
+        std::sync::Arc::new(crate::platform::NativeRuntime::new()),
+    )
+}
+
+pub fn skills_to_tools_with_context_and_runtime(
+    skills: &[Skill],
+    security: std::sync::Arc<crate::security::SecurityPolicy>,
+    unfiltered_registry: &[std::sync::Arc<dyn zeroclaw_api::tool::Tool>],
+    runtime: std::sync::Arc<dyn crate::platform::RuntimeAdapter>,
+) -> Vec<Box<dyn zeroclaw_api::tool::Tool>> {
     let mut tools: Vec<Box<dyn zeroclaw_api::tool::Tool>> = Vec::new();
     for skill in skills {
         for tool in &skill.tools {
             match tool.kind.as_str() {
                 "shell" | "script" => {
-                    let inner = crate::skills::skill_tool::SkillShellTool::new(
+                    let inner = crate::skills::skill_tool::SkillShellTool::new_with_runtime(
                         &skill.name,
                         tool,
                         security.clone(),
+                        runtime.clone(),
                     );
                     tools.push(Box::new(zeroclaw_tools::wrappers::RateLimitedTool::new(
                         inner,

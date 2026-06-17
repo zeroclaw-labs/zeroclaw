@@ -646,6 +646,16 @@ mod tests {
         })
     }
 
+    #[cfg(target_os = "windows")]
+    fn absolute_path_outside_workspace() -> &'static str {
+        r"C:\Windows"
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn absolute_path_outside_workspace() -> &'static str {
+        "/etc"
+    }
+
     fn create_test_files(dir: &TempDir) {
         std::fs::write(
             dir.path().join("hello.rs"),
@@ -854,7 +864,7 @@ mod tests {
     async fn content_search_rejects_absolute_path_outside_allowlist() {
         let tool = ContentSearchTool::new(test_security(std::env::temp_dir()));
         let result = tool
-            .execute(json!({"pattern": "test", "path": "/etc"}))
+            .execute(json!({"pattern": "test", "path": absolute_path_outside_workspace()}))
             .await
             .unwrap();
 

@@ -7,6 +7,7 @@
 //! convention and keeps names valid under OpenAI-compatible function-name
 //! rules (`^[a-zA-Z0-9_-]+$`), which reject `.`.
 
+use crate::platform::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -20,6 +21,30 @@ use zeroclaw_api::tool::{Tool, ToolResult};
 const SKILL_SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1 MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
+
+#[cfg(not(target_os = "windows"))]
+const SAFE_ENV_VARS: &[&str] = &[
+    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
+];
+
+#[cfg(target_os = "windows")]
+const SAFE_ENV_VARS: &[&str] = &[
+    "PATH",
+    "PATHEXT",
+    "HOME",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "TEMP",
+    "TMP",
+    "TERM",
+    "LANG",
+    "USERNAME",
+];
 
 /// Maximum provider function-name length. Anthropic's current client-tool
 /// contract is the strictest we rely on: `name` must match
@@ -100,6 +125,7 @@ pub struct SkillShellTool {
     command_template: String,
     args: HashMap<String, String>,
     security: Arc<SecurityPolicy>,
+    runtime: Arc<dyn RuntimeAdapter>,
     /// Resolved per-command timeout in seconds (manifest `timeout_secs`, or the
     /// `SKILL_SHELL_TIMEOUT_SECS` default), clamped to a minimum of 1.
     timeout_secs: u64,
@@ -115,12 +141,22 @@ impl SkillShellTool {
         tool: &crate::skills::SkillTool,
         security: Arc<SecurityPolicy>,
     ) -> Self {
+        Self::new_with_runtime(skill_name, tool, security, Arc::new(NativeRuntime::new()))
+    }
+
+    pub fn new_with_runtime(
+        skill_name: &str,
+        tool: &crate::skills::SkillTool,
+        security: Arc<SecurityPolicy>,
+        runtime: Arc<dyn RuntimeAdapter>,
+    ) -> Self {
         Self {
             tool_name: composed_tool_name(skill_name, &tool.name),
             tool_description: tool.description.clone(),
             command_template: tool.command.clone(),
             args: tool.args.clone(),
             security,
+            runtime,
             timeout_secs: tool.timeout_secs.unwrap_or(SKILL_SHELL_TIMEOUT_SECS).max(1),
         }
     }
@@ -206,16 +242,23 @@ impl Tool for SkillShellTool {
             });
         }
 
-        // Build and execute the command
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c").arg(&command);
-        cmd.current_dir(&self.security.workspace_dir);
+        let mut cmd = match self
+            .runtime
+            .build_shell_command(&command, &self.security.workspace_dir)
+        {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to build runtime command: {e}")),
+                });
+            }
+        };
         cmd.env_clear();
 
         // Only pass safe environment variables
-        for var in &[
-            "PATH", "HOME", "TERM", "LANG", "LC_ALL", "USER", "SHELL", "TMPDIR",
-        ] {
+        for var in SAFE_ENV_VARS {
             if let Ok(val) = std::env::var(var) {
                 cmd.env(var, val);
             }
