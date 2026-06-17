@@ -1,11 +1,13 @@
 import { memo, useState, useEffect, useRef, useCallback } from 'react';
-import { Navigate, useParams } from 'react-router-dom';
-import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench } from 'lucide-react';
+import { Link, Navigate, useParams } from 'react-router-dom';
+import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, FolderOpen } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { AgentProvider, useAgent, type ChatMessage } from '@/contexts/AgentContext';
+import { useAgent, type ChatMessage } from '@/contexts/AgentContext';
 import { useDraft } from '@/hooks/useDraft';
 import { t } from '@/lib/i18n';
+import { Badge, Button } from '@/components/ui';
+import ChatWorkspace from '@/pages/ChatWorkspace';
 
 import ToolCallCard from '@/components/ToolCallCard';
 import ApprovalBanner from '@/components/ApprovalBanner';
@@ -14,23 +16,43 @@ const DRAFT_KEY_PREFIX = 'agent-chat';
 
 /**
  * Route entry point for `/agent/:alias`. Reads the alias from the URL and
- * mounts an AgentProvider keyed by it so React tears down and rebuilds the
- * WebSocket / chat state on alias change. Missing alias → redirect to the
- * agents list.
+ * hands it to the multi-agent ChatWorkspace as the initial chat to open and
+ * activate. The workspace itself owns the set of open chats and never
+ * remounts on tab/layout switches, so the alias is passed as a prop (not used
+ * as a React `key`) — that keeps every chat's AgentProvider WebSocket alive
+ * across tab switches. Missing alias → redirect to the agents list.
  */
 export default function AgentChat() {
   const { alias } = useParams<{ alias: string }>();
   if (!alias) {
     return <Navigate to="/agents" replace />;
   }
-  return (
-    <AgentProvider key={alias} agentAlias={alias}>
-      <AgentChatInner agentAlias={alias} />
-    </AgentProvider>
-  );
+  return <ChatWorkspace initialAlias={alias} />;
 }
 
-function AgentChatInner({ agentAlias }: { agentAlias: string }) {
+/** Status snapshot a chat pane pushes up to the workspace tab bar. */
+export interface AgentChatStatus {
+  typing: boolean;
+  messageCount: number;
+}
+
+/**
+ * Full chat view for a single agent. Must be rendered inside an
+ * `<AgentProvider>` (it calls `useAgent()` internally). Exported so the
+ * multi-agent `ChatWorkspace` can mount one instance per open chat and keep
+ * them all alive simultaneously.
+ *
+ * `onStatus` lets the host (the workspace) observe live typing / message-count
+ * changes per pane without itself subscribing to the agent context — used to
+ * drive the streaming and unread indicators in the tab bar.
+ */
+export function AgentChatInner({
+  agentAlias,
+  onStatus,
+}: {
+  agentAlias: string;
+  onStatus?: (s: AgentChatStatus) => void;
+}) {
   const {
     messages,
     sendMessage,
@@ -75,6 +97,14 @@ function AgentChatInner({ agentAlias }: { agentAlias: string }) {
   useEffect(() => {
     saveDraft(input);
   }, [input, saveDraft]);
+
+  // Report live status (typing + message count) up to the host workspace so it
+  // can render streaming / unread indicators in the tab bar. Fires on every
+  // typing flip or message-count change; the workspace decides what to do with
+  // it (e.g. mark a hidden tab unread when its count grows).
+  useEffect(() => {
+    onStatus?.({ typing, messageCount: messages.length });
+  }, [typing, messages.length, onStatus]);
 
   // Scroll to bottom on new messages / streaming.
   // Note: WebSocket lifecycle, hydration, and tool_call/tool_result handling
@@ -218,12 +248,20 @@ function AgentChatInner({ agentAlias }: { agentAlias: string }) {
        Hoisting the opt-out to the outermost container covers all of them
        with a single ancestor. Static UI chrome here localizes through
        t() i18n, so losing browser translation on it is intentional. */
-    <div translate="no" className="notranslate flex flex-col h-[calc(100vh-3.5rem)]">
+    <div translate="no" className="notranslate flex flex-col h-full min-h-0">
       {/* Header with model selector */}
-      <div className="flex items-center justify-between px-4 py-2 border-b" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}>
+      <div className="flex items-center justify-between px-4 py-2 border-b border-pc-border bg-pc-surface">
         <div className="flex items-center gap-2">
-          <Bot className="h-4 w-4" style={{ color: 'var(--pc-accent)' }} />
-          <span className="text-sm font-medium" style={{ color: 'var(--pc-text-primary)' }}>{agentAlias}</span>
+          <Bot className="h-4 w-4 text-pc-accent" />
+          <span className="text-sm font-medium text-pc-text">{agentAlias}</span>
+          <Link
+            to={`/agent/${encodeURIComponent(agentAlias)}/workspace`}
+            className="inline-flex items-center gap-1 px-2 h-6 rounded-[var(--radius-md)] text-xs font-medium text-pc-text-secondary transition-colors hover:text-pc-text hover:bg-[var(--pc-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
+            title={t('agentchat.open_workspace')}
+          >
+            <FolderOpen className="h-3.5 w-3.5" />
+            {t('agentchat.files')}
+          </Link>
         </div>
 
         <div className="relative" ref={modelDropdownRef}>
@@ -231,20 +269,7 @@ function AgentChatInner({ agentAlias }: { agentAlias: string }) {
             type="button"
             onClick={() => setShowModelDropdown((v) => !v)}
             disabled={modelLoading || typing || (availableModels.length === 0 && currentModel === null)}
-            className="flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-medium border transition-colors disabled:opacity-50"
-            style={{
-              background: 'var(--pc-bg-elevated)',
-              borderColor: 'var(--pc-border)',
-              color: 'var(--pc-text-secondary)',
-            }}
-            onMouseEnter={(e) => {
-              e.currentTarget.style.borderColor = 'var(--pc-accent-dim)';
-              e.currentTarget.style.color = 'var(--pc-text-primary)';
-            }}
-            onMouseLeave={(e) => {
-              e.currentTarget.style.borderColor = 'var(--pc-border)';
-              e.currentTarget.style.color = 'var(--pc-text-secondary)';
-            }}
+            className="flex items-center gap-2 px-3 h-7 rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary transition-colors hover:text-pc-text hover:border-pc-border-strong disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
           >
             <span className="max-w-[180px] truncate">
               {modelLoading
@@ -255,37 +280,24 @@ function AgentChatInner({ agentAlias }: { agentAlias: string }) {
           </button>
 
           {showModelDropdown && availableModels.length > 0 && (
-            <div
-              className="absolute right-0 mt-1.5 rounded-xl border shadow-lg z-50 py-1 min-w-[200px] max-h-60 overflow-y-auto"
-              style={{
-                background: 'var(--pc-bg-elevated)',
-                borderColor: 'var(--pc-border)',
-              }}
-            >
-              {availableModels.map((model) => (
-                <button
-                  key={model}
-                  type="button"
-                  onClick={() => handleModelSwitch(model)}
-                  className="w-full text-left px-3 py-2 text-xs transition-colors"
-                  style={{
-                    color: model === currentModel ? 'var(--pc-accent)' : 'var(--pc-text-primary)',
-                    background: model === currentModel ? 'var(--pc-accent-glow)' : 'transparent',
-                  }}
-                  onMouseEnter={(e) => {
-                    if (model !== currentModel) {
-                      e.currentTarget.style.background = 'var(--pc-bg-surface)';
-                    }
-                  }}
-                  onMouseLeave={(e) => {
-                    if (model !== currentModel) {
-                      e.currentTarget.style.background = 'transparent';
-                    }
-                  }}
-                >
-                  {model}
-                </button>
-              ))}
+            <div className="absolute right-0 mt-1.5 rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated shadow-[var(--pc-shadow-md)] z-50 py-1 min-w-[200px] max-h-60 overflow-y-auto">
+              {availableModels.map((model) => {
+                const isActive = model === currentModel;
+                return (
+                  <button
+                    key={model}
+                    type="button"
+                    onClick={() => handleModelSwitch(model)}
+                    className={`w-full text-left px-3 py-2 text-xs transition-colors ${
+                      isActive
+                        ? 'text-pc-accent bg-pc-accent/10'
+                        : 'text-pc-text hover:bg-[var(--pc-hover)]'
+                    }`}
+                  >
+                    {model}
+                  </button>
+                );
+              })}
             </div>
           )}
         </div>
@@ -293,7 +305,7 @@ function AgentChatInner({ agentAlias }: { agentAlias: string }) {
 
       {/* Connection status bar */}
       {error && (
-        <div className="px-4 py-2 border-b flex items-center gap-2 text-sm animate-fade-in" style={{ background: 'var(--color-status-error-alpha-08)', borderColor: 'var(--color-status-error-alpha-20)', color: 'var(--color-status-error)' }}>
+        <div className="px-4 py-2 border-b border-status-error/20 bg-status-error/10 text-status-error flex items-center gap-2 text-sm animate-fade-in">
           <AlertCircle className="h-4 w-4 shrink-0" />
           {error}
         </div>
@@ -301,41 +313,35 @@ function AgentChatInner({ agentAlias }: { agentAlias: string }) {
 
       {/* Chat toolbar */}
       {messages.length > 0 && (
-        <div
-          className="flex items-center justify-end gap-2 px-4 py-2 border-b"
-          style={{ background: 'var(--pc-bg-surface)', borderColor: 'var(--pc-border)' }}
-        >
-          <button
-            type="button"
+        <div className="flex items-center justify-end gap-2 px-4 py-2 border-b border-pc-border bg-pc-surface">
+          <Button
+            variant="ghost"
+            size="sm"
             onClick={toggleCompact}
-            className="btn-secondary flex items-center gap-1.5 text-xs"
-            style={{ padding: '0.3rem 0.75rem', borderRadius: '0.5rem' }}
             aria-label={t('agent.compact_mode')}
           >
             {compact ? <Maximize2 className="h-3 w-3" /> : <Minimize2 className="h-3 w-3" />}
             {t('agent.compact_mode')}
-          </button>
-          <button
-            type="button"
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
             onClick={toggleToolActivity}
-            className="btn-secondary flex items-center gap-1.5 text-xs"
-            style={{ padding: '0.3rem 0.75rem', borderRadius: '0.5rem' }}
             aria-label={showToolActivity ? t('agent.tool_activity_hide') : t('agent.tool_activity_show')}
             aria-pressed={showToolActivity}
           >
             <Wrench className="h-3 w-3" />
             {showToolActivity ? t('agent.tool_activity_hide') : t('agent.tool_activity_show')}
-          </button>
-          <button
-            type="button"
+          </Button>
+          <Button
+            variant="danger"
+            size="sm"
             onClick={handleClearAll}
-            className="btn-danger flex items-center gap-1.5 text-xs"
-            style={{ padding: '0.3rem 0.75rem', borderRadius: '0.5rem' }}
             aria-label={t('agent.clear_all')}
           >
             <Trash2 className="h-3 w-3" />
             {t('agent.clear_all')}
-          </button>
+          </Button>
         </div>
       )}
 
@@ -344,12 +350,12 @@ function AgentChatInner({ agentAlias }: { agentAlias: string }) {
         className={`flex-1 overflow-y-auto p-4 ${compact ? 'space-y-1.5' : 'space-y-4'}`}
       >
         {messages.length === 0 && (
-          <div className="flex flex-col items-center justify-center h-full text-center animate-fade-in" style={{ color: 'var(--pc-text-muted)' }}>
-            <div className="h-16 w-16 rounded-3xl flex items-center justify-center mb-4 animate-float" style={{ background: 'var(--pc-accent-glow)' }}>
-              <Bot className="h-8 w-8" style={{ color: 'var(--pc-accent)' }} />
+          <div className="flex flex-col items-center justify-center h-full text-center animate-fade-in text-pc-text-muted">
+            <div className="h-14 w-14 rounded-[var(--radius-lg)] flex items-center justify-center mb-4 bg-pc-accent/10">
+              <Bot className="h-7 w-7 text-pc-accent" />
             </div>
-            <p className="text-lg font-semibold mb-1" style={{ color: 'var(--pc-text-primary)' }}>ZeroClaw Agent</p>
-            <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>{t('agent.start_conversation')}</p>
+            <p className="text-base font-semibold mb-1 text-pc-text">{t('agentchat.empty_title')}</p>
+            <p className="text-sm text-pc-text-muted">{t('agent.start_conversation')}</p>
           </div>
         )}
 
@@ -369,24 +375,24 @@ function AgentChatInner({ agentAlias }: { agentAlias: string }) {
 
         {typing && (
           <div className="flex items-start gap-3 animate-fade-in">
-            <div className="flex-shrink-0 w-9 h-9 rounded-2xl flex items-center justify-center border" style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)' }}>
-              <Bot className="h-4 w-4" style={{ color: 'var(--pc-accent)' }} />
+            <div className="flex-shrink-0 w-8 h-8 rounded-[var(--radius-md)] flex items-center justify-center border border-pc-border bg-pc-elevated">
+              <Bot className="h-4 w-4 text-pc-accent" />
             </div>
             {streamingContent || streamingThinking ? (
-              <div className="rounded-2xl px-4 py-3 border max-w-[75%]" style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)', color: 'var(--pc-text-primary)' }}>
+              <div className="rounded-[var(--radius-lg)] px-4 py-3 border border-pc-border bg-pc-elevated text-pc-text max-w-[75%]">
                 {streamingThinking && (
                   <details className="mb-2" open={!streamingContent}>
-                    <summary className="text-xs cursor-pointer select-none" style={{ color: 'var(--pc-text-muted)' }}>Thinking{!streamingContent && '...'}</summary>
-                    <pre className="text-xs mt-1 whitespace-pre-wrap break-words leading-relaxed overflow-auto max-h-60 p-2 rounded-lg" style={{ color: 'var(--pc-text-muted)', background: 'var(--pc-bg-surface)' }}>{streamingThinking}</pre>
+                    <summary className="text-xs cursor-pointer select-none text-pc-text-muted">{t('agentchat.thinking')}{!streamingContent && '...'}</summary>
+                    <pre className="text-xs mt-1 whitespace-pre-wrap break-words leading-relaxed overflow-auto max-h-60 p-2 rounded-[var(--radius-sm)] text-pc-text-muted bg-pc-code">{streamingThinking}</pre>
                   </details>
                 )}
                 {streamingContent && <p className="text-sm whitespace-pre-wrap break-words leading-relaxed">{streamingContent}</p>}
               </div>
             ) : (
-              <div className="rounded-2xl px-4 py-3 border flex items-center gap-1.5" style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)' }}>
-                <span className="bounce-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--pc-accent)' }} />
-                <span className="bounce-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--pc-accent)' }} />
-                <span className="bounce-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--pc-accent)' }} />
+              <div className="rounded-[var(--radius-lg)] px-4 py-3 border border-pc-border bg-pc-elevated flex items-center gap-1.5">
+                <span className="bounce-dot w-1.5 h-1.5 rounded-full bg-pc-accent" />
+                <span className="bounce-dot w-1.5 h-1.5 rounded-full bg-pc-accent" />
+                <span className="bounce-dot w-1.5 h-1.5 rounded-full bg-pc-accent" />
               </div>
             )}
           </div>
@@ -401,8 +407,8 @@ function AgentChatInner({ agentAlias }: { agentAlias: string }) {
       )}
 
       {/* Input area */}
-      <div className="border-t p-4" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}>
-        <div className="flex items-center gap-3 max-w-4xl mx-auto">
+      <div className="border-t border-pc-border bg-pc-surface p-4">
+        <div className="flex items-end gap-3 max-w-4xl mx-auto">
           <textarea
             ref={inputRef}
             rows={1}
@@ -417,53 +423,57 @@ function AgentChatInner({ agentAlias }: { agentAlias: string }) {
                 ? t('agent.running')
                 : t('agent.type_message')}
             disabled={!connected || typing}
-            className="input-electric flex-1 px-4 text-sm resize-none disabled:opacity-40"
-            style={{ minHeight: '44px', maxHeight: '200px', paddingTop: '10px', paddingBottom: '10px' }}
+            className="flex-1 px-4 text-sm resize-none rounded-[var(--radius-md)] border border-pc-border bg-pc-input text-pc-text placeholder:text-pc-text-muted transition-colors focus:outline-none focus:border-pc-accent focus:ring-2 focus:ring-pc-accent/30 disabled:opacity-40"
+            style={{ minHeight: '40px', maxHeight: '200px', paddingTop: '9px', paddingBottom: '9px' }}
           />
           {typing ? (
-            <button
-              type="button"
+            <Button
+              variant="danger"
+              size="md"
               onClick={handleAbort}
-              className="btn-danger flex-shrink-0 rounded-2xl flex items-center justify-center"
-              style={{ color: 'white', width: '40px', height: '40px' }}
+              className="flex-shrink-0 w-10 px-0"
               aria-label={t('agent.stop')}
               title={t('agent.stop')}
             >
               <Square className="h-4 w-4" fill="currentColor" />
-            </button>
+            </Button>
           ) : (
-            <button
-              type='button'
+            <Button
+              variant="primary"
+              size="md"
               onClick={handleSend}
               disabled={!connected || !input.trim()}
-              className="btn-electric flex-shrink-0 rounded-2xl flex items-center justify-center"
-              style={{ color: 'white', width: '40px', height: '40px' }}
+              className="flex-shrink-0 w-10 px-0"
+              aria-label={t('agent.send')}
             >
-              <Send className="h-5 w-5" />
-            </button>
+              <Send className="h-4 w-4" />
+            </Button>
           )}
         </div>
-        <div className="flex items-center justify-center mt-2 gap-2">
-          <span
-            className="status-dot"
-            style={typing
-              ? { background: 'var(--pc-accent)', boxShadow: '0 0 6px var(--pc-accent)' }
-              : connected
-                ? { background: 'var(--color-status-success)', boxShadow: '0 0 6px var(--color-status-success)' }
-                : { background: 'var(--color-status-error)', boxShadow: '0 0 6px var(--color-status-error)' }
-            }
-          />
-          <span className="text-[10px]" style={{ color: 'var(--pc-text-faint)' }}>
+        <div className="flex items-center justify-center mt-2">
+          <Badge tone={typing ? 'warn' : connected ? 'ok' : 'error'}>
             {typing
               ? t('agent.running')
               : connected
                 ? t('agent.connected_status')
                 : t('agent.disconnected_status')}
-          </span>
+          </Badge>
         </div>
       </div>
     </div>
   );
+}
+
+// Channel-user (and some agent) messages arrive with a leading
+// `[YYYY-MM-DD HH:MM:SS TZ] ` prefix the gateway prepends. The zone is a chrono
+// `%Z` abbreviation (e.g. CEST) that JS `Date` can't reliably parse, so we
+// don't try — we just strip the prefix for display and copy; the bubble shows
+// its own wall-clock caption separately. Anchored to the start so a bracketed
+// datetime appearing mid-message (a log line, an error report) is left intact.
+const SERVER_TIMESTAMP_RE = /^\s*\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [^\]]+\]\s*/;
+
+function stripServerTimestamp(content: string): string {
+  return content.replace(SERVER_TIMESTAMP_RE, '');
 }
 
 // Each chat message is rendered through this memoized component so that
@@ -488,6 +498,11 @@ const MessageItem = memo(function MessageItem({
   onCopy,
   onDelete,
 }: MessageItemProps) {
+  // Locally-composed user input is verbatim and never carries the gateway's
+  // `[timestamp]` prefix, so don't strip it (that would clip a user message
+  // starting with a bracketed datetime). Only server-sourced messages can.
+  const cleanContent = msg.local ? msg.content : stripServerTimestamp(msg.content);
+
   return (
     <div
       className={`group flex items-start ${compact ? 'gap-2' : 'gap-3'} ${
@@ -497,59 +512,54 @@ const MessageItem = memo(function MessageItem({
     >
       {!compact && (
         <div
-          className="flex-shrink-0 w-9 h-9 rounded-2xl flex items-center justify-center border"
-          style={{
-            background: msg.role === 'user' ? 'var(--pc-accent)' : 'var(--pc-bg-elevated)',
-            borderColor: msg.role === 'user' ? 'var(--pc-accent)' : 'var(--pc-border)',
-          }}
+          className={`flex-shrink-0 w-8 h-8 rounded-[var(--radius-md)] flex items-center justify-center border ${
+            msg.role === 'user'
+              ? 'bg-pc-accent/15 border-pc-accent/30'
+              : 'bg-pc-elevated border-pc-border'
+          }`}
         >
           {msg.role === 'user' ? (
-            <User className="h-4 w-4 text-white" />
+            <User className="h-4 w-4 text-pc-accent" />
           ) : (
-            <Bot className="h-4 w-4" style={{ color: 'var(--pc-accent)' }} />
+            <Bot className="h-4 w-4 text-pc-accent" />
           )}
         </div>
       )}
       <div className="relative max-w-[75%]">
         <div
-          className={compact ? 'rounded-xl px-3 py-1.5 border' : 'rounded-2xl px-4 py-3 border'}
-          style={
+          className={`${compact ? 'rounded-[var(--radius-md)] px-3 py-1.5 border' : 'rounded-[var(--radius-lg)] px-4 py-3 border'} text-pc-text ${
             msg.role === 'user'
-              ? { background: 'var(--pc-accent-glow)', borderColor: 'var(--pc-accent-dim)', color: 'var(--pc-text-primary)' }
-              : { background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)', color: 'var(--pc-text-primary)' }
-          }
+              ? 'bg-pc-accent/10 border-pc-accent/20'
+              : 'bg-pc-elevated border-pc-border'
+          }`}
         >
           {msg.thinking && (
             <details className="mb-2">
-              <summary className="text-xs cursor-pointer select-none" style={{ color: 'var(--pc-text-muted)' }}>Thinking</summary>
-              <pre className="text-xs mt-1 whitespace-pre-wrap break-words leading-relaxed overflow-auto max-h-60 p-2 rounded-lg" style={{ color: 'var(--pc-text-muted)', background: 'var(--pc-bg-surface)' }}>{msg.thinking}</pre>
+              <summary className="text-xs cursor-pointer select-none text-pc-text-muted">{t('agentchat.thinking')}</summary>
+              <pre className="text-xs mt-1 whitespace-pre-wrap break-words leading-relaxed overflow-auto max-h-60 p-2 rounded-[var(--radius-sm)] text-pc-text-muted bg-pc-code">{msg.thinking}</pre>
             </details>
           )}
           {msg.toolCall ? (
             <ToolCallCard toolCall={msg.toolCall} />
           ) : msg.markdown ? (
-            <div className={`${compact ? 'text-xs' : 'text-sm'} break-words leading-relaxed chat-markdown`}><ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown></div>
+            <div className={`${compact ? 'text-xs' : 'text-sm'} break-words leading-relaxed chat-markdown`}><ReactMarkdown remarkPlugins={[remarkGfm]}>{cleanContent}</ReactMarkdown></div>
           ) : (
-            <p className={`${compact ? 'text-xs' : 'text-sm'} whitespace-pre-wrap break-words leading-relaxed`}>{msg.content}</p>
+            <p className={`${compact ? 'text-xs' : 'text-sm'} whitespace-pre-wrap break-words leading-relaxed`}>{cleanContent}</p>
           )}
           {!compact && (
-            <p
-              className="text-[10px] mt-1.5" style={{ color: msg.role === 'user' ? 'var(--pc-accent-light)' : 'var(--pc-text-faint)' }}>
+            <p className="text-[10px] mt-1.5 text-pc-text-faint">
               {msg.timestamp.toLocaleTimeString()}
             </p>
           )}
         </div>
         <div className="flex items-center justify-end gap-1 mt-1 opacity-0 group-hover:opacity-100 transition-opacity">
           <button
-            onClick={() => onCopy(msg.id, msg.content)}
+            onClick={() => onCopy(msg.id, cleanContent)}
             aria-label={t('agent.copy_message')}
-            className="p-1 rounded-lg"
-            style={{ color: 'var(--pc-text-muted)' }}
-            onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--pc-text-primary)'; }}
-            onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--pc-text-muted)'; }}
+            className="p-1 rounded-[var(--radius-sm)] text-pc-text-muted hover:text-pc-text transition-colors"
           >
             {isCopied ? (
-              <Check className="h-3.5 w-3.5" style={{ color: '#34d399' }} />
+              <Check className="h-3.5 w-3.5 text-status-success" />
             ) : (
               <Copy className="h-3.5 w-3.5" />
             )}
@@ -557,10 +567,7 @@ const MessageItem = memo(function MessageItem({
           <button
             onClick={() => onDelete(msg.id)}
             aria-label={t('agent.delete_message')}
-            className="p-1 rounded-lg"
-            style={{ color: 'var(--pc-text-muted)' }}
-            onMouseEnter={(e) => { e.currentTarget.style.color = '#f87171'; }}
-            onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--pc-text-muted)'; }}
+            className="p-1 rounded-[var(--radius-sm)] text-pc-text-muted hover:text-status-error transition-colors"
           >
             <X className="h-3.5 w-3.5" />
           </button>
