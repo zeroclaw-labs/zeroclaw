@@ -142,6 +142,10 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
     let current_exe =
         std::env::current_exe().context("cannot determine current executable path")?;
 
+    // Fail fast before downloading if the install directory is not writable
+    // (e.g. a system-wide install that needs sudo / an elevated console).
+    ensure_install_dir_writable(&current_exe).await?;
+
     // Phase 2: Download
     ::zeroclaw_log::record!(
         INFO,
@@ -618,6 +622,29 @@ fn host_architecture() -> Option<&'static str> {
         Some("arm")
     } else {
         None
+    }
+}
+
+/// Verify the directory containing the executable is writable, so the update
+/// fails fast with an actionable message instead of downloading a binary and
+/// only then erroring during backup or swap. System-wide installs (e.g.
+/// `/usr/local/bin`, `/usr/bin`, or `Program Files`) typically require elevated
+/// privileges.
+async fn ensure_install_dir_writable(exe: &Path) -> Result<()> {
+    let dir = exe
+        .parent()
+        .context("cannot determine install directory for the current executable")?;
+    let probe = dir.join(format!(".zeroclaw-update-probe-{}", std::process::id()));
+    match tokio::fs::File::create(&probe).await {
+        Ok(_) => {
+            let _ = tokio::fs::remove_file(&probe).await;
+            Ok(())
+        }
+        Err(e) => bail!(
+            "install directory {} is not writable ({e}); re-run `zeroclaw update` with \
+             elevated privileges (sudo on macOS/Linux, an Administrator console on Windows)",
+            dir.display()
+        ),
     }
 }
 
@@ -1316,6 +1343,23 @@ mod tests {
         extract_zip(&zip_buf, &dest).unwrap();
 
         assert_eq!(std::fs::read(&dest).unwrap(), fake_exe);
+    }
+
+    #[tokio::test]
+    async fn ensure_install_dir_writable_accepts_writable_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("zeroclaw");
+        ensure_install_dir_writable(&exe).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_install_dir_writable_rejects_missing_dir() {
+        let exe = Path::new("/no-such-zeroclaw-install-dir-9f1c/zeroclaw");
+        let err = ensure_install_dir_writable(exe)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not writable"), "got: {err}");
     }
 
     #[tokio::test]
