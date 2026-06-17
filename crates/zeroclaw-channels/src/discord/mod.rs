@@ -1,11 +1,8 @@
-use anyhow::Context as _;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
-use reqwest::multipart::{Form, Part};
 use serde_json::json;
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,6 +14,29 @@ use zeroclaw_api::channel::{
 };
 use zeroclaw_api::media::MediaAttachment;
 use zeroclaw_runtime::i18n;
+
+mod types;
+// Keep the historical public path (`…::discord::DiscordSlashCommandSpec`) stable.
+pub use types::{DiscordSlashCommandResolver, DiscordSlashCommandSpec};
+// Contract types/codec/consts used throughout this module and its siblings.
+pub(crate) use types::*;
+
+mod chunk;
+pub(crate) use chunk::*;
+
+mod markers;
+pub(crate) use markers::*;
+
+mod rest;
+pub(crate) use rest::*;
+
+mod interaction;
+pub(crate) use interaction::*;
+
+mod slash;
+// Keep the historical public path for the orchestrator's resolver wiring.
+pub use slash::discord_slash_specs_from_skills;
+pub(crate) use slash::*;
 
 /// Discord channel — connects via Gateway WebSocket for real-time messages
 pub struct DiscordChannel {
@@ -100,24 +120,7 @@ pub struct DiscordChannel {
     /// Resolves skill-derived commands to register alongside `/ask`.
     /// `None` (or an empty resolution) = `/ask` only.
     slash_command_resolver: Option<DiscordSlashCommandResolver>,
-    /// Fingerprint of the last *successfully* reconciled command set —
-    /// READYs with an unchanged set skip the REST round-trip; failures
-    /// reset it so the next READY retries instead of wedging. Arc'd
-    /// because reconciliation runs in a spawned task.
-    registered_commands_hash: Arc<Mutex<Option<u64>>>,
 }
-
-/// Credentials needed to answer a deferred interaction later: the followup
-/// webhook is addressed by application id + interaction token.
-#[derive(Clone)]
-struct PendingInteraction {
-    app_id: String,
-    token: String,
-    created: std::time::Instant,
-}
-
-/// Discord interaction followup tokens are valid for 15 minutes.
-const INTERACTION_TOKEN_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 #[derive(Clone, Debug, Default)]
 struct DiscordGatewaySession {
@@ -125,27 +128,6 @@ struct DiscordGatewaySession {
     resume_gateway_url: Option<String>,
     sequence: Option<i64>,
 }
-
-#[derive(Debug)]
-pub(crate) struct DiscordListenerFatalError {
-    message: String,
-}
-
-impl DiscordListenerFatalError {
-    pub(crate) fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-impl std::fmt::Display for DiscordListenerFatalError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for DiscordListenerFatalError {}
 
 impl DiscordChannel {
     pub fn new(
@@ -186,7 +168,6 @@ impl DiscordChannel {
             slash_commands: false,
             pending_interactions: Arc::new(Mutex::new(HashMap::new())),
             slash_command_resolver: None,
-            registered_commands_hash: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1012,974 +993,6 @@ fn marker_kind_for(content_type: &str, is_audio: bool) -> &'static str {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum DiscordAttachmentKind {
-    Image,
-    Document,
-    Video,
-    Audio,
-    Voice,
-}
-
-impl DiscordAttachmentKind {
-    fn from_marker(kind: &str) -> Option<Self> {
-        match kind.trim().to_ascii_uppercase().as_str() {
-            "IMAGE" | "PHOTO" => Some(Self::Image),
-            "DOCUMENT" | "FILE" => Some(Self::Document),
-            "VIDEO" => Some(Self::Video),
-            "AUDIO" => Some(Self::Audio),
-            "VOICE" => Some(Self::Voice),
-            _ => None,
-        }
-    }
-
-    fn marker_name(&self) -> &'static str {
-        match self {
-            Self::Image => "IMAGE",
-            Self::Document => "DOCUMENT",
-            Self::Video => "VIDEO",
-            Self::Audio => "AUDIO",
-            Self::Voice => "VOICE",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DiscordAttachment {
-    kind: DiscordAttachmentKind,
-    target: String,
-}
-
-fn parse_attachment_markers(message: &str) -> (String, Vec<DiscordAttachment>) {
-    let mut cleaned = String::with_capacity(message.len());
-    let mut attachments = Vec::new();
-    let mut cursor = 0usize;
-
-    while let Some(rel_start) = message[cursor..].find('[') {
-        let start = cursor + rel_start;
-        cleaned.push_str(&message[cursor..start]);
-
-        let Some(rel_end) = message[start..].find(']') else {
-            cleaned.push_str(&message[start..]);
-            cursor = message.len();
-            break;
-        };
-        let end = start + rel_end;
-        let marker_text = &message[start + 1..end];
-
-        let parsed = marker_text.split_once(':').and_then(|(kind, target)| {
-            let kind = DiscordAttachmentKind::from_marker(kind)?;
-            let target = target.trim();
-            if target.is_empty() {
-                return None;
-            }
-            Some(DiscordAttachment {
-                kind,
-                target: target.to_string(),
-            })
-        });
-
-        if let Some(attachment) = parsed {
-            attachments.push(attachment);
-        } else {
-            cleaned.push_str(&message[start..=end]);
-        }
-
-        cursor = end + 1;
-    }
-
-    if cursor < message.len() {
-        cleaned.push_str(&message[cursor..]);
-    }
-
-    (cleaned.trim().to_string(), attachments)
-}
-
-/// Resolved outbound attachment target after sandbox validation.
-#[derive(Debug)]
-enum DiscordMarkerTarget {
-    Local(PathBuf),
-    Http(String),
-}
-
-/// Why a marker target was rejected. Drives the user-facing emoji reaction
-/// on the bot's outgoing message: `Refused` (trust-boundary rejection) maps
-/// to 🚫, `NotFound` (path didn't resolve on disk) maps to ⚠️. The
-/// distinction matters because a chatter should see at a glance that the
-/// bot deliberately declined a target rather than tried and failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DiscordMarkerFailure {
-    /// Trust-boundary refusal: disallowed scheme, relative path, missing
-    /// workspace_dir, or canonicalised path outside the workspace.
-    Refused,
-    /// Path passed scheme/absolute/workspace checks but did not resolve
-    /// to anything on disk.
-    NotFound,
-}
-
-#[derive(Debug)]
-enum DiscordMarkerError {
-    Refused(anyhow::Error),
-    NotFound(anyhow::Error),
-}
-
-impl DiscordMarkerError {
-    fn kind(&self) -> DiscordMarkerFailure {
-        match self {
-            Self::Refused(_) => DiscordMarkerFailure::Refused,
-            Self::NotFound(_) => DiscordMarkerFailure::NotFound,
-        }
-    }
-}
-
-impl std::fmt::Display for DiscordMarkerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Refused(e) | Self::NotFound(e) => write!(f, "{e}"),
-        }
-    }
-}
-
-/// Validate an outbound marker target against Discord's trust-boundary policy.
-///
-/// The orchestrator system prompt mandates absolute paths for media markers,
-/// and the workspace is the only directory the agent is authorised to
-/// expose to chatters:
-///
-/// * `http`/`https` URLs are accepted and inlined as links.
-/// * Any other URL scheme (`file:`, `data:`, custom `://`) is refused.
-/// * Local paths must be absolute. Relative paths are agent
-///   misconfiguration and dropped, not silently resolved against cwd.
-/// * Absolute paths are canonicalised and must resolve inside
-///   `workspace_dir`. Anything outside or any traversal escape is
-///   refused; a path that simply doesn't exist on disk returns
-///   `NotFound`, which the caller renders differently from a refusal.
-/// * When `workspace_dir` is not configured, no local path can be safely
-///   bounded, so all local targets are refused.
-fn validate_marker_target(
-    target: &str,
-    workspace_dir: Option<&Path>,
-) -> Result<DiscordMarkerTarget, DiscordMarkerError> {
-    if target.starts_with("http://") || target.starts_with("https://") {
-        return Ok(DiscordMarkerTarget::Http(target.to_string()));
-    }
-    if target.contains("://") {
-        let scheme = target.split("://").next().unwrap_or("?");
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "scheme": scheme,
-                    "target": target,
-                })),
-            "discord: marker target uses disallowed scheme"
-        );
-        return Err(DiscordMarkerError::Refused(anyhow::Error::msg(format!(
-            "marker target uses disallowed scheme {scheme:?}; only http/https and absolute workspace paths are accepted"
-        ))));
-    }
-    if target.starts_with("data:") || target.starts_with("file:") {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({"target": target})),
-            "discord: marker target uses disallowed data: or file: scheme"
-        );
-        return Err(DiscordMarkerError::Refused(anyhow::Error::msg(
-            "marker target uses disallowed scheme; only http/https and absolute workspace paths are accepted",
-        )));
-    }
-
-    let target_path = Path::new(target);
-    if !target_path.is_absolute() {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "target": target,
-                    "reason": "not_absolute",
-                })),
-            "discord: marker target is not absolute"
-        );
-        return Err(DiscordMarkerError::Refused(anyhow::Error::msg(format!(
-            "marker target {target} is not an absolute path; the agent must emit absolute paths inside workspace_dir"
-        ))));
-    }
-
-    let workspace = workspace_dir.ok_or_else(|| {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "target": target,
-                    "reason": "no_workspace_dir",
-                })),
-            "discord: marker target is local path but channel has no workspace_dir"
-        );
-        DiscordMarkerError::Refused(anyhow::Error::msg(format!(
-            "marker target {target} is a local path but the channel was started without a workspace_dir, refusing for safety"
-        )))
-    })?;
-    let workspace_canon = std::fs::canonicalize(workspace)
-        .with_context(|| format!("canonicalize workspace {}", workspace.display()))
-        .map_err(DiscordMarkerError::Refused)?;
-    let target_canon = match std::fs::canonicalize(target_path) {
-        Ok(p) => p,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "target": target,
-                        "reason": "not_found",
-                    })),
-                "discord: marker target not found on disk"
-            );
-            return Err(DiscordMarkerError::NotFound(anyhow::Error::msg(format!(
-                "marker target {target} not found on disk"
-            ))));
-        }
-        Err(e) => {
-            return Err(DiscordMarkerError::Refused(
-                anyhow::Error::from(e).context(format!("canonicalize marker target {target}")),
-            ));
-        }
-    };
-
-    if !target_canon.starts_with(&workspace_canon) {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "target": target,
-                    "target_canon": target_canon.display().to_string(),
-                    "workspace_canon": workspace_canon.display().to_string(),
-                    "reason": "outside_workspace",
-                })),
-            "discord: marker target escapes workspace_dir"
-        );
-        return Err(DiscordMarkerError::Refused(anyhow::Error::msg(format!(
-            "marker target {target} resolves to {} which is outside workspace_dir {}; refusing",
-            target_canon.display(),
-            workspace_canon.display(),
-        ))));
-    }
-    Ok(DiscordMarkerTarget::Local(target_canon))
-}
-
-fn classify_outgoing_attachments(
-    attachments: &[DiscordAttachment],
-    workspace_dir: Option<&Path>,
-) -> (Vec<PathBuf>, Vec<String>, Vec<DiscordMarkerFailure>) {
-    let mut local_files = Vec::new();
-    let mut remote_urls = Vec::new();
-    let mut failures = Vec::new();
-
-    for attachment in attachments {
-        match validate_marker_target(&attachment.target, workspace_dir) {
-            Ok(DiscordMarkerTarget::Local(path)) => local_files.push(path),
-            Ok(DiscordMarkerTarget::Http(url)) => remote_urls.push(url),
-            Err(e) => {
-                let kind_label = match e.kind() {
-                    DiscordMarkerFailure::Refused => "trust boundary",
-                    DiscordMarkerFailure::NotFound => "not found",
-                };
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"kind": attachment.kind.marker_name(), "target": attachment.target, "reason": kind_label, "error": format!("{}", e)})), "dropping unresolved outbound attachment marker");
-                failures.push(e.kind());
-            }
-        }
-    }
-
-    (local_files, remote_urls, failures)
-}
-
-/// Build the count-only delivery failure tail appended to the bot's reply
-/// when at least one marker was dropped. Returns `None` when the failure
-/// list is empty so callers can keep the body untouched.
-fn delivery_failure_note(failures: &[DiscordMarkerFailure]) -> Option<String> {
-    if failures.is_empty() {
-        return None;
-    }
-    let count = failures.len().to_string();
-    let key = if failures.len() == 1 {
-        "channel-discord-delivery-failure-note-one"
-    } else {
-        "channel-discord-delivery-failure-note-many"
-    };
-    Some(i18n::get_required_cli_string_with_args(
-        key,
-        &[("count", count.as_str())],
-    ))
-}
-
-/// Compose the final reply body with the delivery-failure note appended.
-/// When the marker-stripped content is empty the note replaces the body;
-/// otherwise the note follows the content separated by a blank line.
-fn compose_body_with_failure_note(content: &str, note: Option<&str>) -> String {
-    match note {
-        Some(note) if content.trim().is_empty() => note.to_string(),
-        Some(note) => format!("{content}\n\n{note}"),
-        None => content.to_string(),
-    }
-}
-
-/// Emoji reactions applied to the bot's own outgoing message based on which
-/// kinds of marker failures occurred. 🚫 signals a trust-boundary refusal,
-/// ⚠️ signals a post-validation delivery failure. Both can fire on the
-/// same message when a batch mixes refusals and not-found targets.
-fn decide_failure_reactions(failures: &[DiscordMarkerFailure]) -> Vec<&'static str> {
-    let mut out = Vec::new();
-    if failures
-        .iter()
-        .any(|k| matches!(k, DiscordMarkerFailure::Refused))
-    {
-        out.push("🚫");
-    }
-    if failures
-        .iter()
-        .any(|k| matches!(k, DiscordMarkerFailure::NotFound))
-    {
-        out.push("⚠️");
-    }
-    out
-}
-
-fn with_inline_attachment_urls(content: &str, remote_urls: &[String]) -> String {
-    let mut lines = Vec::new();
-    if !content.trim().is_empty() {
-        lines.push(content.trim().to_string());
-    }
-    if !remote_urls.is_empty() {
-        lines.extend(remote_urls.iter().cloned());
-    }
-    lines.join("\n")
-}
-
-/// POST a plain-text message and return the new message's ID. Callers
-/// that don't need the ID (e.g. non-first chunks) can discard it.
-async fn send_discord_message_json(
-    client: &reqwest::Client,
-    bot_token: &str,
-    recipient: &str,
-    content: &str,
-) -> anyhow::Result<String> {
-    let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
-    let body = json!({ "content": content });
-
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bot {bot_token}"))
-        .json(&body)
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err = resp
-            .text()
-            .await
-            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-        anyhow::bail!("Discord send message failed ({status}): {err}");
-    }
-
-    extract_message_id(resp).await
-}
-
-/// POST a message with file attachments via multipart, returning the new
-/// message's ID. Callers that don't need the ID can discard it.
-async fn send_discord_message_with_files(
-    client: &reqwest::Client,
-    bot_token: &str,
-    recipient: &str,
-    content: &str,
-    files: &[PathBuf],
-) -> anyhow::Result<String> {
-    let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
-
-    let mut form = Form::new().text("payload_json", json!({ "content": content }).to_string());
-
-    for (idx, path) in files.iter().enumerate() {
-        let bytes = tokio::fs::read(path).await.map_err(|error| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "path": path.display().to_string(),
-                        "phase": "attachment_read",
-                        "error": format!("{}", error),
-                    })),
-                "discord: failed to read attachment"
-            );
-            anyhow::Error::msg(format!(
-                "Discord attachment read failed for '{}': {error}",
-                path.display()
-            ))
-        })?;
-        let filename = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("attachment.bin")
-            .to_string();
-        form = form.part(
-            format!("files[{idx}]"),
-            Part::bytes(bytes).file_name(filename),
-        );
-    }
-
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bot {bot_token}"))
-        .multipart(form)
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err = resp
-            .text()
-            .await
-            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-        anyhow::bail!("Discord send message with files failed ({status}): {err}");
-    }
-
-    extract_message_id(resp).await
-}
-
-async fn extract_message_id(resp: reqwest::Response) -> anyhow::Result<String> {
-    let body: serde_json::Value = resp.json().await?;
-    body.get("id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"field": "id"})),
-                "discord: send response missing id field"
-            );
-            anyhow::Error::msg("Discord send response missing 'id' field")
-        })
-}
-
-/// Edit an existing Discord message via PATCH.
-///
-/// Returns `Ok(())` on success. On HTTP 429 (rate limited), logs at debug
-/// level and returns `Ok(())` since skipping a mid-stream edit is harmless.
-async fn edit_discord_message(
-    client: &reqwest::Client,
-    bot_token: &str,
-    channel_id: &str,
-    message_id: &str,
-    content: &str,
-) -> anyhow::Result<()> {
-    let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}");
-    let body = json!({ "content": content });
-
-    let resp = client
-        .patch(&url)
-        .header("Authorization", format!("Bot {bot_token}"))
-        .json(&body)
-        .send()
-        .await?;
-
-    if resp.status().as_u16() == 429 {
-        ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "edit message rate-limited (429), skipping update"
-        );
-        return Ok(());
-    }
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err = resp
-            .text()
-            .await
-            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-        anyhow::bail!("edit message failed ({status}): {err}");
-    }
-
-    Ok(())
-}
-
-/// Delete a Discord message.
-///
-/// Returns `Ok(())` on success. On HTTP 429 (rate limited), logs at debug
-/// level and returns `Ok(())` since a stale message is cosmetic only.
-async fn delete_discord_message(
-    client: &reqwest::Client,
-    bot_token: &str,
-    channel_id: &str,
-    message_id: &str,
-) -> anyhow::Result<()> {
-    let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}");
-
-    let resp = client
-        .delete(&url)
-        .header("Authorization", format!("Bot {bot_token}"))
-        .send()
-        .await?;
-
-    if resp.status().as_u16() == 429 {
-        ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "delete message rate-limited (429), skipping"
-        );
-        return Ok(());
-    }
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err = resp
-            .text()
-            .await
-            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-        anyhow::bail!("delete message failed ({status}): {err}");
-    }
-
-    Ok(())
-}
-
-// ── Slash commands (prototype) ─────────────────────────────────────────────
-//
-// Discord delivers application-command interactions over the same Gateway
-// WebSocket as INTERACTION_CREATE dispatch events. We:
-//   1. register a `/ask <prompt>` global command on READY (idempotent upsert),
-//   2. ack each interaction within the 3s window with a type-5 "deferred" reply,
-//   3. enqueue the prompt as a normal ChannelMessage whose reply_target carries
-//      an `interaction:{app_id}:{token}` sentinel, and
-//   4. answer by editing the deferred message (PATCH @original) from send().
-//
-// All REST here is invoked from spawned tasks, never inline on the listen
-// loop, so it can't starve the gateway heartbeat.
-
-/// Reply-target sentinel prefix marking a ChannelMessage that must be answered
-/// via the interaction followup webhook rather than a normal channel message.
-pub(crate) const DISCORD_INTERACTION_PREFIX: &str = "interaction:";
-
-/// Build the sentinel reply target carrying only the interaction id. The
-/// bearer token deliberately never enters the reply target: reply targets
-/// flow into logs, session keys (and thus on-disk filenames), and memory
-/// rows — `send()` resolves the credentials from the channel-local
-/// `pending_interactions` store instead.
-fn discord_interaction_reply_target(interaction_id: &str) -> String {
-    format!("{DISCORD_INTERACTION_PREFIX}{interaction_id}")
-}
-
-/// Parse `interaction:{interaction_id}` back into the id. Rejects empty ids
-/// and anything with extra segments (the legacy `app:token` form must never
-/// round-trip as valid).
-pub(crate) fn parse_discord_interaction_target(target: &str) -> Option<&str> {
-    let id = target.strip_prefix(DISCORD_INTERACTION_PREFIX)?;
-    if id.is_empty() || id.contains(':') {
-        return None;
-    }
-    Some(id)
-}
-
-/// A slash command derived from an installed skill. `slug` is the Discord
-/// command name; `skill_name` is the skill's manifest name (sanitized of
-/// quotes and newlines at spec-build time, since it is interpolated into
-/// the synthesized agent prompt); `description` is truncated to Discord's
-/// 100-char limit.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiscordSlashCommandSpec {
-    pub skill_name: String,
-    pub slug: String,
-    pub description: String,
-}
-
-/// Resolves the current skill-derived command set from canonical state at
-/// READY/interaction time. No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE
-/// SOURCE OF TRUTH") — skills install/uninstall at runtime. The loader does
-/// blocking file IO, so callers must run it via `spawn_blocking`, never on
-/// the gateway listen loop.
-pub type DiscordSlashCommandResolver = Arc<dyn Fn() -> Vec<DiscordSlashCommandSpec> + Send + Sync>;
-
-/// Discord caps an application at 100 global commands; stay under it with
-/// headroom for `/ask` and future built-ins.
-const MAX_SKILL_SLASH_COMMANDS: usize = 90;
-
-/// Squeeze a skill name into Discord's command-name charset
-/// (`^[a-z0-9_-]{1,32}$`): ASCII-lowercase, runs of anything else collapse
-/// to a single `-`. Deliberately stricter than Discord's full unicode
-/// charset — an all-non-ASCII name slugs to empty and is dropped (with a
-/// WARN naming the skill), which is a documented limitation.
-fn discord_command_slug(name: &str) -> String {
-    let mut slug = String::new();
-    let mut last_dash = true; // suppress leading '-'
-    for c in name.to_lowercase().chars() {
-        if c.is_ascii_alphanumeric() || c == '_' {
-            slug.push(c);
-            last_dash = false;
-        } else if !last_dash {
-            slug.push('-');
-            last_dash = true;
-        }
-        if slug.len() == 32 {
-            break;
-        }
-    }
-    slug.trim_end_matches('-').to_string()
-}
-
-/// Map installed skills to slash-command specs. Exposure rules:
-/// - opt-in via the `slash` tag — skills run shell/HTTP tools, so surfacing
-///   one to a whole guild must be a deliberate per-skill decision;
-/// - community-synced skills (tag `open-skills`) are excluded even when
-///   tagged: their manifests are third-party-controlled, and a remote
-///   commit must not be able to surface new commands (name + description
-///   render in every guild's Discord UI) without operator action.
-///
-/// Specs are sorted by slug so the output (and everything derived from it:
-/// the registration fingerprint, collision winners, the cap cutoff) is
-/// deterministic regardless of filesystem iteration order. Reserved names,
-/// empty slugs, and collisions are dropped with a WARN; the set caps at
-/// `MAX_SKILL_SLASH_COMMANDS` with dropped names logged (no silent caps).
-pub fn discord_slash_specs_from_skills(
-    skills: &[zeroclaw_runtime::skills::Skill],
-) -> Vec<DiscordSlashCommandSpec> {
-    let mut candidates: Vec<&zeroclaw_runtime::skills::Skill> = skills
-        .iter()
-        .filter(|s| s.tags.iter().any(|t| t == "slash"))
-        .filter(|s| !s.tags.iter().any(|t| t == "open-skills"))
-        .collect();
-    candidates.sort_by(|a, b| a.name.cmp(&b.name));
-
-    let mut seen = std::collections::HashSet::new();
-    seen.insert("ask".to_string());
-    let mut specs = Vec::new();
-    for skill in candidates {
-        let slug = discord_command_slug(&skill.name);
-        if slug.is_empty() || !seen.insert(slug.clone()) {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "skill": skill.name,
-                        "slug": slug,
-                    })),
-                "skipping skill slash command (reserved, empty, or colliding slug)"
-            );
-            continue;
-        }
-        let description = if skill.description.is_empty() {
-            format!("Run the {} skill", skill.name)
-        } else {
-            skill.description.clone()
-        };
-        let skill_name: String = skill
-            .name
-            .chars()
-            .map(|c| {
-                if c == '\n' || c == '\r' || c == '\'' {
-                    ' '
-                } else {
-                    c
-                }
-            })
-            .collect();
-        specs.push(DiscordSlashCommandSpec {
-            skill_name,
-            slug,
-            description: description.chars().take(100).collect(),
-        });
-    }
-    specs.sort_by(|a, b| a.slug.cmp(&b.slug));
-    if specs.len() > MAX_SKILL_SLASH_COMMANDS {
-        let dropped: Vec<&str> = specs[MAX_SKILL_SLASH_COMMANDS..]
-            .iter()
-            .map(|s| s.slug.as_str())
-            .collect();
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"dropped": dropped})),
-            "too many skill slash commands; truncating to the registration cap"
-        );
-        specs.truncate(MAX_SKILL_SLASH_COMMANDS);
-    }
-    specs
-}
-
-/// The desired global-command set: `/ask` plus one command per skill spec,
-/// each taking a single required string `input`. Also the registration
-/// fingerprint input — its JSON string hashes into the skip-if-unchanged
-/// gate.
-fn slash_command_registration_body(specs: &[DiscordSlashCommandSpec]) -> serde_json::Value {
-    let mut commands = vec![json!({
-        "name": "ask",
-        "description": "Ask the agent a question",
-        "type": 1, // CHAT_INPUT
-        "options": [{
-            "name": "prompt",
-            "description": "What to ask",
-            "type": 3, // STRING
-            "required": true
-        }]
-    })];
-    for spec in specs {
-        commands.push(json!({
-            "name": spec.slug,
-            "description": spec.description,
-            "type": 1, // CHAT_INPUT
-            "options": [{
-                "name": "input",
-                "description": SKILL_COMMAND_OPTION_DESCRIPTION,
-                "type": 3, // STRING
-                "required": true
-            }]
-        }));
-    }
-    serde_json::Value::Array(commands)
-}
-
-/// The option description this feature writes on every skill command. It
-/// doubles as the ownership marker for stale-command reaping: Discord has
-/// no durable "registered by" field, and a structural shape alone (one
-/// required string option named `input`) is generic enough that foreign
-/// tooling could collide with it.
-const SKILL_COMMAND_OPTION_DESCRIPTION: &str = "What to send to the skill";
-
-/// Ownership fingerprint for commands this feature owns: exactly one
-/// required string option named `input` carrying this feature's exact
-/// option description. Used to reap commands for uninstalled skills across
-/// restarts; commands registered by other tooling must never be touched —
-/// the description match makes accidental collision with a foreign
-/// `/x <input>` command effectively impossible.
-///
-/// Limitation: two slash-enabled aliases sharing one bot token would see
-/// each other's commands as reap candidates (commands are
-/// application-global, desired sets are per-alias). Enable slash commands
-/// on at most one alias per bot application.
-fn is_skill_command_shape(cmd: &serde_json::Value) -> bool {
-    let Some(opts) = cmd.get("options").and_then(|o| o.as_array()) else {
-        return false;
-    };
-    if opts.len() != 1 {
-        return false;
-    }
-    let o = &opts[0];
-    o.get("name").and_then(|n| n.as_str()) == Some("input")
-        && o.get("type").and_then(serde_json::Value::as_u64) == Some(3)
-        && o.get("required").and_then(serde_json::Value::as_bool) == Some(true)
-        && o.get("description").and_then(|d| d.as_str()) == Some(SKILL_COMMAND_OPTION_DESCRIPTION)
-}
-
-/// Comparable projection of a command for change detection: description plus
-/// (name, type, required, description) per option. Discord decorates listed
-/// commands with server-side fields (id, version, default_member_permissions,
-/// …) that must not defeat the comparison.
-fn command_projection(cmd: &serde_json::Value) -> serde_json::Value {
-    json!({
-        "description": cmd.get("description").cloned().unwrap_or_default(),
-        "options": cmd
-            .get("options")
-            .and_then(|o| o.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .map(|o| {
-                        json!({
-                            "name": o.get("name").cloned().unwrap_or_default(),
-                            "type": o.get("type").cloned().unwrap_or_default(),
-                            "required": o.get("required").cloned().unwrap_or(json!(false)),
-                            "description": o.get("description").cloned().unwrap_or_default(),
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default(),
-    })
-}
-
-/// Discord REST base; injectable in `reconcile_slash_commands` for tests.
-const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
-
-/// Reconcile the application's global commands with the desired set:
-/// upsert each desired command (POST upserts by name) and delete stale
-/// skill-shaped commands left over from uninstalled skills. Commands
-/// registered by other tooling are never touched — this deliberately
-/// avoids the bulk-overwrite PUT. Global commands can take up to an hour
-/// to propagate the first time.
-///
-/// Returns `Err` when any owned stale command could not be deleted (other
-/// than a 404, which means it is already gone): the caller's fingerprint
-/// must not record such a pass as successful, or the stale command would
-/// never be retried while the desired set stays unchanged. Upserts for the
-/// desired set are still attempted first so a delete failure cannot block
-/// new registrations.
-async fn reconcile_slash_commands(
-    client: &reqwest::Client,
-    bot_token: &str,
-    app_id: &str,
-    desired: &serde_json::Value,
-    api_base: &str,
-) -> anyhow::Result<()> {
-    let base = format!("{api_base}/applications/{app_id}/commands");
-    let auth = format!("Bot {bot_token}");
-    let Some(desired) = desired.as_array() else {
-        anyhow::bail!("desired command set is not an array");
-    };
-    let desired_names: std::collections::HashSet<&str> = desired
-        .iter()
-        .filter_map(|c| c.get("name").and_then(|n| n.as_str()))
-        .collect();
-
-    // Reap stale skill commands first so the 100-command cap never blocks
-    // the upserts that follow. Delete failures are counted, not fatal
-    // mid-pass: the upserts still run, but the pass reports Err at the end
-    // so the fingerprint is not recorded and the next READY retries.
-    let mut failed_deletes = 0usize;
-    let resp = client
-        .get(&base)
-        .header("Authorization", &auth)
-        .send()
-        .await
-        .map_err(reqwest::Error::without_url)?;
-    if !resp.status().is_success() {
-        anyhow::bail!("listing global commands failed ({})", resp.status());
-    }
-    let existing: Vec<serde_json::Value> = resp.json().await?;
-    for cmd in &existing {
-        let name = cmd.get("name").and_then(|n| n.as_str()).unwrap_or("");
-        if name == "ask" || desired_names.contains(name) || !is_skill_command_shape(cmd) {
-            continue;
-        }
-        let Some(id) = cmd.get("id").and_then(|i| i.as_str()) else {
-            continue;
-        };
-        let del = client
-            .delete(format!("{base}/{id}"))
-            .header("Authorization", &auth)
-            .send()
-            .await
-            .map_err(reqwest::Error::without_url)?;
-        if del.status().is_success() || del.status() == reqwest::StatusCode::NOT_FOUND {
-            // 404 = already gone (raced another reconcile or manual
-            // cleanup) — the desired end state holds either way.
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"command": name})),
-                "deregistered stale skill slash command"
-            );
-        } else {
-            failed_deletes += 1;
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "command": name,
-                        "status": del.status().as_u16(),
-                    })),
-                "failed to deregister stale skill slash command"
-            );
-        }
-    }
-
-    let existing_by_name: std::collections::HashMap<&str, &serde_json::Value> = existing
-        .iter()
-        .filter_map(|c| c.get("name").and_then(|n| n.as_str()).map(|n| (n, c)))
-        .collect();
-    let mut upserted = 0usize;
-    for cmd in desired {
-        let name = cmd.get("name").and_then(|n| n.as_str()).unwrap_or("?");
-        // Steady-state restarts should be ~zero writes: Discord's daily
-        // command-create budget is finite, and the existing list is already
-        // in hand.
-        if let Some(current) = existing_by_name.get(name)
-            && command_projection(current) == command_projection(cmd)
-        {
-            continue;
-        }
-        let resp = client
-            .post(&base)
-            .header("Authorization", &auth)
-            .json(cmd)
-            .send()
-            .await
-            .map_err(reqwest::Error::without_url)?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("slash command registration failed for '{name}' ({status}): {err}");
-        }
-        upserted += 1;
-    }
-    if upserted > 0 {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"upserted": upserted})),
-            "discord slash commands upserted"
-        );
-    }
-    if failed_deletes > 0 {
-        anyhow::bail!(
-            "{failed_deletes} stale skill command delete(s) failed; \
-             reconcile not recorded, next READY retries"
-        );
-    }
-    Ok(())
-}
-
-/// Acknowledge an interaction within Discord's 3-second window with a
-/// type-5 "deferred channel message" (the "thinking…" state).
-async fn discord_defer_interaction(
-    client: &reqwest::Client,
-    interaction_id: &str,
-    interaction_token: &str,
-) -> anyhow::Result<()> {
-    let url = format!(
-        "https://discord.com/api/v10/interactions/{interaction_id}/{interaction_token}/callback"
-    );
-    // type 5 = DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE
-    let body = json!({ "type": 5 });
-    // without_url: reqwest transport errors embed the full request URL,
-    // which here contains the interaction token (a live credential).
-    let resp = client
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(reqwest::Error::without_url)?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err = resp.text().await.unwrap_or_default();
-        anyhow::bail!("interaction defer failed ({status}): {err}");
-    }
-    Ok(())
-}
-
-/// Extract a string option (`d.data.options[name].value`) from an
-/// APPLICATION_COMMAND interaction payload. Empty string when absent.
-fn interaction_string_option(d: &serde_json::Value, name: &str) -> String {
-    d.get("data")
-        .and_then(|x| x.get("options"))
-        .and_then(|o| o.as_array())
-        .and_then(|opts| {
-            opts.iter()
-                .find(|o| o.get("name").and_then(|n| n.as_str()) == Some(name))
-        })
-        .and_then(|o| o.get("value"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string()
-}
-
 /// Why a slash-command interaction was refused. Drives the WARN log and the
 /// ephemeral rejection text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2020,223 +1033,13 @@ fn interaction_gate(
     Ok(())
 }
 
-/// Answer a refused interaction immediately with an ephemeral message
-/// (type 4, flags 64 = only the invoker sees it). Without any callback the
-/// invoker stares at "The application did not respond" for 3 seconds, which
-/// reads as a bug rather than a policy decision.
-async fn discord_reject_interaction(
-    client: &reqwest::Client,
-    interaction_id: &str,
-    interaction_token: &str,
-    message: &str,
-) -> anyhow::Result<()> {
-    let url = format!(
-        "https://discord.com/api/v10/interactions/{interaction_id}/{interaction_token}/callback"
-    );
-    let body = json!({
-        "type": 4,
-        "data": {
-            "content": message,
-            "flags": 64
-        }
-    });
-    // without_url: transport errors embed the token-bearing URL.
-    let resp = client
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(reqwest::Error::without_url)?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err = resp.text().await.unwrap_or_default();
-        anyhow::bail!("interaction reject failed ({status}): {err}");
-    }
-    Ok(())
-}
-
-/// Deliver the agent's answer by editing the deferred interaction response
-/// (`PATCH /webhooks/{app_id}/{token}/messages/@original`). The token is valid
-/// for 15 minutes; no bot auth header is required for the followup webhook.
-async fn discord_edit_interaction_response(
-    client: &reqwest::Client,
-    app_id: &str,
-    interaction_token: &str,
-    content: &str,
-) -> anyhow::Result<()> {
-    let url = format!(
-        "https://discord.com/api/v10/webhooks/{app_id}/{interaction_token}/messages/@original"
-    );
-    let trimmed: String = content.chars().take(DISCORD_MAX_MESSAGE_LENGTH).collect();
-    if trimmed.chars().count() < content.chars().count() {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({
-                    "content_chars": content.chars().count(),
-                })),
-            "interaction reply truncated to Discord's 2000-char limit (chunked followups are a planned follow-up)"
-        );
-    }
-    // without_url: transport errors embed the token-bearing URL.
-    let resp = client
-        .patch(&url)
-        .json(&json!({ "content": trimmed }))
-        .send()
-        .await
-        .map_err(reqwest::Error::without_url)?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err = resp.text().await.unwrap_or_default();
-        anyhow::bail!("interaction followup edit failed ({status}): {err}");
-    }
-    Ok(())
-}
-
 const BASE64_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/// Discord's maximum message length for regular messages.
-///
-/// Discord rejects longer payloads with `50035 Invalid Form Body`.
-const DISCORD_MAX_MESSAGE_LENGTH: usize = 2000;
 /// Upper bound for an archived message entry once edit markers accrue.
 /// Edits are remote-controlled and unlimited; past this size the middle of
 /// the edit history is dropped (original text and latest edit retained).
 const MAX_ARCHIVE_ENTRY_BYTES: usize = 16 * 1024;
 const DISCORD_ACK_REACTIONS: &[&str] = &["⚡️", "🦀", "🙌", "💪", "👌", "👀", "👣"];
-
-/// Split a message into chunks that respect Discord's 2000-character limit.
-/// Tries to split at word boundaries when possible.
-fn split_message_for_discord(message: &str) -> Vec<String> {
-    if message.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH {
-        return vec![message.to_string()];
-    }
-
-    let mut chunks = Vec::new();
-    let mut remaining = message;
-
-    while !remaining.is_empty() {
-        // Find the byte offset for the 2000th character boundary.
-        // If there are fewer than 2000 chars left, we can emit the tail directly.
-        let hard_split = remaining
-            .char_indices()
-            .nth(DISCORD_MAX_MESSAGE_LENGTH)
-            .map_or(remaining.len(), |(idx, _)| idx);
-
-        let chunk_end = if hard_split == remaining.len() {
-            hard_split
-        } else {
-            // Try to find a good break point (newline, then space)
-            let search_area = &remaining[..hard_split];
-
-            // Prefer splitting at newline
-            if let Some(pos) = search_area.rfind('\n') {
-                // Don't split if the newline is too close to the end
-                if search_area[..pos].chars().count() >= DISCORD_MAX_MESSAGE_LENGTH / 2 {
-                    pos + 1
-                } else {
-                    // Try space as fallback
-                    search_area.rfind(' ').map_or(hard_split, |space| space + 1)
-                }
-            } else if let Some(pos) = search_area.rfind(' ') {
-                pos + 1
-            } else {
-                // Hard split at the limit
-                hard_split
-            }
-        };
-
-        chunks.push(remaining[..chunk_end].to_string());
-        remaining = &remaining[chunk_end..];
-    }
-
-    chunks
-}
-
-/// Split a message into multiple logical chunks at paragraph boundaries for
-/// multi-message delivery. Respects code fences — never splits inside a
-/// fenced code block. Falls back to [`split_message_for_discord`] for any
-/// segment that exceeds `max_len`.
-fn split_message_for_discord_multi(content: &str, max_len: usize) -> Vec<String> {
-    if content.is_empty() {
-        return vec![];
-    }
-
-    // Gather paragraph-level segments, respecting code fences.
-    let mut segments: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut in_fence = false;
-
-    for line in content.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") {
-            in_fence = !in_fence;
-        }
-
-        // If we hit a blank line outside a fence, that's a paragraph break.
-        if line.is_empty() && !in_fence && !current.is_empty() {
-            segments.push(current.trim_end().to_string());
-            current.clear();
-            continue;
-        }
-
-        if !current.is_empty() {
-            current.push('\n');
-        }
-        current.push_str(line);
-    }
-    if !current.is_empty() {
-        segments.push(current.trim_end().to_string());
-    }
-
-    // Now coalesce small segments and split oversized ones.
-    let mut chunks: Vec<String> = Vec::new();
-
-    for segment in segments {
-        if segment.chars().count() > max_len {
-            // This segment (possibly a large code fence) exceeds the limit.
-            // Fall back to the word-boundary splitter.
-            let sub_chunks = split_message_for_discord(&segment);
-            chunks.extend(sub_chunks);
-        } else {
-            chunks.push(segment);
-        }
-    }
-
-    if chunks.is_empty() {
-        vec![content.to_string()]
-    } else {
-        chunks
-    }
-}
-
-/// Choose the chunks to deliver for an outbound Discord message.
-///
-/// `split_message_for_discord_multi` returns an empty vec for empty input
-/// (its paragraph splitter has no segments to emit); the non-multi
-/// splitter returns `vec![""]`. When MultiMessage stream mode hands
-/// `send()` a paragraph that collapses to empty text after marker strip,
-/// the chunk loop would iterate zero times and silently skip an attached
-/// file upload. Force a single empty chunk in exactly that case so the
-/// multipart POST fires.
-fn chunks_for_send(
-    content: &str,
-    stream_mode: zeroclaw_config::schema::StreamMode,
-    max_len: usize,
-    has_local_files: bool,
-) -> Vec<String> {
-    let mut chunks = match stream_mode {
-        zeroclaw_config::schema::StreamMode::MultiMessage => {
-            split_message_for_discord_multi(content, max_len)
-        }
-        _ => split_message_for_discord(content),
-    };
-    if chunks.is_empty() && has_local_files {
-        chunks.push(String::new());
-    }
-    chunks
-}
 
 fn pick_uniform_index(len: usize) -> usize {
     debug_assert!(len > 0);
@@ -2254,31 +1057,6 @@ fn pick_uniform_index(len: usize) -> usize {
 
 fn random_discord_ack_reaction() -> &'static str {
     DISCORD_ACK_REACTIONS[pick_uniform_index(DISCORD_ACK_REACTIONS.len())]
-}
-
-/// URL-encode a Unicode emoji for use in Discord reaction API paths.
-///
-/// Discord's reaction endpoints accept raw Unicode emoji in the URL path,
-/// but they must be percent-encoded per RFC 3986. Custom guild emojis use
-/// the `name:id` format and are passed through unencoded.
-fn encode_emoji_for_discord(emoji: &str) -> String {
-    if emoji.contains(':') {
-        return emoji.to_string();
-    }
-
-    let mut encoded = String::new();
-    for byte in emoji.as_bytes() {
-        let _ = write!(encoded, "%{byte:02X}");
-    }
-    encoded
-}
-
-fn discord_reaction_url(channel_id: &str, message_id: &str, emoji: &str) -> String {
-    let raw_id = message_id.strip_prefix("discord_").unwrap_or(message_id);
-    let encoded_emoji = encode_emoji_for_discord(emoji);
-    format!(
-        "https://discord.com/api/v10/channels/{channel_id}/messages/{raw_id}/reactions/{encoded_emoji}/@me"
-    )
 }
 
 fn mention_tags(bot_user_id: &str) -> [String; 2] {
@@ -2991,7 +1769,7 @@ impl Channel for DiscordChannel {
                                     let client = self.http_client();
                                     let bot_token = self.bot_token.clone();
                                     let resolver = self.slash_command_resolver.clone();
-                                    let hash_store = Arc::clone(&self.registered_commands_hash);
+                                    let workspace_dir = self.workspace_dir.clone();
                                     zeroclaw_spawn::spawn!(async move {
                                         let specs = match resolver {
                                             Some(resolve) => {
@@ -3017,21 +1795,38 @@ impl Channel for DiscordChannel {
                                             body.to_string().hash(&mut h);
                                             h.finish()
                                         };
-                                        // Skip only when the set matches the
-                                        // last *successful* reconcile —
-                                        // failures reset the fingerprint so
-                                        // the next READY retries.
-                                        if *hash_store.lock() == Some(fingerprint) {
+                                        use crate::discord_slash_state::SlashReconcileState;
+                                        let now = crate::discord_slash_state::now_unix();
+                                        let state =
+                                            SlashReconcileState::load(workspace_dir.as_deref(), &app_id);
+                                        // Honour a persisted rate-limit cooldown across restarts: a
+                                        // 429'd reconcile must not re-hammer Discord on the next READY.
+                                        if state.rate_limited(now) {
+                                            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"retry_after_until": state.retry_after_until})), "discord slash command reconcile in rate-limit cooldown; skipping");
+                                            return;
+                                        }
+                                        // Skip only when the set matches the last *successful*
+                                        // reconcile. The fingerprint is persisted, so an unchanged
+                                        // set is skipped after a restart too (no daily-budget churn).
+                                        if state.fingerprint == Some(fingerprint) {
                                             ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"commands": specs.len() + 1})), "discord slash command set unchanged; skipping re-registration");
                                             return;
                                         }
                                         match reconcile_slash_commands(&client, &bot_token, &app_id, &body, DISCORD_API_BASE).await {
-                                            Ok(()) => {
-                                                *hash_store.lock() = Some(fingerprint);
+                                            Ok(ReconcileOutcome::Reconciled) => {
+                                                SlashReconcileState::record_success(workspace_dir.as_deref(), &app_id, fingerprint, now);
                                                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"commands": specs.len() + 1})), "discord slash commands registered");
                                             }
+                                            Ok(ReconcileOutcome::RateLimited { until }) => {
+                                                // Persist the cooldown (keeping the prior fingerprint)
+                                                // so the next READY/restart waits it out.
+                                                SlashReconcileState::record_retry_after(workspace_dir.as_deref(), &app_id, &state, until);
+                                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"retry_after_until": until})), "discord slash command reconcile rate-limited; cooldown persisted");
+                                            }
                                             Err(e) => {
-                                                *hash_store.lock() = None;
+                                                // Hard failure: leave persisted state untouched. The
+                                                // new fingerprint differs from the stored one, so the
+                                                // next READY retries without a forced reset.
                                                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord slash command registration failed");
                                             }
                                         }
@@ -4159,6 +2954,7 @@ impl Channel for DiscordChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
 
     fn s(items: &[&str]) -> Vec<String> {
         items.iter().map(|i| (*i).to_string()).collect()
@@ -4532,6 +3328,39 @@ mod tests {
         reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconcile_returns_rate_limited_on_post_429() {
+        // A 429 on an upsert must surface as RateLimited (with the body's
+        // retry_after deadline) so the caller persists a cooldown instead of
+        // re-hammering the daily command budget on the next READY.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(
+                ResponseTemplate::new(429).set_body_json(serde_json::json!({"retry_after": 5.0})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[]); // /ask → one POST
+        let now = crate::discord_slash_state::now_unix();
+        let outcome = reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri())
+            .await
+            .unwrap();
+        match outcome {
+            ReconcileOutcome::RateLimited { until } => assert!(until >= now + 5),
+            ReconcileOutcome::Reconciled => panic!("expected RateLimited on a POST 429"),
+        }
     }
 
     #[test]

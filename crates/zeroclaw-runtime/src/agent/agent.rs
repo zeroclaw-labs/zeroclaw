@@ -779,6 +779,19 @@ impl Agent {
             return None;
         }
 
+        // Skip response-cache for multimodal prompts.  Messages carrying
+        // `[IMAGE:...]` (or other inline-asset) markers are normalised to
+        // data URIs later in the turn loop; cache keys built on the raw
+        // markers would either miss (different normalised payload) or
+        // collide (same marker path but different image content).
+        if messages
+            .iter()
+            .filter(|message| message.role != "system")
+            .any(|message| message.content.contains("[IMAGE:"))
+        {
+            return None;
+        }
+
         let system = messages
             .iter()
             .find(|message| message.role == "system")
@@ -3057,6 +3070,90 @@ mod tests {
         }
     }
 
+    #[test]
+    fn direct_agent_turn_does_not_write_intermediate_native_text_to_stdout() {
+        let current_exe = std::env::current_exe().expect("current test binary path");
+        let output = std::process::Command::new(current_exe)
+            .args([
+                "direct_agent_turn_stdout_boundary_helper_4721",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .expect("helper test process should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            output.status.success(),
+            "helper failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            stdout,
+            stderr
+        );
+        assert!(
+            !stdout.contains("intermediate native narration"),
+            "intermediate native narration leaked to stdout:\n{stdout}"
+        );
+        assert!(
+            stderr.contains("intermediate native narration"),
+            "intermediate native narration was not routed to stderr:\n{stderr}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "subprocess helper for stdout/stderr boundary regression"]
+    async fn direct_agent_turn_stdout_boundary_helper_4721() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![
+                zeroclaw_providers::ChatResponse {
+                    text: Some("intermediate native narration".into()),
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: "tc1".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                zeroclaw_providers::ChatResponse {
+                    text: Some("final answer".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]),
+        });
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let answer = agent
+            .turn("run the tool")
+            .await
+            .expect("turn should finish");
+        assert_eq!(answer, "final answer");
+    }
+
     struct FailingModelProvider;
 
     #[async_trait]
@@ -5245,6 +5342,62 @@ mod tests {
             seen_b.lock().len(),
             1,
             "fresh transcript must not reuse a cache entry written for a different prior transcript"
+        );
+    }
+
+    /// Response-cache key must return `None` when messages contain `[IMAGE:]`
+    /// markers, preventing stale or semantically wrong cache hits on
+    /// multimodal prompts.
+    #[test]
+    fn response_cache_key_skips_multimodal_image_markers() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(tmp.path(), 60, 100)
+                .expect("response cache init"),
+        );
+
+        let agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(vec![Box::new(MockTool)])
+            .memory(Arc::from(
+                zeroclaw_memory::create_memory(
+                    &zeroclaw_config::schema::MemoryConfig {
+                        backend: "none".into(),
+                        ..zeroclaw_config::schema::MemoryConfig::default()
+                    },
+                    std::path::Path::new("/tmp"),
+                    None,
+                )
+                .expect("memory"),
+            ))
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .response_cache(Some(cache))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_name("test-model".into())
+            .temperature(Some(0.0))
+            .build()
+            .expect("agent builder");
+
+        // Plain text messages should produce a cache key.
+        let plain_messages = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("hello"),
+        ];
+        let key = agent.response_cache_key_for_messages(&plain_messages, "test-model");
+        assert!(key.is_some(), "plain text prompt must produce a cache key");
+
+        // Messages containing `[IMAGE:]` must return None (skip cache).
+        let multimodal_messages = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("describe this image [IMAGE:/tmp/photo.png]"),
+        ];
+        let key = agent.response_cache_key_for_messages(&multimodal_messages, "test-model");
+        assert!(
+            key.is_none(),
+            "multimodal prompt with [IMAGE:] marker must skip response cache"
         );
     }
 
