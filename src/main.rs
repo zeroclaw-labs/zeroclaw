@@ -2429,10 +2429,7 @@ fn prompt_for_field(
         {
             Ok(pw) => {
                 if !pw.is_empty() {
-                    eprintln!(
-                        "  \u{2713} Secret received ({})",
-                        pw.len()
-                    );
+                    eprintln!("  \u{2713} Secret received ({})", pw.len());
                 }
                 return Ok(Some(pw));
             }
@@ -5050,10 +5047,7 @@ async fn main() -> Result<()> {
                         .interact()?;
                     let secret_value = secret_value.trim().to_string();
                     if !secret_value.is_empty() {
-                        eprintln!(
-                            "  \u{2713} Secret received ({})",
-                            secret_value.len()
-                        );
+                        eprintln!("  \u{2713} Secret received ({})", secret_value.len());
                     }
                     if secret_value.is_empty() {
                         anyhow::bail!("Value cannot be empty.");
@@ -5838,10 +5832,7 @@ fn handle_estop_command(
                         .with_prompt("Enter OTP code")
                         .allow_empty_password(false)
                         .interact()?;
-                    eprintln!(
-                        "  \u{2713} OTP received ({})",
-                        entered.len()
-                    );
+                    eprintln!("  \u{2713} OTP received ({})", entered.len());
                     otp_code = Some(entered);
                 }
 
@@ -6433,10 +6424,7 @@ fn read_auth_input(prompt: &str) -> Result<String> {
         .interact()?;
     let trimmed = input.trim().to_string();
     if !trimmed.is_empty() {
-        eprintln!(
-            "  \u{2713} Secret received ({})",
-            trimmed.len()
-        );
+        eprintln!("  \u{2713} Secret received ({})", trimmed.len());
     }
     Ok(trimmed)
 }
