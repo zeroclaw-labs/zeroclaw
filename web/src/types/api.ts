@@ -244,6 +244,7 @@ export interface WsMessage {
   name?: string;
   args?: any;
   output?: string;
+  id?: string;
   message?: string;
   code?: string;
   session_id?: string;

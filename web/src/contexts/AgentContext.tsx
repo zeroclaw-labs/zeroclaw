@@ -6,6 +6,7 @@ import { t } from '@/lib/i18n';
 import { getProp, putProp, listProps, getStatus, getSessionMessages, abortSession, deleteSession } from '@/lib/api';
 import { primeModelProviderCatalog, modelProviderDisplayName } from '@/lib/modelProviders';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
+import { resolveToolResultIndex } from '@/lib/toolCardMatch';
 import {
   loadChatHistory,
   mapServerMessagesToPersisted,
@@ -278,7 +279,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
               id: generateUUID(),
               role: 'agent' as const,
               content: `${t('agent.tool_call_prefix')} ${toolName}(${argsKey})`,
-              toolCall: { name: toolName, args: toolArgs },
+              toolCall: { name: toolName, args: toolArgs, id: msg.id },
               timestamp: new Date(),
             },
           ];
@@ -294,9 +295,13 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
           break;
         }
         const toolName = msg.name;
+        const resultId = msg.id;
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => {
-          const idx = prev.findIndex((m) => m.toolCall && m.toolCall.output === undefined);
+          // Correlate the result to its pending card by gateway tool_call_id so
+          // out-of-order parallel results land on the right card; see
+          // resolveToolResultIndex for the id-less fallback.
+          const idx = resolveToolResultIndex(prev, resultId);
           if (idx !== -1) {
             const updated = [...prev];
             const existing = prev[idx]!;
