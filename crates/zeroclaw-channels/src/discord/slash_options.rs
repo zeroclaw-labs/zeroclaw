@@ -148,6 +148,36 @@ fn number_value(v: f64, kind: OptKind) -> Value {
     }
 }
 
+/// Extract the values a user submitted for a slash command's options out of an
+/// INTERACTION_CREATE payload's `data.options[]`, as `(name, display)` pairs in
+/// the order Discord sent them. The value is stringified by JSON kind (string
+/// as-is; number/bool to text) for folding into the synthesized agent prompt.
+/// This generalises the single-`input` extractor for typed commands.
+pub fn extract_submitted_options(data: &Value) -> Vec<(String, String)> {
+    data.get("data")
+        .and_then(|d| d.get("options"))
+        .and_then(|o| o.as_array())
+        .map(|opts| {
+            opts.iter()
+                .filter_map(|o| {
+                    let name = o.get("name")?.as_str()?.to_string();
+                    let value = o.get("value").map(stringify_value).unwrap_or_default();
+                    Some((name, value))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn stringify_value(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +272,34 @@ mod tests {
             value: "y".to_string(),
         }];
         assert!(u.to_registration_json().get("choices").is_none());
+    }
+
+    #[test]
+    fn extract_submitted_reads_typed_values_in_order_and_stringifies() {
+        let interaction = json!({
+            "type": 2,
+            "data": {
+                "name": "search",
+                "options": [
+                    { "name": "query", "type": 3, "value": "rust" },
+                    { "name": "limit", "type": 4, "value": 5 },
+                    { "name": "verbose", "type": 5, "value": true }
+                ]
+            }
+        });
+        assert_eq!(
+            extract_submitted_options(&interaction),
+            vec![
+                ("query".to_string(), "rust".to_string()),
+                ("limit".to_string(), "5".to_string()),
+                ("verbose".to_string(), "true".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_submitted_is_empty_when_no_options() {
+        assert!(extract_submitted_options(&json!({ "data": { "name": "x" } })).is_empty());
+        assert!(extract_submitted_options(&json!({})).is_empty());
     }
 }

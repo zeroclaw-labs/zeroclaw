@@ -1940,6 +1940,9 @@ impl Channel for DiscordChannel {
                                 // routing happens in the spawned task.
                                 let prompt = interaction_string_option(d, "prompt");
                                 let input = interaction_string_option(d, "input");
+                                // Extract typed-option values here (owned) so the
+                                // spawned 'static task doesn't borrow `event`.
+                                let submitted = slash_options::extract_submitted_options(d);
                                 let interaction_guild = d
                                     .get("guild_id")
                                     .and_then(serde_json::Value::as_str)
@@ -2092,12 +2095,36 @@ impl Channel for DiscordChannel {
                                                 None => Vec::new(),
                                             };
                                             match specs.into_iter().find(|spec| spec.slug == command) {
-                                                Some(spec) if !input.is_empty() => Some(format!(
-                                                    "Use the '{}' skill for this request: {input}",
-                                                    spec.skill_name
-                                                )),
-                                                Some(_) => None, // known command, empty input
-                                                None => None,    // stale or foreign command
+                                                Some(spec) if spec.options.is_empty() => {
+                                                    // Legacy single free-text `input` option.
+                                                    if input.is_empty() {
+                                                        None // known command, empty input
+                                                    } else {
+                                                        Some(format!(
+                                                            "Use the '{}' skill for this request: {input}",
+                                                            spec.skill_name
+                                                        ))
+                                                    }
+                                                }
+                                                Some(spec) => {
+                                                    // Typed options: fold the submitted name/value pairs
+                                                    // (extracted above) into the prompt (Discord enforces
+                                                    // the required ones).
+                                                    if submitted.is_empty() {
+                                                        None
+                                                    } else {
+                                                        let rendered = submitted
+                                                            .iter()
+                                                            .map(|(n, v)| format!("{n}: {v}"))
+                                                            .collect::<Vec<_>>()
+                                                            .join("\n");
+                                                        Some(format!(
+                                                            "Use the '{}' skill for this request:\n{rendered}",
+                                                            spec.skill_name
+                                                        ))
+                                                    }
+                                                }
+                                                None => None, // stale or foreign command
                                             }
                                         };
                                         let Some(content) = content else {
