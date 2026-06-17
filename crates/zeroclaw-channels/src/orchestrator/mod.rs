@@ -2410,7 +2410,7 @@ async fn handle_runtime_command_if_needed(
         ChannelRuntimeCommand::SetModel(raw_model) => {
             let model = raw_model.trim().trim_matches('`').to_string();
             if model.is_empty() {
-                "Model ID cannot be empty. Use `/model <model-id>`.".to_string()
+                zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-model-empty")
             } else {
                 // Resolve model_provider+model from model_routes (match by model name or hint)
                 if let Some(route) = ctx.model_routes.iter().find(|r| {
@@ -2424,9 +2424,12 @@ async fn handle_runtime_command_if_needed(
                 }
                 set_route_selection(ctx, &sender_key, current.clone(), &defaults_snapshot);
 
-                format!(
-                    "Model switched to `{}` (model_provider: `{}`). Context preserved.",
-                    current.model, current.model_provider
+                zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "channel-runtime-model-switched",
+                    &[
+                        ("model", current.model.as_str()),
+                        ("provider", current.model_provider.as_str()),
+                    ],
                 )
             }
         }
@@ -2459,7 +2462,7 @@ async fn handle_runtime_command_if_needed(
                 );
             }
             mark_sender_for_new_session(ctx, &sender_key);
-            "Conversation history cleared. Starting fresh.".to_string()
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-new-session")
         }
     };
 
@@ -5244,8 +5247,9 @@ async fn process_channel_message_body(
                 ChatMessage::assistant("[Task timed out — not continuing this request]"),
             );
             if let Some(channel) = target_channel.as_ref() {
-                let error_text =
-                    "⚠️ Request timed out while waiting for the model. Please try again.";
+                let error_text = zeroclaw_runtime::i18n::get_required_cli_string(
+                    "channel-runtime-request-timeout",
+                );
                 if let Some(ref draft_id) = draft_message_id {
                     let _ = channel
                         .finalize_draft(&msg.reply_target, draft_id, error_text)
@@ -5421,9 +5425,9 @@ async fn run_message_dispatch_loop(
             };
             let reply = if let Some(state) = previous {
                 state.cancellation.cancel();
-                "Stop signal sent.".to_string()
+                zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-sent")
             } else {
-                "No in-flight task for this sender scope.".to_string()
+                zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-stop-no-task")
             };
             let channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
             if let Some(channel) = channel {
@@ -16973,10 +16977,12 @@ BTC is currently around $65,000 based on latest tool output."#
         }
 
         let sent_messages = channel_impl.sent_messages.lock().await;
+        let new_session_reply =
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-new-session");
         assert!(
-            sent_messages.iter().any(|message| {
-                message.contains("Conversation history cleared. Starting fresh.")
-            })
+            sent_messages
+                .iter()
+                .any(|message| message.contains(&new_session_reply))
         );
     }
 

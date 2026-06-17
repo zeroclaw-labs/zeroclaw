@@ -646,3 +646,9 @@ cli-channels-notion = {"  "}{$status} Notion
 cli-channels-start-hint = 启动渠道：zeroclaw channel start
 cli-channels-doctor-hint = 检查健康状况：    zeroclaw channel doctor
 cli-channels-configure-hint = 配置方法：      zeroclaw config set channels.<name>.<field>=<value>
+channel-runtime-new-session = 对话历史已清除。重新开始。
+channel-runtime-stop-sent = 已发送停止信号。
+channel-runtime-stop-no-task = 此发送者范围内没有正在执行的任务。
+channel-runtime-model-empty = 模型 ID 不能为空。请使用 `/model <model-id>`。
+channel-runtime-model-switched = 已切换到模型 `{ $model }`（model_provider：`{ $provider }`）。上下文已保留。
+channel-runtime-request-timeout = ⚠️ 等待模型响应超时，请重试。
