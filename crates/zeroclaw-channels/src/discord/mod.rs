@@ -725,6 +725,29 @@ const fn is_thread_channel_type(channel_type: u64) -> bool {
 /// is a safety bound so a hung request cannot stall the listener.
 const THREAD_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Deliver a (deferred) interaction's answer, splitting it across Discord's
+/// 2000-char limit: the first chunk edits the @original deferred message and any
+/// remaining chunks are posted as followups. The chunking lives here in the
+/// wiring layer so `interaction` need not depend on `chunk` (preserving the
+/// no-impl-to-impl module boundary).
+async fn deliver_interaction_answer(
+    client: &reqwest::Client,
+    app_id: &str,
+    interaction_token: &str,
+    api_base: &str,
+    content: &str,
+) -> anyhow::Result<()> {
+    let chunks = split_message_for_discord(content);
+    let mut chunks = chunks.iter();
+    let first = chunks.next().map(String::as_str).unwrap_or("");
+    discord_edit_interaction_response(client, app_id, interaction_token, api_base, first).await?;
+    for chunk in chunks {
+        discord_post_interaction_followup(client, app_id, interaction_token, api_base, chunk)
+            .await?;
+    }
+    Ok(())
+}
+
 /// Pure channel-filter decision: does `msg_channel` pass the allowlist?
 ///
 /// A channel passes when:
@@ -1371,10 +1394,11 @@ impl Channel for DiscordChannel {
             }
             let content = crate::util::strip_tool_call_tags(&message.content);
             let client = self.http_client();
-            return discord_edit_interaction_response(
+            return deliver_interaction_answer(
                 &client,
                 &pending.app_id,
                 &pending.token,
+                DISCORD_API_BASE,
                 &content,
             )
             .await;
@@ -2079,7 +2103,7 @@ impl Channel for DiscordChannel {
                                             let msg = i18n::get_required_cli_string(
                                                 "channel-discord-interaction-unavailable",
                                             );
-                                            if let Err(e) = discord_edit_interaction_response(&client, &app_id, &interaction_token, &msg).await {
+                                            if let Err(e) = discord_edit_interaction_response(&client, &app_id, &interaction_token, DISCORD_API_BASE, &msg).await {
                                                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord interaction unavailable-notice failed");
                                             }
                                             pending.lock().remove(&interaction_id);
@@ -3019,6 +3043,60 @@ mod tests {
             ),
             Ok(())
         );
+    }
+
+    #[tokio::test]
+    async fn interaction_answer_over_2000_chars_chunks_into_edit_plus_followup() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // The first chunk edits the deferred @original message.
+        Mock::given(method("PATCH"))
+            .and(path("/webhooks/app1/tok/messages/@original"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // The remaining chunk is delivered as a followup POST (not truncated).
+        Mock::given(method("POST"))
+            .and(path("/webhooks/app1/tok"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        // 3000 contiguous chars (no break point) → a 2000-char chunk + a 1000.
+        let content = "a".repeat(3000);
+        deliver_interaction_answer(&client, "app1", "tok", &server.uri(), &content)
+            .await
+            .unwrap();
+        // wiremock verifies the expect(1) counts when the server drops.
+    }
+
+    #[tokio::test]
+    async fn short_interaction_answer_only_edits_original() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/webhooks/app1/tok/messages/@original"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // A short reply must not trigger any followup POST.
+        Mock::given(method("POST"))
+            .and(path("/webhooks/app1/tok"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        deliver_interaction_answer(&client, "app1", "tok", &server.uri(), "short answer")
+            .await
+            .unwrap();
     }
 
     #[test]
