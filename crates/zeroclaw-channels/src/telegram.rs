@@ -536,6 +536,7 @@ pub struct TelegramChannel {
     last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
     mention_only: bool,
     bot_username: Mutex<Option<String>>,
+    bot_id: Mutex<Option<i64>>,
     /// Base URL for the Telegram Bot API. Defaults to `https://api.telegram.org`.
     /// Override for local Bot API servers or testing.
     api_base: String,
@@ -615,6 +616,7 @@ impl TelegramChannel {
             typing_handle: Mutex::new(None),
             mention_only,
             bot_username: Mutex::new(None),
+            bot_id: Mutex::new(None),
             api_base: TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
             transcription: None,
             transcription_manager: None,
@@ -1278,11 +1280,17 @@ impl TelegramChannel {
         }
 
         let data: serde_json::Value = resp.json().await?;
-        let username = data
-            .get("result")
-            .and_then(|r| r.get("username"))
+        let result = data.get("result").context("missing result in getMe response")?;
+        let username = result
+            .get("username")
             .and_then(|u| u.as_str())
             .context("Bot username not found in response")?;
+
+        // Cache the bot's user ID for reply-to-self detection
+        if let Some(id) = result.get("id").and_then(|i| i.as_i64()) {
+            let mut cache = self.bot_id.lock();
+            *cache = Some(id);
+        }
 
         Ok(username.to_string())
     }
@@ -1380,6 +1388,17 @@ impl TelegramChannel {
             .unwrap_or(false)
     }
 
+    /// Check whether `message` is a reply to a message sent by the bot
+    /// itself. When true, the `mention_only` gate should be bypassed.
+    fn is_reply_to_bot(message: &serde_json::Value, bot_id: i64) -> bool {
+        message
+            .get("reply_to_message")
+            .and_then(|r| r.get("from"))
+            .and_then(|f| f.get("id"))
+            .and_then(|i| i.as_i64())
+            .is_some_and(|id| id == bot_id)
+    }
+
     /// Apply the `mention_only` gate to a non-text update (photo / document /
     /// voice) using its caption as the channel for the mention.
     ///
@@ -1409,6 +1428,17 @@ impl TelegramChannel {
         }
         let bot_username_guard = self.bot_username.lock();
         let bot_username = bot_username_guard.as_ref()?;
+
+        // If the user is replying directly to the bot's message, bypass the
+        // mention check — replies are an unambiguous signal of intent.
+        if let Some(caption) = caption {
+            if let Some(bot_id) = *self.bot_id.lock() {
+                if Self::is_reply_to_bot(message, bot_id) {
+                    return Some(Self::normalize_incoming_content(caption, bot_username));
+                }
+            }
+        }
+
         let caption = caption?;
         if !Self::contains_bot_mention(caption, bot_username) {
             return None;
@@ -2249,8 +2279,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         if self.mention_only && is_group {
             let bot_username = self.bot_username.lock();
             if let Some(ref bot_username) = *bot_username {
+                // If the user is replying directly to the bot's message, bypass
+                // the mention check — replies are an unambiguous signal of intent.
                 if !Self::contains_bot_mention(text, bot_username) {
-                    return None;
+                    let bot_id = *self.bot_id.lock();
+                    if bot_id.is_none_or(|id| !Self::is_reply_to_bot(message, id)) {
+                        return None;
+                    }
                 }
             } else {
                 return None;
