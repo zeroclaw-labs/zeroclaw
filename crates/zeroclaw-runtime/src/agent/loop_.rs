@@ -108,6 +108,7 @@ use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::{AutonomyLevel, SecurityPolicy};
 use crate::tools::{self, Tool};
+use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -401,6 +402,26 @@ fn compute_excluded_mcp_tools(
         .collect()
 }
 
+/// Build a `query_summary` field for memory observability events from a raw
+/// user query.
+///
+/// Applies [`scrub_credentials`] first, then truncates to ≤200 content
+/// chars via [`truncate_with_ellipsis`] (which appends a 3-char `...`
+/// ellipsis when truncation occurred, so summaries are ≤203 chars total).
+/// The order matters: `scrub_credentials` may insert placeholder
+/// substrings, so truncating first risks chopping a half-token.
+///
+/// Returns `None` for empty input so observers can distinguish "no query
+/// recorded" from "empty query string". Always call this helper at memory
+/// emit sites — never inline the scrub-then-truncate pattern, since that
+/// invites drift where one site accidentally skips the scrubber.
+pub fn make_query_summary(raw: &str) -> Option<String> {
+    if raw.is_empty() {
+        return None;
+    }
+    Some(truncate_with_ellipsis(&scrub_credentials(raw), 200))
+}
+
 pub use zeroclaw_api::TOOL_CHOICE_OVERRIDE;
 
 /// Convert a tool registry to OpenAI function-calling format for native tool support.
@@ -436,66 +457,99 @@ fn autosave_memory_key(prefix: &str) -> String {
 /// the user did not initiate. / #5456.
 async fn build_context(
     mem: &dyn Memory,
+    observer: &dyn Observer,
     user_msg: &str,
     min_relevance_score: f64,
     session_id: Option<&str>,
     exclude_conversation: bool,
 ) -> String {
     let mut context = String::new();
+    let backend = mem.name().to_string();
 
-    // Pull relevant memories for this message
-    if let Ok(mut entries) = mem.recall(user_msg, 5, session_id, None, None).await {
-        // Apply time decay: older non-Core memories score lower
-        decay::apply_time_decay(&mut entries, decay::DEFAULT_HALF_LIFE_DAYS);
+    // Pull relevant memories for this message. The original code used
+    // `if let Ok(...)` to silently swallow recall errors; we keep that
+    // behavior but refactor to an explicit match so the failure path can
+    // still emit a `MemoryRecall` observer event.
+    let start = std::time::Instant::now();
+    let recall_result = mem.recall(user_msg, 5, session_id, None, None).await;
+    let duration = start.elapsed();
+    let query_summary = make_query_summary(user_msg);
 
-        let relevant: Vec<_> = entries
-            .iter()
-            .filter(|e| match e.score {
-                Some(score) => score >= min_relevance_score,
-                None => true,
-            })
-            .collect();
+    match recall_result {
+        Ok(mut entries) => {
+            observer.record_event(&ObserverEvent::MemoryRecall {
+                query_summary,
+                duration,
+                num_entries: entries.len(),
+                backend,
+                success: true,
+            });
 
-        if !relevant.is_empty() {
-            let mut included = false;
-            for entry in &relevant {
-                // Scheduled (cron / heartbeat) runs must not see chat-origin
-                // memories. The autosave-key checks below catch the agent's
-                // own autosaves but miss Conversation entries written by
-                // channel handlers (Discord, gateway, WhatsApp, …) under
-                // their own keys. / #5456.
-                if exclude_conversation && matches!(entry.category, MemoryCategory::Conversation) {
-                    continue;
+            // Apply time decay: older non-Core memories score lower
+            decay::apply_time_decay(&mut entries, decay::DEFAULT_HALF_LIFE_DAYS);
+
+            let relevant: Vec<_> = entries
+                .iter()
+                .filter(|e| match e.score {
+                    Some(score) => score >= min_relevance_score,
+                    None => true,
+                })
+                .collect();
+
+            if !relevant.is_empty() {
+                let mut included = false;
+                for entry in &relevant {
+                    // Scheduled (cron / heartbeat) runs must not see chat-origin
+                    // memories. The autosave-key checks below catch the agent's
+                    // own autosaves but miss Conversation entries written by
+                    // channel handlers (Discord, gateway, WhatsApp, …) under
+                    // their own keys. / #5456.
+                    if exclude_conversation
+                        && matches!(entry.category, MemoryCategory::Conversation)
+                    {
+                        continue;
+                    }
+                    if zeroclaw_memory::is_assistant_autosave_key(&entry.key) {
+                        continue;
+                    }
+                    // Skip raw per-turn user messages: re-injecting them causes each
+                    // recalled entry to embed all prior generations, growing exponentially.
+                    // Consolidated knowledge is already promoted to Core/Daily entries.
+                    if zeroclaw_memory::is_user_autosave_key(&entry.key) {
+                        continue;
+                    }
+                    if zeroclaw_memory::should_skip_autosave_content(&entry.content) {
+                        continue;
+                    }
+                    // Skip entries containing tool_result blocks — they can leak
+                    // stale tool output from previous heartbeat ticks into new
+                    // sessions, presenting the LLM with orphan tool_result data.
+                    if entry.content.contains("<tool_result") {
+                        continue;
+                    }
+                    if !included {
+                        context.push_str(MEMORY_CONTEXT_OPEN);
+                        context.push('\n');
+                        included = true;
+                    }
+                    let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
                 }
-                if zeroclaw_memory::is_assistant_autosave_key(&entry.key) {
-                    continue;
+                if included {
+                    context.push_str(MEMORY_CONTEXT_CLOSE);
+                    context.push_str("\n\n");
                 }
-                // Skip raw per-turn user messages: re-injecting them causes each
-                // recalled entry to embed all prior generations, growing exponentially.
-                // Consolidated knowledge is already promoted to Core/Daily entries.
-                if zeroclaw_memory::is_user_autosave_key(&entry.key) {
-                    continue;
-                }
-                if zeroclaw_memory::should_skip_autosave_content(&entry.content) {
-                    continue;
-                }
-                // Skip entries containing tool_result blocks — they can leak
-                // stale tool output from previous heartbeat ticks into new
-                // sessions, presenting the LLM with orphan tool_result data.
-                if entry.content.contains("<tool_result") {
-                    continue;
-                }
-                if !included {
-                    context.push_str(MEMORY_CONTEXT_OPEN);
-                    context.push('\n');
-                    included = true;
-                }
-                let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
             }
-            if included {
-                context.push_str(MEMORY_CONTEXT_CLOSE);
-                context.push_str("\n\n");
-            }
+        }
+        Err(_) => {
+            observer.record_event(&ObserverEvent::MemoryRecall {
+                query_summary,
+                duration,
+                num_entries: 0,
+                backend,
+                success: false,
+            });
+            // Preserve original swallow behavior — recall errors are not
+            // propagated; an empty context string is returned.
         }
     }
 
@@ -506,6 +560,7 @@ async fn build_context(
 /// Includes pin-alias lookup (e.g. "red_led" → 13) when query matches, plus retrieved chunks.
 fn build_hardware_context(
     rag: &crate::rag::HardwareRag,
+    observer: &dyn Observer,
     user_msg: &str,
     boards: &[String],
     chunk_limit: usize,
@@ -522,7 +577,16 @@ fn build_hardware_context(
         context.push_str(&pin_ctx);
     }
 
+    let start = std::time::Instant::now();
     let chunks = rag.retrieve(user_msg, boards, chunk_limit);
+    let duration = start.elapsed();
+    observer.record_event(&ObserverEvent::RagRetrieve {
+        query_summary: make_query_summary(user_msg),
+        duration,
+        num_chunks: chunks.len(),
+        num_boards: boards.len(),
+    });
+
     if chunks.is_empty() && pin_ctx.is_empty() {
         return String::new();
     }
@@ -753,6 +817,17 @@ fn agent_provider_composite(
         .map(|(ty, alias, _)| format!("{ty}.{alias}"))
 }
 
+/// Return the owned agent config direct-turn setup needs, with runtime-profile
+/// values baked into `resolved`.
+fn resolved_agent_for_turn(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> Result<zeroclaw_config::schema::AliasedAgentConfig> {
+    config
+        .resolved_agent_config(agent_alias)
+        .with_context(|| format!("agents.{agent_alias} is not configured"))
+}
+
 /// Resolve (api_key, uri) for `provider_name`, preferring the alias-specific
 /// config when `provider_name` is a dotted `<family>.<alias>` reference.
 /// Falls back to `fallback` (the agent's configured provider) for bare family
@@ -793,10 +868,7 @@ pub async fn run(
     overrides: AgentRunOverrides,
 ) -> Result<String> {
     use ::zeroclaw_log::Instrument;
-    let agent = config
-        .agent(agent_alias)
-        .with_context(|| format!("agents.{agent_alias} is not configured"))?
-        .clone();
+    let agent = resolved_agent_for_turn(&config, agent_alias)?;
     crate::agent::thinking::validate_thinking_config(&agent.resolved.thinking);
     let risk_profile = config
         .risk_profile_for_agent(agent_alias)
@@ -836,14 +908,11 @@ pub async fn run(
         let agent_alias: &str = __zc_alias.as_str();
         // ── Effective per-agent runtime tunables ──────────────────────
         // Profile values (when set) override the agent's inline fields.
-        // See `Config::effective_*` helpers for precedence rules.
-        let _eff_max_tool_iterations = config.effective_max_tool_iterations(agent_alias);
-        let eff_max_history_messages = config.effective_max_history_messages(agent_alias);
-        let eff_max_context_tokens = config.effective_max_context_tokens(agent_alias);
-        let eff_compact_context = config.effective_compact_context(agent_alias);
-        let eff_max_system_prompt_chars = config.effective_max_system_prompt_chars(agent_alias);
-        let _eff_max_tool_result_chars = config.effective_max_tool_result_chars(agent_alias);
-        let _eff_tool_call_dedup_exempt = config.effective_tool_call_dedup_exempt(agent_alias);
+        // See `Config::resolved_agent_config` for precedence rules.
+        let eff_max_history_messages = agent.resolved.max_history_messages;
+        let eff_max_context_tokens = agent.resolved.max_context_tokens;
+        let eff_compact_context = agent.resolved.compact_context;
+        let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
         let base_observer = observability::create_observer(&config.observability);
         let observer: Arc<dyn Observer> = Arc::from(base_observer);
         let runtime: Arc<dyn platform::RuntimeAdapter> =
@@ -904,6 +973,19 @@ pub async fn run(
         } else {
             (None, None)
         };
+
+        // Build SOP engine when sops_dir is configured so SOP tools are
+        // available on this path (CLI agent run).
+        let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
+            let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
+                zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
+            let (engine, audit) =
+                crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, sop_mem);
+            (Some(engine), Some(audit))
+        } else {
+            (None, None)
+        };
+
         let all_tools_result = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
@@ -923,6 +1005,8 @@ pub async fn run(
             None,
             is_subagent_caller,
             None,
+            sop_engine,
+            sop_audit,
         );
         let mut tools_registry = all_tools_result.tools;
         let delegate_handle = all_tools_result.delegate_handle;
@@ -1058,6 +1142,20 @@ pub async fn run(
                                 crate::tools::ToolSearchTool::new(deferred_set, activated);
                             if let Some(policy) = mcp_policy {
                                 tool_search = tool_search.with_access_policy(policy);
+                            }
+                            if let Some(ref handle) = delegate_handle {
+                                let delegate_tools = std::sync::Arc::clone(handle);
+                                tool_search = tool_search.with_activation_hook(
+                                    std::sync::Arc::new(move |tool| {
+                                        let mut tools = delegate_tools.write();
+                                        let already_registered = tools
+                                            .iter()
+                                            .any(|existing| existing.name() == tool.name());
+                                        if !already_registered {
+                                            tools.push(tool);
+                                        }
+                                    }),
+                                );
                             }
                             tools_registry.push(Box::new(tool_search));
                         }
@@ -1487,9 +1585,14 @@ pub async fn run(
                 system_prompt = format!("{prefix}\n\n{system_prompt}");
             }
 
+            let runtime_capability_names = tools_registry
+                .iter()
+                .map(|tool| tool.name())
+                .collect::<Vec<_>>();
             if let Some(suggestion) = crate::skills::render_missing_skill_install_suggestion(
                 &effective_msg,
                 &skills,
+                &runtime_capability_names,
                 &config.data_dir,
                 config.skills.install_suggestions.enabled,
             ) {
@@ -1505,7 +1608,8 @@ pub async fn run(
                 && !zeroclaw_memory::should_skip_autosave_content(&effective_msg)
             {
                 let user_key = autosave_memory_key("user_msg");
-                let _ = mem
+                let store_start = std::time::Instant::now();
+                let store_result = mem
                     .store(
                         &user_key,
                         &effective_msg,
@@ -1513,6 +1617,12 @@ pub async fn run(
                         memory_session_id.as_deref(),
                     )
                     .await;
+                observer.record_event(&ObserverEvent::MemoryStore {
+                    category: MemoryCategory::Conversation.to_string(),
+                    backend: mem.name().to_string(),
+                    duration: store_start.elapsed(),
+                    success: store_result.is_ok(),
+                });
             }
 
             // Inject memory + hardware RAG context into user message.
@@ -1525,6 +1635,7 @@ pub async fn run(
             let exclude_conv = !interactive || memory_session_id.is_none();
             let mem_context = build_context(
                 mem.as_ref(),
+                &*observer,
                 &effective_msg,
                 config.memory.min_relevance_score,
                 memory_session_id.as_deref(),
@@ -1534,7 +1645,9 @@ pub async fn run(
             let rag_limit = if eff_compact_context { 2 } else { 5 };
             let hw_context = hardware_rag
                 .as_ref()
-                .map(|r| build_hardware_context(r, &effective_msg, &board_names, rag_limit))
+                .map(|r| {
+                    build_hardware_context(r, &*observer, &effective_msg, &board_names, rag_limit)
+                })
                 .unwrap_or_default();
             let context = format!("{mem_context}{hw_context}");
             let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
@@ -1718,9 +1831,54 @@ pub async fn run(
                     }
                 }
             }
+            // Emit the user-visible response before any background work so the
+            // skill-review fork can never delay the user's answer.
             final_output = response;
             println!("{final_output}");
             observer.record_event(&ObserverEvent::TurnComplete);
+
+            // Background skill review fork — post-turn, opt-in
+            // (`skills.skill-improvement.enabled`, default false). Runs a forked
+            // agent with a restricted toolset (skills_list, skill_view,
+            // skill_manage) over a snapshot of the conversation and decides
+            // whether to patch SKILL.md, add a support file, or do nothing.
+            //
+            // Scoped under TOOL_LOOP_COST_TRACKING_CONTEXT with the same
+            // `cost_tracking_context` as the parent turn, so the fork's provider
+            // calls are recorded against — and bounded by — the same cost
+            // tracker and budget (the scope wrapping the parent turn's
+            // `run_tool_call_loop` has already exited by this point).
+            // See `crate::skills::review::maybe_run_skill_review`.
+            if config.skills.skill_improvement.enabled {
+                let review_workspace = config.agent_workspace_dir(agent_alias);
+                let review_config = config.skills.skill_improvement.clone();
+                let failed_slugs: Vec<String> =
+                    crate::skills::improver::extract_skill_executions_from_history(&history)
+                        .into_iter()
+                        .filter_map(|(slug, ok)| if ok { None } else { Some(slug) })
+                        .collect();
+                TOOL_LOOP_COST_TRACKING_CONTEXT
+                    .scope(
+                        cost_tracking_context.clone(),
+                        crate::skills::review::maybe_run_skill_review(
+                            review_workspace,
+                            review_config,
+                            config.skills.allow_scripts,
+                            history.clone(),
+                            failed_slugs,
+                            model_provider.as_ref(),
+                            &provider_name,
+                            &model_name,
+                            observer.as_ref(),
+                            &config.multimodal,
+                            &config.pacing,
+                            agent.resolved.max_tool_result_chars,
+                            agent.resolved.max_context_tokens,
+                            None, // cancellation_token — no parent token in single-shot run
+                        ),
+                    )
+                    .await;
+            }
         } else {
             println!("🦀 ZeroClaw Interactive Mode");
             println!("Type /help for commands.\n");
@@ -1862,9 +2020,14 @@ pub async fn run(
                     }
                 }
 
+                let runtime_capability_names = tools_registry
+                    .iter()
+                    .map(|tool| tool.name())
+                    .collect::<Vec<_>>();
                 if let Some(suggestion) = crate::skills::render_missing_skill_install_suggestion(
                     &effective_input,
                     &skills,
+                    &runtime_capability_names,
                     &config.data_dir,
                     config.skills.install_suggestions.enabled,
                 ) {
@@ -1896,7 +2059,8 @@ pub async fn run(
                     && !zeroclaw_memory::should_skip_autosave_content(&effective_input)
                 {
                     let user_key = autosave_memory_key("user_msg");
-                    let _ = mem
+                    let store_start = std::time::Instant::now();
+                    let store_result = mem
                         .store(
                             &user_key,
                             &effective_input,
@@ -1904,6 +2068,12 @@ pub async fn run(
                             memory_session_id.as_deref(),
                         )
                         .await;
+                    observer.record_event(&ObserverEvent::MemoryStore {
+                        category: MemoryCategory::Conversation.to_string(),
+                        backend: mem.name().to_string(),
+                        duration: store_start.elapsed(),
+                        success: store_result.is_ok(),
+                    });
                 }
 
                 // Inject memory + hardware RAG context into user message.
@@ -1912,6 +2082,7 @@ pub async fn run(
                 // Discord, …) would bleed into this interactive session.
                 let mem_context = build_context(
                     mem.as_ref(),
+                    &*observer,
                     &effective_input,
                     config.memory.min_relevance_score,
                     memory_session_id.as_deref(),
@@ -1921,7 +2092,15 @@ pub async fn run(
                 let rag_limit = if eff_compact_context { 2 } else { 5 };
                 let hw_context = hardware_rag
                     .as_ref()
-                    .map(|r| build_hardware_context(r, &effective_input, &board_names, rag_limit))
+                    .map(|r| {
+                        build_hardware_context(
+                            r,
+                            &*observer,
+                            &effective_input,
+                            &board_names,
+                            rag_limit,
+                        )
+                    })
                     .unwrap_or_default();
                 let context = format!("{mem_context}{hw_context}");
                 let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
@@ -2247,10 +2426,7 @@ pub async fn process_message(
     session_id: Option<&str>,
 ) -> Result<String> {
     use ::zeroclaw_log::Instrument;
-    let agent = config
-        .agent(agent_alias)
-        .with_context(|| format!("agents.{agent_alias} is not configured"))?
-        .clone();
+    let agent = resolved_agent_for_turn(&config, agent_alias)?;
     crate::agent::thinking::validate_thinking_config(&agent.resolved.thinking);
     let risk_profile = config
         .risk_profile_for_agent(agent_alias)
@@ -2295,14 +2471,9 @@ pub async fn process_message(
 
         // ── Effective per-agent runtime tunables ──────────────────────
         // Profile values (when set) override the agent's inline fields.
-        // See `Config::effective_*` helpers for precedence rules.
-        let _eff_max_tool_iterations = config.effective_max_tool_iterations(agent_alias);
-        let _eff_max_history_messages = config.effective_max_history_messages(agent_alias);
-        let _eff_max_context_tokens = config.effective_max_context_tokens(agent_alias);
-        let eff_compact_context = config.effective_compact_context(agent_alias);
-        let eff_max_system_prompt_chars = config.effective_max_system_prompt_chars(agent_alias);
-        let _eff_max_tool_result_chars = config.effective_max_tool_result_chars(agent_alias);
-        let _eff_tool_call_dedup_exempt = config.effective_tool_call_dedup_exempt(agent_alias);
+        // See `Config::resolved_agent_config` for precedence rules.
+        let eff_compact_context = agent.resolved.compact_context;
+        let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
 
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
@@ -2345,6 +2516,19 @@ pub async fn process_message(
         } else {
             (None, None)
         };
+
+        // Build SOP engine when sops_dir is configured so SOP tools are
+        // available on this path (process_message CLI agent).
+        let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
+            let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
+                zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
+            let (engine, audit) =
+                crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, sop_mem);
+            (Some(engine), Some(audit))
+        } else {
+            (None, None)
+        };
+
         let all_tools_result_pm = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
@@ -2366,6 +2550,8 @@ pub async fn process_message(
             None,
             false,
             None,
+            sop_engine,
+            sop_audit,
         );
         let mut tools_registry = all_tools_result_pm.tools;
         let delegate_handle_pm = all_tools_result_pm.delegate_handle;
@@ -2466,6 +2652,20 @@ pub async fn process_message(
                                 crate::tools::ToolSearchTool::new(deferred_set, activated);
                             if let Some(policy) = mcp_policy_pm {
                                 tool_search_pm = tool_search_pm.with_access_policy(policy);
+                            }
+                            if let Some(ref handle) = delegate_handle_pm {
+                                let delegate_tools = std::sync::Arc::clone(handle);
+                                tool_search_pm = tool_search_pm.with_activation_hook(
+                                    std::sync::Arc::new(move |tool| {
+                                        let mut tools = delegate_tools.write();
+                                        let already_registered = tools
+                                            .iter()
+                                            .any(|existing| existing.name() == tool.name());
+                                        if !already_registered {
+                                            tools.push(tool);
+                                        }
+                                    }),
+                                );
                             }
                             tools_registry.push(Box::new(tool_search_pm));
                         }
@@ -2762,9 +2962,14 @@ pub async fn process_message(
         }
 
         let effective_msg_ref = effective_message.as_str();
+        let runtime_capability_names = tools_registry
+            .iter()
+            .map(|tool| tool.name())
+            .collect::<Vec<_>>();
         if let Some(suggestion) = crate::skills::render_missing_skill_install_suggestion(
             effective_msg_ref,
             &skills,
+            &runtime_capability_names,
             &config.data_dir,
             config.skills.install_suggestions.enabled,
         ) {
@@ -2776,6 +2981,7 @@ pub async fn process_message(
         // user's own Conversation history within their session is intended.
         let mem_context = build_context(
             mem.as_ref(),
+            &*observer,
             effective_msg_ref,
             config.memory.min_relevance_score,
             session_id,
@@ -2785,7 +2991,9 @@ pub async fn process_message(
         let rag_limit = if eff_compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
-            .map(|r| build_hardware_context(r, effective_msg_ref, &board_names, rag_limit))
+            .map(|r| {
+                build_hardware_context(r, &*observer, effective_msg_ref, &board_names, rag_limit)
+            })
             .unwrap_or_default();
         let context = format!("{mem_context}{hw_context}");
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
@@ -2848,10 +3056,10 @@ pub async fn process_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_text_tool_prompt_policy, emergency_history_trim, estimate_history_tokens,
-        fast_trim_tool_results, load_interactive_session_history,
-        maybe_inject_channel_delivery_defaults, save_interactive_session_history,
-        truncate_tool_result,
+        apply_text_tool_prompt_policy, build_context, emergency_history_trim,
+        estimate_history_tokens, fast_trim_tool_results, load_interactive_session_history,
+        make_query_summary, maybe_inject_channel_delivery_defaults,
+        save_interactive_session_history, truncate_tool_result,
     };
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
     use crate::agent::tool_execution::execute_one_tool;
@@ -5288,6 +5496,164 @@ mod tests {
             .lock()
             .expect("recorded args lock should be valid");
         assert_eq!(recorded[0]["delivery"], serde_json::json!({"mode": "none"}));
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_injects_channel_delivery_defaults_for_lark() {
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"cron_add","arguments":{"job_type":"agent","prompt":"remind me later","schedule":{"kind":"every","every_ms":60000}}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let recorded_args = Arc::new(Mutex::new(Vec::new()));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingArgsTool::new(
+            "cron_add",
+            Arc::clone(&recorded_args),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("schedule a reminder"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &model_provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "lark",
+            Some("chat-99"),
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            false,
+            false, // parallel_tools
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
+        )
+        .await
+        .expect("lark cron_add delivery defaults should be injected");
+
+        assert!(
+            result.ends_with("done"),
+            "result should end with 'done', got: {result}"
+        );
+
+        let recorded = recorded_args
+            .lock()
+            .expect("recorded args lock should be valid");
+        let delivery = recorded[0]["delivery"].clone();
+        assert_eq!(
+            delivery,
+            serde_json::json!({
+                "mode": "announce",
+                "channel": "lark",
+                "to": "chat-99",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_injects_channel_delivery_defaults_for_feishu() {
+        let model_provider = ScriptedModelProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"cron_add","arguments":{"job_type":"agent","prompt":"feishu reminder","schedule":{"kind":"every","every_ms":60000}}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let recorded_args = Arc::new(Mutex::new(Vec::new()));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingArgsTool::new(
+            "cron_add",
+            Arc::clone(&recorded_args),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("schedule a feishu reminder"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &model_provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            None,
+            "feishu",
+            Some("chat-77"),
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            false,
+            false, // parallel_tools
+            0,
+            0,
+            None,
+            None, // channel
+            None, // receipt_generator
+            None, // collected_receipts
+            None, // event_tx
+            None, // steering
+            None, // new_messages_out
+            &LoopKnobs::default(),
+            None,
+        )
+        .await
+        .expect("feishu cron_add delivery defaults should be injected");
+
+        assert!(
+            result.ends_with("done"),
+            "result should end with 'done', got: {result}"
+        );
+
+        let recorded = recorded_args
+            .lock()
+            .expect("recorded args lock should be valid");
+        let delivery = recorded[0]["delivery"].clone();
+        assert_eq!(
+            delivery,
+            serde_json::json!({
+                "mode": "announce",
+                "channel": "feishu",
+                "to": "chat-77",
+            })
+        );
     }
 
     #[tokio::test]
@@ -8735,7 +9101,7 @@ This is an example, not an invocation."#;
         .await
         .unwrap();
 
-        let context = build_context(&mem, "status updates", 0.0, None, false).await;
+        let context = build_context(&mem, &NoopObserver, "status updates", 0.0, None, false).await;
         assert!(context.contains("user_preference"));
         assert!(!context.contains("assistant_resp_poisoned"));
         assert!(!context.contains("fabricated event"));
@@ -8770,7 +9136,7 @@ This is an example, not an invocation."#;
         .await
         .unwrap();
 
-        let context = build_context(&mem, "answers", 0.0, None, false).await;
+        let context = build_context(&mem, &NoopObserver, "answers", 0.0, None, false).await;
         assert!(context.contains("user_preference"));
         assert!(!context.contains("user_msg"));
         assert!(!context.contains("embedding prior context"));
@@ -8805,7 +9171,7 @@ This is an example, not an invocation."#;
         .await
         .unwrap();
 
-        let context = build_context(&mem, "Alice on-call", 0.0, None, true).await;
+        let context = build_context(&mem, &NoopObserver, "Alice on-call", 0.0, None, true).await;
         assert!(
             !context.contains("Alice"),
             "Conversation memory leaked into scheduled context: {context}"
@@ -8817,6 +9183,220 @@ This is an example, not an invocation."#;
         assert!(
             context.contains("team_oncall"),
             "Non-Conversation memory should still surface: {context}"
+        );
+    }
+
+    #[test]
+    fn make_query_summary_redacts_credentials_and_caps_length() {
+        // Empty input → None (so observers can distinguish "no query
+        // recorded" from "empty query string").
+        assert!(make_query_summary("").is_none());
+
+        // Plain query passes through unchanged when within the cap.
+        let plain = make_query_summary("hello world").unwrap();
+        assert_eq!(plain, "hello world");
+
+        // Credential pattern is scrubbed by `scrub_credentials` before
+        // the truncation step. The raw token must not appear in the
+        // emitted summary.
+        let scrubbed =
+            make_query_summary("connect with api_key: sk-proj-abcdef1234567890zzz").unwrap();
+        assert!(
+            !scrubbed.contains("sk-proj-abcdef1234567890zzz"),
+            "raw credential leaked into query_summary: {scrubbed:?}"
+        );
+
+        // Long input is truncated. `truncate_with_ellipsis(s, 200)` keeps up
+        // to 200 content chars and appends "..." when it had to truncate,
+        // for a total ceiling of 203 chars.
+        let long_input = "a".repeat(500);
+        let truncated = make_query_summary(&long_input).unwrap();
+        assert!(
+            truncated.chars().count() <= 203,
+            "expected ≤203 chars (200 content + ellipsis), got {}",
+            truncated.chars().count()
+        );
+        assert!(
+            truncated.ends_with("..."),
+            "expected trailing ellipsis on truncated input, got {truncated:?}"
+        );
+    }
+
+    /// Captured `MemoryRecall` event used by the wiring-contract tests below.
+    struct CapturedRecall {
+        query_summary: Option<String>,
+        backend: String,
+        success: bool,
+    }
+
+    /// Counting observer that records every `MemoryRecall` event so the test
+    /// can assert that the runtime hot path emits the variant once per
+    /// `build_context` call. Locks in the wiring contract that motivated the
+    /// memory-OTel work.
+    #[derive(Default)]
+    struct RecallCountingObserver {
+        recalls: parking_lot::Mutex<Vec<CapturedRecall>>,
+    }
+
+    impl crate::observability::Observer for RecallCountingObserver {
+        fn record_event(&self, event: &crate::observability::ObserverEvent) {
+            if let crate::observability::ObserverEvent::MemoryRecall {
+                query_summary,
+                backend,
+                success,
+                ..
+            } = event
+            {
+                self.recalls.lock().push(CapturedRecall {
+                    query_summary: query_summary.clone(),
+                    backend: backend.clone(),
+                    success: *success,
+                });
+            }
+        }
+
+        fn record_metric(&self, _metric: &zeroclaw_api::observability_traits::ObserverMetric) {}
+
+        fn name(&self) -> &str {
+            "recall-counting-observer"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn build_context_emits_memory_recall_event() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+        let observer = RecallCountingObserver::default();
+
+        let _ = build_context(&mem, &observer, "any query", 0.0, None, false).await;
+
+        let recalls = observer.recalls.lock();
+        assert_eq!(
+            recalls.len(),
+            1,
+            "build_context must emit exactly one MemoryRecall event per call"
+        );
+        assert_eq!(recalls[0].query_summary.as_deref(), Some("any query"));
+        assert_eq!(recalls[0].backend, "sqlite");
+        assert!(
+            recalls[0].success,
+            "successful recall must report success = true"
+        );
+    }
+
+    /// Memory backend whose `recall` always returns `Err`. Used to exercise
+    /// the failure arm of `build_context`'s explicit match — the runtime
+    /// swallows the error and returns an empty context, but observers must
+    /// still see a `MemoryRecall { success: false }` event.
+    struct FailingRecallMemory;
+
+    #[async_trait]
+    impl zeroclaw_memory::Memory for FailingRecallMemory {
+        fn name(&self) -> &str {
+            "failing-recall"
+        }
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
+            anyhow::bail!("simulated recall failure")
+        }
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<zeroclaw_memory::MemoryEntry>> {
+            Ok(None)
+        }
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        async fn health_check(&self) -> bool {
+            false
+        }
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<zeroclaw_memory::MemoryEntry>> {
+            self.recall(query, limit, session_id, since, until).await
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for FailingRecallMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str {
+            "FailingRecallMemory"
+        }
+    }
+
+    #[tokio::test]
+    async fn build_context_emits_memory_recall_event_on_failure() {
+        let mem = FailingRecallMemory;
+        let observer = RecallCountingObserver::default();
+
+        let context = build_context(&mem, &observer, "any query", 0.0, None, false).await;
+        assert!(
+            context.is_empty(),
+            "recall failure must still produce empty context (swallow behavior)"
+        );
+
+        let recalls = observer.recalls.lock();
+        assert_eq!(
+            recalls.len(),
+            1,
+            "build_context must emit exactly one MemoryRecall event even on Err"
+        );
+        assert_eq!(recalls[0].query_summary.as_deref(), Some("any query"));
+        assert_eq!(recalls[0].backend, "failing-recall");
+        assert!(
+            !recalls[0].success,
+            "failed recall must report success = false"
         );
     }
 
@@ -10252,6 +10832,188 @@ Let me check the result."#;
         assert_eq!(result, "ok");
     }
 
+    // ── Skill review fork cost-accounting tests ──
+    //
+    // The post-turn skill-review fork (`crate::skills::review::maybe_run_skill_review`)
+    // runs AFTER the parent turn's `TOOL_LOOP_COST_TRACKING_CONTEXT.scope(...)`
+    // has exited, so `agent::loop_::run` re-scopes it under the SAME
+    // `cost_tracking_context` as the parent turn. These tests pin that wiring:
+    // the fork's provider calls must be recorded against — and bounded by — the
+    // same tracker/budget as the parent.
+
+    fn review_test_pricing() -> crate::agent::cost::ModelProviderPricing {
+        use std::collections::HashMap;
+        let mut model_pricing: HashMap<String, f64> = HashMap::new();
+        model_pricing.insert("mock-model.input".to_string(), 3.0);
+        model_pricing.insert("mock-model.output".to_string(), 15.0);
+        let mut pricing: crate::agent::cost::ModelProviderPricing = HashMap::new();
+        pricing.insert("mock-provider".to_string(), model_pricing);
+        pricing
+    }
+
+    fn review_test_history() -> Vec<ChatMessage> {
+        // One completed tool call so `should_trigger` (threshold 1) fires.
+        vec![
+            ChatMessage::system("test"),
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("..."),
+            ChatMessage {
+                role: "tool".to_string(),
+                content: "ok".to_string(),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn skill_review_fork_records_cost_usage_under_parent_scope() {
+        use super::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
+        use crate::cost::CostTracker;
+        use crate::observability::noop::NoopObserver;
+
+        // Fork's single provider turn returns "Nothing to save." with usage —
+        // no tool calls, so the fork ends after one recorded provider call.
+        let model_provider = ScriptedModelProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                text: Some("Nothing to save.".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(800),
+                    output_tokens: Some(120),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            }]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+        let observer = NoopObserver;
+        let workspace = tempfile::TempDir::new().unwrap();
+        let cost_config = zeroclaw_config::schema::CostConfig {
+            enabled: true,
+            ..zeroclaw_config::schema::CostConfig::default()
+        };
+        let tracker = Arc::new(CostTracker::new(cost_config, workspace.path()).unwrap());
+        let ctx =
+            ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(review_test_pricing()));
+
+        let review_config = zeroclaw_config::schema::SkillImprovementConfig {
+            enabled: true,
+            cooldown_secs: 0,
+            nudge_interval_iterations: 1,
+            max_review_iterations: 2,
+        };
+
+        TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(ctx),
+                crate::skills::review::maybe_run_skill_review(
+                    workspace.path().to_path_buf(),
+                    review_config,
+                    false,
+                    review_test_history(),
+                    Vec::new(),
+                    &model_provider,
+                    "mock-provider",
+                    "mock-model",
+                    &observer,
+                    &zeroclaw_config::schema::MultimodalConfig::default(),
+                    &zeroclaw_config::schema::PacingConfig::default(),
+                    0,
+                    0,
+                    None,
+                ),
+            )
+            .await;
+
+        let summary = tracker.get_summary().unwrap();
+        assert_eq!(
+            summary.request_count, 1,
+            "review fork must record its provider call under the parent cost scope"
+        );
+        assert_eq!(summary.total_tokens, 920);
+        assert!(summary.session_cost_usd > 0.0);
+    }
+
+    #[tokio::test]
+    async fn skill_review_fork_respects_budget_under_parent_scope() {
+        use super::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
+        use crate::cost::CostTracker;
+        use crate::observability::noop::NoopObserver;
+
+        // Provider that WOULD record usage if reached — but the pre-exceeded
+        // budget must block the call before it happens.
+        let model_provider = ScriptedModelProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                text: Some("should not be reached".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(800),
+                    output_tokens: Some(120),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            }]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+        let observer = NoopObserver;
+        let workspace = tempfile::TempDir::new().unwrap();
+        let cost_config = zeroclaw_config::schema::CostConfig {
+            enabled: true,
+            daily_limit_usd: 0.001, // very low limit
+            ..zeroclaw_config::schema::CostConfig::default()
+        };
+        let tracker = Arc::new(CostTracker::new(cost_config, workspace.path()).unwrap());
+        // Record usage that already exceeds the daily limit.
+        tracker
+            .record_usage(crate::cost::types::TokenUsage::new(
+                "mock-model",
+                100_000,
+                50_000,
+                0,
+                1.0,
+                1.0,
+                0.0,
+            ))
+            .unwrap();
+        let before = tracker.get_summary().unwrap().request_count;
+
+        let ctx =
+            ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(review_test_pricing()));
+        let review_config = zeroclaw_config::schema::SkillImprovementConfig {
+            enabled: true,
+            cooldown_secs: 0,
+            nudge_interval_iterations: 1,
+            max_review_iterations: 2,
+        };
+
+        TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(ctx),
+                crate::skills::review::maybe_run_skill_review(
+                    workspace.path().to_path_buf(),
+                    review_config,
+                    false,
+                    review_test_history(),
+                    Vec::new(),
+                    &model_provider,
+                    "mock-provider",
+                    "mock-model",
+                    &observer,
+                    &zeroclaw_config::schema::MultimodalConfig::default(),
+                    &zeroclaw_config::schema::PacingConfig::default(),
+                    0,
+                    0,
+                    None,
+                ),
+            )
+            .await;
+
+        let after = tracker.get_summary().unwrap().request_count;
+        assert_eq!(
+            after, before,
+            "budget-exceeded fork must not make a recorded provider call"
+        );
+    }
+
     // ── apply_policy_tool_filter coverage ─────────────────────
     //
     // The dispatch-site filter must consult both the parent agent's
@@ -10535,6 +11297,37 @@ Let me check the result."#;
             Some("openai"),
             "bare family name would bypass the alias-aware factory path and drop \
              requires_openai_auth from the config, routing to the wrong provider"
+        );
+    }
+
+    #[test]
+    fn direct_turn_agent_config_resolves_runtime_profile_tunables() {
+        use zeroclaw_config::providers::RuntimeProfileRef;
+        use zeroclaw_config::schema::{AliasedAgentConfig, RuntimeProfileConfig};
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.runtime_profiles.insert(
+            "long".to_string(),
+            RuntimeProfileConfig {
+                max_tool_iterations: 25,
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "default".to_string(),
+            AliasedAgentConfig {
+                runtime_profile: RuntimeProfileRef::new("long"),
+                ..Default::default()
+            },
+        );
+
+        let agent = super::resolved_agent_for_turn(&config, "default")
+            .expect("configured agent should resolve for direct turns");
+
+        assert_eq!(
+            agent.resolved.max_tool_iterations, 25,
+            "direct agent turns must honor runtime_profiles.*.max_tool_iterations \
+             instead of the skipped AliasedAgentConfig::resolved default"
         );
     }
 

@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
-use zeroclaw_config::schema::{Config, StreamMode};
+use zeroclaw_config::schema::{Config, StreamMode, TELEGRAM_OFFICIAL_API_BASE_URL};
 use zeroclaw_runtime::security::pairing::PairingGuard;
 
 /// Telegram's maximum message length for text messages
@@ -579,6 +579,10 @@ enum EditMessageResult {
     Failed(reqwest::StatusCode),
 }
 
+fn normalize_telegram_api_base(api_base: &str) -> String {
+    api_base.trim_end_matches('/').to_string()
+}
+
 impl TelegramChannel {
     pub fn new(
         bot_token: String,
@@ -611,7 +615,7 @@ impl TelegramChannel {
             typing_handle: Mutex::new(None),
             mention_only,
             bot_username: Mutex::new(None),
-            api_base: "https://api.telegram.org".to_string(),
+            api_base: TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
             transcription: None,
             transcription_manager: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
@@ -676,7 +680,7 @@ impl TelegramChannel {
     /// Override the Telegram Bot API base URL.
     /// Useful for local Bot API servers or testing.
     pub fn with_api_base(mut self, api_base: String) -> Self {
-        self.api_base = api_base;
+        self.api_base = normalize_telegram_api_base(&api_base);
         self
     }
 
@@ -863,7 +867,8 @@ impl TelegramChannel {
             anyhow::bail!("Cannot persist empty Telegram identity");
         }
         let group_name = format!("telegram_{}", self.alias);
-        let channel_ref = format!("telegram.{}", self.alias);
+        let channel_ref: zeroclaw_config::providers::ChannelRef =
+            format!("telegram.{}", self.alias).into();
         let snapshot = {
             let mut cfg = config.write();
             if !cfg.channels.telegram.contains_key(&self.alias) {
@@ -924,6 +929,7 @@ impl TelegramChannel {
     async fn register_bot_commands(&self) {
         let mut commands: Vec<serde_json::Value> = vec![
             serde_json::json!({ "command": "new",    "description": "Start a new conversation session" }),
+            serde_json::json!({ "command": "clear",  "description": "Clear this conversation session" }),
             serde_json::json!({ "command": "stop",   "description": "Cancel the current in-flight task" }),
             serde_json::json!({ "command": "model",  "description": "Show or switch the current model" }),
             serde_json::json!({ "command": "models", "description": "List available model_providers or switch model_provider" }),
@@ -1624,10 +1630,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
     /// Download a file from the Telegram CDN.
     async fn download_file(&self, file_path: &str) -> anyhow::Result<Vec<u8>> {
-        let url = format!(
-            "https://api.telegram.org/file/bot{}/{file_path}",
-            self.bot_token
-        );
+        let url = format!("{}/file/bot{}/{file_path}", self.api_base, self.bot_token);
         let resp = self
             .http_client()
             .get(&url)
@@ -1870,7 +1873,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             sender: sender_identity,
             reply_target,
             content,
-            channel: "telegram".to_string(),
+            channel: "telegram".into(),
             channel_alias: Some(self.alias.clone()),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2039,7 +2042,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             sender: sender_identity,
             reply_target,
             content,
-            channel: "telegram".to_string(),
+            channel: "telegram".into(),
             channel_alias: Some(self.alias.clone()),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2309,7 +2312,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             sender: sender_identity,
             reply_target,
             content,
-            channel: "telegram".to_string(),
+            channel: "telegram".into(),
             channel_alias: Some(self.alias.clone()),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -4119,7 +4122,7 @@ mod tests {
         config.peer_groups.insert(
             "voicers".to_string(),
             PeerGroupConfig {
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 external_peers: vec![PeerUsername::new("@alice"), PeerUsername::new("@bob")],
                 output_modality: OutputModality::Voice,
                 ..Default::default()
@@ -4129,7 +4132,7 @@ mod tests {
         config.peer_groups.insert(
             "other".to_string(),
             PeerGroupConfig {
-                channel: "signal".to_string(),
+                channel: "signal".into(),
                 external_peers: vec![PeerUsername::new("@carol")],
                 output_modality: OutputModality::Voice,
                 ..Default::default()
@@ -4139,7 +4142,7 @@ mod tests {
         config.peer_groups.insert(
             "mirrorers".to_string(),
             PeerGroupConfig {
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 external_peers: vec![PeerUsername::new("@dave")],
                 output_modality: OutputModality::Mirror,
                 ..Default::default()
@@ -4183,7 +4186,7 @@ mod tests {
         config.peer_groups.insert(
             "voicers".to_string(),
             PeerGroupConfig {
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 external_peers: vec![PeerUsername::new("@alice")],
                 output_modality: OutputModality::Voice,
                 ..Default::default()
@@ -4485,6 +4488,40 @@ mod tests {
         assert_eq!(
             ch.api_url("getMe"),
             "https://api.telegram.org/bot123:ABC/getMe"
+        );
+    }
+
+    #[test]
+    fn telegram_api_url_uses_custom_api_base() {
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "123:ABC".into(),
+            "telegram_test_alias",
+            Arc::new(Vec::new),
+            mention_only,
+        )
+        .with_api_base("http://127.0.0.1:8081".to_string());
+
+        assert_eq!(
+            ch.api_url("getMe"),
+            "http://127.0.0.1:8081/bot123:ABC/getMe"
+        );
+    }
+
+    #[test]
+    fn telegram_api_url_normalizes_custom_api_base_trailing_slash() {
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "123:ABC".into(),
+            "telegram_test_alias",
+            Arc::new(Vec::new),
+            mention_only,
+        )
+        .with_api_base("http://127.0.0.1:8081/".to_string());
+
+        assert_eq!(
+            ch.api_url("getMe"),
+            "http://127.0.0.1:8081/bot123:ABC/getMe"
         );
     }
 
@@ -7283,6 +7320,7 @@ mod tests {
         let expected_body = serde_json::json!({
             "commands": [
                 { "command": "new",    "description": "Start a new conversation session" },
+                { "command": "clear",  "description": "Clear this conversation session" },
                 { "command": "stop",   "description": "Cancel the current in-flight task" },
                 { "command": "model",  "description": "Show or switch the current model" },
                 { "command": "models", "description": "List available model_providers or switch model_provider" },
@@ -7444,6 +7482,7 @@ mod tests {
         let expected_body = serde_json::json!({
             "commands": [
                 { "command": "new",     "description": "Start a new conversation session" },
+                { "command": "clear",   "description": "Clear this conversation session" },
                 { "command": "stop",    "description": "Cancel the current in-flight task" },
                 { "command": "model",   "description": "Show or switch the current model" },
                 { "command": "models",  "description": "List available model_providers or switch model_provider" },
@@ -7486,6 +7525,7 @@ mod tests {
         let expected_body = serde_json::json!({
             "commands": [
                 { "command": "new",       "description": "Start a new conversation session" },
+                { "command": "clear",     "description": "Clear this conversation session" },
                 { "command": "stop",      "description": "Cancel the current in-flight task" },
                 { "command": "model",     "description": "Show or switch the current model" },
                 { "command": "models",    "description": "List available model_providers or switch model_provider" },

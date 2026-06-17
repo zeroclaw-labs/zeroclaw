@@ -18,15 +18,16 @@ use super::schema::{
     LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
     LmstudioModelProviderConfig, MinimaxModelProviderConfig, MistralModelProviderConfig,
     ModelProviderConfig, MoonshotModelProviderConfig, MorphModelProviderConfig,
-    NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
-    NvidiaModelProviderConfig, OllamaModelProviderConfig, OpenAIModelProviderConfig,
-    OpenRouterModelProviderConfig, OpencodeModelProviderConfig, OsaurusModelProviderConfig,
-    OvhModelProviderConfig, PerplexityModelProviderConfig, QianfanModelProviderConfig,
-    QwenModelProviderConfig, RekaModelProviderConfig, SambanovaModelProviderConfig,
-    SglangModelProviderConfig, SiliconflowModelProviderConfig, StepfunModelProviderConfig,
-    SyntheticModelProviderConfig, TelnyxModelProviderConfig, TogetherModelProviderConfig,
-    UpstageModelProviderConfig, VeniceModelProviderConfig, VercelModelProviderConfig,
-    VllmModelProviderConfig, XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    NearaiModelProviderConfig, NebiusModelProviderConfig, NovitaModelProviderConfig,
+    NscaleModelProviderConfig, NvidiaModelProviderConfig, OllamaModelProviderConfig,
+    OpenAIModelProviderConfig, OpenRouterModelProviderConfig, OpencodeModelProviderConfig,
+    OsaurusModelProviderConfig, OvhModelProviderConfig, PerplexityModelProviderConfig,
+    QianfanModelProviderConfig, QwenModelProviderConfig, RekaModelProviderConfig,
+    SambanovaModelProviderConfig, SglangModelProviderConfig, SiliconflowModelProviderConfig,
+    StepfunModelProviderConfig, SyntheticModelProviderConfig, TelnyxModelProviderConfig,
+    TogetherModelProviderConfig, UpstageModelProviderConfig, VeniceModelProviderConfig,
+    VercelModelProviderConfig, VllmModelProviderConfig, XaiModelProviderConfig,
+    YiModelProviderConfig, ZaiModelProviderConfig,
 };
 use super::schema::{
     AssemblyAiTranscriptionProviderConfig, DeepgramTranscriptionProviderConfig,
@@ -154,6 +155,8 @@ define_provider_ref!(ModelProviderRef, "providers.models");
 define_provider_ref!(TtsProviderRef, "providers.tts");
 define_provider_ref!(TranscriptionProviderRef, "providers.transcription");
 define_provider_ref!(ChannelRef, "channels");
+define_provider_ref!(RiskProfileRef, "risk_profiles");
+define_provider_ref!(RuntimeProfileRef, "runtime_profiles");
 
 /// Hard ceiling on `providers.models.<alias>.fallback` chain depth. The cycle
 /// guard only bounds chains that loop; a long acyclic chain would otherwise
@@ -226,6 +229,7 @@ macro_rules! for_each_model_provider_slot {
             (avian, "avian", AvianModelProviderConfig),
             (deepmyst, "deepmyst", DeepmystModelProviderConfig),
             (venice, "venice", VeniceModelProviderConfig),
+            (nearai, "nearai", NearaiModelProviderConfig),
             (novita, "novita", NovitaModelProviderConfig),
             (nvidia, "nvidia", NvidiaModelProviderConfig),
             (vercel, "vercel", VercelModelProviderConfig),
@@ -624,6 +628,15 @@ pub struct TranscriptionProviders {
     pub local_whisper: HashMap<String, LocalWhisperTranscriptionProviderConfig>,
 }
 
+pub enum TranscriptionProviderEntry<'a> {
+    Groq(&'a GroqTranscriptionProviderConfig),
+    OpenAi(&'a OpenAiTranscriptionProviderConfig),
+    Deepgram(&'a DeepgramTranscriptionProviderConfig),
+    AssemblyAi(&'a AssemblyAiTranscriptionProviderConfig),
+    Google(&'a GoogleTranscriptionProviderConfig),
+    LocalWhisper(&'a LocalWhisperTranscriptionProviderConfig),
+}
+
 impl TranscriptionProviders {
     /// True when no slot has any entry.
     pub fn is_empty(&self) -> bool {
@@ -657,6 +670,116 @@ impl TranscriptionProviders {
             out.push(("local_whisper", k.as_str()));
         }
         out.into_iter()
+    }
+
+    pub fn iter_entries(
+        &self,
+    ) -> Box<dyn Iterator<Item = (&'static str, &str, TranscriptionProviderEntry<'_>)> + '_> {
+        Box::new(
+            std::iter::empty()
+                .chain(self.groq.iter().map(|(alias, config)| {
+                    (
+                        "groq",
+                        alias.as_str(),
+                        TranscriptionProviderEntry::Groq(config),
+                    )
+                }))
+                .chain(self.openai.iter().map(|(alias, config)| {
+                    (
+                        "openai",
+                        alias.as_str(),
+                        TranscriptionProviderEntry::OpenAi(config),
+                    )
+                }))
+                .chain(self.deepgram.iter().map(|(alias, config)| {
+                    (
+                        "deepgram",
+                        alias.as_str(),
+                        TranscriptionProviderEntry::Deepgram(config),
+                    )
+                }))
+                .chain(self.assemblyai.iter().map(|(alias, config)| {
+                    (
+                        "assemblyai",
+                        alias.as_str(),
+                        TranscriptionProviderEntry::AssemblyAi(config),
+                    )
+                }))
+                .chain(self.google.iter().map(|(alias, config)| {
+                    (
+                        "google",
+                        alias.as_str(),
+                        TranscriptionProviderEntry::Google(config),
+                    )
+                }))
+                .chain(self.local_whisper.iter().map(|(alias, config)| {
+                    (
+                        "local_whisper",
+                        alias.as_str(),
+                        TranscriptionProviderEntry::LocalWhisper(config),
+                    )
+                })),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcription_iter_entries_walks_every_typed_slot() {
+        let mut providers = TranscriptionProviders::default();
+        providers
+            .groq
+            .insert("fast".into(), GroqTranscriptionProviderConfig::default());
+        providers.openai.insert(
+            "whisper".into(),
+            OpenAiTranscriptionProviderConfig::default(),
+        );
+        providers.deepgram.insert(
+            "nova".into(),
+            DeepgramTranscriptionProviderConfig::default(),
+        );
+        providers.assemblyai.insert(
+            "default".into(),
+            AssemblyAiTranscriptionProviderConfig::default(),
+        );
+        providers.google.insert(
+            "speech".into(),
+            GoogleTranscriptionProviderConfig::default(),
+        );
+        providers.local_whisper.insert(
+            "lan".into(),
+            LocalWhisperTranscriptionProviderConfig::default(),
+        );
+
+        let entries: Vec<(&str, String, &str)> = providers
+            .iter_entries()
+            .map(|(family, alias, entry)| {
+                let variant = match entry {
+                    TranscriptionProviderEntry::Groq(_) => "groq",
+                    TranscriptionProviderEntry::OpenAi(_) => "openai",
+                    TranscriptionProviderEntry::Deepgram(_) => "deepgram",
+                    TranscriptionProviderEntry::AssemblyAi(_) => "assemblyai",
+                    TranscriptionProviderEntry::Google(_) => "google",
+                    TranscriptionProviderEntry::LocalWhisper(_) => "local_whisper",
+                };
+                (family, alias.to_string(), variant)
+            })
+            .collect();
+
+        assert_eq!(
+            entries,
+            vec![
+                ("groq", "fast".into(), "groq"),
+                ("openai", "whisper".into(), "openai"),
+                ("deepgram", "nova".into(), "deepgram"),
+                ("assemblyai", "default".into(), "assemblyai"),
+                ("google", "speech".into(), "google"),
+                ("local_whisper", "lan".into(), "local_whisper"),
+            ]
+        );
     }
 }
 

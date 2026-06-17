@@ -115,8 +115,9 @@ impl Tool for SpawnSubagentTool {
             });
         }
 
-        // risk_profile gate: a parent's risk_profile.allowed_tools that
-        // omits `spawn_subagent` must refuse pre-spawn. The agent-loop
+        // Risk-profile tool gate: a non-empty allowed_tools list that omits
+        // `spawn_subagent`, or an excluded_tools list that names it, must
+        // refuse pre-spawn. The agent-loop
         // dispatch filter (apply_policy_tool_filter) already drops the
         // tool from the registry when the policy excludes it, but this
         // tool also runs from cron and other registry construction
@@ -267,7 +268,7 @@ mod tests {
         config.agents.insert(
             alias.to_string(),
             AliasedAgentConfig {
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..AliasedAgentConfig::default()
             },
         );
@@ -370,7 +371,7 @@ mod tests {
         );
     }
 
-    // ── risk_profile.allowed_tools gates spawn_subagent ──
+    // ── risk-profile tool gates spawn_subagent ──
 
     fn config_with_allowed_tools(alias: &str, allowed_tools: Vec<String>) -> Config {
         let mut config = Config::default();
@@ -384,7 +385,7 @@ mod tests {
         config.agents.insert(
             alias.to_string(),
             AliasedAgentConfig {
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..AliasedAgentConfig::default()
             },
         );
@@ -393,9 +394,9 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_when_risk_profile_excludes_spawn_subagent() {
-        // Parent's risk_profile.allowed_tools omits "spawn_subagent" —
-        // the tool itself refuses pre-spawn so the dispatch-site filter
-        // doesn't have to be the only line of defense.
+        // Parent's non-empty risk_profile.allowed_tools omits
+        // "spawn_subagent" — the tool itself refuses pre-spawn so the
+        // dispatch-site filter doesn't have to be the only line of defense.
         let config = config_with_allowed_tools("alpha", vec!["shell".into()]);
         let tool = SpawnSubagentTool::new(
             Arc::new(config),

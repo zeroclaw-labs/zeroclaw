@@ -315,6 +315,9 @@ fn handle_add(
         author,
         version: Some(version.unwrap_or_else(|| "0.1.0".to_string())),
         category,
+        // Scaffold creates a tagless skill; tags (including the `slash` opt-in
+        // for #7490 slash commands) are managed in the dashboard skills editor.
+        tags: Vec::new(),
     };
 
     let skill_dir = service.scaffold_skill(
@@ -543,10 +546,45 @@ fn prompt_for_description(description: Option<String>) -> Result<String> {
 }
 
 fn open_in_editor(path: &std::path::Path) -> Result<()> {
-    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let Some(editor) = editor_from_env_or_path() else {
+        anyhow::bail!("no editor found; set VISUAL or EDITOR");
+    };
     let status = std::process::Command::new(&editor).arg(path).status()?;
     if !status.success() {
         anyhow::bail!("{editor} exited with non-zero status");
     }
     Ok(())
+}
+
+fn editor_from_env_or_path() -> Option<String> {
+    std::env::var("VISUAL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .or_else(|| {
+            fallback_editors()
+                .iter()
+                .copied()
+                .find(|candidate| executable_on_path(candidate))
+                .map(str::to_string)
+        })
+}
+
+fn executable_on_path(name: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())
+}
+
+fn fallback_editors() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["notepad.exe", "nano", "vim"]
+    } else {
+        &["nano", "vi", "vim", "editor"]
+    }
 }

@@ -5,6 +5,7 @@ use crate::approval::ApprovalManager;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
 use crate::security::SecurityPolicy;
+use crate::sop::{SopAuditLogger, SopEngine};
 use crate::tools::{self, Tool};
 use anyhow::{Context, Result};
 use chrono::{Datelike, Timelike};
@@ -125,6 +126,21 @@ impl TurnGuard {
 impl Drop for TurnGuard {
     fn drop(&mut self) {
         self.fire();
+    }
+}
+
+/// Resolve the tool dispatcher with the same provider-capability fallback
+/// used by fresh agent construction.
+#[must_use]
+pub fn tool_dispatcher_for_provider(
+    agent_cfg: &zeroclaw_config::schema::AliasedAgentConfig,
+    model_provider: &dyn ModelProvider,
+) -> Box<dyn ToolDispatcher> {
+    match agent_cfg.resolved.tool_dispatcher.as_str() {
+        "native" => Box::new(NativeToolDispatcher),
+        "xml" => Box::new(XmlToolDispatcher),
+        _ if model_provider.supports_native_tools() => Box::new(NativeToolDispatcher),
+        _ => Box::new(XmlToolDispatcher),
     }
 }
 
@@ -783,12 +799,17 @@ impl Agent {
     ) {
         let context = self
             .memory_strategy
-            .load_context(user_message, self.memory_session_id.as_deref())
+            .load_context(
+                &*self.observer,
+                user_message,
+                self.memory_session_id.as_deref(),
+            )
             .await
             .unwrap_or_default();
 
         if self.auto_save {
-            let _ = self
+            let store_start = std::time::Instant::now();
+            let store_result = self
                 .memory
                 .store(
                     "user_msg",
@@ -797,6 +818,12 @@ impl Agent {
                     self.memory_session_id.as_deref(),
                 )
                 .await;
+            self.observer.record_event(&ObserverEvent::MemoryStore {
+                category: MemoryCategory::Conversation.to_string(),
+                backend: self.memory.name().to_string(),
+                duration: store_start.elapsed(),
+                success: store_result.is_ok(),
+            });
         }
 
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
@@ -834,6 +861,10 @@ impl Agent {
 
     pub fn set_model_provider_name(&mut self, model_provider_name: String) {
         self.model_provider_name = model_provider_name;
+    }
+
+    pub fn set_tool_dispatcher(&mut self, tool_dispatcher: Box<dyn ToolDispatcher>) {
+        self.tool_dispatcher = tool_dispatcher;
     }
 
     /// Return the names of all registered tools.  Test-only — avoids
@@ -928,6 +959,8 @@ impl Agent {
             false,
             false,
             None,
+            None,
+            None,
         )
         .await
     }
@@ -938,12 +971,18 @@ impl Agent {
     /// When `exclude_memory` is `true`, the agent is constructed without
     /// persistent memory: `NoneMemory` backend, auto-save off, and all
     /// `memory_*` tools stripped. ACP sessions pass `true`.
+    ///
+    /// `sop_engine` and `sop_audit` are optional shared handles from the daemon.
+    /// When `Some`, the agent session uses the daemon's unified SOP engine.
+    /// When `None`, the agent builds its own engine from config (CLI/standalone).
     pub async fn from_config_with_session_cwd_and_mcp_backchannel(
         config: &Config,
         agent_alias: &str,
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
         exclude_memory: bool,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
     ) -> Result<Self> {
         Self::from_config_with_session_cwd_and_mcp_approval_mode(
             config,
@@ -953,6 +992,8 @@ impl Agent {
             true,
             exclude_memory,
             None,
+            sop_engine,
+            sop_audit,
         )
         .await
     }
@@ -968,6 +1009,8 @@ impl Agent {
         initialize_mcp: bool,
         exclude_memory: bool,
         tui_env: Option<std::collections::HashMap<String, String>>,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
     ) -> Result<Self> {
         Self::from_config_with_session_cwd_and_mcp_approval_mode(
             config,
@@ -977,6 +1020,8 @@ impl Agent {
             true,
             exclude_memory,
             tui_env,
+            sop_engine,
+            sop_audit,
         )
         .await
     }
@@ -989,6 +1034,8 @@ impl Agent {
         approval_backchannel: bool,
         exclude_memory: bool,
         tui_env: Option<std::collections::HashMap<String, String>>,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
     ) -> Result<Self> {
         let agent_cfg = config
             .agent(agent_alias)
@@ -1081,6 +1128,22 @@ impl Agent {
             None
         };
 
+        // Build SOP engine when sops_dir is configured so SOP tools are
+        // available on this path (WebSocket/daemon sessions).
+        // If caller provided an engine (daemon path), use it; otherwise
+        // build our own (CLI/standalone path).
+        let (sop_engine, sop_audit) = match (sop_engine, sop_audit) {
+            (Some(engine), Some(audit)) => (Some(engine), Some(audit)),
+            (None, None) if config.sop.sops_dir.is_some() => {
+                let mem: Arc<dyn zeroclaw_memory::Memory> =
+                    zeroclaw_memory::create_memory_for_agent(config, agent_alias, None).await?;
+                let (engine, audit) =
+                    crate::sop::build_sop_engine(config.sop.clone(), &config.data_dir, mem);
+                (Some(engine), Some(audit))
+            }
+            _ => (None, None),
+        };
+
         let all_tools_result = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
@@ -1100,6 +1163,8 @@ impl Agent {
             None,
             false,
             tui_env,
+            sop_engine,
+            sop_audit,
         );
         let mut tools = all_tools_result.tools;
         let delegate_handle = all_tools_result.delegate_handle;
@@ -1282,13 +1347,7 @@ impl Agent {
                 &provider_runtime_options,
             )?;
 
-        let dispatcher_choice = agent_cfg.resolved.tool_dispatcher.as_str();
-        let tool_dispatcher: Box<dyn ToolDispatcher> = match dispatcher_choice {
-            "native" => Box::new(NativeToolDispatcher),
-            "xml" => Box::new(XmlToolDispatcher),
-            _ if model_provider.supports_native_tools() => Box::new(NativeToolDispatcher),
-            _ => Box::new(XmlToolDispatcher),
-        };
+        let tool_dispatcher = tool_dispatcher_for_provider(agent_cfg, model_provider.as_ref());
 
         let route_model_by_hint: HashMap<String, String> = config
             .model_routes
@@ -1759,12 +1818,17 @@ impl Agent {
 
         let context = self
             .memory_strategy
-            .load_context(user_message, self.memory_session_id.as_deref())
+            .load_context(
+                &*self.observer,
+                user_message,
+                self.memory_session_id.as_deref(),
+            )
             .await
             .unwrap_or_default();
 
         if self.auto_save {
-            let _ = self
+            let store_start = std::time::Instant::now();
+            let store_result = self
                 .memory
                 .store(
                     "user_msg",
@@ -1773,6 +1837,12 @@ impl Agent {
                     self.memory_session_id.as_deref(),
                 )
                 .await;
+            self.observer.record_event(&ObserverEvent::MemoryStore {
+                category: MemoryCategory::Conversation.to_string(),
+                backend: self.memory.name().to_string(),
+                duration: store_start.elapsed(),
+                success: store_result.is_ok(),
+            });
         }
 
         let now = chrono::Local::now();
@@ -2987,6 +3057,90 @@ mod tests {
         }
     }
 
+    #[test]
+    fn direct_agent_turn_does_not_write_intermediate_native_text_to_stdout() {
+        let current_exe = std::env::current_exe().expect("current test binary path");
+        let output = std::process::Command::new(current_exe)
+            .args([
+                "direct_agent_turn_stdout_boundary_helper_4721",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .expect("helper test process should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            output.status.success(),
+            "helper failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            stdout,
+            stderr
+        );
+        assert!(
+            !stdout.contains("intermediate native narration"),
+            "intermediate native narration leaked to stdout:\n{stdout}"
+        );
+        assert!(
+            stderr.contains("intermediate native narration"),
+            "intermediate native narration was not routed to stderr:\n{stderr}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "subprocess helper for stdout/stderr boundary regression"]
+    async fn direct_agent_turn_stdout_boundary_helper_4721() {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(vec![
+                zeroclaw_providers::ChatResponse {
+                    text: Some("intermediate native narration".into()),
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: "tc1".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                zeroclaw_providers::ChatResponse {
+                    text: Some("final answer".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]),
+        });
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let answer = agent
+            .turn("run the tool")
+            .await
+            .expect("turn should finish");
+        assert_eq!(answer, "final answer");
+    }
+
     struct FailingModelProvider;
 
     #[async_trait]
@@ -3419,7 +3573,7 @@ mod tests {
         );
         let agent_cfg = zeroclaw_config::schema::AliasedAgentConfig {
             model_provider: "custom.default".into(),
-            risk_profile: "test-profile".to_string(),
+            risk_profile: "test-profile".into(),
             ..zeroclaw_config::schema::AliasedAgentConfig::default()
         };
         config.agents.insert("test-agent".to_string(), agent_cfg);
@@ -3485,7 +3639,7 @@ mod tests {
             "test-agent".to_string(),
             AliasedAgentConfig {
                 model_provider: "openai.codex".into(),
-                risk_profile: "test-profile".to_string(),
+                risk_profile: "test-profile".into(),
                 ..AliasedAgentConfig::default()
             },
         );
@@ -5876,6 +6030,7 @@ mod tests {
                     args: std::collections::HashMap::new(),
                     target: None,
                     locked_args: std::collections::HashMap::new(),
+                    timeout_secs: None,
                 })
                 .collect(),
             prompts: vec![],
@@ -5964,6 +6119,7 @@ mod tests {
                 args: std::collections::HashMap::new(),
                 target: Some("shell".to_string()),
                 locked_args: std::collections::HashMap::new(),
+                timeout_secs: None,
             }],
             prompts: vec![],
             location: None,
@@ -6210,6 +6366,7 @@ mod tests {
                 .expect("memory creation should succeed with valid config"),
         );
 
+        let ws_dir = tmp.path().to_path_buf();
         let mut agent_a = Agent::builder()
             .model_provider(Box::new(MockModelProvider {
                 responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
@@ -6228,7 +6385,7 @@ mod tests {
             .observer(Arc::from(crate::observability::NoopObserver {}) as Arc<dyn Observer>)
             .response_cache(Some(cache.clone()))
             .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .workspace_dir(ws_dir.clone())
             .model_name("test-model".into())
             .temperature(Some(0.0))
             .build()
@@ -6252,7 +6409,7 @@ mod tests {
             .observer(observer)
             .response_cache(Some(cache))
             .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .workspace_dir(ws_dir)
             .model_name("test-model".into())
             .temperature(Some(0.0))
             .build()

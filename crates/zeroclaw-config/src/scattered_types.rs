@@ -219,6 +219,37 @@ impl Default for EvalConfig {
     }
 }
 
+fn default_eval_suite_dir() -> String {
+    "evals".to_string()
+}
+fn default_eval_mode() -> String {
+    "replay".to_string()
+}
+
+/// Configuration for the agent evaluation harness (`[eval]`), surfaced via the
+/// `zeroclaw eval` command. Distinct from `[agent.eval]`, which is the in-loop
+/// response-quality scorer.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "eval"]
+pub struct EvalHarnessConfig {
+    /// Default directory of `*.json` trace fixtures used when `--suite` is omitted.
+    #[serde(default = "default_eval_suite_dir")]
+    pub suite_dir: String,
+    /// Default execution mode (`replay` or `live`) used when `--mode` is omitted.
+    #[serde(default = "default_eval_mode")]
+    pub mode: String,
+}
+
+impl Default for EvalHarnessConfig {
+    fn default() -> Self {
+        Self {
+            suite_dir: default_eval_suite_dir(),
+            mode: default_eval_mode(),
+        }
+    }
+}
+
 fn default_cc_enabled() -> bool {
     true
 }
@@ -454,6 +485,24 @@ fn default_max_attachment_bytes() -> usize {
     25 * 1024 * 1024
 }
 
+/// OAuth2 settings for IMAP email authentication (XOAUTH2 / RFC 8628).
+/// Populate these to use OAuth2 bearer tokens instead of plain-password LOGIN.
+/// All major providers (Microsoft, Google) support this flow via device code.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct EmailOAuth2Config {
+    /// OAuth2 application client ID (public client; no secret required for device flow).
+    pub client_id: String,
+    /// Token endpoint for refresh and device-code polling
+    /// (e.g. `https://login.microsoftonline.com/consumers/oauth2/v2.0/token`).
+    pub token_url: String,
+    /// Device-code initiation endpoint
+    /// (e.g. `https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode`).
+    pub device_code_url: String,
+    /// OAuth2 scopes to request (must include `offline_access` for refresh tokens).
+    pub scopes: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, zeroclaw_macros::Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.email"]
@@ -502,6 +551,23 @@ pub struct EmailConfig {
     /// Set to `false` to send plain-text emails instead.
     #[serde(default = "default_true")]
     pub html_body: bool,
+    /// OAuth2 settings for IMAP authentication. When present, IMAP uses
+    /// XOAUTH2 instead of plain LOGIN. Required for providers like
+    /// Outlook/Hotmail that have deprecated password auth.
+    #[serde(default)]
+    pub oauth2: Option<EmailOAuth2Config>,
+    /// When `true`, the daemon never modifies any IMAP flag: not on startup,
+    /// not on message receipt, not ever. It only processes emails that arrive
+    /// after startup (UID >= uid_next at connect time). Existing unread mail
+    /// stays unread; no `\Seen` is set implicitly via RFC822 or explicitly via
+    /// STORE. Think of it as a PA who reads your messages aloud but never
+    /// touches the read/unread indicator.
+    ///
+    /// When `false` (default), the daemon behaves as an active mailbox owner:
+    /// it drains UNSEEN messages on startup (RFC822 fetch, which implicitly
+    /// sets `\Seen`) and processes all new mail as it arrives.
+    #[serde(default)]
+    pub observer_mode: bool,
 }
 
 impl ChannelConfig for EmailConfig {
@@ -534,6 +600,8 @@ impl Default for EmailConfig {
             max_attachment_bytes: default_max_attachment_bytes(),
             excluded_tools: Vec::new(),
             html_body: true,
+            oauth2: None,
+            observer_mode: false,
         }
     }
 }
