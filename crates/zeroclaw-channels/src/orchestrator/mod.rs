@@ -4549,12 +4549,8 @@ async fn process_channel_message_body(
                         ctx.activated_tools.as_ref(),
                         Some(model_switch_callback.clone()),
                         &ctx.pacing,
-                        ctx.prompt_config
-                            .agent(ctx.agent_alias.as_str())
-                            .is_some_and(|agent| agent.resolved.strict_tool_parsing),
-                        ctx.prompt_config
-                            .agent(ctx.agent_alias.as_str())
-                            .is_some_and(|agent| agent.resolved.parallel_tools),
+                        ctx.agent_cfg.resolved.strict_tool_parsing,
+                        ctx.agent_cfg.resolved.parallel_tools,
                         ctx.max_tool_result_chars,
                         ctx.context_token_budget,
                         None, // shared_budget
