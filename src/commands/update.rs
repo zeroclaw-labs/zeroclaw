@@ -571,13 +571,16 @@ async fn validate_binary(path: &Path) -> Result<()> {
 
 /// Read the binary header and verify its architecture matches the host.
 ///
-/// On Linux/FreeBSD this reads the ELF header; on macOS the Mach-O header.
-/// If the binary is for a different architecture, returns a descriptive error
-/// instead of the opaque "Exec format error (os error 8)".
+/// On Linux/FreeBSD this reads the ELF header, on macOS the Mach-O header, and
+/// on Windows the PE/COFF header. If the binary is for a different architecture,
+/// returns a descriptive error instead of the opaque "Exec format error
+/// (os error 8)" (Unix) or its Windows equivalent.
 async fn check_binary_arch(path: &Path) -> Result<()> {
+    // Enough bytes to cover a PE file's DOS stub and reach the COFF machine
+    // field pointed to by `e_lfanew` (well under 4 KiB in practice).
     let header = tokio::fs::read(path)
         .await
-        .map(|bytes| bytes.into_iter().take(32).collect::<Vec<u8>>())
+        .map(|bytes| bytes.into_iter().take(4096).collect::<Vec<u8>>())
         .context("failed to read binary header")?;
 
     if header.len() < 20 {
@@ -599,7 +602,7 @@ async fn check_binary_arch(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Detect the CPU architecture from an ELF or Mach-O binary header.
+/// Detect the CPU architecture from an ELF, Mach-O, or PE binary header.
 fn detect_arch_from_header(header: &[u8]) -> Option<&'static str> {
     // ELF magic: 0x7f 'E' 'L' 'F'
     if header.len() >= 20 && header[0..4] == [0x7f, b'E', b'L', b'F'] {
@@ -623,6 +626,28 @@ fn detect_arch_from_header(header: &[u8]) -> Option<&'static str> {
             0x0100_000C => "aarch64",
             _ => "unknown-macho",
         });
+    }
+
+    // PE (Windows): "MZ" DOS header; the PE header offset is stored at 0x3C and
+    // the COFF machine field follows the "PE\0\0" signature.
+    if header.len() >= 0x40 && header[0] == b'M' && header[1] == b'Z' {
+        let pe_off =
+            u32::from_le_bytes([header[0x3C], header[0x3D], header[0x3E], header[0x3F]]) as usize;
+        if let Some(coff) = pe_off
+            .checked_add(6)
+            .and_then(|end| header.get(pe_off..end))
+        {
+            if &coff[0..4] == b"PE\0\0" {
+                let machine = u16::from_le_bytes([coff[4], coff[5]]);
+                return Some(match machine {
+                    0x8664 => "x86_64",
+                    0xAA64 => "aarch64",
+                    0x014C => "x86",
+                    0x01C0 => "arm",
+                    _ => "unknown-pe",
+                });
+            }
+        }
     }
 
     None
@@ -1222,6 +1247,34 @@ mod tests {
         header[0..4].copy_from_slice(&[0xCF, 0xFA, 0xED, 0xFE]);
         header[4..8].copy_from_slice(&0x0100_000Cu32.to_le_bytes());
         assert_eq!(detect_arch_from_header(&header), Some("aarch64"));
+    }
+
+    fn make_pe_header(machine: u16) -> Vec<u8> {
+        // "MZ" DOS header, e_lfanew at 0x3C pointing to a PE header at 0x40,
+        // "PE\0\0" signature, then the COFF machine field.
+        let mut header = vec![0u8; 0x48];
+        header[0] = b'M';
+        header[1] = b'Z';
+        header[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        header[0x40..0x44].copy_from_slice(b"PE\0\0");
+        header[0x44..0x46].copy_from_slice(&machine.to_le_bytes());
+        header
+    }
+
+    #[test]
+    fn detect_arch_pe_x86_64() {
+        assert_eq!(
+            detect_arch_from_header(&make_pe_header(0x8664)),
+            Some("x86_64")
+        );
+    }
+
+    #[test]
+    fn detect_arch_pe_aarch64() {
+        assert_eq!(
+            detect_arch_from_header(&make_pe_header(0xAA64)),
+            Some("aarch64")
+        );
     }
 
     #[test]
