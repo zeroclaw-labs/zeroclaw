@@ -565,7 +565,10 @@ impl DelegateTool {
 
         let mut resolved = agent_config.resolved.clone();
 
-        if let Some(profile) = self.runtime_profiles.get(agent_config.runtime_profile.as_str()) {
+        if let Some(profile) = self
+            .runtime_profiles
+            .get(agent_config.runtime_profile.as_str())
+        {
             if profile.max_tool_iterations > 0 {
                 resolved.max_tool_iterations = profile.max_tool_iterations;
             }
@@ -4426,7 +4429,9 @@ mod tests {
             target_alias.to_string(),
             AliasedAgentConfig {
                 risk_profile: pick(target_max_actions > caller_max_actions),
-                runtime_profile: RuntimeProfileRef::new(pick(target_max_actions > caller_max_actions)),
+                runtime_profile: RuntimeProfileRef::new(pick(
+                    target_max_actions > caller_max_actions,
+                )),
                 model_provider: "ollama.target".into(),
                 ..AliasedAgentConfig::default()
             },
