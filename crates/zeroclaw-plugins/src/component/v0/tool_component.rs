@@ -6,7 +6,7 @@
 //
 // At construction the component bytes are compiled once and a `ToolPluginPre`
 // is built via `Linker::instantiate_pre`.  Per `execute` call a fresh
-// `Store<PluginLoggingHost>` is created and `pre.instantiate` does only the
+// `Store<PluginHost>` is created and `pre.instantiate` does only the
 // cheap per-instance wiring step.
 
 use std::sync::Arc;
@@ -17,7 +17,8 @@ use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_api::tool_attribution;
 
 use super::bindings::tool::ToolPluginPre;
-use super::logging::{self, PluginLoggingHost};
+use super::plugin_host::{self, PluginHost};
+use super::wrap_plugin;
 use crate::component::engine::ComponentEngine;
 use crate::error::PluginError;
 
@@ -27,9 +28,9 @@ tool_attribution!(ComponentTool, ToolKind::Plugin);
 pub struct ComponentTool {
     engine: Arc<ComponentEngine>,
     /// Pre-instantiated binding compiled from the component bytes once.
-    /// `ToolPluginPre<PluginLoggingHost>` wraps an `InstancePre<PluginLoggingHost>`
+    /// `ToolPluginPre<PluginHost>` wraps an `InstancePre<PluginHost>`
     /// which is `Send + Sync`.
-    pre: Arc<ToolPluginPre<PluginLoggingHost>>,
+    pre: Arc<ToolPluginPre<PluginHost>>,
     name: String,
     description: String,
     parameters_schema: serde_json::Value,
@@ -57,11 +58,11 @@ impl ComponentTool {
         permissions: Vec<crate::FineGrainedPermission>,
     ) -> anyhow::Result<Self> {
         let component = engine.compile(bytes)?;
-        let mut linker = wasmtime::component::Linker::<PluginLoggingHost>::new(engine.engine());
+        let mut linker = wasmtime::component::Linker::<PluginHost>::new(engine.engine());
         wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(PluginError::from)?;
         wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
             .map_err(PluginError::from)?;
-        logging::add_to_linker_tool(&mut linker)?;
+        plugin_host::add_to_linker_tool(&mut linker)?;
 
         // Build the InstancePre once; only cheap per-instance wiring happens
         // in execute().
@@ -71,7 +72,7 @@ impl ComponentTool {
         let pre = Arc::new(ToolPluginPre::new(instance_pre).map_err(PluginError::from)?);
 
         // Probe metadata with a throw-away store.
-        let mut store = wasmtime::Store::new(engine.engine(), PluginLoggingHost::default());
+        let mut store = wasmtime::Store::new(engine.engine(), PluginHost::default());
         let bindings = pre.instantiate(&mut store).map_err(PluginError::from)?;
 
         // Phase 2: read plugin-info exports — canonical source of truth.
@@ -136,8 +137,8 @@ impl Tool for ComponentTool {
         let plugin_version = self.plugin_version.clone();
 
         let permissions = Arc::clone(&self.permissions);
-        logging::wrap_plugin_call(&plugin_name, &plugin_version, "execute", async move {
-            let host = PluginLoggingHost::with_permissions(&permissions).await?;
+        wrap_plugin::wrap_plugin_call(&plugin_name, &plugin_version, "execute", async move {
+            let host = PluginHost::with_permissions(&permissions).await?;
             let mut store = wasmtime::Store::new(engine.engine(), host);
             let bindings = pre.instantiate(&mut store).map_err(PluginError::from)?;
             let exports = bindings.zeroclaw_plugin_tool();

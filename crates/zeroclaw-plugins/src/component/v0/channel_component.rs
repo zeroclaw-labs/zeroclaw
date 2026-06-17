@@ -27,7 +27,7 @@ use super::bindings::channel::{
         MediaAttachment as WitMediaAttachment, SendMessage as WitSendMessage,
     },
 };
-use super::logging::{self, PluginLoggingHost};
+use super::plugin_host::{self, PluginHost};
 use crate::component::engine::ComponentEngine;
 use crate::error::PluginError;
 use crate::{call_plugin, call_plugin_sync};
@@ -38,7 +38,7 @@ use crate::{call_plugin, call_plugin_sync};
 pub struct ComponentChannel {
     alias: String,
     capabilities: ChannelCapabilities,
-    state: Arc<Mutex<(wasmtime::Store<PluginLoggingHost>, ChannelPlugin)>>,
+    state: Arc<Mutex<(wasmtime::Store<PluginHost>, ChannelPlugin)>>,
     /// Canonical plugin name as self-reported by `plugin-info`. Source of truth.
     plugin_name: String,
     /// Plugin version string as self-reported by `plugin-info`. Source of truth.
@@ -71,12 +71,12 @@ impl ComponentChannel {
         permissions: Vec<crate::FineGrainedPermission>,
     ) -> anyhow::Result<Self> {
         let component = engine.compile(bytes)?;
-        let mut linker = wasmtime::component::Linker::<PluginLoggingHost>::new(engine.engine());
+        let mut linker = wasmtime::component::Linker::<PluginHost>::new(engine.engine());
         wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(PluginError::from)?;
         wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
             .map_err(PluginError::from)?;
-        logging::add_to_linker_channel(&mut linker)?;
-        let host = PluginLoggingHost::with_permissions(&permissions).await?;
+        plugin_host::add_to_linker_channel(&mut linker)?;
+        let host = PluginHost::with_permissions(&permissions).await?;
         let mut store = wasmtime::Store::new(engine.engine(), host);
 
         let instance = linker
@@ -218,7 +218,7 @@ impl Channel for ComponentChannel {
                         .ok()
                         .flatten()
                 };
-                let result = super::logging::wrap_plugin_call(
+                let result = super::wrap_plugin::wrap_plugin_call(
                     &plugin_name,
                     &plugin_version,
                     "poll_message",

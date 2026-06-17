@@ -26,7 +26,7 @@ use super::bindings::memory::{
         ProceduralMessage as WitProceduralMessage,
     },
 };
-use super::logging::{self, PluginLoggingHost};
+use super::plugin_host::{self, PluginHost};
 use crate::call_plugin;
 use crate::component::engine::ComponentEngine;
 use crate::error::PluginError;
@@ -37,7 +37,7 @@ use crate::error::PluginError;
 pub struct ComponentMemory {
     alias: String,
     capabilities: MemoryCapabilities,
-    state: Arc<Mutex<(wasmtime::Store<PluginLoggingHost>, MemoryPlugin)>>,
+    state: Arc<Mutex<(wasmtime::Store<PluginHost>, MemoryPlugin)>>,
     /// Canonical plugin name as self-reported by `plugin-info`. Source of truth.
     plugin_name: String,
     /// Plugin version string as self-reported by `plugin-info`. Source of truth.
@@ -71,12 +71,12 @@ impl ComponentMemory {
         permissions: Vec<crate::FineGrainedPermission>,
     ) -> anyhow::Result<Self> {
         let component = engine.compile(bytes)?;
-        let mut linker = wasmtime::component::Linker::<PluginLoggingHost>::new(engine.engine());
+        let mut linker = wasmtime::component::Linker::<PluginHost>::new(engine.engine());
         wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(PluginError::from)?;
         wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
             .map_err(PluginError::from)?;
-        logging::add_to_linker_memory(&mut linker)?;
-        let host = PluginLoggingHost::with_permissions(&permissions).await?;
+        plugin_host::add_to_linker_memory(&mut linker)?;
+        let host = PluginHost::with_permissions(&permissions).await?;
         let mut store = wasmtime::Store::new(engine.engine(), host);
 
         let instance = linker

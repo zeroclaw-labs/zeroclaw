@@ -7,7 +7,7 @@ macro_rules! call_plugin {
         let plugin_version = $self.plugin_version.clone();
         let mut guard = state.lock().await;
         let (ref mut store, ref mut bindings) = *guard;
-        super::logging::wrap_plugin_call(
+        super::wrap_plugin::wrap_plugin_call(
             &plugin_name,
             &plugin_version,
             $op,
@@ -25,7 +25,7 @@ macro_rules! call_plugin_sync {
         let plugin_version = $self.plugin_version.clone();
         let mut guard = state.blocking_lock();
         let (ref mut store, ref mut bindings) = *guard;
-        super::logging::wrap_plugin_call_sync(&plugin_name, &plugin_version, $op, || {
+        super::wrap_plugin::wrap_plugin_call_sync(&plugin_name, &plugin_version, $op, || {
             $block(store, bindings)
         })
     }};
