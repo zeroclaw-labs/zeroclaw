@@ -107,6 +107,8 @@ mod tests {
                 cancellation_token: None,
                 attachments: vec![],
                 in_reply_to: None,
+                suppress_voice: false,
+                force_voice: false,
             })
             .await;
         assert!(result.is_ok());
@@ -124,6 +126,8 @@ mod tests {
                 cancellation_token: None,
                 attachments: vec![],
                 in_reply_to: None,
+                suppress_voice: false,
+                force_voice: false,
             })
             .await;
         assert!(result.is_ok());

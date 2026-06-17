@@ -3712,6 +3712,7 @@ impl Channel for DiscordChannel {
         recipient: &str,
         message_id: &str,
         text: &str,
+        _suppress_voice: bool,
     ) -> anyhow::Result<()> {
         if self.stream_mode == zeroclaw_config::schema::StreamMode::MultiMessage {
             // Flush remaining buffered text.
@@ -4420,6 +4421,8 @@ mod tests {
             cancellation_token: None,
             attachments: Vec::new(),
             in_reply_to: None,
+            force_voice: false,
+            suppress_voice: false,
         };
         let err = ch.send(&msg).await.unwrap_err();
         assert!(err.to_string().contains("unknown or expired"));

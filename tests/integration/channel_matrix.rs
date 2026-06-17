@@ -206,6 +206,7 @@ impl Channel for MatrixTestChannel {
         recipient: &str,
         message_id: &str,
         text: &str,
+        _suppress_voice: bool,
     ) -> anyhow::Result<()> {
         self.events
             .lock()
@@ -421,7 +422,7 @@ async fn draft_full_lifecycle_send_update_finalize() {
     ch.update_draft("user_1", &draft_id, "thinking... partial response")
         .await
         .unwrap();
-    ch.finalize_draft("user_1", &draft_id, "Final complete response")
+    ch.finalize_draft("user_1", &draft_id, "Final complete response", false)
         .await
         .unwrap();
 
@@ -1405,7 +1406,7 @@ async fn minimal_channel_all_defaults_succeed() {
             .is_none()
     );
     assert!(ch.update_draft("u", "m", "t").await.is_ok());
-    assert!(ch.finalize_draft("u", "m", "t").await.is_ok());
+    assert!(ch.finalize_draft("u", "m", "t", false).await.is_ok());
     assert!(ch.cancel_draft("u", "m").await.is_ok());
     assert!(ch.add_reaction("c", "m", "\u{1F440}").await.is_ok());
     assert!(ch.remove_reaction("c", "m", "\u{1F440}").await.is_ok());
@@ -1470,6 +1471,7 @@ async fn full_conversation_lifecycle() {
         &incoming.reply_target,
         &draft_id,
         "Here's what I found: complete answer.",
+        false,
     )
     .await
     .unwrap();
