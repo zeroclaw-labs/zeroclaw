@@ -4,6 +4,8 @@ import {
   Globe, ExternalLink, Download, Wifi, Database, GitBranch,
   Image, Camera, Calculator, Wrench, CheckCircle2, Loader2,
 } from 'lucide-react';
+import { Card, Badge } from '@/components/ui';
+import { t } from '@/lib/i18n';
 
 export interface ToolCallInfo {
   name: string;
@@ -60,34 +62,54 @@ export default function ToolCallCard({ toolCall }: ToolCallCardProps) {
   const isInline = output.length <= INLINE_THRESHOLD;
 
   return (
-    <div className="tool-card">
-      <div className="tool-card__header">
-        <Icon className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--pc-accent)' }} />
-        <span>{toolCall.name}</span>
-        {resolved ? (
-          <CheckCircle2 className="h-3.5 w-3.5 flex-shrink-0" style={{ color: '#34d399' }} />
-        ) : (
-          <Loader2 className="h-3.5 w-3.5 flex-shrink-0 animate-spin" style={{ color: 'var(--pc-accent)' }} />
-        )}
+    <Card padded={false} className="bg-pc-elevated p-3 text-xs">
+      <div className="flex items-center gap-2">
+        <Icon className="h-4 w-4 flex-shrink-0 text-pc-accent" />
+        <span className="font-mono text-pc-text truncate">{toolCall.name}</span>
+        <span className="ml-auto flex-shrink-0">
+          {resolved ? (
+            <Badge tone="ok">
+              <CheckCircle2 className="h-3 w-3" />
+              {t('tool_call.done')}
+            </Badge>
+          ) : (
+            <Badge tone="neutral">
+              <Loader2 className="h-3 w-3 animate-spin" />
+              {t('tool_call.running')}
+            </Badge>
+          )}
+        </span>
       </div>
 
       {argsStr && (
-        <details>
-          <summary>args</summary>
-          <pre>{argsStr}</pre>
+        <details className="mt-2 group">
+          <summary className="cursor-pointer select-none text-pc-text-muted hover:text-pc-text-secondary">
+            {t('tool_call.args')}
+          </summary>
+          <pre className="mt-1.5 overflow-auto rounded-[var(--radius-sm)] bg-pc-code p-2 font-mono text-[11px] leading-relaxed text-pc-text-secondary">
+            {argsStr}
+          </pre>
         </details>
       )}
 
       {resolved && (
         isInline ? (
-          output && <div className="tool-card__inline">{output}</div>
+          output && (
+            <div className="mt-2 overflow-auto rounded-[var(--radius-sm)] bg-pc-code p-2 font-mono text-[11px] leading-relaxed text-pc-text-secondary">
+              {output}
+            </div>
+          )
         ) : (
-          <details>
-            <summary>{truncate(output, PREVIEW_MAX_CHARS)}</summary>
-            <pre>{output}</pre>
+          <details className="mt-2">
+            <summary className="cursor-pointer select-none truncate text-pc-text-muted hover:text-pc-text-secondary">
+              {truncate(output, PREVIEW_MAX_CHARS)}
+            </summary>
+            <pre className="mt-1.5 overflow-auto rounded-[var(--radius-sm)] bg-pc-code p-2 font-mono text-[11px] leading-relaxed text-pc-text-secondary">
+              {output}
+            </pre>
           </details>
         )
       )}
-    </div>
+    </Card>
   );
 }

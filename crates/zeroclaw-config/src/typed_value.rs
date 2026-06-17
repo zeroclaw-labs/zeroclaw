@@ -109,10 +109,19 @@ pub fn coerce_for_set_prop(
 
         // Bool fields.
         (Some(PropKind::Bool), serde_json::Value::Bool(b)) => Ok(b.to_string()),
-        (Some(PropKind::Bool), serde_json::Value::String(s))
-            if s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("false") =>
-        {
-            Ok(s.to_lowercase())
+        (Some(PropKind::Bool), serde_json::Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.eq_ignore_ascii_case("true") || trimmed.eq_ignore_ascii_case("false") {
+                Ok(trimmed.to_lowercase())
+            } else {
+                Err(ConfigApiError::new(
+                    ConfigApiCode::ValueTypeMismatch,
+                    format!(
+                        "bool field requires `true`/`false`; got {}",
+                        json_type_name(value)
+                    ),
+                ))
+            }
         }
         (Some(PropKind::Bool), other) => Err(ConfigApiError::new(
             ConfigApiCode::ValueTypeMismatch,
@@ -126,8 +135,19 @@ pub fn coerce_for_set_prop(
         (Some(PropKind::Integer), serde_json::Value::Number(n)) if n.is_i64() || n.is_u64() => {
             Ok(n.to_string())
         }
-        (Some(PropKind::Integer), serde_json::Value::String(s)) if s.parse::<i64>().is_ok() => {
-            Ok(s.clone())
+        (Some(PropKind::Integer), serde_json::Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.parse::<i64>().is_ok() {
+                Ok(trimmed.to_string())
+            } else {
+                Err(ConfigApiError::new(
+                    ConfigApiCode::ValueTypeMismatch,
+                    format!(
+                        "integer field requires a whole number; got {}",
+                        json_type_name(value)
+                    ),
+                ))
+            }
         }
         (Some(PropKind::Integer), other) => Err(ConfigApiError::new(
             ConfigApiCode::ValueTypeMismatch,
@@ -139,8 +159,19 @@ pub fn coerce_for_set_prop(
 
         // Float fields.
         (Some(PropKind::Float), serde_json::Value::Number(n)) => Ok(n.to_string()),
-        (Some(PropKind::Float), serde_json::Value::String(s)) if s.parse::<f64>().is_ok() => {
-            Ok(s.clone())
+        (Some(PropKind::Float), serde_json::Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.parse::<f64>().is_ok() {
+                Ok(trimmed.to_string())
+            } else {
+                Err(ConfigApiError::new(
+                    ConfigApiCode::ValueTypeMismatch,
+                    format!(
+                        "float field requires a number; got {}",
+                        json_type_name(value)
+                    ),
+                ))
+            }
         }
         (Some(PropKind::Float), other) => Err(ConfigApiError::new(
             ConfigApiCode::ValueTypeMismatch,
@@ -249,6 +280,44 @@ mod tests {
             .unwrap(),
             "true"
         );
+    }
+
+    #[test]
+    fn legacy_typed_scalar_strings_trim_whitespace() {
+        assert_eq!(
+            coerce_for_set_prop(
+                &serde_json::Value::String(" True ".into()),
+                Some(PropKind::Bool)
+            )
+            .unwrap(),
+            "true"
+        );
+        assert_eq!(
+            coerce_for_set_prop(
+                &serde_json::Value::String(" 42 ".into()),
+                Some(PropKind::Integer)
+            )
+            .unwrap(),
+            "42"
+        );
+        assert_eq!(
+            coerce_for_set_prop(
+                &serde_json::Value::String(" 2.5 ".into()),
+                Some(PropKind::Float)
+            )
+            .unwrap(),
+            "2.5"
+        );
+    }
+
+    #[test]
+    fn string_fields_preserve_whitespace() {
+        for kind in [Some(PropKind::String), Some(PropKind::Enum), None] {
+            assert_eq!(
+                coerce_for_set_prop(&serde_json::Value::String("  value  ".into()), kind).unwrap(),
+                "  value  "
+            );
+        }
     }
 
     #[test]

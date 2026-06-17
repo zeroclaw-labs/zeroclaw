@@ -66,6 +66,12 @@ enum Cmd {
     GenVersions,
     /// Remove orphaned root entries from the gh-pages clone (run in its root)
     PruneRoot,
+    /// Retain master and the newest DOCS_KEEP_VERSIONS final releases; drop
+    /// every other version dir (run in the gh-pages clone root)
+    PruneVersions,
+    /// Emit the gh-pages root index.html redirecting to the stable version
+    /// (from stable-version.txt), or master when none resolves
+    GenRootIndex,
     /// Inject the version-selector script into deployed pages that lack it
     RetrofitSelector,
     /// Regenerate pc-themes.css + switcher list from the dashboard theme registry
@@ -118,6 +124,8 @@ fn main() -> anyhow::Result<()> {
         ),
         Cmd::GenVersions => cmd::mdbook::versions::run(),
         Cmd::PruneRoot => cmd::mdbook::versions::prune_root(),
+        Cmd::PruneVersions => cmd::mdbook::versions::prune_versions(),
+        Cmd::GenRootIndex => cmd::mdbook::versions::gen_root_index(),
         Cmd::RetrofitSelector => cmd::mdbook::versions::retrofit_selector(),
         Cmd::Themes => cmd::mdbook::themes::run(&xtask::util::repo_root()),
         Cmd::Hardware => cmd::mdbook::hardware::run(&xtask::util::repo_root()),

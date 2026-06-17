@@ -2028,9 +2028,7 @@ fn history_notifications_for_message(
 ) -> Vec<JsonRpcNotification> {
     match msg {
         ConversationMessage::Chat(chat) => {
-            if chat.role == "assistant"
-                && zeroclaw_runtime::agent::history_pruner::is_history_pruner_marker(&chat.content)
-            {
+            if chat.is_pruned_tool_exchange_summary() {
                 return vec![JsonRpcNotification {
                     jsonrpc: "2.0",
                     method: "session/update",
@@ -3393,10 +3391,7 @@ mod tests {
     #[test]
     fn history_pruner_marker_replays_as_tool_call_not_agent_message() {
         use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
-        let marker = format!(
-            "{}3 tool call(s); results dropped from context]",
-            zeroclaw_runtime::agent::history_pruner::HISTORY_PRUNER_MARKER_PREFIX
-        );
+        let marker = ChatMessage::pruned_tool_exchange_summary(3);
         let msg = ConversationMessage::Chat(ChatMessage::assistant(&marker));
         let notes = history_notifications_for_message("sess-x", &msg);
         assert_eq!(notes.len(), 1);

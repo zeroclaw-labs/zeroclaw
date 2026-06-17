@@ -4,6 +4,9 @@
   "version": "0.1.0",
   "license": "(MIT OR Apache-2.0)",
   "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
   "scripts": {
     "build": "tsc -b && vite build",
     "dev": "vite"
