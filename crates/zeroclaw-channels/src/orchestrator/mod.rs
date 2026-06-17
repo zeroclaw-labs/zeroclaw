@@ -804,6 +804,14 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Remote media is also accepted via http:// or https:// URLs in the same marker form.\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n",
         ),
+        "whatsapp" | "whatsapp-web" => Some(
+            "When responding on WhatsApp Web:\n\
+             - Be concise and direct\n\
+             - For media attachments use markers: [IMAGE:<path>], [DOCUMENT:<path>], [VIDEO:<path>], [AUDIO:<path>], or [VOICE:<path>]\n\
+             - Marker paths must refer to local files inside the configured workspace directory. Absolute paths and workspace-relative paths are accepted when they stay inside that workspace.\n\
+             - Do not use http://, https://, data:, file:, or any other URL scheme in WhatsApp Web media markers.\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n",
+        ),
         "telegram" => Some(
             "When responding on Telegram:\n\
              - Include media markers for files or URLs that should be sent as attachments\n\
@@ -5640,6 +5648,7 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
     feature = "channel-slack",
     feature = "channel-telegram",
     feature = "channel-wechat",
+    feature = "whatsapp-web",
 ))]
 fn one_shot_channel_workspace_dir(config: &Config, channel_type: &str, alias: &str) -> PathBuf {
     config.channel_workspace_dir(&format!("{channel_type}.{alias}"))
@@ -5876,7 +5885,11 @@ fn build_channel_by_id(
                     let alias = alias.clone();
                     Arc::new(move || cfg_arc.read().channel_external_peers("whatsapp", &alias))
                 };
-                Ok(Arc::new(WhatsAppWebChannel::new(wa, alias, peer_resolver)))
+                let workspace_dir = one_shot_channel_workspace_dir(&config, "whatsapp", &alias);
+                Ok(Arc::new(
+                    WhatsAppWebChannel::new(wa, alias, peer_resolver)
+                        .with_workspace_dir(workspace_dir),
+                ))
             }
             #[cfg(not(feature = "whatsapp-web"))]
             {
@@ -7113,6 +7126,7 @@ fn collect_configured_channels(
                         let alias = alias.clone();
                         Arc::new(move || cfg_arc.read().channel_external_peers("whatsapp", &alias))
                     };
+                    let workspace_dir = config.channel_workspace_dir(&format!("whatsapp.{alias}"));
                     channels.push(ConfiguredChannel {
                         display_name: "WhatsApp",
                         alias: Some(alias.clone()),
@@ -7121,6 +7135,7 @@ fn collect_configured_channels(
                                 WhatsAppWebChannel::new(wa, alias.clone(), peer_resolver)
                                     .with_transcription(config.transcription.clone())
                                     .with_tts(&config)
+                                    .with_workspace_dir(workspace_dir)
                                     .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
                                     .with_group_mention_patterns(wa.group_mention_patterns.clone()),
                             ),
@@ -9501,7 +9516,8 @@ pub async fn deliver_announcement(
             let peers = config.channel_external_peers("whatsapp", alias);
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
-            let ch = WhatsAppWebChannel::new(wa, alias.to_string(), peer_resolver);
+            let ch = WhatsAppWebChannel::new(wa, alias.to_string(), peer_resolver)
+                .with_workspace_dir(config.channel_workspace_dir(&format!("whatsapp.{alias}")));
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(not(feature = "whatsapp-web"))]
@@ -17361,6 +17377,37 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             block.contains("[IMAGE:<absolute-path>]"),
             "discord block must show the absolute-path marker form"
+        );
+    }
+
+    #[test]
+    fn channel_delivery_instructions_for_whatsapp_web_match_local_marker_contract() {
+        let block = channel_delivery_instructions("whatsapp")
+            .expect("whatsapp channel must have a delivery-instructions block");
+        assert!(
+            block.contains("When responding on WhatsApp Web:"),
+            "whatsapp block must identify itself"
+        );
+        assert!(
+            block.contains("[IMAGE:<path>]"),
+            "whatsapp block must describe marker syntax"
+        );
+        assert!(
+            block.contains("inside the configured workspace directory"),
+            "whatsapp block must describe workspace bounds"
+        );
+        assert!(
+            block.contains("Absolute paths and workspace-relative paths are accepted"),
+            "whatsapp block must match the validator's local path contract"
+        );
+        assert!(
+            block.contains("Do not use http://, https://, data:, file:"),
+            "whatsapp block must say URL schemes are refused"
+        );
+        assert_eq!(
+            channel_delivery_instructions("whatsapp-web"),
+            Some(block),
+            "the compatibility alias should use the same WhatsApp Web guidance"
         );
     }
 
