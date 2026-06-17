@@ -27,7 +27,6 @@ zeroclaw-spawn.workspace = true
 anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"
-cap-std = { version = "3", optional = true }
 dns-lookup = { version = "3", optional = true }
 ring = "0.17"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
