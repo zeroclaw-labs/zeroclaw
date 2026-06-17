@@ -621,10 +621,22 @@ fn host_architecture() -> Option<&'static str> {
     }
 }
 
+/// Replace the running executable at `target` with the freshly downloaded
+/// binary at `new`.
+///
+/// The mechanism differs by platform because each OS treats the file backing a
+/// running process differently:
+///
+/// * Unix — the kernel keeps the inode alive while the process runs, so the old
+///   path can be unlinked and the new binary copied into the now-free path
+///   (this avoids `ETXTBSY`).
+/// * Windows — the OS locks the image of a running process and refuses to delete
+///   it, but it *does* allow renaming. So the running exe is moved aside to a
+///   `.old` sidecar and the new binary is copied into the original path. The
+///   sidecar usually cannot be removed until the old process exits, so its
+///   deletion is best-effort and any leftover is swept on the next update run.
+#[cfg(not(windows))]
 async fn swap_binary(new: &Path, target: &Path) -> Result<()> {
-    // On Linux, a running binary cannot be overwritten in place (ETXTBSY).
-    // Remove the old file first, then copy the new one into the now-free path.
-    // This works because the kernel keeps the inode alive until the process exits.
     tokio::fs::remove_file(target)
         .await
         .context("failed to remove old binary")?;
@@ -634,6 +646,31 @@ async fn swap_binary(new: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+async fn swap_binary(new: &Path, target: &Path) -> Result<()> {
+    // Move the running exe aside under a process-unique name. A fixed name could
+    // collide with a sidecar left by an earlier update whose old process is
+    // still running (and therefore still locking the file); the rename would
+    // then have to delete that locked file and fail. A unique name sidesteps it.
+    let sidelined = sidecar_path(target, "old");
+    // Renaming a running executable is permitted on Windows even though deleting
+    // it is not.
+    tokio::fs::rename(target, &sidelined)
+        .await
+        .context("failed to move old binary aside")?;
+    if let Err(e) = tokio::fs::copy(new, target).await {
+        // Put the original back so the install is not left without a binary.
+        let _ = tokio::fs::rename(&sidelined, target).await;
+        return Err(e).context("failed to write new binary");
+    }
+    // Best-effort: the old image is still mapped by this process and usually
+    // cannot be removed until it exits. Also sweep sidecars from earlier runs.
+    let _ = tokio::fs::remove_file(&sidelined).await;
+    sweep_stale_sidecars(target).await;
+    Ok(())
+}
+
+#[cfg(not(windows))]
 async fn rollback_binary(backup: &Path, target: &Path) -> Result<()> {
     // Remove-then-copy to avoid ETXTBSY if the target is somehow still mapped.
     let _ = tokio::fs::remove_file(target).await;
@@ -641,6 +678,53 @@ async fn rollback_binary(backup: &Path, target: &Path) -> Result<()> {
         .await
         .context("failed to restore backup binary")?;
     Ok(())
+}
+
+#[cfg(windows)]
+async fn rollback_binary(backup: &Path, target: &Path) -> Result<()> {
+    // `target` may be the currently running image (which cannot be deleted but
+    // can be renamed) or a stale, not-running new binary. Move whatever is there
+    // aside under a process-unique name, then restore the backup into the
+    // original path.
+    let sidelined = sidecar_path(target, "rollback-old");
+    let _ = tokio::fs::rename(target, &sidelined).await;
+    tokio::fs::copy(backup, target)
+        .await
+        .context("failed to restore backup binary")?;
+    let _ = tokio::fs::remove_file(&sidelined).await;
+    Ok(())
+}
+
+/// Build a process-unique sidecar path next to `target`, e.g.
+/// `zeroclaw.exe` -> `zeroclaw.exe.<pid>.old`.
+#[cfg(windows)]
+fn sidecar_path(target: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = target.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.{suffix}", std::process::id()));
+    target.with_file_name(name)
+}
+
+/// Best-effort removal of sidecars left by earlier updates whose old process had
+/// not yet exited. Files still locked by a live process are silently skipped and
+/// swept by a later run.
+#[cfg(windows)]
+async fn sweep_stale_sidecars(target: &Path) {
+    let (Some(dir), Some(base)) = (target.parent(), target.file_name().and_then(|n| n.to_str()))
+    else {
+        return;
+    };
+    let prefix = format!("{base}.");
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with(&prefix) && (name.ends_with(".old") || name.ends_with(".rollback-old"))
+        {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
+    }
 }
 
 async fn smoke_test(binary: &Path) -> Result<()> {
@@ -1232,6 +1316,32 @@ mod tests {
         extract_zip(&zip_buf, &dest).unwrap();
 
         assert_eq!(std::fs::read(&dest).unwrap(), fake_exe);
+    }
+
+    #[tokio::test]
+    async fn swap_binary_replaces_target_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("zeroclaw");
+        let new = tmp.path().join("zeroclaw_new");
+        std::fs::write(&target, b"old binary").unwrap();
+        std::fs::write(&new, b"new binary").unwrap();
+
+        swap_binary(&new, &target).await.unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"new binary");
+    }
+
+    #[tokio::test]
+    async fn rollback_binary_restores_backup_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("zeroclaw");
+        let backup = tmp.path().join("zeroclaw.bak");
+        std::fs::write(&target, b"broken binary").unwrap();
+        std::fs::write(&backup, b"good binary").unwrap();
+
+        rollback_binary(&backup, &target).await.unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"good binary");
     }
 
     #[test]
