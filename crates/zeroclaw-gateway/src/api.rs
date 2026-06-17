@@ -2095,19 +2095,19 @@ mod tests {
             auth_limiter: Arc::new(crate::auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             #[cfg(feature = "channel-whatsapp-cloud")]
-            whatsapp: None,
+            whatsapp: HashMap::new(),
             #[cfg(feature = "channel-whatsapp-cloud")]
-            whatsapp_app_secret: None,
+            whatsapp_app_secret: HashMap::new(),
             #[cfg(feature = "channel-linq")]
             linq: HashMap::new(),
             #[cfg(feature = "channel-linq")]
             linq_signing_secrets: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
-            nextcloud_talk: None,
+            nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
-            nextcloud_talk_webhook_secret: None,
+            nextcloud_talk_webhook_secret: HashMap::new(),
             #[cfg(feature = "channel-wati")]
-            wati: None,
+            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
