@@ -2026,4 +2026,46 @@ mod tests {
             .expect("signal handler should not error");
         assert_eq!(result, DaemonExit::Shutdown);
     }
+
+    #[test]
+    fn validate_heartbeat_matrix_passes_when_configured() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config
+            .channels
+            .matrix
+            .insert("default".to_string(), Default::default());
+        assert!(
+            validate_heartbeat_channel_config(&config, "matrix").is_ok(),
+            "matrix target should be accepted when channels.matrix is configured"
+        );
+    }
+
+    #[test]
+    fn validate_heartbeat_matrix_fails_when_not_configured() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let err = validate_heartbeat_channel_config(&config, "matrix")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not configured"),
+            "matrix target should fail when channels.matrix is empty, got: {err}"
+        );
+    }
+
+    #[test]
+    fn auto_detect_heartbeat_matrix_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config
+            .channels
+            .matrix
+            .insert("default".to_string(), Default::default());
+        assert_eq!(
+            auto_detect_heartbeat_channel(&config),
+            None,
+            "matrix requires explicit target, auto-detect should return None"
+        );
+    }
 }
