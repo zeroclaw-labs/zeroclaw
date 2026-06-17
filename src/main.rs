@@ -393,6 +393,27 @@ impl LogLevel {
     }
 }
 
+/// Subcommands for `zeroclaw eval`.
+#[cfg(feature = "agent-runtime")]
+#[derive(Subcommand, Debug)]
+enum EvalCommands {
+    /// Run a suite of evaluation cases.
+    Run {
+        /// Directory of `*.json` trace fixtures (defaults to `evals`).
+        #[arg(long)]
+        suite: Option<String>,
+
+        /// Execution mode: `replay` (deterministic) or `live` (later phase).
+        /// Defaults to config `[eval] mode`.
+        #[arg(long)]
+        mode: Option<String>,
+
+        /// Output format.
+        #[arg(long, value_enum, default_value = "table")]
+        format: commands::eval::OutputFormat,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Quickstart — create one working agent end-to-end. Replaces the
@@ -889,6 +910,25 @@ Examples:
         /// Run quick checks only (no network)
         #[arg(long)]
         quick: bool,
+    },
+
+    #[cfg(feature = "agent-runtime")]
+    /// Run the agent evaluation harness
+    // i18n-exempt: clap derive help — framework requires a compile-time literal
+    #[command(long_about = "\
+Run the agent evaluation harness.
+
+Phase 0 supports deterministic replay: every `*.json` trace fixture in the suite \
+directory is replayed through the real agent loop and graded against its declarative \
+expectations. No network calls, fully deterministic. Exits non-zero if any case fails, \
+so it can gate CI.
+
+Examples:
+  zeroclaw eval run                                  # replay ./evals
+  zeroclaw eval run --suite evals --format json")]
+    Eval {
+        #[command(subcommand)]
+        eval_command: EvalCommands,
     },
 
     /// Generate shell completion script to stdout
@@ -4757,6 +4797,24 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+
+        Commands::Eval { eval_command } => match eval_command {
+            EvalCommands::Run {
+                suite,
+                mode,
+                format,
+            } => {
+                let suite_dir = suite.unwrap_or_else(|| config.eval.suite_dir.clone());
+                let mode: zeroclaw_eval::Mode =
+                    mode.unwrap_or_else(|| config.eval.mode.clone()).parse()?;
+                let report = commands::eval::run(std::path::PathBuf::from(suite_dir), mode).await?;
+                commands::eval::print_report(&report, format);
+                if !report.all_passed() {
+                    std::process::exit(1);
+                }
+                Ok(())
+            }
+        },
 
         Commands::Config { config_command } => match config_command {
             ConfigCommands::Schema { path } => {
