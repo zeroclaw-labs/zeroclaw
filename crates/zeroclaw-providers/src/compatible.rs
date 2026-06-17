@@ -74,6 +74,8 @@ pub struct OpenAiCompatibleModelProvider {
     /// Raw PEM bytes of a custom CA certificate for TLS connections.
     /// Loaded from disk once at construction; not refreshed across config reloads.
     tls_ca_cert_pem: Option<Vec<u8>>,
+    /// Extra JSON fields merged into every API request body.
+    extra_body: Option<serde_json::Value>,
 }
 
 /// How the model_provider expects the API key to be sent.
@@ -326,8 +328,17 @@ impl OpenAiCompatibleModelProvider {
             local_model_tool_sanitize: false,
             public_model_listing: false,
             tls_ca_cert_pem: None,
+            extra_body: None,
         }
     }
+    /// Inject extra JSON fields into every API request body.
+    /// Merged at the top level — use for provider-specific features like
+    /// `thinking: "off"` (Qwen3.5 on hipfire) or routing transforms.
+    pub fn with_extra_body(mut self, extra: serde_json::Value) -> Self {
+        self.extra_body = Some(extra);
+        self
+    }
+
     /// Opt this provider into per-model conservative tool-schema sanitization.
     /// Today the only trigger is the gemma-4 family on llama.cpp, where the
     /// upstream tool-call parser rejects empty-properties / non-string
@@ -1044,6 +1055,9 @@ struct NativeChatRequest {
     tool_choice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    /// Extra fields merged at the top level of the serialized JSON body.
+    #[serde(flatten)]
+    extra_body: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1059,6 +1073,13 @@ struct NativeMessage {
     /// that require it in assistant tool-call history messages.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
+    /// When the upstream response used the `reasoning` key (OpenRouter /
+    /// vLLM >= v0.16.0) rather than the canonical `reasoning_content`, we
+    /// store the value here so the field name round-trips faithfully.
+    /// The two fields are mutually exclusive — only one is ever `Some`.
+    /// See #6584.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "reasoning")]
+    reasoning: Option<String>,
 }
 
 // ---------------------------------------------------------------
@@ -1799,6 +1820,7 @@ impl OpenAiCompatibleModelProvider {
             tools,
             tool_choice,
             max_tokens: self.max_tokens,
+            extra_body: self.extra_body.clone(),
         }
     }
 
@@ -1907,10 +1929,16 @@ impl OpenAiCompatibleModelProvider {
                         .map(|value| MessageContent::Text(value.to_string()));
 
                     // Accept both `reasoning_content` (canonical) and
-                    // `reasoning` (OpenRouter / vLLM >= v0.16.0). See #6584.
+                    // `reasoning` (OpenRouter / vLLM >= v0.16.0).
+                    // Preserve whichever field name was originally
+                    // received so the value round-trips faithfully on
+                    // multi-turn requests.  See #6584.
                     let reasoning_content = value
                         .get("reasoning_content")
-                        .or_else(|| value.get("reasoning"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToString::to_string);
+                    let reasoning = value
+                        .get("reasoning")
                         .and_then(serde_json::Value::as_str)
                         .map(ToString::to_string);
 
@@ -1920,22 +1948,32 @@ impl OpenAiCompatibleModelProvider {
                         tool_call_id: None,
                         tool_calls: Some(tool_calls),
                         reasoning_content,
+                        reasoning,
                     };
                 }
 
                 // Plain-text assistant turns from thinking-mode providers carry
-                // `reasoning_content` in a JSON-encoded `content` field with no
-                // `tool_calls` key. Without this branch the message would fall
-                // through to the plain-text fallback below and lose
-                // `reasoning_content`, so the next request to providers that
-                // require reasoning round-trip (e.g. DeepSeek V4 thinking) is
-                // rejected with a 400. See #6233.
+                // `reasoning_content` (or `reasoning`) in a JSON-encoded
+                // `content` field with no `tool_calls` key. Without this
+                // branch the message would fall through to the plain-text
+                // fallback below and lose reasoning, so the next request to
+                // providers that require reasoning round-trip (e.g. DeepSeek
+                // V4 thinking) is rejected with a 400. See #6233.
+                // Preserve the original field name for faithful round-trip
+                // (OpenRouter / vLLM >= v0.16.0).  See #6584.
                 if message.role == "assistant"
                     && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
                     && value.get("tool_calls").is_none()
-                    && let Some(reasoning_content) = value
+                    && let Some((reasoning_content, reasoning)) = value
                         .get("reasoning_content")
                         .and_then(serde_json::Value::as_str)
+                        .map(|s| (Some(s.to_string()), None))
+                        .or_else(|| {
+                            value
+                                .get("reasoning")
+                                .and_then(serde_json::Value::as_str)
+                                .map(|s| (None, Some(s.to_string())))
+                        })
                     && matches!(
                         value.get("content"),
                         None | Some(serde_json::Value::Null | serde_json::Value::String(_))
@@ -1951,7 +1989,8 @@ impl OpenAiCompatibleModelProvider {
                         content,
                         tool_call_id: None,
                         tool_calls: None,
-                        reasoning_content: Some(reasoning_content.to_string()),
+                        reasoning_content,
+                        reasoning,
                     };
                 }
 
@@ -1984,6 +2023,7 @@ impl OpenAiCompatibleModelProvider {
                         tool_call_id,
                         tool_calls: None,
                         reasoning_content: None,
+                        reasoning: None,
                     };
                 }
 
@@ -1997,6 +2037,7 @@ impl OpenAiCompatibleModelProvider {
                     tool_call_id: None,
                     tool_calls: None,
                     reasoning_content: None,
+                    reasoning: None,
                 }
             })
             .collect()
@@ -2804,6 +2845,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     tools: tools.clone(),
                     tool_choice: tools.as_ref().map(|_| "auto".to_string()),
                     max_tokens: provider.max_tokens,
+                    extra_body: provider.extra_body.clone(),
                 })
             } else {
                 let messages = effective_messages
@@ -3275,6 +3317,7 @@ mod tests {
                 tool_call_id: None,
                 tool_calls: None,
                 reasoning_content: None,
+                reasoning: None,
             }],
             temperature: Some(0.7),
             stream: Some(true),
@@ -3286,6 +3329,7 @@ mod tests {
             tools: Some(vec![serde_json::json!({"name": "echo"})]),
             tool_choice: Some("auto".to_string()),
             max_tokens: None,
+            extra_body: None,
         };
         let value: serde_json::Value = serde_json::to_value(&req).unwrap();
         assert_eq!(
@@ -3315,11 +3359,39 @@ mod tests {
             tools: None,
             tool_choice: None,
             max_tokens: None,
+            extra_body: None,
         };
         let value: serde_json::Value = serde_json::to_value(&req).unwrap();
         assert!(
             value.get("stream_options").is_none(),
             "non-streaming NativeChatRequest must not emit a stream_options key"
+        );
+    }
+
+    #[test]
+    fn extra_body_flattens_into_request_top_level() {
+        let req = NativeChatRequest {
+            model: "qwen".to_string(),
+            messages: vec![],
+            temperature: None,
+            stream: None,
+            stream_options: None,
+            reasoning_effort: None,
+            tool_stream: None,
+            tools: None,
+            tool_choice: None,
+            max_tokens: None,
+            extra_body: Some(serde_json::json!({"thinking": "off"})),
+        };
+        let value: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value.get("thinking").and_then(serde_json::Value::as_str),
+            Some("off"),
+            "extra_body fields must serialize at the top level, not nested"
+        );
+        assert!(
+            value.get("extra_body").is_none(),
+            "extra_body key itself must not appear in serialized JSON"
         );
     }
 
@@ -3942,6 +4014,7 @@ mod tests {
             })]),
             tool_choice: Some("auto".to_string()),
             max_tokens: None,
+            extra_body: None,
         };
 
         let value = serde_json::to_value(&req).unwrap();
@@ -5326,6 +5399,7 @@ mod tests {
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: None,
+            reasoning: None,
         };
         let json = serde_json::to_string(&msg_without).unwrap();
         assert!(
@@ -5339,6 +5413,7 @@ mod tests {
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: Some("thinking...".to_string()),
+            reasoning: None,
         };
         let json = serde_json::to_string(&msg_with).unwrap();
         assert!(

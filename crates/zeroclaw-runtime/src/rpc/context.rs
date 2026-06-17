@@ -142,6 +142,11 @@ pub struct RpcContext {
     /// when the store could not be opened (read-only FS, bad perms) —
     /// callers must treat persistence as best-effort.
     pub acp_session_store: Option<Arc<AcpSessionStore>>,
+
+    /// Shared SOP engine from the daemon (for RPC/TUI agent sessions).
+    /// `None` when standalone — sessions build their own.
+    pub sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
+    pub sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
 }
 
 impl RpcContext {
@@ -160,6 +165,8 @@ impl RpcContext {
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
+            sop_engine: None,
+            sop_audit: None,
         })
     }
 
@@ -181,6 +188,8 @@ impl RpcContext {
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store,
+            sop_engine: None,
+            sop_audit: None,
         })
     }
 }

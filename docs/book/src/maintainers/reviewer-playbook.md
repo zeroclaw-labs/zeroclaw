@@ -107,6 +107,20 @@ For replaced PRs or issue paths, use [Superseding PRs](./superseding.md) and pre
 
 If logs or payloads in the report contain personal identifiers or sensitive data, request redaction before deeper triage. The triage process must not propagate the exposure.
 
+## Discussions stewardship
+
+Discussions are a maintained community surface only when a steward or review cadence exists. The default cadence is a weekly maintainer pass over new and recently active threads. A named steward may own that surface pass, but the steward maintains the surface; they do not become the owner of every question, idea, or implementation that appears there.
+
+During each Discussions pass:
+
+1. Check new and recently active threads for category fit, unanswered Q&A, spam, sensitive data, and threads that have produced a concrete project outcome.
+2. Keep lightweight community conversation in Discussions when it is still exploratory, answerable there, or useful as a showcase, demo, poll, announcement, or broad-feedback thread.
+3. Promote concrete outcomes to the owning tracked surface: bugs and accepted feature scopes to issues, architecture proposals to RFC issues, PR-specific details to PR comments, durable operating rules to maintainer or contributor docs.
+4. Close the loop in the originating Discussion with a short summary and link to the issue, RFC, PR, or doc that now owns the outcome. Mark an answer only when the category and result make that accurate.
+5. Redirect security-sensitive threads to the private vulnerability path in [Security issues](../contributing/communication.md#security-issues), handle sensitive data under [Privacy](../contributing/privacy.md), and close pure advertising or not-project-relevant threads. Preserve useful project-related demos or integrations as community showcase material when they are not asking maintainers to track work.
+
+If Discussions are not being reviewed on the documented cadence, do not present them as a required intake path. Treat them as a passive archive until a steward or cadence is restored.
+
 ### PR backlog pruning
 
 When review demand exceeds capacity:
