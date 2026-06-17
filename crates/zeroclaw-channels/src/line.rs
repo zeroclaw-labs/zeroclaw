@@ -443,24 +443,6 @@ async fn handle_webhook(
 
         let is_group = matches!(source_type, "group" | "room");
 
-        // Show loading indicator immediately — fire-and-forget before any gate.
-        let loading_chat_id = if is_group {
-            source
-                .get("groupId")
-                .or_else(|| source.get("roomId"))
-                .and_then(|v| v.as_str())
-                .unwrap_or(user_id)
-        } else {
-            user_id
-        };
-        send_loading_indicator(
-            &state.client,
-            &state.channel_access_token,
-            &state.api_base_url,
-            loading_chat_id,
-        )
-        .await;
-
         // 3. Group policy gate
         if is_group {
             match state.group_policy {
@@ -509,6 +491,14 @@ async fn handle_webhook(
                     if !is_line_user_allowed(&*state, user_id) {
                         // Try pairing bind
                         if let Some(code) = LineChannel::extract_bind_code(text) {
+                            // Pairing is the authorization handshake; show loading during bind.
+                            send_loading_indicator(
+                                &state.client,
+                                &state.channel_access_token,
+                                &state.api_base_url,
+                                user_id,
+                            )
+                            .await;
                             let bind_reply_token = event
                                 .get("replyToken")
                                 .and_then(|t| t.as_str())
@@ -592,6 +582,24 @@ async fn handle_webhook(
                 }
             }
         }
+
+        // Show loading indicator only for messages that passed both policy gates.
+        let loading_chat_id = if is_group {
+            source
+                .get("groupId")
+                .or_else(|| source.get("roomId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(user_id)
+        } else {
+            user_id
+        };
+        send_loading_indicator(
+            &state.client,
+            &state.channel_access_token,
+            &state.api_base_url,
+            loading_chat_id,
+        )
+        .await;
 
         // 5. Resolve recipient (groupId/roomId for group context)
         let recipient = match source_type {
@@ -2662,25 +2670,21 @@ mod tests {
         .with_api_base_url(&server.uri());
 
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let sender_name = Arc::clone(&ch.sender_name);
         let sender_icon = Arc::clone(&ch.sender_icon);
 
         let abort = zeroclaw_spawn::spawn!(async move {
-            ch.listen_with_listener(listener, "Ubot".to_string(), tx)
-                .await
-                .ok();
+            ch.listen(tx).await.ok();
         })
         .abort_handle();
 
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // sender_name is set by listen() before spawning listen_with_listener,
-        // but since we bypass listen() here we seed it manually to test the
-        // contract — the real assertion is covered by the integration path.
-        // Instead verify the field types and defaults before listen():
-        assert_eq!(*sender_name.read(), "");
-        assert!(sender_icon.read().is_none());
+        assert_eq!(*sender_name.read(), "AI");
+        assert_eq!(
+            *sender_icon.read(),
+            Some("https://profile.line-scdn.net/popcorn.png".to_string())
+        );
         abort.abort();
     }
 
