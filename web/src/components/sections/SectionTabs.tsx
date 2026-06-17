@@ -49,9 +49,11 @@ export default function SectionTabs({ tabs, defaultKey }: SectionTabsProps) {
 
   return (
     <div className="flex flex-col gap-4 flex-1 min-h-0">
+      {/* Calm underline tabs: active draws an accent underline + primary
+          text; inactive sits muted with a transparent border. The shared
+          bottom hairline reads as a quiet baseline, not a heavy bar. */}
       <div
-        className="flex items-center gap-1 border-b -mx-2 px-2 overflow-x-auto"
-        style={{ borderColor: 'var(--pc-border)' }}
+        className="flex items-center gap-1 border-b border-pc-border -mx-2 px-2 overflow-x-auto"
         role="tablist"
       >
         {tabs.map((t) => {
@@ -63,14 +65,14 @@ export default function SectionTabs({ tabs, defaultKey }: SectionTabsProps) {
               role="tab"
               aria-selected={isActive}
               onClick={() => setActive(t.key)}
-              className="px-3 py-2 text-sm border-b-2 -mb-px transition-colors"
-              style={{
-                borderColor: isActive ? 'var(--pc-accent)' : 'transparent',
-                color: isActive
-                  ? 'var(--pc-text-primary)'
-                  : 'var(--pc-text-secondary)',
-                fontWeight: isActive ? 600 : 400,
-              }}
+              className={[
+                'px-3 py-2 text-sm border-b-2 -mb-px transition-colors',
+                'focus-visible:outline-none focus-visible:ring-2',
+                'focus-visible:ring-[var(--pc-focus)] focus-visible:rounded-sm',
+                isActive
+                  ? 'border-pc-accent text-pc-text font-medium'
+                  : 'border-transparent text-pc-text-muted hover:text-pc-text-secondary',
+              ].join(' ')}
             >
               {t.label}
             </button>

@@ -31,7 +31,40 @@ pub struct ApprovalPendingMap {
     inner: std::sync::Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>,
 }
 
+pub struct PendingApproval {
+    map: Arc<ApprovalPendingMap>,
+    request_id: String,
+    active: bool,
+}
+
+impl PendingApproval {
+    pub fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for PendingApproval {
+    fn drop(&mut self) {
+        if self.active {
+            self.map.remove(&self.request_id);
+        }
+    }
+}
+
 impl ApprovalPendingMap {
+    pub fn register(
+        self: &Arc<Self>,
+        request_id: String,
+        tx: oneshot::Sender<ChannelApprovalResponse>,
+    ) -> PendingApproval {
+        self.insert(request_id.clone(), tx);
+        PendingApproval {
+            map: Arc::clone(self),
+            request_id,
+            active: true,
+        }
+    }
+
     pub fn insert(&self, request_id: String, tx: oneshot::Sender<ChannelApprovalResponse>) {
         self.inner
             .lock()
@@ -39,7 +72,7 @@ impl ApprovalPendingMap {
             .insert(request_id, tx);
     }
 
-    pub fn resolve(&self, request_id: &str, response: ChannelApprovalResponse) {
+    pub fn resolve(&self, request_id: &str, response: ChannelApprovalResponse) -> bool {
         let tx = self
             .inner
             .lock()
@@ -47,7 +80,25 @@ impl ApprovalPendingMap {
             .remove(request_id);
         if let Some(tx) = tx {
             let _ = tx.send(response);
+            return true;
         }
+        false
+    }
+
+    pub fn remove(&self, request_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(request_id)
+            .is_some()
+    }
+
+    #[cfg(test)]
+    pub fn contains(&self, request_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(request_id)
     }
 }
 
@@ -154,14 +205,15 @@ mod tests {
         let map = ApprovalPendingMap::default();
         let (tx, mut rx) = oneshot::channel::<ChannelApprovalResponse>();
         map.insert("req-1".to_string(), tx);
-        map.resolve("req-1", ChannelApprovalResponse::Approve);
+        assert!(map.resolve("req-1", ChannelApprovalResponse::Approve));
+        assert!(!map.contains("req-1"));
         assert_eq!(rx.try_recv().unwrap(), ChannelApprovalResponse::Approve);
     }
 
     #[test]
     fn pending_map_resolve_unknown_key_is_noop() {
         let map = ApprovalPendingMap::default();
-        map.resolve("nonexistent", ChannelApprovalResponse::Deny);
+        assert!(!map.resolve("nonexistent", ChannelApprovalResponse::Deny));
     }
 
     #[test]
@@ -170,6 +222,39 @@ mod tests {
         let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
         map.insert("req-2".to_string(), tx);
         // _rx is dropped — resolve sends to a closed channel; must not panic
-        map.resolve("req-2", ChannelApprovalResponse::Approve);
+        assert!(map.resolve("req-2", ChannelApprovalResponse::Approve));
+        assert!(!map.contains("req-2"));
+    }
+
+    #[test]
+    fn pending_map_remove_drops_stale_request() {
+        let map = ApprovalPendingMap::default();
+        let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
+        map.insert("req-3".to_string(), tx);
+        assert!(map.contains("req-3"));
+        assert!(map.remove("req-3"));
+        assert!(!map.contains("req-3"));
+        assert!(!map.remove("req-3"));
+    }
+
+    #[test]
+    fn pending_guard_drop_removes_registered_request() {
+        let map = Arc::new(ApprovalPendingMap::default());
+        let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
+        let guard = map.register("req-4".to_string(), tx);
+        assert!(map.contains("req-4"));
+        drop(guard);
+        assert!(!map.contains("req-4"));
+    }
+
+    #[test]
+    fn pending_guard_can_be_disarmed_after_resolution() {
+        let map = Arc::new(ApprovalPendingMap::default());
+        let (tx, _rx) = oneshot::channel::<ChannelApprovalResponse>();
+        let mut guard = map.register("req-5".to_string(), tx);
+        assert!(map.resolve("req-5", ChannelApprovalResponse::Approve));
+        guard.disarm();
+        drop(guard);
+        assert!(!map.contains("req-5"));
     }
 }
