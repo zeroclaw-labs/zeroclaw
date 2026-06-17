@@ -137,6 +137,12 @@ group = "bridge_sh"
 prefix = "export "
 
 [[var]]
+path = "providers.models.nearai.tee.api_key"
+value = "\"$NEARAI_API_KEY\""
+group = "bridge_sh"
+prefix = "export "
+
+[[var]]
 path = "storage.qdrant.home.url"
 value = "\"$QDRANT_URL\""
 group = "bridge_sh"
@@ -167,6 +173,13 @@ assign = " = "
 [[var]]
 path = "providers.models.openai.home.api_key"
 value = "$env:OPENAI_API_KEY"
+group = "bridge_ps"
+prefix = "$env:"
+assign = " = "
+
+[[var]]
+path = "providers.models.nearai.tee.api_key"
+value = "$env:NEARAI_API_KEY"
 group = "bridge_ps"
 prefix = "$env:"
 assign = " = "
