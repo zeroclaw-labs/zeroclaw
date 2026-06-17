@@ -31,6 +31,7 @@ ratatui = { version = "0.30", default-features = true, features = ["unstable-ren
 serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 unicode-width = "0.2"
+unicode-segmentation = "1"
 toml = "1.0"
 tokio = { version = "1.50", default-features = false, features = [
     "rt-multi-thread", "macros", "time", "sync", "net", "io-util", "process", "signal",

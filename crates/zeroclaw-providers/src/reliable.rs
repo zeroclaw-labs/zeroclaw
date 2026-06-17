@@ -1,4 +1,5 @@
 use super::ModelProvider;
+use super::dispatch::ProviderDispatch;
 use super::stream_guard::AbortOnDrop;
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
@@ -749,7 +750,11 @@ impl ModelProvider for ReliableModelProvider {
                     .with_attrs(::serde_json::json!({"model_provider": name})),
                 "Warming up model_provider connection pool"
             );
-            if model_provider.warmup().await.is_err() {
+            if ProviderDispatch::from_ref(&**model_provider)
+                .warmup()
+                .await
+                .is_err()
+            {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -783,7 +788,7 @@ impl ModelProvider for ReliableModelProvider {
                 let mut last_diagnostic: Option<ProviderErrorDiagnostic> = None;
 
                 for attempt in 0..=self.max_retries {
-                    match model_provider
+                    match ProviderDispatch::from_ref(&**model_provider)
                         .chat_with_system(system_prompt, message, current_model, temperature)
                         .await
                     {
@@ -966,7 +971,7 @@ impl ModelProvider for ReliableModelProvider {
                 let mut last_diagnostic: Option<ProviderErrorDiagnostic> = None;
 
                 for attempt in 0..=self.max_retries {
-                    match model_provider
+                    match ProviderDispatch::from_ref(&**model_provider)
                         .chat_with_history(&effective_messages, current_model, temperature)
                         .await
                     {
@@ -1169,7 +1174,7 @@ impl ModelProvider for ReliableModelProvider {
                 let mut last_diagnostic: Option<ProviderErrorDiagnostic> = None;
 
                 for attempt in 0..=self.max_retries {
-                    match model_provider
+                    match ProviderDispatch::from_ref(&**model_provider)
                         .chat_with_tools(&effective_messages, tools, current_model, temperature)
                         .await
                     {
@@ -1363,7 +1368,10 @@ impl ModelProvider for ReliableModelProvider {
                         tools: request.tools,
                         thinking: request.thinking,
                     };
-                    match model_provider.chat(req, current_model, temperature).await {
+                    match ProviderDispatch::from_ref(&**model_provider)
+                        .chat(req, current_model, temperature)
+                        .await
+                    {
                         Ok(resp) => {
                             // Re-roll a transient empty completion instead of
                             // returning a blank turn (bounded by `max_retries`;
@@ -1579,7 +1587,12 @@ impl ModelProvider for ReliableModelProvider {
                 tools: request.tools,
                 thinking: request.thinking,
             };
-            let stream = model_provider.stream_chat(req, &current_model, temperature, options);
+            let stream = ProviderDispatch::from_ref(&**model_provider).stream_chat(
+                req,
+                &current_model,
+                temperature,
+                options,
+            );
             let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
             let handle = ::zeroclaw_spawn::spawn!(async move {
@@ -1737,14 +1750,26 @@ impl ModelProvider for ReliableModelProvider {
 
 impl ::zeroclaw_api::attribution::Attributable for ReliableModelProvider {
     fn role(&self) -> ::zeroclaw_api::attribution::Role {
-        ::zeroclaw_api::attribution::Role::Provider(
-            ::zeroclaw_api::attribution::ProviderKind::Model(
-                ::zeroclaw_api::attribution::ModelProviderKind::Reliable,
-            ),
-        )
+        // Delegate to the primary (first) inner provider so the on-disk
+        // model_provider_type reflects the concrete provider
+        // (`anthropic`, `openai`, …) rather than the wrapper kind.
+        // If the wrapper somehow held zero providers we fall back to
+        // the parent `System` role — log emissions in that degenerate
+        // state are not user-facing.
+        match self.model_providers.first() {
+            Some((_, p)) => ::zeroclaw_api::attribution::Attributable::role(&**p),
+            None => ::zeroclaw_api::attribution::Role::System,
+        }
     }
+
     fn alias(&self) -> &str {
-        &self.alias
+        // Delegate to the primary inner provider for the same reason
+        // as `role()`. Falls back to the wrapper's own configured alias
+        // when no inner provider is registered.
+        match self.model_providers.first() {
+            Some((_, p)) => ::zeroclaw_api::attribution::Attributable::alias(&**p),
+            None => &self.alias,
+        }
     }
 }
 
@@ -4013,5 +4038,79 @@ mod tests {
         );
 
         assert!(provider.supports_vision());
+    }
+
+    #[tokio::test]
+    async fn reliable_wrapper_exposes_inner_provider_attribution() {
+        use crate::ProviderDispatch;
+        use std::sync::Arc;
+        use zeroclaw_api::attribution::Attributable;
+
+        let inner_mock = MockModelProvider {
+            calls: Arc::new(AtomicUsize::new(0)),
+            fail_until_attempt: 0,
+            response: "ok",
+            error: "",
+        };
+        let inner_role = inner_mock.role();
+        let inner_alias = inner_mock.alias().to_string();
+
+        let reliable = ReliableModelProvider::new(
+            "wrapped-alias",
+            vec![("primary".into(), Box::new(inner_mock))],
+            0,
+            0,
+        );
+        // The wrapper must report the inner provider's role/alias,
+        // not its own.
+        assert_eq!(reliable.role(), inner_role, "wrapper must delegate role()",);
+        assert_eq!(
+            reliable.alias(),
+            inner_alias,
+            "wrapper must delegate alias()",
+        );
+
+        // End-to-end through ProviderDispatch: the captured event
+        // must report the inner provider's `model_provider_type`,
+        // never `reliable`.
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let reliable: Arc<dyn ModelProvider> = Arc::new(reliable);
+        let dispatch = ProviderDispatch::new(reliable);
+        let req = ChatRequest {
+            messages: &[],
+            tools: None,
+            thinking: None,
+        };
+        let _ = dispatch.chat(req, "m", None).await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut found_type: Option<String> = None;
+        while found_type.is_none() && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if let Some(zc) = value.get("zeroclaw")
+                        && let Some(t) = zc.get("model_provider_type").and_then(|v| v.as_str())
+                    {
+                        found_type = Some(t.to_string());
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_elapsed) => {}
+            }
+        }
+        assert_ne!(
+            found_type.as_deref(),
+            Some("reliable"),
+            "ReliableModelProvider must not surface as model_provider_type=reliable",
+        );
+        zeroclaw_log::clear_broadcast_hook();
     }
 }

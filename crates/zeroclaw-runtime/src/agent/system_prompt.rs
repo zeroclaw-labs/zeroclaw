@@ -77,6 +77,34 @@ pub fn build_system_prompt(
     )
 }
 
+/// Like [`build_system_prompt`] but accepts `show_tool_calls` to control
+/// whether the system prompt instructs the model to hide tool narration.
+pub fn build_system_prompt_with_tool_calls(
+    workspace_dir: &std::path::Path,
+    model_name: &str,
+    tools: &[(&str, &str)],
+    skills: &[Skill],
+    identity_config: Option<&zeroclaw_config::schema::IdentityConfig>,
+    bootstrap_max_chars: Option<usize>,
+    show_tool_calls: bool,
+) -> String {
+    build_system_prompt_with_mode_and_autonomy(
+        workspace_dir,
+        model_name,
+        tools,
+        skills,
+        identity_config,
+        bootstrap_max_chars,
+        Some(&zeroclaw_config::schema::RiskProfileConfig::default()),
+        false,
+        zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+        false,
+        0,
+        true,
+        show_tool_calls,
+    )
+}
+
 pub fn build_system_prompt_with_mode(
     workspace_dir: &std::path::Path,
     model_name: &str,
@@ -105,6 +133,7 @@ pub fn build_system_prompt_with_mode(
         false,
         0,
         true,
+        false,
     )
 }
 
@@ -124,13 +153,19 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     // When `false`, `MEMORY.md` is omitted from the injected bootstrap files.
     // Set to `false` for isolated / ACP sessions that use `exclude_memory`.
     inject_memory: bool,
+    // When `true`, the model is allowed to narrate tool usage in its
+    // response. When `false` (default), the system prompt instructs
+    // the model to treat tool calls as invisible infrastructure.
+    show_tool_calls: bool,
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
     let has_tools = !tools.is_empty();
 
     // ── 0. Anti-narration (top priority) ───────────────────────
-    if has_tools {
+    // When show_tool_calls is true, the model is allowed to describe
+    // its tool usage so channel users see what tools are being called.
+    if has_tools && !show_tool_calls {
         prompt.push_str(
             "## CRITICAL: No Tool Narration\n\n\
              NEVER narrate, announce, describe, or explain your tool usage to the user. \
@@ -351,7 +386,9 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
         prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n");
         prompt.push_str("- When a user sends a voice note, it is automatically transcribed to text. Your text reply is automatically converted to a voice note and sent back. Do NOT attempt to generate audio yourself — TTS is handled by the channel.\n");
-        prompt.push_str("- NEVER narrate or describe your tool usage. Do NOT say 'Let me fetch...', 'I will use...', 'Searching...', or similar. Give the FINAL ANSWER only — no intermediate steps, no tool mentions, no progress updates.\n");
+        if !show_tool_calls {
+            prompt.push_str("- NEVER narrate or describe your tool usage. Do NOT say 'Let me fetch...', 'I will use...', 'Searching...', or similar. Give the FINAL ANSWER only — no intermediate steps, no tool mentions, no progress updates.\n");
+        }
         prompt.push_str("- Calibration note: agents in this system currently err on the side of silence when a response would be appropriate, which users find frustrating. Skew toward replying. Memory is supplementary context that informs how you respond, not a gate on whether you respond.\n\n");
     } // end if !compact_context (Channel Capabilities)
 
