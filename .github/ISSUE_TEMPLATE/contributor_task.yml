@@ -1,0 +1,79 @@
+name: Contributor-Ready Task
+description: Maintainer-scoped task intended for external contributors
+title: "[Task]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this when a maintainer has scoped work enough that an external contributor can pick it up.
+        Maintainers apply pickup labels separately after confirming scope, risk, acceptance criteria,
+        and review capacity.
+
+  - type: textarea
+    id: task
+    attributes:
+      label: Task
+      description: What needs to be done?
+      placeholder: Update ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: What does a contributor need to understand before starting?
+      placeholder: Relevant docs, code paths, linked issue/RFC, prior discussion.
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: What outcomes make this complete?
+      placeholder: |
+        - ...
+        - ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: files
+    attributes:
+      label: Likely files or areas
+      description: Point contributors to the likely starting locations.
+      placeholder: |
+        - crates/...
+        - docs/book/src/...
+    validations:
+      required: false
+
+  - type: dropdown
+    id: contributor_fit
+    attributes:
+      label: Contributor fit
+      options:
+        - good first issue candidate
+        - help wanted candidate
+        - maintainer-scoped task, not yet ready for pickup labels
+    validations:
+      required: true
+
+  - type: textarea
+    id: mentor_or_contact
+    attributes:
+      label: Mentor, reviewer, or contact
+      description: Who can answer scope questions or review the result?
+      placeholder: GitHub handle, team, or "maintainer triage required".
+    validations:
+      required: true
+
+  - type: textarea
+    id: risk
+    attributes:
+      label: Risk notes
+      description: Why is this safe for external pickup, or what risks should reviewers watch?
+      placeholder: Expected risk, validation needed, security/config caveats.
+    validations:
+      required: false
