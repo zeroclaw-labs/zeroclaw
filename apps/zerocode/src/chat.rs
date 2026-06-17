@@ -3081,7 +3081,7 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
                         ));
                     }
                 } else {
-                    let mut style = Style::default();
+                    let mut style = theme::body_style();
                     if let Some(level) = heading_level {
                         style = match level {
                             HeadingLevel::H1 | HeadingLevel::H2 => {
@@ -3127,7 +3127,10 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
 
     // Fallback: if parsing produced nothing, return raw text.
     if lines.is_empty() && !text.is_empty() {
-        lines.push(Line::from(Span::raw(text.to_string())));
+        lines.push(Line::from(Span::styled(
+            text.to_string(),
+            theme::body_style(),
+        )));
     }
 
     lines
@@ -4553,13 +4556,13 @@ fn labelled_clipboard_text(entry: &ChatEntry) -> String {
     }
 }
 
-/// Suspend the TUI, open `$EDITOR` with `content`, return the edited text.
+/// Suspend the TUI, open `$VISUAL` / `$EDITOR` with `content`, return the edited text.
 /// Restores raw mode and alternate screen before returning.
-/// Falls back to `content` unchanged if `$EDITOR` is unset or the process fails.
+/// Falls back to `content` unchanged if no editor is available or the process fails.
 pub async fn open_editor_for_content(content: &str) -> String {
-    let editor = std::env::var("EDITOR")
-        .or_else(|_| std::env::var("VISUAL"))
-        .unwrap_or_else(|_| "vi".to_string());
+    let Some(editor) = crate::editor::editor_from_env_or_path() else {
+        return content.to_string();
+    };
 
     let tmp = match tempfile::NamedTempFile::new() {
         Ok(f) => f,
@@ -5353,6 +5356,12 @@ mod tests {
         let out = rendered("# Title\n", 80);
         assert!(out.contains('\u{258C}'), "expected H1 gutter: {out}");
         assert!(out.contains("Title"));
+    }
+
+    #[test]
+    fn md_plain_text_uses_theme_body_style() {
+        let out = markdown_to_lines("plain assistant text\n", 80);
+        assert_eq!(out[0].spans[0].style, theme::body_style());
     }
 
     #[test]

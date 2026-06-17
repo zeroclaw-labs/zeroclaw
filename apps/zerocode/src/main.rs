@@ -28,6 +28,7 @@ mod config;
 mod config_manager;
 mod dashboard;
 mod diff;
+mod editor;
 mod file_explorer;
 mod i18n;
 mod input_bar;

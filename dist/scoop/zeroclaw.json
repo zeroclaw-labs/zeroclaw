@@ -1,5 +1,5 @@
 {
-    "version": "0.5.9",
+    "version": "0.8.0",
     "description": "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant.",
     "homepage": "https://github.com/zeroclaw-labs/zeroclaw",
     "license": "MIT|Apache-2.0",

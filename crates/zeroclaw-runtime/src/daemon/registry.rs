@@ -54,6 +54,10 @@ pub struct DaemonRegistry {
     socket_start: Option<RpcStarter>,
     wss_start: Option<RpcStarter>,
     mqtt_start: Option<MqttStarter>,
+    /// Shared SOP engine built by the daemon reload loop. Passed through to
+    /// RpcContext so RPC/TUI agent sessions share the same engine.
+    sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
+    sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
 }
 
 impl DaemonRegistry {
@@ -129,6 +133,26 @@ impl DaemonRegistry {
 
     pub(crate) fn take_mqtt_start(&mut self) -> Option<MqttStarter> {
         self.mqtt_start.take()
+    }
+
+    /// Set the shared SOP engine for this daemon iteration.
+    pub fn set_sop_engine(
+        &mut self,
+        sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
+        sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
+    ) -> &mut Self {
+        self.sop_engine = sop_engine;
+        self.sop_audit = sop_audit;
+        self
+    }
+
+    pub(crate) fn take_sop_engine(
+        &mut self,
+    ) -> (
+        Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
+        Option<Arc<crate::sop::SopAuditLogger>>,
+    ) {
+        (self.sop_engine.take(), self.sop_audit.take())
     }
 }
 

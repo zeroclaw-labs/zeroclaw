@@ -53,6 +53,13 @@
   --pc-bg-code: #1a1a20;
   --pc-bg-sidebar: rgba(30, 30, 36, 0.95);
 
+  /* Derived surface tints — adapt automatically across every color theme
+     because they color-mix the per-theme surface/text/accent tokens that the
+     theme system overrides at runtime (see ThemeContext.applyVars). Defined
+     here so referenced vars are never undefined in dark or light palettes. */
+  --pc-bg-surface-subtle: color-mix(in srgb, var(--pc-bg-surface) 92%, var(--pc-text-primary) 8%);
+  --pc-bg-surface-elevated: color-mix(in srgb, var(--pc-bg-elevated) 85%, var(--pc-text-primary) 15%);
+
   /* Borders */
   --pc-border: rgba(255, 255, 255, 0.08);
   --pc-border-strong: rgba(255, 255, 255, 0.1);
@@ -69,6 +76,23 @@
   --pc-accent-dim: rgba(34, 211, 238, 0.3);
   --pc-accent-glow: rgba(34, 211, 238, 0.1);
   --pc-accent-rgb: 34, 211, 238;
+
+  /* Link text — derived from the per-theme accent so it tracks every palette. */
+  --pc-text-link: var(--pc-accent-light);
+
+  /* ── Operator Console scale tokens (additive) ──
+     Consistent radii + elevation for the redesign primitives. These do not
+     vary per theme; they are structural design tokens. */
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+
+  --pc-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.18);
+  --pc-shadow-md: 0 4px 16px rgba(0, 0, 0, 0.22);
+
+  /* Focus ring color — tracks the per-theme accent for a strong, legible ring. */
+  --pc-focus: var(--pc-accent);
 
   /* Hover */
   --pc-hover: rgba(255, 255, 255, 0.05);
@@ -106,9 +130,10 @@ body {
   min-height: 100vh;
 }
 
-/* Focus ring */
+/* Focus ring — solid accent for a strong, legible, WCAG-friendly ring
+   (was a low-contrast 30%-alpha color). */
 :focus-visible {
-  outline: 2px solid var(--pc-accent-dim);
+  outline: 2px solid var(--pc-focus);
   outline-offset: 2px;
 }
 

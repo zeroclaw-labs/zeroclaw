@@ -54,6 +54,8 @@
   - [Streaming](./providers/streaming.md)
   - [Routing](./providers/routing.md)
   - [Custom providers](./providers/custom.md)
+  - [OpenAI Codex (subscription)](./providers/openai-codex-subscription.md)
+
 - [Channels & Integrations](./channels/overview.md)
   - [Peer Groups](./channels/peer-groups.md)
   - [Matrix](./channels/matrix.md)
@@ -103,6 +105,7 @@
   - [Observability](./sop/observability.md)
   - [Worked Example](./sop/example.md)
 - [Extending & Plugins](./developing/index.md)
+  - [First-party extensions](./developing/first-party-extensions.md)
   - [Plugin protocol](./developing/plugin-protocol.md)
   - [Extension examples](./developing/extension-examples.md)
   - [Building the docs locally](./developing/building-docs.md)

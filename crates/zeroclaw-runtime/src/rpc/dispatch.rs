@@ -84,6 +84,7 @@ pub enum Method {
     ConfigList,
     ConfigDelete,
     ConfigMapKeys,
+    ConfigResolveAliasSource,
     ConfigMapKeyCreate,
     ConfigMapKeyDelete,
     ConfigMapKeyRename,
@@ -182,6 +183,10 @@ impl Method {
         (Method::ConfigList, "config/list"),
         (Method::ConfigDelete, "config/delete"),
         (Method::ConfigMapKeys, "config/map-keys"),
+        (
+            Method::ConfigResolveAliasSource,
+            "config/resolve-alias-source",
+        ),
         (Method::ConfigMapKeyCreate, "config/map-key-create"),
         (Method::ConfigMapKeyDelete, "config/map-key-delete"),
         (Method::ConfigMapKeyRename, "config/map-key-rename"),
@@ -485,6 +490,9 @@ impl RpcDispatcher {
             Method::ConfigList => self.handle_config_list(&req.params),
             Method::ConfigDelete => self.handle_config_delete(&req.params).await,
             Method::ConfigMapKeys => self.handle_config_map_keys(&req.params),
+            Method::ConfigResolveAliasSource => {
+                self.handle_config_resolve_alias_source(&req.params)
+            }
             Method::ConfigMapKeyCreate => self.handle_config_map_key_create(&req.params).await,
             Method::ConfigMapKeyDelete => self.handle_config_map_key_delete(&req.params).await,
             Method::ConfigMapKeyRename => self.handle_config_map_key_rename(&req.params).await,
@@ -751,6 +759,8 @@ impl RpcDispatcher {
             false,
             exclude_memory,
             tui_env,
+            self.ctx.sop_engine.clone(),
+            self.ctx.sop_audit.clone(),
         )
         .await
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to create agent: {e}")))?;
@@ -1154,6 +1164,8 @@ impl RpcDispatcher {
             false,
             exclude_memory,
             tui_env,
+            self.ctx.sop_engine.clone(),
+            self.ctx.sop_audit.clone(),
         )
         .await
         .ok()?;
@@ -2537,6 +2549,16 @@ impl RpcDispatcher {
         })
     }
 
+    fn handle_config_resolve_alias_source(&self, params: &Value) -> RpcResult {
+        let req: ConfigResolveAliasSourceParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let values = config.resolve_alias_source(req.source);
+        to_result(ConfigResolveAliasSourceResult {
+            source: req.source,
+            values,
+        })
+    }
+
     fn handle_config_map_keys(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeysParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
@@ -3063,7 +3085,9 @@ impl RpcDispatcher {
                     has_picker,
                     completed,
                     ready: false,
-                    group: String::new(),
+                    group: zeroclaw_config::sections::section_group_for_key(&key)
+                        .label()
+                        .to_string(),
                     is_quickstart: wizard.is_some(),
                     shape: wizard.map(Section::shape),
                     label,
@@ -3517,6 +3541,15 @@ mod tests {
         serde_json::from_str(s).unwrap()
     }
 
+    fn make_approval_test_dispatcher() -> RpcDispatcher {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(zeroclaw_config::schema::Config::default(), sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        RpcDispatcher::new(ctx, tx, "test-peer-approval:pid=1".into())
+    }
+
     #[test]
     fn method_from_wire_roundtrip() {
         for (method, wire) in Method::ALL {
@@ -3540,6 +3573,52 @@ mod tests {
         for (_, wire) in Method::ALL {
             assert!(seen.insert(*wire), "duplicate wire name: {wire}");
         }
+    }
+
+    #[test]
+    fn session_approve_resolves_pending_request() {
+        let dispatcher = make_approval_test_dispatcher();
+        let (tx, mut rx) =
+            tokio::sync::oneshot::channel::<zeroclaw_api::channel::ChannelApprovalResponse>();
+        dispatcher
+            .ctx
+            .approval_pending
+            .insert("req-allow".to_string(), tx);
+
+        let result = dispatcher
+            .handle_session_approve(&json!({
+                "session_id": "sess-1",
+                "request_id": "req-allow",
+                "decision": "allow_once"
+            }))
+            .unwrap();
+
+        assert_eq!(result["session_id"], "sess-1");
+        assert_eq!(result["request_id"], "req-allow");
+        assert_eq!(result["acknowledged"], true);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            zeroclaw_api::channel::ChannelApprovalResponse::Approve
+        );
+        assert!(!dispatcher.ctx.approval_pending.contains("req-allow"));
+    }
+
+    #[test]
+    fn session_approve_unknown_request_is_acknowledged_noop() {
+        let dispatcher = make_approval_test_dispatcher();
+
+        let result = dispatcher
+            .handle_session_approve(&json!({
+                "session_id": "sess-1",
+                "request_id": "timed-out-req",
+                "decision": "allow_once"
+            }))
+            .unwrap();
+
+        assert_eq!(result["session_id"], "sess-1");
+        assert_eq!(result["request_id"], "timed-out-req");
+        assert_eq!(result["acknowledged"], true);
+        assert!(!dispatcher.ctx.approval_pending.contains("timed-out-req"));
     }
 
     #[test]
@@ -3777,7 +3856,7 @@ mod tests {
             AliasedAgentConfig {
                 enabled: true,
                 model_provider: "openai.test-provider".into(),
-                risk_profile: "test-profile".to_string(),
+                risk_profile: "test-profile".into(),
                 ..Default::default()
             },
         );

@@ -504,29 +504,16 @@ async fn prepare_messages_inner(
         });
     }
 
-    // When image count exceeds the limit, strip markers from oldest messages
-    // first so that the most recent (most relevant) images survive. This
-    // prevents conversations from becoming permanently stuck once the
-    // cumulative image count crosses the threshold.
-    let trimmed = if total_images > max_images {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({
-                    "total_images": total_images,
-                    "max_images": max_images,
-                    "trimmed_to": max_images,
-                })),
-            "multimodal: trimming oldest images — conversation exceeds image limit"
-        );
-        trim_old_images(messages, max_images)
-    } else {
-        messages.to_vec()
-    };
-
+    // Normalize every image marker first, then enforce the per-request image
+    // cap further below based only on images that *successfully* normalize.
+    // Trimming the oldest images *before* normalization is unsafe: a newer
+    // image ref that fails to load would evict an older valid one that could
+    // still have been sent (see `skipped_images_do_not_consume_image_budget`).
+    // The post-normalization cap keeps the most recent successful images and
+    // prevents conversations from sticking once the cumulative count crosses
+    // the threshold, so no pre-normalization trim is needed here.
     let remote_client = build_runtime_proxy_client_with_timeouts("model_provider.ollama", 30, 10);
-    let latest_tool_indices = latest_tool_result_indices(&trimmed);
+    let latest_tool_indices = latest_tool_result_indices(messages);
 
     let mut normalized_messages = Vec::with_capacity(messages.len());
     let mut has_successful_images = false;
@@ -2038,6 +2025,71 @@ mod tests {
         // Second and third should have base64-encoded images
         assert!(result.messages[1].content.contains("data:image"));
         assert!(result.messages[2].content.contains("data:image"));
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_caps_to_newest_successful_images() {
+        // Regression for the dead pre-normalization trim: with more valid images
+        // than the cap, normalization must run on all of them and the cap must
+        // keep the *newest* `max_images`, dropping the oldest. Exactly one
+        // "post-normalization image cap exceeded" path should fire — there is no
+        // longer a separate, misleading pre-normalization "trimmed_to" warning.
+        let temp = tempfile::tempdir().unwrap();
+        // Minimal valid PNG (1x1 RGB pixel).
+        let png_data = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC,
+            0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+
+        // Nine distinct valid image files across nine user messages, max 4.
+        let mut messages = Vec::new();
+        for i in 0..9 {
+            let p = temp.path().join(format!("img{i}.png"));
+            std::fs::write(&p, png_data).unwrap();
+            messages.push(ChatMessage::user(format!(
+                "[IMAGE:{}]\nImage {i}",
+                p.display()
+            )));
+        }
+
+        let config = MultimodalConfig {
+            max_images: 4,
+            max_image_size_mb: 5,
+            allow_remote_fetch: false,
+            max_image_turns: 0, // disable age-based trimming to isolate the cap
+            ..Default::default()
+        };
+
+        let result = prepare_messages_for_provider(&messages, &config)
+            .await
+            .expect("should succeed");
+
+        // Output is capped to exactly max_images...
+        let surviving = result
+            .messages
+            .iter()
+            .filter(|m| m.content.contains("data:image"))
+            .count();
+        assert_eq!(surviving, 4, "output should keep exactly max_images");
+
+        // ...and it is the newest four that survive; the oldest five are stripped.
+        for (i, m) in result.messages.iter().enumerate() {
+            if i < 5 {
+                assert!(
+                    !m.content.contains("data:image"),
+                    "oldest message {i} should be capped out"
+                );
+                assert!(m.content.contains(&format!("Image {i}")));
+            } else {
+                assert!(
+                    m.content.contains("data:image"),
+                    "newest message {i} should survive the cap"
+                );
+            }
+        }
     }
 
     #[tokio::test]

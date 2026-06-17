@@ -2122,7 +2122,7 @@ mod tests {
             "test-agent".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "openrouter.default".into(),
-                risk_profile: "test-profile".to_string(),
+                risk_profile: "test-profile".into(),
                 ..Default::default()
             },
         );
@@ -2184,6 +2184,8 @@ mod tests {
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             reload_tx: None,
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }

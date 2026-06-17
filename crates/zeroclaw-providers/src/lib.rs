@@ -23,6 +23,7 @@ pub mod bedrock;
 pub mod catalog;
 pub mod compatible;
 pub mod copilot;
+pub mod dispatch;
 pub mod factory;
 pub mod gemini;
 pub mod gemini_cli;
@@ -42,6 +43,7 @@ pub(crate) mod stream_guard;
 pub mod telnyx;
 pub mod traits;
 
+pub use dispatch::{ProviderDispatch, ProviderDispatchRef};
 #[allow(unused_imports)]
 pub use traits::{
     ChatMessage, ChatRequest, ChatResponse, ConversationMessage, ModelProvider,
@@ -633,6 +635,8 @@ pub struct ModelProviderRuntimeOptions {
     pub think: Option<bool>,
     /// Passed verbatim as `chat_template_kwargs` to the llamacpp provider.
     pub chat_template_kwargs: Option<serde_json::Value>,
+    /// Path to a custom CA certificate file for TLS connections.
+    pub tls_ca_cert_path: Option<String>,
 }
 
 impl Default for ModelProviderRuntimeOptions {
@@ -655,6 +659,7 @@ impl Default for ModelProviderRuntimeOptions {
             wire_api: None,
             think: None,
             chat_template_kwargs: None,
+            tls_ca_cert_path: None,
         }
     }
 }
@@ -697,6 +702,8 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         .map(|p| p.merge_system_into_user)
         .unwrap_or(false);
 
+    let tls_ca_cert_path = entry.and_then(|e| e.tls_ca_cert_path.clone());
+
     ModelProviderRuntimeOptions {
         auth_profile_override: None,
         provider_kind: entry.and_then(|e| {
@@ -721,6 +728,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         wire_api: entry.and_then(|e| e.wire_api.map(|w| w.as_str().to_string())),
         think: entry.and_then(|e| e.think),
         chat_template_kwargs: entry.and_then(|e| e.chat_template_kwargs.clone()),
+        tls_ca_cert_path,
     }
 }
 
@@ -1342,7 +1350,7 @@ pub fn create_resilient_model_provider_for_alias(
             &entry.fallback,
             &mut visited,
             1,
-        );
+        )?;
     }
 
     let reliable = ReliableModelProvider::new(
@@ -1405,25 +1413,27 @@ fn push_pinned_entries(
 /// built with its OWN credentials/endpoint/model and appended (model-pinned)
 /// before descending into its own `fallback`. Dangling refs, cycles, and chains
 /// deeper than `MAX_FALLBACK_DEPTH` are skipped — `Config::collect_warnings`
-/// already surfaces all three to operators.
+/// already surfaces all three to operators. A resolved alias that cannot be
+/// constructed is a hard error because otherwise operators think the requested
+/// fallback is available when it is not.
 fn append_fallback_chain(
     out: &mut Vec<(String, Box<dyn ModelProvider>)>,
     config: &zeroclaw_config::schema::Config,
     refs: &[zeroclaw_config::providers::ModelProviderRef],
     visited: &mut Vec<String>,
     depth: usize,
-) {
+) -> anyhow::Result<()> {
     if depth > zeroclaw_config::providers::MAX_FALLBACK_DEPTH {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                 .with_attrs(::serde_json::json!({
-                    "max_depth": zeroclaw_config::providers::MAX_FALLBACK_DEPTH
+                        "max_depth": zeroclaw_config::providers::MAX_FALLBACK_DEPTH
                 })),
             "fallback chain exceeds max depth; pruning"
         );
-        return;
+        return Ok(());
     }
     for fallback_ref in refs {
         let raw = fallback_ref.as_str().trim();
@@ -1453,6 +1463,21 @@ fn append_fallback_chain(
         }
 
         let opts = provider_runtime_options_for_alias(config, family, &alias);
+        if !factory::fallback_auth_ready_for_alias(
+            config,
+            family,
+            &alias,
+            entry.api_key.as_deref(),
+            &opts,
+        ) {
+            let profile = format!("[providers.models.{family}.{alias}]");
+            anyhow::bail!(
+                "Fallback provider `{raw}` resolved to `{resolved}` ({profile}) but no \
+                 profile-resolved credential exists. Set `api_key` on {profile}, configure \
+                 the alias's external auth flow, or remove it from `fallback`."
+            );
+        }
+
         match create_model_provider_inner(
             Some(config),
             family,
@@ -1463,23 +1488,19 @@ fn append_fallback_chain(
         ) {
             Ok(built) => push_pinned_entries(out, config, family, &alias, built),
             Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"fallback": resolved, "error": format!("{e}")})
-                        ),
-                    "fallback provider failed to build; skipping"
+                let profile = format!("[providers.models.{family}.{alias}]");
+                anyhow::bail!(
+                    "Fallback provider `{raw}` resolved to `{resolved}` ({profile}) failed to \
+                     build: {e}"
                 );
-                continue;
             }
         }
 
         visited.push(resolved.clone());
-        append_fallback_chain(out, config, &entry.fallback, visited, depth + 1);
+        append_fallback_chain(out, config, &entry.fallback, visited, depth + 1)?;
         visited.pop();
     }
+    Ok(())
 }
 
 /// Build a resilient model provider from a name that may be either a bare
@@ -1555,6 +1576,7 @@ pub fn create_routed_model_provider_with_options(
     // upstream for the owning agent).
     let mut model_providers: Vec<(String, Box<dyn ModelProvider>)> = Vec::new();
     for name in &needed {
+        let is_primary = name == primary_name;
         let routed_credential = model_routes
             .iter()
             .find(|r| &r.model_provider == name)
@@ -1579,9 +1601,9 @@ pub fn create_routed_model_provider_with_options(
                         (!trimmed.is_empty()).then_some(trimmed)
                     })
             })
-            .or(api_key);
-        let url = if name == primary_name { api_url } else { None };
-        let entry_options = if name == primary_name {
+            .or_else(|| is_primary.then_some(api_key).flatten());
+        let url = if is_primary { api_url } else { None };
+        let entry_options = if is_primary {
             options.clone()
         } else {
             options_for_provider_ref(config, name, options)
@@ -1597,18 +1619,7 @@ pub fn create_routed_model_provider_with_options(
         ) {
             Ok(model_provider) => model_providers.push((name.clone(), model_provider)),
             Err(e) => {
-                if name == primary_name {
-                    return Err(e);
-                }
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"model_provider": name.as_str(), "error": format!("{}", e)})
-                        ),
-                    "Ignoring routed model_provider that failed to initialize"
-                );
+                anyhow::bail!("Routed model_provider `{name}` failed to initialize: {e}");
             }
         }
     }
@@ -1714,11 +1725,12 @@ pub fn default_model_provider_url(name: &str) -> Option<&'static str> {
         HuggingfaceModelProviderConfig, HyperbolicModelProviderConfig,
         InceptionModelProviderConfig, LambdaAiModelProviderConfig, LeptonModelProviderConfig,
         LitellmModelProviderConfig, MistralModelProviderConfig, MorphModelProviderConfig,
-        NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
-        OpencodeModelProviderConfig, PerplexityModelProviderConfig, RekaModelProviderConfig,
-        SambanovaModelProviderConfig, SglangModelProviderConfig, SiliconflowModelProviderConfig,
-        SyntheticModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
-        VercelModelProviderConfig, VllmModelProviderConfig, YiModelProviderConfig,
+        NearaiModelProviderConfig, NebiusModelProviderConfig, NovitaModelProviderConfig,
+        NscaleModelProviderConfig, OpencodeModelProviderConfig, PerplexityModelProviderConfig,
+        RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
+        SiliconflowModelProviderConfig, SyntheticModelProviderConfig, TogetherModelProviderConfig,
+        UpstageModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
+        YiModelProviderConfig,
     };
 
     match name {
@@ -1766,6 +1778,7 @@ pub fn default_model_provider_url(name: &str) -> Option<&'static str> {
         "arcee" => Some(<ArceeModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "lambda_ai" => Some(<LambdaAiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "inception" => Some(<InceptionModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
+        "nearai" => Some(<NearaiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "baichuan" => Some(<BaichuanModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         "yi" => Some(<YiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
         _ => None,
@@ -1823,6 +1836,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
         ModelProviderCategory::OpenAiCompatible,
         &[
             ("venice", "Venice", false),
+            ("nearai", "NEAR AI Cloud", false),
             ("vercel", "Vercel AI Gateway", false),
             ("cloudflare", "Cloudflare AI", false),
             ("moonshot", "Moonshot", false),
@@ -2167,6 +2181,17 @@ mod tests {
         assert!(
             !model_provider.capabilities().native_tool_calling,
             "Venice should use prompt-guided tools, not native tool calling"
+        );
+    }
+
+    #[test]
+    fn factory_nearai() {
+        let model_provider = create_model_provider("nearai", Some("nearai-key")).unwrap();
+        // NEAR AI Cloud is OpenAI-protocol-compatible: default Bearer auth +
+        // native OpenAI-style tool calling. No .without_native_tools() override.
+        assert!(
+            model_provider.capabilities().native_tool_calling,
+            "NEAR AI Cloud should use OpenAI-compatible native tool calling"
         );
     }
 
@@ -2523,6 +2548,32 @@ mod tests {
             options.native_tools,
             Some(true),
             "native_tools must propagate from the active model_provider entry to runtime options"
+        );
+    }
+
+    #[test]
+    fn provider_runtime_options_from_config_propagates_tls_ca_cert_path() {
+        // Regression guard: tls_ca_cert_path on a ModelProviderConfig entry must
+        // reach ModelProviderRuntimeOptions so apply_compat_options can call
+        // with_tls_ca_cert_path on the provider. Same pattern as native_tools above.
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.openai.insert(
+            "corp".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    tls_ca_cert_path: Some("/tmp/example-ca.pem".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let entry = config.providers.models.find("openai", "corp");
+        let options = model_provider_runtime_options_from_model_provider_entry(&config, entry);
+        assert_eq!(
+            options.tls_ca_cert_path.as_deref(),
+            Some("/tmp/example-ca.pem"),
+            "tls_ca_cert_path must propagate from ModelProviderConfig to ModelProviderRuntimeOptions"
         );
     }
 
@@ -3008,6 +3059,7 @@ mod tests {
             "ollama",
             "gemini",
             "venice",
+            "nearai",
             "vercel",
             "cloudflare",
             "moonshot",
@@ -3603,6 +3655,79 @@ mod tests {
         );
     }
 
+    #[test]
+    fn routed_model_provider_fails_when_routed_provider_fallback_lacks_profile_credential() {
+        use zeroclaw_config::schema::{
+            Config, ModelProviderConfig, ModelRouteConfig, OpenAIModelProviderConfig,
+            ReliabilityConfig,
+        };
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    api_key: Some("primary-key".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.openai.insert(
+            "routed".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4.1".to_string()),
+                    api_key: Some("route-key".to_string()),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "openai.bad",
+                    )],
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.openai.insert(
+            "bad".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4.1-mini".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        let routes = [ModelRouteConfig {
+            hint: "test".to_string(),
+            model_provider: "openai.routed".to_string(),
+            model: "gpt-4.1".to_string(),
+            api_key: None,
+        }];
+
+        let result = create_routed_model_provider_with_options(
+            &config,
+            "openai.primary",
+            Some("primary-key"),
+            None,
+            &ReliabilityConfig::default(),
+            &routes,
+            "gpt-4o",
+            &ModelProviderRuntimeOptions::default(),
+        );
+
+        assert!(
+            result.is_err(),
+            "route provider fallback failures must not be silently ignored"
+        );
+        let message = result.err().unwrap().to_string();
+        assert!(
+            message.contains("openai.routed"),
+            "error must name the routed provider that failed: {message}"
+        );
+        assert!(
+            message.contains("openai.bad"),
+            "error must preserve the failed fallback alias: {message}"
+        );
+    }
+
     /// Regression test: any dotted alias name ("openai.<anything>") must route through
     /// the alias-aware factory path so the typed config's `requires_openai_auth = true`
     /// flag is visible to `OpenAIModelProviderConfig::create_provider`. Without this,
@@ -3663,6 +3788,7 @@ mod tests {
             OpenAIModelProviderConfig {
                 base: ModelProviderConfig {
                     model: Some("gpt-4o".to_string()),
+                    api_key: Some("primary-key".to_string()),
                     fallback_models: vec!["gpt-4o-mini".to_string()],
                     fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
                         "openai.backup",
@@ -3676,6 +3802,7 @@ mod tests {
             OpenAIModelProviderConfig {
                 base: ModelProviderConfig {
                     model: Some("gpt-4.1".to_string()),
+                    api_key: Some("backup-key".to_string()),
                     ..Default::default()
                 },
             },
@@ -3694,6 +3821,323 @@ mod tests {
         assert!(
             result.is_ok(),
             "multi-alias fallback chain must build: {}",
+            result.err().unwrap()
+        );
+    }
+
+    #[test]
+    fn resilient_alias_fails_when_resolved_fallback_lacks_profile_credential() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig, OpenAIModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    api_key: Some("primary-key".to_string()),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "openai.backup",
+                    )],
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.openai.insert(
+            "backup".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4.1".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let result = create_resilient_model_provider_for_alias(
+            &config,
+            "openai",
+            "primary",
+            Some("primary-key"),
+            None,
+            &zeroclaw_config::schema::ReliabilityConfig::default(),
+            &ModelProviderRuntimeOptions::default(),
+        );
+        assert!(
+            result.is_err(),
+            "missing fallback credential must fail loudly"
+        );
+        let err = result.err().unwrap();
+        let message = err.to_string();
+        assert!(
+            message.contains("openai.backup"),
+            "error must name resolved fallback alias: {message}"
+        );
+        assert!(
+            message.contains("[providers.models.openai.backup]"),
+            "error must name the profile to fix: {message}"
+        );
+        assert!(
+            message.contains("api_key"),
+            "error must name the credential field to set: {message}"
+        );
+    }
+
+    #[test]
+    fn resilient_alias_fails_when_resolved_fallback_uri_lacks_profile_credential() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig, OpenAIModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    api_key: Some("primary-key".to_string()),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "openai.backup",
+                    )],
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.openai.insert(
+            "backup".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4.1".to_string()),
+                    kind: Some("openai-compatible".to_string()),
+                    uri: Some("https://api.openai.com/v1".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let result = create_resilient_model_provider_for_alias(
+            &config,
+            "openai",
+            "primary",
+            Some("primary-key"),
+            None,
+            &zeroclaw_config::schema::ReliabilityConfig::default(),
+            &ModelProviderRuntimeOptions::default(),
+        );
+        assert!(
+            result.is_err(),
+            "uri and kind alone must not make a fallback auth-ready"
+        );
+        let message = result.err().unwrap().to_string();
+        assert!(
+            message.contains("openai.backup"),
+            "error must name resolved fallback alias: {message}"
+        );
+        assert!(
+            message.contains("[providers.models.openai.backup]"),
+            "error must name the profile to fix: {message}"
+        );
+        assert!(
+            message.contains("api_key"),
+            "error must name the credential field to set: {message}"
+        );
+    }
+
+    #[test]
+    fn resilient_alias_fails_when_minimax_fallback_lacks_auth_source() {
+        use zeroclaw_config::schema::{
+            Config, MinimaxModelProviderConfig, ModelProviderConfig, OpenAIModelProviderConfig,
+        };
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    api_key: Some("primary-key".to_string()),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "minimax.backup",
+                    )],
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.minimax.insert(
+            "backup".to_string(),
+            MinimaxModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("minimax-text-01".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let result = create_resilient_model_provider_for_alias(
+            &config,
+            "openai",
+            "primary",
+            Some("primary-key"),
+            None,
+            &zeroclaw_config::schema::ReliabilityConfig::default(),
+            &ModelProviderRuntimeOptions::default(),
+        );
+        assert!(
+            result.is_err(),
+            "MiniMax fallback without api_key or oauth_refresh_token must fail loudly"
+        );
+        let message = result.err().unwrap().to_string();
+        assert!(
+            message.contains("minimax.backup"),
+            "error must name resolved fallback alias: {message}"
+        );
+        assert!(
+            message.contains("api_key"),
+            "error must name the credential field to set: {message}"
+        );
+    }
+
+    #[test]
+    fn resilient_alias_fails_when_resolved_fallback_factory_fails() {
+        use zeroclaw_config::schema::{Config, CustomModelProviderConfig, ModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            zeroclaw_config::schema::OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    api_key: Some("primary-key".to_string()),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "custom.backup",
+                    )],
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.custom.insert(
+            "backup".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("custom-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let result = create_resilient_model_provider_for_alias(
+            &config,
+            "openai",
+            "primary",
+            Some("primary-key"),
+            None,
+            &zeroclaw_config::schema::ReliabilityConfig::default(),
+            &ModelProviderRuntimeOptions::default(),
+        );
+        assert!(
+            result.is_err(),
+            "resolved fallback factory failure must abort build"
+        );
+        let err = result.err().unwrap();
+        let message = err.to_string();
+        assert!(
+            message.contains("custom.backup"),
+            "error must name resolved fallback alias: {message}"
+        );
+        assert!(
+            message.contains("[providers.models.custom.backup]"),
+            "error must name the profile to fix: {message}"
+        );
+        assert!(
+            message.contains("uri"),
+            "factory error must preserve the missing field detail: {message}"
+        );
+    }
+
+    #[test]
+    fn resilient_alias_allows_openai_external_auth_fallback_without_api_key() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig, OpenAIModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    api_key: Some("primary-key".to_string()),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "openai.codex",
+                    )],
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.openai.insert(
+            "codex".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-5-codex".to_string()),
+                    requires_openai_auth: true,
+                    ..Default::default()
+                },
+            },
+        );
+
+        let result = create_resilient_model_provider_for_alias(
+            &config,
+            "openai",
+            "primary",
+            Some("primary-key"),
+            None,
+            &zeroclaw_config::schema::ReliabilityConfig::default(),
+            &ModelProviderRuntimeOptions::default(),
+        );
+        assert!(
+            result.is_ok(),
+            "OpenAI external-auth fallbacks may intentionally omit api_key: {}",
+            result.err().unwrap()
+        );
+    }
+
+    #[test]
+    fn resilient_alias_allows_local_fallback_without_profile_api_key() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig, OllamaModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            zeroclaw_config::schema::OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    api_key: Some("primary-key".to_string()),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "ollama.local",
+                    )],
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.ollama.insert(
+            "local".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("llama3.2".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        let result = create_resilient_model_provider_for_alias(
+            &config,
+            "openai",
+            "primary",
+            Some("primary-key"),
+            None,
+            &zeroclaw_config::schema::ReliabilityConfig::default(),
+            &ModelProviderRuntimeOptions::default(),
+        );
+        assert!(
+            result.is_ok(),
+            "local fallback providers may intentionally omit api_key: {}",
             result.err().unwrap()
         );
     }
@@ -3741,6 +4185,7 @@ mod tests {
             OpenAIModelProviderConfig {
                 base: ModelProviderConfig {
                     model: Some("gpt-4o".to_string()),
+                    api_key: Some("a-key".to_string()),
                     fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
                         "openai.b",
                     )],
@@ -3753,6 +4198,7 @@ mod tests {
             OpenAIModelProviderConfig {
                 base: ModelProviderConfig {
                     model: Some("gpt-4.1".to_string()),
+                    api_key: Some("b-key".to_string()),
                     fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
                         "openai.a",
                     )],
@@ -3796,6 +4242,7 @@ mod tests {
                 OpenAIModelProviderConfig {
                     base: ModelProviderConfig {
                         model: Some("gpt-4o".to_string()),
+                        api_key: Some(format!("a{i}-key")),
                         fallback,
                         ..Default::default()
                     },
