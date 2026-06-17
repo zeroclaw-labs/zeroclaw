@@ -116,6 +116,19 @@ impl QuickstartStep {
             Self::Agent => "Agent",
         }
     }
+
+    #[must_use]
+    pub fn label_key(self) -> &'static str {
+        match self {
+            Self::ModelProvider => "cli-quickstart-step-model-provider",
+            Self::RiskProfile => "cli-quickstart-step-risk-profile",
+            Self::RuntimeProfile => "cli-quickstart-step-runtime-profile",
+            Self::Memory => "cli-quickstart-step-memory",
+            Self::Channels => "cli-quickstart-step-channels",
+            Self::PeerGroups => "cli-quickstart-step-peer-groups",
+            Self::Agent => "cli-quickstart-step-agent",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -132,6 +145,26 @@ impl QuickstartError {
             field: field.into(),
             message: message.into(),
         }
+    }
+
+    fn for_surface(
+        ctx: Option<&RunCtx>,
+        step: QuickstartStep,
+        field: impl Into<String>,
+        fallback: impl Into<String>,
+        key: &str,
+        args: &[(&str, &str)],
+    ) -> Self {
+        let fallback = fallback.into();
+        if !matches!(ctx.map(|ctx| ctx.surface), Some(Surface::Cli)) {
+            return Self::new(step, field, fallback);
+        }
+
+        Self::new(
+            step,
+            field,
+            crate::i18n::get_required_cli_string_with_args(key, args),
+        )
     }
 }
 
@@ -249,10 +282,13 @@ pub async fn apply_with_surface(
     let applied = match applied {
         Some(applied) => applied,
         None => {
-            return Err(vec![QuickstartError::new(
+            return Err(vec![QuickstartError::for_surface(
+                Some(&ctx),
                 QuickstartStep::Agent,
                 "apply",
                 "internal error: apply_into returned no result despite no validation errors",
+                "cli-quickstart-error-internal-no-result",
+                &[],
             )]);
         }
     };
@@ -260,10 +296,13 @@ pub async fn apply_with_surface(
     config
         .set_prop_persistent("onboard_state.quickstart_completed", "true")
         .map_err(|err| {
-            vec![QuickstartError::new(
+            vec![QuickstartError::for_surface(
+                Some(&ctx),
                 QuickstartStep::Agent,
                 "",
                 format!("failed to flip quickstart-completed: {err}"),
+                "cli-quickstart-error-completion-flag",
+                &[("err", &err.to_string())],
             )]
         })?;
     ::zeroclaw_log::record!(
@@ -321,10 +360,13 @@ pub async fn apply_with_surface(
         ),
     }
     write_result.map_err(|err| {
-        vec![QuickstartError::new(
+        vec![QuickstartError::for_surface(
+            Some(&ctx),
             QuickstartStep::Agent,
             "",
             format!("failed to persist config: {err}"),
+            "cli-quickstart-error-persist-config",
+            &[("err", &err.to_string())],
         )]
     })?;
 
@@ -332,7 +374,7 @@ pub async fn apply_with_surface(
     // into place. Any failure here is reported but does not unwind the
     // already-persisted config; the agent is valid without them.
     let mut commit_errors = Vec::new();
-    commit_personality_files(staged_files, &mut commit_errors);
+    commit_personality_files(staged_files, &mut commit_errors, Some(&ctx));
     if !commit_errors.is_empty() {
         return Err(commit_errors);
     }
@@ -654,7 +696,7 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
             MODEL_PROVIDER_ESSENTIALS,
         ),
         FieldSection::Channel => (format!("channels.{type_key}"), CHANNEL_ESSENTIALS),
-        FieldSection::PeerGroup => (format!("peer-groups.{type_key}"), PEER_GROUP_ESSENTIALS),
+        FieldSection::PeerGroup => ("peer_groups".to_string(), PEER_GROUP_ESSENTIALS),
     };
 
     // A throwaway Config we can mutate freely. Inject one default
@@ -740,6 +782,10 @@ const MODEL_PROVIDER_ESSENTIALS: &[&str] = &[
 const CHANNEL_ESSENTIALS: &[&str] = &["bot_token", "token", "webhook_url", "allowed_users"];
 const PEER_GROUP_ESSENTIALS: &[&str] = &["channel", "external_peers", "agents", "ignore"];
 
+/// Runtime profile the Quickstart silently installs. The Runtime Profile
+/// picker was removed from every surface; apply always writes this preset.
+const FORCED_RUNTIME_PRESET: &str = "unbounded";
+
 fn apply_into(
     config: &mut Config,
     submission: &BuilderSubmission,
@@ -747,7 +793,7 @@ fn apply_into(
     errors: &mut Vec<QuickstartError>,
     ctx: Option<&RunCtx>,
 ) -> Option<AppliedAgent> {
-    let provider_ref = apply_model_provider(config, &submission.model_provider, errors)?;
+    let provider_ref = apply_model_provider(config, &submission.model_provider, errors, ctx)?;
     emit_selector_pick(
         ctx,
         "model_provider",
@@ -762,6 +808,7 @@ fn apply_into(
         risk_preset_keys,
         write_risk_preset,
         errors,
+        ctx,
     )?;
     emit_selector_pick(
         ctx,
@@ -770,14 +817,17 @@ fn apply_into(
         &risk_alias,
     );
 
-    let runtime_alias = apply_named_preset(
-        config,
-        &submission.runtime_profile,
-        QuickstartStep::RuntimeProfile,
-        runtime_preset_keys,
-        write_runtime_preset,
-        errors,
-    )?;
+    let runtime_alias = match write_runtime_preset(config, FORCED_RUNTIME_PRESET) {
+        Ok(alias) => alias,
+        Err(msg) => {
+            errors.push(QuickstartError::new(
+                QuickstartStep::RuntimeProfile,
+                "",
+                msg,
+            ));
+            return None;
+        }
+    };
     emit_selector_pick(
         ctx,
         "runtime_profile",
@@ -785,7 +835,7 @@ fn apply_into(
         &runtime_alias,
     );
 
-    let memory_backend = apply_memory(config, &submission.memory, errors)?;
+    let memory_backend = apply_memory(config, &submission.memory, errors, ctx)?;
     emit_selector_pick(
         ctx,
         "memory",
@@ -793,7 +843,7 @@ fn apply_into(
         &memory_backend,
     );
 
-    let channel_refs = apply_channels(config, &submission.channels, errors);
+    let channel_refs = apply_channels(config, &submission.channels, errors, ctx);
     if let Some(ctx) = ctx {
         ::zeroclaw_log::record!(
             DEBUG,
@@ -821,10 +871,12 @@ fn apply_into(
         &runtime_alias,
         &channel_refs,
         errors,
+        ctx,
     )?;
     emit_selector_pick(ctx, "agent", "create_new", &alias);
 
-    let peer_group_refs = apply_peer_groups(config, &submission.peer_groups, &channel_refs, errors);
+    let peer_group_refs =
+        apply_peer_groups(config, &submission.peer_groups, &channel_refs, errors, ctx);
     if let Some(ctx) = ctx {
         ::zeroclaw_log::record!(
             DEBUG,
@@ -847,6 +899,7 @@ fn apply_into(
         &submission.agent.personality_files,
         staged_files,
         errors,
+        ctx,
     );
 
     materialize_default_skills_bundle(config);
@@ -899,25 +952,33 @@ fn apply_model_provider(
     config: &mut Config,
     choice: &SelectorChoice<ModelProviderChoice>,
     errors: &mut Vec<QuickstartError>,
+    ctx: Option<&RunCtx>,
 ) -> Option<String> {
     match choice {
         SelectorChoice::Existing(reference) => {
             let (family, alias) = match split_ref(reference) {
                 Some(parts) => parts,
                 None => {
-                    errors.push(QuickstartError::new(
+                    errors.push(QuickstartError::for_surface(
+                        ctx,
                         QuickstartStep::ModelProvider,
                         "",
                         format!("`{reference}` is not a `<type>.<alias>` reference"),
+                        "cli-quickstart-error-not-type-alias-ref",
+                        &[("reference", reference)],
                     ));
                     return None;
                 }
             };
             if !section_has_alias(config, "providers.models", family, alias) {
-                errors.push(QuickstartError::new(
+                let path = format!("providers.models.{family}.{alias}");
+                errors.push(QuickstartError::for_surface(
+                    ctx,
                     QuickstartStep::ModelProvider,
                     "",
-                    format!("no `providers.models.{family}.{alias}` configured"),
+                    format!("no `{path}` configured"),
+                    "cli-quickstart-error-no-configured-path",
+                    &[("path", &path)],
                 ));
                 return None;
             }
@@ -928,10 +989,13 @@ fn apply_model_provider(
                 || choice.alias.trim().is_empty()
                 || choice.model.trim().is_empty()
             {
-                errors.push(QuickstartError::new(
+                errors.push(QuickstartError::for_surface(
+                    ctx,
                     QuickstartStep::ModelProvider,
                     "",
                     "provider type, alias, and model are required",
+                    "cli-quickstart-error-provider-required",
+                    &[],
                 ));
                 return None;
             }
@@ -947,22 +1011,29 @@ fn apply_model_provider(
             {
                 Some(info) => info.name.to_string(),
                 None => {
-                    errors.push(QuickstartError::new(
+                    errors.push(QuickstartError::for_surface(
+                        ctx,
                         QuickstartStep::ModelProvider,
                         "provider_type",
                         format!(
                             "unknown model provider type `{}` — pick one from the provider list",
                             choice.provider_type.trim()
                         ),
+                        "cli-quickstart-error-unknown-provider-type",
+                        &[("provider", choice.provider_type.trim())],
                     ));
                     return None;
                 }
             };
             if section_has_alias(config, "providers.models", &provider_type, &choice.alias) {
-                errors.push(QuickstartError::new(
+                let alias_ref = format!("{}.{}", provider_type, choice.alias);
+                errors.push(QuickstartError::for_surface(
+                    ctx,
                     QuickstartStep::ModelProvider,
                     "alias",
-                    format!("alias `{}.{}` already exists", provider_type, choice.alias),
+                    format!("alias `{alias_ref}` already exists"),
+                    "cli-quickstart-error-alias-exists",
+                    &[("alias", &alias_ref)],
                 ));
                 return None;
             }
@@ -1019,6 +1090,7 @@ fn apply_named_preset<K, W>(
     list_existing: K,
     write_preset: W,
     errors: &mut Vec<QuickstartError>,
+    ctx: Option<&RunCtx>,
 ) -> Option<String>
 where
     K: Fn(&Config) -> Vec<String>,
@@ -1029,10 +1101,13 @@ where
             if list_existing(config).iter().any(|a| a == alias) {
                 Some(alias.clone())
             } else {
-                errors.push(QuickstartError::new(
+                errors.push(QuickstartError::for_surface(
+                    ctx,
                     step,
                     "",
                     format!("no `{alias}` profile configured"),
+                    "cli-quickstart-error-no-profile",
+                    &[("alias", alias)],
                 ));
                 None
             }
@@ -1049,10 +1124,6 @@ where
 
 fn risk_preset_keys(config: &Config) -> Vec<String> {
     config.risk_profiles.keys().cloned().collect()
-}
-
-fn runtime_preset_keys(config: &Config) -> Vec<String> {
-    config.runtime_profiles.keys().cloned().collect()
 }
 
 fn write_risk_preset(config: &mut Config, preset_name: &str) -> Result<String, String> {
@@ -1096,25 +1167,33 @@ fn apply_memory(
     config: &mut Config,
     choice: &SelectorChoice<MemoryChoice>,
     errors: &mut Vec<QuickstartError>,
+    ctx: Option<&RunCtx>,
 ) -> Option<String> {
     match choice {
         SelectorChoice::Existing(reference) => {
             let (family, alias) = match split_ref(reference) {
                 Some(parts) => parts,
                 None => {
-                    errors.push(QuickstartError::new(
+                    errors.push(QuickstartError::for_surface(
+                        ctx,
                         QuickstartStep::Memory,
                         "",
                         format!("`{reference}` is not a `<type>.<alias>` reference"),
+                        "cli-quickstart-error-not-type-alias-ref",
+                        &[("reference", reference)],
                     ));
                     return None;
                 }
             };
             if !section_has_alias(config, "storage", family, alias) {
-                errors.push(QuickstartError::new(
+                let path = format!("storage.{family}.{alias}");
+                errors.push(QuickstartError::for_surface(
+                    ctx,
                     QuickstartStep::Memory,
                     "",
-                    format!("no `storage.{family}.{alias}` configured"),
+                    format!("no `{path}` configured"),
+                    "cli-quickstart-error-no-configured-path",
+                    &[("path", &path)],
                 ));
                 return None;
             }
@@ -1179,6 +1258,7 @@ fn apply_channels(
     config: &mut Config,
     channels: &[SelectorChoice<ChannelQuickStart>],
     errors: &mut Vec<QuickstartError>,
+    ctx: Option<&RunCtx>,
 ) -> Vec<String> {
     let mut refs = Vec::with_capacity(channels.len());
     for (idx, ch) in channels.iter().enumerate() {
@@ -1186,49 +1266,63 @@ fn apply_channels(
             SelectorChoice::Existing(reference) => {
                 if let Some((family, alias)) = split_ref(reference) {
                     if !channel_exists(config, family, alias) {
-                        errors.push(QuickstartError::new(
+                        let path = format!("channels.{family}.{alias}");
+                        errors.push(QuickstartError::for_surface(
+                            ctx,
                             QuickstartStep::Channels,
                             format!("channels[{idx}]"),
-                            format!("no `channels.{family}.{alias}` configured"),
+                            format!("no `{path}` configured"),
+                            "cli-quickstart-error-no-configured-path",
+                            &[("path", &path)],
                         ));
                         continue;
                     }
                     // Existing channel already bound to a different agent
                     // cannot be re-used — one channel, one agent invariant.
                     if let Some(owner) = config.agent_for_channel(reference) {
-                        errors.push(QuickstartError::new(
+                        errors.push(QuickstartError::for_surface(
+                            ctx,
                             QuickstartStep::Channels,
                             format!("channels[{idx}]"),
                             format!("channel `{reference}` is already bound to agent `{owner}`"),
+                            "cli-quickstart-error-channel-bound",
+                            &[("reference", reference), ("owner", owner)],
                         ));
                         continue;
                     }
                     refs.push(reference.clone());
                 } else {
-                    errors.push(QuickstartError::new(
+                    errors.push(QuickstartError::for_surface(
+                        ctx,
                         QuickstartStep::Channels,
                         format!("channels[{idx}]"),
                         format!("`{reference}` is not a `<type>.<alias>` reference"),
+                        "cli-quickstart-error-not-type-alias-ref",
+                        &[("reference", reference)],
                     ));
                 }
             }
             SelectorChoice::Fresh(entry) => {
                 if entry.channel_type.trim().is_empty() || entry.alias.trim().is_empty() {
-                    errors.push(QuickstartError::new(
+                    errors.push(QuickstartError::for_surface(
+                        ctx,
                         QuickstartStep::Channels,
                         format!("channels[{idx}]"),
                         "channel type and alias are required",
+                        "cli-quickstart-error-channel-required",
+                        &[],
                     ));
                     continue;
                 }
                 if channel_exists(config, &entry.channel_type, &entry.alias) {
-                    errors.push(QuickstartError::new(
+                    let alias_ref = format!("{}.{}", entry.channel_type, entry.alias);
+                    errors.push(QuickstartError::for_surface(
+                        ctx,
                         QuickstartStep::Channels,
                         format!("channels[{idx}].alias"),
-                        format!(
-                            "alias `{}.{}` already exists",
-                            entry.channel_type, entry.alias
-                        ),
+                        format!("alias `{alias_ref}` already exists"),
+                        "cli-quickstart-error-alias-exists",
+                        &[("alias", &alias_ref)],
                     ));
                     continue;
                 }
@@ -1288,22 +1382,29 @@ fn apply_peer_groups(
     peer_groups: &[zeroclaw_config::presets::QuickstartPeerGroup],
     staged_channel_refs: &[String],
     errors: &mut Vec<QuickstartError>,
+    ctx: Option<&RunCtx>,
 ) -> Vec<String> {
     let mut refs = Vec::with_capacity(peer_groups.len());
     for (idx, pg) in peer_groups.iter().enumerate() {
         if pg.name.trim().is_empty() {
-            errors.push(QuickstartError::new(
+            errors.push(QuickstartError::for_surface(
+                ctx,
                 QuickstartStep::Channels,
                 format!("peer_groups[{idx}].name"),
                 "peer-group name is required",
+                "cli-quickstart-error-peer-group-name-required",
+                &[],
             ));
             continue;
         }
         if pg.channel.trim().is_empty() {
-            errors.push(QuickstartError::new(
+            errors.push(QuickstartError::for_surface(
+                ctx,
                 QuickstartStep::Channels,
                 format!("peer_groups[{idx}].channel"),
                 "peer-group channel ref is required",
+                "cli-quickstart-error-peer-group-channel-required",
+                &[],
             ));
             continue;
         }
@@ -1315,27 +1416,33 @@ fn apply_peer_groups(
             None => false,
         };
         if !staged_match && !configured_match {
-            errors.push(QuickstartError::new(
+            errors.push(QuickstartError::for_surface(
+                ctx,
                 QuickstartStep::Channels,
                 format!("peer_groups[{idx}].channel"),
                 format!(
                     "peer-group `{}` references unknown channel `{}`",
                     pg.name, pg.channel
                 ),
+                "cli-quickstart-error-peer-group-unknown-channel",
+                &[("name", &pg.name), ("channel", &pg.channel)],
             ));
             continue;
         }
         // Collision: existing peer-group block wins. Surface the conflict
         // so the operator sees what they need to rename.
         if config.peer_groups.contains_key(&pg.name) {
-            errors.push(QuickstartError::new(
+            errors.push(QuickstartError::for_surface(
+                ctx,
                 QuickstartStep::Channels,
                 format!("peer_groups[{idx}].name"),
                 format!("peer-group `{}` already exists", pg.name),
+                "cli-quickstart-error-peer-group-exists",
+                &[("name", &pg.name)],
             ));
             continue;
         }
-        if let Err(err) = config.create_map_key("peer-groups", &pg.name) {
+        if let Err(err) = config.create_map_key("peer_groups", &pg.name) {
             errors.push(QuickstartError::new(
                 QuickstartStep::Channels,
                 format!("peer_groups[{idx}]"),
@@ -1343,7 +1450,7 @@ fn apply_peer_groups(
             ));
             continue;
         }
-        let prefix = format!("peer-groups.{}", pg.name);
+        let prefix = format!("peer_groups.{}", pg.name);
         if let Err(err) = config.set_prop_persistent(&format!("{prefix}.channel"), &pg.channel) {
             errors.push(QuickstartError::new(
                 QuickstartStep::Channels,
@@ -1407,45 +1514,56 @@ fn apply_personality_files(
     files: &[zeroclaw_config::presets::QuickstartPersonalityFile],
     staged: &mut Vec<StagedPersonalityWrite>,
     errors: &mut Vec<QuickstartError>,
+    ctx: Option<&RunCtx>,
 ) {
     if files.is_empty() {
         return;
     }
     let workspace = config.agent_workspace_dir(agent_alias);
     if let Err(err) = std::fs::create_dir_all(&workspace) {
-        errors.push(QuickstartError::new(
+        errors.push(QuickstartError::for_surface(
+            ctx,
             QuickstartStep::Agent,
             "personality_files",
             format!("could not create agent workspace: {err}"),
+            "cli-quickstart-error-personality-workspace",
+            &[("err", &err.to_string())],
         ));
         return;
     }
     for (idx, file) in files.iter().enumerate() {
         let trimmed = file.filename.trim();
         if trimmed.is_empty() {
-            errors.push(QuickstartError::new(
+            errors.push(QuickstartError::for_surface(
+                ctx,
                 QuickstartStep::Agent,
                 format!("personality_files[{idx}].filename"),
                 "filename is required",
+                "cli-quickstart-error-personality-filename-required",
+                &[],
             ));
             continue;
         }
         if !crate::agent::personality::EDITABLE_PERSONALITY_FILES.contains(&trimmed) {
-            errors.push(QuickstartError::new(
+            errors.push(QuickstartError::for_surface(
+                ctx,
                 QuickstartStep::Agent,
                 format!("personality_files[{idx}].filename"),
                 format!("`{trimmed}` is not an editable personality file"),
+                "cli-quickstart-error-personality-not-editable",
+                &[("filename", trimmed)],
             ));
             continue;
         }
         if file.content.chars().count() > crate::agent::personality::MAX_FILE_CHARS {
-            errors.push(QuickstartError::new(
+            let limit = crate::agent::personality::MAX_FILE_CHARS.to_string();
+            errors.push(QuickstartError::for_surface(
+                ctx,
                 QuickstartStep::Agent,
                 format!("personality_files[{idx}].content"),
-                format!(
-                    "content exceeds {} char limit",
-                    crate::agent::personality::MAX_FILE_CHARS
-                ),
+                format!("content exceeds {} char limit", limit),
+                "cli-quickstart-error-personality-too-large",
+                &[("limit", &limit)],
             ));
             continue;
         }
@@ -1455,19 +1573,25 @@ fn apply_personality_files(
         let mut tempfile = match tempfile::NamedTempFile::new_in(&workspace) {
             Ok(t) => t,
             Err(err) => {
-                errors.push(QuickstartError::new(
+                errors.push(QuickstartError::for_surface(
+                    ctx,
                     QuickstartStep::Agent,
                     format!("personality_files[{idx}]"),
-                    format!("stage {trimmed} failed: {err}"),
+                    format!("could not stage `{trimmed}`: {err}"),
+                    "cli-quickstart-error-personality-stage-failed",
+                    &[("filename", trimmed), ("err", &err.to_string())],
                 ));
                 continue;
             }
         };
         if let Err(err) = std::io::Write::write_all(&mut tempfile, file.content.as_bytes()) {
-            errors.push(QuickstartError::new(
+            errors.push(QuickstartError::for_surface(
+                ctx,
                 QuickstartStep::Agent,
                 format!("personality_files[{idx}]"),
-                format!("stage {trimmed} failed: {err}"),
+                format!("could not stage `{trimmed}`: {err}"),
+                "cli-quickstart-error-personality-stage-failed",
+                &[("filename", trimmed), ("err", &err.to_string())],
             ));
             continue;
         }
@@ -1484,13 +1608,18 @@ fn apply_personality_files(
 fn commit_personality_files(
     staged: Vec<StagedPersonalityWrite>,
     errors: &mut Vec<QuickstartError>,
+    ctx: Option<&RunCtx>,
 ) {
     for write in staged {
         if let Err(err) = write.tempfile.persist(&write.dest) {
-            errors.push(QuickstartError::new(
+            let path = write.dest.display().to_string();
+            errors.push(QuickstartError::for_surface(
+                ctx,
                 QuickstartStep::Agent,
                 "personality_files",
-                format!("write {} failed: {}", write.dest.display(), err.error),
+                format!("could not write `{path}`: {}", err.error),
+                "cli-quickstart-error-personality-write-failed",
+                &[("path", &path), ("err", &err.error.to_string())],
             ));
         }
     }
@@ -1518,20 +1647,27 @@ fn apply_agent(
     runtime_alias: &str,
     channel_refs: &[String],
     errors: &mut Vec<QuickstartError>,
+    ctx: Option<&RunCtx>,
 ) -> Option<String> {
     if identity.name.trim().is_empty() {
-        errors.push(QuickstartError::new(
+        errors.push(QuickstartError::for_surface(
+            ctx,
             QuickstartStep::Agent,
             "name",
             "agent name is required",
+            "cli-quickstart-error-agent-name-required",
+            &[],
         ));
         return None;
     }
     if config.agents.contains_key(&identity.name) {
-        errors.push(QuickstartError::new(
+        errors.push(QuickstartError::for_surface(
+            ctx,
             QuickstartStep::Agent,
             "name",
             format!("agent `{}` already exists", identity.name),
+            "cli-quickstart-error-agent-exists",
+            &[("name", &identity.name)],
         ));
         return None;
     }
@@ -1602,20 +1738,55 @@ fn section_has_alias(config: &Config, prefix: &str, family: &str, alias: &str) -
     false
 }
 
-/// Live model catalog for a provider type. `(models, live)`:
+/// Live model catalog for a provider type. `(models, pricing, live)`:
 /// `live=true` means surfaces should render a picker; `live=false`
-/// means fall back to free text. Tries `ModelProvider::list_models()`
-/// first, then the family catalog table.
-pub async fn model_catalog(model_provider: &str) -> (Vec<String>, bool) {
+/// means fall back to free text. Tries `ModelProvider::list_models_with_pricing()`
+/// first, then the family catalog table (no pricing for fallbacks).
+pub async fn model_catalog(
+    model_provider: &str,
+) -> (
+    Vec<String>,
+    Option<std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing>>,
+    bool,
+) {
     if let Ok(handle) = zeroclaw_providers::create_model_provider(model_provider, None)
-        && let Ok(models) = handle.list_models().await
+        && let Ok(models) = zeroclaw_providers::ProviderDispatch::from_ref(&*handle)
+            .list_models_with_pricing()
+            .await
         && !models.is_empty()
     {
-        return (models, true);
+        let raw_pricing: std::collections::HashMap<
+            String,
+            zeroclaw_api::model_provider::ModelPricing,
+        > = models
+            .iter()
+            .filter_map(|m| m.pricing.as_ref().map(|p| (m.id.clone(), p.clone())))
+            .collect();
+        let ids = models.into_iter().map(|m| m.id).collect();
+        let Some(ids) =
+            zeroclaw_providers::catalog::sort_model_catalog_for_chat(model_provider, ids)
+        else {
+            return (Vec::new(), None, false);
+        };
+        let pricing: std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing> =
+            ids.iter()
+                .filter_map(|id| raw_pricing.get(id).map(|p| (id.clone(), p.clone())))
+                .collect();
+        let pricing = if pricing.is_empty() {
+            None
+        } else {
+            Some(pricing)
+        };
+        return (ids, pricing, true);
     }
     match zeroclaw_providers::catalog::list_models_for_family(model_provider).await {
-        Ok(models) if !models.is_empty() => (models, true),
-        _ => (Vec::new(), false),
+        Ok(models) if !models.is_empty() => (
+            zeroclaw_providers::catalog::sort_model_catalog_for_chat(model_provider, models)
+                .unwrap_or_default(),
+            None,
+            true,
+        ),
+        _ => (Vec::new(), None, false),
     }
 }
 
@@ -1946,21 +2117,23 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_preset_profiles_persist_to_disk() {
+        // The runtime profile picker was removed; apply silently forces the
+        // `unbounded` preset regardless of the submitted runtime value.
         let (dir, applied) = apply_to_temp(fresh_submission("bot")).await;
         assert!(applied.risk_profiles.contains_key("balanced"));
-        assert!(applied.runtime_profiles.contains_key("balanced"));
+        assert!(applied.runtime_profiles.contains_key("unbounded"));
         let reloaded = reload(&dir);
         assert!(
             reloaded.risk_profiles.contains_key("balanced"),
             "risk_profiles.balanced must survive save_dirty + reload, not dangle"
         );
         assert!(
-            reloaded.runtime_profiles.contains_key("balanced"),
-            "runtime_profiles.balanced must survive save_dirty + reload, not dangle"
+            reloaded.runtime_profiles.contains_key("unbounded"),
+            "runtime_profiles.unbounded must survive save_dirty + reload, not dangle"
         );
         let agent = reloaded.agents.get("bot").expect("agent persisted");
         assert_eq!(agent.risk_profile, "balanced");
-        assert_eq!(agent.runtime_profile, "balanced");
+        assert_eq!(agent.runtime_profile, "unbounded");
     }
 
     #[tokio::test]
@@ -1991,5 +2164,40 @@ mod tests {
             "second channel must also be bound; got {bound:?}"
         );
         assert_eq!(bound.len(), 2, "both channels bound, not just the last");
+    }
+
+    #[tokio::test]
+    async fn peer_groups_persist_to_canonical_section() {
+        let mut submission = fresh_submission("bot");
+        submission.channels = vec![SelectorChoice::Fresh(ChannelQuickStart {
+            channel_type: "telegram".into(),
+            alias: "tg".into(),
+            token: Some("tok-a".into()),
+        })];
+        submission.peer_groups = vec![zeroclaw_config::presets::QuickstartPeerGroup {
+            name: "team".into(),
+            channel: "telegram.tg".into(),
+            external_peers: vec!["*".into()],
+            ignore: vec![],
+        }];
+
+        let (dir, _applied) = apply_to_temp(submission).await;
+        let raw = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(
+            raw.contains("[peer_groups.team]"),
+            "Quickstart must serialize peer groups through canonical snake_case paths:\n{raw}"
+        );
+        assert!(
+            !raw.contains("[peer-groups.team]"),
+            "Quickstart must not write the stale kebab-case peer-groups path:\n{raw}"
+        );
+
+        let reloaded = reload(&dir);
+        let group = reloaded
+            .peer_groups
+            .get("team")
+            .expect("peer group persisted");
+        assert_eq!(group.channel, "telegram.tg");
+        assert_eq!(group.external_peers, vec!["*".to_string()]);
     }
 }

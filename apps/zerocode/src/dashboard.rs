@@ -26,6 +26,10 @@ const POLL_INTERVAL_SECS: u64 = 5;
 /// of the conversation. Long sessions never load the full history.
 const SESSION_MESSAGES_PAGE_SIZE: usize = 100;
 
+pub(crate) enum DashboardMouseAction {
+    OpenAgentConfig(String),
+}
+
 // ── Tab enum ─────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -80,6 +84,8 @@ pub(crate) struct Dashboard {
     cron_jobs: Vec<CronJobEntry>,
     memories: Vec<MemoryEntryResult>,
     memory_error: Option<String>,
+    cost_error: Option<String>,
+    sessions_loaded: bool,
     /// Lazy-loaded full payload for the currently-open Memory detail
     /// row. Fetched via `memory/get` on selection (the list rows store
     /// only previews, with `content` truncated to ~200 bytes by the
@@ -121,6 +127,7 @@ pub(crate) struct Dashboard {
     // Layout tracking for mouse
     tab_area: Rect,
     list_area: Rect,
+    overview_agents_area: Rect,
     detail_area: Option<Rect>,
     double_click: mouse::DoubleClickTracker,
 }
@@ -141,6 +148,8 @@ impl Dashboard {
             cron_jobs: Vec::new(),
             memories: Vec::new(),
             memory_error: None,
+            cost_error: None,
+            sessions_loaded: false,
             memory_detail: None,
             memory_detail_key: None,
             tuis: Vec::new(),
@@ -163,6 +172,7 @@ impl Dashboard {
             search_query_saved: String::new(),
             tab_area: Rect::default(),
             list_area: Rect::default(),
+            overview_agents_area: Rect::default(),
             detail_area: None,
             double_click: mouse::DoubleClickTracker::new(),
         }
@@ -199,8 +209,20 @@ impl Dashboard {
         // Fetch tab-specific data
         match self.tab {
             Tab::Overview => {
-                if let Ok(c) = self.rpc.cost_query(None).await {
-                    self.cost = Some(c);
+                match self.rpc.cost_query(None).await {
+                    Ok(c) => {
+                        self.cost = Some(c);
+                        self.cost_error = None;
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("not available") {
+                            self.cost_error =
+                                Some(crate::i18n::t("zc-dashboard-cost-not-available"));
+                        } else {
+                            self.cost_error = Some(msg);
+                        }
+                    }
                 }
                 if let Ok(a) = self.rpc.agents_status().await {
                     self.agents = a.agents;
@@ -218,6 +240,7 @@ impl Dashboard {
                 };
                 if let Ok(s) = self.rpc.session_list(query).await {
                     self.sessions = s.sessions;
+                    self.sessions_loaded = true;
                 }
             }
             Tab::Agents => {
@@ -254,11 +277,20 @@ impl Dashboard {
                 }
             }
             Tab::Health => {} // health already fetched above
-            Tab::Cost => {
-                if let Ok(c) = self.rpc.cost_query(None).await {
+            Tab::Cost => match self.rpc.cost_query(None).await {
+                Ok(c) => {
                     self.cost = Some(c);
+                    self.cost_error = None;
                 }
-            }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("not available") {
+                        self.cost_error = Some(crate::i18n::t("zc-dashboard-cost-not-available"));
+                    } else {
+                        self.cost_error = Some(msg);
+                    }
+                }
+            },
             Tab::Cron => {
                 if let Ok(c) = self.rpc.cron_list().await {
                     self.cron_jobs = c.jobs;
@@ -434,7 +466,7 @@ impl Dashboard {
 
     // ── Overview tab ─────────────────────────────────────────────
 
-    fn draw_overview(&self, frame: &mut ratatui::Frame, area: Rect) {
+    fn draw_overview(&mut self, frame: &mut ratatui::Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -547,6 +579,7 @@ impl Dashboard {
             .borders(Borders::ALL)
             .border_style(theme::dim_style());
         let agents_inner = agents_block.inner(chunks[1]);
+        self.overview_agents_area = chunks[1];
         frame.render_widget(agents_block, chunks[1]);
 
         let items: Vec<ListItem> = self
@@ -565,7 +598,14 @@ impl Dashboard {
                     ),
                     Span::styled(&a.alias, theme::body_style()),
                     Span::styled(
-                        format!("  ({} active)", a.active_sessions),
+                        if a.persisted_sessions > 0 {
+                            format!(
+                                "  ({} live, {} saved)",
+                                a.live_sessions, a.persisted_sessions
+                            )
+                        } else {
+                            format!("  ({} live)", a.live_sessions)
+                        },
                         theme::dim_style(),
                     ),
                 ]))
@@ -676,13 +716,15 @@ impl Dashboard {
             })
             .collect();
 
+        let title = if self.sessions_loaded {
+            format!(" Sessions ({}) ", filtered.len())
+        } else {
+            " Sessions ".to_string()
+        };
         let list = List::new(items)
             .block(
                 Block::default()
-                    .title(Span::styled(
-                        format!(" Sessions ({}) ", filtered.len()),
-                        theme::title_style(),
-                    ))
+                    .title(Span::styled(title, theme::title_style()))
                     .borders(Borders::ALL)
                     .border_style(theme::dim_style()),
             )
@@ -850,7 +892,14 @@ impl Dashboard {
                         status_style,
                     ),
                     Span::styled(
-                        format!("  sessions: {}", a.active_sessions),
+                        if a.persisted_sessions > 0 {
+                            format!(
+                                "  {} live / {} saved",
+                                a.live_sessions, a.persisted_sessions
+                            )
+                        } else {
+                            format!("  {} live", a.live_sessions)
+                        },
                         theme::dim_style(),
                     ),
                 ]))
@@ -903,10 +952,16 @@ impl Dashboard {
                 },
             ),
             detail_line(
-                &crate::i18n::t("zc-dashboard-detail-sessions"),
-                &a.active_sessions.to_string(),
+                &crate::i18n::t("zc-dashboard-detail-live-sessions"),
+                &a.live_sessions.to_string(),
             ),
         ];
+        if a.persisted_sessions > 0 {
+            lines.push(detail_line(
+                &crate::i18n::t("zc-dashboard-detail-persisted-sessions"),
+                &a.persisted_sessions.to_string(),
+            ));
+        }
 
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -1304,6 +1359,15 @@ impl Dashboard {
             .border_style(theme::dim_style());
         let inner = block.inner(area);
         frame.render_widget(block, area);
+
+        if let Some(ref err) = self.cost_error {
+            frame.render_widget(
+                Paragraph::new(Span::styled(err.as_str(), theme::warn_style()))
+                    .wrap(Wrap { trim: true }),
+                inner,
+            );
+            return;
+        }
 
         let Some(ref c) = self.cost else {
             frame.render_widget(
@@ -1818,7 +1882,11 @@ impl Dashboard {
 
     // ── Mouse handling ───────────────────────────────────────────
 
-    pub(crate) fn handle_mouse(&mut self, evt: MouseEvent, _content_area: Rect) {
+    pub(crate) fn handle_mouse(
+        &mut self,
+        evt: MouseEvent,
+        _content_area: Rect,
+    ) -> Option<DashboardMouseAction> {
         use crossterm::event::MouseButton;
 
         let col = evt.column;
@@ -1826,6 +1894,19 @@ impl Dashboard {
 
         match evt.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                if self.tab == Tab::Overview
+                    && mouse::in_rect(col, row, self.overview_agents_area)
+                    && let Some(idx) = mouse::list_click_index(
+                        row,
+                        self.overview_agents_area,
+                        0,
+                        self.agents.len(),
+                    )
+                    && let Some(agent) = self.agents.get(idx)
+                {
+                    return Some(DashboardMouseAction::OpenAgentConfig(agent.alias.clone()));
+                }
+
                 // Tab bar clicks
                 let labels: Vec<String> = TABS
                     .iter()
@@ -1834,7 +1915,7 @@ impl Dashboard {
                 let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
                 if let Some(idx) = mouse::tab_click_index(col, row, self.tab_area, &label_refs, 3) {
                     self.tab = TABS[idx];
-                    return;
+                    return None;
                 }
 
                 // List clicks
@@ -1877,6 +1958,7 @@ impl Dashboard {
             }
             _ => {}
         }
+        None
     }
 
     // ── Navigation helpers ───────────────────────────────────────

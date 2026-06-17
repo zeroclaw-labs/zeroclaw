@@ -28,6 +28,13 @@ pub struct SkillFrontmatter {
     pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
+    /// Free-form tags from the YAML `tags:` list. Drive skill tiering and
+    /// opt-in surfaces — notably the `slash` tag, which exposes the skill as a
+    /// Discord slash command (zeroclaw-labs/zeroclaw#7490). Loader-managed tags
+    /// such as `open-skills` also live here. Round-tripped so editing a skill no
+    /// longer silently strips its tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 impl SkillFrontmatter {
@@ -71,6 +78,20 @@ impl SkillFrontmatter {
                 false,
                 "Skill category for registry grouping (e.g. coding, ops).",
             ),
+            PropFieldInfo {
+                name: "tags".to_string(),
+                category: "skill-frontmatter",
+                display_value: String::new(),
+                type_hint: "Vec<String>",
+                kind: PropKind::StringArray,
+                is_secret: false,
+                enum_variants: None,
+                description: "Free-form tags. The `slash` tag opts the skill into Discord slash commands (zeroclaw-labs/zeroclaw#7490); others drive tiering / registry grouping.",
+                derived_from_secret: false,
+                credential_class: None,
+                tab: zeroclaw_config::config::ConfigTab::None,
+                alias_source: None,
+            },
         ]
     }
 }
@@ -97,6 +118,7 @@ fn field(
         derived_from_secret: false,
         credential_class: None,
         tab: zeroclaw_config::config::ConfigTab::None,
+        alias_source: None,
     }
 }
 
@@ -111,7 +133,7 @@ mod tests {
         let fields = SkillFrontmatter::prop_fields();
         assert_eq!(
             fields.len(),
-            6,
+            7,
             "SkillFrontmatter::prop_fields drifted from struct definition; \
              update both when adding/removing fields"
         );

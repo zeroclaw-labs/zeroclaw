@@ -24,6 +24,10 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+pub const PRUNED_TOOL_EXCHANGE_SUMMARY_PREFIX: &str = "[Tool exchange:";
+pub const PRUNED_TOOL_EXCHANGE_SUMMARY_SUFFIX: &str = "results collapsed]";
+pub const PRUNED_CONTEXT_SEPARATOR: &str = "[context continues]";
+
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
@@ -51,6 +55,28 @@ impl ChatMessage {
             role: "tool".into(),
             content: content.into(),
         }
+    }
+
+    pub fn pruned_tool_exchange_summary(tool_count: usize) -> String {
+        format!(
+            "{PRUNED_TOOL_EXCHANGE_SUMMARY_PREFIX} {tool_count} tool call(s) — {PRUNED_TOOL_EXCHANGE_SUMMARY_SUFFIX}"
+        )
+    }
+
+    pub fn pruned_context_separator() -> Self {
+        Self::user(PRUNED_CONTEXT_SEPARATOR)
+    }
+
+    pub fn is_pruned_tool_exchange_summary(&self) -> bool {
+        self.role == "assistant"
+            && self
+                .content
+                .starts_with(PRUNED_TOOL_EXCHANGE_SUMMARY_PREFIX)
+            && self.content.contains(PRUNED_TOOL_EXCHANGE_SUMMARY_SUFFIX)
+    }
+
+    pub fn is_pruned_context_separator(&self) -> bool {
+        self.role == "user" && self.content.trim() == PRUNED_CONTEXT_SEPARATOR
     }
 }
 
@@ -363,6 +389,37 @@ pub const BASELINE_TIMEOUT_SECS: u64 = 120;
 /// classic chat completions shape.
 pub const BASELINE_WIRE_API: &str = "chat_completions";
 
+/// Per-token pricing for a model. All values are per-token rates as strings
+/// expressed in USD per token — e.g. `"0.000005"` = $5.00 per 1M tokens.
+///
+/// Deserialized from the `pricing` object in OpenAI-compatible `/models`
+/// responses (Kilo Gateway, OpenRouter, etc.).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ModelPricing {
+    /// Input/prompt tokens per-token rate (USD per token, e.g. `"0.000005"` = $5/1M tokens).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// Output/completion tokens per-token rate (USD per token, e.g. `"0.000020"` = $20/1M tokens).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<String>,
+    /// Cached input read rate — per-token charge for reading cached prompt data
+    /// (USD per token, e.g. `"0.000001"` = $1/1M tokens). Kilo Gateway specific.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_cache_read: Option<String>,
+    /// Cached input write rate — per-token charge for writing prompt data to cache
+    /// (USD per token, e.g. `"0.000001"` = $1/1M tokens). Kilo Gateway specific.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_cache_write: Option<String>,
+}
+
+/// Model info with optional pricing — returned by `list_models_with_pricing`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelInfo {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<ModelPricing>,
+}
+
 #[async_trait]
 pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
     /// Query model_provider capabilities.
@@ -447,6 +504,19 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
     /// catalog (no auth required) in `zeroclaw_providers::models_dev`.
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         anyhow::bail!("live model listing is not supported for this model_provider")
+    }
+
+    /// Fetch the list of available models with pricing data for this
+    /// model_provider. Default delegates to `list_models` and returns no
+    /// pricing. Concrete providers that receive pricing from their `/models`
+    /// endpoint override this to return enriched data.
+    async fn list_models_with_pricing(&self) -> anyhow::Result<Vec<ModelInfo>> {
+        Ok(self
+            .list_models()
+            .await?
+            .into_iter()
+            .map(|id| ModelInfo { id, pricing: None })
+            .collect())
     }
 
     /// Multi-turn conversation. See `simple_chat` for the `temperature`

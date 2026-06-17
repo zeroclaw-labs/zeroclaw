@@ -240,6 +240,27 @@ pub async fn handle_ws_chat(
 /// Gateway session key prefix to avoid collisions with channel sessions.
 const GW_SESSION_PREFIX: &str = "gw_";
 
+async fn resolve_ws_memory_handle(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> anyhow::Result<Option<Arc<dyn zeroclaw_memory::Memory>>> {
+    if config.agent(agent_alias).is_some_and(|agent| {
+        matches!(
+            agent.memory.backend,
+            zeroclaw_config::multi_agent::MemoryBackendKind::None
+        )
+    }) {
+        return Ok(None);
+    }
+
+    let api_key = config
+        .resolved_model_provider_for_agent(agent_alias)
+        .and_then(|(_, _, cfg)| cfg.api_key.clone());
+    zeroclaw_memory::create_memory_for_agent(config, agent_alias, api_key.as_deref())
+        .await
+        .map(Some)
+}
+
 async fn handle_socket(
     socket: WebSocket,
     state: AppState,
@@ -260,6 +281,22 @@ async fn handle_socket(
     // construction is deferred until after the optional `connect` frame so the
     // client can provide a per-session cwd for the security sandbox root.
     let config = state.config.read().clone();
+    let ws_memory = match resolve_ws_memory_handle(&config, &agent_alias).await {
+        Ok(memory) => memory,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "agent": &agent_alias,
+                        "error": format!("{e:#}"),
+                    })),
+                "WS per-agent memory resolution failed; consolidation disabled for connection"
+            );
+            None
+        }
+    };
     let mut resumed = false;
     let mut message_count: usize = 0;
     let mut effective_name: Option<String> = None;
@@ -351,7 +388,8 @@ async fn handle_socket(
         }
     }
 
-    let session_cwd = match resolve_session_cwd(requested_cwd.as_deref(), &config.data_dir) {
+    let session_cwd = match resolve_ws_session_cwd(requested_cwd.as_deref(), &config, &agent_alias)
+    {
         Ok(cwd) => cwd,
         Err(e) => {
             let err = serde_json::json!({
@@ -382,6 +420,8 @@ async fn handle_socket(
             Some(&session_cwd),
             true,
             false,
+            state.sop_engine.clone(),
+            state.sop_audit.clone(),
         )
         .await
         {
@@ -484,6 +524,7 @@ async fn handle_socket(
                         &mut receiver,
                         &mut approval_event_rx,
                         &pending_approvals,
+                        &ws_memory,
                         &content,
                         &session_key,
                     )
@@ -625,6 +666,7 @@ async fn handle_socket(
                     &mut receiver,
                     &mut approval_event_rx,
                     &pending_approvals,
+                    &ws_memory,
                     &content,
                     &session_key,
                 )
@@ -696,6 +738,34 @@ fn resolve_session_cwd(
             cwd.display()
         ))
     })
+}
+
+fn resolve_ws_session_cwd(
+    requested_cwd: Option<&str>,
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> anyhow::Result<PathBuf> {
+    let agent_workspace = config.agent_workspace_dir(agent_alias);
+    if requested_cwd.is_none() {
+        std::fs::create_dir_all(&agent_workspace).map_err(|e| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "agent": agent_alias,
+                        "cwd": agent_workspace.display().to_string(),
+                        "error": format!("{}", e),
+                    })),
+                "ws agent workspace cwd rejected"
+            );
+            anyhow::Error::msg(format!(
+                "cwd is not a usable directory ({}): {e}",
+                agent_workspace.display()
+            ))
+        })?;
+    }
+    resolve_session_cwd(requested_cwd, &agent_workspace)
 }
 
 fn session_queue_ws_error_code(error: &crate::session_queue::SessionQueueError) -> &'static str {
@@ -817,27 +887,27 @@ async fn process_chat_message(
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
     approval_event_rx: &mut tokio::sync::mpsc::Receiver<zeroclaw_api::agent::TurnEvent>,
     pending_approvals: &PendingApprovals,
+    ws_memory: &Option<Arc<dyn zeroclaw_memory::Memory>>,
     content: &str,
     session_key: &str,
 ) {
     use futures_util::StreamExt as _;
     use zeroclaw_runtime::agent::TurnEvent;
 
-    let provider_label = {
-        let cfg = state.config.read();
-        cfg.providers
-            .models
-            .iter_entries()
-            .next()
-            .map(|(ty, alias, _)| format!("{ty}.{alias}"))
-            .unwrap_or_else(|| "unknown".to_string())
-    };
+    // Attribute telemetry, broadcasts, and cost to THIS agent's actual model
+    // (resolved per-turn), not the global default model or the first configured
+    // provider. Previously `provider_label` took the first `providers.models`
+    // entry and the model came from `model_label` (the global default), so every
+    // gateway_ws_turn / agent_start / cost record mislabelled the model.
+    let (turn_alias, turn_provider, turn_model) = agent.attribution_fields();
+    let provider_label = turn_provider.clone();
+    let model_label = turn_model.clone();
 
     // Broadcast agent_start event
     let _ = state.event_tx.send(serde_json::json!({
         "type": "agent_start",
         "model_provider": provider_label,
-        "model": state.model,
+        "model": model_label,
     }));
 
     // Set session state to running
@@ -870,7 +940,6 @@ async fn process_chat_message(
     // from the other branch.
     let content_owned = content.to_string();
     let session_key_owned = session_key.to_string();
-    let (turn_alias, turn_provider, turn_model) = agent.attribution_fields();
     let turn_fut = async {
         use ::zeroclaw_log::Instrument as _;
         let span = ::zeroclaw_log::info_span!(
@@ -1125,10 +1194,13 @@ async fn process_chat_message(
                             &error.new_messages,
                         );
                         if !has_assistant_chat_message(&error.new_messages) {
+                            let marker = zeroclaw_runtime::i18n::get_required_cli_string(
+                                "turn-interrupted-by-user",
+                            );
                             let truncated = if accumulated_text.is_empty() {
-                                "[interrupted by user]".to_string()
+                                marker
                             } else {
-                                format!("{accumulated_text}\n\n[interrupted by user]")
+                                format!("{accumulated_text}\n\n{marker}")
                             };
                             let assistant_msg =
                                 zeroclaw_providers::ChatMessage::assistant(&truncated);
@@ -1142,10 +1214,13 @@ async fn process_chat_message(
                         }
                     }
                     _ => {
+                        let marker = zeroclaw_runtime::i18n::get_required_cli_string(
+                            "turn-interrupted-by-user",
+                        );
                         let truncated = if accumulated_text.is_empty() {
-                            "[interrupted by user]".to_string()
+                            marker
                         } else {
-                            format!("{accumulated_text}\n\n[interrupted by user]")
+                            format!("{accumulated_text}\n\n{marker}")
                         };
                         let assistant_msg = zeroclaw_providers::ChatMessage::assistant(&truncated);
                         if backend.session_exists(session_key) {
@@ -1175,7 +1250,7 @@ async fn process_chat_message(
         let _ = state.event_tx.send(serde_json::json!({
             "type": "agent_end",
             "model_provider": provider_label,
-            "model": state.model,
+            "model": model_label,
         }));
 
         // Trace the cancelled turn so the doctor / replay tool sees it
@@ -1186,7 +1261,7 @@ async fn process_chat_message(
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                 .with_attrs(::serde_json::json!({
                     "model_provider": provider_label,
-                    "model": state.model,
+                    "model": model_label,
                     "session_key": session_key,
                     "reason": "interrupted by user",
                     "cancelled": true,
@@ -1207,34 +1282,41 @@ async fn process_chat_message(
             // Fire-and-forget memory consolidation so facts from WS sessions
             // are extracted to long-term memory (Daily + Core categories).
             if state.auto_save {
-                let mem = state.mem.clone();
-                let model_provider = state.model_provider.clone();
-                let model = state.model.clone();
-                let temperature = state.temperature;
-                let user_msg = content.to_string();
-                let assistant_resp = outcome.response.clone();
-                zeroclaw_spawn::spawn!(async move {
-                    if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
-                        model_provider.as_ref(),
-                        &model,
-                        temperature,
-                        mem.as_ref(),
-                        &user_msg,
-                        &assistant_resp,
-                    )
-                    .await
-                    {
-                        ::zeroclaw_log::record!(
-                            DEBUG,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                            "WS memory consolidation skipped"
-                        );
-                    }
-                });
+                if let Some(mem) = ws_memory.clone() {
+                    let model_provider = state.model_provider.clone();
+                    let model = state.model.clone();
+                    let temperature = state.temperature;
+                    let user_msg = content.to_string();
+                    let assistant_resp = outcome.response.clone();
+                    zeroclaw_spawn::spawn!(async move {
+                        if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
+                            model_provider.as_ref(),
+                            &model,
+                            temperature,
+                            mem.as_ref(),
+                            &user_msg,
+                            &assistant_resp,
+                        )
+                        .await
+                        {
+                            ::zeroclaw_log::record!(
+                                DEBUG,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                "WS memory consolidation skipped"
+                            );
+                        }
+                    });
+                } else {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        "WS memory consolidation skipped"
+                    );
+                }
             }
 
             // Compute cost from accumulated tokens + configured pricing,
@@ -1249,7 +1331,7 @@ async fn process_chat_message(
             let cost_usd = record_turn_cost(
                 state,
                 &provider_label,
-                &state.model,
+                &model_label,
                 total_input_tokens,
                 total_output_tokens,
                 None,
@@ -1262,7 +1344,7 @@ async fn process_chat_message(
                 "output_tokens": total_output_tokens,
                 "tokens_used": total_tokens,
                 "cost_usd": cost_usd,
-                "model": state.model,
+                "model": model_label,
                 "provider": provider_label,
             });
             let _ = sender.send(Message::Text(done.to_string().into())).await;
@@ -1276,7 +1358,7 @@ async fn process_chat_message(
             let _ = state.event_tx.send(serde_json::json!({
                 "type": "agent_end",
                 "model_provider": provider_label,
-                "model": state.model,
+                "model": model_label,
             }));
 
             // Append a runtime-trace.jsonl record so a `zeroclaw doctor`
@@ -1288,7 +1370,7 @@ async fn process_chat_message(
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_attrs(::serde_json::json!({
                         "model_provider": provider_label,
-                        "model": state.model,
+                        "model": model_label,
                         "session_key": session_key,
                         "input_tokens": total_input_tokens,
                         "output_tokens": total_output_tokens,
@@ -1354,7 +1436,7 @@ async fn process_chat_message(
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "model_provider": provider_label,
-                        "model": state.model,
+                        "model": model_label,
                         "session_key": session_key,
                         "error": sanitized,
                         "error_code": error_code,
@@ -1390,7 +1472,7 @@ fn record_turn_cost(
     // V3 per-provider pricing lookup. Mirrors how the channels
     // orchestrator and the gateway lib.rs cost-tracking scope build
     // their `ModelProviderPricing`: walk every
-    // `[model_providers.<type>.<alias>]` and key the per-profile
+    // `[providers.models.<type>.<alias>]` and key the per-profile
     // pricing map by `<type>.<alias>`. The streaming and non-streaming
     // paths derive identical costs because both bottom out in the same
     // `<type>.<alias>` key shape.
@@ -1587,6 +1669,35 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn ws_memory_resolution_honors_agent_backend_none_over_install_backend() {
+        use tempfile::TempDir;
+        use zeroclaw_config::multi_agent::MemoryBackendKind;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.memory.backend = "sqlite.default".to_string();
+
+        let mut agent = AliasedAgentConfig::default();
+        agent.memory.backend = MemoryBackendKind::None;
+        config.agents.insert("web".to_string(), agent);
+
+        let memory = resolve_ws_memory_handle(&config, "web")
+            .await
+            .expect("WS per-agent memory resolution");
+
+        assert!(
+            memory.is_none(),
+            "WebSocket consolidation must disable memory when the agent backend is none"
+        );
+    }
+
     #[test]
     fn event_matches_session_passes_session_scoped_chat_messages() {
         // /api/sessions/{id}/messages broadcasts a session-scoped assistant
@@ -1680,6 +1791,55 @@ mod tests {
         let resolved = resolve_session_cwd(None, fallback.path()).unwrap();
 
         assert_eq!(resolved, fallback.path().canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_ws_session_cwd_defaults_to_agent_workspace_without_request() {
+        use tempfile::TempDir;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config
+            .agents
+            .insert("web".to_string(), AliasedAgentConfig::default());
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let agent_workspace = config.agent_workspace_dir("web");
+        assert!(!agent_workspace.exists());
+
+        let resolved = resolve_ws_session_cwd(None, &config, "web").unwrap();
+
+        assert!(agent_workspace.exists());
+        assert_eq!(resolved, agent_workspace.canonicalize().unwrap());
+        assert_ne!(resolved, config.data_dir.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_ws_session_cwd_keeps_requested_cwd_strict() {
+        use tempfile::TempDir;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config
+            .agents
+            .insert("web".to_string(), AliasedAgentConfig::default());
+        let agent_workspace = config.agent_workspace_dir("web");
+        let missing_requested = tmp.path().join("missing");
+
+        let err = resolve_ws_session_cwd(Some(missing_requested.to_str().unwrap()), &config, "web")
+            .expect_err("explicit missing cwd should be rejected");
+
+        assert!(!agent_workspace.exists());
+        assert!(err.to_string().contains("cwd is not a usable directory"));
     }
 
     #[test]

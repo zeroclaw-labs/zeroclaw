@@ -10,7 +10,7 @@ use zeroclaw_api::tool::ToolSpec;
 const DEFAULT_API_VERSION: &str = "2024-08-01-preview";
 
 pub struct AzureOpenAiModelProvider {
-    /// `[model_providers.azure.<alias>]` config-key alias.
+    /// `[providers.models.azure.<alias>]` config-key alias.
     alias: String,
     credential: Option<String>,
     #[allow(dead_code)]
@@ -19,6 +19,9 @@ pub struct AzureOpenAiModelProvider {
     deployment_name: String,
     api_version: String,
     base_url: String,
+    /// Operator-configured reasoning effort (minimal/low/medium/high).
+    /// Sent only to models that accept it (GPT-5.x / o-series).
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -26,6 +29,10 @@ struct ChatRequest {
     messages: Vec<Message>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -70,6 +77,10 @@ struct NativeChatRequest {
     tools: Option<Vec<NativeToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -182,6 +193,7 @@ impl AzureOpenAiModelProvider {
         resource_name: &str,
         deployment_name: &str,
         api_version: Option<&str>,
+        reasoning_effort: Option<String>,
     ) -> Self {
         let version = api_version.unwrap_or(DEFAULT_API_VERSION);
         let base_url = format!(
@@ -195,6 +207,7 @@ impl AzureOpenAiModelProvider {
             deployment_name: deployment_name.to_string(),
             api_version: version.to_string(),
             base_url,
+            reasoning_effort,
         }
     }
     fn chat_completions_url(&self) -> String {
@@ -202,6 +215,29 @@ impl AzureOpenAiModelProvider {
             "{}/chat/completions?api-version={}",
             self.base_url, self.api_version
         )
+    }
+
+    /// Return the configured `reasoning_effort` when the model accepts it
+    /// (GPT-5.x / o-series), otherwise `None`.  Mirrors the compatible
+    /// provider's `reasoning_effort_for_model` so Azure parity is maintained.
+    fn reasoning_effort_for_model(&self, model: &str) -> Option<String> {
+        let effort = self.reasoning_effort.as_ref()?;
+        let id = model
+            .rsplit('/')
+            .next()
+            .unwrap_or(model)
+            .to_ascii_lowercase();
+        // gpt-5*-chat-latest are non-reasoning router models; they reject
+        // reasoning_effort, so exclude them the same way compatible.rs does.
+        let is_gpt5_chat_latest = id.starts_with("gpt-5") && id.ends_with("-chat-latest");
+        let is_reasoning_model = id == "o1"
+            || id.starts_with("o1-")
+            || id == "o3"
+            || id.starts_with("o3-")
+            || id == "o4"
+            || id.starts_with("o4-")
+            || (id.starts_with("gpt-5") && !is_gpt5_chat_latest);
+        is_reasoning_model.then(|| effort.clone())
     }
 
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
@@ -362,7 +398,7 @@ impl ModelProvider for AzureOpenAiModelProvider {
         &self,
         system_prompt: Option<&str>,
         message: &str,
-        _model: &str,
+        model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         let credential = self.credential.as_ref().ok_or_else(|| {
@@ -395,6 +431,8 @@ impl ModelProvider for AzureOpenAiModelProvider {
         let request = ChatRequest {
             messages,
             temperature,
+            reasoning_effort: self.reasoning_effort_for_model(model),
+            max_completion_tokens: None,
         };
 
         let response = self
@@ -430,7 +468,7 @@ impl ModelProvider for AzureOpenAiModelProvider {
     async fn chat(
         &self,
         request: ProviderChatRequest<'_>,
-        _model: &str,
+        model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.credential.as_ref().ok_or_else(|| {
@@ -452,6 +490,8 @@ impl ModelProvider for AzureOpenAiModelProvider {
             temperature,
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
+            reasoning_effort: self.reasoning_effort_for_model(model),
+            max_completion_tokens: None,
         };
 
         let response = self
@@ -495,7 +535,7 @@ impl ModelProvider for AzureOpenAiModelProvider {
         &self,
         messages: &[ChatMessage],
         tools: &[serde_json::Value],
-        _model: &str,
+        model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.credential.as_ref().ok_or_else(|| {
@@ -528,6 +568,8 @@ impl ModelProvider for AzureOpenAiModelProvider {
             temperature,
             tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
             tools: native_tools,
+            reasoning_effort: self.reasoning_effort_for_model(model),
+            max_completion_tokens: None,
         };
 
         let response = self
@@ -593,8 +635,14 @@ mod tests {
 
     #[test]
     fn url_construction_default_version() {
-        let p =
-            AzureOpenAiModelProvider::new("test", Some("test-key"), "my-resource", "gpt-4o", None);
+        let p = AzureOpenAiModelProvider::new(
+            "test",
+            Some("test-key"),
+            "my-resource",
+            "gpt-4o",
+            None,
+            None,
+        );
         assert_eq!(
             p.chat_completions_url(),
             "https://my-resource.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-08-01-preview"
@@ -609,6 +657,7 @@ mod tests {
             "my-resource",
             "gpt-4o",
             Some("2024-06-01"),
+            None,
         );
         assert_eq!(
             p.chat_completions_url(),
@@ -623,6 +672,7 @@ mod tests {
             Some("key"),
             "contoso-ai",
             "my-gpt35-deployment",
+            None,
             None,
         );
         let url = p.chat_completions_url();
@@ -642,6 +692,7 @@ mod tests {
             "resource",
             "deployment",
             None,
+            None,
         );
         assert_eq!(p.credential.as_deref(), Some("my-azure-key"));
     }
@@ -654,6 +705,7 @@ mod tests {
             "resource",
             "deployment",
             None,
+            None,
         );
         assert_eq!(p.credential.as_deref(), Some("azure-test-credential"));
         assert_eq!(p.resource_name, "resource");
@@ -663,13 +715,13 @@ mod tests {
 
     #[test]
     fn creates_without_credential() {
-        let p = AzureOpenAiModelProvider::new("test", None, "resource", "deployment", None);
+        let p = AzureOpenAiModelProvider::new("test", None, "resource", "deployment", None, None);
         assert!(p.credential.is_none());
     }
 
     #[tokio::test]
     async fn chat_fails_without_key() {
-        let p = AzureOpenAiModelProvider::new("test", None, "resource", "deployment", None);
+        let p = AzureOpenAiModelProvider::new("test", None, "resource", "deployment", None, None);
         let result = p.chat_with_system(None, "hello", "gpt-4o", Some(0.7)).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key not set"));
@@ -677,7 +729,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_system_fails_without_key() {
-        let p = AzureOpenAiModelProvider::new("test", None, "resource", "deployment", None);
+        let p = AzureOpenAiModelProvider::new("test", None, "resource", "deployment", None, None);
         let result = p
             .chat_with_system(Some("You are ZeroClaw"), "test", "gpt-4o", Some(0.5))
             .await;
@@ -698,6 +750,8 @@ mod tests {
                 },
             ],
             temperature: Some(0.7),
+            reasoning_effort: None,
+            max_completion_tokens: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"role\":\"system\""));
@@ -714,6 +768,8 @@ mod tests {
                 content: "hello".to_string(),
             }],
             temperature: Some(0.0),
+            reasoning_effort: None,
+            max_completion_tokens: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("system"));
@@ -780,7 +836,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_tools_fails_without_key() {
-        let p = AzureOpenAiModelProvider::new("test", None, "resource", "deployment", None);
+        let p = AzureOpenAiModelProvider::new("test", None, "resource", "deployment", None, None);
         let messages = vec![ChatMessage::user("hello".to_string())];
         let tools = vec![serde_json::json!({
             "type": "function",
@@ -817,7 +873,14 @@ mod tests {
 
     #[test]
     fn capabilities_reports_native_tools_and_vision() {
-        let p = AzureOpenAiModelProvider::new("test", Some("key"), "resource", "deployment", None);
+        let p = AzureOpenAiModelProvider::new(
+            "test",
+            Some("key"),
+            "resource",
+            "deployment",
+            None,
+            None,
+        );
         let caps = <AzureOpenAiModelProvider as ModelProvider>::capabilities(&p);
         assert!(caps.native_tool_calling);
         assert!(caps.vision);
@@ -825,19 +888,33 @@ mod tests {
 
     #[test]
     fn supports_native_tools_returns_true() {
-        let p = AzureOpenAiModelProvider::new("test", Some("key"), "resource", "deployment", None);
+        let p = AzureOpenAiModelProvider::new(
+            "test",
+            Some("key"),
+            "resource",
+            "deployment",
+            None,
+            None,
+        );
         assert!(p.supports_native_tools());
     }
 
     #[test]
     fn supports_vision_returns_true() {
-        let p = AzureOpenAiModelProvider::new("test", Some("key"), "resource", "deployment", None);
+        let p = AzureOpenAiModelProvider::new(
+            "test",
+            Some("key"),
+            "resource",
+            "deployment",
+            None,
+            None,
+        );
         assert!(p.supports_vision());
     }
 
     #[tokio::test]
     async fn warmup_is_noop() {
-        let p = AzureOpenAiModelProvider::new("test", None, "resource", "deployment", None);
+        let p = AzureOpenAiModelProvider::new("test", None, "resource", "deployment", None, None);
         let result = p.warmup().await;
         assert!(result.is_ok());
     }
@@ -850,6 +927,7 @@ mod tests {
             "resource",
             "deployment",
             Some("2025-01-01"),
+            None,
         );
         assert_eq!(p.api_version, "2025-01-01");
     }

@@ -1,6 +1,5 @@
 use crate::util::*;
 use std::collections::HashMap;
-use std::path::Path;
 use std::process::Command;
 
 #[derive(Debug)]
@@ -34,9 +33,18 @@ pub fn run() -> anyhow::Result<()> {
             eprintln!("FAIL: {locale}");
             failed = true;
         }
-        for (entry, reason) in audit_generated_responses(&path)? {
+        let raw = std::fs::read_to_string(&path)?;
+        let po_entries = parse_po_entries(&raw);
+        for (entry, reason) in audit_generated_responses(&po_entries) {
             eprintln!(
                 "FAIL: {locale}:{}: generated-response translation ({reason}) at {}",
+                entry.msgstr_line, entry.reference
+            );
+            failed = true;
+        }
+        for (entry, reason) in audit_protected_literals(&po_entries) {
+            eprintln!(
+                "FAIL: {locale}:{}: protected-literal translation ({reason}) at {}",
                 entry.msgstr_line, entry.reference
             );
             failed = true;
@@ -44,18 +52,26 @@ pub fn run() -> anyhow::Result<()> {
     }
 
     if failed {
-        anyhow::bail!("one or more .po files have format or generated-response errors");
+        anyhow::bail!(
+            "one or more .po files have format, generated-response, or protected-literal errors"
+        );
     }
     println!("All .po files OK.");
     Ok(())
 }
 
-fn audit_generated_responses(path: &Path) -> anyhow::Result<Vec<(PoEntry, &'static str)>> {
-    let raw = std::fs::read_to_string(path)?;
-    Ok(parse_po_entries(&raw)
-        .into_iter()
-        .filter_map(|entry| generated_response_reason(&entry).map(|reason| (entry, reason)))
-        .collect())
+fn audit_generated_responses(entries: &[PoEntry]) -> Vec<(&PoEntry, &'static str)> {
+    entries
+        .iter()
+        .filter_map(|entry| generated_response_reason(entry).map(|reason| (entry, reason)))
+        .collect()
+}
+
+fn audit_protected_literals(entries: &[PoEntry]) -> Vec<(&PoEntry, &'static str)> {
+    entries
+        .iter()
+        .filter_map(|entry| protected_literal_reason(entry).map(|reason| (entry, reason)))
+        .collect()
 }
 
 fn parse_po_entries(raw: &str) -> Vec<PoEntry> {
@@ -239,6 +255,169 @@ fn generated_response_reason(entry: &PoEntry) -> Option<&'static str> {
     None
 }
 
+fn protected_literal_reason(entry: &PoEntry) -> Option<&'static str> {
+    if entry.msgstr.trim().is_empty() {
+        return None;
+    }
+
+    for phrase in PROTECTED_PHRASES {
+        if entry.msgid.contains(phrase) && !entry.msgstr.contains(phrase) {
+            return Some("protected product/protocol name changed");
+        }
+    }
+
+    for literal in protected_code_literals(&entry.msgid) {
+        if !entry.msgstr.contains(&literal) {
+            return Some("machine-facing code literal changed");
+        }
+    }
+
+    None
+}
+
+const PROTECTED_PHRASES: &[&str] = &["ZeroClaw Maturity Framework"];
+
+fn protected_code_literals(text: &str) -> Vec<String> {
+    let mut literals = Vec::new();
+    collect_inline_code_literals(text, &mut literals);
+    collect_fenced_code_literals(text, &mut literals);
+    literals.sort();
+    literals.dedup();
+    literals
+}
+
+fn collect_inline_code_literals(text: &str, literals: &mut Vec<String>) {
+    let mut rest = text;
+    while let Some(start) = rest.find('`') {
+        rest = &rest[start + 1..];
+        if rest.starts_with("``") {
+            continue;
+        }
+        let Some(end) = rest.find('`') else {
+            break;
+        };
+        let literal = &rest[..end];
+        rest = &rest[end + 1..];
+        if is_protected_command_literal(literal) {
+            literals.push(literal.to_string());
+        }
+    }
+}
+
+fn collect_fenced_code_literals(text: &str, literals: &mut Vec<String>) {
+    let mut fence_language: Option<String> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            if fence_language.is_some() {
+                fence_language = None;
+            } else {
+                fence_language = Some(
+                    trimmed
+                        .trim_start_matches('`')
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or_default()
+                        .to_ascii_lowercase(),
+                );
+            }
+            continue;
+        }
+        let Some(language) = fence_language.as_deref() else {
+            continue;
+        };
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if is_protected_command_literal(trimmed) {
+            literals.push(trimmed.to_string());
+        }
+        if language != "toml" {
+            continue;
+        }
+
+        if is_toml_section(trimmed) {
+            literals.push(trimmed.to_string());
+        } else if let Some((key, _)) = trimmed.split_once('=') {
+            let key = key.trim();
+            if is_config_key(key) {
+                literals.push(key.to_string());
+            }
+        }
+    }
+}
+
+fn is_protected_command_literal(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed == "zeroclaw daemon" || trimmed.starts_with("zeroclaw daemon ")
+}
+
+fn is_config_key(text: &str) -> bool {
+    is_toml_key_path(text)
+}
+
+fn is_toml_section(text: &str) -> bool {
+    let text = text.trim();
+    let section = if text.starts_with("[[") && text.ends_with("]]") {
+        &text[2..text.len() - 2]
+    } else if text.starts_with('[') && text.ends_with(']') {
+        &text[1..text.len() - 1]
+    } else {
+        return false;
+    };
+    is_toml_key_path(section.trim())
+}
+
+fn is_toml_key_path(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+
+    let mut start = 0;
+    let mut quote = None;
+    for (idx, c) in text.char_indices() {
+        if let Some(active_quote) = quote {
+            if c == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+
+        match c {
+            '"' | '\'' => quote = Some(c),
+            '.' => {
+                if !is_toml_key_segment(&text[start..idx]) {
+                    return false;
+                }
+                start = idx + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    quote.is_none() && is_toml_key_segment(&text[start..])
+}
+
+fn is_toml_key_segment(text: &str) -> bool {
+    let text = text.trim();
+    is_bare_toml_key(text) || is_quoted_toml_key(text)
+}
+
+fn is_bare_toml_key(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn is_quoted_toml_key(text: &str) -> bool {
+    text.len() >= 2
+        && ((text.starts_with('"') && text.ends_with('"'))
+            || (text.starts_with('\'') && text.ends_with('\'')))
+}
+
 fn contains_assistant_response_phrase(text: &str) -> bool {
     const NEEDLES: &[&str] = &[
         "please provide",
@@ -391,12 +570,88 @@ mod tests {
     }
 
     #[test]
-    fn does_not_flag_literal_preservation_issue_for_6407() {
-        let broader_follow_up = entry(
+    fn flags_translated_command_literal_for_6407() {
+        let issue = entry(
             "[`zeroclaw daemon`↴](#zeroclaw-daemon)",
             "[`zeroclaw 守护进程`↴](#zeroclaw-daemon)",
         );
-        assert_eq!(generated_response_reason(&broader_follow_up), None);
+        assert_eq!(generated_response_reason(&issue), None);
+        assert_eq!(
+            protected_literal_reason(&issue),
+            Some("machine-facing code literal changed")
+        );
+    }
+
+    #[test]
+    fn flags_translated_toml_keys_for_6407() {
+        let issue = entry(
+            "```toml\n[observability]\nruntime_trace_mode = \"rolling\"\nruntime_trace_path = \"state/runtime-trace.jsonl\"\n```",
+            "```toml\n[可观测性]\n运行时跟踪模式 = \"rolling\"\n运行时跟踪路径 = \"state/runtime-trace.jsonl\"\n```",
+        );
+        assert_eq!(
+            protected_literal_reason(&issue),
+            Some("machine-facing code literal changed")
+        );
+    }
+
+    #[test]
+    fn flags_single_word_toml_keys_for_6407() {
+        let issue = entry(
+            "```toml\n[agent]\nenabled = true\nmodel = \"openai.default\"\n```",
+            "```toml\n[agent]\n启用 = true\n模型 = \"openai.default\"\n```",
+        );
+        assert_eq!(
+            protected_literal_reason(&issue),
+            Some("machine-facing code literal changed")
+        );
+    }
+
+    #[test]
+    fn flags_quoted_dotted_toml_sections_for_6407() {
+        let issue = entry(
+            "```toml\n[cost.rates.providers.models.anthropic.\"claude.opus\"]\ninput = 15.0\n```",
+            "```toml\n[cost.rates.providers.models.anthropic.\"claude-opus\"]\ninput = 15.0\n```",
+        );
+        assert_eq!(
+            protected_literal_reason(&issue),
+            Some("machine-facing code literal changed")
+        );
+    }
+
+    #[test]
+    fn ignores_non_toml_fenced_config_like_text() {
+        let clean = entry(
+            "```text\n[placeholder]\nexample_value = 1\n```",
+            "```text\n[marcador]\nvalor_de_ejemplo = 1\n```",
+        );
+        assert_eq!(protected_literal_reason(&clean), None);
+    }
+
+    #[test]
+    fn flags_translated_product_name_for_6407() {
+        let issue = entry("The ZeroClaw Maturity Framework", "零爪成熟度框架");
+        assert_eq!(
+            protected_literal_reason(&issue),
+            Some("protected product/protocol name changed")
+        );
+    }
+
+    #[test]
+    fn allows_translated_prose_around_preserved_literals() {
+        let clean = entry(
+            "Run `zeroclaw daemon` after setting `[observability]`.",
+            "设置 `[observability]` 后运行 `zeroclaw daemon`。",
+        );
+        assert_eq!(protected_literal_reason(&clean), None);
+    }
+
+    #[test]
+    fn allows_translated_cli_placeholders() {
+        let clean = entry(
+            "**Usage:** `zeroclaw [OPTIONS] <COMMAND>`",
+            "**Uso:** `zeroclaw [OPCIONES] <COMANDO>`",
+        );
+        assert_eq!(protected_literal_reason(&clean), None);
     }
 
     #[test]

@@ -18,11 +18,15 @@
 
 import { useEffect, useState } from 'react';
 import { ChevronRight, Plus, Trash2 } from 'lucide-react';
+import { t } from '@/lib/i18n';
 import {
   ApiError,
   createMapKey,
   deleteMapKey,
   getMapKeys,
+  getCatalogModels,
+  patchConfig,
+  type ModelPricing,
 } from '../../lib/api';
 import { configuredResourceIds } from '../../lib/configuredModels';
 import FieldForm from './FieldForm';
@@ -62,6 +66,44 @@ function basePathFor(category: CostRatesCategory, providerType: string) {
   return `cost.rates.providers.${category}.${providerType}`;
 }
 
+/** Apply catalog pricing to a resource's rate entry. Fetches from the API
+ *  if the in-memory cache is empty, then builds and submits PATCH ops.
+ *  Silent-fail on errors — pricing pre-fill is a nice-to-have. */
+async function applyCatalogPricingToResource(
+  basePath: string,
+  resource: string,
+  catalogPricing: Record<string, ModelPricing> | null,
+  providerType: string,
+): Promise<void> {
+  let pricing: ModelPricing | undefined = catalogPricing
+    ? catalogPricing[resource]
+    : undefined;
+  if (!pricing) {
+    try {
+      const resp = await getCatalogModels(providerType);
+      pricing = resp.pricing?.[resource];
+    } catch { /* silent fail */ }
+  }
+  if (!pricing) return;
+  const fullPath = `${basePath}.${resource}`;
+  const ops: { op: 'replace'; path: string; value: number }[] = [];
+  if (pricing.prompt !== undefined) {
+    const v = parseFloat(pricing.prompt);
+    if (!isNaN(v)) ops.push({ op: 'replace', path: `${fullPath}.input_per_mtok`, value: v * 1_000_000 });
+  }
+  if (pricing.completion !== undefined) {
+    const v = parseFloat(pricing.completion);
+    if (!isNaN(v)) ops.push({ op: 'replace', path: `${fullPath}.output_per_mtok`, value: v * 1_000_000 });
+  }
+  if (pricing.input_cache_read !== undefined) {
+    const v = parseFloat(pricing.input_cache_read);
+    if (!isNaN(v)) ops.push({ op: 'replace', path: `${fullPath}.cached_input_per_mtok`, value: v * 1_000_000 });
+  }
+  if (ops.length > 0) {
+    await patchConfig(ops);
+  }
+}
+
 // Embedded mode — providers.<category>.<alias> "Costs" tab. The resource
 // id (e.g. `claude-opus-4-7`) is fixed by the bound model/voice on the
 // alias; on first visit there's no rate entry yet, so the widget shows a
@@ -79,6 +121,7 @@ function SingleResourceEditor({
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
+  const [catalogPricing, setCatalogPricing] = useState<Record<string, ModelPricing> | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -94,16 +137,24 @@ function SingleResourceEditor({
         setExists(false);
         setError(e instanceof ApiError ? e.envelope.message : String(e));
       });
+    // Fetch catalog pricing in parallel — silent fail, it's a nice-to-have.
+    getCatalogModels(providerType)
+      .then((r) => {
+        if (!cancelled && r.pricing) setCatalogPricing(r.pricing);
+      })
+      .catch(() => {});
     return () => {
       cancelled = true;
     };
-  }, [basePath, fixedResource]);
+  }, [basePath, fixedResource, providerType]);
 
   const addRates = async () => {
     setBusy(true);
     setError(null);
     try {
       await createMapKey(basePath, fixedResource);
+      // Pre-fill rates from catalog pricing.
+      await applyCatalogPricingToResource(basePath, fixedResource, catalogPricing, providerType);
       setExists(true);
       setReloadKey((n) => n + 1);
       onSaved?.();
@@ -122,10 +173,9 @@ function SingleResourceEditor({
     return (
       <div className="flex flex-col gap-3">
         <p className="text-sm" style={{ color: 'var(--pc-text-secondary)' }}>
-          No rate sheet entry yet for{' '}
+          {t('cost_rates.no_entry_yet_for')}{' '}
           <code className="font-mono">{composite(category, providerType, fixedResource)}</code>.
-          Adding one lets the orchestrator price token usage at this rate
-          instead of falling back to <code>cost.usd_per_1k_input</code>.
+          {' '}{t('cost_rates.no_entry_fallback_prefix')} <code>cost.usd_per_1k_input</code>.
         </p>
         {error && <ErrorBanner msg={error} />}
         <button
@@ -135,7 +185,7 @@ function SingleResourceEditor({
           className="btn-electric flex items-center gap-2 text-sm px-3 py-2 self-start"
         >
           <Plus className="h-4 w-4" />
-          {busy ? 'Adding…' : 'Add rates'}
+          {busy ? t('cost_rates.adding') : t('cost_rates.add_rates')}
         </button>
       </div>
     );
@@ -144,9 +194,9 @@ function SingleResourceEditor({
   return (
     <div className="flex flex-col gap-3">
       <p className="text-sm" style={{ color: 'var(--pc-text-secondary)' }}>
-        Rate sheet for{' '}
+        {t('cost_rates.rate_sheet_for')}{' '}
         <code className="font-mono">{composite(category, providerType, fixedResource)}</code>{' '}
-        — path <code className="font-mono">{fullPath}</code>.
+        {t('cost_rates.path_label')} <code className="font-mono">{fullPath}</code>.
       </p>
       {error && <ErrorBanner msg={error} />}
       <FieldForm
@@ -181,6 +231,7 @@ function ResourceListEditor({
   const [newResource, setNewResource] = useState('');
   const [adding, setAdding] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
+  const [catalogPricing, setCatalogPricing] = useState<Record<string, ModelPricing> | null>(null);
 
   const reload = async () => {
     setLoading(true);
@@ -200,8 +251,17 @@ function ResourceListEditor({
 
   useEffect(() => {
     void reload();
+    // Fetch catalog pricing for pre-fill — silent fail, nice-to-have.
+    getCatalogModels(providerType)
+      .then((r) => { if (r.pricing) setCatalogPricing(r.pricing); })
+      .catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [basePath]);
+
+  /** Apply catalog pricing to a newly-created resource, if available. */
+  const applyPricing = async (resource: string) => {
+    await applyCatalogPricingToResource(basePath, resource, catalogPricing, providerType);
+  };
 
   const addResource = async () => {
     const trimmed = newResource.trim();
@@ -210,6 +270,8 @@ function ResourceListEditor({
     setError(null);
     try {
       await createMapKey(basePath, trimmed);
+      // Pre-fill rates from catalog pricing before reload.
+      await applyPricing(trimmed);
       setNewResource('');
       setOpen(trimmed);
       await reload();
@@ -248,8 +310,8 @@ function ResourceListEditor({
             className="p-4 text-sm text-center"
             style={{ color: 'var(--pc-text-muted)' }}
           >
-            No rates configured under{' '}
-            <code className="font-mono">{basePath}</code>. Add one below.
+            {t('cost_rates.no_rates_under')}{' '}
+            <code className="font-mono">{basePath}</code>. {t('cost_rates.add_one_below')}
           </div>
         ) : (
           resources.map((resource) => (
@@ -298,13 +360,13 @@ function ResourceListEditor({
               className="btn-electric text-sm px-3 py-1.5 flex items-center gap-1"
             >
               <Plus className="h-4 w-4" />
-              {adding ? 'Adding…' : 'Add'}
+              {adding ? t('cost_rates.adding') : t('cost_rates.add')}
             </button>
           </div>
           {suggestions.filter((s) => !resources.includes(s)).length > 0 && (
             <div className="flex items-center gap-1.5 flex-wrap">
               <span className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
-                From <code className="font-mono">providers.{category}.{providerType}</code>:
+                {t('cost_rates.from_label')} <code className="font-mono">providers.{category}.{providerType}</code>:
               </span>
               {suggestions
                 .filter((s) => !resources.includes(s))
@@ -332,8 +394,7 @@ function ResourceListEditor({
         className="text-xs"
         style={{ color: 'var(--pc-text-faint)' }}
       >
-        Resource id is the upstream model / voice / pipeline name as it
-        appears in usage telemetry, not the local alias. Rates emit at{' '}
+        {t('cost_rates.resource_id_help')} {t('cost_rates.rates_emit_at')}{' '}
         <code className="font-mono">{basePath}.&lt;resource&gt;</code>.
       </p>
     </div>
@@ -412,8 +473,8 @@ function ResourceRow({
           }}
           title={
             armed
-              ? `Click again to delete ${composite(category, providerType, resource)}`
-              : `Delete ${composite(category, providerType, resource)}`
+              ? `${t('cost_rates.click_again_to_delete')} ${composite(category, providerType, resource)}`
+              : `${t('common.delete')} ${composite(category, providerType, resource)}`
           }
           className="btn-icon flex-shrink-0"
           style={
@@ -426,7 +487,7 @@ function ResourceRow({
           }
         >
           {armed ? (
-            <span className="text-xs px-1">Confirm</span>
+            <span className="text-xs px-1">{t('common.confirm')}</span>
           ) : (
             <Trash2 className="h-4 w-4" />
           )}

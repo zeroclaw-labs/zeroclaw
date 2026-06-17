@@ -628,8 +628,8 @@ fn normalize_provider_type(
         "github_models" | "github-models" => Some("github_models"),
         // Stepfun: was stepfun|step (stepfun-intl handled below as variant)
         "stepfun" | "step" => Some("stepfun"),
-        // KiloCli: was kilocli|kilo
-        "kilocli" | "kilo" => Some("kilocli"),
+        // KiloCli: was kilocli|kilo-cli
+        "kilocli" | "kilo-cli" => Some("kilocli"),
         _ => None,
     };
 

@@ -1,12 +1,15 @@
 use std::fmt::Write;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use std::sync::Arc;
 
 use zeroclaw_api::model_provider::{ChatMessage, ModelProvider};
 use zeroclaw_memory::traits::Memory;
+use zeroclaw_providers::ProviderDispatch;
 use zeroclaw_providers::multimodal;
+
+use crate::observability::{Observer, ObserverEvent};
 
 pub use zeroclaw_config::scattered_types::ContextCompressionConfig;
 
@@ -120,6 +123,7 @@ pub struct ContextCompressor {
     config: ContextCompressionConfig,
     context_window: usize,
     memory: Option<Arc<dyn Memory>>,
+    observer: Option<Arc<dyn Observer>>,
 }
 
 impl ContextCompressor {
@@ -128,6 +132,7 @@ impl ContextCompressor {
             config,
             context_window,
             memory: None,
+            observer: None,
         }
     }
 
@@ -135,6 +140,15 @@ impl ContextCompressor {
     /// old messages are discarded. Without this, compressed facts are lost.
     pub fn with_memory(mut self, memory: Arc<dyn Memory>) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Attach an observer so compression-summary stores emit
+    /// `ObserverEvent::MemoryStore` alongside the other agent-loop write
+    /// sites. Optional — when not set, stores still happen but are
+    /// invisible to OTel/log observers.
+    pub fn with_observer(mut self, observer: Arc<dyn Observer>) -> Self {
+        self.observer = Some(observer);
         self
     }
 
@@ -349,9 +363,10 @@ impl ContextCompressor {
 
         // LLM summarization with safety timeout
         let timeout = Duration::from_secs(self.config.timeout_secs);
+        let dispatcher = ProviderDispatch::from_ref(model_provider);
         let summary_raw = match tokio::time::timeout(
             timeout,
-            model_provider.chat_with_system(
+            dispatcher.chat_with_system(
                 Some(SUMMARIZER_SYSTEM),
                 &user_prompt,
                 summary_model,
@@ -391,28 +406,38 @@ impl ContextCompressor {
         // This ensures facts from compressed turns remain retrievable via memory recall.
         if let Some(ref memory) = self.memory {
             let facts_key = format!("compressed_context_{}", uuid::Uuid::new_v4());
-            if let Err(e) = memory
-                .store(
-                    &facts_key,
-                    &summary,
-                    zeroclaw_memory::traits::MemoryCategory::Daily,
-                    None,
-                )
-                .await
-            {
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "Failed to save compression summary to memory"
-                );
-            } else {
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"message_count": message_count})),
-                    "Saved compression summary to memory before discarding  messages"
-                );
+            let category = zeroclaw_memory::traits::MemoryCategory::Daily;
+            let store_start = Instant::now();
+            let store_result = memory
+                .store(&facts_key, &summary, category.clone(), None)
+                .await;
+            let store_duration = store_start.elapsed();
+            let success = store_result.is_ok();
+            match &store_result {
+                Ok(_) => {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"message_count": message_count})),
+                        "Saved compression summary to memory before discarding messages"
+                    );
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "Failed to save compression summary to memory"
+                    );
+                }
+            }
+            if let Some(ref observer) = self.observer {
+                observer.record_event(&ObserverEvent::MemoryStore {
+                    category: category.to_string(),
+                    backend: memory.name().to_string(),
+                    duration: store_duration,
+                    success,
+                });
             }
         }
 

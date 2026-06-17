@@ -7,6 +7,7 @@ use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::{ClassificationRule, Config, ModelRouteConfig};
+use zeroclaw_providers::ProviderDispatch;
 
 const DEFAULT_AGENT_MAX_DEPTH: u32 = 3;
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 10;
@@ -363,8 +364,8 @@ impl ModelRoutingConfigTool {
 
         let mut agents: BTreeMap<String, Value> = BTreeMap::new();
         for (name, agent) in &cfg.agents {
-            let risk = cfg.risk_profiles.get(&agent.risk_profile);
-            let runtime = cfg.runtime_profiles.get(&agent.runtime_profile);
+            let risk = cfg.risk_profiles.get(agent.risk_profile.as_str());
+            let runtime = cfg.runtime_profiles.get(agent.runtime_profile.as_str());
             agents.insert(
                 name.clone(),
                 json!({
@@ -375,6 +376,8 @@ impl ModelRoutingConfigTool {
                     "agentic": runtime.map(|r| r.agentic),
                     "allowed_tools": risk.map(|r| &r.allowed_tools),
                     "max_tool_iterations": runtime.map(|r| r.max_tool_iterations),
+                    "delegate_same_risk_profile": agent.delegate_same_risk_profile,
+                    "delegates": agent.delegates,
                 }),
             );
         }
@@ -628,7 +631,7 @@ impl ModelRoutingConfigTool {
 
         // Greedy sampling: the ping is a liveness check, not a generation task.
         const PING_TEMPERATURE: f64 = 0.0;
-        model_provider
+        ProviderDispatch::from_ref(&*model_provider)
             .chat_with_system(
                 Some("Respond with OK."),
                 "ping",
@@ -835,6 +838,14 @@ impl ModelRoutingConfigTool {
             None
         };
 
+        let delegate_same_risk_profile_update =
+            Self::parse_optional_bool(args, "delegate_same_risk_profile")?;
+        let delegates_update = if let Some(raw) = args.get("delegates") {
+            Some(Self::parse_string_list(raw, "delegates")?)
+        } else {
+            None
+        };
+
         let mut cfg = self.load_config_without_env()?;
 
         // synthesize providers.models[model_provider_family][name] from inline brain params.
@@ -909,22 +920,19 @@ impl ModelRoutingConfigTool {
             } else if runtime.max_delegation_depth == 0 {
                 runtime.max_delegation_depth = DEFAULT_AGENT_MAX_DEPTH;
             }
-            if runtime.agentic {
-                let allowed_tools_empty = cfg
-                    .risk_profiles
-                    .get(&name)
-                    .is_none_or(|r| r.allowed_tools.is_empty());
-                if allowed_tools_empty {
-                    anyhow::bail!("Agent '{name}' has agentic=true but allowed_tools is empty.");
-                }
-            }
         }
 
         // Get or create the agent and wire up alias references.
         let next_agent = cfg.agents.entry(name.clone()).or_default();
         next_agent.model_provider = agent_model_provider_ref.into();
-        next_agent.risk_profile = name.clone();
-        next_agent.runtime_profile = name.clone();
+        next_agent.risk_profile = name.clone().into();
+        next_agent.runtime_profile = name.clone().into();
+        if let Some(same_profile) = delegate_same_risk_profile_update {
+            next_agent.delegate_same_risk_profile = same_profile;
+        }
+        if let Some(delegates) = delegates_update {
+            next_agent.delegates = delegates;
+        }
 
         cfg.save().await?;
 
@@ -1068,6 +1076,17 @@ impl Tool for ModelRoutingConfigTool {
                     "type": ["integer", "null"],
                     "minimum": 1,
                     "description": "Maximum tool-call iterations for agentic delegate mode"
+                },
+                "delegate_same_risk_profile": {
+                    "type": "boolean",
+                    "description": "Auto-allow delegation to same-risk-profile peers (default true). Set false to restrict reach to the explicit delegates list."
+                },
+                "delegates": {
+                    "description": "Explicit delegate roster: additional agent aliases this agent may delegate to, beyond same-profile peers (string or string array)",
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}}
+                    ]
                 }
             },
             "additionalProperties": false
@@ -1290,6 +1309,45 @@ mod tests {
         let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
         let output: Value = serde_json::from_str(&get_result.output).unwrap();
         assert!(output["agents"]["coder"].is_null());
+    }
+
+    #[tokio::test]
+    async fn upsert_agent_writes_delegate_roster_fields() {
+        let tmp = TempDir::new().unwrap();
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+
+        // Create the explicit delegate target first so the roster names a
+        // real agent (snapshot/readback does not validate, but keep it real).
+        let _ = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "aaalore",
+                "model_provider": "openai",
+                "model": "gpt-5.3"
+            }))
+            .await
+            .unwrap();
+
+        let upsert = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "aaa",
+                "model_provider": "openai",
+                "model": "gpt-5.3",
+                "delegate_same_risk_profile": false,
+                "delegates": ["aaalore"]
+            }))
+            .await
+            .unwrap();
+        assert!(upsert.success, "{:?}", upsert.error);
+
+        let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
+        let output: Value = serde_json::from_str(&get_result.output).unwrap();
+        assert_eq!(
+            output["agents"]["aaa"]["delegate_same_risk_profile"],
+            json!(false)
+        );
+        assert_eq!(output["agents"]["aaa"]["delegates"], json!(["aaalore"]));
     }
 
     #[tokio::test]

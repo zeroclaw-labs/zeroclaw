@@ -23,6 +23,16 @@ enum Cmd {
     Build,
     /// Regenerate cli.md, config.md, and rustdoc API reference
     Refs,
+    /// mdBook preprocessor: expand `{{#peer-group <channel>}}` directives.
+    /// Invoked by mdBook via book.toml; not run directly.
+    Preprocess {
+        /// `supports <renderer>` probe from mdBook (exit 0 = supported).
+        #[arg(value_name = "ARG")]
+        arg: Option<String>,
+        /// The renderer name mdBook passes after `supports`.
+        #[arg(value_name = "RENDERER")]
+        renderer: Option<String>,
+    },
     /// Sync .po files and AI-fill translation delta
     Sync {
         #[arg(long)]
@@ -56,10 +66,20 @@ enum Cmd {
     GenVersions,
     /// Remove orphaned root entries from the gh-pages clone (run in its root)
     PruneRoot,
+    /// Retain master and the newest DOCS_KEEP_VERSIONS final releases; drop
+    /// every other version dir (run in the gh-pages clone root)
+    PruneVersions,
+    /// Emit the gh-pages root index.html redirecting to the stable version
+    /// (from stable-version.txt), or master when none resolves
+    GenRootIndex,
     /// Inject the version-selector script into deployed pages that lack it
     RetrofitSelector,
     /// Regenerate pc-themes.css + switcher list from the dashboard theme registry
     Themes,
+    /// Regenerate hardware reference snippets from the board registry + catalog
+    Hardware,
+    /// Check internal links in the already-built book HTML
+    Linkcheck,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -70,6 +90,12 @@ fn main() -> anyhow::Result<()> {
         Cmd::Serve { locale } => cmd::mdbook::serve::run(locale.as_deref(), tag),
         Cmd::Build => cmd::mdbook::build::run(tag),
         Cmd::Refs => cmd::mdbook::refs::run(tag),
+        Cmd::Preprocess { arg, .. } => {
+            if arg.as_deref() == Some("supports") {
+                cmd::mdbook::peer_groups::supports();
+            }
+            cmd::mdbook::peer_groups::run()
+        }
         Cmd::Sync {
             locale,
             force,
@@ -98,7 +124,14 @@ fn main() -> anyhow::Result<()> {
         ),
         Cmd::GenVersions => cmd::mdbook::versions::run(),
         Cmd::PruneRoot => cmd::mdbook::versions::prune_root(),
+        Cmd::PruneVersions => cmd::mdbook::versions::prune_versions(),
+        Cmd::GenRootIndex => cmd::mdbook::versions::gen_root_index(),
         Cmd::RetrofitSelector => cmd::mdbook::versions::retrofit_selector(),
         Cmd::Themes => cmd::mdbook::themes::run(&xtask::util::repo_root()),
+        Cmd::Hardware => cmd::mdbook::hardware::run(&xtask::util::repo_root()),
+        Cmd::Linkcheck => cmd::mdbook::linkcheck::check_internal_links(
+            &xtask::util::repo_root(),
+            tag.unwrap_or("master"),
+        ),
     }
 }
