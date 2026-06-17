@@ -1750,7 +1750,9 @@ pub async fn model_catalog(
     bool,
 ) {
     if let Ok(handle) = zeroclaw_providers::create_model_provider(model_provider, None)
-        && let Ok(models) = handle.list_models_with_pricing().await
+        && let Ok(models) = zeroclaw_providers::ProviderDispatch::from_ref(&*handle)
+            .list_models_with_pricing()
+            .await
         && !models.is_empty()
     {
         let raw_pricing: std::collections::HashMap<

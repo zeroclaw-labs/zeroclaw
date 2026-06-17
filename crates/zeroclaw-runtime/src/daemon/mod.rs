@@ -1555,6 +1555,7 @@ mod tests {
             zeroclaw_config::schema::TelegramConfig {
                 enabled: true,
                 bot_token: "token".into(),
+                api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
@@ -1735,6 +1736,7 @@ mod tests {
             zeroclaw_config::schema::TelegramConfig {
                 enabled: true,
                 bot_token: "bot-token".into(),
+                api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
@@ -1762,6 +1764,7 @@ mod tests {
             zeroclaw_config::schema::TelegramConfig {
                 enabled: true,
                 bot_token: "bot-token".into(),
+                api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::default(),
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
