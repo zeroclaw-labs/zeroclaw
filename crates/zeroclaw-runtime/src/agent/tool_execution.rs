@@ -27,6 +27,9 @@ pub fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn T
 pub struct ToolExecutionOutcome {
     pub output: String,
     pub success: bool,
+    /// Raw failure text on the data path. Credential scrubbing is a rendering
+    /// concern applied at each human-facing surface (observer events,
+    /// post-execution log line, CLI progress), never stored pre-scrubbed here.
     pub error_reason: Option<String>,
     pub duration: Duration,
     /// Cryptographic HMAC receipt proving this tool actually executed.
