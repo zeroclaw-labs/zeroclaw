@@ -210,6 +210,13 @@ pub struct Config {
     #[group = "Agent"]
     pub scheduler: SchedulerConfig,
 
+    /// Agent evaluation harness (`[eval]`) — surfaced via `zeroclaw eval`.
+    /// Distinct from `[agent.eval]`, which is the in-loop response-quality scorer.
+    #[serde(default)]
+    #[nested]
+    #[group = "Operations"]
+    pub eval: crate::scattered_types::EvalHarnessConfig,
+
     /// Pacing controls for slow/local LLM workloads (`[pacing]`).
     #[serde(default)]
     #[nested]
@@ -2001,6 +2008,33 @@ pub struct VeniceModelProviderConfig {
     pub base: ModelProviderConfig,
 }
 
+// ── NEAR AI Cloud ──
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum NearaiEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for NearaiEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://cloud-api.near.ai/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.nearai"]
+pub struct NearaiModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
 // ── Novita ──
 
 #[derive(
@@ -3119,6 +3153,7 @@ impl_default_family_endpoint! {
     AvianModelProviderConfig,
     DeepmystModelProviderConfig,
     VeniceModelProviderConfig,
+    NearaiModelProviderConfig,
     NovitaModelProviderConfig,
     NvidiaModelProviderConfig,
     TelnyxModelProviderConfig,
@@ -3448,7 +3483,7 @@ pub struct ChannelAliasInfo {
 }
 
 impl Config {
-    /// Resolve the configured alias values valid for an [`AliasSource`].
+    /// Resolve the configured alias values valid for an [`crate::traits::AliasSource`].
     /// Two-tier sources return dotted `<type>.<alias>` keys; flat sources
     /// return bare alias keys. The single resolver every surface uses for
     /// `PropKind::AliasRef` pickers and validation.
@@ -7359,6 +7394,19 @@ pub struct PluginsConfig {
     pub security: PluginSecurityConfig,
 }
 
+impl PluginsConfig {
+    /// Resolve `plugins_dir` to an absolute path, expanding a leading `~/`.
+    ///
+    /// This is the single source of truth for the plugin directory: the CLI,
+    /// runtime tool/skill discovery, and the gateway all resolve through it so
+    /// that `zeroclaw plugin install` and the agent agree on one location.
+    /// Pure — performs no filesystem I/O.
+    #[must_use]
+    pub fn resolved_plugins_dir(&self) -> PathBuf {
+        expand_tilde_path(&self.plugins_dir)
+    }
+}
+
 /// Plugin signature verification configuration (`[plugins.security]`).
 ///
 /// Controls Ed25519 signature verification for plugin manifests.
@@ -8561,6 +8609,45 @@ fn validate_proxy_url(field: &str, url: &str) -> Result<()> {
 
     if parsed.host_str().is_none() {
         anyhow::bail!("Invalid {field} URL: host is required");
+    }
+
+    Ok(())
+}
+
+fn validate_http_base_url(field: &str, url: &str) -> Result<()> {
+    if url.trim().is_empty() {
+        validation_bail!(
+            RequiredFieldEmpty,
+            field.to_string(),
+            "{field} must not be empty"
+        );
+    }
+
+    let parsed = match reqwest::Url::parse(url) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            validation_bail!(
+                InvalidFormat,
+                field.to_string(),
+                "{field} must be a valid URL: {err}"
+            );
+        }
+    };
+
+    if !matches!(parsed.scheme(), "http" | "https") {
+        validation_bail!(
+            InvalidFormat,
+            field.to_string(),
+            "{field} must use http:// or https://"
+        );
+    }
+
+    if parsed.host_str().is_none() {
+        validation_bail!(
+            InvalidFormat,
+            field.to_string(),
+            "{field} must include a host"
+        );
     }
 
     Ok(())
@@ -11615,6 +11702,12 @@ fn default_telegram_approval_timeout_secs() -> u64 {
     120
 }
 
+pub const TELEGRAM_OFFICIAL_API_BASE_URL: &str = "https://api.telegram.org";
+
+fn default_telegram_api_base_url() -> String {
+    TELEGRAM_OFFICIAL_API_BASE_URL.to_string()
+}
+
 fn default_channel_approval_timeout_secs() -> u64 {
     300
 }
@@ -11624,7 +11717,7 @@ fn default_matrix_draft_update_interval_ms() -> u64 {
 }
 
 /// Telegram bot channel configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.telegram"]
 pub struct TelegramConfig {
@@ -11640,6 +11733,11 @@ pub struct TelegramConfig {
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub bot_token: String,
+    /// Telegram Bot API base URL. Defaults to the official Telegram endpoint;
+    /// set to a local Bot API server URL when self-hosting Telegram's bot API.
+    #[tab(Connection)]
+    #[serde(default = "default_telegram_api_base_url")]
+    pub api_base_url: String,
     /// Streaming mode for progressive response delivery via message edits.
     #[tab(Behavior)]
     #[serde(default)]
@@ -11693,6 +11791,26 @@ pub struct TelegramConfig {
     pub reply_queue_depth_max: u16,
 }
 
+impl Default for TelegramConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bot_token: String::new(),
+            api_base_url: default_telegram_api_base_url(),
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: default_draft_update_interval_ms(),
+            interrupt_on_new_message: false,
+            mention_only: false,
+            ack_reactions: None,
+            proxy_url: None,
+            approval_timeout_secs: default_telegram_approval_timeout_secs(),
+            excluded_tools: Vec::new(),
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
+        }
+    }
+}
+
 impl ChannelConfig for TelegramConfig {
     fn name() -> &'static str {
         "Telegram"
@@ -11700,6 +11818,27 @@ impl ChannelConfig for TelegramConfig {
     fn desc() -> &'static str {
         "connect your bot"
     }
+}
+
+/// Scope of inbound Discord reaction events the bot records.
+///
+/// Anything other than `Off` adds the GUILD_MESSAGE_REACTIONS and
+/// DIRECT_MESSAGE_REACTIONS gateway intents (both unprivileged; no
+/// Developer Portal toggle needed) and archives matching reactions to the
+/// channel's `discord.db` sidecar when `archive` is enabled.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum DiscordReactionScope {
+    /// Ignore inbound reaction events entirely (no reaction intents requested).
+    #[default]
+    Off,
+    /// Record reactions to the bot's own messages only.
+    Own,
+    /// Record reactions to any message that passes the channel's filters.
+    All,
 }
 
 /// Discord bot channel configuration.
@@ -11754,6 +11893,12 @@ pub struct DiscordConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
+    /// When true, register and serve Discord slash commands (e.g. `/ask`)
+    /// over the Gateway WebSocket, in addition to message handling. Default
+    /// false. (Prototype: currently registers a single `/ask <prompt>`.)
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub slash_commands: bool,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
@@ -11791,6 +11936,17 @@ pub struct DiscordConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub intents_mask: Option<u64>,
+    /// Which inbound reactions to record: `off` (default: reaction events
+    /// are not even requested from the gateway), `own` (reactions to the
+    /// bot's messages), or `all` (reactions to any message passing the
+    /// channel's filters). Recorded reactions are archived to `discord.db`
+    /// when `archive` is enabled, and removed again when a user removes
+    /// their reaction (bulk clears, remove-all / remove-emoji, are not
+    /// yet swept). A set `intents_mask` overrides the derived mask: if it
+    /// omits the reaction intents, nothing is recorded.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub reaction_notifications: DiscordReactionScope,
     /// Seconds to wait for operator approval on `always_ask` tools before auto-denying.
     #[tab(Behavior)]
     #[serde(default = "default_channel_approval_timeout_secs")]
@@ -14838,6 +14994,7 @@ impl Default for Config {
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
+            eval: crate::scattered_types::EvalHarnessConfig::default(),
             pacing: PacingConfig::default(),
             skills: SkillsConfig::default(),
             pipeline: PipelineConfig::default(),
@@ -15078,6 +15235,37 @@ fn expand_tilde_path(path: &str) -> PathBuf {
     }
 
     PathBuf::from(expanded_str)
+}
+
+/// Returns the legacy plugin directories that still hold installed plugins not
+/// visible to the runtime, which now scans [`PluginsConfig::resolved_plugins_dir`].
+///
+/// Historically `zeroclaw plugin install` wrote to `<data_dir>/plugins` (and,
+/// before the data-dir rename, `<install_root>/workspace/plugins`). A directory
+/// is reported only when it differs from the configured plugins dir and contains
+/// at least one plugin (a subdirectory with a `manifest.toml`). Used to surface a
+/// migration hint and to drive `zeroclaw plugin migrate`.
+#[must_use]
+pub fn legacy_plugin_dirs_with_entries(config: &Config) -> Vec<PathBuf> {
+    let target = config.plugins.resolved_plugins_dir();
+    [
+        config.data_dir.join("plugins"),
+        config.install_root_dir().join("workspace").join("plugins"),
+    ]
+    .into_iter()
+    .filter(|legacy| *legacy != target && dir_has_plugin(legacy))
+    .collect()
+}
+
+/// Returns `true` if `dir` holds at least one plugin (a subdirectory containing a
+/// `manifest.toml`).
+fn dir_has_plugin(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|entry| entry.path().join("manifest.toml").exists())
 }
 
 /// Detect if an executable path lives under a macOS Homebrew prefix and return
@@ -15393,6 +15581,13 @@ pub async fn ensure_bootstrap_files(workspace_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ExtraNestedModelProviderTable {
+    family: String,
+    alias: String,
+    nested: String,
+}
+
 impl Config {
     /// External-peer usernames authorized on `<channel_type>.<alias>`.
     ///
@@ -15522,6 +15717,76 @@ impl Config {
             );
         }
         out
+    }
+
+    /// Return extra-nested model-provider alias tables that look like a
+    /// misplaced provider config, e.g.
+    /// `[providers.models.zai.default.default]`.
+    ///
+    /// Serde treats the first `default` as the alias and silently ignores the
+    /// second `default` child table. When that child table carries provider
+    /// fields such as `model`, `api_key`, or family-specific fields, the
+    /// operator's settings are dropped while the empty alias still validates as
+    /// an in-progress provider. This raw-TOML detector runs before that shape
+    /// is erased by typed deserialization.
+    fn extra_nested_model_provider_tables(raw_toml: &str) -> Vec<ExtraNestedModelProviderTable> {
+        let raw: toml::Table = match raw_toml.parse() {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+        let Some(models) = raw
+            .get("providers")
+            .and_then(toml::Value::as_table)
+            .and_then(|providers| providers.get("models"))
+            .and_then(toml::Value::as_table)
+        else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::new();
+        for (family, aliases_value) in models {
+            if !crate::providers::ModelProviders::slot_names().contains(&family.as_str()) {
+                continue;
+            }
+            let Some(aliases) = aliases_value.as_table() else {
+                continue;
+            };
+            for (alias, alias_value) in aliases {
+                let Some(alias_table) = alias_value.as_table() else {
+                    continue;
+                };
+                for (nested_key, nested_value) in alias_table {
+                    let Some(nested_table) = nested_value.as_table() else {
+                        continue;
+                    };
+                    if nested_table.is_empty()
+                        || Self::is_model_provider_table_valued_field(nested_key)
+                    {
+                        continue;
+                    }
+                    out.push(ExtraNestedModelProviderTable {
+                        family: family.clone(),
+                        alias: alias.clone(),
+                        nested: nested_key.clone(),
+                    });
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    fn is_model_provider_table_valued_field(key: &str) -> bool {
+        // These shared model-provider fields legitimately deserialize from
+        // nested TOML tables under an alias. Every other table-valued child of
+        // `[providers.models.<family>.<alias>]` is an ignored extra section,
+        // regardless of whether its contents are shared or family-specific
+        // provider fields.
+        matches!(
+            key,
+            "chat_template_kwargs" | "extra_headers" | "pricing" | "provider_extra"
+        )
     }
 
     /// Returns `true` if `path` was populated by a `ZEROCLAW_*` env-var
@@ -15770,7 +16035,32 @@ impl Config {
                         .with_attrs(::serde_json::json!({"kind": kind, "family": family})),
                     &format!(
                         "[providers.{kind}.{family}] section dropped: not a known {kind} \
-                         provider family. Its aliases will not load and {reference}."
+                        provider family. Its aliases will not load and {reference}."
+                    )
+                );
+            }
+            // Extra child tables under a known model-provider alias are also
+            // erased by serde. If the child carries provider-shaped fields,
+            // call out the likely mistaken nesting instead of letting the
+            // parent alias look like an ordinary unfinished provider.
+            for entry in Self::extra_nested_model_provider_tables(&contents) {
+                let family = entry.family.as_str();
+                let alias = entry.alias.as_str();
+                let nested = entry.nested.as_str();
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "family": family,
+                            "alias": alias,
+                            "nested": nested,
+                        })),
+                    &format!(
+                        "[providers.models.{}.{}.{}] section ignored: \
+                         model-provider fields must live directly under \
+                         [providers.models.{}.{}]. Move the nested keys up one level.",
+                        family, alias, nested, family, alias
                     )
                 );
             }
@@ -16109,6 +16399,13 @@ impl Config {
                     "{path} = {depth} is out of range; must be 0..={REPLY_QUEUE_DEPTH_CEILING}"
                 );
             }
+        }
+
+        for (alias, tg) in &self.channels.telegram {
+            validate_http_base_url(
+                &format!("channels.telegram.{alias}.api_base_url"),
+                &tg.api_base_url,
+            )?;
         }
 
         for name in self.http_request.secrets.keys() {
@@ -18647,6 +18944,88 @@ mod tests {
         }
     }
 
+    // ── Plugins dir resolution ────────────────────────────────
+
+    #[test]
+    async fn resolved_plugins_dir_passes_absolute_path_through() {
+        let cfg = PluginsConfig {
+            plugins_dir: "/srv/plugins".to_string(),
+            ..PluginsConfig::default()
+        };
+        assert_eq!(cfg.resolved_plugins_dir(), PathBuf::from("/srv/plugins"));
+    }
+
+    #[test]
+    async fn resolved_plugins_dir_expands_leading_tilde() {
+        let cfg = PluginsConfig {
+            plugins_dir: "~/.zeroclaw/plugins".to_string(),
+            ..PluginsConfig::default()
+        };
+        let resolved = cfg.resolved_plugins_dir();
+        if std::env::var("HOME").is_ok() {
+            assert!(!resolved.to_string_lossy().starts_with('~'));
+            assert!(resolved.ends_with(".zeroclaw/plugins"));
+        }
+    }
+
+    /// Build a `Config` whose data dir, install root, and configured plugins dir
+    /// live under `root`, and create a plugin at `<parent>/<name>/manifest.toml`.
+    fn config_with_dirs(root: &Path) -> Config {
+        Config {
+            data_dir: root.join("data"),
+            config_path: root.join("install").join("config.toml"),
+            plugins: PluginsConfig {
+                plugins_dir: root.join("plugins").to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn write_plugin(parent: &Path, name: &str) {
+        std::fs::create_dir_all(parent.join(name)).unwrap();
+        std::fs::write(parent.join(name).join("manifest.toml"), "name = \"x\"\n").unwrap();
+    }
+
+    #[test]
+    async fn legacy_plugin_dirs_detects_data_and_workspace_locations() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_dirs(tmp.path());
+        write_plugin(&config.data_dir.join("plugins"), "fromdata");
+        write_plugin(
+            &config.install_root_dir().join("workspace").join("plugins"),
+            "fromworkspace",
+        );
+
+        let dirs = legacy_plugin_dirs_with_entries(&config);
+        assert_eq!(dirs.len(), 2, "both legacy locations should be reported");
+        assert!(dirs.contains(&config.data_dir.join("plugins")));
+        assert!(dirs.contains(&config.install_root_dir().join("workspace").join("plugins")));
+    }
+
+    #[test]
+    async fn legacy_plugin_dirs_empty_when_no_legacy_plugins() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_dirs(tmp.path());
+        // Plugin lives in the configured dir, not a legacy one.
+        write_plugin(&config.plugins.resolved_plugins_dir(), "current");
+
+        assert!(legacy_plugin_dirs_with_entries(&config).is_empty());
+    }
+
+    #[test]
+    async fn legacy_plugin_dirs_skips_dir_equal_to_target() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_dirs(tmp.path());
+        // Point the configured plugins dir AT the legacy data dir.
+        let data_plugins = config.data_dir.join("plugins");
+        config.plugins.plugins_dir = data_plugins.to_string_lossy().into_owned();
+        write_plugin(&data_plugins, "same");
+
+        // The data-dir candidate now equals the target → not a "legacy" dir.
+        assert!(legacy_plugin_dirs_with_entries(&config).is_empty());
+    }
+
     // ── Defaults ─────────────────────────────────────────────
 
     fn has_test_table(raw: &str, table: &str) -> bool {
@@ -18954,6 +19333,72 @@ enabled = true
         config
             .validate()
             .expect("zero depth means default; must pass");
+    }
+
+    #[test]
+    async fn telegram_api_base_url_default_uses_official_endpoint() {
+        assert_eq!(
+            TelegramConfig::default().api_base_url,
+            "https://api.telegram.org"
+        );
+    }
+
+    #[test]
+    async fn telegram_api_base_url_missing_toml_defaults_to_official_endpoint() {
+        let parsed: TelegramConfig = toml::from_str(r#"bot_token = "tok""#).unwrap();
+
+        assert_eq!(parsed.api_base_url, "https://api.telegram.org");
+    }
+
+    #[test]
+    async fn telegram_api_base_url_parses_custom_endpoint() {
+        let parsed: TelegramConfig = toml::from_str(
+            r#"
+bot_token = "tok"
+api_base_url = "http://127.0.0.1:8081"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.api_base_url, "http://127.0.0.1:8081");
+    }
+
+    #[test]
+    async fn validate_rejects_empty_telegram_api_base_url() {
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "default".to_string(),
+            TelegramConfig {
+                bot_token: "tok".into(),
+                api_base_url: "   ".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("empty Telegram API base URL must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("channels.telegram.default.api_base_url"));
+    }
+
+    #[test]
+    async fn validate_rejects_malformed_telegram_api_base_url() {
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "default".to_string(),
+            TelegramConfig {
+                bot_token: "tok".into(),
+                api_base_url: "not a url".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("malformed Telegram API base URL must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("channels.telegram.default.api_base_url"));
     }
 
     #[test]
@@ -19400,6 +19845,7 @@ auto_save = true
     #[test]
     async fn config_toml_roundtrip() {
         let config = Config {
+            eval: crate::scattered_types::EvalHarnessConfig::default(),
             degraded_security: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: {
@@ -19482,6 +19928,7 @@ auto_save = true
                     TelegramConfig {
                         enabled: true,
                         bot_token: "123:ABC".into(),
+                        api_base_url: default_telegram_api_base_url(),
                         stream_mode: StreamMode::default(),
                         draft_update_interval_ms: default_draft_update_interval_ms(),
                         interrupt_on_new_message: false,
@@ -20173,6 +20620,7 @@ default_temperature = 0.7
             },
         );
         let config = Config {
+            eval: crate::scattered_types::EvalHarnessConfig::default(),
             degraded_security: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers,
@@ -20714,6 +21162,7 @@ default_temperature = 0.7
         let tc = TelegramConfig {
             enabled: true,
             bot_token: "123:XYZ".into(),
+            api_base_url: default_telegram_api_base_url(),
             stream_mode: StreamMode::Partial,
             draft_update_interval_ms: 500,
             interrupt_on_new_message: true,
@@ -20740,6 +21189,7 @@ default_temperature = 0.7
         assert_eq!(parsed.stream_mode, StreamMode::Off);
         assert_eq!(parsed.draft_update_interval_ms, 1000);
         assert!(!parsed.interrupt_on_new_message);
+        assert_eq!(parsed.api_base_url, "https://api.telegram.org");
     }
 
     #[test]
@@ -20753,12 +21203,14 @@ default_temperature = 0.7
             listen_to_bots: false,
             interrupt_on_new_message: false,
             mention_only: false,
+            slash_commands: false,
             proxy_url: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
             intents_mask: None,
+            reaction_notifications: DiscordReactionScope::Off,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
@@ -20781,12 +21233,14 @@ default_temperature = 0.7
             listen_to_bots: false,
             interrupt_on_new_message: false,
             mention_only: false,
+            slash_commands: false,
             proxy_url: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
             intents_mask: None,
+            reaction_notifications: DiscordReactionScope::Off,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
@@ -24373,6 +24827,7 @@ require_otp_to_resume = true
             TelegramConfig {
                 enabled: true,
                 bot_token: plaintext_token.into(),
+                api_base_url: default_telegram_api_base_url(),
                 stream_mode: StreamMode::default(),
                 draft_update_interval_ms: default_draft_update_interval_ms(),
                 interrupt_on_new_message: false,
@@ -26547,6 +27002,147 @@ model = "gpt-4o"
     }
 
     #[test]
+    async fn extra_nested_model_provider_tables_flags_dropped_provider_fields() {
+        let finding = |family: &str, alias: &str, nested: &str| ExtraNestedModelProviderTable {
+            family: family.to_string(),
+            alias: alias.to_string(),
+            nested: nested.to_string(),
+        };
+
+        // serde accepts `[providers.models.zai.default.default]` by treating
+        // the first `default` as the provider alias and erasing the second
+        // child table. The typed Config therefore looks like an empty
+        // `zai.default` provider and `validate()` accepts it as an
+        // in-progress quickstart entry. The raw-TOML detector must preserve
+        // that diagnostic signal before deserialization erases the shape.
+        let raw = r#"
+schema_version = 3
+
+[providers.models.zai.default.default]
+model = "glm-5.1"
+api_key = "sk-test"
+endpoint = "global"
+
+[risk_profiles.default]
+level = "supervised"
+
+[agents.default]
+enabled = true
+model_provider = "zai.default"
+risk_profile = "default"
+"#;
+        let parsed: Config = toml::from_str(raw).expect("extra nesting must not fail parse");
+        let provider = parsed
+            .providers
+            .models
+            .find("zai", "default")
+            .expect("outer alias is still present");
+        assert!(
+            provider.model.is_none() && provider.api_key.is_none(),
+            "precondition: serde silently drops the nested model/api_key"
+        );
+        parsed
+            .validate()
+            .expect("typed validation cannot see the raw extra nesting");
+        assert_eq!(
+            Config::extra_nested_model_provider_tables(raw),
+            vec![finding("zai", "default", "default")]
+        );
+
+        let valid = r#"
+schema_version = 3
+
+[providers.models.zai.default]
+model = "glm-5.1"
+api_key = "sk-test"
+endpoint = "global"
+"#;
+        assert!(
+            Config::extra_nested_model_provider_tables(valid).is_empty(),
+            "valid V3 alias tables must not be flagged"
+        );
+
+        let valid_table_fields = r#"
+schema_version = 3
+
+[providers.models.openai.default]
+model = "gpt-4o"
+
+[providers.models.openai.default.extra_headers]
+model = "header-value"
+api_key = "header-value"
+
+[providers.models.openai.default.provider_extra]
+model = "router-model"
+api_key = "provider-extra-value"
+
+[providers.models.openai.default.chat_template_kwargs]
+model = "template-model"
+api_key = "template-value"
+
+[providers.models.openai.default.pricing]
+model = 1.0
+api_key = 2.0
+"#;
+        assert!(
+            Config::extra_nested_model_provider_tables(valid_table_fields).is_empty(),
+            "valid table-valued provider fields must not be flagged even when child keys collide"
+        );
+
+        let valid_pricing = r#"
+schema_version = 3
+
+[providers.models.openai.default]
+model = "gpt-4o"
+pricing = { "gpt-4o.input" = 5.0, "gpt-4o.output" = 15.0 }
+"#;
+        assert!(
+            Config::extra_nested_model_provider_tables(valid_pricing).is_empty(),
+            "valid nested provider fields such as pricing must not be flagged"
+        );
+
+        let family_specific = r#"
+schema_version = 3
+
+[providers.models.azure.default.default]
+api_version = "2024-10-21"
+
+[providers.models.ollama.local.default]
+num_ctx = 16384
+"#;
+        assert_eq!(
+            Config::extra_nested_model_provider_tables(family_specific),
+            vec![
+                finding("azure", "default", "default"),
+                finding("ollama", "local", "default")
+            ],
+            "family-specific fields must still be flagged when extra-nested"
+        );
+
+        let dotted_alias = r#"
+schema_version = 3
+
+[providers.models.openai."prod.v2".default]
+model = "gpt-4o"
+"#;
+        assert_eq!(
+            Config::extra_nested_model_provider_tables(dotted_alias),
+            vec![finding("openai", "prod.v2", "default")],
+            "aliases containing dots must stay intact in diagnostics"
+        );
+
+        assert!(
+            Config::extra_nested_model_provider_tables(
+                "schema_version = 3\n[providers.models.zia.default.default]\nmodel = \"x\"\n",
+            )
+            .is_empty(),
+            "unknown families are handled by unknown_provider_families"
+        );
+        assert!(Config::extra_nested_model_provider_tables("not toml {{{").is_empty());
+        assert!(Config::extra_nested_model_provider_tables("providers = 3\n").is_empty());
+    }
+
+    #[test]
     async fn map_key_create_survives_incremental_save() {
         // Repro for the zerocode "providers vanish after restart" report:
         // the RPC config/map-key-create path is create_map_key + mark_dirty
@@ -27137,6 +27733,53 @@ allowed_users = []
                 result.unwrap_err()
             );
         }
+    }
+
+    /// The dashboard's `/config/channels` global-settings tab filters the
+    /// canonical `prop_fields()` list down to direct `[channels]` fields.
+    /// Keep root settings such as `show_tool_calls` discoverable there without
+    /// mixing per-alias fields into the same editor.
+    #[test]
+    async fn channels_root_settings_stay_on_direct_prop_surface() {
+        let mut config = Config::default();
+        config.init_defaults(None);
+        config
+            .channels
+            .matrix
+            .insert("default".into(), MatrixConfig::default());
+
+        let paths: Vec<_> = config
+            .prop_fields()
+            .into_iter()
+            .map(|field| field.name)
+            .collect();
+        let direct_channel_paths: Vec<_> = paths
+            .iter()
+            .filter_map(|path| {
+                path.strip_prefix("channels.")
+                    .filter(|rest| !rest.contains('.'))
+                    .map(|_| path.as_str())
+            })
+            .collect();
+
+        assert!(
+            direct_channel_paths.contains(&"channels.show_tool_calls"),
+            "root [channels] settings should include show_tool_calls: {direct_channel_paths:?}"
+        );
+        assert!(
+            direct_channel_paths.contains(&"channels.ack_reactions"),
+            "root [channels] settings should include other global channel controls"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path == "channels.matrix.default.enabled"),
+            "fixture should include a nested channel alias field"
+        );
+        assert!(
+            !direct_channel_paths.contains(&"channels.matrix.default.enabled"),
+            "global channel settings must not include per-alias fields"
+        );
     }
 
     /// Audit gate for RFC #6971 Phase 0: any credential-shaped property path

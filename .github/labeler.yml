@@ -353,7 +353,6 @@
   - changed-files:
       - any-glob-to-any-file:
           - "crates/zeroclaw-providers/src/catalog.rs"
-          - "crates/zeroclaw-config/src/schema.rs"
           - "crates/zeroclaw-providers/src/factory.rs"
 
 "provider:ollama":

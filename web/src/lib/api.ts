@@ -50,68 +50,118 @@ export class ApiError extends Error {
   }
 }
 
+// A response reduced to the plain data the downstream logic needs, so it can be
+// shared between coalesced callers (a Response body can only be read once).
+interface RawResult {
+  ok: boolean;
+  status: number;
+  statusText: string;
+  text: string;
+}
+
+// In-flight GET coalescer. Concurrent identical GETs (same URL + token, no body)
+// share a single network request instead of each firing their own — this folds
+// away the duplicate fetches from React StrictMode's double-invoked effects and
+// from sibling components polling the same endpoint. Each caller re-parses the
+// shared response TEXT below, so no two callers ever share a mutable object.
+// Keyed entries are removed as soon as the request settles, so this only merges
+// genuinely-overlapping requests, never caches stale data.
+const inFlightGets = new Map<string, Promise<RawResult>>();
+
 export async function apiFetch<T = unknown>(
   path: string,
   options: RequestInit = {},
 ): Promise<T> {
   const token = getToken();
-  const headers = new Headers(options.headers);
+  const url = `${apiOrigin}${basePath}${path}`;
+  const method = (options.method ?? "GET").toUpperCase();
+  // Only idempotent, body-less GETs are safe to coalesce. Skip coalescing when
+  // the request carries custom headers (which could change the response) or an
+  // AbortSignal — the cached entry closes over the FIRST caller's options, so a
+  // later caller would silently get the wrong response and have its signal
+  // ignored. Plain header-less, signal-less GETs still share one request.
+  const coalesceKey =
+    method === "GET" && !options.body && !options.headers && !options.signal
+      ? `${token ?? ""} ${url}`
+      : null;
 
-  if (token) {
-    headers.set("Authorization", `Bearer ${token}`);
+  const doFetch = async (): Promise<RawResult> => {
+    const headers = new Headers(options.headers);
+    if (token) {
+      headers.set("Authorization", `Bearer ${token}`);
+    }
+    if (
+      options.body &&
+      typeof options.body === "string" &&
+      !headers.has("Content-Type")
+    ) {
+      headers.set("Content-Type", "application/json");
+    }
+    const response = await fetch(url, { ...options, headers });
+    const text =
+      response.status === 204 ? "" : await response.text().catch(() => "");
+    return {
+      ok: response.ok,
+      status: response.status,
+      statusText: response.statusText,
+      text,
+    };
+  };
+
+  let result: RawResult;
+  if (coalesceKey) {
+    const existing = inFlightGets.get(coalesceKey);
+    if (existing) {
+      result = await existing;
+    } else {
+      const pending = doFetch().finally(() => inFlightGets.delete(coalesceKey));
+      inFlightGets.set(coalesceKey, pending);
+      result = await pending;
+    }
+  } else {
+    result = await doFetch();
   }
 
-  if (
-    options.body &&
-    typeof options.body === "string" &&
-    !headers.has("Content-Type")
-  ) {
-    headers.set("Content-Type", "application/json");
-  }
-
-  const response = await fetch(`${apiOrigin}${basePath}${path}`, {
-    ...options,
-    headers,
-  });
-
-  if (response.status === 401) {
+  if (result.status === 401) {
     clearToken();
     window.dispatchEvent(new Event("zeroclaw-unauthorized"));
     throw new UnauthorizedError();
   }
 
-  if (!response.ok) {
+  if (!result.ok) {
     // Try to parse a structured ConfigApiError envelope. Falls back to a
     // plain Error when the body is non-JSON or doesn't match the shape.
     // Centralises the parsing so callers (including the Quickstart flow)
     // never have to regex-match `error.message` to recover the structured
     // code — they just `instanceof ApiError` and read `.envelope.code`.
-    const text = await response.text().catch(() => "");
-    if (text) {
+    if (result.text) {
       try {
-        const parsed = JSON.parse(text);
+        const parsed = JSON.parse(result.text);
         if (
           parsed &&
           typeof parsed === "object" &&
           typeof parsed.code === "string" &&
           typeof parsed.message === "string"
         ) {
-          throw new ApiError(response.status, parsed);
+          throw new ApiError(result.status, parsed);
         }
       } catch (e) {
         if (e instanceof ApiError) throw e;
         // JSON.parse failure → fall through to the plain Error path.
       }
     }
-    throw new Error(`API ${response.status}: ${text || response.statusText}`);
+    throw new Error(`API ${result.status}: ${result.text || result.statusText}`);
   }
 
-  // Some endpoints may return 204 No Content
-  if (response.status === 204) {
+  // Only 204 No Content is a genuinely empty success. A non-204 success with
+  // an empty body is a contract violation (truncated/misbehaving response):
+  // fall through to JSON.parse so it surfaces as a clear parse error here
+  // rather than silently coercing to `undefined` and exploding far away.
+  if (result.status === 204) {
     return undefined as unknown as T;
   }
 
-  return response.json() as Promise<T>;
+  return JSON.parse(result.text) as T;
 }
 
 function unwrapField<T>(value: T | Record<string, T>, key: string): T {
@@ -133,10 +183,47 @@ function unwrapField<T>(value: T | Record<string, T>, key: string): T {
 // Pairing
 // ---------------------------------------------------------------------------
 
+/** Best-effort human label for the paired device, shown in the device list. */
+function pairingDeviceName(): string {
+  const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
+  const browser = /Edg/.test(ua)
+    ? "Edge"
+    : /OPR|Opera/.test(ua)
+      ? "Opera"
+      : /Chrome/.test(ua)
+        ? "Chrome"
+        : /Firefox/.test(ua)
+          ? "Firefox"
+          : /Safari/.test(ua)
+            ? "Safari"
+            : "Browser";
+  const os = /Windows/.test(ua)
+    ? "Windows"
+    : /Android/.test(ua)
+      ? "Android"
+      : /iPhone|iPad|iOS/.test(ua)
+        ? "iOS"
+        : /Mac/.test(ua)
+          ? "macOS"
+          : /Linux/.test(ua)
+            ? "Linux"
+            : "";
+  return os ? `${browser} on ${os}` : browser;
+}
+
 export async function pair(code: string): Promise<{ token: string }> {
-  const response = await fetch(`${basePath}/pair`, {
+  // Use the enhanced /api/pair endpoint (not legacy /pair): it registers the
+  // device in the device_registry so it shows up in the paired-devices list and
+  // can be revoked. /pair only persists the bearer token, leaving the device
+  // invisible/unmanageable in the UI. Both are unauthenticated (code-gated).
+  const response = await fetch(`${basePath}/api/pair`, {
     method: "POST",
-    headers: { "X-Pairing-Code": code },
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      code,
+      device_name: pairingDeviceName(),
+      device_type: "browser",
+    }),
   });
 
   if (!response.ok) {
@@ -197,8 +284,18 @@ export async function getPublicHealth(): Promise<{
 // Status / Health
 // ---------------------------------------------------------------------------
 
-export function getStatus(): Promise<StatusResponse> {
-  return apiFetch<StatusResponse>("/api/status");
+/**
+ * System status overview. Pass an `agent` alias to get the model, provider,
+ * temperature, and memory backend resolved for that specific agent — the
+ * gateway runs the same `resolved_model_provider_for_agent` logic it uses to
+ * build the Agent, so the returned `model` reflects that agent's configured
+ * provider entry. Omitting the alias returns the install-wide first-of-each
+ * summary (the gateway default model), which is NOT correct for any
+ * non-default agent.
+ */
+export function getStatus(agent?: string): Promise<StatusResponse> {
+  const qs = agent ? `?agent=${encodeURIComponent(agent)}` : "";
+  return apiFetch<StatusResponse>(`/api/status${qs}`);
 }
 
 export function getHealth(): Promise<HealthSnapshot> {
@@ -269,7 +366,12 @@ export interface ListResponseEntry {
   is_secret: boolean;
   /** Variants for `kind === 'enum'` fields (drives <select> options). */
   enum_variants?: string[];
-  /** Alias namespace for `kind === 'alias-ref'` fields (drives the resolved picker). */
+  /**
+   * Alias namespace for `kind === 'alias-ref'` fields (drives the resolved
+   * picker). Emitted by the schema-driven `PropKind::AliasRef` backend from
+   * zeroclaw-labs/zeroclaw#7594; absent on backends that predate it, in which
+   * case FieldForm falls back to its per-section alias maps.
+   */
   alias_source?: string;
   section?: string;
   /** Tab grouping from `ConfigTab` enum. Absent when `ConfigTab::None`. */
@@ -353,11 +455,16 @@ export function listProps(prefix?: string): Promise<ListResponse> {
   return apiFetch<ListResponse>(`/api/config/list${q}`);
 }
 
-export function patchConfig(ops: PatchOp[]): Promise<PatchResponse> {
-  return apiFetch<PatchResponse>("/api/config", {
+export async function patchConfig(ops: PatchOp[]): Promise<PatchResponse> {
+  const result = await apiFetch<PatchResponse>("/api/config", {
     method: "PATCH",
     body: JSON.stringify(ops),
   });
+  // Config structure changed: notify listeners (e.g. the ⌘K search index)
+  // so they can invalidate caches. Decoupled via a browser event to avoid a
+  // circular import (configSearch.ts imports from this module).
+  window.dispatchEvent(new Event("zeroclaw-config-mutated"));
+  return result;
 }
 
 export function initSection(
@@ -526,6 +633,9 @@ export interface SkillFrontmatter {
   author?: string | null;
   version?: string | null;
   category?: string | null;
+  /** Free-form skill tags. The `slash` tag opts the skill into Discord slash
+   *  commands (zeroclaw-labs/zeroclaw#7490); `open-skills` is loader-managed. */
+  tags?: string[];
 }
 
 export interface SkillBundleEntry {
@@ -1111,6 +1221,13 @@ export interface ResolveAliasSourceResponse {
   values: string[];
 }
 
+/**
+ * Resolve the live alias values for a schema-declared `alias_source`
+ * namespace. Backs the generic `kind === 'alias-ref'` picker introduced by
+ * zeroclaw-labs/zeroclaw#7594. The endpoint only exists on backends that
+ * declare `PropKind::AliasRef`; callers must gate on `entry.alias_source`
+ * being present so this is never hit on older daemons.
+ */
 export function resolveAliasSource(
   source: string,
 ): Promise<ResolveAliasSourceResponse> {
@@ -1144,13 +1261,13 @@ export interface SelectItemResponse {
   created: boolean;
 }
 
-export function selectSectionItem(
+export async function selectSectionItem(
   section: string,
   key: string,
   alias?: string,
 ): Promise<SelectItemResponse> {
   const body = alias ? JSON.stringify({ alias }) : undefined;
-  return apiFetch<SelectItemResponse>(
+  const result = await apiFetch<SelectItemResponse>(
     `/api/config/sections/${encodeURIComponent(section)}/items/${encodeURIComponent(key)}`,
     {
       method: "POST",
@@ -1158,6 +1275,12 @@ export function selectSectionItem(
       body,
     },
   );
+  // Selecting an item may instantiate a new alias (config entity): notify
+  // listeners (e.g. the ⌘K search index) to invalidate their caches.
+  // Decoupled via a browser event to avoid a circular import
+  // (configSearch.ts imports from this module).
+  window.dispatchEvent(new Event("zeroclaw-config-mutated"));
+  return result;
 }
 // ── Quickstart ───────────────────────────────────────────────────────
 
@@ -1350,14 +1473,19 @@ export interface MapKeyMutResponse {
   created?: boolean;
 }
 
-export function deleteMapKey(
+export async function deleteMapKey(
   path: string,
   key: string,
 ): Promise<MapKeyMutResponse> {
-  return apiFetch<MapKeyMutResponse>(
+  const result = await apiFetch<MapKeyMutResponse>(
     `/api/config/map-key?path=${encodeURIComponent(path)}&key=${encodeURIComponent(key)}`,
     { method: "DELETE" },
   );
+  // An entity was removed: notify listeners (e.g. the ⌘K search index) to
+  // invalidate their caches. Decoupled via a browser event to avoid a
+  // circular import (configSearch.ts imports from this module).
+  window.dispatchEvent(new Event("zeroclaw-config-mutated"));
+  return result;
 }
 
 export function renameMapKey(
@@ -1474,12 +1602,20 @@ export function triggerCronJob(id: string): Promise<CronTriggerResult> {
 export function patchCronJob(
   id: string,
   patch: {
+    /**
+     * The job's configured agent alias. Always send it: the gateway's
+     * CronPatchBody requires `agent` (it gates a shell-command change by the
+     * agent's risk profile), so a patch that omits it fails with
+     * `422 missing field agent` even for a pure schedule/name/enabled change.
+     */
+    agent: string;
     name?: string;
     schedule?: string;
     tz?: string;
     clear_tz?: boolean;
     command?: string;
     prompt?: string;
+    enabled?: boolean;
   },
 ): Promise<CronJob> {
   return apiFetch<CronJob | { status: string; job: CronJob }>(

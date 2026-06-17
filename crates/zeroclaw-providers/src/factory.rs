@@ -199,6 +199,24 @@ pub fn apply_compat_options(
     if let Some(ref cert_path) = opts.tls_ca_cert_path {
         p = p.with_tls_ca_cert_path(cert_path);
     }
+    if let Some(extra) = &opts.provider_extra {
+        if extra.is_object() {
+            p = p.with_extra_body(extra.clone());
+        } else {
+            let config_path = format!("[providers.models.{}].provider_extra", p.alias);
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "alias": p.alias,
+                        "config_path": &config_path,
+                    })),
+                "provider_extra must be a JSON object (use TOML inline \
+                 table syntax, not a JSON string). Got: {extra}. Config path: {config_path}",
+            );
+        }
+    }
     Box::new(p)
 }
 
@@ -380,15 +398,16 @@ use zeroclaw_config::schema::{
     LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
     LmstudioModelProviderConfig, MinimaxModelProviderConfig, MistralModelProviderConfig,
     MoonshotEndpoint, MoonshotModelProviderConfig, MorphModelProviderConfig,
-    NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
-    NvidiaModelProviderConfig, OllamaModelProviderConfig, OpenAIModelProviderConfig,
-    OpenRouterModelProviderConfig, OpencodeModelProviderConfig, OsaurusModelProviderConfig,
-    OvhModelProviderConfig, PerplexityModelProviderConfig, QianfanModelProviderConfig,
-    QwenModelProviderConfig, RekaModelProviderConfig, SambanovaModelProviderConfig,
-    SglangModelProviderConfig, SiliconflowModelProviderConfig, StepfunModelProviderConfig,
-    SyntheticModelProviderConfig, TelnyxModelProviderConfig, TogetherModelProviderConfig,
-    UpstageModelProviderConfig, VeniceModelProviderConfig, VercelModelProviderConfig,
-    VllmModelProviderConfig, XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    NearaiModelProviderConfig, NebiusModelProviderConfig, NovitaModelProviderConfig,
+    NscaleModelProviderConfig, NvidiaModelProviderConfig, OllamaModelProviderConfig,
+    OpenAIModelProviderConfig, OpenRouterModelProviderConfig, OpencodeModelProviderConfig,
+    OsaurusModelProviderConfig, OvhModelProviderConfig, PerplexityModelProviderConfig,
+    QianfanModelProviderConfig, QwenModelProviderConfig, RekaModelProviderConfig,
+    SambanovaModelProviderConfig, SglangModelProviderConfig, SiliconflowModelProviderConfig,
+    StepfunModelProviderConfig, SyntheticModelProviderConfig, TelnyxModelProviderConfig,
+    TogetherModelProviderConfig, UpstageModelProviderConfig, VeniceModelProviderConfig,
+    VercelModelProviderConfig, VllmModelProviderConfig, XaiModelProviderConfig,
+    YiModelProviderConfig, ZaiModelProviderConfig,
 };
 
 // ── Pure-compat families ───────────────────────────────────────────────
@@ -693,6 +712,11 @@ impl CompatFamilySpec for VeniceModelProviderConfig {
         self.build_compat_base(alias, key, api_url)
             .without_native_tools()
     }
+}
+impl CompatFamilySpec for NearaiModelProviderConfig {
+    const DISPLAY: &'static str = "NEAR AI Cloud";
+    const DEFAULT_URL: &'static str = "https://cloud-api.near.ai/v1";
+    const AUTH: AuthStyle = AuthStyle::Bearer;
 }
 impl CompatFamilySpec for AtomicChatModelProviderConfig {
     const DISPLAY: &'static str = "Atomic Chat";
@@ -1024,7 +1048,7 @@ impl FamilyProviderFactory for AzureModelProviderConfig {
         alias: &str,
         key: Option<&str>,
         _api_url: Option<&str>,
-        _opts: &ModelProviderRuntimeOptions,
+        opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
         // Reads typed Azure alias fields directly. Operator sets these
         // under `[providers.models.azure.<alias>]` or via the schema-mirror
@@ -1071,6 +1095,7 @@ impl FamilyProviderFactory for AzureModelProviderConfig {
                 resource,
                 deployment,
                 api_version,
+                opts.reasoning_effort.clone(),
             ),
         ))
     }

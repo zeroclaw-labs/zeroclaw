@@ -89,14 +89,92 @@ fn windows_task_name() -> &'static str {
     WINDOWS_TASK_NAME
 }
 
+fn linux_service_base(config: &Config) -> String {
+    let Some(dir_name) = config
+        .config_path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+    else {
+        return "zeroclaw".to_string();
+    };
+    let base = dir_name.strip_prefix('.').unwrap_or(dir_name);
+    if base == "zeroclaw" {
+        return base.to_string();
+    }
+    if let Some(suffix) = base.strip_prefix("zeroclaw-")
+        && !suffix.is_empty()
+    {
+        return base.to_string();
+    }
+    "zeroclaw".to_string()
+}
+
+fn linux_systemd_unit(config: &Config) -> String {
+    format!("{}.service", linux_service_base(config))
+}
+
+fn linux_openrc_service(config: &Config) -> String {
+    linux_service_base(config)
+}
+
+fn ensure_linux_default_install_scope(config: &Config, action: &str) -> Result<()> {
+    let service = linux_service_base(config);
+    if service == "zeroclaw" {
+        return Ok(());
+    }
+
+    let config_dir = config
+        .config_path
+        .parent()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| config.config_path.display().to_string());
+    bail!(
+        "Linux service {action} only manages the default zeroclaw service. \
+         Config directory {config_dir} maps to named service {service}; \
+         provide that unit manually, then use service status/start/stop/restart/logs to manage it."
+    );
+}
+
+fn linux_systemd_action_args(config: &Config, action: &str) -> Vec<String> {
+    vec![
+        "--user".to_string(),
+        action.to_string(),
+        linux_systemd_unit(config),
+    ]
+}
+
+fn linux_openrc_action_args(config: &Config, action: &str) -> Vec<String> {
+    vec![linux_openrc_service(config), action.to_string()]
+}
+
+fn linux_journalctl_args(config: &Config, lines: usize, follow: bool) -> Vec<String> {
+    let mut args = vec![
+        "--user".to_string(),
+        "-u".to_string(),
+        linux_systemd_unit(config),
+        "-n".to_string(),
+        lines.to_string(),
+        "--no-pager".to_string(),
+    ];
+    if follow {
+        args.push("-f".to_string());
+    }
+    args
+}
+
+fn linux_openrc_log_dir(config: &Config) -> PathBuf {
+    Path::new("/var/log").join(linux_openrc_service(config))
+}
+
 /// Returns whether the ZeroClaw daemon service is currently running.
-pub fn is_running() -> bool {
+pub fn is_running(config: &Config) -> bool {
     if cfg!(target_os = "macos") {
         run_capture(Command::new("launchctl").arg("list"))
             .map(|out| out.lines().any(|l| l.contains(SERVICE_LABEL)))
             .unwrap_or(false)
     } else if cfg!(target_os = "linux") {
-        is_running_linux()
+        is_running_linux(config)
     } else if cfg!(target_os = "windows") {
         run_capture(Command::new("schtasks").args([
             "/Query",
@@ -112,15 +190,15 @@ pub fn is_running() -> bool {
     }
 }
 
-fn is_running_linux() -> bool {
+fn is_running_linux(config: &Config) -> bool {
     // Try systemd first, then OpenRC — mirrors detect_init_system() order
-    if run_capture(Command::new("systemctl").args(["--user", "is-active", "zeroclaw.service"]))
+    if run_capture(Command::new("systemctl").args(linux_systemd_action_args(config, "is-active")))
         .map(|out| out.trim() == "active")
         .unwrap_or(false)
     {
         return true;
     }
-    run_capture(Command::new("rc-service").args(["zeroclaw", "status"]))
+    run_capture(Command::new("rc-service").args(linux_openrc_action_args(config, "status")))
         .map(|out| out.contains("started"))
         .unwrap_or(false)
 }
@@ -155,7 +233,7 @@ pub fn start(config: &Config, init_system: InitSystem) -> Result<()> {
         Ok(())
     } else if cfg!(target_os = "linux") {
         let resolved = init_system.resolve()?;
-        start_linux(resolved)
+        start_linux(config, resolved)
     } else if cfg!(target_os = "windows") {
         let _ = config;
         run_checked(Command::new("schtasks").args(["/Run", "/TN", windows_task_name()]))?;
@@ -167,14 +245,18 @@ pub fn start(config: &Config, init_system: InitSystem) -> Result<()> {
     }
 }
 
-fn start_linux(init_system: InitSystem) -> Result<()> {
+fn start_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
             run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-            run_checked(Command::new("systemctl").args(["--user", "start", "zeroclaw.service"]))?;
+            run_checked(
+                Command::new("systemctl").args(linux_systemd_action_args(config, "start")),
+            )?;
         }
         InitSystem::Openrc => {
-            run_checked(Command::new("rc-service").args(["zeroclaw", "start"]))?;
+            run_checked(
+                Command::new("rc-service").args(linux_openrc_action_args(config, "start")),
+            )?;
         }
         InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
     }
@@ -196,7 +278,7 @@ pub fn stop(config: &Config, init_system: InitSystem) -> Result<()> {
         Ok(())
     } else if cfg!(target_os = "linux") {
         let resolved = init_system.resolve()?;
-        stop_linux(resolved)
+        stop_linux(config, resolved)
     } else if cfg!(target_os = "windows") {
         let _ = config;
         let task_name = windows_task_name();
@@ -209,14 +291,17 @@ pub fn stop(config: &Config, init_system: InitSystem) -> Result<()> {
     }
 }
 
-fn stop_linux(init_system: InitSystem) -> Result<()> {
+fn stop_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
-            let _ =
-                run_checked(Command::new("systemctl").args(["--user", "stop", "zeroclaw.service"]));
+            let _ = run_checked(
+                Command::new("systemctl").args(linux_systemd_action_args(config, "stop")),
+            );
         }
         InitSystem::Openrc => {
-            let _ = run_checked(Command::new("rc-service").args(["zeroclaw", "stop"]));
+            let _ = run_checked(
+                Command::new("rc-service").args(linux_openrc_action_args(config, "stop")),
+            );
         }
         InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
     }
@@ -234,7 +319,7 @@ pub fn restart(config: &Config, init_system: InitSystem) -> Result<()> {
 
     if cfg!(target_os = "linux") {
         let resolved = init_system.resolve()?;
-        return restart_linux(resolved);
+        return restart_linux(config, resolved);
     }
 
     if cfg!(target_os = "windows") {
@@ -247,14 +332,18 @@ pub fn restart(config: &Config, init_system: InitSystem) -> Result<()> {
     anyhow::bail!("Service management is supported on macOS and Linux only")
 }
 
-fn restart_linux(init_system: InitSystem) -> Result<()> {
+fn restart_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
             run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-            run_checked(Command::new("systemctl").args(["--user", "restart", "zeroclaw.service"]))?;
+            run_checked(
+                Command::new("systemctl").args(linux_systemd_action_args(config, "restart")),
+            )?;
         }
         InitSystem::Openrc => {
-            run_checked(Command::new("rc-service").args(["zeroclaw", "restart"]))?;
+            run_checked(
+                Command::new("rc-service").args(linux_openrc_action_args(config, "restart")),
+            )?;
         }
         InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
     }
@@ -314,23 +403,23 @@ pub fn status(config: &Config, init_system: InitSystem) -> Result<()> {
 fn status_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
-            let out = run_capture(Command::new("systemctl").args([
-                "--user",
-                "is-active",
-                "zeroclaw.service",
-            ]))
+            let out = run_capture(
+                Command::new("systemctl").args(linux_systemd_action_args(config, "is-active")),
+            )
             .unwrap_or_else(|_| "unknown".into());
             println!("Service state: {}", out.trim());
             println!(
                 "Unit: {}",
-                linux_service_file(config)?.display().to_string()
+                linux_systemd_unit_file(config)?.display().to_string()
             );
         }
         InitSystem::Openrc => {
-            let out = run_capture(Command::new("rc-service").args(["zeroclaw", "status"]))
-                .unwrap_or_else(|_| "unknown".into());
+            let out = run_capture(
+                Command::new("rc-service").args(linux_openrc_action_args(config, "status")),
+            )
+            .unwrap_or_else(|_| "unknown".into());
             println!("Service state: {}", out.trim());
-            println!("Unit: /etc/init.d/zeroclaw");
+            println!("Unit: /etc/init.d/{}", linux_openrc_service(config));
         }
         InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
     }
@@ -406,17 +495,7 @@ fn logs_macos(config: &Config, lines: usize, follow: bool) -> Result<()> {
 fn logs_linux(config: &Config, init_system: InitSystem, lines: usize, follow: bool) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
-            let mut args = vec![
-                "--user".to_string(),
-                "-u".to_string(),
-                "zeroclaw.service".to_string(),
-                "-n".to_string(),
-                lines.to_string(),
-                "--no-pager".to_string(),
-            ];
-            if follow {
-                args.push("-f".to_string());
-            }
+            let args = linux_journalctl_args(config, lines, follow);
             let status = Command::new("journalctl")
                 .args(&args)
                 .status()
@@ -426,21 +505,24 @@ fn logs_linux(config: &Config, init_system: InitSystem, lines: usize, follow: bo
             }
         }
         InitSystem::Openrc => {
-            // OpenRC logs go to /var/log/zeroclaw/error.log (as configured in the init script)
-            let log_file = Path::new("/var/log/zeroclaw/error.log");
+            // OpenRC logs go to /var/log/<service>/error.log (as configured in the init script).
+            let log_dir = linux_openrc_log_dir(config);
+            let log_file = log_dir.join("error.log");
             if !log_file.exists() {
                 // Fall back to access log
-                let access_log = Path::new("/var/log/zeroclaw/access.log");
+                let access_log = log_dir.join("access.log");
                 if !access_log.exists() {
-                    bail!("No log files found at /var/log/zeroclaw/. Is the service installed?");
+                    bail!(
+                        "No log files found at {}. Is the service installed?",
+                        log_dir.display()
+                    );
                 }
-                return tail_file(access_log, lines, follow);
+                return tail_file(&access_log, lines, follow);
             }
-            tail_file(log_file, lines, follow)?;
+            tail_file(&log_file, lines, follow)?;
         }
         InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
     }
-    let _ = config;
     Ok(())
 }
 
@@ -518,6 +600,13 @@ fn tail_file(path: &Path, lines: usize, follow: bool) -> Result<()> {
 }
 
 pub fn uninstall(config: &Config, init_system: InitSystem) -> Result<()> {
+    if cfg!(target_os = "linux") {
+        let resolved = init_system.resolve()?;
+        ensure_linux_default_install_scope(config, "uninstall")?;
+        stop_linux(config, resolved)?;
+        return uninstall_linux(config, resolved);
+    }
+
     stop(config, init_system)?;
 
     if cfg!(target_os = "macos") {
@@ -528,11 +617,6 @@ pub fn uninstall(config: &Config, init_system: InitSystem) -> Result<()> {
         }
         println!("✅ Service uninstalled ({})", file.display().to_string());
         return Ok(());
-    }
-
-    if cfg!(target_os = "linux") {
-        let resolved = init_system.resolve()?;
-        return uninstall_linux(config, resolved);
     }
 
     if cfg!(target_os = "windows") {
@@ -774,6 +858,8 @@ fn render_macos_launch_agent_plist(
 }
 
 fn install_linux(config: &Config, init_system: InitSystem) -> Result<()> {
+    ensure_linux_default_install_scope(config, "install")?;
+
     match init_system {
         InitSystem::Systemd => install_linux_systemd(config),
         InitSystem::Openrc => install_linux_openrc(config),
@@ -1467,12 +1553,25 @@ fn linux_service_file(config: &Config) -> Result<PathBuf> {
     let home = directories::UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
+    // `service install` remains default-instance only; named instances can be
+    // managed when operators provide matching units themselves.
     let _ = config;
     Ok(home
         .join(".config")
         .join("systemd")
         .join("user")
         .join("zeroclaw.service"))
+}
+
+fn linux_systemd_unit_file(config: &Config) -> Result<PathBuf> {
+    let home = directories::UserDirs::new()
+        .map(|u| u.home_dir().to_path_buf())
+        .context("Could not find home directory")?;
+    Ok(home
+        .join(".config")
+        .join("systemd")
+        .join("user")
+        .join(linux_systemd_unit(config)))
 }
 
 fn run_checked(command: &mut Command) -> Result<()> {
@@ -1570,6 +1669,120 @@ mod macos_plist_tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+}
+
+#[cfg(test)]
+mod linux_service_tests {
+    use super::*;
+
+    fn config_at(path: &str) -> Config {
+        Config {
+            config_path: PathBuf::from(path),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn linux_service_base_derives_named_instance_from_config_dir() {
+        assert_eq!(
+            linux_service_base(&config_at("/home/user/.zeroclaw-p100-104/config.toml")),
+            "zeroclaw-p100-104"
+        );
+        assert_eq!(
+            linux_service_base(&config_at("/home/user/zeroclaw-prod/config.toml")),
+            "zeroclaw-prod"
+        );
+    }
+
+    #[test]
+    fn linux_service_base_falls_back_for_default_and_unrelated_dirs() {
+        assert_eq!(
+            linux_service_base(&config_at("/home/user/.zeroclaw/config.toml")),
+            "zeroclaw"
+        );
+        assert_eq!(
+            linux_service_base(&config_at("/tmp/scratch/config.toml")),
+            "zeroclaw"
+        );
+        assert_eq!(
+            linux_service_base(&config_at("/home/user/.zeroclaw-/config.toml")),
+            "zeroclaw"
+        );
+        assert_eq!(linux_service_base(&config_at("config.toml")), "zeroclaw");
+    }
+
+    #[test]
+    fn linux_service_control_args_use_named_instance() {
+        let config = config_at("/home/user/.zeroclaw-p100-104/config.toml");
+
+        assert_eq!(
+            linux_systemd_action_args(&config, "start"),
+            ["--user", "start", "zeroclaw-p100-104.service"]
+        );
+        assert_eq!(
+            linux_openrc_action_args(&config, "status"),
+            ["zeroclaw-p100-104", "status"]
+        );
+    }
+
+    #[test]
+    fn linux_openrc_log_dir_uses_named_instance() {
+        assert_eq!(
+            linux_openrc_log_dir(&config_at("/home/user/.zeroclaw/config.toml")),
+            PathBuf::from("/var/log/zeroclaw")
+        );
+        assert_eq!(
+            linux_openrc_log_dir(&config_at("/home/user/.zeroclaw-p100-104/config.toml")),
+            PathBuf::from("/var/log/zeroclaw-p100-104")
+        );
+    }
+
+    #[test]
+    fn linux_install_scope_rejects_named_instances() {
+        assert!(
+            ensure_linux_default_install_scope(
+                &config_at("/home/user/.zeroclaw/config.toml"),
+                "install"
+            )
+            .is_ok()
+        );
+
+        let err = ensure_linux_default_install_scope(
+            &config_at("/home/user/.zeroclaw-p100-104/config.toml"),
+            "install",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("only manages the default zeroclaw service"));
+        assert!(err.contains("zeroclaw-p100-104"));
+    }
+
+    #[test]
+    fn linux_journalctl_args_use_named_instance() {
+        let config = config_at("/home/user/.zeroclaw-p100-104/config.toml");
+
+        assert_eq!(
+            linux_journalctl_args(&config, 50, true),
+            [
+                "--user",
+                "-u",
+                "zeroclaw-p100-104.service",
+                "-n",
+                "50",
+                "--no-pager",
+                "-f"
+            ]
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn linux_service_file_stays_default_for_install_path() {
+        let file =
+            linux_service_file(&config_at("/home/user/.zeroclaw-p100-104/config.toml")).unwrap();
+        let path = file.to_string_lossy();
+        assert!(path.ends_with(".config/systemd/user/zeroclaw.service"));
     }
 }
 
