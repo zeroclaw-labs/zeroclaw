@@ -27,7 +27,7 @@ use super::bindings::channel::{
         MediaAttachment as WitMediaAttachment, SendMessage as WitSendMessage,
     },
 };
-use super::plugin_host::{self, PluginStore};
+use super::plugin_store::{self, PluginStore};
 use crate::component::engine::ComponentEngine;
 use crate::error::PluginError;
 use crate::{call_plugin, call_plugin_sync};
@@ -75,7 +75,7 @@ impl ComponentChannel {
         wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(PluginError::from)?;
         wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
             .map_err(PluginError::from)?;
-        plugin_host::add_to_linker_channel(&mut linker)?;
+        plugin_store::add_to_linker_channel(&mut linker)?;
         let host = PluginStore::with_permissions(&permissions).await?;
         let mut store = wasmtime::Store::new(engine.engine(), host);
 

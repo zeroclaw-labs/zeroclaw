@@ -17,7 +17,7 @@ use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_api::tool_attribution;
 
 use super::bindings::tool::ToolPluginPre;
-use super::plugin_host::{self, PluginStore};
+use super::plugin_store::{self, PluginStore};
 use super::wrap_plugin;
 use crate::component::engine::ComponentEngine;
 use crate::error::PluginError;
@@ -62,7 +62,7 @@ impl ComponentTool {
         wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(PluginError::from)?;
         wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
             .map_err(PluginError::from)?;
-        plugin_host::add_to_linker_tool(&mut linker)?;
+        plugin_store::add_to_linker_tool(&mut linker)?;
 
         // Build the InstancePre once; only cheap per-instance wiring happens
         // in execute().

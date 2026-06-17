@@ -13,6 +13,6 @@ mod call_plugin;
 mod channel_component;
 pub(super) mod logging;
 mod memory_component;
-mod plugin_host;
+mod plugin_store;
 mod tool_component;
 mod wrap_plugin;

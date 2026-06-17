@@ -5,7 +5,7 @@ use serde_json::json;
 use zeroclaw_log::{Action, Event, EventOutcome, record};
 
 use super::bindings;
-use super::plugin_host::PluginStore;
+use super::plugin_store::PluginStore;
 
 // ── Core log dispatcher ───────────────────────────────────────────────────────
 
