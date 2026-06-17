@@ -100,11 +100,6 @@ pub struct DiscordChannel {
     /// Resolves skill-derived commands to register alongside `/ask`.
     /// `None` (or an empty resolution) = `/ask` only.
     slash_command_resolver: Option<DiscordSlashCommandResolver>,
-    /// Fingerprint of the last *successfully* reconciled command set —
-    /// READYs with an unchanged set skip the REST round-trip; failures
-    /// reset it so the next READY retries instead of wedging. Arc'd
-    /// because reconciliation runs in a spawned task.
-    registered_commands_hash: Arc<Mutex<Option<u64>>>,
 }
 
 /// Credentials needed to answer a deferred interaction later: the followup
@@ -186,7 +181,6 @@ impl DiscordChannel {
             slash_commands: false,
             pending_interactions: Arc::new(Mutex::new(HashMap::new())),
             slash_command_resolver: None,
-            registered_commands_hash: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1807,6 +1801,25 @@ fn command_projection(cmd: &serde_json::Value) -> serde_json::Value {
 /// Discord REST base; injectable in `reconcile_slash_commands` for tests.
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 
+/// Outcome of a slash-command reconcile pass.
+#[derive(Debug)]
+enum ReconcileOutcome {
+    /// The command set was reconciled (or was already current).
+    Reconciled,
+    /// Discord rate-limited the pass; the caller must persist this cooldown and
+    /// not retry until the given unix-seconds deadline.
+    RateLimited { until: i64 },
+}
+
+/// Turn a `429` response into a unix-seconds deadline before which no further
+/// reconcile should run, reading Discord's `retry_after` body / headers.
+async fn rate_limit_deadline(resp: reqwest::Response) -> i64 {
+    let now = crate::discord_slash_state::now_unix();
+    let headers = resp.headers().clone();
+    let body = resp.json::<serde_json::Value>().await.ok();
+    crate::discord_slash_state::retry_after_deadline(&headers, body.as_ref(), now)
+}
+
 /// Reconcile the application's global commands with the desired set:
 /// upsert each desired command (POST upserts by name) and delete stale
 /// skill-shaped commands left over from uninstalled skills. Commands
@@ -1826,7 +1839,7 @@ async fn reconcile_slash_commands(
     app_id: &str,
     desired: &serde_json::Value,
     api_base: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ReconcileOutcome> {
     let base = format!("{api_base}/applications/{app_id}/commands");
     let auth = format!("Bot {bot_token}");
     let Some(desired) = desired.as_array() else {
@@ -1848,6 +1861,11 @@ async fn reconcile_slash_commands(
         .send()
         .await
         .map_err(reqwest::Error::without_url)?;
+    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Ok(ReconcileOutcome::RateLimited {
+            until: rate_limit_deadline(resp).await,
+        });
+    }
     if !resp.status().is_success() {
         anyhow::bail!("listing global commands failed ({})", resp.status());
     }
@@ -1912,6 +1930,19 @@ async fn reconcile_slash_commands(
             .send()
             .await
             .map_err(reqwest::Error::without_url)?;
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            // Stop on the first 429 and surface the cooldown rather than
+            // hammering the remaining upserts into the same rate limit.
+            let until = rate_limit_deadline(resp).await;
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"command": name, "retry_after_until": until})),
+                "discord slash command reconcile rate-limited; backing off"
+            );
+            return Ok(ReconcileOutcome::RateLimited { until });
+        }
         if !resp.status().is_success() {
             let status = resp.status();
             let err = resp.text().await.unwrap_or_default();
@@ -1933,7 +1964,7 @@ async fn reconcile_slash_commands(
              reconcile not recorded, next READY retries"
         );
     }
-    Ok(())
+    Ok(ReconcileOutcome::Reconciled)
 }
 
 /// Acknowledge an interaction within Discord's 3-second window with a
@@ -2991,7 +3022,7 @@ impl Channel for DiscordChannel {
                                     let client = self.http_client();
                                     let bot_token = self.bot_token.clone();
                                     let resolver = self.slash_command_resolver.clone();
-                                    let hash_store = Arc::clone(&self.registered_commands_hash);
+                                    let workspace_dir = self.workspace_dir.clone();
                                     zeroclaw_spawn::spawn!(async move {
                                         let specs = match resolver {
                                             Some(resolve) => {
@@ -3017,21 +3048,38 @@ impl Channel for DiscordChannel {
                                             body.to_string().hash(&mut h);
                                             h.finish()
                                         };
-                                        // Skip only when the set matches the
-                                        // last *successful* reconcile —
-                                        // failures reset the fingerprint so
-                                        // the next READY retries.
-                                        if *hash_store.lock() == Some(fingerprint) {
+                                        use crate::discord_slash_state::SlashReconcileState;
+                                        let now = crate::discord_slash_state::now_unix();
+                                        let state =
+                                            SlashReconcileState::load(workspace_dir.as_deref(), &app_id);
+                                        // Honour a persisted rate-limit cooldown across restarts: a
+                                        // 429'd reconcile must not re-hammer Discord on the next READY.
+                                        if state.rate_limited(now) {
+                                            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"retry_after_until": state.retry_after_until})), "discord slash command reconcile in rate-limit cooldown; skipping");
+                                            return;
+                                        }
+                                        // Skip only when the set matches the last *successful*
+                                        // reconcile. The fingerprint is persisted, so an unchanged
+                                        // set is skipped after a restart too (no daily-budget churn).
+                                        if state.fingerprint == Some(fingerprint) {
                                             ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"commands": specs.len() + 1})), "discord slash command set unchanged; skipping re-registration");
                                             return;
                                         }
                                         match reconcile_slash_commands(&client, &bot_token, &app_id, &body, DISCORD_API_BASE).await {
-                                            Ok(()) => {
-                                                *hash_store.lock() = Some(fingerprint);
+                                            Ok(ReconcileOutcome::Reconciled) => {
+                                                SlashReconcileState::record_success(workspace_dir.as_deref(), &app_id, fingerprint, now);
                                                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"commands": specs.len() + 1})), "discord slash commands registered");
                                             }
+                                            Ok(ReconcileOutcome::RateLimited { until }) => {
+                                                // Persist the cooldown (keeping the prior fingerprint)
+                                                // so the next READY/restart waits it out.
+                                                SlashReconcileState::record_retry_after(workspace_dir.as_deref(), &app_id, &state, until);
+                                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"retry_after_until": until})), "discord slash command reconcile rate-limited; cooldown persisted");
+                                            }
                                             Err(e) => {
-                                                *hash_store.lock() = None;
+                                                // Hard failure: leave persisted state untouched. The
+                                                // new fingerprint differs from the stored one, so the
+                                                // next READY retries without a forced reset.
                                                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord slash command registration failed");
                                             }
                                         }
@@ -4532,6 +4580,39 @@ mod tests {
         reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconcile_returns_rate_limited_on_post_429() {
+        // A 429 on an upsert must surface as RateLimited (with the body's
+        // retry_after deadline) so the caller persists a cooldown instead of
+        // re-hammering the daily command budget on the next READY.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(
+                ResponseTemplate::new(429).set_body_json(serde_json::json!({"retry_after": 5.0})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[]); // /ask → one POST
+        let now = crate::discord_slash_state::now_unix();
+        let outcome = reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri())
+            .await
+            .unwrap();
+        match outcome {
+            ReconcileOutcome::RateLimited { until } => assert!(until >= now + 5),
+            ReconcileOutcome::Reconciled => panic!("expected RateLimited on a POST 429"),
+        }
     }
 
     #[test]

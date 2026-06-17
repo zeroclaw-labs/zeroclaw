@@ -43,7 +43,7 @@ export interface ThemeContextValue {
 export const ThemeContext = createContext<ThemeContextValue>({
   theme: 'dark',
   accent: 'cyan',
-  colorTheme: 'default-dark',
+  colorTheme: 'operator-dark',
   uiFont: 'system',
   monoFont: 'jetbrains',
   uiFontSize: 15,
@@ -114,7 +114,7 @@ interface StoredTheme {
 const DEFAULTS: StoredTheme = {
   theme: 'dark',
   accent: 'cyan',
-  colorTheme: 'default-dark',
+  colorTheme: 'operator-dark',
   uiFont: 'system',
   monoFont: 'jetbrains',
   uiFontSize: 15,
@@ -126,9 +126,9 @@ const validAccents: AccentColor[] = ['cyan', 'violet', 'emerald', 'amber', 'rose
 
 function migrateThemeToColorTheme(themeMode: ThemeMode): ColorThemeId {
   switch (themeMode) {
-    case 'light': return 'default-light';
+    case 'light': return DEFAULT_LIGHT_THEME;
     case 'oled': return 'oled-black';
-    default: return 'default-dark';
+    default: return DEFAULT_DARK_THEME;
   }
 }
 
