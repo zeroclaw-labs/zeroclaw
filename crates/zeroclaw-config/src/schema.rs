@@ -13546,6 +13546,12 @@ pub struct LarkConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
+    /// Override for the top-level `[channels].ack_reactions` setting.
+    /// When `None`, falls back to the global value. When set explicitly,
+    /// it takes precedence for this Lark/Feishu channel alias.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub ack_reactions: Option<bool>,
     /// Whether to use the Feishu (Chinese) endpoint instead of Lark (International)
     #[tab(Advanced)]
     #[serde(default)]

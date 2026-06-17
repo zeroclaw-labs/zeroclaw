@@ -7569,6 +7569,7 @@ fn collect_configured_channels(
         channels.push(ConfiguredChannel {
             display_name,
             alias: Some(alias.clone()),
+            let ack = lk.ack_reactions.unwrap_or(config.channels.ack_reactions);
             channel: Arc::new(
                 LarkChannel::from_config(lk, alias.clone(), peer_resolver)
                     .with_approval_timeout_secs(lk.approval_timeout_secs)
@@ -7576,7 +7577,7 @@ fn collect_configured_channels(
                     .with_ack_reactions(lk.ack_reactions.unwrap_or(config.channels.ack_reactions))
                     .with_streaming(lk.stream_mode, lk.draft_update_interval_ms)
                     .with_transcription(config.transcription.clone())
-                    .with_ack_reactions(config.channels.ack_reactions),
+                    .with_ack_reactions(ack),
             ),
         });
     }
