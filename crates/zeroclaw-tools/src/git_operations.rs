@@ -984,7 +984,12 @@ impl Tool for GitOperationsTool {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some("Not in a git repository".into()),
+                    error: Some(format!(
+                        "Not in a git repository (checked path: {}). \
+                        Pass `path` to target a subdirectory inside a Git worktree, \
+                        or initialize a repository with `git init` before running git_operations.",
+                        working_dir.display()
+                    )),
                 });
             }
         }
@@ -1764,5 +1769,36 @@ mod tests {
         let out = String::from_utf8_lossy(&status.stdout);
         assert!(out.contains("A  a.txt"), "a.txt not staged: {out:?}");
         assert!(out.contains("A  b.txt"), "b.txt not staged: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn not_in_git_repo_error_includes_path_and_recovery_hint() {
+        // Create a temporary directory that is NOT a git repository.
+        let tmp = TempDir::new().unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
+
+        let result = tool.execute(json!({"operation": "status"})).await.unwrap();
+
+        assert!(!result.success, "expected failure in a non-git directory");
+        let error_msg = result.error.expect("expected an error message");
+
+        // The error must contain the checked path so the user knows where we looked.
+        let path_str = tmp.path().display().to_string();
+        assert!(
+            error_msg.contains(&path_str),
+            "error message should contain the checked path ({path_str:?}), got: {error_msg:?}"
+        );
+
+        // The error must contain the recovery keyword so the user knows what to do.
+        assert!(
+            error_msg.contains("git init"),
+            "error message should contain recovery hint \"git init\", got: {error_msg:?}"
+        );
     }
 }
