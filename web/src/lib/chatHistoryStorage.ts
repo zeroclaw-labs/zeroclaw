@@ -10,6 +10,9 @@ export interface PersistedChatBubble {
   content: string;
   thinking?: string;
   markdown?: boolean;
+  /** Verbatim locally-composed user input — never gateway-prefixed, so the
+   *  bubble skips stripServerTimestamp for it. (Server rows omit this.) */
+  local?: boolean;
   toolCall?: { name: string; args?: unknown; output?: string };
   timestamp: string;
 }
@@ -84,6 +87,7 @@ export function persistedToUiMessages(
   content: string;
   thinking?: string;
   markdown?: boolean;
+  local?: boolean;
   toolCall?: { name: string; args?: unknown; output?: string };
   timestamp: Date;
 }> {
@@ -93,6 +97,7 @@ export function persistedToUiMessages(
     content: m.content,
     thinking: m.thinking,
     markdown: m.markdown,
+    local: m.local,
     toolCall: m.toolCall,
     timestamp: new Date(m.timestamp),
   }));
@@ -105,6 +110,7 @@ export function uiMessagesToPersisted(
     content: string;
     thinking?: string;
     markdown?: boolean;
+    local?: boolean;
     toolCall?: { name: string; args?: unknown; output?: string };
     timestamp: Date;
   }>,
@@ -115,6 +121,7 @@ export function uiMessagesToPersisted(
     content: m.content,
     thinking: m.thinking,
     markdown: m.markdown,
+    local: m.local,
     toolCall: m.toolCall,
     timestamp: m.timestamp.toISOString(),
   }));

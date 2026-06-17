@@ -4,6 +4,14 @@
 
 use crate::security::traits::Sandbox;
 use std::process::Command;
+use std::sync::OnceLock;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct FirejailHardeningSupport {
+    seccomp: bool,
+    caps_drop: bool,
+    noroot: bool,
+}
 
 /// Firejail sandbox backend for Linux
 #[derive(Debug, Clone, Default)]
@@ -35,10 +43,77 @@ impl FirejailSandbox {
             .map(|o| o.status.success())
             .unwrap_or(false)
     }
-}
 
-impl Sandbox for FirejailSandbox {
-    fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()> {
+    fn hardening_support() -> FirejailHardeningSupport {
+        static SUPPORT: OnceLock<FirejailHardeningSupport> = OnceLock::new();
+        *SUPPORT.get_or_init(Self::detect_hardening_support)
+    }
+
+    fn detect_hardening_support() -> FirejailHardeningSupport {
+        let support = Command::new("firejail")
+            .arg("--help")
+            .env_clear()
+            .output()
+            .map(|output| {
+                Self::support_from_help(
+                    &String::from_utf8_lossy(&output.stdout),
+                    &String::from_utf8_lossy(&output.stderr),
+                )
+            })
+            .unwrap_or_default();
+
+        Self::log_incomplete_hardening_support(support);
+        support
+    }
+
+    fn support_from_help(stdout: &str, stderr: &str) -> FirejailHardeningSupport {
+        let contains = |flag| stdout.contains(flag) || stderr.contains(flag);
+
+        FirejailHardeningSupport {
+            seccomp: contains("--seccomp"),
+            caps_drop: contains("--caps.drop"),
+            noroot: contains("--noroot"),
+        }
+    }
+
+    fn log_incomplete_hardening_support(support: FirejailHardeningSupport) {
+        if support.seccomp && support.caps_drop && support.noroot {
+            return;
+        }
+
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "backend": "firejail",
+                    "seccomp": support.seccomp,
+                    "caps_drop": support.caps_drop,
+                    "noroot": support.noroot,
+                })),
+            "firejail sandbox hardening support is incomplete"
+        );
+    }
+
+    fn append_hardening_flags(cmd: &mut Command, support: FirejailHardeningSupport) {
+        if support.seccomp {
+            cmd.arg("--seccomp");
+        }
+
+        if support.caps_drop {
+            cmd.arg("--caps.drop=all");
+        }
+
+        if support.noroot {
+            cmd.arg("--noroot");
+        }
+    }
+
+    fn wrap_command_with_support(
+        &self,
+        cmd: &mut Command,
+        support: FirejailHardeningSupport,
+    ) -> std::io::Result<()> {
         // Prepend firejail to the command
         let program = cmd.get_program().to_string_lossy().to_string();
         let args: Vec<String> = cmd
@@ -59,6 +134,7 @@ impl Sandbox for FirejailSandbox {
             "--noprofile",    // Skip profile loading
             "--quiet",        // Suppress warnings
         ]);
+        Self::append_hardening_flags(&mut firejail_cmd, support);
 
         // Add the original command
         firejail_cmd.arg(&program);
@@ -67,6 +143,12 @@ impl Sandbox for FirejailSandbox {
         // Replace the command
         *cmd = firejail_cmd;
         Ok(())
+    }
+}
+
+impl Sandbox for FirejailSandbox {
+    fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()> {
+        self.wrap_command_with_support(cmd, Self::hardening_support())
     }
 
     fn is_available(&self) -> bool {
@@ -85,6 +167,12 @@ impl Sandbox for FirejailSandbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect()
+    }
 
     #[test]
     fn firejail_sandbox_name() {
@@ -141,10 +229,7 @@ mod tests {
             "wrapped command should use firejail as program"
         );
 
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|s| s.to_string_lossy().to_string())
-            .collect();
+        let args = args(&cmd);
 
         let expected_flags = [
             "--private=home",
@@ -167,6 +252,79 @@ mod tests {
     }
 
     #[test]
+    fn firejail_supported_hardening_flags_include_seccomp_cap_drop_and_noroot() {
+        let mut cmd = Command::new("firejail");
+        FirejailSandbox::append_hardening_flags(
+            &mut cmd,
+            FirejailHardeningSupport {
+                seccomp: true,
+                caps_drop: true,
+                noroot: true,
+            },
+        );
+
+        let args = args(&cmd);
+        assert!(
+            args.windows(3)
+                .any(|window| window == ["--seccomp", "--caps.drop=all", "--noroot"]),
+            "supported firejail hardening flags must be appended together"
+        );
+    }
+
+    #[test]
+    fn firejail_support_from_help_detects_stdout_and_stderr_flags() {
+        let support = FirejailSandbox::support_from_help("--seccomp --caps.drop", "--noroot");
+
+        assert!(support.seccomp);
+        assert!(support.caps_drop);
+        assert!(support.noroot);
+    }
+
+    #[test]
+    fn firejail_wrap_command_applies_supported_hardening_flags() {
+        let sandbox = FirejailSandbox;
+        let mut cmd = Command::new("echo");
+        cmd.arg("test");
+        sandbox
+            .wrap_command_with_support(
+                &mut cmd,
+                FirejailHardeningSupport {
+                    seccomp: true,
+                    caps_drop: true,
+                    noroot: true,
+                },
+            )
+            .unwrap();
+
+        let args = args(&cmd);
+        let expected_flags = ["--seccomp", "--caps.drop=all", "--noroot"];
+        for flag in expected_flags {
+            assert!(
+                args.contains(&flag.to_string()),
+                "wrap_command must apply supported hardening flag: {flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn firejail_skips_unadvertised_hardening_flags() {
+        let mut cmd = Command::new("firejail");
+        FirejailSandbox::append_hardening_flags(
+            &mut cmd,
+            FirejailHardeningSupport {
+                seccomp: true,
+                caps_drop: false,
+                noroot: true,
+            },
+        );
+
+        let args = args(&cmd);
+        assert!(args.contains(&"--seccomp".to_string()));
+        assert!(!args.contains(&"--caps.drop=all".to_string()));
+        assert!(args.contains(&"--noroot".to_string()));
+    }
+
+    #[test]
     fn firejail_wrap_command_preserves_original_command() {
         let sandbox = FirejailSandbox;
         let mut cmd = Command::new("ls");
@@ -174,10 +332,7 @@ mod tests {
         cmd.arg("/workspace");
         sandbox.wrap_command(&mut cmd).unwrap();
 
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|s| s.to_string_lossy().to_string())
-            .collect();
+        let args = args(&cmd);
 
         assert!(
             args.contains(&"ls".to_string()),

@@ -90,10 +90,13 @@ import {
   type AgentSummary,
 } from "@/lib/agents";
 import AgentCard from "@/components/AgentCard";
+import AgentDrawer from "@/components/AgentDrawer";
 import EntityLink from "@/components/EntityLink";
 import EntityEnabledToggle from "@/components/EntityEnabledToggle";
 import { useSSE } from "@/hooks/useSSE";
+import { usePolling } from "@/hooks/usePolling";
 import { t } from "@/lib/i18n";
+import { StatCard, PageHeader, ConfirmDialog } from "@/components/ui";
 
 type TabId =
   | "overview"
@@ -150,7 +153,7 @@ function ProcessRamCard({ process }: { process?: ProcessStats }) {
           className="text-xs uppercase tracking-wider font-medium"
           style={{ color: "var(--pc-text-muted)" }}
         >
-          RAM
+          {t("dashboard.ram.label")}
         </span>
       </div>
       <p
@@ -161,10 +164,10 @@ function ProcessRamCard({ process }: { process?: ProcessStats }) {
       </p>
       <p className="text-sm truncate" style={{ color: "var(--pc-text-muted)" }}>
         {pct !== null
-          ? `${pct.toFixed(pct < 1 ? 2 : 1)}% of ${formatBytes(process!.system_ram_total_bytes)}`
+          ? `${pct.toFixed(pct < 1 ? 2 : 1)}% ${t("dashboard.ram.of")} ${formatBytes(process!.system_ram_total_bytes)}`
           : supported
-            ? "resident (zeroclaw)"
-            : "not supported on this platform"}
+            ? t("dashboard.ram.resident")
+            : t("dashboard.ram.unsupported")}
       </p>
     </div>
   );
@@ -190,7 +193,7 @@ function ProcessCpuCard({ process }: { process?: ProcessStats }) {
           className="text-xs uppercase tracking-wider font-medium"
           style={{ color: "var(--pc-text-muted)" }}
         >
-          CPU
+          {t("dashboard.cpu.label")}
         </span>
       </div>
       <p
@@ -202,9 +205,9 @@ function ProcessCpuCard({ process }: { process?: ProcessStats }) {
       <p className="text-sm truncate" style={{ color: "var(--pc-text-muted)" }}>
         {supported
           ? ncpu > 0
-            ? `${ncpu} cores · ${(pct / ncpu).toFixed(1)}% normalized`
-            : "across all cores"
-          : "not supported on this platform"}
+            ? `${ncpu} ${t("dashboard.cpu.cores")} · ${(pct / ncpu).toFixed(1)}% ${t("dashboard.cpu.normalized")}`
+            : t("dashboard.cpu.across_all_cores")
+          : t("dashboard.cpu.unsupported")}
       </p>
     </div>
   );
@@ -231,13 +234,13 @@ function formatRelative(iso: string): string {
   try {
     const diff = Date.now() - new Date(iso).getTime();
     const seconds = Math.floor(diff / 1000);
-    if (seconds < 60) return `${seconds}s ago`;
+    if (seconds < 60) return `${seconds}${t("dashboard.rel.seconds_ago")}`;
     const minutes = Math.floor(seconds / 60);
-    if (minutes < 60) return `${minutes}m ago`;
+    if (minutes < 60) return `${minutes}${t("dashboard.rel.minutes_ago")}`;
     const hours = Math.floor(minutes / 60);
-    if (hours < 24) return `${hours}h ago`;
+    if (hours < 24) return `${hours}${t("dashboard.rel.hours_ago")}`;
     const days = Math.floor(hours / 24);
-    return `${days}d ago`;
+    return `${days}${t("dashboard.rel.days_ago")}`;
   } catch {
     return iso;
   }
@@ -299,22 +302,24 @@ function readinessColor(state: ChannelReadinessState): string {
 function readinessLabel(state: ChannelReadinessState): string {
   switch (state) {
     case 'ready':
-      return 'ready';
+      return t('dashboard.readiness.ready');
     case 'missing':
-      return 'missing';
+      return t('dashboard.readiness.missing');
     case 'unknown':
-      return 'not checked';
+      return t('dashboard.readiness.not_checked');
   }
 }
 
+// Label keys resolved at render; the second tuple element is the readiness
+// field the row reads.
 const CHANNEL_READINESS_ROWS: Array<[
   string,
   'enabled' | 'bound_to_agent' | 'authenticated' | 'listening',
 ]> = [
-  ['Enabled', 'enabled'],
-  ['Agent', 'bound_to_agent'],
-  ['Authenticated', 'authenticated'],
-  ['Listening', 'listening'],
+  ['dashboard.readiness.enabled', 'enabled'],
+  ['dashboard.readiness.agent', 'bound_to_agent'],
+  ['dashboard.readiness.authenticated', 'authenticated'],
+  ['dashboard.readiness.listening', 'listening'],
 ];
 
 // Genuinely process-global tiles only. Provider/Model and Memory Backend
@@ -563,7 +568,7 @@ function OverviewTab({
                     id={name}
                     className="flex items-center justify-between py-2.5 px-3 rounded-xl transition-all hover:opacity-90"
                     style={{ background: "var(--pc-bg-elevated)" }}
-                    title={`Open channels.${name} config`}
+                    title={`${t("dashboard.open_config_prefix")}channels.${name}${t("dashboard.open_config_suffix")}`}
                   >
                     <span
                       className="text-sm font-mono font-medium"
@@ -692,8 +697,8 @@ function OverviewTab({
                         style={{ color: "var(--pc-text-muted)" }}
                       >
                         {lastOk && (
-                          <span title={`last ok: ${lastOk}`}>
-                            ok {formatRelative(lastOk)}
+                          <span title={`${t("dashboard.last_ok_title")} ${lastOk}`}>
+                            {t("dashboard.ok_prefix")} {formatRelative(lastOk)}
                           </span>
                         )}
                         {comp.restart_count > 0 && (
@@ -725,7 +730,7 @@ function OverviewTab({
               className="text-sm font-semibold uppercase tracking-wider"
               style={{ color: "var(--pc-text-primary)" }}
             >
-              Connected TUIs
+              {t("dashboard.connected_tuis")}
             </h2>
             <span
               className="text-xs font-mono px-2 py-0.5 rounded-full"
@@ -765,7 +770,7 @@ function OverviewTab({
                       color: "var(--pc-text-muted)",
                     }}
                   >
-                    {tui.peer_label || tui.transport || "unknown"}
+                    {tui.peer_label || tui.transport || t("dashboard.unknown")}
                   </span>
                 </div>
                 <span
@@ -796,13 +801,13 @@ type SessionSort =
   | "messages-desc"
   | "messages-asc";
 
-const SESSION_SORT_OPTIONS: { value: SessionSort; label: string }[] = [
-  { value: "activity-desc", label: "Recent activity" },
-  { value: "activity-asc", label: "Oldest activity" },
-  { value: "created-desc", label: "Newest first" },
-  { value: "created-asc", label: "Oldest first" },
-  { value: "messages-desc", label: "Busiest" },
-  { value: "messages-asc", label: "Quietest" },
+const SESSION_SORT_OPTIONS: { value: SessionSort; labelKey: string }[] = [
+  { value: "activity-desc", labelKey: "dashboard.sort.recent_activity" },
+  { value: "activity-asc", labelKey: "dashboard.sort.oldest_activity" },
+  { value: "created-desc", labelKey: "dashboard.sort.newest_first" },
+  { value: "created-asc", labelKey: "dashboard.sort.oldest_first" },
+  { value: "messages-desc", labelKey: "dashboard.sort.busiest" },
+  { value: "messages-asc", labelKey: "dashboard.sort.quietest" },
 ];
 
 function isSessionSort(v: string): v is SessionSort {
@@ -843,6 +848,8 @@ function SessionsTab() {
   } | null>(null);
   const [inspectNewestFirst, setInspectNewestFirst] = useState(true);
   const [deleting, setDeleting] = useState<string | null>(null);
+  // The session queued for deletion; non-null opens the confirm dialog.
+  const [pendingDelete, setPendingDelete] = useState<Session | null>(null);
 
   const { events } = useSSE({
     filterTypes: ["session_update", "session_created", "session_closed"],
@@ -941,15 +948,11 @@ function SessionsTab() {
       );
   };
 
+  // Runs once the operator confirms in the dialog; the destructive intent is
+  // gated by ConfirmDialog rather than the native window.confirm.
   const handleDelete = async (session: Session) => {
     if (deleting) return;
-    if (
-      !window.confirm(
-        `Delete session ${session.session_id}? This cannot be undone.`,
-      )
-    ) {
-      return;
-    }
+    setPendingDelete(null);
     setDeleting(session.session_key);
     try {
       await deleteSession(session.session_key);
@@ -1030,10 +1033,10 @@ function SessionsTab() {
               type="search"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search…"
+              placeholder={t("dashboard.search_placeholder")}
               className="input-electric pl-7 pr-2 py-1 text-xs w-40"
-              title="Substring match on id, key, name, agent, channel"
-              aria-label="Search sessions"
+              title={t("dashboard.session_search_title")}
+              aria-label={t("dashboard.session_search_aria")}
             />
           </div>
           <div className="relative">
@@ -1045,12 +1048,12 @@ function SessionsTab() {
               value={sortBy}
               onChange={(e) => setSortBy(e.target.value as SessionSort)}
               className="input-electric pl-7 pr-6 py-1 text-xs appearance-none cursor-pointer"
-              title="Sort sessions"
-              aria-label="Sort sessions"
+              title={t("dashboard.session_sort_title")}
+              aria-label={t("dashboard.session_sort_title")}
             >
               {SESSION_SORT_OPTIONS.map((o) => (
                 <option key={o.value} value={o.value}>
-                  {o.label}
+                  {t(o.labelKey)}
                 </option>
               ))}
             </select>
@@ -1064,9 +1067,9 @@ function SessionsTab() {
               value={agentFilter}
               onChange={(e) => setAgentFilter(e.target.value)}
               className="input-electric pl-7 pr-6 py-1 text-xs appearance-none cursor-pointer"
-              title="Filter by owning agent"
+              title={t("dashboard.filter_agent_title")}
             >
-              <option value="">All agents</option>
+              <option value="">{t("dashboard.all_agents")}</option>
               {knownAgents.map((a) => (
                 <option key={a} value={a}>
                   {a}
@@ -1083,9 +1086,9 @@ function SessionsTab() {
               value={channelFilter}
               onChange={(e) => setChannelFilter(e.target.value)}
               className="input-electric pl-7 pr-6 py-1 text-xs appearance-none cursor-pointer"
-              title="Filter by owning channel"
+              title={t("dashboard.filter_channel_title")}
             >
-              <option value="">All channels</option>
+              <option value="">{t("dashboard.all_channels")}</option>
               {knownChannels.map((c) => (
                 <option key={c} value={c}>
                   {c}
@@ -1103,7 +1106,7 @@ function SessionsTab() {
         >
           {sessions.length === 0
             ? t("dashboard.no_sessions")
-            : "No sessions match the current search and filters"}
+            : t("dashboard.no_sessions_match")}
         </p>
       ) : (
         <div className="space-y-2 overflow-y-auto max-h-[32rem]">
@@ -1133,7 +1136,7 @@ function SessionsTab() {
                         background: "rgba(var(--pc-accent-rgb), 0.10)",
                         color: "var(--pc-accent-light)",
                       }}
-                      title={`Open agents.${session.agent_alias} config`}
+                      title={`${t("dashboard.open_config_prefix")}agents.${session.agent_alias}${t("dashboard.open_config_suffix")}`}
                     >
                       {session.agent_alias}
                     </EntityLink>
@@ -1147,7 +1150,7 @@ function SessionsTab() {
                         background: "rgba(167, 139, 250, 0.10)",
                         color: "#a78bfa",
                       }}
-                      title={`Open channels.${session.channel_id} config`}
+                      title={`${t("dashboard.open_config_prefix")}channels.${session.channel_id}${t("dashboard.open_config_suffix")}`}
                     >
                       {session.channel_id}
                     </EntityLink>
@@ -1169,17 +1172,17 @@ function SessionsTab() {
                   type="button"
                   onClick={() => openInspect(session)}
                   className="p-1.5 rounded-lg hover:bg-[var(--pc-hover)]"
-                  title="View messages"
+                  title={t("dashboard.view_messages")}
                   style={{ color: "var(--pc-text-muted)" }}
                 >
                   <Eye className="h-4 w-4" />
                 </button>
                 <button
                   type="button"
-                  onClick={() => handleDelete(session)}
+                  onClick={() => setPendingDelete(session)}
                   disabled={deleting === session.session_key}
                   className="p-1.5 rounded-lg hover:bg-[var(--pc-hover)] disabled:opacity-50"
-                  title="Delete session"
+                  title={t("dashboard.delete_session")}
                   style={{ color: "var(--color-status-error)" }}
                 >
                   <Trash2 className="h-4 w-4" />
@@ -1206,7 +1209,7 @@ function SessionsTab() {
                   className="text-xs uppercase tracking-wider mb-1"
                   style={{ color: "var(--pc-text-faint)" }}
                 >
-                  Session
+                  {t("dashboard.session_label")}
                 </p>
                 <p
                   className="text-sm font-mono break-all"
@@ -1253,9 +1256,11 @@ function SessionsTab() {
                       color: "var(--pc-text-muted)",
                       borderColor: "var(--pc-border)",
                     }}
-                    title="Flip transcript order"
+                    title={t("dashboard.flip_transcript")}
                   >
-                    {inspectNewestFirst ? "newest first" : "oldest first"}
+                    {inspectNewestFirst
+                      ? t("dashboard.newest_first_short")
+                      : t("dashboard.oldest_first_short")}
                   </button>
                 )}
                 <button
@@ -1263,7 +1268,7 @@ function SessionsTab() {
                   onClick={() => setInspect(null)}
                   className="p-1 rounded-lg hover:bg-[var(--pc-hover)]"
                   style={{ color: "var(--pc-text-muted)" }}
-                  title="Close"
+                  title={t("common.close")}
                 >
                   <X className="h-4 w-4" />
                 </button>
@@ -1282,14 +1287,14 @@ function SessionsTab() {
                   className="text-sm"
                   style={{ color: "var(--pc-text-muted)" }}
                 >
-                  Loading transcript…
+                  {t("dashboard.loading_transcript")}
                 </p>
               ) : inspect.messages.length === 0 ? (
                 <p
                   className="text-sm"
                   style={{ color: "var(--pc-text-faint)" }}
                 >
-                  No persisted messages for this session.
+                  {t("dashboard.no_persisted_messages")}
                 </p>
               ) : (
                 (inspectNewestFirst
@@ -1331,6 +1336,24 @@ function SessionsTab() {
           </div>
         </div>
       )}
+
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        danger
+        title={t("common.delete")}
+        message={`${t("dashboard.confirm_delete_session_prefix")} ${pendingDelete?.session_id ?? ""}${t("dashboard.confirm_delete_suffix")}`}
+        confirmLabel={t("common.delete")}
+        onConfirm={() => {
+          // Close the dialog first (capturing the target): a confirm clicked
+          // while an earlier delete is still in flight would otherwise hit
+          // handleDelete's `if (deleting) return` and never clear pendingDelete,
+          // leaving the dialog stuck open.
+          const target = pendingDelete;
+          setPendingDelete(null);
+          if (target) void handleDelete(target);
+        }}
+        onClose={() => setPendingDelete(null)}
+      />
     </div>
   );
 }
@@ -1454,7 +1477,7 @@ function ChannelsTab() {
                   kind="channel"
                   id={channel.name}
                   className="text-sm font-semibold font-mono break-all hover:underline"
-                  title={`Open channels.${channel.name} config`}
+                  title={`${t("dashboard.open_config_prefix")}channels.${channel.name}${t("dashboard.open_config_suffix")}`}
                 >
                   <span style={{ color: "var(--pc-text-primary)" }}>
                     {channel.name}
@@ -1466,18 +1489,18 @@ function ChannelsTab() {
                 >
                   {channel.owning_agent ? (
                     <>
-                      owned by{" "}
+                      {t("dashboard.owned_by")}{" "}
                       <EntityLink
                         kind="agent"
                         id={channel.owning_agent}
                         className="hover:underline font-mono"
-                        title={`Open agents.${channel.owning_agent} config`}
+                        title={`${t("dashboard.open_config_prefix")}agents.${channel.owning_agent}${t("dashboard.open_config_suffix")}`}
                       >
                         {channel.owning_agent}
                       </EntityLink>
                     </>
                   ) : (
-                    "no owning agent"
+                    t("dashboard.no_owning_agent")
                   )}
                 </span>
               </div>
@@ -1509,11 +1532,11 @@ function ChannelsTab() {
           >
             {channel.readiness ? (
               <>
-                {CHANNEL_READINESS_ROWS.map(([label, key]) => {
+                {CHANNEL_READINESS_ROWS.map(([labelKey, key]) => {
                   const value = channel.readiness?.[key];
                   return value ? (
                     <div key={key} className="flex justify-between gap-3 text-xs">
-                      <span style={{ color: "var(--pc-text-muted)" }}>{label}</span>
+                      <span style={{ color: "var(--pc-text-muted)" }}>{t(labelKey)}</span>
                       <span style={{ color: readinessColor(value) }}>
                         {readinessLabel(value)}
                       </span>
@@ -1613,30 +1636,26 @@ export default function Dashboard() {
     );
   };
 
-  useEffect(() => {
-    let cancelled = false;
-    const refresh = () => {
+  // Uptime ticks every second on the server; poll every 5s so the tile and
+  // health badges stay live — but only while the tab is visible (paused when
+  // backgrounded), and re-armed when the cost window changes.
+  usePolling(
+    (isStale) => {
       const { from, to } = costWindowBounds(costWindow);
       Promise.all([getStatus(), getCost(from, to), getTuis()])
         .then(([s, c, t]) => {
-          if (cancelled) return;
+          if (isStale()) return;
           setStatus(s);
           setCost(c);
           setTuis(t);
         })
         .catch((err) => {
-          if (!cancelled) setError(err.message);
+          if (!isStale()) setError(err.message);
         });
-    };
-    refresh();
-    // Uptime ticks every second on the server; poll every 5s so the tile and
-    // health badges stay live without hammering the gateway.
-    const id = window.setInterval(refresh, 5000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(id);
-    };
-  }, [costWindow]);
+    },
+    5000,
+    [costWindow],
+  );
 
   if (error) {
     return (
@@ -1673,16 +1692,22 @@ export default function Dashboard() {
     <div className="p-6 space-y-6 animate-fade-in">
       <AgentsSection />
 
-      {/* Global system stats — tab navigation */}
+      {/* Global system stats — tab navigation. Scrolls horizontally when the
+          six tabs don't fit (mobile) instead of overflowing the frame; each
+          button keeps its size (flex-shrink-0) so labels never get clipped. */}
       <div
-        className="flex items-center gap-1 p-1 rounded-2xl"
+        className="flex items-center gap-1 p-1 rounded-2xl overflow-x-auto"
         style={{ background: "var(--pc-bg-elevated)" }}
+        role="tablist"
+        aria-label={t("nav.dashboard")}
       >
         {TABS.map(({ id, labelKey, icon: Icon }) => (
           <button
             key={id}
+            role="tab"
+            aria-selected={activeTab === id}
             onClick={() => setActiveTab(id)}
-            className="flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-medium transition-all"
+            className="flex flex-shrink-0 items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-medium transition-all whitespace-nowrap"
             style={
               activeTab === id
                 ? {
@@ -1819,8 +1844,8 @@ function HealthTab({ status }: { status: StatusResponse }) {
                 style={{ color: "var(--pc-text-muted)" }}
               >
                 {lastOk && (
-                  <span title={`last ok: ${lastOk}`}>
-                    ok {formatRelative(lastOk)}
+                  <span title={`${t("dashboard.last_ok_title")} ${lastOk}`}>
+                    {t("dashboard.ok_prefix")} {formatRelative(lastOk)}
                   </span>
                 )}
                 {comp.restart_count > 0 && (
@@ -1843,12 +1868,12 @@ function HealthTab({ status }: { status: StatusResponse }) {
 
 // Cost dashboard: per-day totals plus per-agent and per-model rollups
 // with input / output / cached token splits. Both rollups are daily-scoped
-const COST_WINDOW_OPTIONS: { value: CostWindow; label: string }[] = [
-  { value: "today", label: "Today" },
-  { value: "7d", label: "Last 7 days" },
-  { value: "30d", label: "Last 30 days" },
-  { value: "month", label: "This month" },
-  { value: "all", label: "All time" },
+const COST_WINDOW_OPTIONS: { value: CostWindow; labelKey: string }[] = [
+  { value: "today", labelKey: "dashboard.cost.today" },
+  { value: "7d", labelKey: "dashboard.cost.last_7_days" },
+  { value: "30d", labelKey: "dashboard.cost.last_30_days" },
+  { value: "month", labelKey: "dashboard.cost.this_month" },
+  { value: "all", labelKey: "dashboard.cost.all_time" },
 ];
 
 function CostTab({
@@ -1863,10 +1888,12 @@ function CostTab({
   const byModel = Object.values(cost.by_model);
   const byAgent = Object.values(cost.by_agent);
   const navigate = useNavigate();
-  const windowLabel =
-    COST_WINDOW_OPTIONS.find(
-      (o) => o.value === costWindow,
-    )?.label.toLowerCase() ?? costWindow;
+  const windowLabelKey = COST_WINDOW_OPTIONS.find(
+    (o) => o.value === costWindow,
+  )?.labelKey;
+  const windowLabel = windowLabelKey
+    ? t(windowLabelKey).toLowerCase()
+    : costWindow;
 
   const openModelRates = async (modelId: string) => {
     const map = await resolveModelToProviderType("models").catch(() => null);
@@ -1882,7 +1909,7 @@ function CostTab({
           className="text-xs uppercase tracking-wider"
           style={{ color: "var(--pc-text-secondary)" }}
         >
-          Window
+          {t("dashboard.cost.window")}
         </label>
         <select
           value={costWindow}
@@ -1891,7 +1918,7 @@ function CostTab({
         >
           {COST_WINDOW_OPTIONS.map((opt) => (
             <option key={opt.value} value={opt.value}>
-              {opt.label}
+              {t(opt.labelKey)}
             </option>
           ))}
         </select>
@@ -1904,12 +1931,14 @@ function CostTab({
               className="text-sm font-semibold uppercase tracking-wider"
               style={{ color: "var(--pc-text-primary)" }}
             >
-              Spend by agent · {windowLabel}
+              {t("dashboard.cost.spend_by_agent")} · {windowLabel}
             </h2>
           </div>
           {byAgent.length === 0 ? (
             <p className="text-sm" style={{ color: "var(--pc-text-faint)" }}>
-              No per-agent tracking. Enable <code>[cost].track_per_agent</code>.
+              {t("dashboard.cost.no_per_agent_pre")}{" "}
+              <code>[cost].track_per_agent</code>
+              {t("dashboard.cost.no_per_agent_post")}
             </p>
           ) : (
             <ul className="space-y-2 text-sm">
@@ -1942,17 +1971,17 @@ function CostTab({
                       className="flex items-center gap-3 text-xs flex-wrap"
                       style={{ color: "var(--pc-text-muted)" }}
                     >
-                      <span>{row.request_count} exchanges</span>
+                      <span>{row.request_count} {t("dashboard.cost.exchanges")}</span>
                       <span>
-                        {row.input_tokens.toLocaleString()} input tokens
+                        {row.input_tokens.toLocaleString()} {t("dashboard.cost.input_tokens")}
                       </span>
                       {row.cached_input_tokens > 0 && (
                         <span>
-                          {row.cached_input_tokens.toLocaleString()} cached
+                          {row.cached_input_tokens.toLocaleString()} {t("dashboard.cost.cached")}
                         </span>
                       )}
                       <span>
-                        {row.output_tokens.toLocaleString()} output tokens
+                        {row.output_tokens.toLocaleString()} {t("dashboard.cost.output_tokens")}
                       </span>
                     </div>
                   </li>
@@ -1971,12 +2000,12 @@ function CostTab({
               className="text-sm font-semibold uppercase tracking-wider"
               style={{ color: "var(--pc-text-primary)" }}
             >
-              Spend by model · {windowLabel}
+              {t("dashboard.cost.spend_by_model")} · {windowLabel}
             </h2>
           </div>
           {byModel.length === 0 ? (
             <p className="text-sm" style={{ color: "var(--pc-text-faint)" }}>
-              No model usage recorded in this window.
+              {t("dashboard.cost.no_model_usage")}
             </p>
           ) : (
             <ul className="space-y-2 text-sm">
@@ -1998,7 +2027,7 @@ function CostTab({
                           color: "var(--pc-text-primary)",
                           background: "transparent",
                         }}
-                        title={`Open the rate sheet entry for ${row.model}`}
+                        title={`${t("dashboard.cost.open_rate_sheet_title")} ${row.model}`}
                       >
                         {row.model}
                       </button>
@@ -2013,17 +2042,17 @@ function CostTab({
                       className="flex items-center gap-3 text-xs flex-wrap"
                       style={{ color: "var(--pc-text-muted)" }}
                     >
-                      <span>{row.request_count} exchanges</span>
+                      <span>{row.request_count} {t("dashboard.cost.exchanges")}</span>
                       <span>
-                        {row.input_tokens.toLocaleString()} input tokens
+                        {row.input_tokens.toLocaleString()} {t("dashboard.cost.input_tokens")}
                       </span>
                       {row.cached_input_tokens > 0 && (
                         <span>
-                          {row.cached_input_tokens.toLocaleString()} cached
+                          {row.cached_input_tokens.toLocaleString()} {t("dashboard.cost.cached")}
                         </span>
                       )}
                       <span>
-                        {row.output_tokens.toLocaleString()} output tokens
+                        {row.output_tokens.toLocaleString()} {t("dashboard.cost.output_tokens")}
                       </span>
                     </div>
                   </li>
@@ -2045,11 +2074,11 @@ function CostTab({
 
 type MemorySort = "newest" | "oldest" | "key-asc" | "key-desc";
 
-const MEMORY_SORT_OPTIONS: { value: MemorySort; label: string }[] = [
-  { value: "newest", label: "Newest first" },
-  { value: "oldest", label: "Oldest first" },
-  { value: "key-asc", label: "Key A → Z" },
-  { value: "key-desc", label: "Key Z → A" },
+const MEMORY_SORT_OPTIONS: { value: MemorySort; labelKey: string }[] = [
+  { value: "newest", labelKey: "dashboard.mem.sort.newest" },
+  { value: "oldest", labelKey: "dashboard.mem.sort.oldest" },
+  { value: "key-asc", labelKey: "dashboard.mem.sort.key_asc" },
+  { value: "key-desc", labelKey: "dashboard.mem.sort.key_desc" },
 ];
 
 function isMemorySort(v: string): v is MemorySort {
@@ -2076,6 +2105,8 @@ function MemoriesTab() {
   }, [searchQuery]);
   const [knownAgents, setKnownAgents] = useState<string[]>([]);
   const [deleting, setDeleting] = useState<string | null>(null);
+  // The entry queued for deletion; non-null opens the confirm dialog.
+  const [pendingDelete, setPendingDelete] = useState<MemoryEntry | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [showAddForm, setShowAddForm] = useState(false);
   const [formKey, setFormKey] = useState("");
@@ -2160,10 +2191,11 @@ function MemoriesTab() {
     return sorted;
   }, [entries, sortBy]);
 
+  // Runs once the operator confirms in the dialog; the destructive intent is
+  // gated by ConfirmDialog rather than the native window.confirm.
   const handleDelete = async (entry: MemoryEntry) => {
     if (deleting) return;
-    if (!window.confirm(`Delete memory ${entry.key}? This cannot be undone.`))
-      return;
+    setPendingDelete(null);
     setDeleting(entry.id);
     try {
       // Per-agent rows resolve through the agent's own memory backend; the
@@ -2181,7 +2213,7 @@ function MemoriesTab() {
 
   const handleAdd = async () => {
     if (!formKey.trim() || !formContent.trim()) {
-      setFormError("Key and content are required");
+      setFormError(t("dashboard.mem.error_key_content_required"));
       return;
     }
     setSubmitting(true);
@@ -2218,7 +2250,7 @@ function MemoriesTab() {
             }}
           />
           <span className="text-sm" style={{ color: "var(--pc-text-muted)" }}>
-            Loading memories…
+            {t("dashboard.mem.loading")}
           </span>
         </div>
       </div>
@@ -2248,7 +2280,7 @@ function MemoriesTab() {
           className="text-sm font-semibold uppercase tracking-wider"
           style={{ color: "var(--pc-text-primary)" }}
         >
-          Memories
+          {t("dashboard.mem.heading")}
         </h2>
         <span
           className="text-xs font-mono px-2 py-0.5 rounded-full"
@@ -2275,7 +2307,7 @@ function MemoriesTab() {
             setFormAgent(agentFilter);
           }}
           className="btn-electric text-xs ml-2 inline-flex items-center gap-1 px-2.5 py-1 rounded-lg"
-          title="Add a memory entry"
+          title={t("dashboard.mem.add_title")}
         >
           <Plus className="h-3 w-3" />
           {t("dashboard.add_memory")}
@@ -2291,10 +2323,10 @@ function MemoriesTab() {
               type="search"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search…"
+              placeholder={t("dashboard.search_placeholder")}
               className="input-electric pl-7 pr-2 py-1 text-xs w-40"
-              title="Backend-side recall — searches across the configured memory store. Combined with the agent and category filters."
-              aria-label="Search memories"
+              title={t("dashboard.mem.search_title")}
+              aria-label={t("dashboard.mem.search_aria")}
             />
           </div>
           <div className="relative">
@@ -2306,12 +2338,12 @@ function MemoriesTab() {
               value={sortBy}
               onChange={(e) => setSortBy(e.target.value as MemorySort)}
               className="input-electric pl-7 pr-6 py-1 text-xs appearance-none cursor-pointer"
-              title="Sort memories"
-              aria-label="Sort memories"
+              title={t("dashboard.mem.sort_title")}
+              aria-label={t("dashboard.mem.sort_aria")}
             >
               {MEMORY_SORT_OPTIONS.map((o) => (
                 <option key={o.value} value={o.value}>
-                  {o.label}
+                  {t(o.labelKey)}
                 </option>
               ))}
             </select>
@@ -2325,9 +2357,9 @@ function MemoriesTab() {
               value={agentFilter}
               onChange={(e) => setFilter("agent", e.target.value)}
               className="input-electric pl-7 pr-6 py-1 text-xs appearance-none cursor-pointer"
-              title="Filter by owning agent"
+              title={t("dashboard.filter_agent_title")}
             >
-              <option value="">All agents</option>
+              <option value="">{t("dashboard.all_agents")}</option>
               {knownAgents.map((a) => (
                 <option key={a} value={a}>
                   {a}
@@ -2344,9 +2376,9 @@ function MemoriesTab() {
               value={categoryFilter}
               onChange={(e) => setFilter("category", e.target.value)}
               className="input-electric pl-7 pr-6 py-1 text-xs appearance-none cursor-pointer"
-              title="Filter by category"
+              title={t("dashboard.mem.filter_category_title")}
             >
-              <option value="">All categories</option>
+              <option value="">{t("dashboard.mem.all_categories")}</option>
               {knownCategories.map((c) => (
                 <option key={c} value={c}>
                   {c}
@@ -2362,7 +2394,7 @@ function MemoriesTab() {
           className="text-sm py-8 text-center"
           style={{ color: "var(--pc-text-faint)" }}
         >
-          No memories match the current search and filters
+          {t("dashboard.mem.no_match")}
         </p>
       ) : (
         <div className="space-y-2 overflow-y-auto max-h-[32rem]">
@@ -2389,7 +2421,7 @@ function MemoriesTab() {
                         background: "rgba(var(--pc-accent-rgb), 0.10)",
                         color: "var(--pc-accent-light)",
                       }}
-                      title={`Open agents.${entry.agent_alias} config`}
+                      title={`${t("dashboard.open_config_prefix")}agents.${entry.agent_alias}${t("dashboard.open_config_suffix")}`}
                     >
                       {entry.agent_alias}
                     </EntityLink>
@@ -2421,10 +2453,10 @@ function MemoriesTab() {
               </div>
               <button
                 type="button"
-                onClick={() => handleDelete(entry)}
+                onClick={() => setPendingDelete(entry)}
                 disabled={deleting === entry.id}
                 className="p-1.5 rounded-lg hover:bg-[var(--pc-hover)] disabled:opacity-50 flex-shrink-0"
-                title="Delete memory"
+                title={t("dashboard.mem.delete")}
                 style={{ color: "var(--color-status-error)" }}
               >
                 <Trash2 className="h-4 w-4" />
@@ -2478,14 +2510,14 @@ function MemoriesTab() {
                   className="block text-xs font-semibold mb-1.5 uppercase tracking-wider"
                   style={{ color: "var(--pc-text-secondary)" }}
                 >
-                  Key{" "}
+                  {t("dashboard.mem.field_key")}{" "}
                   <span style={{ color: "var(--color-status-error)" }}>*</span>
                 </label>
                 <input
                   type="text"
                   value={formKey}
                   onChange={(e) => setFormKey(e.target.value)}
-                  placeholder="e.g. user_preferences"
+                  placeholder={t("dashboard.mem.key_placeholder")}
                   className="input-electric w-full px-3 py-2.5 text-sm"
                 />
               </div>
@@ -2494,13 +2526,13 @@ function MemoriesTab() {
                   className="block text-xs font-semibold mb-1.5 uppercase tracking-wider"
                   style={{ color: "var(--pc-text-secondary)" }}
                 >
-                  Content{" "}
+                  {t("dashboard.mem.field_content")}{" "}
                   <span style={{ color: "var(--color-status-error)" }}>*</span>
                 </label>
                 <textarea
                   value={formContent}
                   onChange={(e) => setFormContent(e.target.value)}
-                  placeholder="Memory content…"
+                  placeholder={t("dashboard.mem.content_placeholder")}
                   rows={4}
                   className="input-electric w-full px-3 py-2.5 text-sm resize-none"
                 />
@@ -2510,13 +2542,13 @@ function MemoriesTab() {
                   className="block text-xs font-semibold mb-1.5 uppercase tracking-wider"
                   style={{ color: "var(--pc-text-secondary)" }}
                 >
-                  Category (optional)
+                  {t("dashboard.mem.field_category")}
                 </label>
                 <input
                   type="text"
                   value={formCategory}
                   onChange={(e) => setFormCategory(e.target.value)}
-                  placeholder="e.g. preferences, context, facts"
+                  placeholder={t("dashboard.mem.category_placeholder")}
                   className="input-electric w-full px-3 py-2.5 text-sm"
                 />
               </div>
@@ -2525,14 +2557,14 @@ function MemoriesTab() {
                   className="block text-xs font-semibold mb-1.5 uppercase tracking-wider"
                   style={{ color: "var(--pc-text-secondary)" }}
                 >
-                  Agent (optional)
+                  {t("dashboard.mem.field_agent")}
                 </label>
                 <select
                   value={formAgent}
                   onChange={(e) => setFormAgent(e.target.value)}
                   className="input-electric w-full px-3 py-2.5 text-sm appearance-none cursor-pointer"
                 >
-                  <option value="">Install-wide (no agent attribution)</option>
+                  <option value="">{t("dashboard.mem.install_wide")}</option>
                   {knownAgents.map((a) => (
                     <option key={a} value={a}>
                       {a}
@@ -2543,8 +2575,7 @@ function MemoriesTab() {
                   className="text-[11px] mt-1"
                   style={{ color: "var(--pc-text-faint)" }}
                 >
-                  Picks which agent's memory backend the row lands in. Leave
-                  blank to write to the gateway's default backend.
+                  {t("dashboard.mem.agent_hint")}
                 </p>
               </div>
             </div>
@@ -2554,7 +2585,7 @@ function MemoriesTab() {
                 onClick={() => setShowAddForm(false)}
                 className="btn-secondary px-4 py-2 text-sm font-medium"
               >
-                Cancel
+                {t("dashboard.mem.cancel")}
               </button>
               <button
                 type="button"
@@ -2562,12 +2593,30 @@ function MemoriesTab() {
                 disabled={submitting}
                 className="btn-electric px-4 py-2 text-sm font-medium disabled:opacity-50"
               >
-                {submitting ? "Saving…" : "Save"}
+                {submitting ? t("dashboard.mem.saving") : t("dashboard.mem.save")}
               </button>
             </div>
           </div>
         </div>
       )}
+
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        danger
+        title={t("common.delete")}
+        message={`${t("dashboard.mem.confirm_delete_prefix")} ${pendingDelete?.key ?? ""}${t("dashboard.confirm_delete_suffix")}`}
+        confirmLabel={t("common.delete")}
+        onConfirm={() => {
+          // Close the dialog first (capturing the target): a confirm clicked
+          // while an earlier delete is still in flight would otherwise hit
+          // handleDelete's `if (deleting) return` and never clear pendingDelete,
+          // leaving the dialog stuck open.
+          const target = pendingDelete;
+          setPendingDelete(null);
+          if (target) void handleDelete(target);
+        }}
+        onClose={() => setPendingDelete(null)}
+      />
     </div>
   );
 }
@@ -2610,8 +2659,8 @@ function MemoryContent({
           style={{ color: "var(--pc-accent)" }}
         >
           {expanded
-            ? "Collapse"
-            : `Expand (${content.length.toLocaleString()} chars, ${newlines + 1} lines)`}
+            ? t("dashboard.mem.collapse")
+            : `${t("dashboard.mem.expand")} (${content.length.toLocaleString()} ${t("dashboard.mem.chars")}, ${newlines + 1} ${t("dashboard.mem.lines")})`}
         </button>
       )}
     </>
@@ -2635,6 +2684,83 @@ function truncateForPreview(content: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Dashboard metrics row — real aggregates derived from the agents list the
+// section already loads. Every value is computed from AgentSummary fields, so
+// nothing here is fabricated. Metrics that depend on data the page does not
+// have are simply omitted.
+// ---------------------------------------------------------------------------
+
+function formatMetricUsd(value: number): string {
+  if (value <= 0) return "$0";
+  if (value < 0.01) return "<$0.01";
+  // Below $100 keep cents; the prior `< 1` and `< 100` branches were identical.
+  if (value < 100) return `$${value.toFixed(2)}`;
+  return `$${Math.round(value).toLocaleString()}`;
+}
+
+function DashboardMetrics({ agents }: { agents: AgentSummary[] }) {
+  const total = agents.length;
+  const enabled = agents.filter((a) => a.enabled).length;
+  const totalSessions = agents.reduce((sum, a) => sum + a.sessionCount, 0);
+  const totalMemories = agents.reduce((sum, a) => sum + a.memoryCount, 0);
+  // monthCostUsd is null when per-agent cost tracking is disabled; only sum the
+  // agents that actually report a figure, and surface whether any did.
+  const trackedSpend = agents.filter((a) => a.monthCostUsd !== null);
+  const totalSpend = trackedSpend.reduce(
+    (sum, a) => sum + (a.monthCostUsd ?? 0),
+    0,
+  );
+
+  return (
+    <div className="grid grid-cols-2 gap-3 sm:gap-4 lg:grid-cols-5">
+      <StatCard
+        label={t("dash.metric.agents")}
+        value={total}
+        sublabel={
+          total === 0
+            ? t("dash.metric.agents.none")
+            : `${enabled} ${t("dash.metric.agents.enabled_sub")}`
+        }
+        icon={<Bot className="h-5 w-5" />}
+        tone="neutral"
+      />
+      <StatCard
+        label={t("dash.metric.enabled")}
+        value={`${enabled}/${total}`}
+        sublabel={t("dash.metric.enabled.sub")}
+        icon={<Activity className="h-5 w-5" />}
+        tone={enabled > 0 ? "ok" : "neutral"}
+      />
+      <StatCard
+        label={t("dash.metric.sessions")}
+        value={totalSessions.toLocaleString()}
+        sublabel={t("dash.metric.sessions.sub")}
+        icon={<MessageSquare className="h-5 w-5" />}
+        tone="neutral"
+      />
+      <StatCard
+        label={t("dash.metric.memories")}
+        value={totalMemories.toLocaleString()}
+        sublabel={t("dash.metric.memories.sub")}
+        icon={<Brain className="h-5 w-5" />}
+        tone="neutral"
+      />
+      <StatCard
+        label={t("dash.metric.spend")}
+        value={trackedSpend.length === 0 ? "—" : formatMetricUsd(totalSpend)}
+        sublabel={
+          trackedSpend.length === 0
+            ? t("dash.metric.spend.untracked")
+            : t("dash.metric.spend.sub")
+        }
+        icon={<DollarSign className="h-5 w-5" />}
+        tone="neutral"
+      />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // AgentsSection — top-of-dashboard agent grid. Always visible (above the
 // global-stats tabs) so the dashboard reads as "many agents + system state"
 // rather than "the agent". Same card component used on /agents.
@@ -2642,15 +2768,22 @@ function truncateForPreview(content: string): string {
 
 function AgentsSection() {
   const [agents, setAgents] = useState<AgentSummary[] | null>(null);
-  const [quickstartLabel, setQuickstartLabel] = useState("Start Quickstart");
+  const [quickstartLabel, setQuickstartLabel] = useState(
+    t("dashboard.start_quickstart"),
+  );
   const [error, setError] = useState<string | null>(null);
   const [toggling, setToggling] = useState<Set<string>>(new Set());
+  // Selecting a row sets the drawer's agent (by alias); closing clears it.
+  // Keying off the alias keeps the open drawer in sync with live toggles.
+  const [selectedAlias, setSelectedAlias] = useState<string | null>(null);
 
   useEffect(() => {
     loadAgentSummaries()
       .then(setAgents)
       .catch((err: unknown) =>
-        setError(err instanceof Error ? err.message : "Failed to load agents"),
+        setError(
+          err instanceof Error ? err.message : t("dashboard.load_agents_error"),
+        ),
       );
   }, []);
 
@@ -2658,12 +2791,12 @@ function AgentsSection() {
     getQuickstartState()
       .then((state) => {
         if (state.agents.length > 0) {
-          setQuickstartLabel("Create another agent");
+          setQuickstartLabel(t("dashboard.create_another_agent"));
         } else {
-          setQuickstartLabel("Start Quickstart");
+          setQuickstartLabel(t("dashboard.start_quickstart"));
         }
       })
-      .catch(() => setQuickstartLabel("Start Quickstart"));
+      .catch(() => setQuickstartLabel(t("dashboard.start_quickstart")));
   }, []);
 
   const handleToggle = useCallback(async (agent: AgentSummary) => {
@@ -2678,7 +2811,9 @@ function AgentsSection() {
       );
     } catch (err) {
       setError(
-        err instanceof Error ? err.message : `Failed to toggle ${agent.alias}`,
+        err instanceof Error
+          ? err.message
+          : `${t("dashboard.toggle_agent_error_prefix")} ${agent.alias}`,
       );
     } finally {
       setToggling((prev) => {
@@ -2707,36 +2842,52 @@ function AgentsSection() {
     ? Math.max(0, sortedAgents.length - AGENT_GLANCE_LIMIT)
     : 0;
 
+  const selectedAgent =
+    selectedAlias === null
+      ? null
+      : (agents?.find((a) => a.alias === selectedAlias) ?? null);
+
   return (
-    <section>
-      <header className="flex items-center justify-between mb-4">
-        <div className="flex items-center gap-2">
-          <h2
-            className="text-sm font-semibold uppercase tracking-wider"
-            style={{ color: "var(--pc-text-primary)" }}
+    <section className="space-y-6">
+      <PageHeader
+        title={t("dash.title")}
+        description={t("dash.subtitle")}
+        actions={
+          <Link
+            to="/agents"
+            className="text-xs flex items-center gap-1 hover:underline"
+            style={{ color: "var(--pc-text-muted)" }}
           >
-            Agents
-          </h2>
-          {sortedAgents && sortedAgents.length > 0 && (
-            <span
-              className="text-xs font-mono px-2 py-0.5 rounded-full"
-              style={{
-                background: "rgba(var(--pc-accent-rgb), 0.1)",
-                color: "var(--pc-accent)",
-              }}
-            >
-              {sortedAgents.length}
-            </span>
-          )}
-        </div>
-        <Link
-          to="/agents"
-          className="text-xs flex items-center gap-1 hover:underline"
-          style={{ color: "var(--pc-text-muted)" }}
+            {hiddenCount > 0
+              ? `${t("dash.view_all")} (${sortedAgents!.length})`
+              : t("dash.view_all")}
+            <ChevronRight className="h-3 w-3" />
+          </Link>
+        }
+      />
+
+      {sortedAgents && sortedAgents.length > 0 && (
+        <DashboardMetrics agents={sortedAgents} />
+      )}
+
+      <header className="flex items-center gap-2">
+        <h2
+          className="text-sm font-semibold uppercase tracking-wider"
+          style={{ color: "var(--pc-text-secondary)" }}
         >
-          {hiddenCount > 0 ? `View all (${sortedAgents!.length})` : "View all"}
-          <ChevronRight className="h-3 w-3" />
-        </Link>
+          {t("dash.agents_heading")}
+        </h2>
+        {sortedAgents && sortedAgents.length > 0 && (
+          <span
+            className="text-xs font-mono px-2 py-0.5 rounded-full"
+            style={{
+              background: "rgba(var(--pc-accent-rgb), 0.1)",
+              color: "var(--pc-accent)",
+            }}
+          >
+            {sortedAgents.length}
+          </span>
+        )}
       </header>
 
       {error && (
@@ -2760,7 +2911,7 @@ function AgentsSection() {
             color: "var(--pc-text-muted)",
           }}
         >
-          Loading agents...
+          {t("dashboard.loading_agents")}
         </div>
       ) : agents.length === 0 ? (
         <div
@@ -2771,7 +2922,7 @@ function AgentsSection() {
             className="text-sm font-medium mb-2"
             style={{ color: "var(--pc-text-primary)" }}
           >
-            No agents configured yet.
+            {t("dashboard.no_agents_configured")}
           </p>
           <Link
             to="/quickstart"
@@ -2782,41 +2933,36 @@ function AgentsSection() {
           </Link>
         </div>
       ) : (
-        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+        <div className="rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface overflow-hidden">
           {visibleAgents!.map((agent) => (
             <AgentCard
               key={agent.alias}
               agent={agent}
-              toggling={toggling.has(agent.alias)}
-              onToggle={() => handleToggle(agent)}
+              selected={agent.alias === selectedAlias}
+              onSelect={() => setSelectedAlias(agent.alias)}
             />
           ))}
           {hiddenCount > 0 && (
             <Link
               to="/agents"
-              className="rounded-2xl border p-5 flex flex-col items-center justify-center text-center transition-colors hover:opacity-90"
-              style={{
-                background: "var(--pc-bg-surface)",
-                borderColor: "var(--pc-border)",
-                borderStyle: "dashed",
-                color: "var(--pc-text-muted)",
-              }}
+              className="flex items-center justify-center gap-1.5 px-4 py-3 text-sm font-medium border-t border-pc-border text-pc-text-muted transition-colors hover:bg-[var(--pc-hover)] hover:text-pc-text"
             >
-              <Plus
-                className="h-6 w-6 mb-2"
-                style={{ color: "var(--pc-accent)" }}
-              />
-              <p
-                className="text-sm font-medium"
-                style={{ color: "var(--pc-text-primary)" }}
-              >
-                {hiddenCount} more {hiddenCount === 1 ? "agent" : "agents"}
-              </p>
-              <p className="text-xs mt-1">View all on /agents</p>
+              {t("dash.view_all")} · {hiddenCount}{" "}
+              {hiddenCount === 1
+                ? t("dashboard.more_agent")
+                : t("dashboard.more_agents")}
+              <ChevronRight className="h-3.5 w-3.5" />
             </Link>
           )}
         </div>
       )}
+
+      <AgentDrawer
+        agent={selectedAgent}
+        onClose={() => setSelectedAlias(null)}
+        onToggle={handleToggle}
+        toggling={selectedAgent ? toggling.has(selectedAgent.alias) : false}
+      />
     </section>
   );
 }
