@@ -47,12 +47,21 @@ pub fn build_locales(root: &std::path::Path, tag: Option<&str>) -> anyhow::Resul
     let mdbook = mdbook_program()?;
     let preprocessor_env = peer_groups_preprocessor_env();
     let tag_dir = tag.unwrap_or(DEFAULT_TAG);
+    // Search is enabled only for the primary locale. Per-locale searchindex is
+    // high-entropy (~6-7 MB raw each) and does not delta-compress across
+    // versions, so building it for every locale dominates gh-pages clone size.
+    // The primary locale (first in locales.toml, English) keeps full search;
+    // translated locales build without a search index or search box.
+    let primary_locale = entries.first().map(|e| e.code.clone());
     for entry in &entries {
         let dest = format!("book/{}/{}", tag_dir, entry.code);
         let mut cmd = Command::new(&mdbook);
         cmd.args(["build", "-d", &dest])
             .env("MDBOOK_BOOK__LANGUAGE", &entry.code)
             .current_dir(&book);
+        if Some(&entry.code) != primary_locale.as_ref() {
+            cmd.env("MDBOOK_OUTPUT__HTML__SEARCH__ENABLE", "false");
+        }
         if let Some((key, value)) = &preprocessor_env {
             cmd.env(key, value);
         }
