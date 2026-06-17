@@ -22,6 +22,12 @@ export interface ChatMessage {
   markdown?: boolean;
   toolCall?: ToolCallInfo;
   timestamp: Date;
+  /** True for messages composed locally in the web UI (verbatim user input).
+   *  Such content never carries the gateway's `[timestamp]` prefix, so the
+   *  bubble must NOT run stripServerTimestamp on it — otherwise a user message
+   *  that happens to start with a bracketed datetime would be clipped. Only
+   *  server-sourced messages (live stream + hydrated history) can be prefixed. */
+  local?: boolean;
 }
 
 interface AgentContextValue {
@@ -471,22 +477,11 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
 
     async function loadModelInfo() {
       try {
-        // Resolve the *agent-scoped* active model. `/api/status?agent=<alias>`
-        // runs the same `resolved_model_provider_for_agent` logic the gateway
-        // uses to construct the Agent, so `status.model` reflects the value
-        // written to this agent's provider entry
-        // (`providers.models.<provider>.model`) — including a model we just
-        // switched to. Calling `getStatus()` without the alias would return
-        // the install-wide default model, which is wrong for any non-default
-        // agent and would clobber `currentModel` right after a switch.
-        //
-        // The previous implementation also tried `getProp('model')` /
-        // `getProp('default_model')` to "prefer the configured value", but
-        // those top-level paths don't exist in the schema (they 404 with
-        // `path_not_found`) and the prop GET endpoint never returns a
-        // `populated` flag for non-secret fields — so that branch was dead
-        // code that only added two failing round trips per load. The
-        // agent-scoped status already is the configured value.
+        // Agent-scoped status: `/api/status?agent=<alias>` runs the same
+        // `resolved_model_provider_for_agent` logic the gateway uses to build
+        // the Agent, so the fallback `status.model` is correct for THIS agent
+        // rather than the install-wide default. (Ported from
+        // zeroclaw-labs/zeroclaw#7191.)
         const status = await getStatus(agentAlias);
         if (cancelled) return;
 
@@ -558,6 +553,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
           role: 'user',
           content,
           timestamp: new Date(),
+          local: true,
         },
       ]);
     } catch {
@@ -572,18 +568,21 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
 
     // Watchdog so the UI can never get stuck on the loading spinner. It is
     // armed once per phase — for the config write, then again for the socket
-    // reconnect — so each phase gets its own full budget. Originally a single
-    // timer armed at the top had to cover *both* phases: a slow daemon write
-    // could consume the whole budget and fire "model switch timed out" while
-    // the switch was still progressing (and, because it nulls the pending
-    // ref, the later onOpen would skip updating currentModel — a timeout
-    // error for a switch that actually succeeded). Splitting the budget keeps
-    // the spinner bounded against a hung request *and* a reconnect that never
-    // opens, without the false positive. The `=== model` identity check stops
-    // a fired watchdog from clobbering a newer switch.
+    // reconnect — so each phase gets its own full budget. A single timer armed
+    // at the top had to cover *both* phases: a slow daemon write could consume
+    // the whole budget and fire "model switch timed out" while the switch was
+    // still progressing (and, because it nulled the pending ref, the later
+    // onOpen would skip updating currentModel — a timeout error for a switch
+    // that actually succeeded). Splitting the budget keeps the spinner bounded
+    // against a hung request *and* a reconnect that never opens, without the
+    // false positive. The `=== model` identity check stops a fired watchdog
+    // from clobbering a newer switch. (Ported from zeroclaw-labs/zeroclaw#7191.)
     const armWatchdog = () => {
       if (switchTimeoutRef.current) clearTimeout(switchTimeoutRef.current);
       switchTimeoutRef.current = setTimeout(() => {
+        // The timer has fired; null its ref so it honestly reflects
+        // "no watchdog armed" (a later clearTimeout on the dead id is a no-op).
+        switchTimeoutRef.current = null;
         if (pendingModelSwitchRef.current === model) {
           pendingModelSwitchRef.current = null;
           setModelLoading(false);
@@ -598,6 +597,10 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       // / schema V3). `model` here is a provider ref (e.g. "kilo.minimax_m3").
       // The global `model`/`default_model` keys were removed in V3.
       await putProp(`agents.${agentAlias}.model_provider`, model);
+      // The write-phase watchdog may have fired (or a newer switch may have
+      // superseded this one) while the request was in flight. Bail before
+      // touching the live socket so we never tear it down after giving up.
+      if (pendingModelSwitchRef.current !== model) return;
 
       // If a turn is actively streaming, abort it on the backend before we tear
       // down the socket. This prevents the old model from continuing to execute
@@ -648,10 +651,20 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       }
 
       const ws = new WebSocketClient({ agentAlias });
+      // Point wsRef at the NEW client before connect(), so a synchronous
+      // connect() throw (e.g. an invalid WebSocket URL/protocol token) still
+      // leaves a live, reconnect-capable socket in the ref instead of the old
+      // intentionally-closed one — otherwise the page strands offline with no
+      // reconnect path until reload.
+      wsRef.current = ws;
       attachSocketCallbacks(ws);
       ws.connect();
-      wsRef.current = ws;
     } catch (err) {
+      // If the per-phase watchdog already fired (timed out) and nulled the
+      // pending ref while this request was in flight, bail so a late rejection
+      // doesn't overwrite the timeout state. (The `if (modelLoading) return`
+      // debounce above prevents truly concurrent switches.)
+      if (pendingModelSwitchRef.current !== model) return;
       if (switchTimeoutRef.current) {
         clearTimeout(switchTimeoutRef.current);
         switchTimeoutRef.current = null;
@@ -716,9 +729,11 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         oldWs.disconnect();
 
         const ws = new WebSocketClient({ agentAlias });
+        // Assign wsRef before connect() so a synchronous throw can't strand the
+        // page on the old intentionally-closed socket (see switchModel).
+        wsRef.current = ws;
         attachSocketCallbacks(ws);
         ws.connect();
-        wsRef.current = ws;
       }
     })();
   }, [agentAlias, attachSocketCallbacks]);
