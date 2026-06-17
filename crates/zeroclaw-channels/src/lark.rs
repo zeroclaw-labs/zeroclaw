@@ -734,7 +734,6 @@ impl LarkChannel {
             reaction_ids: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: 1000,
-            ack_reactions: true,
             last_draft_edit: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             #[cfg(test)]
             api_base_override: None,
