@@ -1,0 +1,94 @@
+name: Support / Configuration Help
+description: Ask for help with setup, configuration, or usage
+title: "[Support]: "
+labels:
+  - "r:support"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for help with setup, configuration, or expected usage. Use the bug template for reproducible defects.
+        Discord is better for quick back-and-forth. If the answer becomes a bug, feature request,
+        docs gap, or workaround, capture the outcome in GitHub.
+        Do not include secrets, tokens, private URLs, personal data, or unredacted logs.
+
+  - type: dropdown
+    id: support_area
+    attributes:
+      label: Support area
+      options:
+        - installation
+        - quickstart/onboarding
+        - config file
+        - environment variables
+        - provider setup
+        - channel setup
+        - tools / permissions
+        - gateway / dashboard
+        - skills / plugins
+        - docs unclear
+        - not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to do?
+      description: Describe the outcome you want, not only the command that failed.
+      placeholder: I want ZeroClaw to ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: current_state
+    attributes:
+      label: What happened instead?
+      description: Include the exact error or confusing behavior. Redact secrets and personal data.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: attempted
+    attributes:
+      label: What have you already tried?
+      placeholder: |
+        - Read ...
+        - Ran ...
+        - Changed ...
+    validations:
+      required: false
+
+  - type: textarea
+    id: config_excerpt
+    attributes:
+      label: Relevant redacted config or commands
+      description: Paste only the smallest relevant excerpt. Replace secrets with REDACTED.
+      render: text
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: ZeroClaw version
+      placeholder: v0.8.0 / commit SHA / unknown
+    validations:
+      required: false
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Ubuntu 24.04 / macOS 15 / Windows 11
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Data hygiene checks
+      options:
+        - label: I redacted secrets, tokens, private URLs, and personal data from submitted content.
+          required: true

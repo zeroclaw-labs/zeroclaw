@@ -10,6 +10,9 @@ export interface PersistedChatBubble {
   content: string;
   thinking?: string;
   markdown?: boolean;
+  /** Verbatim locally-composed user input — never gateway-prefixed, so the
+   *  bubble skips stripServerTimestamp for it. (Server rows omit this.) */
+  local?: boolean;
   toolCall?: { name: string; args?: unknown; output?: string };
   timestamp: string;
 }
@@ -84,6 +87,7 @@ export function persistedToUiMessages(
   content: string;
   thinking?: string;
   markdown?: boolean;
+  local?: boolean;
   toolCall?: { name: string; args?: unknown; output?: string };
   timestamp: Date;
 }> {
@@ -93,6 +97,7 @@ export function persistedToUiMessages(
     content: m.content,
     thinking: m.thinking,
     markdown: m.markdown,
+    local: m.local,
     toolCall: m.toolCall,
     timestamp: new Date(m.timestamp),
   }));
@@ -105,22 +110,26 @@ export function uiMessagesToPersisted(
     content: string;
     thinking?: string;
     markdown?: boolean;
+    local?: boolean;
+    ephemeral?: boolean;
     toolCall?: { name: string; args?: unknown; output?: string };
     timestamp: Date;
-    local?: boolean;
   }>,
 ): PersistedChatBubble[] {
   return messages
-    // Skip messages flagged `local: true` (web slash-command output like /help,
-    // /model banners, unknown-command notices). They are ephemeral UI feedback
-    // and must not be re-hydrated as fake assistant replies on reload. #7137
-    .filter((m) => !m.local)
+    // Skip messages flagged `ephemeral: true` (web slash-command output like
+    // /help, /model banners, unknown-command notices). They are throwaway UI
+    // feedback and must not be re-hydrated as fake assistant replies on reload. #7137
+    .filter((m) => !m.ephemeral)
     .map((m) => ({
       id: m.id,
       role: m.role,
       content: m.content,
       thinking: m.thinking,
       markdown: m.markdown,
+      // Preserve the verbatim-user-input flag so reloaded bubbles still skip
+      // server-timestamp stripping.
+      local: m.local,
       toolCall: m.toolCall,
       timestamp: m.timestamp.toISOString(),
     }));

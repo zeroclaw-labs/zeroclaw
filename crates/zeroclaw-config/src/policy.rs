@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -2413,6 +2414,16 @@ impl SecurityPolicy {
         // file_read/write/edit and the shell tool jail to the agent's
         // own dir, not the install-wide legacy path.
         let agent_workspace = config.agent_workspace_dir(agent_alias);
+        // The per-agent workspace is the shell tool's spawn cwd and the file-tool
+        // jail root. Create it here so every path that builds a per-agent policy
+        // (agent loop, gateway, channels) has the directory present. A missing cwd
+        // makes the shell tool's process spawn fail with ENOENT on a fresh agent.
+        std::fs::create_dir_all(&agent_workspace).with_context(|| {
+            format!(
+                "SecurityPolicy::for_agent: failed to create agent workspace dir {}",
+                agent_workspace.display()
+            )
+        })?;
         let mut policy = Self::from_profiles(risk_profile, runtime_profile, &agent_workspace);
         if let Some(agent_cfg) = config.agents.get(agent_alias) {
             policy.risk_profile_name = agent_cfg.risk_profile.trim().to_string();
@@ -4473,6 +4484,47 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(canonical);
+    }
+
+    #[test]
+    fn for_agent_creates_the_per_agent_workspace_dir() {
+        use crate::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+
+        let root =
+            std::env::temp_dir().join(format!("zeroclaw-for-agent-mkdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut cfg = Config {
+            data_dir: root.join("data"),
+            config_path: root.join("config.toml"),
+            ..Config::default()
+        };
+        cfg.risk_profiles
+            .insert("default".into(), RiskProfileConfig::default());
+        cfg.agents.insert(
+            "agent_a".into(),
+            AliasedAgentConfig {
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let ws = cfg.agent_workspace_dir("agent_a");
+        assert!(
+            !ws.exists(),
+            "precondition: workspace dir must not exist yet"
+        );
+
+        let policy = SecurityPolicy::for_agent(&cfg, "agent_a").unwrap();
+
+        assert!(
+            ws.exists(),
+            "for_agent must create the per-agent workspace dir at the chokepoint"
+        );
+        assert_eq!(
+            policy.workspace_dir, ws,
+            "policy cwd/jail root must be the created workspace dir"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -193,7 +193,22 @@ impl Tool for ToolSearchTool {
         let mut activated_count = 0;
         let mut returned_count = 0;
         let mut newly_activated = Vec::new();
-        let mut guard = self.activated.lock().unwrap();
+        let mut guard = match self.activated.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "query": query,
+                            "mode": "keyword_search",
+                        })),
+                    "tool_search activated-tool lock poisoned during keyword activation; recovering guard"
+                );
+                poisoned.into_inner()
+            }
+        };
 
         for stub in &results {
             if returned_count >= max_results {
@@ -257,7 +272,22 @@ impl ToolSearchTool {
         let mut not_found = Vec::new();
         let mut activated_count = 0;
         let mut newly_activated = Vec::new();
-        let mut guard = self.activated.lock().unwrap();
+        let mut guard = match self.activated.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "requested_names": names,
+                            "mode": "select",
+                        })),
+                    "tool_search activated-tool lock poisoned during select activation; recovering guard"
+                );
+                poisoned.into_inner()
+            }
+        };
 
         for name in names {
             if name.is_empty() {
@@ -343,6 +373,16 @@ mod tests {
         DeferredMcpToolStub::new(name.to_string(), def)
     }
 
+    fn assert_poisoned_activated_contains(
+        activated: &Arc<Mutex<ActivatedToolSet>>,
+        tool_name: &str,
+    ) {
+        let guard = activated
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(guard.is_activated(tool_name));
+    }
+
     #[tokio::test]
     async fn tool_metadata() {
         let tool = ToolSearchTool::new(
@@ -413,6 +453,31 @@ mod tests {
         assert!(activated.lock().unwrap().is_activated("fs__read"));
     }
 
+    #[tokio::test]
+    async fn keyword_search_recovers_poisoned_activated_lock() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let poisoned = Arc::clone(&activated);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().expect("test mutex should lock");
+            panic!("poison activated-tools lock");
+        })
+        .join();
+        let tool = ToolSearchTool::new(
+            make_deferred_set(vec![make_stub("fs__read", "Read a file from disk")]).await,
+            Arc::clone(&activated),
+        );
+
+        let result = tool
+            .execute(serde_json::json!({"query": "read file"}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("<function>"));
+        assert!(result.output.contains("fs__read"));
+        assert_poisoned_activated_contains(&activated, "fs__read");
+    }
+
     /// Verify tool_search works with stubs from multiple MCP servers,
     /// simulating a daemon-mode setup where several servers are deferred.
     #[tokio::test]
@@ -476,6 +541,32 @@ mod tests {
         assert!(guard.is_activated("srv__tool_a"));
         assert!(guard.is_activated("srv__tool_b"));
         assert_eq!(guard.tool_specs().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn select_recovers_poisoned_activated_lock() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let poisoned = Arc::clone(&activated);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().expect("test mutex should lock");
+            panic!("poison activated-tools lock");
+        })
+        .join();
+        let stubs = vec![
+            make_stub("srv__tool_a", "Tool A"),
+            make_stub("srv__tool_b", "Tool B"),
+        ];
+        let tool = ToolSearchTool::new(make_deferred_set(stubs).await, Arc::clone(&activated));
+
+        let result = tool
+            .execute(serde_json::json!({"query": "select:srv__tool_a"}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("<function>"));
+        assert!(result.output.contains("srv__tool_a"));
+        assert_poisoned_activated_contains(&activated, "srv__tool_a");
     }
 
     /// Verify re-activating an already-activated tool does not duplicate it.

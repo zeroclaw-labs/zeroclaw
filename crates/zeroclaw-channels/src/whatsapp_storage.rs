@@ -680,13 +680,18 @@ impl AppSyncStore for RusqliteStore {
 
     async fn get_version(&self, name: &str) -> wacore::store::error::Result<HashState> {
         let conn = self.conn.lock();
-        let state_data: Vec<u8> = to_store_err!(conn.query_row(
+        // No stored version yet (fresh app-state table) means version 0, not an
+        // error — matches InMemoryStore and the diesel SqliteStore. Surfacing an
+        // error here breaks the critical app-state sync on first pairing.
+        match conn.query_row(
             "SELECT state_data FROM app_state_versions WHERE name = ?1 AND device_id = ?2",
             params![name, self.device_id],
-            |row| row.get(0),
-        ))?;
-
-        to_store_err!(serde_json::from_slice(&state_data))
+            |row| row.get::<_, Vec<u8>>(0),
+        ) {
+            Ok(state_data) => to_store_err!(serde_json::from_slice(&state_data)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(HashState::default()),
+            Err(e) => Err(wacore::store::error::StoreError::Database(Box::new(e))),
+        }
     }
 
     async fn set_version(&self, name: &str, state: HashState) -> wacore::store::error::Result<()> {

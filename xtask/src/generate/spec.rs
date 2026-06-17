@@ -692,12 +692,12 @@ mod tests {
     #[test]
     fn dist_has_all_channels_minus_heavyweight() {
         let r = resolve(&root(), &Selection::Dist).unwrap();
-        // All channels: a representative non-default channel from channels-full.
+        // All channels: representative non-default channels from channels-full.
         assert!(
-            r.cargo_flags.contains("channel-discord"),
+            r.cargo_flags.contains("channel-slack"),
             "dist must ship all channels"
         );
-        assert!(r.cargo_flags.contains("channel-slack"));
+        assert!(r.cargo_flags.contains("channel-signal"));
         // Heavyweight excluded.
         assert!(
             !r.cargo_flags.contains("hardware"),
