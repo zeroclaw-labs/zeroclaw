@@ -517,6 +517,11 @@ pub struct AppState {
     /// TUI session registry from the daemon (for /api/tuis endpoint).
     /// `None` when the gateway runs standalone without a daemon.
     pub tui_registry: Option<Arc<zeroclaw_runtime::rpc::tui_identity::TuiRegistry>>,
+    /// Shared SOP engine from the daemon (for WS agent sessions).
+    /// `None` when the gateway runs standalone — sessions build their own.
+    pub sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    /// Shared SOP audit logger from the daemon (for WS agent sessions).
+    pub sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -533,6 +538,9 @@ pub async fn run_gateway(
     // TUI session registry from the daemon for the /api/tuis endpoint.
     tui_registry: Option<Arc<zeroclaw_runtime::rpc::tui_identity::TuiRegistry>>,
     canvas_store: Option<CanvasStore>,
+    // Shared SOP engine from the daemon. `None` when standalone — sessions build their own.
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 ) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
@@ -816,6 +824,8 @@ pub async fn run_gateway(
                 Some(canvas_store.clone()),
                 false,
                 None,
+                sop_engine.clone(),
+                sop_audit.clone(),
             );
             // Wire channel-driven tool handles so the dashboard agent can
             // deliver messages to configured channels (same pattern as
@@ -1299,15 +1309,17 @@ pub async fn run_gateway(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             "Web dashboard: not available — configured gateway.web_dist_dir is missing on \
-             this machine and no fallback location was found. Build with `cargo web build` \
-             and point gateway.web_dist_dir at the resulting web/dist directory."
+             this machine and no fallback location was found. Reinstall with the supported \
+             installer (`./install.sh --source` on Linux/macOS, `setup.bat` on Windows) to \
+             build and place the dashboard where the gateway looks for it."
         );
     } else {
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "Web dashboard: not available — no web/dist found. Build with `cargo web build` \
-             and point gateway.web_dist_dir at the resulting web/dist directory."
+            "Web dashboard: not available — no web/dist found. Reinstall with the supported \
+             installer (`./install.sh --source` on Linux/macOS, `setup.bat` on Windows) to \
+             build and place the dashboard where the gateway looks for it."
         );
     }
 
@@ -1468,6 +1480,8 @@ pub async fn run_gateway(
         cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         tui_registry,
+        sop_engine,
+        sop_audit,
         #[cfg(feature = "webauthn")]
         webauthn: if config.security.webauthn.enabled {
             let secret_store = Arc::new(zeroclaw_runtime::security::SecretStore::new(
@@ -1534,6 +1548,10 @@ pub async fn run_gateway(
         )
         .route("/api/config/templates", get(api_config::handle_templates))
         .route("/api/config/map-keys", get(api_config::handle_get_map_keys))
+        .route(
+            "/api/config/resolve-alias-source",
+            get(api_config::handle_resolve_alias_source),
+        )
         .route(
             "/api/config/map-key",
             post(api_config::handle_map_key).delete(api_config::handle_delete_map_key),
@@ -1885,24 +1903,29 @@ pub async fn run_gateway(
     Ok(())
 }
 
-fn format_paircode_recovery_command(host: &str, port: u16) -> String {
-    let mut cmd = format!("zeroclaw gateway get-paircode --new --port {port}");
-    if let Some(host_arg) = paircode_recovery_host_arg(host) {
-        cmd.push_str(" --host ");
-        cmd.push_str(host_arg);
-    }
-    cmd
-}
-
-fn paircode_recovery_host_arg(host: &str) -> Option<&str> {
-    match host {
-        "127.0.0.1" | "localhost" | "::1" | "0.0.0.0" | "::" => None,
-        _ => Some(host),
-    }
+/// Admin paircode routes are localhost-only ([`require_localhost`]), so the
+/// recovery hint must never advertise a non-loopback `--host`: the CLI would
+/// then target an address the admin guard rejects with `403`. We omit `--host`
+/// entirely and let the CLI fall back to its loopback default. (`_host` is kept
+/// for call-site symmetry with [`format_paircode_recovery_curl`].)
+fn format_paircode_recovery_command(_host: &str, port: u16) -> String {
+    format!("zeroclaw gateway get-paircode --new --port {port}")
 }
 
 fn format_paircode_recovery_curl(host: &str, port: u16, path_prefix: &str) -> String {
-    format!("curl -s -X POST http://{host}:{port}{path_prefix}/admin/paircode/new")
+    // Admin paircode routes are localhost-only, so the curl fallback must point
+    // at loopback. Bind-only hosts and non-loopback advertised hosts are
+    // normalized to `127.0.0.1`; explicit loopback hosts are preserved.
+    let recovery_host = paircode_recovery_curl_host(host);
+    format!("curl -s -X POST http://{recovery_host}:{port}{path_prefix}/admin/paircode/new")
+}
+
+fn paircode_recovery_curl_host(host: &str) -> &str {
+    match host {
+        "127.0.0.1" | "localhost" => host,
+        "::1" => "[::1]",
+        _ => "127.0.0.1",
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -3880,9 +3903,43 @@ mod tests {
 
     #[test]
     fn paircode_recovery_command_includes_specific_host_when_needed() {
+        // Admin paircode routes are localhost-only, so the recovery hint must
+        // not advertise a non-loopback `--host` (the admin guard would 403 it).
+        // The CLI is left to fall back to its loopback default.
         assert_eq!(
             format_paircode_recovery_command("192.168.1.20", 42617),
-            "zeroclaw gateway get-paircode --new --port 42617 --host 192.168.1.20"
+            "zeroclaw gateway get-paircode --new --port 42617"
+        );
+    }
+
+    #[test]
+    fn paircode_recovery_command_uses_loopback_for_nonloopback_host() {
+        // Regression for #6561: a gateway bound to a non-loopback interface must
+        // not surface a recovery hint that the localhost-only admin guard rejects.
+        let cmd = format_paircode_recovery_command("192.168.1.20", 42617);
+        assert!(
+            !cmd.contains("192.168.1.20"),
+            "recovery command must not advertise the non-loopback bound host: {cmd}"
+        );
+        assert!(
+            !cmd.contains("--host"),
+            "recovery command should omit --host so the CLI uses its loopback default: {cmd}"
+        );
+
+        let curl = format_paircode_recovery_curl("192.168.1.20", 42617, "");
+        assert_eq!(
+            curl, "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new",
+            "curl fallback must target loopback, not the non-loopback bound host"
+        );
+        assert!(
+            !curl.contains("192.168.1.20"),
+            "curl fallback must not advertise the non-loopback bound host: {curl}"
+        );
+
+        // Path prefix is still preserved while the host is normalized.
+        assert_eq!(
+            format_paircode_recovery_curl("192.168.1.20", 42617, "/gw"),
+            "curl -s -X POST http://127.0.0.1:42617/gw/admin/paircode/new"
         );
     }
 
@@ -3891,6 +3948,30 @@ mod tests {
         assert_eq!(
             format_paircode_recovery_curl("127.0.0.1", 42617, ""),
             "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new"
+        );
+    }
+
+    #[test]
+    fn paircode_recovery_curl_normalizes_unspecified_bind_hosts() {
+        assert_eq!(
+            format_paircode_recovery_curl("0.0.0.0", 42617, ""),
+            "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new"
+        );
+        assert_eq!(
+            format_paircode_recovery_curl("::", 42617, ""),
+            "curl -s -X POST http://127.0.0.1:42617/admin/paircode/new"
+        );
+    }
+
+    #[test]
+    fn paircode_recovery_curl_preserves_actual_loopback_hosts() {
+        assert_eq!(
+            format_paircode_recovery_curl("localhost", 42617, ""),
+            "curl -s -X POST http://localhost:42617/admin/paircode/new"
+        );
+        assert_eq!(
+            format_paircode_recovery_curl("::1", 42617, ""),
+            "curl -s -X POST http://[::1]:42617/admin/paircode/new"
         );
     }
 
@@ -3972,6 +4053,8 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
@@ -4342,7 +4425,7 @@ mod tests {
         // the spawn: a still-running task at the deadline means boot
         // got far enough to start serving.
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None).await
+            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
         });
 
         match tokio::time::timeout(
@@ -4400,13 +4483,13 @@ mod tests {
         // matching [risk_profiles.<key>] entry exists.
         let agent = AliasedAgentConfig {
             enabled: true,
-            risk_profile: "definitely_not_configured".to_string(),
+            risk_profile: "definitely_not_configured".into(),
             ..AliasedAgentConfig::default()
         };
         config.agents.insert("fake123".to_string(), agent);
 
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None).await
+            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
         });
 
         match tokio::time::timeout(
@@ -4447,7 +4530,7 @@ mod tests {
         );
 
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None).await
+            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
         });
 
         match tokio::time::timeout(
@@ -4530,6 +4613,8 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -4614,6 +4699,8 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -5203,6 +5290,8 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -5305,6 +5394,8 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -5422,6 +5513,8 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -5520,6 +5613,8 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -5636,6 +5731,8 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -5718,6 +5815,8 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -5805,6 +5904,8 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -5899,6 +6000,8 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -5989,6 +6092,8 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6129,6 +6234,8 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6963,6 +7070,8 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
@@ -7046,6 +7155,8 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };

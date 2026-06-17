@@ -91,11 +91,11 @@ Issue `risk:*` labels describe likely fix blast radius from the report. PR `risk
 | `status:accepted` | The team has accepted the RFC or work item. Add `status:no-stale` only when the issue also needs stale protection. |
 | `status:blocked` | Valid work is waiting on an external dependency, maintainer decision, or linked prerequisite. Record the blocker; this is stale protection only while that blocker remains unresolved. |
 | `status:in-progress` | An open PR is actively targeting the issue. Re-check live PR state before relying on it during stale passes. |
-| `status:no-stale` | Accepted or otherwise long-lived work should stay open and is not already protected by another stale exclusion. Record the reason and active owner or steward path using the contributor-visible owner sources in the [Project board contract](./pr-workflow.md#issue-ownership-path). Active release trackers and active RFC or design trackers may use the tracker itself as the visible reason and steward surface while they remain active. |
+| `status:no-stale` | Accepted or otherwise long-lived work should stay open and is not already protected by another stale exclusion. Record the reason and routing evidence using the contributor-visible sources in the [Project board contract](./pr-workflow.md#issue-routing-evidence). Active release trackers and active RFC or design trackers may use the tracker itself as the visible reason and routing surface while they remain active. |
 | `good first issue` | XS/S, self-contained, documented work with clear acceptance criteria, relevant code or docs links, a named mentor or contact, and low onboarding risk. |
 | `help wanted` | Actionable, unblocked work maintainers want external help on and can review. Do not use it as a generic valid/unowned marker. |
 
-Assignee means active work. Area steward means responsibility for the next issue-routing decision when no implementer is active. The [Project board contract](./pr-workflow.md#issue-ownership-path) defines the accepted owner sources and routing outcomes. Labels can identify the likely area, but labels alone are not an owner source.
+Assignee means active work. Routing evidence records why an issue needs special stale protection, tracker treatment, or a deferred maintainer decision. `status:blocked` only needs the recorded unresolved blocker unless it also needs separate `status:no-stale` protection. The [Project board contract](./pr-workflow.md#issue-routing-evidence) defines the accepted evidence sources and routing outcomes. Labels can identify the likely area, but labels alone are not ownership or stale protection.
 
 ### Resolution labels
 
@@ -106,6 +106,20 @@ For duplicates, link the canonical target before closing or redirecting discussi
 For replaced PRs or issue paths, use [Superseding PRs](./superseding.md) and preserve contributor attribution when relevant.
 
 If logs or payloads in the report contain personal identifiers or sensitive data, request redaction before deeper triage. The triage process must not propagate the exposure.
+
+## Discussions stewardship
+
+Discussions are a maintained community surface only when a steward or review cadence exists. The default cadence is a weekly maintainer pass over new and recently active threads. A named steward may own that surface pass, but the steward maintains the surface; they do not become the owner of every question, idea, or implementation that appears there.
+
+During each Discussions pass:
+
+1. Check new and recently active threads for category fit, unanswered Q&A, spam, sensitive data, and threads that have produced a concrete project outcome.
+2. Keep lightweight community conversation in Discussions when it is still exploratory, answerable there, or useful as a showcase, demo, poll, announcement, or broad-feedback thread.
+3. Promote concrete outcomes to the owning tracked surface: bugs and accepted feature scopes to issues, architecture proposals to RFC issues, PR-specific details to PR comments, durable operating rules to maintainer or contributor docs.
+4. Close the loop in the originating Discussion with a short summary and link to the issue, RFC, PR, or doc that now owns the outcome. Mark an answer only when the category and result make that accurate.
+5. Redirect security-sensitive threads to the private vulnerability path in [Security issues](../contributing/communication.md#security-issues), handle sensitive data under [Privacy](../contributing/privacy.md), and close pure advertising or not-project-relevant threads. Preserve useful project-related demos or integrations as community showcase material when they are not asking maintainers to track work.
+
+If Discussions are not being reviewed on the documented cadence, do not present them as a required intake path. Treat them as a passive archive until a steward or cadence is restored.
 
 ### PR backlog pruning
 
@@ -139,7 +153,7 @@ This keeps context loss low and avoids the next reviewer redoing the same fetche
 
 ## Weekly queue hygiene
 
-- Walk the stale queue. Apply `status:no-stale` only under the rules in the [Project board contract](./pr-workflow.md#issue-ownership-path): when accepted or otherwise long-lived work has a recorded reason to stay open, a visible active owner or steward path, and no other stale exclusion already applies. Active release trackers and active RFC or design trackers may keep stale protection by default when the issue itself clearly identifies the active coordination or decision surface; revisit them when the milestone closes, the tracker drifts from live state, the RFC reaches a decision, is superseded, or closes, or the issue stops representing an active project decision surface. Until the stale-exemption audit lands, treat existing `status:no-stale` issues missing those facts as audit findings rather than automatic stale candidates.
+- Walk the stale queue. Apply `status:no-stale` only under the rules in the [Project board contract](./pr-workflow.md#issue-routing-evidence): when accepted or otherwise long-lived work has a recorded reason to stay open, contributor-visible routing evidence, and no other stale exclusion already applies. Active release trackers and active RFC or design trackers may keep stale protection by default when the issue itself clearly identifies the active coordination or decision surface; revisit them when the milestone closes, the tracker drifts from live state, the RFC reaches a decision, is superseded, or closes, or the issue stops representing an active project decision surface. Until the stale-exemption audit lands, treat existing `status:no-stale` issues missing those facts as audit findings rather than automatic stale candidates.
 - Prioritize `size: XS/S` bug and security PRs first.
 - Convert recurring support questions into docs improvements and auto-response guidance.
 

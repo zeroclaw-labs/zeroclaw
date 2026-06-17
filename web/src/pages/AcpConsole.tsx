@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react';
+import { Link } from 'react-router-dom';
 import {
   AlertCircle,
   Check,
@@ -8,8 +9,10 @@ import {
   ShieldCheck,
   Square,
   Terminal,
+  Users,
   X,
 } from 'lucide-react';
+import { Badge, Button, Card, PageHeader, type BadgeTone } from '@/components/ui';
 import { loadAgentPickerSummaries, type AgentPickerSummary } from '@/lib/agents';
 import {
   AcpWebSocketClient,
@@ -45,7 +48,7 @@ interface PermissionRequest {
   options: AcpPermissionOption[];
 }
 
-const DEFAULT_PROMPT = 'Summarize the current ZeroClaw gateway state in one paragraph.';
+const DEFAULT_PROMPT_KEY = 'acp.default_prompt';
 const MAX_DETAIL_CHARS = 8_000;
 
 function nowLabel(): string {
@@ -97,7 +100,7 @@ function getToolTitle(update: Record<string, unknown>): string {
   if (typeof update.title === 'string') return update.title;
   if (typeof update.name === 'string') return update.name;
   if (typeof update.kind === 'string') return update.kind;
-  return 'Tool call';
+  return t('acp.tool_call');
 }
 
 function frameLabel(frame: AcpFrame): string {
@@ -135,7 +138,7 @@ export default function AcpConsole() {
   const [agents, setAgents] = useState<AgentPickerSummary[]>([]);
   const [agentsLoading, setAgentsLoading] = useState(true);
   const [selectedAgentAlias, setSelectedAgentAlias] = useState<string | null>(null);
-  const [prompt, setPrompt] = useState(DEFAULT_PROMPT);
+  const [prompt, setPrompt] = useState(() => t(DEFAULT_PROMPT_KEY));
   const [streamingText, setStreamingText] = useState('');
   const [messages, setMessages] = useState<ConsoleMessage[]>([]);
   const [permissions, setPermissions] = useState<PermissionRequest[]>([]);
@@ -220,7 +223,7 @@ export default function AcpConsole() {
       if (thought) {
         addMessage(setMessages, {
           kind: 'thought',
-          title: 'Agent thought',
+          title: t('acp.agent_thought'),
           content: thought,
         });
       }
@@ -231,7 +234,7 @@ export default function AcpConsole() {
       addMessage(setMessages, {
         kind: 'tool',
         title: getToolTitle(update),
-        content: updateKind === 'tool_call' ? 'Started' : 'Finished',
+        content: updateKind === 'tool_call' ? t('acp.tool_started') : t('acp.tool_finished'),
         detail: stringifyDetail(update),
       });
       return;
@@ -239,8 +242,8 @@ export default function AcpConsole() {
 
     addMessage(setMessages, {
       kind: 'system',
-      title: 'Session update',
-      content: typeof updateKind === 'string' ? updateKind : 'Unknown update',
+      title: t('acp.session_update'),
+      content: typeof updateKind === 'string' ? updateKind : t('acp.unknown_update'),
       detail: stringifyDetail(update),
     });
   }, [appendAssistantChunk]);
@@ -490,83 +493,64 @@ export default function AcpConsole() {
     pushEvent(optionId ? `permission selected: ${optionId}` : 'permission cancelled');
   };
 
-  const statusTone = status === 'connected'
-    ? 'var(--color-status-success)'
+  const statusTone: BadgeTone = status === 'connected'
+    ? 'ok'
     : status === 'connecting'
-      ? 'var(--color-status-warning)'
-      : 'var(--color-status-error)';
+      ? 'warn'
+      : 'error';
 
   return (
     <div className="p-6 max-w-7xl mx-auto h-full flex flex-col gap-4">
-      <header className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-        <div className="flex items-center gap-3">
-          <div
-            className="h-11 w-11 rounded-2xl flex items-center justify-center border"
-            style={{ background: 'var(--pc-accent-glow)', borderColor: 'var(--pc-accent-dim)' }}
-          >
-            <Terminal className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
-          </div>
-          <div>
-            <h1 className="text-2xl font-semibold" style={{ color: 'var(--pc-text-primary)' }}>
-              {t('acp.title')}
-            </h1>
-            <p className="text-sm mt-1" style={{ color: 'var(--pc-text-muted)' }}>
-              {t('acp.subtitle')}
-            </p>
-          </div>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <select
-            value={selectedAgentAlias ?? ''}
-            onChange={(event) => setSelectedAgentAlias(event.target.value || null)}
-            disabled={agentsLoading || !hasEnabledAgent || busy}
-            className="rounded-xl border px-3 py-2 text-xs font-medium disabled:opacity-50"
-            style={{
-              borderColor: 'var(--pc-border)',
-              background: 'var(--pc-bg-elevated)',
-              color: 'var(--pc-text-secondary)',
-            }}
-            aria-label="ACP agent"
-            title="ACP agent"
-          >
-            {agents.length === 0 || !agents.some((agent) => agent.enabled) ? (
-              <option value="">
-                {agentsLoading
-                  ? t('acp.agent.loading')
-                  : agents.length === 0
-                    ? t('acp.agent.none_configured')
-                    : t('acp.agent.none_enabled')}
-              </option>
-            ) : (
-              <>
-                <option value="">{t('acp.agent.server_default')}</option>
-                {agents.map((agent) => (
-                  <option key={agent.alias} value={agent.alias} disabled={!agent.enabled}>
-                    {agent.alias}{agent.enabled ? '' : ` (${t('acp.agent.disabled')})`}
-                  </option>
-                ))}
-              </>
-            )}
-          </select>
-          <span
-            className="inline-flex items-center gap-2 rounded-xl border px-3 py-2 text-xs font-medium"
-            style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)', color: statusTone }}
-          >
-            <Plug className="h-4 w-4" />
-            {status}
+      <PageHeader
+        title={
+          <span className="inline-flex items-center gap-2.5">
+            <Terminal className="h-5 w-5 text-pc-accent" />
+            {t('acp.title')}
           </span>
-          <button
-            type="button"
-            onClick={connect}
-            disabled={!hasEnabledAgent}
-            className="inline-flex items-center gap-2 rounded-xl border px-3 py-2 text-xs font-medium transition-colors hover:opacity-80 disabled:opacity-50"
-            style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-elevated)', color: 'var(--pc-text-secondary)' }}
-          >
-            <RefreshCw className="h-4 w-4" />
-            {t('acp.reconnect')}
-          </button>
-        </div>
-      </header>
+        }
+        description={t('acp.subtitle')}
+        actions={
+          // Wrap so the agent-select / status badge / reconnect button stack on
+          // narrow screens instead of clipping out of a single non-wrapping row.
+          <div className="flex flex-wrap items-center gap-2 min-w-0">
+            <select
+              value={selectedAgentAlias ?? ''}
+              onChange={(event) => setSelectedAgentAlias(event.target.value || null)}
+              disabled={agentsLoading || !hasEnabledAgent || busy}
+              className="h-9 min-w-0 max-w-full rounded-[var(--radius-md)] border border-pc-border bg-pc-input px-3 text-[13px] font-medium text-pc-text-secondary disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-pc-accent/40 focus-visible:border-pc-accent/40"
+              aria-label={t('acp.agent_select_label')}
+              title={t('acp.agent_select_label')}
+            >
+              {agents.length === 0 || !agents.some((agent) => agent.enabled) ? (
+                <option value="">
+                  {agentsLoading
+                    ? t('acp.agent.loading')
+                    : agents.length === 0
+                      ? t('acp.agent.none_configured')
+                      : t('acp.agent.none_enabled')}
+                </option>
+              ) : (
+                <>
+                  <option value="">{t('acp.agent.server_default')}</option>
+                  {agents.map((agent) => (
+                    <option key={agent.alias} value={agent.alias} disabled={!agent.enabled}>
+                      {agent.alias}{agent.enabled ? '' : ` (${t('acp.agent.disabled')})`}
+                    </option>
+                  ))}
+                </>
+              )}
+            </select>
+            <Badge tone={statusTone}>
+              <Plug className="h-3 w-3" />
+              {status}
+            </Badge>
+            <Button variant="ghost" size="md" onClick={connect} disabled={!hasEnabledAgent}>
+              <RefreshCw className="h-4 w-4" />
+              {t('acp.reconnect')}
+            </Button>
+          </div>
+        }
+      />
 
       <section className="grid gap-3 md:grid-cols-4">
         <StatusTile label={t('acp.status.server')} value={agentLabel} />
@@ -582,43 +566,46 @@ export default function AcpConsole() {
       </section>
 
       {error && (
-        <div
-          className="rounded-xl border px-4 py-3 flex items-start gap-2 text-sm"
-          style={{
-            background: 'var(--color-status-error-alpha-08)',
-            borderColor: 'var(--color-status-error-alpha-20)',
-            color: 'var(--color-status-error)',
-          }}
-        >
+        <div className="rounded-[var(--radius-md)] border border-status-error/20 bg-status-error/10 px-4 py-3 flex items-start gap-2 text-sm text-status-error">
           <AlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
           <span>{error}</span>
         </div>
       )}
 
+      {!agentsLoading && !hasEnabledAgent && (
+        <div className="rounded-[var(--radius-md)] border border-pc-border bg-pc-surface px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-sm text-pc-text-secondary">
+          <span>
+            {agents.length === 0
+              ? t('acp.agent.none_configured')
+              : t('acp.agent.none_enabled')}
+          </span>
+          <Link to="/agents">
+            <Button variant="ghost" size="sm">
+              <Users className="h-4 w-4" />
+              {t('acp.manage_agents')}
+            </Button>
+          </Link>
+        </div>
+      )}
+
       <main className="grid min-h-0 flex-1 gap-4 lg:grid-cols-[minmax(0,1fr)_360px]">
-        <section className="card rounded-2xl overflow-hidden flex min-h-[560px] flex-col">
-          <div className="border-b px-4 py-3 flex items-center justify-between" style={{ borderColor: 'var(--pc-border)' }}>
-            <div className="flex items-center gap-2 text-sm font-medium" style={{ color: 'var(--pc-text-secondary)' }}>
+        <Card padded={false} className="overflow-hidden flex min-h-[560px] flex-col shadow-[var(--pc-shadow-sm)]">
+          <div className="border-b border-pc-border px-4 py-3 flex items-center justify-between">
+            <div className="flex items-center gap-2 text-sm font-medium text-pc-text-secondary">
               <Terminal className="h-4 w-4" />
               {t('acp.transcript')}
             </div>
             {busy && (
-              <button
-                type="button"
-                onClick={cancelPrompt}
-                disabled={cancelRequested}
-                className="inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium disabled:opacity-50"
-                style={{ background: 'var(--pc-bg-elevated)', color: 'var(--pc-text-secondary)' }}
-              >
+              <Button variant="ghost" size="sm" onClick={cancelPrompt} disabled={cancelRequested}>
                 <Square className="h-3.5 w-3.5" />
                 {cancelRequested ? t('acp.cancelling') : t('acp.cancel')}
-              </button>
+              </Button>
             )}
           </div>
 
           <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3">
             {messages.length === 0 && !streamingText ? (
-              <div className="h-full min-h-80 flex items-center justify-center text-sm" style={{ color: 'var(--pc-text-muted)' }}>
+              <div className="h-full min-h-80 flex items-center justify-center text-sm text-pc-text-muted">
                 {t('acp.empty_transcript')}
               </div>
             ) : (
@@ -642,8 +629,7 @@ export default function AcpConsole() {
           </div>
 
           <form
-            className="border-t p-4 flex flex-col gap-3 sm:flex-row"
-            style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}
+            className="border-t border-pc-border bg-pc-surface p-4 flex flex-col gap-3 sm:flex-row"
             onSubmit={(event) => {
               event.preventDefault();
               void sendPrompt();
@@ -653,101 +639,82 @@ export default function AcpConsole() {
               value={prompt}
               onChange={(event) => setPrompt(event.target.value)}
               rows={3}
-              className="min-h-20 flex-1 resize-none rounded-xl border px-3 py-2 text-sm"
-              style={{
-                background: 'var(--pc-bg-input)',
-                borderColor: 'var(--pc-border)',
-                color: 'var(--pc-text-primary)',
-              }}
+              className="min-h-20 flex-1 resize-none rounded-[var(--radius-md)] border border-pc-border bg-pc-input px-3 py-2 text-sm text-pc-text placeholder:text-pc-text-faint focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-pc-accent/40 focus-visible:border-pc-accent/40"
               placeholder={t('acp.prompt_placeholder')}
             />
-            <button
-              type="submit"
-              disabled={!canSend}
-              className="btn-electric inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2 text-sm font-medium disabled:opacity-50 sm:w-32"
-            >
+            <Button type="submit" size="md" disabled={!canSend} className="sm:w-32">
               <Send className="h-4 w-4" />
               {t('acp.send')}
-            </button>
+            </Button>
           </form>
-        </section>
+        </Card>
 
         <aside className="flex min-h-0 flex-col gap-4">
-          <section className="card rounded-2xl overflow-hidden">
-            <div className="border-b px-4 py-3 flex items-center gap-2" style={{ borderColor: 'var(--pc-border)' }}>
-              <ShieldCheck className="h-4 w-4" style={{ color: 'var(--pc-accent)' }} />
-              <h2 className="text-sm font-semibold" style={{ color: 'var(--pc-text-primary)' }}>
+          <Card padded={false} className="overflow-hidden shadow-[var(--pc-shadow-sm)]">
+            <div className="border-b border-pc-border px-4 py-3 flex items-center gap-2">
+              <ShieldCheck className="h-4 w-4 text-pc-accent" />
+              <h2 className="text-sm font-semibold text-pc-text">
                 {t('acp.permissions')}
               </h2>
             </div>
             <div className="p-4 space-y-3">
               {permissions.length === 0 ? (
-                <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
+                <p className="text-sm text-pc-text-muted">
                   {t('acp.permissions_empty')}
                 </p>
               ) : (
                 permissions.map((permission) => (
                   <div
                     key={String(permission.id)}
-                    className="rounded-xl border p-3 space-y-3"
-                    style={{ borderColor: 'var(--color-status-warning-alpha-20)', background: 'var(--color-status-warning-alpha-05)' }}
+                    className="rounded-[var(--radius-md)] border border-status-warning/20 bg-status-warning/5 p-3 space-y-3"
                   >
                     <div>
-                      <div className="text-sm font-medium" style={{ color: 'var(--pc-text-primary)' }}>
+                      <div className="text-sm font-medium text-pc-text">
                         {permission.title}
                       </div>
                       {permission.sessionId && (
-                        <div className="text-xs mt-1 font-mono" style={{ color: 'var(--pc-text-muted)' }}>
+                        <div className="text-xs mt-1 font-mono text-pc-text-muted">
                           {permission.sessionId}
                         </div>
                       )}
                     </div>
                     {permission.detail && (
-                      <pre
-                        className="max-h-36 overflow-auto whitespace-pre-wrap rounded-lg p-2 text-xs"
-                        style={{ background: 'var(--pc-bg-code)', color: 'var(--pc-text-secondary)' }}
-                      >
+                      <pre className="max-h-36 overflow-auto whitespace-pre-wrap rounded-[var(--radius-sm)] bg-pc-code p-2 text-xs text-pc-text-secondary">
                         {permission.detail}
                       </pre>
                     )}
                     <div className="flex flex-wrap gap-2">
                       {permission.options.map((option) => (
-                        <button
+                        <Button
                           key={option.optionId}
-                          type="button"
+                          variant="ghost"
+                          size="sm"
                           onClick={() => answerPermission(permission, option.optionId)}
-                          className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium"
-                          style={{ background: 'var(--pc-bg-elevated)', color: 'var(--pc-text-secondary)' }}
                         >
                           <Check className="h-3.5 w-3.5" />
                           {option.name ?? option.kind ?? option.optionId}
-                        </button>
+                        </Button>
                       ))}
-                      <button
-                        type="button"
-                        onClick={() => answerPermission(permission)}
-                        className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium"
-                        style={{ background: 'var(--pc-bg-elevated)', color: 'var(--pc-text-muted)' }}
-                      >
+                      <Button variant="ghost" size="sm" onClick={() => answerPermission(permission)}>
                         <X className="h-3.5 w-3.5" />
                         {t('acp.dismiss')}
-                      </button>
+                      </Button>
                     </div>
                   </div>
                 ))
               )}
             </div>
-          </section>
+          </Card>
 
-          <section className="card rounded-2xl overflow-hidden flex min-h-0 flex-1 flex-col">
-            <div className="border-b px-4 py-3" style={{ borderColor: 'var(--pc-border)' }}>
-              <h2 className="text-sm font-semibold" style={{ color: 'var(--pc-text-primary)' }}>
+          <Card padded={false} className="overflow-hidden flex min-h-0 flex-1 flex-col shadow-[var(--pc-shadow-sm)]">
+            <div className="border-b border-pc-border px-4 py-3">
+              <h2 className="text-sm font-semibold text-pc-text">
                 {t('acp.protocol_log')}
               </h2>
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto p-4">
               {events.length === 0 ? (
-                <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
+                <p className="text-sm text-pc-text-muted">
                   {t('acp.protocol_waiting')}
                 </p>
               ) : (
@@ -755,8 +722,7 @@ export default function AcpConsole() {
                   {events.map((event, index) => (
                     <li
                       key={`${event}-${index}`}
-                      className="rounded-lg px-2 py-1.5 font-mono text-xs"
-                      style={{ background: 'var(--pc-bg-code)', color: 'var(--pc-text-secondary)' }}
+                      className="rounded-[var(--radius-sm)] bg-pc-code px-2 py-1.5 font-mono text-xs text-pc-text-secondary"
                     >
                       {event}
                     </li>
@@ -764,7 +730,7 @@ export default function AcpConsole() {
                 </ol>
               )}
             </div>
-          </section>
+          </Card>
         </aside>
       </main>
     </div>
@@ -773,67 +739,45 @@ export default function AcpConsole() {
 
 function StatusTile({ label, value }: { label: string; value: string }) {
   return (
-    <div className="card rounded-2xl p-4">
-      <div className="text-xs uppercase tracking-wider" style={{ color: 'var(--pc-text-faint)' }}>
+    <Card>
+      <div className="text-[11px] font-medium uppercase tracking-wide text-pc-text-faint">
         {label}
       </div>
-      <div className="mt-1 truncate text-sm font-medium" style={{ color: 'var(--pc-text-primary)' }} title={value}>
+      <div className="mt-1 truncate text-sm font-medium text-pc-text" title={value}>
         {value}
       </div>
-    </div>
+    </Card>
   );
 }
 
+// Calm per-kind treatment for transcript rows. The user turn carries a faint
+// accent tint; everything else sits on neutral surfaces keyed by tokens.
+const TRANSCRIPT_TONE: Record<ConsoleMessageKind, { labelKey: string; className: string }> = {
+  user: { labelKey: 'acp.role_you', className: 'bg-pc-accent/[0.06] border-pc-accent/25' },
+  assistant: { labelKey: 'acp.role_agent', className: 'bg-pc-elevated border-pc-border' },
+  thought: { labelKey: 'acp.role_thought', className: 'bg-pc-surface border-pc-border' },
+  tool: { labelKey: 'acp.role_tool', className: 'bg-pc-code border-pc-border' },
+  system: { labelKey: 'acp.role_system', className: 'bg-pc-surface border-pc-border' },
+};
+
 function TranscriptMessage({ message }: { message: ConsoleMessage }) {
-  const tone = {
-    user: {
-      label: 'You',
-      background: 'var(--pc-accent-glow)',
-      border: 'var(--pc-accent-dim)',
-    },
-    assistant: {
-      label: 'Agent',
-      background: 'var(--pc-bg-elevated)',
-      border: 'var(--pc-border)',
-    },
-    thought: {
-      label: 'Thought',
-      background: 'var(--pc-bg-surface)',
-      border: 'var(--pc-border)',
-    },
-    tool: {
-      label: 'Tool',
-      background: 'var(--pc-bg-code)',
-      border: 'var(--pc-border)',
-    },
-    system: {
-      label: 'System',
-      background: 'var(--pc-bg-surface)',
-      border: 'var(--pc-border)',
-    },
-  }[message.kind];
+  const tone = TRANSCRIPT_TONE[message.kind];
 
   return (
-    <article
-      className="rounded-2xl border p-3"
-      style={{ background: tone.background, borderColor: tone.border }}
-    >
+    <article className={`rounded-[var(--radius-md)] border p-3 ${tone.className}`}>
       <div className="mb-2 flex items-center justify-between gap-2">
-        <div className="text-xs font-semibold uppercase tracking-wider" style={{ color: 'var(--pc-text-muted)' }}>
-          {message.title ?? tone.label}
+        <div className="text-[11px] font-semibold uppercase tracking-wide text-pc-text-muted">
+          {message.title ?? t(tone.labelKey)}
         </div>
-        <time className="text-[11px] font-mono" style={{ color: 'var(--pc-text-faint)' }}>
+        <time className="text-[11px] font-mono text-pc-text-faint">
           {message.timestamp}
         </time>
       </div>
-      <div className="whitespace-pre-wrap break-words text-sm leading-relaxed" style={{ color: 'var(--pc-text-primary)' }}>
+      <div className="whitespace-pre-wrap break-words text-sm leading-relaxed text-pc-text">
         {message.content}
       </div>
       {message.detail && (
-        <pre
-          className="mt-3 max-h-60 overflow-auto whitespace-pre-wrap rounded-lg p-2 text-xs"
-          style={{ background: 'var(--pc-bg-base)', color: 'var(--pc-text-secondary)' }}
-        >
+        <pre className="mt-3 max-h-60 overflow-auto whitespace-pre-wrap rounded-[var(--radius-sm)] bg-pc-base p-2 text-xs text-pc-text-secondary">
           {message.detail}
         </pre>
       )}
