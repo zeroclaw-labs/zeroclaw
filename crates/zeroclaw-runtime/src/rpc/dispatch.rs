@@ -42,6 +42,7 @@ pub enum Method {
     Initialize,
     Status,
     Health,
+    DoctorRun,
 
     // Sessions (agent chat lives here — session/prompt + session/update
     // notifications is the RPC equivalent of the gateway's ws/chat)
@@ -146,6 +147,7 @@ impl Method {
         (Method::Initialize, "initialize"),
         (Method::Status, "status"),
         (Method::Health, "health"),
+        (Method::DoctorRun, "doctor/run"),
         // Sessions
         (Method::SessionNew, "session/new"),
         (Method::SessionClose, "session/close"),
@@ -266,6 +268,23 @@ fn not_yet_implemented(method: Method) -> RpcResult {
         INTERNAL_ERROR,
         format!("{}: not yet implemented", method.wire_name()),
     ))
+}
+
+fn doctor_summary(results: &[DiagResult]) -> DoctorSummary {
+    DoctorSummary {
+        ok: results
+            .iter()
+            .filter(|r| r.severity == crate::doctor::Severity::Ok)
+            .count(),
+        warnings: results
+            .iter()
+            .filter(|r| r.severity == crate::doctor::Severity::Warn)
+            .count(),
+        errors: results
+            .iter()
+            .filter(|r| r.severity == crate::doctor::Severity::Error)
+            .count(),
+    }
 }
 
 fn personality_template_context(
@@ -430,6 +449,7 @@ impl RpcDispatcher {
             Method::Initialize => self.handle_initialize(&req.params).await,
             Method::Status => self.handle_status().await,
             Method::Health => self.handle_health(),
+            Method::DoctorRun => self.handle_doctor_run().await,
 
             // Sessions
             Method::SessionNew => self.handle_session_new(&req.params).await,
@@ -659,6 +679,13 @@ impl RpcDispatcher {
             );
         }
         Ok(val)
+    }
+
+    async fn handle_doctor_run(&self) -> RpcResult {
+        let config = self.ctx.config.read().clone();
+        let results = crate::doctor::run_structured(&config).await;
+        let summary = doctor_summary(&results);
+        to_result(DoctorRunResult { results, summary })
     }
 
     // ── TUI handlers ─────────────────────────────────────────────
@@ -3566,6 +3593,44 @@ mod tests {
     #[test]
     fn method_from_wire_unknown() {
         assert_eq!(Method::from_wire("nonexistent/method"), None);
+    }
+
+    #[test]
+    fn doctor_run_method_is_registered() {
+        assert_eq!(Method::from_wire("doctor/run"), Some(Method::DoctorRun));
+        assert_eq!(Method::DoctorRun.wire_name(), "doctor/run");
+    }
+
+    #[test]
+    fn doctor_summary_counts_each_severity_bucket() {
+        let results = vec![
+            DiagResult {
+                severity: crate::doctor::Severity::Ok,
+                category: "config".to_string(),
+                message: "ok".to_string(),
+            },
+            DiagResult {
+                severity: crate::doctor::Severity::Warn,
+                category: "config".to_string(),
+                message: "warning".to_string(),
+            },
+            DiagResult {
+                severity: crate::doctor::Severity::Warn,
+                category: "runtime".to_string(),
+                message: "warning".to_string(),
+            },
+            DiagResult {
+                severity: crate::doctor::Severity::Error,
+                category: "workspace".to_string(),
+                message: "error".to_string(),
+            },
+        ];
+
+        let summary = doctor_summary(&results);
+
+        assert_eq!(summary.ok, 1);
+        assert_eq!(summary.warnings, 2);
+        assert_eq!(summary.errors, 1);
     }
 
     #[test]

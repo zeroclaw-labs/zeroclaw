@@ -636,6 +636,8 @@ pub async fn agent_turn(
     model_switch_callback: Option<ModelSwitchCallback>,
     strict_tool_parsing: bool,
     parallel_tools: bool,
+    max_tool_result_chars: usize,
+    context_token_budget: usize,
     channel: Option<&dyn Channel>,
 ) -> Result<String> {
     run_tool_call_loop(
@@ -662,9 +664,9 @@ pub async fn agent_turn(
         &zeroclaw_config::schema::PacingConfig::default(),
         strict_tool_parsing,
         parallel_tools,
-        0,    // max_tool_result_chars: 0 = disabled (legacy callers)
-        0,    // context_token_budget: 0 = disabled (legacy callers)
-        None, // shared_budget: no shared budget for legacy callers
+        max_tool_result_chars,
+        context_token_budget,
+        None, // shared_budget: no shared budget for agent_turn callers
         channel,
         None, // receipt_generator
         None, // collected_receipts
@@ -3044,6 +3046,8 @@ pub async fn process_message(
                     None,
                     agent.resolved.strict_tool_parsing,
                     agent.resolved.parallel_tools,
+                    agent.resolved.max_tool_result_chars,
+                    agent.resolved.max_context_tokens,
                     None, // channel: process_message path has no channel ref
                 ),
             )
@@ -3078,6 +3082,7 @@ mod tests {
         NamedMockTool,
         CompletesAndSignalsTool,
         CancelsTurnTool,
+        VerboseTool,
     );
 
     // ── maybe_inject_channel_delivery_defaults tests ──────────────
@@ -9065,6 +9070,8 @@ This is an example, not an invocation."#;
                 None,
                 false,
                 false, // parallel_tools
+                0,     // max_tool_result_chars: disabled for test
+                0,     // context_token_budget: disabled for test
                 None,  // channel
             )
             .await
@@ -9131,6 +9138,8 @@ This is an example, not an invocation."#;
                 None,
                 true,
                 false, // parallel_tools
+                0,     // max_tool_result_chars: disabled for test
+                0,     // context_token_budget: disabled for test
                 None,  // channel
             )
             .await
@@ -9144,6 +9153,221 @@ This is an example, not an invocation."#;
             assert!(
                 !result.contains("private reasoning"),
                 "strict parser should still strip think tags from final text, got: {result}"
+            );
+        });
+    }
+
+    // ── Regression tests for trimming-budget forwarding through agent_turn ────
+
+    /// A mock tool that produces a configurable-length output string for
+    /// testing that `max_tool_result_chars` is forwarded through
+    /// `agent_turn` to `run_tool_call_loop`.
+    struct VerboseTool {
+        name: String,
+        output_len: usize,
+        invocations: Arc<AtomicUsize>,
+    }
+
+    impl VerboseTool {
+        fn new(name: &str, output_len: usize, invocations: Arc<AtomicUsize>) -> Self {
+            Self {
+                name: name.to_string(),
+                output_len,
+                invocations,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for VerboseTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "Returns a long output for trimming-budget regression tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "value": { "type": "string" }
+                }
+            })
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.invocations.fetch_add(1, Ordering::SeqCst);
+            let output = format!(
+                "verbose-start-{}-{}",
+                self.name,
+                "X".repeat(self.output_len)
+            );
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output,
+                error: None,
+            })
+        }
+    }
+
+    /// When `max_tool_result_chars` is set to a non-zero value, `agent_turn`
+    /// should forward it to `run_tool_call_loop`, which truncates oversized
+    /// tool results. This test verifies the old hardcoded-0 bug (where
+    /// trimming was silently disabled) does not regress.
+    #[test]
+    fn agent_turn_forwards_max_tool_result_chars_to_truncate_tool_result() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should initialize");
+
+        runtime.block_on(async {
+            let model_provider = ScriptedModelProvider::from_text_responses(vec![
+                r#"<tool_call>
+{"name":"verbose_checker","arguments":{"value":"check"}}
+</tool_call>"#,
+                "done",
+            ]);
+
+            let invocations = Arc::new(AtomicUsize::new(0));
+            let verbose_tool: Box<dyn Tool> = Box::new(VerboseTool::new(
+                "verbose_checker",
+                500, // produce 500+ chars of output
+                Arc::clone(&invocations),
+            ));
+            let tools_registry: Vec<Box<dyn Tool>> = vec![verbose_tool];
+            let mut history = vec![
+                ChatMessage::system("test-system"),
+                ChatMessage::user("check"),
+            ];
+            let observer = NoopObserver;
+
+            let _result = agent_turn(
+                &model_provider,
+                &mut history,
+                &tools_registry,
+                &observer,
+                "mock-provider",
+                "mock-model",
+                Some(0.0),
+                true,
+                "daemon",
+                None,
+                &zeroclaw_config::schema::MultimodalConfig::default(),
+                4,
+                None,
+                &[],
+                &[],
+                None,
+                None,
+                false,
+                false,
+                100, // max_tool_result_chars: truncate at 100 chars
+                0,   // context_token_budget: disabled
+                None,
+            )
+            .await
+            .expect("agent_turn should complete");
+
+            assert_eq!(
+                invocations.load(Ordering::SeqCst),
+                1,
+                "tool should be called once"
+            );
+
+            // The tool result in history should be truncated (contain the
+            // truncation marker "...") rather than preserving the full 500+ char output.
+            let all_content: String = history
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<&str>>()
+                .join(" ");
+
+            assert!(
+                !all_content.contains(&"X".repeat(500)),
+                "tool result should not contain 500 consecutive X chars when truncated to 100 chars"
+            );
+        });
+    }
+
+    /// Control test: when `max_tool_result_chars = 0` (disabled), the full
+    /// tool result must be preserved in history without truncation.
+    #[test]
+    fn agent_turn_with_zero_budget_preserves_full_tool_result() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should initialize");
+
+        runtime.block_on(async {
+            let model_provider = ScriptedModelProvider::from_text_responses(vec![
+                r#"<tool_call>
+{"name":"verbose_checker","arguments":{"value":"check"}}
+</tool_call>"#,
+                "done",
+            ]);
+
+            let invocations = Arc::new(AtomicUsize::new(0));
+            let verbose_tool: Box<dyn Tool> = Box::new(VerboseTool::new(
+                "verbose_checker",
+                500,
+                Arc::clone(&invocations),
+            ));
+            let tools_registry: Vec<Box<dyn Tool>> = vec![verbose_tool];
+            let mut history = vec![
+                ChatMessage::system("test-system"),
+                ChatMessage::user("check"),
+            ];
+            let observer = NoopObserver;
+
+            let _result = agent_turn(
+                &model_provider,
+                &mut history,
+                &tools_registry,
+                &observer,
+                "mock-provider",
+                "mock-model",
+                Some(0.0),
+                true,
+                "daemon",
+                None,
+                &zeroclaw_config::schema::MultimodalConfig::default(),
+                4,
+                None,
+                &[],
+                &[],
+                None,
+                None,
+                false,
+                false,
+                0, // max_tool_result_chars: disabled (no truncation)
+                0, // context_token_budget: disabled
+                None,
+            )
+            .await
+            .expect("agent_turn should complete");
+
+            assert_eq!(invocations.load(Ordering::SeqCst), 1);
+
+            // Check that the full output is preserved somewhere in history
+            // (tool results may appear under different roles depending on the
+            // message format used by run_tool_call_loop).
+            let all_content: String = history
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<&str>>()
+                .join(" ");
+
+            assert!(
+                all_content.contains(&"X".repeat(500)),
+                "full tool result should be preserved somewhere in history when max_tool_result_chars=0, \
+                 history roles: {:?}",
+                history.iter().map(|m| m.role.clone()).collect::<Vec<_>>()
             );
         });
     }
