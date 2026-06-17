@@ -90,17 +90,17 @@ Full detail: [Request lifecycle](./request-lifecycle.md).
 
 ## Extension points
 
-Trait-based extension contracts live in `zeroclaw-api`. The common first-party extension surfaces are:
+Trait-based extension contracts live in `zeroclaw-api`. For built-in providers, channels, tools, memory backends, and peripherals, start with [First-party extensions](../developing/first-party-extensions.md); the bullets below point to the closest adjacent docs.
 
-- **`ModelProvider`**: implement for a new LLM endpoint. See [Custom providers](../providers/custom.md) and [First-party extensions](../developing/first-party-extensions.md).
-- **`Channel`**: implement for a new messaging platform. Inbound and outbound are separate hooks. See [Channels overview](../channels/overview.md) and [First-party extensions](../developing/first-party-extensions.md).
-- **`Tool`**: implement for a new built-in agent capability. See [Tools overview](../tools/overview.md) and [First-party extensions](../developing/first-party-extensions.md).
-- **`Memory`**: implement for a memory backend that preserves agent/session scoping. See [First-party extensions](../developing/first-party-extensions.md).
-- **`Peripheral`**: implement for hardware boards and device surfaces. See [Hardware overview](../hardware/index.md) and [First-party extensions](../developing/first-party-extensions.md).
+- **`ModelProvider`**: use `custom` or an existing provider family for OpenAI-compatible endpoints; implement this trait when adding a new provider family, auth model, capability declaration, or wire protocol. See [Custom providers](../providers/custom.md).
+- **`Channel`**: implement for a new messaging platform. Inbound and outbound are separate hooks. See [Channels overview](../channels/overview.md).
+- **`Tool`**: implement for a new built-in agent capability. See [Tools overview](../tools/overview.md).
+- **`Memory`**: implement for a memory backend that preserves agent/session scoping.
+- **`Peripheral`**: implement for hardware boards and device surfaces. See [Hardware overview](../hardware/index.md).
 
-`Observer` and `RuntimeAdapter` are also public traits, but changes there are usually architecture-sensitive rather than ordinary adapter additions. Start with [Logging](./logging.md), [Request lifecycle](./request-lifecycle.md), and the [RFC process](../contributing/rfcs.md) before changing those contracts.
+Other public traits, including `Observer` and `RuntimeAdapter`, are lower-level contracts. Use the [architecture map](../contributing/architecture-map.md) and [RFC process](../contributing/rfcs.md) before changing them.
 
-Concrete implementations are registered through the owning factory, registry, or feature gate for that surface. The kernel depends on the trait contracts rather than concrete implementations, and compile-time feature flags decide which optional implementations ship in a given binary.
+New implementations should stay behind the `zeroclaw-api` trait contracts and wire through the owning factory, registry, or feature gate for that surface. RFC #5574 continues shrinking runtime implementation dependencies, so avoid adding new concrete runtime dependencies unless the design requires them.
 
 ## Where to read next
 
