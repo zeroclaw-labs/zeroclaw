@@ -407,14 +407,7 @@ pub fn record_last_run_with_status(
 ) -> Result<()> {
     let bounded_output = truncate_cron_output(output);
     with_initialized_connection(config, |conn| {
-        conn.execute(
-            "UPDATE cron_jobs
-             SET last_run = ?1, last_status = ?2, last_output = ?3
-             WHERE id = ?4",
-            params![finished_at.to_rfc3339(), status, bounded_output, job_id],
-        )
-        .context("Failed to update cron last run fields")?;
-        Ok(())
+        apply_last_run_state(conn, job_id, finished_at, status, &bounded_output)
     })
 }
 
@@ -542,6 +535,46 @@ pub fn record_run(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn persist_manual_run_result(
+    config: &Config,
+    job: &CronJob,
+    started_at: DateTime<Utc>,
+    finished_at: DateTime<Utc>,
+    status: &str,
+    output: Option<&str>,
+    duration_ms: i64,
+) -> Result<()> {
+    let bounded_output = output.map(truncate_cron_output);
+
+    with_initialized_connection(config, |conn| {
+        let tx = conn.unchecked_transaction()?;
+
+        insert_run_and_prune(
+            &tx,
+            config,
+            &job.id,
+            started_at,
+            finished_at,
+            status,
+            bounded_output.as_deref(),
+            duration_ms,
+        )?;
+
+        apply_last_run_state(
+            &tx,
+            &job.id,
+            finished_at,
+            status,
+            bounded_output.as_deref().unwrap_or(""),
+        )?;
+
+        tx.commit()
+            .context("Failed to commit manual cron run result transaction")?;
+        Ok(())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn persist_run_result(
     config: &Config,
     job: &CronJob,
@@ -641,6 +674,23 @@ fn insert_run_and_prune(
     )
     .context("Failed to prune cron run history")?;
 
+    Ok(())
+}
+
+fn apply_last_run_state(
+    conn: &Connection,
+    job_id: &str,
+    finished_at: DateTime<Utc>,
+    status: &str,
+    output: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE cron_jobs
+         SET last_run = ?1, last_status = ?2, last_output = ?3
+         WHERE id = ?4",
+        params![finished_at.to_rfc3339(), status, output, job_id],
+    )
+    .context("Failed to update cron last run fields")?;
     Ok(())
 }
 

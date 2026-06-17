@@ -535,73 +535,23 @@ pub async fn handle_api_cron_run(
         }
     };
 
-    let started_at = chrono::Utc::now();
-    let (mut success, output) =
-        zeroclaw_runtime::cron::scheduler::execute_job_now(&config, &job).await;
-    let finished_at = chrono::Utc::now();
-    let duration_ms = (finished_at - started_at).num_milliseconds();
-    let outcome = zeroclaw_runtime::cron::scheduler::deliver_and_classify_run_result(
+    let event_tx = Some(state.event_tx.clone());
+    let result = zeroclaw_runtime::cron::scheduler::run_manual_job(
         &config,
         &job,
-        success,
-        output,
         zeroclaw_runtime::cron::scheduler::CronDeliveryContext::GatewayManual,
+        &event_tx,
     )
     .await;
-    success = outcome.success;
-
-    if let Err(e) = zeroclaw_runtime::cron::record_run(
-        &config,
-        &job.id,
-        started_at,
-        finished_at,
-        &outcome.status,
-        Some(&outcome.output),
-        duration_ms,
-    ) {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
-            "manual cron trigger: failed to persist run history"
-        );
-    }
-    if let Err(e) = zeroclaw_runtime::cron::record_last_run_with_status(
-        &config,
-        &job.id,
-        finished_at,
-        &outcome.status,
-        &outcome.output,
-    ) {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
-            "manual cron trigger: failed to update last_run state"
-        );
-    }
-
-    // Broadcast the result so dashboard/SSE clients refresh in real time,
-    // matching the scheduler's automatic-execution behavior.
-    let _ = state.event_tx.send(serde_json::json!({
-        "type": "cron_result",
-        "job_id": job.id,
-        "success": success,
-        "output": &outcome.output,
-        "manual": true,
-        "timestamp": finished_at.to_rfc3339(),
-    }));
 
     Json(serde_json::json!({
-        "status": &outcome.status,
-        "job_id": job.id,
-        "success": success,
-        "output": &outcome.output,
-        "duration_ms": duration_ms,
-        "started_at": started_at.to_rfc3339(),
-        "finished_at": finished_at.to_rfc3339(),
+        "status": result.status,
+        "job_id": result.job_id,
+        "success": result.success,
+        "output": result.output,
+        "duration_ms": result.duration_ms,
+        "started_at": result.started_at.to_rfc3339(),
+        "finished_at": result.finished_at.to_rfc3339(),
     }))
     .into_response()
 }

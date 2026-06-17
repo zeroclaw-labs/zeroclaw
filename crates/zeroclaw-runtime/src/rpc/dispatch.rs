@@ -2258,11 +2258,22 @@ impl RpcDispatcher {
         let config = self.ctx.config.read().clone();
         let job = crate::cron::get_job(&config, &req.id)
             .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron job not found: {e}")))?;
-        let (success, output) = crate::cron::scheduler::execute_job_now(&config, &job).await;
+        let event_tx = self.ctx.event_tx.clone();
+        let result = crate::cron::scheduler::run_manual_job(
+            &config,
+            &job,
+            crate::cron::scheduler::CronDeliveryContext::RpcManual,
+            &event_tx,
+        )
+        .await;
         to_result(CronTriggerResult {
-            id: req.id,
-            success,
-            output,
+            id: result.job_id,
+            success: result.success,
+            status: result.status,
+            output: result.output,
+            duration_ms: result.duration_ms,
+            started_at: result.started_at.to_rfc3339(),
+            finished_at: result.finished_at.to_rfc3339(),
         })
     }
 
@@ -3894,13 +3905,167 @@ mod tests {
     fn make_acp_test_dispatcher(
         config: zeroclaw_config::schema::Config,
     ) -> (RpcDispatcher, Arc<crate::rpc::session::SessionStore>) {
+        make_acp_test_dispatcher_with_events(config, None)
+    }
+
+    fn make_acp_test_dispatcher_with_events(
+        config: zeroclaw_config::schema::Config,
+        event_tx: Option<tokio::sync::broadcast::Sender<Value>>,
+    ) -> (RpcDispatcher, Arc<crate::rpc::session::SessionStore>) {
         use zeroclaw_infra::session_queue::SessionActorQueue;
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
+        let mut ctx = Arc::try_unwrap(ctx)
+            .ok()
+            .expect("minimal test context should be uniquely owned");
+        ctx.event_tx = event_tx;
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
-        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        let dispatcher = RpcDispatcher::new(Arc::new(ctx), tx, "test-peer".into());
         (dispatcher, sessions)
+    }
+
+    #[tokio::test]
+    async fn cron_trigger_rpc_persists_run_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        config
+            .risk_profiles
+            .entry("test-profile".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        let job = crate::cron::add_shell_job_with_approval(
+            &config,
+            "test-agent",
+            Some("rpc-trigger".into()),
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo rpc-trigger-ok",
+            None,
+            true,
+        )
+        .expect("test cron job should be created");
+        let (dispatcher, _sessions) = make_acp_test_dispatcher(config.clone());
+
+        let value = dispatcher
+            .handle_cron_trigger(&json!({ "id": job.id }))
+            .await
+            .expect("cron/trigger should succeed");
+
+        assert_eq!(value["id"], job.id);
+        assert_eq!(value["success"], true);
+        assert_eq!(value["status"], "ok");
+        assert!(
+            value["output"]
+                .as_str()
+                .unwrap_or("")
+                .contains("rpc-trigger-ok")
+        );
+
+        let updated = crate::cron::get_job(&config, &job.id).expect("job should still exist");
+        assert_eq!(updated.last_status.as_deref(), Some("ok"));
+        assert!(
+            updated
+                .last_output
+                .as_deref()
+                .is_some_and(|output| output.contains("rpc-trigger-ok"))
+        );
+
+        let runs =
+            crate::cron::list_runs(&config, &job.id, 10).expect("RPC trigger should persist runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "ok");
+        assert!(
+            runs[0]
+                .output
+                .as_deref()
+                .unwrap_or("")
+                .contains("rpc-trigger-ok")
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_trigger_rpc_reports_degraded_status_and_broadcasts() {
+        crate::cron::scheduler::register_delivery_fn(Box::new(
+            |_config, channel, _target, _thread_id, _output| {
+                Box::pin(async move {
+                    if channel == "fail-delivery" {
+                        anyhow::bail!("synthetic delivery failure");
+                    }
+                    Ok(())
+                })
+            },
+        ));
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        config
+            .risk_profiles
+            .entry("test-profile".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        let job = crate::cron::add_shell_job_with_approval(
+            &config,
+            "test-agent",
+            Some("rpc-trigger-degraded".into()),
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "echo rpc-trigger-degraded",
+            Some(crate::cron::DeliveryConfig {
+                mode: "announce".into(),
+                channel: Some("fail-delivery".into()),
+                to: Some("123456".into()),
+                thread_id: None,
+                best_effort: true,
+            }),
+            true,
+        )
+        .expect("test cron job should be created");
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(8);
+        let (dispatcher, _sessions) =
+            make_acp_test_dispatcher_with_events(config.clone(), Some(event_tx));
+
+        let value = dispatcher
+            .handle_cron_trigger(&json!({ "id": job.id }))
+            .await
+            .expect("cron/trigger should succeed");
+
+        assert_eq!(value["id"], job.id);
+        assert_eq!(value["success"], true);
+        assert_eq!(value["status"], "degraded");
+        assert!(
+            value["output"]
+                .as_str()
+                .unwrap_or("")
+                .contains("delivery failed:")
+        );
+        assert!(value["duration_ms"].as_i64().is_some());
+        assert!(value["started_at"].as_str().unwrap_or("").contains('T'));
+        assert!(value["finished_at"].as_str().unwrap_or("").contains('T'));
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("cron trigger should broadcast")
+            .expect("broadcast channel should stay open");
+        assert_eq!(event["type"], "cron_result");
+        assert_eq!(event["job_id"], job.id);
+        assert_eq!(event["success"], true);
+        assert_eq!(event["manual"], true);
+        assert!(
+            event["output"]
+                .as_str()
+                .unwrap_or("")
+                .contains("delivery failed:")
+        );
+
+        let runs =
+            crate::cron::list_runs(&config, &job.id, 10).expect("RPC trigger should persist runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "degraded");
     }
 
     #[tokio::test]

@@ -1,7 +1,6 @@
 use crate::cron::{self, JobType};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
-use chrono::Utc;
 use serde_json::json;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolResult};
@@ -114,47 +113,23 @@ impl Tool for CronRunTool {
             });
         }
 
-        let started_at = Utc::now();
-        let (mut success, output) =
-            Box::pin(cron::scheduler::execute_job_now(&self.config, &job)).await;
-        let finished_at = Utc::now();
-        let duration_ms = (finished_at - started_at).num_milliseconds();
-        let outcome = cron::scheduler::deliver_and_classify_run_result(
+        let result = cron::scheduler::run_manual_job(
             &self.config,
             &job,
-            success,
-            output,
             cron::scheduler::CronDeliveryContext::ToolManual,
+            &None,
         )
         .await;
-        success = outcome.success;
-
-        let _ = cron::record_run(
-            &self.config,
-            &job.id,
-            started_at,
-            finished_at,
-            &outcome.status,
-            Some(&outcome.output),
-            duration_ms,
-        );
-        let _ = cron::record_last_run_with_status(
-            &self.config,
-            &job.id,
-            finished_at,
-            &outcome.status,
-            &outcome.output,
-        );
 
         Ok(ToolResult {
-            success,
+            success: result.success,
             output: serde_json::to_string_pretty(&json!({
-                "job_id": job.id,
-                "status": outcome.status,
-                "duration_ms": duration_ms,
-                "output": outcome.output
+                "job_id": result.job_id,
+                "status": result.status,
+                "duration_ms": result.duration_ms,
+                "output": result.output
             }))?,
-            error: if success {
+            error: if result.success {
                 None
             } else {
                 Some("cron job execution failed".to_string())
