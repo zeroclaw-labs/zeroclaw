@@ -452,3 +452,128 @@ pub async fn execute_tools_sequential(
     slots.resize_with(tool_calls.len(), || None);
     Ok(slots)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::execute_one_tool;
+    use crate::observability::noop::NoopObserver;
+    use crate::tools::ActivatedToolSet;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use zeroclaw_api::tool::Tool;
+
+    /// Minimal tool that records invocations. Used to verify that the
+    /// poisoned-lock recovery path still resolves an activated tool and
+    /// calls its execute method successfully.
+    struct CountingTool {
+        name: String,
+        invocations: Arc<AtomicUsize>,
+    }
+
+    impl CountingTool {
+        fn new(name: &str, invocations: Arc<AtomicUsize>) -> Self {
+            Self {
+                name: name.to_string(),
+                invocations,
+            }
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for CountingTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+        fn alias(&self) -> &str {
+            "test-counting-tool"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for CountingTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "Counts executions for poisoned-lock tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            })
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+            self.invocations.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "executed via poisoned lock recovery".into(),
+                error: None,
+            })
+        }
+    }
+
+    /// Regression: execute_one_tool must recover a poisoned
+    /// ActivatedToolSet mutex and still resolve the activated tool
+    /// instead of panicking.
+    ///
+    /// Before the fix, the code used `.lock().unwrap()`, which panics
+    /// on a poisoned mutex. The recovery path (`into_inner()`) allows
+    /// the turn to proceed with the last valid state of the activated
+    /// tool set.
+    #[tokio::test]
+    async fn execute_one_tool_recovers_poisoned_activated_tool_lock() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let activated_tool: Arc<dyn Tool> = Arc::new(CountingTool::new(
+            "docker-mcp__extract_text",
+            Arc::clone(&invocations),
+        ));
+        activated
+            .lock()
+            .unwrap()
+            .activate("docker-mcp__extract_text".into(), activated_tool);
+
+        // Poison the mutex by panicking while holding the lock in a
+        // separate thread.
+        let poisoned = Arc::clone(&activated);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().expect("test mutex should lock");
+            panic!("deliberately poison the activated-tools lock");
+        })
+        .join();
+
+        // execute_one_tool must recover the poisoned lock and resolve
+        // the activated tool without panicking.
+        let outcome = execute_one_tool(
+            "docker-mcp__extract_text",
+            serde_json::json!({}),
+            None,
+            &[],  // no static tools — force activated-tools path
+            Some(&activated),
+            &NoopObserver,
+            None,
+            None,
+        )
+        .await
+        .expect("execute_one_tool should recover from poisoned lock");
+
+        assert!(
+            outcome.success,
+            "activated tool execution should succeed after poisoned lock recovery"
+        );
+        assert!(
+            outcome.output.contains("executed via poisoned lock recovery"),
+            "tool output should come from the recovered activated tool"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "recovered activated tool should have been invoked exactly once"
+        );
+    }
+}
