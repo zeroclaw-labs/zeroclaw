@@ -36,7 +36,6 @@ use zeroclaw_api::model_provider::ConversationMessage;
 use zeroclaw_config::schema::Config;
 use zeroclaw_infra::acp_session_store::AcpSessionStore;
 use zeroclaw_runtime::agent::agent::{Agent, TurnEvent};
-use zeroclaw_runtime::agent::history_pruner::HISTORY_PRUNER_MARKER_PREFIX;
 use zeroclaw_runtime::tools::CanvasStore;
 
 use crate::acp_channel::AcpChannel;
@@ -2029,7 +2028,9 @@ fn history_notifications_for_message(
 ) -> Vec<JsonRpcNotification> {
     match msg {
         ConversationMessage::Chat(chat) => {
-            if chat.role == "assistant" && chat.content.starts_with(HISTORY_PRUNER_MARKER_PREFIX) {
+            if chat.role == "assistant"
+                && zeroclaw_runtime::agent::history_pruner::is_history_pruner_marker(&chat.content)
+            {
                 return vec![JsonRpcNotification {
                     jsonrpc: "2.0",
                     method: "session/update",
@@ -3392,8 +3393,10 @@ mod tests {
     #[test]
     fn history_pruner_marker_replays_as_tool_call_not_agent_message() {
         use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
-        let marker =
-            format!("{HISTORY_PRUNER_MARKER_PREFIX}3 tool call(s); results dropped from context]");
+        let marker = format!(
+            "{}3 tool call(s); results dropped from context]",
+            zeroclaw_runtime::agent::history_pruner::HISTORY_PRUNER_MARKER_PREFIX
+        );
         let msg = ConversationMessage::Chat(ChatMessage::assistant(&marker));
         let notes = history_notifications_for_message("sess-x", &msg);
         assert_eq!(notes.len(), 1);
@@ -3407,6 +3410,17 @@ mod tests {
         assert_eq!(
             plain_notes[0].params["update"]["sessionUpdate"],
             "agent_message_chunk"
+        );
+
+        // Sessions pruned before #7684 carry the legacy marker; they must still
+        // replay as the styled tool_call, not leak the raw marker as agent text.
+        let legacy = ConversationMessage::Chat(ChatMessage::assistant(
+            "[Tool exchange: 3 tool call(s) results collapsed]",
+        ));
+        let legacy_notes = history_notifications_for_message("sess-x", &legacy);
+        assert_eq!(
+            legacy_notes[0].params["update"]["sessionUpdate"],
+            "tool_call"
         );
     }
 

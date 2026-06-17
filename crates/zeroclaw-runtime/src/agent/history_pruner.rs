@@ -67,9 +67,20 @@ pub struct PrunedOrphans {
 
 pub const HISTORY_PRUNER_MARKER_PREFIX: &str = "[history-pruner: collapsed ";
 
+// Pre-#7684 marker. Persisted sessions pruned before the rename still carry it;
+// detection stays backward-compatible so old summaries are not re-pruned and do
+// not replay as raw assistant text.
+const LEGACY_TOOL_EXCHANGE_PREFIX: &str = "[Tool exchange:";
+
+pub fn is_history_pruner_marker(content: &str) -> bool {
+    is_tool_exchange_summary(content)
+}
+
 fn is_tool_exchange_summary(content: &str) -> bool {
-    content.starts_with(HISTORY_PRUNER_MARKER_PREFIX)
-        && content.contains("results dropped from context]")
+    (content.starts_with(HISTORY_PRUNER_MARKER_PREFIX)
+        && content.contains("results dropped from context]"))
+        || (content.starts_with(LEGACY_TOOL_EXCHANGE_PREFIX)
+            && content.contains("results collapsed]"))
 }
 
 fn assistant_tool_calls_have_immediate_results(
@@ -806,6 +817,20 @@ mod tests {
             "pruned roles should not contain adjacent assistants: {:?}",
             messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn legacy_tool_exchange_marker_still_detected() {
+        assert!(is_tool_exchange_summary(
+            "[Tool exchange: 2 tool call(s) results collapsed]"
+        ));
+        assert!(is_history_pruner_marker(
+            "[Tool exchange: 2 tool call(s) results collapsed]"
+        ));
+        assert!(is_tool_exchange_summary(
+            "[history-pruner: collapsed 2 tool call(s); results dropped from context]"
+        ));
+        assert!(!is_tool_exchange_summary("[Tool exchange: in progress]"));
     }
 
     #[test]
