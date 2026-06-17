@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Power } from 'lucide-react';
 import { patchConfig } from '@/lib/api';
+import { t } from '@/lib/i18n';
 
 export interface EntityEnabledToggleProps {
   /** Dotted prefix of the entity (`agents.clamps`, `channels.discord.clamps`, …).
@@ -48,7 +49,7 @@ export default function EntityEnabledToggle({
         onClick={flip}
         disabled={busy}
         aria-pressed={enabled}
-        aria-label={enabled ? 'Disable' : 'Enable'}
+        aria-label={enabled ? t('entity_toggle.disable') : t('entity_toggle.enable')}
         className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors disabled:opacity-50"
         style={{
           background: enabled
@@ -64,7 +65,7 @@ export default function EntityEnabledToggle({
         }}
       >
         <Power className="h-3.5 w-3.5" />
-        {enabled ? 'enabled' : 'disabled'}
+        {enabled ? t('entity_toggle.enabled') : t('entity_toggle.disabled')}
       </button>
       {error && (
         <span
@@ -72,7 +73,7 @@ export default function EntityEnabledToggle({
           style={{ color: 'var(--color-status-error)' }}
           title={error}
         >
-          save failed
+          {t('entity_toggle.save_failed')}
         </span>
       )}
     </div>

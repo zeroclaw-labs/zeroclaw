@@ -42,6 +42,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 
 /// Resolve a `cli-*` Fluent key for CLI output. Routes through the runtime
@@ -70,6 +71,21 @@ fn ta(key: &str, args: &[(&str, &str)], fallback: &str) -> String {
     {
         fallback.to_string() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
     }
+}
+
+#[cfg(feature = "agent-runtime")]
+fn qta(key: &str, args: &[(&str, &str)]) -> String {
+    zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_row(key: &str, glyph: &str, summary: &str) -> String {
+    qta(key, &[("glyph", glyph), ("summary", summary)])
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_step_label(step: zeroclaw_runtime::quickstart::QuickstartStep) -> String {
+    t(step.label_key(), step.label())
 }
 
 /// Decorate the value at `path` in `config.toml` with a leading `# {comment}`
@@ -1280,35 +1296,46 @@ async fn run_quickstart_cli(
         // Render selector list with current status / summary.
         let glyph = |ok: bool| if ok { "[✓]" } else { "[ ]" };
         let provider_summary = match &form.provider {
-            None => "not yet chosen".to_string(),
+            None => t("cli-quickstart-summary-not-yet-chosen", "not yet chosen"),
             Some(ProviderChoice::Fresh {
                 display_name,
                 alias,
                 model,
                 ..
-            }) => format!("{display_name} (alias: {alias}, model: {model})"),
-            Some(ProviderChoice::Existing { alias_ref }) => {
-                format!("use existing {alias_ref}")
-            }
+            }) => qta(
+                "cli-quickstart-summary-provider-fresh",
+                &[("name", display_name), ("alias", alias), ("model", model)],
+            ),
+            Some(ProviderChoice::Existing { alias_ref }) => qta(
+                "cli-quickstart-summary-use-existing",
+                &[("reference", alias_ref)],
+            ),
         };
         let preset_summary = |p: &Option<PresetChoice>| -> String {
             match p {
-                None => "not yet chosen".to_string(),
-                Some(PresetChoice::Fresh(name)) => format!("preset: {name}"),
-                Some(PresetChoice::Existing(a)) => format!("use existing {a}"),
+                None => t("cli-quickstart-summary-not-yet-chosen", "not yet chosen"),
+                Some(PresetChoice::Fresh(name)) => {
+                    qta("cli-quickstart-summary-preset-fresh", &[("name", name)])
+                }
+                Some(PresetChoice::Existing(a)) => {
+                    qta("cli-quickstart-summary-use-existing", &[("reference", a)])
+                }
             }
         };
         let memory_summary = match &form.memory {
-            None => "not yet chosen".to_string(),
+            None => t("cli-quickstart-summary-not-yet-chosen", "not yet chosen"),
             Some(kind) => serde_json::to_value(kind)
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_string))
                 .unwrap_or_else(|| format!("{kind:?}").to_lowercase()),
         };
         let channels_summary = if !form.channels_visited {
-            "not yet visited".to_string()
+            t("cli-quickstart-summary-not-yet-visited", "not yet visited")
         } else if form.channels.is_empty() {
-            "none (chat via `zeroclaw agent` only)".to_string()
+            t(
+                "cli-quickstart-summary-channels-none",
+                "none (chat via `zeroclaw agent` only)",
+            )
         } else {
             form.channels
                 .iter()
@@ -1320,16 +1347,21 @@ async fn run_quickstart_cli(
                 .join(", ")
         };
         let agent_summary = match &form.agent {
-            None => "not yet named".to_string(),
-            Some(a) => format!(
-                "alias: {}, system prompt: {} chars, {} personality file(s)",
-                a.name,
-                a.system_prompt.len(),
-                a.personality_files.len(),
+            None => t("cli-quickstart-summary-not-yet-named", "not yet named"),
+            Some(a) => qta(
+                "cli-quickstart-summary-agent",
+                &[
+                    ("alias", &a.name),
+                    ("chars", &a.system_prompt.len().to_string()),
+                    ("files", &a.personality_files.len().to_string()),
+                ],
             ),
         };
         let peer_groups_summary = if form.peer_groups.is_empty() {
-            "none — channels accept no peers".to_string()
+            t(
+                "cli-quickstart-summary-peer-groups-none",
+                "none — channels accept no peers",
+            )
         } else {
             form.peer_groups
                 .iter()
@@ -1338,31 +1370,37 @@ async fn run_quickstart_cli(
                 .join(", ")
         };
 
+        let risk_summary = preset_summary(&form.risk);
         let mut labels: Vec<String> = vec![
-            format!(
-                "{} Model provider     — {provider_summary}",
-                glyph(form.provider_done())
+            quickstart_row(
+                "cli-quickstart-row-model-provider",
+                glyph(form.provider_done()),
+                &provider_summary,
             ),
-            format!(
-                "{} Risk profile       — {}",
+            quickstart_row(
+                "cli-quickstart-row-risk-profile",
                 glyph(form.risk_done()),
-                preset_summary(&form.risk)
+                &risk_summary,
             ),
-            format!(
-                "{} Memory             — {memory_summary}",
-                glyph(form.memory_done())
+            quickstart_row(
+                "cli-quickstart-row-memory",
+                glyph(form.memory_done()),
+                &memory_summary,
             ),
-            format!(
-                "{} Channels (0..N)    — {channels_summary}",
-                glyph(form.channels_done())
+            quickstart_row(
+                "cli-quickstart-row-channels",
+                glyph(form.channels_done()),
+                &channels_summary,
             ),
-            format!(
-                "{} Peer groups        — {peer_groups_summary}",
-                glyph(form.peer_groups_done())
+            quickstart_row(
+                "cli-quickstart-row-peer-groups",
+                glyph(form.peer_groups_done()),
+                &peer_groups_summary,
             ),
-            format!(
-                "{} Agent identity     — {agent_summary}",
-                glyph(form.agent_done())
+            quickstart_row(
+                "cli-quickstart-row-agent-identity",
+                glyph(form.agent_done()),
+                &agent_summary,
             ),
         ];
         let create_enabled = form.all_done();
@@ -1469,14 +1507,17 @@ async fn run_quickstart_cli(
                     .iter()
                     .map(|p| {
                         if p.local {
-                            format!("{} (local)", p.display_name)
+                            qta(
+                                "cli-quickstart-provider-local-label",
+                                &[("name", &p.display_name)],
+                            )
                         } else {
                             p.display_name.clone()
                         }
                     })
                     .collect();
                 let Some(pi) = FuzzySelect::new()
-                    .with_prompt("Provider type")
+                    .with_prompt(t("cli-quickstart-provider-type-prompt", "Provider type"))
                     .items(&prov_labels)
                     .default(0)
                     .max_length(prov_labels.len().max(1))
@@ -1486,9 +1527,15 @@ async fn run_quickstart_cli(
                 };
                 let chosen = &providers[pi];
                 let Ok(alias) = Input::<String>::new()
-                    .with_prompt(format!("Alias for {}", chosen.display_name))
+                    .with_prompt(qta(
+                        "cli-quickstart-alias-for",
+                        &[("name", &chosen.display_name)],
+                    ))
                     .default("default".to_string())
                     .allow_empty(false)
+                    .validate_with(|input: &String| {
+                        zeroclaw_config::helpers::validate_alias_key(input)
+                    })
                     .interact_text()
                 else {
                     continue;
@@ -1547,12 +1594,17 @@ async fn run_quickstart_cli(
                     // intentionally alarming — if a user ever sees it
                     // there's a schema regression worth filing.
                     eprintln!(
-                        "WARN: schema produced no `model` field for `{}` — \
-                         falling back to manual entry. Please report this.",
-                        chosen.kind,
+                        "{}",
+                        qta(
+                            "cli-quickstart-model-field-missing-warning",
+                            &[("provider", &chosen.kind)],
+                        )
                     );
                     let Ok(m) = Input::<String>::new()
-                        .with_prompt(format!("Model id for {}", chosen.display_name))
+                        .with_prompt(qta(
+                            "cli-quickstart-model-id-for",
+                            &[("name", &chosen.display_name)],
+                        ))
                         .allow_empty(false)
                         .interact_text()
                     else {
@@ -1570,7 +1622,7 @@ async fn run_quickstart_cli(
             }
             Action::Risk => {
                 let chosen = pick_preset(
-                    "Risk profile",
+                    &t("cli-quickstart-risk-profile-prompt", "Risk profile"),
                     RISK_PRESETS
                         .iter()
                         .map(|p| (p.preset_name, p.label, p.help))
@@ -1617,7 +1669,7 @@ async fn run_quickstart_cli(
                     })
                     .collect();
                 let Some(i) = FuzzySelect::new()
-                    .with_prompt("Memory backend")
+                    .with_prompt(t("cli-quickstart-memory-backend-prompt", "Memory backend"))
                     .items(&labels)
                     .default(0)
                     .max_length(labels.len().max(1))
@@ -1634,18 +1686,26 @@ async fn run_quickstart_cli(
                         .channels
                         .iter()
                         .map(|c| match c {
-                            ChannelChoice::Fresh { kind, alias, .. } => {
-                                format!("  {kind}.{alias} (remove)")
-                            }
-                            ChannelChoice::Existing { alias_ref } => {
-                                format!("  {alias_ref} (remove)")
-                            }
+                            ChannelChoice::Fresh { kind, alias, .. } => qta(
+                                "cli-quickstart-channel-remove-row",
+                                &[("reference", &format!("{kind}.{alias}"))],
+                            ),
+                            ChannelChoice::Existing { alias_ref } => qta(
+                                "cli-quickstart-channel-remove-row",
+                                &[("reference", alias_ref)],
+                            ),
                         })
                         .collect();
-                    items.push("+ Add a channel".to_string());
-                    items.push("Done (channels selector counts as visited)".to_string());
+                    items.push(t("cli-quickstart-add-channel", "+ Add a channel"));
+                    items.push(t(
+                        "cli-quickstart-channels-done",
+                        "Done (channels selector counts as visited)",
+                    ));
                     let Some(i) = FuzzySelect::new()
-                        .with_prompt("Channels (optional, 0..N)")
+                        .with_prompt(t(
+                            "cli-quickstart-channels-prompt",
+                            "Channels (optional, 0..N)",
+                        ))
                         .items(&items)
                         .default(items.len().saturating_sub(2))
                         .max_length(items.len())
@@ -1662,16 +1722,19 @@ async fn run_quickstart_cli(
                         let mut mode_labels: Vec<String> = Vec::new();
                         let mut mode_kinds: Vec<&str> = Vec::new();
                         if !state.unassigned_channels.is_empty() {
-                            mode_labels.push("Use existing".to_string());
+                            mode_labels.push(t("cli-quickstart-use-existing", "Use existing"));
                             mode_kinds.push("existing");
                         }
-                        mode_labels.push("Create new".to_string());
+                        mode_labels.push(t("cli-quickstart-create-new", "Create new"));
                         mode_kinds.push("fresh");
                         let mode = if mode_labels.len() == 1 {
                             Some(0)
                         } else {
                             FuzzySelect::new()
-                                .with_prompt("Channel source")
+                                .with_prompt(t(
+                                    "cli-quickstart-channel-source-prompt",
+                                    "Channel source",
+                                ))
                                 .items(&mode_labels)
                                 .default(0)
                                 .max_length(mode_labels.len())
@@ -1688,15 +1751,19 @@ async fn run_quickstart_cli(
                             let labels: Vec<String> = state.unassigned_channels.clone();
                             if labels.is_empty() {
                                 println!(
-                                    "  Every configured channel is already \
-                                     bound to an agent. Free one with \
-                                     `zeroclaw config set agents.<alias>.channels \
-                                     ...` before reusing it here."
+                                    "{}",
+                                    t(
+                                        "cli-quickstart-all-channels-bound",
+                                        "  Every configured channel is already bound to an agent. Free one with `zeroclaw config set agents.<alias>.channels ...` before reusing it here.",
+                                    )
                                 );
                                 continue;
                             }
                             let Some(ei) = FuzzySelect::new()
-                                .with_prompt("Pick a configured channel")
+                                .with_prompt(t(
+                                    "cli-quickstart-pick-configured-channel",
+                                    "Pick a configured channel",
+                                ))
                                 .items(&labels)
                                 .default(0)
                                 .max_length(labels.len().max(1))
@@ -1724,7 +1791,7 @@ async fn run_quickstart_cli(
                             .map(|c| c.display_name.clone())
                             .collect();
                         let Some(ci) = FuzzySelect::new()
-                            .with_prompt("Channel type")
+                            .with_prompt(t("cli-quickstart-channel-type-prompt", "Channel type"))
                             .items(&labels)
                             .default(0)
                             .max_length(labels.len().max(1))
@@ -1734,7 +1801,10 @@ async fn run_quickstart_cli(
                         };
                         let chosen = &channel_types[ci];
                         let Ok(alias) = Input::<String>::new()
-                            .with_prompt(format!("Alias for {}", chosen.display_name))
+                            .with_prompt(qta(
+                                "cli-quickstart-alias-for",
+                                &[("name", &chosen.display_name)],
+                            ))
                             .default(chosen.kind.clone())
                             .allow_empty(false)
                             .interact_text()
@@ -1800,21 +1870,26 @@ async fn run_quickstart_cli(
                         .peer_groups
                         .iter()
                         .map(|pg| {
-                            format!(
-                                "{} → {} ({} peers)",
-                                pg.channel,
-                                pg.name,
-                                pg.external_peers.len()
+                            qta(
+                                "cli-quickstart-peer-group-row",
+                                &[
+                                    ("channel", &pg.channel),
+                                    ("name", &pg.name),
+                                    ("count", &pg.external_peers.len().to_string()),
+                                ],
                             )
                         })
                         .collect();
                     let drafts = items.len();
                     if !available.is_empty() {
-                        items.push("+ Add peer group".into());
+                        items.push(t("cli-quickstart-add-peer-group", "+ Add peer group"));
                     }
-                    items.push("Done".into());
+                    items.push(t("cli-quickstart-done", "Done"));
                     let Some(pick) = FuzzySelect::new()
-                        .with_prompt("Peer groups (Enter on a row to remove, + Add to create)")
+                        .with_prompt(t(
+                            "cli-quickstart-peer-groups-prompt",
+                            "Peer groups (Enter on a row to remove, + Add to create)",
+                        ))
                         .items(&items)
                         .default(items.len() - 1)
                         .max_length(items.len())
@@ -1828,7 +1903,10 @@ async fn run_quickstart_cli(
                     }
                     if pick == drafts && !available.is_empty() {
                         let Some(ch_idx) = FuzzySelect::new()
-                            .with_prompt("Channel to authorize")
+                            .with_prompt(t(
+                                "cli-quickstart-channel-to-authorize-prompt",
+                                "Channel to authorize",
+                            ))
                             .items(&available)
                             .default(0)
                             .max_length(available.len())
@@ -1843,9 +1921,10 @@ async fn run_quickstart_cli(
                         };
                         let name = format!("{ch_type}_{ch_alias}_default");
                         let Ok(peers_raw) = Input::<String>::new()
-                            .with_prompt(
+                            .with_prompt(t(
+                                "cli-quickstart-external-peers-prompt",
                                 "External peers (comma- or newline-separated, blank for none)",
-                            )
+                            ))
                             .allow_empty(true)
                             .interact_text()
                         else {
@@ -1885,8 +1964,11 @@ async fn run_quickstart_cli(
                     .map(|a| a.name.clone())
                     .unwrap_or_default();
                 let mut input = Input::<String>::new()
-                    .with_prompt("Agent alias")
-                    .allow_empty(false);
+                    .with_prompt(t("cli-quickstart-agent-alias-prompt", "Agent alias"))
+                    .allow_empty(false)
+                    .validate_with(|input: &String| {
+                        zeroclaw_config::helpers::validate_alias_key(input)
+                    });
                 if !default_name.is_empty() {
                     input = input.default(default_name);
                 }
@@ -1899,7 +1981,10 @@ async fn run_quickstart_cli(
                     .map(|a| a.system_prompt.clone())
                     .unwrap_or_default();
                 let edit = Confirm::new()
-                    .with_prompt("Edit system prompt in $EDITOR? (blank if you skip)")
+                    .with_prompt(t(
+                        "cli-quickstart-edit-system-prompt",
+                        "Edit system prompt in $EDITOR? (blank if you skip)",
+                    ))
                     .default(false)
                     .interact_opt()?;
                 if let Some(true) = edit
@@ -1947,17 +2032,26 @@ async fn run_quickstart_cli(
                     Skip,
                 }
                 impl PersonalityAction {
-                    fn label(self, has_staged: bool) -> &'static str {
+                    fn label(self, has_staged: bool) -> String {
                         match self {
-                            Self::StartWithTemplate => "Start with template (open in $EDITOR)",
+                            Self::StartWithTemplate => t(
+                                "cli-quickstart-personality-start-template",
+                                "Start with template (open in $EDITOR)",
+                            ),
                             Self::StartFromScratch => {
                                 if has_staged {
-                                    "Start from current content (open in $EDITOR)"
+                                    t(
+                                        "cli-quickstart-personality-start-current",
+                                        "Start from current content (open in $EDITOR)",
+                                    )
                                 } else {
-                                    "Start from scratch (open in $EDITOR)"
+                                    t(
+                                        "cli-quickstart-personality-start-scratch",
+                                        "Start from scratch (open in $EDITOR)",
+                                    )
                                 }
                             }
-                            Self::Skip => "Skip",
+                            Self::Skip => t("cli-quickstart-personality-skip", "Skip"),
                         }
                     }
                 }
@@ -1983,18 +2077,29 @@ async fn run_quickstart_cli(
                     actions.push(PersonalityAction::StartFromScratch);
                     actions.push(PersonalityAction::Skip);
                     let has_staged = !staged.is_empty();
-                    let choices: Vec<&str> = actions.iter().map(|a| a.label(has_staged)).collect();
+                    let choices: Vec<String> =
+                        actions.iter().map(|a| a.label(has_staged)).collect();
                     let position = if files.len() > 1 {
                         format!(" [{}/{}]", idx + 1, files.len())
                     } else {
                         String::new()
                     };
                     let back_hint = if idx > 0 {
-                        " (Esc to go back)"
+                        t("cli-quickstart-esc-go-back", " (Esc to go back)")
                     } else {
-                        " (Esc to return to checklist)"
+                        t(
+                            "cli-quickstart-esc-return-checklist",
+                            " (Esc to return to checklist)",
+                        )
                     };
-                    let label = format!("{filename}{position} — what next?{back_hint}");
+                    let label = qta(
+                        "cli-quickstart-personality-file-prompt",
+                        &[
+                            ("filename", filename),
+                            ("position", &position),
+                            ("back_hint", &back_hint),
+                        ],
+                    );
                     let Some(pick) = FuzzySelect::new()
                         .with_prompt(label)
                         .items(&choices)
@@ -2145,8 +2250,11 @@ async fn run_quickstart_cli(
             println!();
             println!("{}", t("cli-next-steps", "Next steps:"));
             println!(
-                "  zeroclaw agent -a {}  # chat with this agent in your terminal",
-                applied.alias
+                "{}",
+                qta(
+                    "cli-quickstart-next-agent-command",
+                    &[("alias", &applied.alias)]
+                )
             );
             if which_zerocode_on_path() {
                 println!("  zerocode                   # launch the TUI"); // i18n-exempt: literal command/identifier example
@@ -2163,16 +2271,23 @@ async fn run_quickstart_cli(
                 )
             );
             eprintln!(
-                "Your existing config is untouched. Fix the following and run quickstart again:"
+                "{}",
+                t(
+                    "cli-quickstart-fix-and-rerun",
+                    "Your existing config is untouched. Fix the following and run quickstart again:",
+                )
             );
             eprintln!();
             for e in &errs {
-                eprintln!("  • {}: {}", e.step.label(), e.message);
+                eprintln!("  • {}: {}", quickstart_step_label(e.step), e.message);
             }
             eprintln!();
             anyhow::bail!(
-                "quickstart could not finish: {} problem(s) to fix",
-                errs.len()
+                "{}",
+                qta(
+                    "cli-quickstart-could-not-finish",
+                    &[("count", &errs.len().to_string())],
+                )
             )
         }
     }
@@ -2330,10 +2445,10 @@ fn pick_preset(
     let mut mode_labels: Vec<String> = Vec::new();
     let mut mode_kinds: Vec<&str> = Vec::new();
     if !existing.is_empty() {
-        mode_labels.push("Use existing".to_string());
+        mode_labels.push(t("cli-quickstart-use-existing", "Use existing"));
         mode_kinds.push("existing");
     }
-    mode_labels.push("Pick a preset".to_string());
+    mode_labels.push(t("cli-quickstart-pick-preset", "Pick a preset"));
     mode_kinds.push("preset");
     let mode = if mode_labels.len() == 1 {
         Some(0)
@@ -2348,7 +2463,10 @@ fn pick_preset(
     let Some(mi) = mode else { return Ok(None) };
     if mode_kinds[mi] == "existing" {
         let Some(i) = FuzzySelect::new()
-            .with_prompt(format!("Pick an existing {prompt}"))
+            .with_prompt(qta(
+                "cli-quickstart-pick-existing-prompt",
+                &[("prompt", prompt)],
+            ))
             .items(existing)
             .default(0)
             .max_length(existing.len().max(1))
@@ -2363,7 +2481,10 @@ fn pick_preset(
         .map(|(_, label, help)| format!("{label}  —  {help}"))
         .collect();
     let Some(i) = FuzzySelect::new()
-        .with_prompt(format!("Pick a {prompt} preset"))
+        .with_prompt(qta(
+            "cli-quickstart-pick-preset-prompt",
+            &[("prompt", prompt)],
+        ))
         .items(&labels)
         .default(0)
         .max_length(labels.len().max(1))
@@ -3669,10 +3790,34 @@ async fn main() -> Result<()> {
                 let canvas_store_for_channels = canvas_store_for_channels.clone();
                 let mut registry = daemon::DaemonRegistry::new();
 
+                // Build SOP engine + audit per iteration from current_config.
+                // This ensures reload picks up config changes (new sops_dir,
+                // changed path, or removed sops_dir).
+                let (sop_engine, sop_audit) = if current_config.sop.sops_dir.is_some() {
+                    let mem: Arc<dyn zeroclaw_memory::Memory> =
+                        Arc::from(zeroclaw_memory::create_memory(
+                            &current_config.memory,
+                            &current_config.data_dir,
+                            None,
+                        )?);
+                    let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
+                        current_config.sop.clone(),
+                        &current_config.data_dir,
+                        mem,
+                    );
+                    (Some(engine), Some(audit))
+                } else {
+                    (None, None)
+                };
+
                 #[cfg(feature = "gateway")]
-                registry.register_gateway(Box::new(
+                registry.register_gateway(Box::new({
+                    let sop_e = sop_engine.clone();
+                    let sop_a = sop_audit.clone();
                     move |host, port, config, tx, reload_tx, tui_registry| {
                         let canvas_store = canvas_store_for_gateway.clone();
+                        let sop_engine = sop_e.clone();
+                        let sop_audit = sop_a.clone();
                         Box::pin(async move {
                             Box::pin(zeroclaw_gateway::run_gateway(
                                 &host,
@@ -3682,50 +3827,63 @@ async fn main() -> Result<()> {
                                 reload_tx,
                                 tui_registry,
                                 Some(canvas_store),
+                                sop_engine,
+                                sop_audit,
                             ))
                             .await
                         })
-                    },
-                ));
+                    }
+                }));
 
-                registry.register_channels(Box::new(move |config, cancel| {
-                    let canvas_store = canvas_store_for_channels.clone();
-                    Box::pin(async move {
-                        Box::pin(zeroclaw_channels::orchestrator::start_channels(
-                            config,
-                            Some(canvas_store),
-                            cancel,
-                        ))
-                        .await
-                    })
+                registry.register_channels(Box::new({
+                    let sop_e = sop_engine.clone();
+                    let sop_a = sop_audit.clone();
+                    move |config, cancel| {
+                        let canvas_store = canvas_store_for_channels.clone();
+                        let sop_engine = sop_e.clone();
+                        let sop_audit = sop_a.clone();
+                        Box::pin(async move {
+                            Box::pin(zeroclaw_channels::orchestrator::start_channels(
+                                config,
+                                Some(canvas_store),
+                                cancel,
+                                sop_engine,
+                                sop_audit,
+                            ))
+                            .await
+                        })
+                    }
                 }));
 
                 #[cfg(feature = "channel-mqtt")]
                 registry.register_mqtt(Box::new({
-                    use std::sync::{Arc, Mutex};
-                    use zeroclaw_config::schema::SopConfig;
-                    use zeroclaw_memory::NoneMemory;
-                    use zeroclaw_runtime::sop::{SopAuditLogger, SopEngine};
-                    let sop_config = current_config.sop.clone();
-                    let workspace_dir = current_config.data_dir.clone();
+                    let engine = sop_engine.clone();
+                    let audit = sop_audit.clone();
                     move |mqtt_config| {
-                        let engine = if sop_config.sops_dir.is_some() {
-                            let mut e = SopEngine::new(sop_config.clone());
-                            e.reload(&workspace_dir);
-                            e
-                        } else {
-                            SopEngine::new(SopConfig::default())
-                        };
-                        let engine = Arc::new(Mutex::new(engine));
-                        let audit =
-                            Arc::new(SopAuditLogger::new(Arc::new(NoneMemory::new("none"))));
+                        let engine = engine.clone();
+                        let audit = audit.clone();
                         Box::pin(async move {
-                            zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
-                                &mqtt_config,
-                                engine,
-                                audit,
-                            )
-                            .await
+                            if let (Some(engine), Some(audit)) = (engine, audit) {
+                                zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
+                                    &mqtt_config,
+                                    engine,
+                                    audit,
+                                )
+                                .await
+                            } else {
+                                // No SOPs directory configured — this is a valid
+                                // user state, not a misconfiguration. Skip the
+                                // listener gracefully.
+                                ::zeroclaw_log::record!(
+                                    INFO,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Skip
+                                    ),
+                                    "MQTT SOP listener skipped — no SOPs directory configured"
+                                );
+                                Ok(())
+                            }
                         })
                     }
                 }));
@@ -3761,6 +3919,11 @@ async fn main() -> Result<()> {
                         .await
                     })
                 }));
+
+                // Pass the shared SOP engine through the registry so
+                // RpcContext (RPC/TUI agent sessions) can share it.
+                registry.set_sop_engine(sop_engine, sop_audit);
+
                 let exit = Box::pin(daemon::run(
                     current_config.clone(),
                     host.clone(),
@@ -3938,7 +4101,7 @@ async fn main() -> Result<()> {
                     "Runtime"
                 )
             );
-            if service::is_running() {
+            if service::is_running(&config) {
                 println!(
                     "{}",
                     t("cli-status-service-running", "🟢 Service:       running")
@@ -4220,7 +4383,23 @@ async fn main() -> Result<()> {
                 }));
 
                 let cancel = tokio_util::sync::CancellationToken::new();
-                Box::pin(channels::start_channels(config, None, cancel)).await
+                let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
+                    let mem: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
+                        zeroclaw_memory::create_memory(&config.memory, &config.data_dir, None)?,
+                    );
+                    let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
+                        config.sop.clone(),
+                        &config.data_dir,
+                        mem,
+                    );
+                    (Some(engine), Some(audit))
+                } else {
+                    (None, None)
+                };
+                Box::pin(channels::start_channels(
+                    config, None, cancel, sop_engine, sop_audit,
+                ))
+                .await
             }
             ChannelCommands::Doctor => Box::pin(channels::doctor_channels(config)).await,
             other => Box::pin(channels::handle_command(other, &config)).await,
@@ -6407,7 +6586,7 @@ async fn run_gateway_if_enabled(
     // manually" message, None for tui_registry (no TUI socket), and None
     // for canvas_store so the gateway falls back to its own default.
     let result = Box::pin(gateway::run_gateway(
-        host, port, config, tx, None, None, None,
+        host, port, config, tx, None, None, None, None, None,
     ))
     .await;
     match result {

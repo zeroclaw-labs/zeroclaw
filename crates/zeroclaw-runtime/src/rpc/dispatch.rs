@@ -757,6 +757,8 @@ impl RpcDispatcher {
             false,
             exclude_memory,
             tui_env,
+            self.ctx.sop_engine.clone(),
+            self.ctx.sop_audit.clone(),
         )
         .await
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to create agent: {e}")))?;
@@ -1154,6 +1156,8 @@ impl RpcDispatcher {
             false,
             exclude_memory,
             tui_env,
+            self.ctx.sop_engine.clone(),
+            self.ctx.sop_audit.clone(),
         )
         .await
         .ok()?;

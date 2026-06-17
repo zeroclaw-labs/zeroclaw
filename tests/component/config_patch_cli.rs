@@ -1,9 +1,9 @@
-//! Regression coverage for `zeroclaw config patch --json` error output.
+//! Regression coverage for `zeroclaw config patch --json` output.
 
 use axum::{Router, routing::patch};
 use parking_lot::Mutex;
-use std::process::{Command, Stdio};
 use std::collections::HashMap;
+use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 use tower::ServiceExt;
@@ -74,9 +74,9 @@ fn test_state(config: Config) -> AppState {
     }
 }
 
-fn run_cli_patch(config_dir: &std::path::Path, patch_doc: &[u8]) -> serde_json::Value {
+fn run_cli_patch_output(config_dir: &std::path::Path, patch_doc: &[u8]) -> Output {
     let bin = env!("CARGO_BIN_EXE_zeroclaw");
-    let output = Command::new(bin)
+    Command::new(bin)
         .env("ZEROCLAW_CONFIG_DIR", config_dir)
         .env("RUST_LOG", "off")
         .args(["config", "patch", "--json", "-"])
@@ -95,8 +95,11 @@ fn run_cli_patch(config_dir: &std::path::Path, patch_doc: &[u8]) -> serde_json::
             }
             child.wait_with_output()
         })
-        .expect("run zeroclaw config patch");
+        .expect("run zeroclaw config patch")
+}
 
+fn run_cli_patch(config_dir: &std::path::Path, patch_doc: &[u8]) -> serde_json::Value {
+    let output = run_cli_patch_output(config_dir, patch_doc);
     assert!(!output.status.success(), "patch should fail");
     assert!(
         output.stdout.is_empty(),
@@ -106,6 +109,19 @@ fn run_cli_patch(config_dir: &std::path::Path, patch_doc: &[u8]) -> serde_json::
 
     let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
     serde_json::from_str(&stderr).expect("stderr should be JSON error envelope")
+}
+
+fn run_cli_patch_success(config_dir: &std::path::Path, patch_doc: &[u8]) -> serde_json::Value {
+    let output = run_cli_patch_output(config_dir, patch_doc);
+    assert!(output.status.success(), "patch should succeed");
+    assert!(
+        output.stderr.is_empty(),
+        "successful --json patch should not emit stderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    serde_json::from_str(&stdout).expect("stdout should be JSON success envelope")
 }
 
 async fn run_http_patch(config_dir: &std::path::Path, patch_doc: &[u8]) -> serde_json::Value {
@@ -135,6 +151,25 @@ async fn run_http_patch(config_dir: &std::path::Path, patch_doc: &[u8]) -> serde
         .await
         .expect("read response body");
     serde_json::from_slice(&body).expect("http body should be JSON error envelope")
+}
+
+#[test]
+fn config_patch_json_success_emits_envelope_and_persists_change() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    let envelope = run_cli_patch_success(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/gateway/host","value":"127.0.0.2"}]"#,
+    );
+
+    assert_eq!(envelope["saved"], true);
+    assert_eq!(envelope["results"][0]["op"], "replace");
+    assert_eq!(envelope["results"][0]["path"], "gateway.host");
+    assert_eq!(envelope["results"][0]["value"], "127.0.0.2");
+
+    let saved =
+        std::fs::read_to_string(config_dir.path().join("config.toml")).expect("read saved config");
+    let parsed: Config = toml::from_str(&saved).expect("saved config should parse");
+    assert_eq!(parsed.gateway.host, "127.0.0.2");
 }
 
 #[tokio::test]
