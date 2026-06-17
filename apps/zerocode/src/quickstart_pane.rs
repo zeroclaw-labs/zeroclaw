@@ -1724,7 +1724,21 @@ impl QuickstartPane {
                     }
                     _ => {
                         if on_name && let Some(c) = typed_char(&key) {
-                            a.name.push(c);
+                            // Agent aliases must be lowercase alphanumeric
+                            // plus underscore (validate_alias_key).  Auto-
+                            // normalise uppercase so a capitalised alias
+                            // does not silently pass input only to fail at
+                            // the end of quickstart (#7591).
+                            //
+                            // Character set must stay in sync with
+                            // zeroclaw_config::helpers::is_valid_alias_char
+                            // (the canonical definition).  Context-sensitive
+                            // rules (no leading/trailing `_`, no `__`,
+                            // 63-char cap) are enforced at submit time.
+                            let normalized = c.to_ascii_lowercase();
+                            if zeroclaw_config::helpers::is_valid_alias_char(normalized) {
+                                a.name.push(normalized);
+                            }
                         }
                     }
                 }

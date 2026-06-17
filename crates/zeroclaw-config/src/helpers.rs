@@ -638,6 +638,19 @@ fn json_to_toml(v: serde_json::Value) -> Option<toml::Value> {
 /// forbidden because they collide with the env-var grammar's path separator.
 ///
 /// The env-var grammar uses `__` as path separator, which lets aliases keep
+/// Returns `true` when `c` is a valid alias character.
+///
+/// Allowed characters are lowercase ASCII letters (`a`–`z`), digits
+/// (`0`–`9`), and the underscore (`_`).  This is the single-character
+/// predicate that backs [`validate_alias_key`]; callers that need to
+/// filter keystrokes (TUI input fields) should call this function
+/// instead of duplicating the character set inline.
+#[inline]
+#[must_use]
+pub fn is_valid_alias_char(c: char) -> bool {
+    matches!(c, 'a'..='z' | '0'..='9' | '_')
+}
+
 /// single `_` literally (`prod_v2`, `staging_api`). Hyphens are forbidden
 /// because they are illegal in POSIX env-var identifiers; uppercase is
 /// forbidden so the bootstrap env-vars (`ZEROCLAW_WORKSPACE`,
@@ -671,7 +684,7 @@ pub fn validate_alias_key(key: &str) -> Result<(), String> {
         ));
     }
     for ch in key.chars() {
-        if !matches!(ch, 'a'..='z' | '0'..='9' | '_') {
+        if !is_valid_alias_char(ch) {
             return Err(format!(
                 "alias '{}' contains invalid character {:?}; \
                  only lowercase letters, digits, and single underscores are allowed (no hyphen, no uppercase)",
@@ -984,6 +997,60 @@ mod tests {
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0].as_str(), Some("tok1"));
         assert_eq!(arr[1].as_str(), Some(r#"p@ss"word"#));
+    }
+
+    // ── is_valid_alias_char ────────────────────────────────────────────────
+
+    #[test]
+    fn is_valid_alias_char_accepts_lowercase_letters() {
+        assert!(is_valid_alias_char('a'));
+        assert!(is_valid_alias_char('z'));
+        assert!(is_valid_alias_char('m'));
+    }
+
+    #[test]
+    fn is_valid_alias_char_accepts_digits() {
+        assert!(is_valid_alias_char('0'));
+        assert!(is_valid_alias_char('9'));
+        assert!(is_valid_alias_char('5'));
+    }
+
+    #[test]
+    fn is_valid_alias_char_accepts_underscore() {
+        assert!(is_valid_alias_char('_'));
+    }
+
+    #[test]
+    fn is_valid_alias_char_rejects_uppercase() {
+        assert!(!is_valid_alias_char('A'));
+        assert!(!is_valid_alias_char('Z'));
+        assert!(!is_valid_alias_char('M'));
+    }
+
+    #[test]
+    fn is_valid_alias_char_rejects_hyphen() {
+        assert!(!is_valid_alias_char('-'));
+    }
+
+    #[test]
+    fn is_valid_alias_char_rejects_dot() {
+        assert!(!is_valid_alias_char('.'));
+    }
+
+    #[test]
+    fn is_valid_alias_char_rejects_slash() {
+        assert!(!is_valid_alias_char('/'));
+    }
+
+    #[test]
+    fn is_valid_alias_char_rejects_space() {
+        assert!(!is_valid_alias_char(' '));
+    }
+
+    #[test]
+    fn is_valid_alias_char_rejects_non_ascii() {
+        assert!(!is_valid_alias_char('é'));
+        assert!(!is_valid_alias_char('中'));
     }
 
     // ── validate_alias_key ────────────────────────────────────────────────
