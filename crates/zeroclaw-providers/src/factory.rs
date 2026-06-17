@@ -396,17 +396,18 @@ use zeroclaw_config::schema::{
     HunyuanModelProviderConfig, HyperbolicModelProviderConfig, InceptionModelProviderConfig,
     KiloCliModelProviderConfig, KiloModelProviderConfig, LambdaAiModelProviderConfig,
     LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
-    LmstudioModelProviderConfig, MinimaxModelProviderConfig, MistralModelProviderConfig,
-    MoonshotEndpoint, MoonshotModelProviderConfig, MorphModelProviderConfig,
-    NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
-    NvidiaModelProviderConfig, OllamaModelProviderConfig, OpenAIModelProviderConfig,
-    OpenRouterModelProviderConfig, OpencodeModelProviderConfig, OsaurusModelProviderConfig,
-    OvhModelProviderConfig, PerplexityModelProviderConfig, QianfanModelProviderConfig,
-    QwenModelProviderConfig, RekaModelProviderConfig, SambanovaModelProviderConfig,
-    SglangModelProviderConfig, SiliconflowModelProviderConfig, StepfunModelProviderConfig,
-    SyntheticModelProviderConfig, TelnyxModelProviderConfig, TogetherModelProviderConfig,
-    UpstageModelProviderConfig, VeniceModelProviderConfig, VercelModelProviderConfig,
-    VllmModelProviderConfig, XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    LmstudioModelProviderConfig, ManifestModelProviderConfig, MinimaxModelProviderConfig,
+    MistralModelProviderConfig, MoonshotEndpoint, MoonshotModelProviderConfig,
+    MorphModelProviderConfig, NearaiModelProviderConfig, NebiusModelProviderConfig,
+    NovitaModelProviderConfig, NscaleModelProviderConfig, NvidiaModelProviderConfig,
+    OllamaModelProviderConfig, OpenAIModelProviderConfig, OpenRouterModelProviderConfig,
+    OpencodeModelProviderConfig, OsaurusModelProviderConfig, OvhModelProviderConfig,
+    PerplexityModelProviderConfig, QianfanModelProviderConfig, QwenModelProviderConfig,
+    RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
+    SiliconflowModelProviderConfig, StepfunModelProviderConfig, SyntheticModelProviderConfig,
+    TelnyxModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
+    VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
+    XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
 };
 
 // ── Pure-compat families ───────────────────────────────────────────────
@@ -602,6 +603,11 @@ impl CompatFamilySpec for LeptonModelProviderConfig {
     const DEFAULT_URL: &'static str = "https://llama3-1-405b.lepton.run/api/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
 }
+impl CompatFamilySpec for ManifestModelProviderConfig {
+    const DISPLAY: &'static str = "Manifest";
+    const DEFAULT_URL: &'static str = "https://app.manifest.build/v1";
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+}
 impl CompatFamilySpec for MorphModelProviderConfig {
     const DISPLAY: &'static str = "Morph";
     const DEFAULT_URL: &'static str = "https://api.morphllm.com/v1";
@@ -711,6 +717,11 @@ impl CompatFamilySpec for VeniceModelProviderConfig {
         self.build_compat_base(alias, key, api_url)
             .without_native_tools()
     }
+}
+impl CompatFamilySpec for NearaiModelProviderConfig {
+    const DISPLAY: &'static str = "NEAR AI Cloud";
+    const DEFAULT_URL: &'static str = "https://cloud-api.near.ai/v1";
+    const AUTH: AuthStyle = AuthStyle::Bearer;
 }
 impl CompatFamilySpec for AtomicChatModelProviderConfig {
     const DISPLAY: &'static str = "Atomic Chat";

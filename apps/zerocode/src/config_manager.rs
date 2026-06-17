@@ -1604,13 +1604,21 @@ impl App {
                     let map_path = map_path.clone();
                     match self.rpc.config_map_key_delete(&map_path, &alias).await {
                         Ok(()) => {
-                            self.status_msg = Some(format!("Deleted {alias}"));
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-alias-deleted",
+                                &[("alias", &alias)],
+                            ));
                             self.load_aliases(&map_path).await?;
                             if self.alias_cursor > 0 && self.alias_cursor >= self.aliases.len() {
                                 self.alias_cursor = self.aliases.len().saturating_sub(1);
                             }
                         }
-                        Err(e) => self.status_msg = Some(format!("Delete failed: {e}")),
+                        Err(e) => {
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-delete-failed",
+                                &[("err", &e.to_string())],
+                            ));
+                        }
                     }
                 }
             }
@@ -1692,7 +1700,10 @@ impl App {
                             self.status_msg = None;
                         }
                         Err(e) => {
-                            self.status_msg = Some(format!("Create failed: {e}"));
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-alias-create-failed",
+                                &[("err", &e.to_string())],
+                            ));
                             self.load_aliases(&map_path).await?;
                             self.screen = Screen::AliasList {
                                 section_idx,
@@ -1828,12 +1839,20 @@ impl App {
                         let prefix = prefix.clone();
                         match self.rpc.config_delete(&prop).await {
                             Ok(()) => {
-                                self.status_msg = Some(format!("Reset {prop}"));
+                                self.status_msg = Some(crate::i18n::t_args(
+                                    "zc-config-status-field-reset",
+                                    &[("prop", &prop)],
+                                ));
                                 self.load_fields(&prefix).await?;
                                 self.field_cursor =
                                     saved_cursor.min(self.fields.len().saturating_sub(1));
                             }
-                            Err(e) => self.status_msg = Some(format!("Delete failed: {e}")),
+                            Err(e) => {
+                                self.status_msg = Some(crate::i18n::t_args(
+                                    "zc-config-status-delete-failed",
+                                    &[("err", &e.to_string())],
+                                ));
+                            }
                         }
                     }
                 }
@@ -1860,7 +1879,12 @@ impl App {
                 let _ = self.draw(term);
                 match self.load_personality_files().await {
                     Ok(()) => self.status_msg = None,
-                    Err(e) => self.status_msg = Some(format!("Load failed: {e}")),
+                    Err(e) => {
+                        self.status_msg = Some(crate::i18n::t_args(
+                            "zc-config-status-load-failed",
+                            &[("err", &e.to_string())],
+                        ));
+                    }
                 }
             }
             ConfigTab::Skills if self.skills_list.is_empty() => {
@@ -1868,7 +1892,12 @@ impl App {
                 let _ = self.draw(term);
                 match self.load_skills_list().await {
                     Ok(()) => self.status_msg = None,
-                    Err(e) => self.status_msg = Some(format!("Load failed: {e}")),
+                    Err(e) => {
+                        self.status_msg = Some(crate::i18n::t_args(
+                            "zc-config-status-load-failed",
+                            &[("err", &e.to_string())],
+                        ));
+                    }
                 }
             }
             _ => {}
@@ -1939,7 +1968,10 @@ impl App {
             Some(ConfigTabAction::Enter) => {
                 if let Some(file) = self.personality_files.get(self.personality_cursor) {
                     let filename = file.filename.clone();
-                    self.status_msg = Some(format!("Loading {filename}..."));
+                    self.status_msg = Some(crate::i18n::t_args(
+                        "zc-config-status-personality-loading-file",
+                        &[("filename", &filename)],
+                    ));
                     let _ = self.draw(term);
                     match self.load_personality_file(&filename).await {
                         Ok(()) => {
@@ -1963,11 +1995,17 @@ impl App {
                                             Ok(_) => {
                                                 self.personality_loaded =
                                                     self.personality_content.clone();
-                                                self.status_msg = Some(format!("Saved {filename}"));
+                                                self.status_msg = Some(crate::i18n::t_args(
+                                                    "zc-config-status-personality-saved-file",
+                                                    &[("filename", &filename)],
+                                                ));
                                                 let _ = self.load_personality_files().await;
                                             }
                                             Err(e) => {
-                                                self.status_msg = Some(format!("Save failed: {e}"));
+                                                self.status_msg = Some(crate::i18n::t_args(
+                                                    "zc-config-status-save-failed",
+                                                    &[("err", &e.to_string())],
+                                                ));
                                             }
                                         }
                                     } else {
@@ -1980,7 +2018,12 @@ impl App {
                                 }
                             }
                         }
-                        Err(e) => self.status_msg = Some(format!("Load failed: {e}")),
+                        Err(e) => {
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-load-failed",
+                                &[("err", &e.to_string())],
+                            ));
+                        }
                     }
                 }
             }
@@ -2032,16 +2075,25 @@ impl App {
                                         self.personality_active_file = None;
                                     }
                                     Err(_) => {
-                                        self.status_msg =
-                                            Some(format!("Template loaded for {filename}"));
+                                        self.status_msg = Some(crate::i18n::t_args(
+                                            "zc-config-status-template-loaded",
+                                            &[("filename", &filename)],
+                                        ));
                                     }
                                 }
                             } else {
-                                self.status_msg =
-                                    Some(format!("No template available for {filename}"));
+                                self.status_msg = Some(crate::i18n::t_args(
+                                    "zc-config-status-template-missing",
+                                    &[("filename", &filename)],
+                                ));
                             }
                         }
-                        Err(e) => self.status_msg = Some(format!("Template fetch failed: {e}")),
+                        Err(e) => {
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-template-fetch-failed",
+                                &[("err", &e.to_string())],
+                            ));
+                        }
                     }
                 }
             }
@@ -2073,16 +2125,27 @@ impl App {
                         ));
                         return Ok(());
                     }
-                    self.status_msg = Some(format!("Saving {filename}..."));
+                    self.status_msg = Some(crate::i18n::t_args(
+                        "zc-config-status-personality-saving-file",
+                        &[("filename", &filename)],
+                    ));
                     let _ = self.draw(term);
                     match self.rpc.personality_put(&agent, &filename, &content).await {
                         Ok(_) => {
                             self.personality_loaded = self.personality_content.clone();
-                            self.status_msg = Some(format!("Saved {filename}"));
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-personality-saved-file",
+                                &[("filename", &filename)],
+                            ));
                             let _ = self.load_personality_files().await;
                             self.personality_active_file = Some(filename);
                         }
-                        Err(e) => self.status_msg = Some(format!("Save failed: {e}")),
+                        Err(e) => {
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-save-failed",
+                                &[("err", &e.to_string())],
+                            ));
+                        }
                     }
                 }
             }
@@ -2164,7 +2227,10 @@ impl App {
             Some(ConfigTabAction::Enter) => {
                 if let Some(skill) = self.skills_list.get(self.skills_cursor) {
                     let name = skill.name.clone();
-                    self.status_msg = Some(format!("Loading {name}..."));
+                    self.status_msg = Some(crate::i18n::t_args(
+                        "zc-config-status-skill-loading",
+                        &[("name", &name)],
+                    ));
                     let _ = self.draw(term);
                     match self.load_skill(&name).await {
                         Ok(()) => {
@@ -2183,10 +2249,16 @@ impl App {
                                         {
                                             Ok(_) => {
                                                 self.skills_body_loaded = self.skills_body.clone();
-                                                self.status_msg = Some(format!("Saved {name}"));
+                                                self.status_msg = Some(crate::i18n::t_args(
+                                                    "zc-config-status-skill-saved",
+                                                    &[("name", &name)],
+                                                ));
                                             }
                                             Err(e) => {
-                                                self.status_msg = Some(format!("Save failed: {e}"));
+                                                self.status_msg = Some(crate::i18n::t_args(
+                                                    "zc-config-status-save-failed",
+                                                    &[("err", &e.to_string())],
+                                                ));
                                             }
                                         }
                                     } else {
@@ -2200,7 +2272,12 @@ impl App {
                                 }
                             }
                         }
-                        Err(e) => self.status_msg = Some(format!("Load failed: {e}")),
+                        Err(e) => {
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-load-failed",
+                                &[("err", &e.to_string())],
+                            ));
+                        }
                     }
                 }
             }
@@ -2208,14 +2285,25 @@ impl App {
                 if let Some(skill) = self.skills_list.get(self.skills_cursor) {
                     let name = skill.name.clone();
                     let bundle = self.skills_bundle.clone();
-                    self.status_msg = Some(format!("Deleting {name}..."));
+                    self.status_msg = Some(crate::i18n::t_args(
+                        "zc-config-status-skill-deleting",
+                        &[("name", &name)],
+                    ));
                     let _ = self.draw(term);
                     match self.rpc.skills_delete(&bundle, &name).await {
                         Ok(_) => {
-                            self.status_msg = Some(format!("Archived {name}"));
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-skill-archived",
+                                &[("name", &name)],
+                            ));
                             let _ = self.load_skills_list().await;
                         }
-                        Err(e) => self.status_msg = Some(format!("Delete failed: {e}")),
+                        Err(e) => {
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-delete-failed",
+                                &[("err", &e.to_string())],
+                            ));
+                        }
                     }
                 }
             }
@@ -2240,7 +2328,10 @@ impl App {
                     let bundle = self.skills_bundle.clone();
                     let frontmatter = self.skills_frontmatter.clone();
                     let body = self.skills_body.clone();
-                    self.status_msg = Some(format!("Saving {name}..."));
+                    self.status_msg = Some(crate::i18n::t_args(
+                        "zc-config-status-skill-saving",
+                        &[("name", &name)],
+                    ));
                     let _ = self.draw(term);
                     match self
                         .rpc
@@ -2250,9 +2341,17 @@ impl App {
                         Ok(_) => {
                             self.skills_body_loaded = self.skills_body.clone();
                             self.skills_frontmatter_loaded = self.skills_frontmatter.clone();
-                            self.status_msg = Some(format!("Saved {name}"));
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-skill-saved",
+                                &[("name", &name)],
+                            ));
                         }
-                        Err(e) => self.status_msg = Some(format!("Save failed: {e}")),
+                        Err(e) => {
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-save-failed",
+                                &[("err", &e.to_string())],
+                            ));
+                        }
                     }
                 }
             }
@@ -2291,7 +2390,10 @@ impl App {
                 let family = segments[2].to_string();
 
                 // Show loading indicator before the blocking RPC call.
-                self.status_msg = Some(format!("Fetching models for {family}..."));
+                self.status_msg = Some(crate::i18n::t_args(
+                    "zc-config-status-fetching-models",
+                    &[("family", &family)],
+                ));
                 let _ = self.draw(term);
 
                 match self.rpc.catalog_models(&family).await {
@@ -2530,11 +2632,19 @@ impl App {
                         );
                         match self.rpc.config_set(&prop, value).await {
                             Ok(()) => {
-                                self.status_msg = Some(format!("Set {prop}"));
+                                self.status_msg = Some(crate::i18n::t_args(
+                                    "zc-config-status-field-set",
+                                    &[("prop", &prop)],
+                                ));
                                 self.load_fields(&prefix).await?;
                                 self.pop_to_field_list_keep_cursor().await?;
                             }
-                            Err(e) => self.status_msg = Some(format!("Set failed: {e}")),
+                            Err(e) => {
+                                self.status_msg = Some(crate::i18n::t_args(
+                                    "zc-config-status-set-failed",
+                                    &[("err", &e.to_string())],
+                                ));
+                            }
                         }
                     }
                 }
@@ -2564,11 +2674,19 @@ impl App {
                     let prefix = prefix.clone();
                     match self.rpc.config_set(&prop, value).await {
                         Ok(()) => {
-                            self.status_msg = Some(format!("Set {prop}"));
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-field-set",
+                                &[("prop", &prop)],
+                            ));
                             self.load_fields(&prefix).await?;
                             self.pop_to_field_list_keep_cursor().await?;
                         }
-                        Err(e) => self.status_msg = Some(format!("Set failed: {e}")),
+                        Err(e) => {
+                            self.status_msg = Some(crate::i18n::t_args(
+                                "zc-config-status-set-failed",
+                                &[("err", &e.to_string())],
+                            ));
+                        }
                     }
                 }
             }
@@ -2635,11 +2753,19 @@ impl App {
             let prefix = prefix.clone();
             match self.rpc.config_set(&prop, value).await {
                 Ok(()) => {
-                    self.status_msg = Some(format!("Set {prop}"));
+                    self.status_msg = Some(crate::i18n::t_args(
+                        "zc-config-status-field-set",
+                        &[("prop", &prop)],
+                    ));
                     self.load_fields(&prefix).await?;
                     self.pop_to_field_list_keep_cursor().await?;
                 }
-                Err(e) => self.status_msg = Some(format!("Set failed: {e}")),
+                Err(e) => {
+                    self.status_msg = Some(crate::i18n::t_args(
+                        "zc-config-status-set-failed",
+                        &[("err", &e.to_string())],
+                    ));
+                }
             }
         }
         Ok(())

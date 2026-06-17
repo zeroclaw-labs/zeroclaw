@@ -69,7 +69,31 @@ pub async fn execute_one_tool(
 
     let static_tool = find_tool(tools_registry, call_name);
     let activated_arc = if static_tool.is_none() {
-        activated_tools.and_then(|at| at.lock().unwrap().get_resolved(call_name))
+        match activated_tools {
+            Some(at) => {
+                let activated_tools = match at.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "tool": call_name,
+                                "tool_call_id": tool_call_id,
+                            })),
+                            "activated-tool lock poisoned while resolving tool; recovering guard for read"
+                        );
+                        poisoned.into_inner()
+                    }
+                };
+                activated_tools.get_resolved(call_name)
+            }
+            None => None,
+        }
     } else {
         None
     };

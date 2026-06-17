@@ -3547,6 +3547,7 @@ dependencies = [
  "toml 0.8.23",
  "xtask",
  "zeroclaw-api",
+ "zeroclaw-providers",
 ]
 
 [[package]]
@@ -9978,6 +9979,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sys-locale"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eab9a99a024a169fe8a903cf9d4a3b3601109bcc13bd9e3c6fff259138626c4"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "system-deps"
 version = "6.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14263,6 +14273,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-eval"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "zeroclaw-api",
+ "zeroclaw-config",
+ "zeroclaw-memory",
+ "zeroclaw-runtime",
+]
+
+[[package]]
 name = "zeroclaw-gateway"
 version = "0.8.0"
 dependencies = [
@@ -14415,6 +14442,7 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-config",
  "zeroclaw-log",
+ "zeroclaw-providers",
  "zeroclaw-spawn",
 ]
 
@@ -14515,6 +14543,7 @@ dependencies = [
  "dialoguer",
  "directories",
  "encoding_rs",
+ "filetime",
  "flate2",
  "fluent",
  "futures-util",
@@ -14552,6 +14581,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "shellexpand",
+ "sys-locale",
  "tar",
  "tempfile",
  "thiserror 2.0.18",
@@ -14632,6 +14662,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sys-locale",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -14734,6 +14765,7 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-channels",
  "zeroclaw-config",
+ "zeroclaw-eval",
  "zeroclaw-gateway",
  "zeroclaw-hardware",
  "zeroclaw-infra",
@@ -14775,6 +14807,7 @@ dependencies = [
  "tokio-tungstenite 0.29.0",
  "toml 1.1.2+spec-1.1.0",
  "unic-langid",
+ "unicode-segmentation",
  "unicode-width 0.2.2",
  "zeroclaw-providers",
 ]

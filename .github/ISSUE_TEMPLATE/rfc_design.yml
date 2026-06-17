@@ -1,0 +1,94 @@
+name: RFC / Design Proposal
+description: Propose a significant architecture, governance, or user-facing direction change
+title: "RFC: "
+labels:
+  - "type:rfc"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for significant changes to architecture, public interfaces, defaults, governance,
+        release process, contribution model, or project direction.
+        Smaller feature requests should use the feature template. Security vulnerabilities must be reported privately.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user pain, project risk, or system gap motivates this proposal?
+      placeholder: The current design makes it hard to ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What should change?
+      placeholder: I propose ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: design
+    attributes:
+      label: Design sketch
+      description: Include interface shape, affected surfaces, rollout phases, or links to a proposal PR.
+      placeholder: |
+        Affected surfaces:
+        Proposed phases:
+        Proposal PR or discussion:
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What other paths did you consider, including doing nothing?
+    validations:
+      required: false
+
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+      description: What is explicitly out of scope for this proposal?
+    validations:
+      required: false
+
+  - type: textarea
+    id: risks
+    attributes:
+      label: Risks and mitigations
+      description: What could go wrong, and how would the project roll back or contain it?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: breaking
+    attributes:
+      label: Breaking change?
+      options:
+        - "No"
+        - "Yes - existing configurations, APIs, or defaults change"
+        - "Potentially - needs investigation"
+    validations:
+      required: true
+
+  - type: textarea
+    id: decision_surface
+    attributes:
+      label: Decision and revisit surface
+      description: Where should discussion, acceptance, follow-up issues, or later revisit happen?
+      placeholder: This issue, linked proposal PR, linked discussion, milestone, or maintainer meeting.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Data hygiene checks
+      options:
+        - label: I removed personal/sensitive data from examples, payloads, and logs.
+          required: true

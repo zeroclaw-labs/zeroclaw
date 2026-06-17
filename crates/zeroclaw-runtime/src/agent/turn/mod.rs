@@ -301,7 +301,7 @@ pub async fn run_tool_call_loop(
             tools_registry,
             excluded_tools,
             activated_tools,
-        );
+        )?;
         let IterationToolSpecs {
             ref tool_specs,
             use_native_tools,
@@ -597,8 +597,8 @@ pub async fn run_tool_call_loop(
                 let _ = tx.send(StreamDelta::Text(narration)).await;
             }
             if !silent {
-                print!("{display_text}");
-                let _ = std::io::stdout().flush();
+                eprint!("{display_text}");
+                let _ = std::io::stderr().flush();
             }
         }
 
