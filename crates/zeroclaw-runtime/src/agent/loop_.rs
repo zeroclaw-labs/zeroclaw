@@ -3652,6 +3652,7 @@ mod tests {
             &observer,
             None,
             None,
+            None,
         )
         .await
         .expect("poisoned activated-tools lock should recover for read");
