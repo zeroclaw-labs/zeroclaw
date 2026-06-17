@@ -7683,4 +7683,107 @@ mod tests {
         let cb_data = "some_other_action:data";
         assert!(cb_data.strip_prefix("approval:").is_none());
     }
+
+    #[test]
+    fn mention_only_reply_to_this_bot_bypasses_gate() {
+        // Regression test for #5866 — reply to this bot's message should
+        // bypass mention_only without an explicit @mention.
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true, // mention_only
+        );
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+
+        let update = serde_json::json!({
+            "update_id": 100,
+            "message": {
+                "message_id": 500,
+                "text": "what about this?",
+                "from": { "id": 999, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "group" },
+                "reply_to_message": {
+                    "message_id": 499,
+                    "from": { "id": 42, "username": "mybot", "is_bot": true },
+                    "text": "here is my answer"
+                }
+            }
+        });
+
+        assert!(
+            ch.parse_update_message(&update).is_some(),
+            "reply to this bot should bypass mention_only gate"
+        );
+    }
+
+    #[test]
+    fn mention_only_reply_to_different_bot_is_dropped() {
+        // In a group with multiple bots, replying to a different bot
+        // should NOT bypass the mention_only gate.
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true, // mention_only
+        );
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+
+        let update = serde_json::json!({
+            "update_id": 101,
+            "message": {
+                "message_id": 501,
+                "text": "hey other bot",
+                "from": { "id": 999, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "group" },
+                "reply_to_message": {
+                    "message_id": 498,
+                    "from": { "id": 77, "username": "otherbot", "is_bot": true },
+                    "text": "other bot reply"
+                }
+            }
+        });
+
+        assert!(
+            ch.parse_update_message(&update).is_none(),
+            "reply to a different bot should NOT bypass mention_only gate"
+        );
+    }
+
+    #[test]
+    fn mention_only_group_non_mention_message_is_dropped() {
+        // Normal group message without @mention or reply-to-bot should
+        // still be dropped when mention_only is true.
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true, // mention_only
+        );
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+
+        let update = serde_json::json!({
+            "update_id": 102,
+            "message": {
+                "message_id": 502,
+                "text": "just a regular message",
+                "from": { "id": 999, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "group" }
+            }
+        });
+
+        assert!(
+            ch.parse_update_message(&update).is_none(),
+            "non-mention group message should be dropped when mention_only=true"
+        );
+    }
 }
