@@ -5,7 +5,7 @@ use serde_json::json;
 use zeroclaw_log::{Action, Event, EventOutcome, record};
 
 use super::bindings;
-use super::plugin_host::PluginHost;
+use super::plugin_host::PluginStore;
 
 // ── Core log dispatcher ───────────────────────────────────────────────────────
 
@@ -41,13 +41,13 @@ fn do_log_record(
 
 // ── logging::Host impls ───────────────────────────────────────────────────────
 
-/// Generate `logging::Host for PluginHost` for one bindgen world.
+/// Generate `logging::Host for PluginStore` for one bindgen world.
 ///
 /// All three worlds produce identical-but-distinct Rust types from the same
 /// WIT; the macro eliminates the otherwise triple-repeated match bodies.
 macro_rules! impl_logging_host {
     ($world:ident) => {
-        impl bindings::$world::zeroclaw::plugin::logging::Host for PluginHost {
+        impl bindings::$world::zeroclaw::plugin::logging::Host for PluginStore {
             async fn log_record(
                 &mut self,
                 level: bindings::$world::zeroclaw::plugin::logging::LogLevel,

@@ -1,7 +1,7 @@
 // Host-side WIT implementation for all three component-model plugin worlds
 // (`tool-plugin`, `memory-plugin`, `channel-plugin`).
 //
-// [`PluginHost`] is the `Store<T>` data type for all three worlds.
+// [`PluginStore`] is the `Store<T>` data type for all three worlds.
 // It carries the `WasiCtx` built from the plugin's `fine_grained_permissions`,
 // and the `ResourceTable` required by WasiView.
 
@@ -22,17 +22,17 @@ use zeroclaw_log::{Action, Event, EventOutcome, record};
 
 use super::bindings;
 
-// ── PluginHost ────────────────────────────────────────────────────────────────
+// ── PluginStore ────────────────────────────────────────────────────────────────
 
 /// Store-data type for all three component plugin worlds.
-pub struct PluginHost {
+pub struct PluginStore {
     wasi: WasiCtx,
     http: WasiHttpCtx,
     http_hooks: PluginHttpHooks,
     table: ResourceTable,
 }
 
-impl Default for PluginHost {
+impl Default for PluginStore {
     /// Constructs a fully-sandboxed host: no filesystem preopens, all network
     /// disabled. Used for metadata-probe stores where no I/O is needed.
     fn default() -> Self {
@@ -88,7 +88,7 @@ impl WasiHttpHooks for PluginHttpHooks {
     }
 }
 
-impl PluginHost {
+impl PluginStore {
     /// Build a host from a plugin's `fine_grained_permissions` list.
     ///
     /// - `Dir` entries call `WasiCtxBuilder::preopened_dir`.
@@ -357,7 +357,7 @@ fn label_matches_glob(label: &str, glob: &str) -> bool {
     true
 }
 
-impl WasiView for PluginHost {
+impl WasiView for PluginStore {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
             ctx: &mut self.wasi,
@@ -366,7 +366,7 @@ impl WasiView for PluginHost {
     }
 }
 
-impl WasiHttpView for PluginHost {
+impl WasiHttpView for PluginStore {
     fn http(&mut self) -> WasiHttpCtxView<'_> {
         WasiHttpCtxView {
             ctx: &mut self.http,
@@ -402,15 +402,15 @@ fn normalize_authority_host(authority: &str) -> Option<String> {
 
 // ── types::Host (empty marker trait) ─────────────────────────────────────────
 
-impl bindings::tool::zeroclaw::plugin::types::Host for PluginHost {}
-impl bindings::memory::zeroclaw::plugin::types::Host for PluginHost {}
-impl bindings::channel::zeroclaw::plugin::types::Host for PluginHost {}
+impl bindings::tool::zeroclaw::plugin::types::Host for PluginStore {}
+impl bindings::memory::zeroclaw::plugin::types::Host for PluginStore {}
+impl bindings::channel::zeroclaw::plugin::types::Host for PluginStore {}
 
 // ── Linker wiring helpers ─────────────────────────────────────────────────────
 
 /// Wire all host interfaces for the `tool-plugin` world into `linker`.
 pub fn add_to_linker_tool(
-    linker: &mut wasmtime::component::Linker<PluginHost>,
+    linker: &mut wasmtime::component::Linker<PluginStore>,
 ) -> anyhow::Result<()> {
     // Use feature flags to allow developers to link in wit bindings that aren't stabilized yet.
     let mut options = crate::component::v0::bindings::tool::LinkOptions::default();
@@ -418,7 +418,7 @@ pub fn add_to_linker_tool(
     {
         options.plugins_wit_v0(true);
     }
-    bindings::tool::ToolPlugin::add_to_linker::<PluginHost, HasSelf<PluginHost>>(
+    bindings::tool::ToolPlugin::add_to_linker::<PluginStore, HasSelf<PluginStore>>(
         linker,
         &options,
         |x| x,
@@ -429,7 +429,7 @@ pub fn add_to_linker_tool(
 
 /// Wire all host interfaces for the `memory-plugin` world into `linker`.
 pub fn add_to_linker_memory(
-    linker: &mut wasmtime::component::Linker<PluginHost>,
+    linker: &mut wasmtime::component::Linker<PluginStore>,
 ) -> anyhow::Result<()> {
     // Use feature flags to allow developers to link in wit bindings that aren't stabilized yet.
     let mut options = crate::component::v0::bindings::memory::LinkOptions::default();
@@ -437,7 +437,7 @@ pub fn add_to_linker_memory(
     {
         options.plugins_wit_v0(true);
     }
-    bindings::memory::MemoryPlugin::add_to_linker::<PluginHost, HasSelf<PluginHost>>(
+    bindings::memory::MemoryPlugin::add_to_linker::<PluginStore, HasSelf<PluginStore>>(
         linker,
         &options,
         |x| x,
@@ -448,7 +448,7 @@ pub fn add_to_linker_memory(
 
 /// Wire all host interfaces for the `channel-plugin` world into `linker`.
 pub fn add_to_linker_channel(
-    linker: &mut wasmtime::component::Linker<PluginHost>,
+    linker: &mut wasmtime::component::Linker<PluginStore>,
 ) -> anyhow::Result<()> {
     // Use feature flags to allow developers to link in wit bindings that aren't stabilized yet.
     let mut options = crate::component::v0::bindings::channel::LinkOptions::default();
@@ -456,7 +456,7 @@ pub fn add_to_linker_channel(
     {
         options.plugins_wit_v0(true);
     }
-    bindings::channel::ChannelPlugin::add_to_linker::<PluginHost, HasSelf<PluginHost>>(
+    bindings::channel::ChannelPlugin::add_to_linker::<PluginStore, HasSelf<PluginStore>>(
         linker,
         &options,
         |x| x,
