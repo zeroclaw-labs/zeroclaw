@@ -21,6 +21,7 @@ use mail_parser::{MessageParser, MimeHeaders};
 use pulldown_cmark::{Options, Parser, html};
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pki_types::DnsName;
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -28,7 +29,6 @@ use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsConnector;
-use uuid::Uuid;
 
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_tools::email_imap::{ImapSession, TlsStreamTolerant};
@@ -351,7 +351,12 @@ impl EmailChannel {
     /// Bounds peak memory when the mailbox has a large unseen backlog.
     const MAX_FETCH_BATCH: usize = 10;
 
-    fn build_parsed_email(&self, parsed: &mail_parser::Message, _uid: u32) -> ParsedEmail {
+    fn build_parsed_email(
+        &self,
+        parsed: &mail_parser::Message,
+        uid: u32,
+        uid_validity: Option<u32>,
+    ) -> ParsedEmail {
         let sender = Self::extract_sender(parsed);
         let subject = parsed.subject().unwrap_or("(no subject)").to_string();
         let body_text = Self::extract_text(parsed);
@@ -359,7 +364,9 @@ impl EmailChannel {
         let msg_id = parsed
             .message_id()
             .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("gen-{}", Uuid::new_v4()));
+            .unwrap_or_else(|| {
+                self.stable_missing_message_id(parsed, uid, uid_validity, &sender, &body_text)
+            });
         #[allow(clippy::cast_sign_loss)]
         let timestamp = parsed
             .date()
@@ -391,10 +398,59 @@ impl EmailChannel {
         }
     }
 
+    fn stable_missing_message_id(
+        &self,
+        parsed: &mail_parser::Message,
+        uid: u32,
+        uid_validity: Option<u32>,
+        sender: &str,
+        body_text: &str,
+    ) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.config.imap_host.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(self.config.username.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(self.config.imap_folder.as_bytes());
+
+        if let Some(uid_validity) = uid_validity.filter(|_| uid != 0) {
+            hasher.update(b"\0uidvalidity\0");
+            hasher.update(uid_validity.to_be_bytes());
+            hasher.update(b"\0uid\0");
+            hasher.update(uid.to_be_bytes());
+            let digest = hasher.finalize();
+            return format!("email-imap-{}-{uid}", hex::encode(&digest[..16]));
+        }
+
+        hasher.update(b"\0content\0");
+        hasher.update(sender.as_bytes());
+        hasher.update(b"\0");
+        if let Some(subject) = parsed.subject() {
+            hasher.update(subject.as_bytes());
+        }
+        hasher.update(b"\0");
+        if let Some(date) = parsed.date() {
+            let date_key = format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+                date.year, date.month, date.day, date.hour, date.minute, date.second
+            );
+            hasher.update(date_key.as_bytes());
+        }
+        hasher.update(b"\0");
+        hasher.update(body_text.as_bytes());
+
+        let digest = hasher.finalize();
+        format!("email-fallback-{}", hex::encode(&digest[..16]))
+    }
+
     /// Active-mode startup drain: fetch all UNSEEN messages using RFC822.
     /// RFC822 implicitly sets `\Seen` on every fetched message per RFC 3501.
     /// Only called when `observer_mode = false`.
-    async fn fetch_unseen_active(&self, session: &mut ImapSession) -> Result<Vec<ParsedEmail>> {
+    async fn fetch_unseen_active(
+        &self,
+        session: &mut ImapSession,
+        uid_validity: Option<u32>,
+    ) -> Result<Vec<ParsedEmail>> {
         let uids = session.uid_search("UNSEEN").await?;
         let mut uid_list: Vec<u32> = uids.into_iter().collect();
         if uid_list.is_empty() {
@@ -416,7 +472,11 @@ impl EmailChannel {
                 if let Some(body) = msg.body()
                     && let Some(parsed) = MessageParser::default().parse(body)
                 {
-                    results.push(self.build_parsed_email(&parsed, msg.uid.unwrap_or(0)));
+                    results.push(self.build_parsed_email(
+                        &parsed,
+                        msg.uid.unwrap_or(0),
+                        uid_validity,
+                    ));
                 }
             }
         }
@@ -429,6 +489,7 @@ impl EmailChannel {
         &self,
         session: &mut ImapSession,
         uid_threshold: u32,
+        uid_validity: Option<u32>,
     ) -> Result<(Vec<ParsedEmail>, u32)> {
         let search = format!("UID {}:*", uid_threshold);
         let uids = session.uid_search(&search).await?;
@@ -465,7 +526,11 @@ impl EmailChannel {
                 if let Some(body) = msg.body()
                     && let Some(parsed) = MessageParser::default().parse(body)
                 {
-                    results.push(self.build_parsed_email(&parsed, msg.uid.unwrap_or(0)));
+                    results.push(self.build_parsed_email(
+                        &parsed,
+                        msg.uid.unwrap_or(0),
+                        uid_validity,
+                    ));
                 }
             }
         }
@@ -579,6 +644,7 @@ impl EmailChannel {
     async fn run_session(&self, tx: &mpsc::Sender<ChannelMessage>) -> Result<()> {
         let mut session = self.connect_imap().await?;
         let mailbox = session.select(&self.config.imap_folder).await?;
+        let uid_validity = mailbox.uid_validity;
 
         // In observer mode: capture uid_next so we only ever process emails that
         // arrive AFTER this session starts. No startup drain, no flag changes.
@@ -598,7 +664,7 @@ impl EmailChannel {
             threshold
         } else {
             // Active mode: drain UNSEEN now, then watch for new arrivals.
-            let unseen = self.fetch_unseen_active(&mut session).await?;
+            let unseen = self.fetch_unseen_active(&mut session, uid_validity).await?;
             let next_uid = mailbox.uid_next.unwrap_or(1);
             for email in unseen {
                 if !self.dispatch_email(email, tx).await? {
@@ -622,7 +688,8 @@ impl EmailChannel {
                     self.config.imap_folder, uid_threshold
                 )
             );
-            self.run_idle_inner(session, tx, uid_threshold).await
+            self.run_idle_inner(session, tx, uid_threshold, uid_validity)
+                .await
         } else {
             let poll_interval = Duration::from_secs(self.config.poll_interval_secs);
             ::zeroclaw_log::record!(
@@ -633,7 +700,7 @@ impl EmailChannel {
                     self.config.imap_folder, poll_interval, uid_threshold
                 )
             );
-            self.run_poll_inner(session, tx, poll_interval, uid_threshold)
+            self.run_poll_inner(session, tx, poll_interval, uid_threshold, uid_validity)
                 .await
         }
     }
@@ -644,6 +711,7 @@ impl EmailChannel {
         mut session: ImapSession,
         tx: &mpsc::Sender<ChannelMessage>,
         mut uid_threshold: u32,
+        uid_validity: Option<u32>,
     ) -> Result<()> {
         loop {
             match self.wait_for_changes(session).await {
@@ -654,11 +722,15 @@ impl EmailChannel {
                         "New mail notification received"
                     );
                     session = returned_session;
-                    uid_threshold = self.process_new(&mut session, tx, uid_threshold).await?;
+                    uid_threshold = self
+                        .process_new(&mut session, tx, uid_threshold, uid_validity)
+                        .await?;
                 }
                 Ok((IdleWaitResult::Timeout, returned_session)) => {
                     session = returned_session;
-                    uid_threshold = self.process_new(&mut session, tx, uid_threshold).await?;
+                    uid_threshold = self
+                        .process_new(&mut session, tx, uid_threshold, uid_validity)
+                        .await?;
                 }
                 Ok((IdleWaitResult::Interrupted, _)) => {
                     ::zeroclaw_log::record!(
@@ -680,11 +752,14 @@ impl EmailChannel {
         tx: &mpsc::Sender<ChannelMessage>,
         poll_interval: Duration,
         mut uid_threshold: u32,
+        uid_validity: Option<u32>,
     ) -> Result<()> {
         loop {
             sleep(poll_interval).await;
             session.noop().await?;
-            uid_threshold = self.process_new(&mut session, tx, uid_threshold).await?;
+            uid_threshold = self
+                .process_new(&mut session, tx, uid_threshold, uid_validity)
+                .await?;
         }
     }
 
@@ -733,8 +808,10 @@ impl EmailChannel {
         session: &mut ImapSession,
         tx: &mpsc::Sender<ChannelMessage>,
         uid_threshold: u32,
+        uid_validity: Option<u32>,
     ) -> Result<u32> {
-        let (messages, new_threshold) = self.fetch_new(session, uid_threshold).await?;
+        let (messages, new_threshold) =
+            self.fetch_new(session, uid_threshold, uid_validity).await?;
 
         for email in messages {
             if !self.dispatch_email(email, tx).await? {
@@ -812,6 +889,10 @@ fn smtp_credential_override(value: Option<&str>) -> Option<&str> {
     value.filter(|value| !value.trim().is_empty())
 }
 
+fn is_synthetic_email_message_id(value: &str) -> bool {
+    value.starts_with("email-imap-") || value.starts_with("email-fallback-")
+}
+
 #[async_trait]
 
 impl Channel for EmailChannel {
@@ -838,7 +919,9 @@ impl Channel for EmailChannel {
             .from(self.config.from_address.parse()?)
             .to(message.recipient.parse()?)
             .subject(subject);
-        if let Some(ref reply_id) = message.in_reply_to {
+        if let Some(ref reply_id) = message.in_reply_to
+            && !is_synthetic_email_message_id(reply_id)
+        {
             builder = builder.in_reply_to(reply_id.clone());
         }
         let mut att_parts: Vec<(String, Vec<u8>, ContentType)> = Vec::new();
@@ -1233,6 +1316,183 @@ mod tests {
         assert_eq!(cloned.imap_host, config.imap_host);
         assert_eq!(cloned.smtp_port, config.smtp_port);
         assert_eq!(cloned.default_subject, config.default_subject);
+    }
+
+    fn mailbox_identity_config() -> EmailConfig {
+        EmailConfig {
+            enabled: true,
+            imap_host: "imap.private.example.invalid".to_string(),
+            imap_port: 993,
+            imap_folder: "Sensitive Folder".to_string(),
+            smtp_host: "smtp.example.invalid".to_string(),
+            smtp_port: 465,
+            smtp_tls: true,
+            username: "private-user@example.invalid".to_string(),
+            password: "secret".to_string(),
+            smtp_username: None,
+            smtp_password: None,
+            from_address: "bot@example.invalid".to_string(),
+            idle_timeout_secs: 1740,
+            poll_interval_secs: 60,
+            default_subject: "Test Subject".to_string(),
+            max_attachment_bytes: default_max_attachment_bytes(),
+            html_body: true,
+            excluded_tools: vec![],
+            oauth2: None,
+            observer_mode: false,
+        }
+    }
+
+    fn parse_test_email(raw: &'static [u8]) -> mail_parser::Message<'static> {
+        MessageParser::default().parse(raw).unwrap()
+    }
+
+    #[test]
+    fn build_parsed_email_keeps_existing_message_id() {
+        let channel = EmailChannel::new(
+            mailbox_identity_config(),
+            "email_test_alias",
+            empty_resolver(),
+        );
+        let parsed = parse_test_email(
+            b"From: Sender <sender@example.invalid>\r\n\
+              Subject: Has Message ID\r\n\
+              Message-ID: <stable-message@example.invalid>\r\n\
+              \r\n\
+              hello",
+        );
+
+        let email = channel.build_parsed_email(&parsed, 42, Some(1234));
+
+        assert_eq!(email.msg_id, parsed.message_id().unwrap());
+    }
+
+    #[test]
+    fn build_parsed_email_uses_stable_uid_fallback_without_message_id() {
+        let channel = EmailChannel::new(
+            mailbox_identity_config(),
+            "email_test_alias",
+            empty_resolver(),
+        );
+        let parsed = parse_test_email(
+            b"From: Sender <sender@example.invalid>\r\n\
+              Subject: Missing Message ID\r\n\
+              Date: Tue, 16 Jun 2026 00:00:00 +0000\r\n\
+              \r\n\
+              hello",
+        );
+
+        let first = channel.build_parsed_email(&parsed, 42, Some(1234)).msg_id;
+        let second = channel.build_parsed_email(&parsed, 42, Some(1234)).msg_id;
+        let other_uid = channel.build_parsed_email(&parsed, 43, Some(1234)).msg_id;
+        let other_uid_validity = channel.build_parsed_email(&parsed, 42, Some(5678)).msg_id;
+
+        assert_eq!(first, second);
+        assert_ne!(first, other_uid);
+        assert_ne!(first, other_uid_validity);
+        assert!(first.starts_with("email-imap-"));
+        assert!(first.ends_with("-42"));
+        assert!(!first.contains("imap.private.example.invalid"));
+        assert!(!first.contains("private-user@example.invalid"));
+        assert!(!first.contains("Sensitive Folder"));
+    }
+
+    #[test]
+    fn build_parsed_email_missing_message_id_fallback_is_scoped_to_mailbox() {
+        let parsed = parse_test_email(
+            b"From: Sender <sender@example.invalid>\r\n\
+              Subject: Missing Message ID\r\n\
+              \r\n\
+              hello",
+        );
+        let first_channel = EmailChannel::new(
+            mailbox_identity_config(),
+            "email_test_alias",
+            empty_resolver(),
+        );
+        let mut other_config = mailbox_identity_config();
+        other_config.username = "other-user@example.invalid".to_string();
+        let other_channel = EmailChannel::new(other_config, "email_test_alias", empty_resolver());
+
+        let first_id = first_channel
+            .build_parsed_email(&parsed, 42, Some(1234))
+            .msg_id;
+        let other_mailbox_id = other_channel
+            .build_parsed_email(&parsed, 42, Some(1234))
+            .msg_id;
+
+        assert_ne!(first_id, other_mailbox_id);
+    }
+
+    #[test]
+    fn build_parsed_email_missing_uid_validity_uses_content_fallback() {
+        let channel = EmailChannel::new(
+            mailbox_identity_config(),
+            "email_test_alias",
+            empty_resolver(),
+        );
+        let parsed = parse_test_email(
+            b"From: Sender <sender@example.invalid>\r\n\
+              Subject: Missing UIDVALIDITY\r\n\
+              Date: Tue, 16 Jun 2026 00:00:00 +0000\r\n\
+              \r\n\
+              stable body",
+        );
+
+        let first = channel.build_parsed_email(&parsed, 42, None).msg_id;
+        let second = channel.build_parsed_email(&parsed, 43, None).msg_id;
+
+        assert_eq!(first, second);
+        assert!(first.starts_with("email-fallback-"));
+    }
+
+    #[test]
+    fn build_parsed_email_missing_uid_fallback_is_stable_and_private() {
+        let channel = EmailChannel::new(
+            mailbox_identity_config(),
+            "email_test_alias",
+            empty_resolver(),
+        );
+        let parsed = parse_test_email(
+            b"From: Sender <sender@example.invalid>\r\n\
+              Subject: Missing UID\r\n\
+              Date: Tue, 16 Jun 2026 00:00:00 +0000\r\n\
+              \r\n\
+              stable body",
+        );
+        let other_parsed = parse_test_email(
+            b"From: Sender <sender@example.invalid>\r\n\
+              Subject: Missing UID\r\n\
+              Date: Tue, 16 Jun 2026 00:00:00 +0000\r\n\
+              \r\n\
+              different body",
+        );
+
+        let first = channel.build_parsed_email(&parsed, 0, Some(1234)).msg_id;
+        let second = channel.build_parsed_email(&parsed, 0, Some(5678)).msg_id;
+        let other_content = channel
+            .build_parsed_email(&other_parsed, 0, Some(1234))
+            .msg_id;
+
+        assert_eq!(first, second);
+        assert_ne!(first, other_content);
+        assert!(first.starts_with("email-fallback-"));
+        assert!(!first.contains("imap.private.example.invalid"));
+        assert!(!first.contains("private-user@example.invalid"));
+        assert!(!first.contains("Sensitive Folder"));
+    }
+
+    #[test]
+    fn synthetic_email_message_ids_are_not_reply_header_ids() {
+        assert!(is_synthetic_email_message_id(
+            "email-imap-57c2da8dd15cdb2f2f3d118a6d636f86-42"
+        ));
+        assert!(is_synthetic_email_message_id(
+            "email-fallback-57c2da8dd15cdb2f2f3d118a6d636f86"
+        ));
+        assert!(!is_synthetic_email_message_id(
+            "<real-message-id@example.invalid>"
+        ));
     }
 
     #[tokio::test]

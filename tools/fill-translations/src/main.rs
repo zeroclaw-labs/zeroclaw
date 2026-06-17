@@ -359,7 +359,7 @@ async fn translate_batch(
 
     let mut out = Vec::with_capacity(batch.len());
     for source in batch {
-        let content = provider
+        let content = zeroclaw_providers::ProviderDispatch::from_ref(provider)
             .chat_with_system(Some(&system), source, model, None)
             .await
             .map_err(|e| fail(e, String::new()))?;

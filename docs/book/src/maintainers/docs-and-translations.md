@@ -21,6 +21,9 @@ Ollama is the current canonical source for docs. Ensure you have [Ollama](https:
 
 `cargo mdbook` is an alias for `cargo run -p xtask --bin mdbook --` (defined in the cargo config). For a lean contributor-facing version of this section, see [Building the docs locally](../developing/building-docs.md).
 
+> [!NOTE]
+> Full-text search is built only for the primary locale (English, first in `locales.toml`). Translated locales build without a search index or search box. Per-locale search indexes are large (~6-7 MB each) and dominate `gh-pages` clone size; restricting search to English keeps clones lean. Adding a search box back to a translated locale means re-enabling `output.html.search.enable` for that build in `build_locales` (`xtask/src/cmd/mdbook/build.rs`).
+
 ### How translations stay current
 
 When English source changes, `cargo mdbook sync` runs two stages:

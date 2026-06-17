@@ -1,0 +1,69 @@
+name: Documentation Issue
+description: Report missing, incorrect, confusing, or outdated documentation
+title: "[Docs]: "
+labels:
+  - "type: docs"
+  - docs
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for documentation problems, missing explanations, broken links, or outdated guidance.
+        If the docs gap comes from a concrete bug or feature request, link that issue too.
+
+  - type: input
+    id: location
+    attributes:
+      label: Documentation location
+      description: URL, file path, heading, command, or page name.
+      placeholder: docs/book/src/... or https://...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: issue_type
+    attributes:
+      label: Documentation issue type
+      options:
+        - missing documentation
+        - incorrect information
+        - confusing or unclear
+        - outdated after code or policy change
+        - broken link
+        - example does not work
+        - other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is wrong or missing?
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected documentation
+      description: What should the docs explain instead?
+    validations:
+      required: false
+
+  - type: textarea
+    id: related_work
+    attributes:
+      label: Related issue, PR, RFC, or discussion
+      description: Link the source of truth if this docs issue follows from other work.
+      placeholder: "#..."
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Data hygiene checks
+      options:
+        - label: I removed personal/sensitive data from examples, payloads, and logs.
+          required: true

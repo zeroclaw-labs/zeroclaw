@@ -122,6 +122,19 @@ the newer `mercury-2`). Key from the
 > Credentials come only from config (`api_key`) or the `--credential` override at run
 > time, these slots do **not** read a per-provider `*_API_KEY` environment variable.
 
+NEAR AI Cloud example:
+
+```toml
+[providers.models.nearai.tee]
+model   = "..."       # pick a modelId from https://cloud-api.near.ai/v1/model/list
+api_key = "..."
+```
+
+The `nearai` slot uses `https://cloud-api.near.ai/v1` by default and sends
+`Authorization: Bearer <api_key>`. To bridge an existing `NEARAI_API_KEY`
+shell variable into ZeroClaw's schema-mirror env surface, set
+`ZEROCLAW_providers__models__nearai__tee__api_key="$NEARAI_API_KEY"`.
+
 ---
 
 ## Multi-region families
