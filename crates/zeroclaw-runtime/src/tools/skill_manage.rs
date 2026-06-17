@@ -493,6 +493,19 @@ impl SkillManageTool {
             .and_then(|v| v.as_str())
             .unwrap_or("Skill review");
 
+        // Check the kill switch before the cooldown so the agent gets a
+        // distinct, actionable error when improvement is disabled — otherwise
+        // both reasons collapse onto the cooldown message via
+        // `should_improve_skill`, and the agent wastes turns waiting for a
+        // cooldown that the disabled flag will never clear.
+        if !self.config.enabled {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Skill improvement is disabled (enabled: false)".to_string()),
+            });
+        }
+
         let mut improver = crate::skills::improver::SkillImprover::new(
             self.workspace_dir.clone(),
             self.config.clone(),
@@ -1111,6 +1124,35 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
+    }
+
+    #[tokio::test]
+    async fn skill_manage_patch_blocked_when_improvement_disabled() {
+        // `enabled = false` is the per-tool kill switch. The error message
+        // must name the disabled state — not the cooldown — so the operator
+        // (or the agent reading the tool history) knows the gate is the
+        // feature flag, not a timer that will eventually clear.
+        let dir = tempdir();
+        write_skill(dir.path(), "deploy", VALID_SKILL).await;
+        let cfg = zeroclaw_config::schema::SkillImprovementConfig {
+            enabled: false,
+            cooldown_secs: 0,
+            ..Default::default()
+        };
+        let tool = SkillManageTool::new(dir.path().to_path_buf(), cfg, true);
+
+        let result = tool
+            .execute(json!({
+                "action": "patch",
+                "slug": "deploy",
+                "content": IMPROVED_SKILL,
+                "reason": "n/a",
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap_or_default();
+        assert_eq!(err, "Skill improvement is disabled (enabled: false)");
     }
 
     // ─── skill_manage: write_file ───────────────────────────
