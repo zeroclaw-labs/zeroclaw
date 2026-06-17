@@ -984,7 +984,10 @@ impl Tool for GitOperationsTool {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some("Not in a git repository".into()),
+                    error: Some(format!(
+                        "Not in a Git repository (checked `{}`). Choose a path inside a Git worktree, pass `path` for a repository subdirectory, or initialize a repository before running git_operations.",
+                        working_dir.display()
+                    )),
                 });
             }
         }
@@ -1764,5 +1767,17 @@ mod tests {
         let out = String::from_utf8_lossy(&status.stdout);
         assert!(out.contains("A  a.txt"), "a.txt not staged: {out:?}");
         assert!(out.contains("A  b.txt"), "b.txt not staged: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn status_outside_git_repository_includes_recovery_hint() {
+        let tmp = TempDir::new().unwrap();
+        let tool = test_tool(tmp.path());
+        let result = tool.execute(json!({"operation": "status"})).await.unwrap();
+        assert!(!result.success);
+        let err = result.error.expect("expected error message");
+        assert!(err.contains("Not in a Git repository"), "{err}");
+        assert!(err.contains("checked"), "{err}");
+        assert!(err.contains("pass `path`"), "{err}");
     }
 }
