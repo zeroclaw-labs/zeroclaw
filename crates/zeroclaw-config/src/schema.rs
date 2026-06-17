@@ -28380,4 +28380,24 @@ model_provider = \"ollama.default\"
         assert!(agent.delegate_same_risk_profile, "default must be true");
         assert!(agent.delegates.is_empty(), "default must be empty");
     }
+
+    #[test]
+    async fn channel_presence_names_are_unique_and_undeliverable_set_is_fixed() {
+        let presence = ChannelsConfig::default().channel_presence();
+        let mut seen = std::collections::HashSet::new();
+        for (name, _, _) in presence {
+            assert!(seen.insert(name), "duplicate channel_presence name: {name}");
+        }
+        let mut undeliverable: Vec<&str> = presence
+            .iter()
+            .filter(|(_, _, deliverable)| !*deliverable)
+            .map(|(name, _, _)| *name)
+            .collect();
+        undeliverable.sort_unstable();
+        assert_eq!(
+            undeliverable,
+            ["amqp", "mqtt", "voice_wake"],
+            "only input-only transports may be non-deliverable; update channel_presence and is_channel_deliverable together"
+        );
+    }
 }
