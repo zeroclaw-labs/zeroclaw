@@ -14,6 +14,18 @@ use zeroclaw_memory::MemoryEntry;
 
 const MEMORY_API_CONTENT_MAX_CHARS: usize = 4096;
 
+fn integration_entry_json(
+    entry: &zeroclaw_runtime::integrations::IntegrationEntry,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": &entry.name,
+        "description": &entry.description,
+        "category": entry.category,
+        "category_label": entry.category.label(),
+        "status": entry.status,
+    })
+}
+
 // ── Bearer token auth extractor ─────────────────────────────────
 
 /// Extract and validate bearer token from Authorization header.
@@ -801,17 +813,7 @@ pub async fn handle_api_integrations(
     let config = state.config.read().clone();
     let entries = zeroclaw_runtime::integrations::registry::all_integrations(&config);
 
-    let integrations: Vec<serde_json::Value> = entries
-        .iter()
-        .map(|entry| {
-            serde_json::json!({
-                "name": entry.name,
-                "description": entry.description,
-                "category": entry.category,
-                "status": entry.status,
-            })
-        })
-        .collect();
+    let integrations: Vec<serde_json::Value> = entries.iter().map(integration_entry_json).collect();
 
     Json(serde_json::json!({"integrations": integrations})).into_response()
 }
@@ -2153,6 +2155,22 @@ mod tests {
             .expect("response body")
             .to_bytes();
         serde_json::from_slice(&body).expect("valid json response")
+    }
+
+    #[test]
+    fn integration_entry_json_derives_category_label_from_category() {
+        let entry = zeroclaw_runtime::integrations::IntegrationEntry {
+            name: "Browser".into(),
+            description: "Run browser automation".into(),
+            category: zeroclaw_runtime::integrations::IntegrationCategory::ToolsAutomation,
+            status: zeroclaw_runtime::integrations::IntegrationStatus::Active,
+        };
+
+        let json = integration_entry_json(&entry);
+
+        assert_eq!(json["category"], "ToolsAutomation");
+        assert_eq!(json["category_label"], "Tools & Automation");
+        assert_eq!(json["status"], "Active");
     }
 
     fn memory_entry_with_content(content: String) -> MemoryEntry {
