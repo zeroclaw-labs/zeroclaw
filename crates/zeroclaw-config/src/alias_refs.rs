@@ -162,6 +162,181 @@ pub fn plan_delete(cfg: &Config, kind: &AliasKind, alias: &str) -> ImpactReport 
     }
 }
 
+// ── delete-with-cascade (mutating) ──────────────────────────────────────────
+
+/// How a delete handles references and whether it mutates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CascadePolicy {
+    /// Refuse if any HARD reference blocks; otherwise scrub the soft references
+    /// and remove the entry. The #7175-accepted default.
+    RefuseOnHard,
+    /// Compute the plan and mutate nothing (the dry-run a surface renders).
+    DryRun,
+}
+
+/// Outcome of a (non-refused) [`delete_with_cascade`].
+#[derive(Debug, Clone)]
+pub struct CascadeReport {
+    /// The impact plan that was computed (same shape as [`plan_delete`]).
+    pub plan: ImpactReport,
+    /// Soft references actually scrubbed. Empty for [`CascadePolicy::DryRun`].
+    pub applied: Vec<RefSite>,
+    /// Dotted path of the removed entry, e.g. `providers.models.anthropic.default`.
+    /// `None` for a dry run.
+    pub deleted_entry: Option<String>,
+}
+
+/// Why a [`delete_with_cascade`] did not complete. `Refused` is an expected,
+/// renderable outcome (a hard reference blocks the delete), not a bug.
+#[derive(Debug)]
+pub enum CascadeError {
+    /// A hard reference blocks the delete; no mutation was performed. The report
+    /// lists the blockers for the surface to render. Boxed so the common `Ok`
+    /// path (and the other variants) don't carry `ImpactReport`'s several `Vec`s
+    /// inline (`clippy::result_large_err`).
+    Refused(Box<ImpactReport>),
+    /// The target alias does not exist.
+    NotFound(String),
+    /// This alias kind is not yet wired into `delete_with_cascade`.
+    NotImplemented(String),
+    /// Bug guard: scrub drifted from `find_all_references` and left a dangling
+    /// reference to the deleted alias. **The config WAS mutated** (scrub + entry
+    /// removal ran) — the caller must NOT persist it. Unreachable while the two
+    /// mirror exactly (same soft-ref sites, same `.trim()`); fires only on
+    /// maintenance drift. The message names the offending paths.
+    PostCondition(String),
+}
+
+impl std::fmt::Display for CascadeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(report) => write!(
+                f,
+                "delete refused: {} hard reference(s) block it",
+                report.blockers.len()
+            ),
+            Self::NotFound(path) => write!(f, "alias not found: {path}"),
+            Self::NotImplemented(msg) => write!(f, "{msg}"),
+            Self::PostCondition(msg) => write!(f, "cascade post-condition failed: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for CascadeError {}
+
+/// Delete an aliased entry and repair every reference to it, per `policy`.
+///
+/// `RefuseOnHard` refuses when any HARD reference would dangle (returns
+/// [`CascadeError::Refused`] with the full report, no mutation), otherwise
+/// scrubs the SOFT references, removes the entry, and verifies no dangling
+/// reference to the alias remains. `DryRun` computes the plan and mutates
+/// nothing. [`plan_delete`] is the read-only sibling.
+///
+/// Currently implements the **model-provider** kind
+/// (`providers.models.<family>.<alias>`); other kinds return
+/// [`CascadeError::NotImplemented`] until their follow-up lands (#7175).
+pub fn delete_with_cascade(
+    cfg: &mut Config,
+    kind: &AliasKind,
+    alias: &str,
+    policy: CascadePolicy,
+) -> Result<CascadeReport, CascadeError> {
+    match kind {
+        AliasKind::Provider {
+            category: ProviderCategory::Models,
+            family,
+        } => delete_model_provider(cfg, family, alias, policy),
+        AliasKind::Provider { .. } => Err(CascadeError::NotImplemented(
+            "TTS/transcription provider delete-with-cascade is not yet implemented".to_string(),
+        )),
+        AliasKind::Agent => Err(CascadeError::NotImplemented(
+            "agent delete-with-cascade lands in a follow-up (#7175)".to_string(),
+        )),
+        AliasKind::Channel { .. } => Err(CascadeError::NotImplemented(
+            "channel delete-with-cascade lands in a follow-up (#7175)".to_string(),
+        )),
+    }
+}
+
+fn delete_model_provider(
+    cfg: &mut Config,
+    family: &str,
+    alias: &str,
+    policy: CascadePolicy,
+) -> Result<CascadeReport, CascadeError> {
+    let entry_path = format!("providers.models.{family}.{alias}");
+    if cfg.providers.models.find(family, alias).is_none() {
+        return Err(CascadeError::NotFound(entry_path));
+    }
+
+    let kind = AliasKind::Provider {
+        category: ProviderCategory::Models,
+        family: family.to_string(),
+    };
+    let report = plan_delete(cfg, &kind, alias);
+
+    if policy == CascadePolicy::DryRun {
+        return Ok(CascadeReport {
+            plan: report,
+            applied: Vec::new(),
+            deleted_entry: None,
+        });
+    }
+    if !report.allowed {
+        return Err(CascadeError::Refused(Box::new(report)));
+    }
+
+    let applied = report.scrubs.clone();
+    let target = format!("{family}.{alias}");
+    scrub_model_provider_refs(cfg, &target);
+    let removed = cfg.providers.models.remove_alias(family, alias);
+    debug_assert!(removed, "existence was checked above");
+
+    // Targeted post-condition: the cascade must leave no reference to the
+    // deleted alias. (We intentionally do NOT re-run the global
+    // `Config::validate()` here — that conflates pre-existing, unrelated
+    // invalidity with this cascade's correctness; the calling surface
+    // validates the whole config before persisting.)
+    let remaining = find_all_references(cfg, &kind, alias);
+    if !remaining.is_empty() {
+        let paths: Vec<_> = remaining.iter().map(|s| s.path.as_str()).collect();
+        return Err(CascadeError::PostCondition(format!(
+            "{} dangling reference(s) to {target} remain: {}",
+            remaining.len(),
+            paths.join(", ")
+        )));
+    }
+
+    Ok(CascadeReport {
+        plan: report,
+        applied,
+        deleted_entry: Some(entry_path),
+    })
+}
+
+/// Mutating mirror of the model-provider arm of [`find_all_references`]: clear
+/// soft scalar refs and drop soft collection elements pointing at `target`
+/// (`"<family>.<alias>"`). `model_provider` is a HARD ref and is never scrubbed
+/// (a delete carrying one is refused before reaching here). `retain` handles
+/// the index-shift concern for the vector drops. Comparisons `.trim()` the
+/// stored value to mirror `find_all_references` (and `validate()`) exactly — a
+/// whitespace-padded ref that find() flagged must be scrubbed here too, or the
+/// post-condition would fail.
+fn scrub_model_provider_refs(cfg: &mut Config, target: &str) {
+    for agent in cfg.agents.values_mut() {
+        if agent.classifier_provider.trim() == target {
+            agent.classifier_provider = crate::providers::ModelProviderRef::default();
+        }
+    }
+    for (_ty, _al, profile) in cfg.providers.models.iter_entries_mut() {
+        profile.fallback.retain(|fb| fb.trim() != target);
+    }
+    cfg.model_routes
+        .retain(|r| r.model_provider.trim() != target);
+    cfg.embedding_routes
+        .retain(|r| r.model_provider.trim() != target);
+}
+
 // ── deterministic iteration over the alias-keyed maps ───────────────────────
 // `Config::agents` / `peer_groups` are HashMaps; sort by key so RefSite order
 // is stable across runs (tests + dashboard binding depend on it).
@@ -969,5 +1144,234 @@ mod tests {
             },
         );
         assert!(plan_delete(&cfg, &AliasKind::Agent, "off").allowed);
+    }
+
+    // ── delete_with_cascade (model providers) ───────────────────────────────
+
+    fn cfg_with_provider(family: &str, alias: &str) -> Config {
+        let mut c = empty_config();
+        c.providers
+            .models
+            .ensure(family, alias)
+            .expect("ensure creates the entry");
+        c
+    }
+
+    #[test]
+    fn cascade_refuses_when_model_provider_is_hard_ref() {
+        let mut cfg = cfg_with_provider("anthropic", "default");
+        cfg.agents.insert(
+            "researcher".to_string(),
+            AliasedAgentConfig {
+                model_provider: "anthropic.default".into(),
+                ..Default::default()
+            },
+        );
+        let kind = provider_kind("anthropic");
+        let err = delete_with_cascade(&mut cfg, &kind, "default", CascadePolicy::RefuseOnHard)
+            .unwrap_err();
+        match err {
+            CascadeError::Refused(report) => assert_eq!(report.blockers.len(), 1),
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        // No mutation on refuse.
+        assert!(cfg.providers.models.find("anthropic", "default").is_some());
+        assert_eq!(
+            cfg.agents["researcher"].model_provider.as_str(),
+            "anthropic.default"
+        );
+    }
+
+    #[test]
+    fn cascade_scrubs_soft_refs_and_removes_entry() {
+        let mut cfg = cfg_with_provider("anthropic", "default");
+        // Another provider whose fallback points at the target.
+        cfg.providers
+            .models
+            .ensure("openai", "main")
+            .unwrap()
+            .fallback = vec!["anthropic.default".into()];
+        cfg.agents.insert(
+            "triage".to_string(),
+            AliasedAgentConfig {
+                classifier_provider: "anthropic.default".into(),
+                ..Default::default()
+            },
+        );
+        cfg.model_routes.push(ModelRouteConfig {
+            hint: "deep".to_string(),
+            model_provider: "anthropic.default".to_string(),
+            model: "claude".to_string(),
+            api_key: None,
+        });
+        cfg.embedding_routes.push(EmbeddingRouteConfig {
+            hint: "sem".to_string(),
+            model_provider: "anthropic.default".to_string(),
+            model: "emb".to_string(),
+            dimensions: None,
+            api_key: None,
+        });
+
+        let kind = provider_kind("anthropic");
+        let report = delete_with_cascade(&mut cfg, &kind, "default", CascadePolicy::RefuseOnHard)
+            .expect("soft-only delete succeeds");
+        assert_eq!(
+            report.applied.len(),
+            4,
+            "classifier + fallback + model_route + embedding_route"
+        );
+        assert_eq!(
+            report.deleted_entry.as_deref(),
+            Some("providers.models.anthropic.default")
+        );
+        assert!(cfg.providers.models.find("anthropic", "default").is_none());
+        assert!(cfg.agents["triage"].classifier_provider.is_empty());
+        assert!(
+            cfg.providers
+                .models
+                .find("openai", "main")
+                .unwrap()
+                .fallback
+                .is_empty()
+        );
+        assert!(cfg.model_routes.is_empty());
+        assert!(cfg.embedding_routes.is_empty());
+        assert!(find_all_references(&cfg, &kind, "default").is_empty());
+    }
+
+    #[test]
+    fn cascade_scrubs_whitespace_padded_refs() {
+        // scrub must trim like find/validate, else a padded ref find() flags is
+        // left behind and the post-condition fails.
+        let mut cfg = cfg_with_provider("anthropic", "default");
+        cfg.agents.insert(
+            "triage".to_string(),
+            AliasedAgentConfig {
+                classifier_provider: "  anthropic.default  ".into(),
+                ..Default::default()
+            },
+        );
+        cfg.model_routes.push(ModelRouteConfig {
+            hint: "deep".to_string(),
+            model_provider: " anthropic.default ".to_string(),
+            model: "claude".to_string(),
+            api_key: None,
+        });
+        let kind = provider_kind("anthropic");
+        let report = delete_with_cascade(&mut cfg, &kind, "default", CascadePolicy::RefuseOnHard)
+            .expect("padded soft refs scrubbed, post-condition passes");
+        assert_eq!(report.applied.len(), 2);
+        assert!(cfg.agents["triage"].classifier_provider.is_empty());
+        assert!(cfg.model_routes.is_empty());
+    }
+
+    #[test]
+    fn cascade_scrubs_all_matching_fallback_entries() {
+        let mut cfg = cfg_with_provider("anthropic", "default");
+        // openai.main lists the target twice in fallback (plus an unrelated one);
+        // retain must drop BOTH matches and keep the unrelated entry.
+        cfg.providers
+            .models
+            .ensure("openai", "main")
+            .unwrap()
+            .fallback = vec![
+            "anthropic.default".into(),
+            "anthropic.fast".into(),
+            "anthropic.default".into(),
+        ];
+        let kind = provider_kind("anthropic");
+        let report = delete_with_cascade(&mut cfg, &kind, "default", CascadePolicy::RefuseOnHard)
+            .expect("soft-only delete succeeds");
+        assert_eq!(
+            report.applied.len(),
+            2,
+            "both matching fallback entries reported"
+        );
+        let fallback = &cfg
+            .providers
+            .models
+            .find("openai", "main")
+            .unwrap()
+            .fallback;
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].as_str(), "anthropic.fast");
+    }
+
+    #[test]
+    fn cascade_dry_run_mutates_nothing() {
+        let mut cfg = cfg_with_provider("anthropic", "default");
+        cfg.agents.insert(
+            "triage".to_string(),
+            AliasedAgentConfig {
+                classifier_provider: "anthropic.default".into(),
+                ..Default::default()
+            },
+        );
+        let kind = provider_kind("anthropic");
+        let report =
+            delete_with_cascade(&mut cfg, &kind, "default", CascadePolicy::DryRun).unwrap();
+        assert!(report.deleted_entry.is_none());
+        assert!(report.applied.is_empty());
+        assert_eq!(report.plan.scrubs.len(), 1);
+        assert!(cfg.providers.models.find("anthropic", "default").is_some());
+        assert_eq!(
+            cfg.agents["triage"].classifier_provider.as_str(),
+            "anthropic.default"
+        );
+    }
+
+    #[test]
+    fn cascade_not_found_for_missing_provider() {
+        let mut cfg = empty_config();
+        let err = delete_with_cascade(
+            &mut cfg,
+            &provider_kind("anthropic"),
+            "ghost",
+            CascadePolicy::RefuseOnHard,
+        )
+        .unwrap_err();
+        assert!(matches!(err, CascadeError::NotFound(_)));
+    }
+
+    #[test]
+    fn cascade_removes_unreferenced_provider() {
+        let mut cfg = cfg_with_provider("anthropic", "spare");
+        let report = delete_with_cascade(
+            &mut cfg,
+            &provider_kind("anthropic"),
+            "spare",
+            CascadePolicy::RefuseOnHard,
+        )
+        .unwrap();
+        assert!(report.applied.is_empty());
+        assert_eq!(
+            report.deleted_entry.as_deref(),
+            Some("providers.models.anthropic.spare")
+        );
+        assert!(cfg.providers.models.find("anthropic", "spare").is_none());
+    }
+
+    #[test]
+    fn cascade_not_implemented_for_other_kinds() {
+        let mut cfg = empty_config();
+        assert!(matches!(
+            delete_with_cascade(
+                &mut cfg,
+                &AliasKind::Channel {
+                    channel_type: "discord".to_string()
+                },
+                "x",
+                CascadePolicy::RefuseOnHard,
+            ),
+            Err(CascadeError::NotImplemented(_))
+        ));
+        let tts = AliasKind::Provider {
+            category: ProviderCategory::Tts,
+            family: "elevenlabs".to_string(),
+        };
+        assert!(matches!(
+            delete_with_cascade(&mut cfg, &tts, "x", CascadePolicy::RefuseOnHard),
+            Err(CascadeError::NotImplemented(_))
+        ));
     }
 }
