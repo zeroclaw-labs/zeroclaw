@@ -141,11 +141,15 @@ interface FieldFormProps {
   drift?: DriftEntry[];
   /** Filter for which entries this form renders. Returning false hides
    *  the entry. Used to partition a section's fields across tabs (e.g.
-   *  Model providers: Connection / Model / Advanced). The form still
-   *  fetches every entry under `prefix`; the predicate only gates
-   *  rendering, so saves still validate against the full server-side
-   *  config. */
+   *  Model providers: Connection / Model / Advanced). By default, the
+   *  form still fetches every entry under `prefix`; the predicate only
+   *  gates rendering, so saves still validate against the full
+   *  server-side config. */
   includePath?: (path: string) => boolean;
+  /** When true, `includePath` also limits save, dirty-count, and
+   *  successful-save discard scope. Use this when hidden fields belong to a
+   *  different editor, not just another tab of the same editor. */
+  scopeActionsToIncludedPaths?: boolean;
   /** Render the save bar as a normal inline element instead of
    *  `sticky bottom-0`. Set when the FieldForm is embedded inside a
    *  taller composite editor (e.g. an expandable rate-sheet row) where
@@ -695,6 +699,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
       title,
       drift,
       includePath,
+      scopeActionsToIncludedPaths = false,
       inlineSaveBar = false,
     },
     ref,
@@ -762,6 +767,16 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [prefix]);
 
+    const actionableEntries = useMemo(() => {
+      if (!scopeActionsToIncludedPaths || !includePath) return entries;
+      return entries.filter((e) => includePath(e.path));
+    }, [entries, includePath, scopeActionsToIncludedPaths]);
+
+    const actionablePaths = useMemo(
+      () => actionableEntries.map((e) => e.path),
+      [actionableEntries],
+    );
+
     // Returns true when nothing was dirty or the save succeeded; false on
     // any error so callers (e.g. the wizard's Next button) can refuse to
     // advance past a broken state.
@@ -790,7 +805,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
         }
         return value;
       };
-      for (const e of entries) {
+      for (const e of actionableEntries) {
         if (configDraft.tombstones.has(e.path)) {
           ops.push({ op: "remove", path: e.path });
           continue;
@@ -835,7 +850,11 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
       try {
         const resp = await patchConfig(ops);
         setSavedAt(`${t("fieldform.saved_prefix")}${resp.results.length}${t("fieldform.saved_suffix")}`);
-        configDraft.discardSection(prefix);
+        if (scopeActionsToIncludedPaths && includePath) {
+          configDraft.discardPaths(actionablePaths);
+        } else {
+          configDraft.discardSection(prefix);
+        }
         await reload();
         onSaved?.();
         return true;
@@ -925,7 +944,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
     // across the loading / loaded transition (React error #310).
     const unsavedCount = useMemo(() => {
       let n = 0;
-      for (const e of entries) {
+      for (const e of actionableEntries) {
         if (configDraft.tombstones.has(e.path)) {
           n += 1;
           continue;
@@ -938,7 +957,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
         if (valueChanged || commentChanged) n += 1;
       }
       return n;
-    }, [entries, draft, comments, configDraft.tombstones]);
+    }, [actionableEntries, draft, comments, configDraft.tombstones]);
 
     // Warn user before navigating away with unsaved changes.
     useEffect(() => {
