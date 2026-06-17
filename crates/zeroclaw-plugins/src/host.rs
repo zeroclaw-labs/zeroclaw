@@ -1,10 +1,23 @@
 //! Plugin host: discovery, loading, lifecycle management.
 
+#[cfg(feature = "plugins-wasmtime")]
+use zeroclaw_api::channel::Channel;
+#[cfg(feature = "plugins-wasmtime")]
+use zeroclaw_api::memory_traits::Memory;
+#[cfg(feature = "plugins-wasmtime")]
+use zeroclaw_api::tool::Tool;
+
 use super::error::PluginError;
 use super::signature::{self, SignatureMode, VerificationResult};
 use super::{PluginCapability, PluginInfo, PluginManifest};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+use crate::FineGrainedPermission;
+#[cfg(feature = "plugins-wasmtime")]
+use crate::component::ComponentEngine;
+#[cfg(feature = "plugins-wasmtime")]
+use std::sync::Arc;
 
 /// Subdirectory inside a skill-capable plugin that holds individual skills.
 const SKILLS_SUBDIR: &str = "skills";
@@ -15,6 +28,8 @@ pub struct PluginHost {
     loaded: HashMap<String, LoadedPlugin>,
     signature_mode: SignatureMode,
     trusted_publisher_keys: Vec<String>,
+    #[cfg(feature = "plugins-wasmtime")]
+    component_engine: Arc<ComponentEngine>,
 }
 
 struct LoadedPlugin {
@@ -69,6 +84,8 @@ impl PluginHost {
             loaded: HashMap::new(),
             signature_mode,
             trusted_publisher_keys,
+            #[cfg(feature = "plugins-wasmtime")]
+            component_engine: Arc::new(ComponentEngine::new()?),
         };
 
         host.discover()?;
@@ -278,6 +295,97 @@ impl PluginHost {
             .filter(|p| p.manifest.capabilities.contains(&PluginCapability::Tool))
             .filter_map(|p| p.wasm_path.as_deref().map(|wp| (&p.manifest, wp)))
             .collect()
+    }
+
+    // Returns the bytes and fine-grained permissions for the specified plugin,
+    // if it exists and has a `wasm_path`.
+    #[cfg(feature = "plugins-wasmtime")]
+    async fn plugin_bytes_and_permissions(
+        &self,
+        name: &str,
+        capability: PluginCapability,
+    ) -> Result<(Vec<u8>, &[FineGrainedPermission]), PluginError> {
+        let plugin = self
+            .loaded
+            .get(name)
+            .ok_or_else(|| PluginError::NotFound(name.to_string()))?;
+        if !plugin.manifest.capabilities.contains(&capability) {
+            return Err(PluginError::UnsupportedCapability(format!(
+                "Plugin {} does not support the {:?} capability",
+                name, capability
+            )));
+        }
+
+        let wasm_path = plugin
+            .wasm_path
+            .as_ref()
+            .ok_or_else(|| PluginError::LoadFailed(name.to_string()))?;
+        let bytes = tokio::fs::read(wasm_path)
+            .await
+            .map_err(|_| PluginError::LoadFailed(name.to_string()))?;
+
+        Ok((bytes, &plugin.manifest.fine_grained_permissions))
+    }
+
+    /// Returns a new instance of the specified channel plugin, if it exists and
+    /// can be instantiated.
+    #[cfg(feature = "plugins-wasmtime")]
+    pub async fn instantiate_channel_plugin(
+        &self,
+        name: &str,
+    ) -> Result<Arc<dyn Channel>, PluginError> {
+        let (bytes, permissions) = self
+            .plugin_bytes_and_permissions(name, PluginCapability::Channel)
+            .await?;
+
+        let channel = crate::component::v0::ComponentChannel::from_bytes(
+            name,
+            &self.component_engine,
+            &bytes,
+            permissions,
+        )
+        .await?;
+
+        Ok(Arc::new(channel))
+    }
+
+    /// Returns a new instance of the specified tool plugin, if it exists and
+    /// can be instantiated.
+    #[cfg(feature = "plugins-wasmtime")]
+    pub async fn instantiate_tool_plugin(&self, name: &str) -> Result<Arc<dyn Tool>, PluginError> {
+        let (bytes, permissions) = self
+            .plugin_bytes_and_permissions(name, PluginCapability::Tool)
+            .await?;
+
+        let tool = crate::component::v0::ComponentTool::from_bytes(
+            &self.component_engine,
+            &bytes,
+            permissions,
+        )
+        .await?;
+
+        Ok(Arc::new(tool))
+    }
+
+    /// Returns a new instance of the specified memory plugin, if it exists and
+    /// can be instantiated.
+    #[cfg(feature = "plugins-wasmtime")]
+    pub async fn instantiate_memory_plugin(&self, name: &str) -> Option<Arc<dyn Memory>> {
+        let (bytes, permissions) = self
+            .plugin_bytes_and_permissions(name, PluginCapability::Memory)
+            .await
+            .ok()?;
+
+        let memory = crate::component::v0::ComponentMemory::from_bytes(
+            name,
+            &self.component_engine,
+            &bytes,
+            permissions,
+        )
+        .await
+        .ok()?;
+
+        Some(Arc::new(memory))
     }
 
     /// Get channel-capable plugins.

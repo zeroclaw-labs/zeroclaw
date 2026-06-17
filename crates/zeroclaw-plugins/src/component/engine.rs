@@ -11,7 +11,7 @@ pub struct ComponentEngine(wasmtime::Engine);
 
 impl ComponentEngine {
     /// Create a new engine with Component Model support enabled.
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new() -> Result<Self, PluginError> {
         let mut config = wasmtime::Config::new();
         config.wasm_component_model(true);
         Ok(Self(
@@ -23,7 +23,7 @@ impl ComponentEngine {
     ///
     /// Callers should store the returned `Arc<Component>` and reuse it
     /// across instantiations — compilation is the expensive step.
-    pub fn compile(&self, bytes: &[u8]) -> anyhow::Result<wasmtime::component::Component> {
+    pub fn compile(&self, bytes: &[u8]) -> Result<wasmtime::component::Component, PluginError> {
         let component =
             wasmtime::component::Component::new(&self.0, bytes).map_err(PluginError::from)?;
         Ok(component)

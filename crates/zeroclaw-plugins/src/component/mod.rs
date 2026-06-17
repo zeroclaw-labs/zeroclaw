@@ -6,3 +6,5 @@
 
 mod engine;
 pub mod v0;
+
+pub use engine::ComponentEngine;

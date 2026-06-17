@@ -53,10 +53,10 @@ impl ComponentTool {
     /// filesystem, TCP, UDP, and HTTP access are restricted to the declared
     /// `fine_grained_permissions` list.
     pub async fn from_bytes(
-        engine: Arc<ComponentEngine>,
+        engine: &Arc<ComponentEngine>,
         bytes: &[u8],
-        permissions: Vec<crate::FineGrainedPermission>,
-    ) -> anyhow::Result<Self> {
+        permissions: &[crate::FineGrainedPermission],
+    ) -> Result<Self, PluginError> {
         let component = engine.compile(bytes)?;
         let mut linker = wasmtime::component::Linker::<PluginStore>::new(engine.engine());
         wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(PluginError::from)?;
@@ -103,14 +103,14 @@ impl ComponentTool {
             .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
 
         Ok(Self {
-            engine,
+            engine: Arc::clone(engine),
             pre,
             name,
             description,
             parameters_schema,
             plugin_name,
             plugin_version,
-            permissions: Arc::new(permissions),
+            permissions: Arc::new(permissions.to_vec()),
         })
     }
 }

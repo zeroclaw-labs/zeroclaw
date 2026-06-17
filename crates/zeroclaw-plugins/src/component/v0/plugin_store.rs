@@ -20,6 +20,8 @@ use wasmtime_wasi_http::p2::{
 };
 use zeroclaw_log::{Action, Event, EventOutcome, record};
 
+use crate::error::PluginError;
+
 use super::bindings;
 
 // ── PluginStore ────────────────────────────────────────────────────────────────
@@ -106,7 +108,9 @@ impl PluginStore {
     /// - Wildcard domain names (e.g. `*.example.com`) are resolved at connect
     ///   time using a reverse-DNS lookup; the resulting hostname is matched
     ///   against the pattern. If reverse DNS fails, the connection is denied.
-    pub async fn with_permissions(perms: &[crate::FineGrainedPermission]) -> anyhow::Result<Self> {
+    pub async fn with_permissions(
+        perms: &[crate::FineGrainedPermission],
+    ) -> Result<Self, PluginError> {
         let mut builder = WasiCtxBuilder::new();
 
         let mut http_rules: Vec<HttpHostRule> = Vec::new();
@@ -133,7 +137,7 @@ impl PluginStore {
                     };
                     builder
                         .preopened_dir(&dir.host_path, &dir.guest_path, dir_perms, file_perms)
-                        .map_err(|e| anyhow::Error::msg(format!("{e}")))?;
+                        .map_err(PluginError::from)?;
                 }
                 crate::FineGrainedPermission::Http(addr) => {
                     http_rules.push(HttpHostRule::parse(addr)?);
@@ -208,7 +212,7 @@ enum HttpHostRule {
 }
 
 impl HttpHostRule {
-    fn parse(addr: &crate::AddressString) -> anyhow::Result<Self> {
+    fn parse(addr: &crate::AddressString) -> Result<Self, PluginError> {
         let s = addr.as_str();
         if let Ok(ip) = s.parse::<IpAddr>() {
             return Ok(Self::Ip(ip));
@@ -242,7 +246,7 @@ enum AddrRule {
 }
 
 impl AddrRule {
-    async fn parse(addr: &crate::AddressString) -> anyhow::Result<Self> {
+    async fn parse(addr: &crate::AddressString) -> Result<Self, PluginError> {
         let s = addr.as_str();
         // IP literal
         if let Ok(ip) = s.parse::<IpAddr>() {
@@ -260,12 +264,11 @@ impl AddrRule {
         // Exact domain — resolve async
         use tokio::net::lookup_host;
         let ips: Arc<[IpAddr]> = lookup_host(format!("{s}:0"))
-            .await
-            .map_err(|e| anyhow::Error::msg(format!("failed to resolve '{s}': {e}")))?
+            .await?
             .map(|sa| sa.ip())
             .collect();
         if ips.is_empty() {
-            anyhow::bail!("domain '{s}' resolved to no addresses");
+            return Err(PluginError::ResolveFailed(s.to_string()));
         }
         Ok(Self::ResolvedDomain(ips))
     }
@@ -411,7 +414,7 @@ impl bindings::channel::zeroclaw::plugin::types::Host for PluginStore {}
 /// Wire all host interfaces for the `tool-plugin` world into `linker`.
 pub fn add_to_linker_tool(
     linker: &mut wasmtime::component::Linker<PluginStore>,
-) -> anyhow::Result<()> {
+) -> Result<(), PluginError> {
     // Use feature flags to allow developers to link in wit bindings that aren't stabilized yet.
     let mut options = crate::component::v0::bindings::tool::LinkOptions::default();
     #[cfg(feature = "plugins-wit-v0")]
@@ -423,14 +426,14 @@ pub fn add_to_linker_tool(
         &options,
         |x| x,
     )
-    .map_err(crate::error::PluginError::from)?;
+    .map_err(PluginError::from)?;
     Ok(())
 }
 
 /// Wire all host interfaces for the `memory-plugin` world into `linker`.
 pub fn add_to_linker_memory(
     linker: &mut wasmtime::component::Linker<PluginStore>,
-) -> anyhow::Result<()> {
+) -> Result<(), PluginError> {
     // Use feature flags to allow developers to link in wit bindings that aren't stabilized yet.
     let mut options = crate::component::v0::bindings::memory::LinkOptions::default();
     #[cfg(feature = "plugins-wit-v0")]
@@ -442,14 +445,14 @@ pub fn add_to_linker_memory(
         &options,
         |x| x,
     )
-    .map_err(crate::error::PluginError::from)?;
+    .map_err(PluginError::from)?;
     Ok(())
 }
 
 /// Wire all host interfaces for the `channel-plugin` world into `linker`.
 pub fn add_to_linker_channel(
     linker: &mut wasmtime::component::Linker<PluginStore>,
-) -> anyhow::Result<()> {
+) -> Result<(), PluginError> {
     // Use feature flags to allow developers to link in wit bindings that aren't stabilized yet.
     let mut options = crate::component::v0::bindings::channel::LinkOptions::default();
     #[cfg(feature = "plugins-wit-v0")]
@@ -461,7 +464,7 @@ pub fn add_to_linker_channel(
         &options,
         |x| x,
     )
-    .map_err(crate::error::PluginError::from)?;
+    .map_err(PluginError::from)?;
     Ok(())
 }
 

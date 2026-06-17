@@ -49,6 +49,9 @@ pub enum PluginError {
     #[error("address is not a valid IPv4, IPv6, or domain name: {0}")]
     AddressStringInvalidAddress(String),
 
+    #[error("domain '{0}' resolved to no addresses")]
+    ResolveFailed(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

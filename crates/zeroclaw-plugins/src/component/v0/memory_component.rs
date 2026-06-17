@@ -27,9 +27,9 @@ use super::bindings::memory::{
     },
 };
 use super::plugin_store::{self, PluginStore};
-use crate::call_plugin;
 use crate::component::engine::ComponentEngine;
 use crate::error::PluginError;
+use crate::{FineGrainedPermission, call_plugin};
 
 // ── Attributable ──────────────────────────────────────────────────────────────
 
@@ -66,17 +66,17 @@ impl ComponentMemory {
     /// `fine_grained_permissions` list.
     pub async fn from_bytes(
         alias: impl Into<String>,
-        engine: Arc<ComponentEngine>,
+        engine: &Arc<ComponentEngine>,
         bytes: &[u8],
-        permissions: Vec<crate::FineGrainedPermission>,
-    ) -> anyhow::Result<Self> {
+        permissions: &[FineGrainedPermission],
+    ) -> Result<Self, PluginError> {
         let component = engine.compile(bytes)?;
         let mut linker = wasmtime::component::Linker::<PluginStore>::new(engine.engine());
         wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(PluginError::from)?;
         wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
             .map_err(PluginError::from)?;
         plugin_store::add_to_linker_memory(&mut linker)?;
-        let host = PluginStore::with_permissions(&permissions).await?;
+        let host = PluginStore::with_permissions(permissions).await?;
         let mut store = wasmtime::Store::new(engine.engine(), host);
 
         let instance = linker
