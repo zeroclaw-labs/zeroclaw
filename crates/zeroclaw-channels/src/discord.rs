@@ -45,6 +45,11 @@ pub struct DiscordChannel {
     /// lifecycle exactly: config reloads rebuild channels, which re-derives
     /// the mask.
     intents_mask_override: Option<u64>,
+    /// Which inbound reactions to record (config `reaction_notifications`).
+    /// Anything other than `Off` adds the two reaction intents to the
+    /// IDENTIFY mask. Same connection-scoped snapshot semantics as the
+    /// mask override above.
+    reaction_scope: zeroclaw_config::schema::DiscordReactionScope,
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
@@ -161,6 +166,7 @@ impl DiscordChannel {
             listen_to_bots,
             mention_only,
             intents_mask_override: None,
+            reaction_scope: zeroclaw_config::schema::DiscordReactionScope::Off,
             typing_handles: Mutex::new(HashMap::new()),
             proxy_url: None,
             transcription: None,
@@ -211,13 +217,28 @@ impl DiscordChannel {
         self
     }
 
+    /// Record inbound reaction events at the given scope. Anything other
+    /// than `Off` adds the (unprivileged) reaction intents to the IDENTIFY
+    /// mask.
+    pub fn with_reaction_notifications(
+        mut self,
+        scope: zeroclaw_config::schema::DiscordReactionScope,
+    ) -> Self {
+        self.reaction_scope = scope;
+        self
+    }
+
     /// Gateway intent mask for IDENTIFY: the raw `intents_mask` override
-    /// when set, otherwise the fixed baseline.
+    /// when set, otherwise the fixed baseline plus feature-implied intents.
     fn gateway_intents(&self) -> u64 {
         if let Some(mask) = self.intents_mask_override {
             return mask;
         }
-        BASELINE_INTENTS
+        let mut mask = BASELINE_INTENTS;
+        if self.reaction_scope != zeroclaw_config::schema::DiscordReactionScope::Off {
+            mask |= INTENT_GUILD_MESSAGE_REACTIONS | INTENT_DIRECT_MESSAGE_REACTIONS;
+        }
+        mask
     }
 
     pub fn with_approval_timeout_secs(mut self, secs: u64) -> Self {
@@ -489,6 +510,166 @@ impl DiscordChannel {
         let updated = format!("{base}{marker}");
         self.restore_archived_entry(archive_mem, &key, &updated, &existing)
             .await;
+    }
+
+    /// Record (or un-record) an inbound reaction event according to
+    /// `reaction_scope`. Reactions land in the archive sidecar under a
+    /// `discord_reaction_{message}_{user}_{emoji}` key so `discord_search`
+    /// finds them; a MESSAGE_REACTION_REMOVE forgets the same key. The bot's
+    /// own reactions (ack/failure emoji) echo back as gateway events and are
+    /// skipped, as are reactors outside the peer allowlist and events outside
+    /// the guild/channel allowlists. Reactions from *other* bots are recorded
+    /// (deliberately not gated by `listen_to_bots` — the peer allowlist
+    /// already governs who is recorded at all).
+    ///
+    /// The key uses the custom emoji `id` when present (stable across guild
+    /// renames; unicode emoji have no id and key by the glyph). The
+    /// human-readable name only appears in the entry content.
+    ///
+    /// Scope `Own` keys off `message_author_id`, which Discord includes on
+    /// MESSAGE_REACTION_ADD only — REMOVE events skip the author gate and
+    /// rely on the key existence check `forget` performs anyway: a reaction
+    /// that was never recorded can't be un-recorded.
+    async fn handle_reaction_event(
+        &self,
+        event_type: &str,
+        d: &serde_json::Value,
+        bot_user_id: &str,
+    ) {
+        use zeroclaw_config::schema::DiscordReactionScope;
+
+        let user_id = d.get("user_id").and_then(|u| u.as_str()).unwrap_or("");
+        let message_id = d.get("message_id").and_then(|m| m.as_str()).unwrap_or("");
+        let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("");
+        if user_id.is_empty() || message_id.is_empty() {
+            return;
+        }
+        // Our own ack/failure reactions arrive back as events — never record them.
+        if user_id == bot_user_id {
+            return;
+        }
+        if !self.is_user_allowed(user_id) {
+            return;
+        }
+        if !self.guild_ids.is_empty()
+            && let Some(g) = d.get("guild_id").and_then(serde_json::Value::as_str)
+            && !self.guild_ids.iter().any(|allowed| allowed == g)
+        {
+            return;
+        }
+        if !self.channel_ids.is_empty() {
+            let parent_id =
+                if !channel_id.is_empty() && !self.channel_ids.iter().any(|c| c == channel_id) {
+                    self.thread_parent(&self.http_client(), channel_id).await
+                } else {
+                    None
+                };
+            if !channel_passes_filter(&self.channel_ids, channel_id, parent_id.as_deref()) {
+                return;
+            }
+        }
+
+        // Key identity: custom-emoji `id` first — names are mutable guild
+        // state (rename/delete between ADD and REMOVE would orphan the
+        // entry, and two same-named emoji would collide). Unicode emoji have
+        // no id and key by the glyph itself.
+        let emoji_key = d.get("emoji").and_then(|e| {
+            e.get("id")
+                .and_then(|i| i.as_str())
+                .or_else(|| e.get("name").and_then(|n| n.as_str()))
+        });
+        let Some(emoji_key) = emoji_key else {
+            // Neither id nor name — nothing meaningful to record or forget.
+            return;
+        };
+        let emoji_display = d
+            .get("emoji")
+            .and_then(|e| e.get("name").and_then(|n| n.as_str()))
+            .unwrap_or(emoji_key);
+        let key = format!("discord_reaction_{message_id}_{user_id}_{emoji_key}");
+
+        let Some(ref archive_mem) = self.archive_memory else {
+            // Nowhere to record without the archive sidecar; still useful in
+            // the trace for live diagnostics.
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "event_type": event_type,
+                        "emoji": emoji_display,
+                        "message_id": message_id,
+                    })),
+                "discord reaction event (archive disabled, not recorded)"
+            );
+            return;
+        };
+
+        if event_type == "MESSAGE_REACTION_REMOVE" {
+            // A failed forget leaves the same stale entry a missed event
+            // would — log it like the store path does.
+            if let Err(e) = archive_mem.forget(&key).await {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error": format!("{e}"),
+                            "key": key,
+                        })),
+                    "failed to forget archived discord reaction"
+                );
+            }
+            return;
+        }
+
+        // Scope `Own`: only reactions to the bot's own messages.
+        if self.reaction_scope == DiscordReactionScope::Own {
+            let message_author = d
+                .get("message_author_id")
+                .and_then(|a| a.as_str())
+                .unwrap_or("");
+            if message_author != bot_user_id {
+                return;
+            }
+        }
+
+        let username = d
+            .get("member")
+            .and_then(|m| m.get("user"))
+            .and_then(|u| u.get("username"))
+            .and_then(|n| n.as_str())
+            .unwrap_or(user_id);
+        let is_dm_event = d.get("guild_id").is_none();
+        let channel_display = if is_dm_event { "dm" } else { channel_id };
+        let ts = chrono::Utc::now().to_rfc3339();
+        let content = format!(
+            "@{username} reacted {emoji_display} to message {message_id} in #{channel_display} at {ts}"
+        );
+        let session = if channel_id.is_empty() {
+            None
+        } else {
+            Some(channel_id)
+        };
+        if let Err(e) = archive_mem
+            .store(
+                &key,
+                &content,
+                zeroclaw_memory::MemoryCategory::Custom("discord".to_string()),
+                session,
+            )
+            .await
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "error": format!("{e}"),
+                        "key": key,
+                    })),
+                "failed to archive discord reaction"
+            );
+        }
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -2281,7 +2462,9 @@ const INTENT_GUILDS: u64 = 1 << 0;
 const INTENT_GUILD_MEMBERS: u64 = 1 << 1; // privileged
 const INTENT_GUILD_PRESENCES: u64 = 1 << 8; // privileged
 const INTENT_GUILD_MESSAGES: u64 = 1 << 9;
+const INTENT_GUILD_MESSAGE_REACTIONS: u64 = 1 << 10;
 const INTENT_DIRECT_MESSAGES: u64 = 1 << 12;
+const INTENT_DIRECT_MESSAGE_REACTIONS: u64 = 1 << 13;
 const INTENT_MESSAGE_CONTENT: u64 = 1 << 15; // privileged
 
 /// The intents every Discord channel needs: guild topology plus guild/DM
@@ -2296,12 +2479,14 @@ const BASELINE_INTENTS: u64 =
 /// `intents_mask` override) are reported as one hex remainder entry rather
 /// than silently dropped.
 fn intent_names(mask: u64) -> Vec<String> {
-    let known: [(u64, &str); 6] = [
+    let known: [(u64, &str); 8] = [
         (INTENT_GUILDS, "guilds"),
         (INTENT_GUILD_MEMBERS, "guild_members"),
         (INTENT_GUILD_PRESENCES, "guild_presences"),
         (INTENT_GUILD_MESSAGES, "guild_messages"),
+        (INTENT_GUILD_MESSAGE_REACTIONS, "guild_message_reactions"),
         (INTENT_DIRECT_MESSAGES, "direct_messages"),
+        (INTENT_DIRECT_MESSAGE_REACTIONS, "direct_message_reactions"),
         (INTENT_MESSAGE_CONTENT, "message_content"),
     ];
     let mut names = Vec::new();
@@ -3142,6 +3327,24 @@ impl Channel for DiscordChannel {
                         if let Some(d) = event.get("d") {
                             self.sync_archive_for_message_event(event_type, d, &bot_user_id)
                                 .await;
+                        }
+                        continue;
+                    }
+
+                    // Inbound reaction events — only delivered at all when
+                    // the IDENTIFY mask included the reaction intents. The
+                    // scope re-check matters when a raw `intents_mask`
+                    // override requested the reaction bits while
+                    // `reaction_notifications = off`, or on a resumed
+                    // session that negotiated a wider mask.
+                    if event_type == "MESSAGE_REACTION_ADD"
+                        || event_type == "MESSAGE_REACTION_REMOVE"
+                    {
+                        if self.reaction_scope
+                            != zeroclaw_config::schema::DiscordReactionScope::Off
+                            && let Some(d) = event.get("d")
+                        {
+                            self.handle_reaction_event(event_type, d, &bot_user_id).await;
                         }
                         continue;
                     }
@@ -4760,6 +4963,237 @@ mod tests {
         // actionable message instead of a dangling empty list.
         let bare = disallowed_intents_hint(INTENT_GUILDS);
         assert!(bare.contains("mask 0x1"));
+    }
+
+    use zeroclaw_config::schema::DiscordReactionScope;
+
+    fn reaction_test_channel(
+        scope: DiscordReactionScope,
+    ) -> (
+        DiscordChannel,
+        std::sync::Arc<dyn zeroclaw_memory::Memory>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let mem: std::sync::Arc<dyn zeroclaw_memory::Memory> = std::sync::Arc::new(
+            zeroclaw_memory::SqliteMemory::new_named("sqlite", dir.path(), "discord").unwrap(),
+        );
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(|| vec!["*".to_string()]),
+            false,
+            false,
+        )
+        .with_archive_memory(std::sync::Arc::clone(&mem))
+        .with_reaction_notifications(scope);
+        (ch, mem, dir)
+    }
+
+    #[test]
+    fn reaction_scope_adds_reaction_intents_to_the_mask() {
+        let (off, _m1, _d1) = reaction_test_channel(DiscordReactionScope::Off);
+        assert_eq!(off.gateway_intents(), 37377);
+
+        let (own, _m2, _d2) = reaction_test_channel(DiscordReactionScope::Own);
+        assert_eq!(
+            own.gateway_intents(),
+            37377 | INTENT_GUILD_MESSAGE_REACTIONS | INTENT_DIRECT_MESSAGE_REACTIONS
+        );
+        // The reactions-on mask is OpenClaw's static base — parity by arithmetic.
+        assert_eq!(own.gateway_intents(), 46593);
+    }
+
+    #[tokio::test]
+    async fn reaction_add_is_archived_and_remove_forgets_it() {
+        let (ch, mem, _dir) = reaction_test_channel(DiscordReactionScope::All);
+        let add = serde_json::json!({
+            "user_id": "u1", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "👍"},
+            "member": {"user": {"username": "bob"}}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_ADD", &add, "botid")
+            .await;
+
+        let key = "discord_reaction_m1_u1_👍";
+        let entry = mem.get(key).await.unwrap().unwrap();
+        assert!(
+            entry
+                .content
+                .contains("@bob reacted 👍 to message m1 in #c1")
+        );
+
+        let remove = serde_json::json!({
+            "user_id": "u1", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "👍"}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_REMOVE", &remove, "botid")
+            .await;
+        assert!(mem.get(key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn own_scope_only_records_reactions_to_bot_messages() {
+        let (ch, mem, _dir) = reaction_test_channel(DiscordReactionScope::Own);
+
+        let to_other = serde_json::json!({
+            "user_id": "u1", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "👍"},
+            "message_author_id": "someone_else"
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_ADD", &to_other, "botid")
+            .await;
+        assert!(
+            mem.get("discord_reaction_m1_u1_👍")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let to_bot = serde_json::json!({
+            "user_id": "u1", "message_id": "m2", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "🎉"},
+            "message_author_id": "botid"
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_ADD", &to_bot, "botid")
+            .await;
+        assert!(
+            mem.get("discord_reaction_m2_u1_🎉")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn bots_own_reactions_are_never_recorded() {
+        // Ack/failure emoji the bot adds itself echo back as gateway events.
+        let (ch, mem, _dir) = reaction_test_channel(DiscordReactionScope::All);
+        let own_ack = serde_json::json!({
+            "user_id": "botid", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "⚡️"},
+            "message_author_id": "u1"
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_ADD", &own_ack, "botid")
+            .await;
+        assert!(
+            mem.get("discord_reaction_m1_botid_⚡️")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_emoji_keys_by_stable_id_so_rename_cannot_orphan_entries() {
+        // Discord sends {id, name} for custom emoji; the name is mutable
+        // guild state. ADD records by id, and a REMOVE arriving after the
+        // emoji was renamed or deleted (name: null) must still forget it.
+        let (ch, mem, _dir) = reaction_test_channel(DiscordReactionScope::All);
+        let add = serde_json::json!({
+            "user_id": "u1", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1",
+            "emoji": {"id": "424242", "name": "partyclaw"}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_ADD", &add, "botid")
+            .await;
+        let entry = mem.get("discord_reaction_m1_u1_424242").await.unwrap();
+        // Content keeps the human-readable name; the key uses the id.
+        assert!(entry.unwrap().content.contains("reacted partyclaw"));
+
+        let remove = serde_json::json!({
+            "user_id": "u1", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1",
+            "emoji": {"id": "424242", "name": serde_json::Value::Null}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_REMOVE", &remove, "botid")
+            .await;
+        assert!(
+            mem.get("discord_reaction_m1_u1_424242")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn identityless_emoji_are_ignored() {
+        // No id and no name: nothing meaningful to record (or forget).
+        let (ch, mem, _dir) = reaction_test_channel(DiscordReactionScope::All);
+        let add = serde_json::json!({
+            "user_id": "u1", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_ADD", &add, "botid")
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn reaction_filters_mirror_the_message_path() {
+        // Peer allowlist: a reactor outside the peer set is never recorded.
+        let dir = tempfile::tempdir().unwrap();
+        let mem: std::sync::Arc<dyn zeroclaw_memory::Memory> = std::sync::Arc::new(
+            zeroclaw_memory::SqliteMemory::new_named("sqlite", dir.path(), "discord").unwrap(),
+        );
+        let gated = DiscordChannel::new(
+            "fake".into(),
+            vec!["g1".into()],
+            "discord_test_alias",
+            Arc::new(|| vec!["friend".to_string()]),
+            false,
+            false,
+        )
+        .with_channel_ids(vec!["c1".into()])
+        .with_archive_memory(std::sync::Arc::clone(&mem))
+        .with_reaction_notifications(DiscordReactionScope::All);
+
+        let stranger = serde_json::json!({
+            "user_id": "stranger", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "👍"}
+        });
+        gated
+            .handle_reaction_event("MESSAGE_REACTION_ADD", &stranger, "botid")
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 0);
+
+        // Guild allowlist: wrong guild is dropped even for an allowed peer.
+        let wrong_guild = serde_json::json!({
+            "user_id": "friend", "message_id": "m2", "channel_id": "c1",
+            "guild_id": "g2", "emoji": {"name": "👍"}
+        });
+        gated
+            .handle_reaction_event("MESSAGE_REACTION_ADD", &wrong_guild, "botid")
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 0);
+
+        // All gates pass: recorded.
+        let ok = serde_json::json!({
+            "user_id": "friend", "message_id": "m3", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "👍"}
+        });
+        gated
+            .handle_reaction_event("MESSAGE_REACTION_ADD", &ok, "botid")
+            .await;
+        assert!(
+            mem.get("discord_reaction_m3_friend_👍")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_without_prior_add_is_a_noop() {
+        let (ch, mem, _dir) = reaction_test_channel(DiscordReactionScope::All);
+        let remove = serde_json::json!({
+            "user_id": "u1", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "👍"}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_REMOVE", &remove, "botid")
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 0);
     }
 
     #[test]

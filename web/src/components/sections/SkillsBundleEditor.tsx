@@ -7,9 +7,12 @@
 // the picker, individual SKILL.md content is fetched on selection.
 
 import { useCallback, useEffect, useState } from 'react';
+import { t } from '@/lib/i18n';
 import { markdown } from '@codemirror/lang-markdown';
 import { oneDark } from '@codemirror/theme-one-dark';
+import { githubLight } from '@uiw/codemirror-theme-github';
 import CodeMirror from '@uiw/react-codemirror';
+import { useTheme } from '@/hooks/useTheme';
 import {
   createSkill,
   deleteSkill,
@@ -30,6 +33,12 @@ interface EditorBuffer {
 }
 
 export default function SkillsBundleEditor({ bundle }: Props) {
+  // Match the SKILL.md editor to the active console scheme — a dark CodeMirror
+  // theme inside a light palette is the light-mode bug we're fixing.
+  // `resolvedTheme` is 'dark' | 'light' | 'oled'; only 'light' is a light scheme.
+  const { resolvedTheme } = useTheme();
+  const cmTheme = resolvedTheme === 'light' ? githubLight : oneDark;
+
   const [skills, setSkills] = useState<SkillEntry[]>([]);
   const [active, setActive] = useState<string | null>(null);
   const [buffer, setBuffer] = useState<EditorBuffer | null>(null);
@@ -93,11 +102,11 @@ export default function SkillsBundleEditor({ bundle }: Props) {
     const name = newName.trim();
     const description = newDescription.trim();
     if (!name) {
-      setError('Name is required.');
+      setError(t('skills_bundle.name_required'));
       return;
     }
     if (!description) {
-      setError('Description is required.');
+      setError(t('skills_bundle.description_required'));
       return;
     }
     setBusy(true);
@@ -175,9 +184,11 @@ export default function SkillsBundleEditor({ bundle }: Props) {
   return (
     <div className="flex flex-col gap-3">
       <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
-        Skills in this bundle live under its configured directory. Each is a folder
-        with a canonical <code>SKILL.md</code> (frontmatter + body) plus optional
-        <code> scripts/</code>, <code>references/</code>, and <code>assets/</code> subdirs.
+        {t('skills_bundle.intro_before_skill_md')}
+        <code>SKILL.md</code> {t('skills_bundle.intro_after_skill_md')}{' '}
+        <code> scripts/</code>, <code>references/</code>,{' '}
+        {t('skills_bundle.intro_and')} <code>assets/</code>{' '}
+        {t('skills_bundle.intro_subdirs')}
       </p>
 
       {/* Skill picker strip */}
@@ -208,12 +219,12 @@ export default function SkillsBundleEditor({ bundle }: Props) {
             className="text-xs px-3 py-1.5 rounded-lg border-dashed border"
             style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-muted)' }}
           >
-            + New skill
+            {t('skills_bundle.new_skill')}
           </button>
         )}
         {skills.length === 0 && !creating && (
           <span className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
-            (no skills installed)
+            {t('skills_bundle.no_skills_installed')}
           </span>
         )}
       </div>
@@ -239,26 +250,26 @@ export default function SkillsBundleEditor({ bundle }: Props) {
         >
           <div className="flex flex-col gap-1">
             <label className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
-              Name (lowercase + hyphens)
+              {t('skills_bundle.name_label_create')}
             </label>
             <input
               type="text"
               value={newName}
               onChange={(e) => setNewName(e.target.value)}
-              placeholder="my-skill"
+              placeholder={t('skills_bundle.name_placeholder')}
               className="rounded-md border bg-transparent px-3 py-1.5 text-sm"
               style={{ borderColor: 'var(--pc-border)' }}
             />
           </div>
           <div className="flex flex-col gap-1">
             <label className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
-              Description (what it does, when to use it — third person)
+              {t('skills_bundle.description_label_create')}
             </label>
             <textarea
               value={newDescription}
               onChange={(e) => setNewDescription(e.target.value)}
               rows={3}
-              placeholder="Reviews pull requests for correctness, security, and style. Use when..."
+              placeholder={t('skills_bundle.description_placeholder')}
               className="rounded-md border bg-transparent px-3 py-1.5 text-sm font-mono"
               style={{ borderColor: 'var(--pc-border)' }}
             />
@@ -270,7 +281,7 @@ export default function SkillsBundleEditor({ bundle }: Props) {
               onClick={() => void onCreate()}
               className="btn-primary text-sm"
             >
-              Create skill
+              {t('skills_bundle.create_skill')}
             </button>
             <button
               type="button"
@@ -282,7 +293,7 @@ export default function SkillsBundleEditor({ bundle }: Props) {
               }}
               className="btn-secondary text-sm"
             >
-              Cancel
+              {t('common.cancel')}
             </button>
           </div>
         </div>
@@ -303,7 +314,7 @@ export default function SkillsBundleEditor({ bundle }: Props) {
             <CodeMirror
               value={buffer.draft.body}
               height="320px"
-              theme={oneDark}
+              theme={cmTheme}
               extensions={[markdown()]}
               onChange={(v) =>
                 setBuffer((prev) =>
@@ -319,7 +330,7 @@ export default function SkillsBundleEditor({ bundle }: Props) {
               onClick={() => void onSave()}
               className="btn-primary text-sm"
             >
-              {busy ? 'Saving…' : 'Save'}
+              {busy ? t('skills_bundle.saving') : t('common.save')}
             </button>
             <button
               type="button"
@@ -331,7 +342,7 @@ export default function SkillsBundleEditor({ bundle }: Props) {
               }
               className="btn-secondary text-sm"
             >
-              Discard
+              {t('skills_bundle.discard')}
             </button>
             <div className="flex-1" />
             {!confirmDelete ? (
@@ -341,12 +352,13 @@ export default function SkillsBundleEditor({ bundle }: Props) {
                 className="btn-secondary text-sm"
                 style={{ color: '#f87171' }}
               >
-                Archive skill
+                {t('skills_bundle.archive_skill')}
               </button>
             ) : (
               <>
                 <span className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
-                  Move to <code>shared/skills/_deleted/</code>?
+                  {t('skills_bundle.move_to_prefix')}{' '}
+                  <code>shared/skills/_deleted/</code>{t('skills_bundle.move_to_suffix')}
                 </span>
                 <button
                   type="button"
@@ -355,14 +367,14 @@ export default function SkillsBundleEditor({ bundle }: Props) {
                   className="btn-primary text-sm"
                   style={{ background: '#dc2626' }}
                 >
-                  Confirm archive
+                  {t('skills_bundle.confirm_archive')}
                 </button>
                 <button
                   type="button"
                   onClick={() => setConfirmDelete(false)}
                   className="btn-secondary text-sm"
                 >
-                  Cancel
+                  {t('common.cancel')}
                 </button>
               </>
             )}
@@ -385,16 +397,20 @@ function FrontmatterForm({ value, onChange, onTagsChange }: FrontmatterFormProps
       className="rounded-xl border p-4 grid gap-3 md:grid-cols-2"
       style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}
     >
-      <Field label="Name (required)" value={value.name} onChange={(v) => onChange('name', v)} />
       <Field
-        label="Version"
+        label={t('skills_bundle.name_label_required')}
+        value={value.name}
+        onChange={(v) => onChange('name', v)}
+      />
+      <Field
+        label={t('skills_bundle.version_label')}
         value={value.version ?? ''}
         onChange={(v) => onChange('version', v)}
         placeholder="0.1.0"
       />
       <div className="md:col-span-2 flex flex-col gap-1">
         <label className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
-          Description (required) — what it does and when to use it
+          {t('skills_bundle.description_label_required')}
         </label>
         <textarea
           value={value.description}
@@ -405,18 +421,18 @@ function FrontmatterForm({ value, onChange, onTagsChange }: FrontmatterFormProps
         />
       </div>
       <Field
-        label="License (SPDX)"
+        label={t('skills_bundle.license_label')}
         value={value.license ?? ''}
         onChange={(v) => onChange('license', v)}
         placeholder="MIT"
       />
       <Field
-        label="Author"
+        label={t('skills_bundle.author_label')}
         value={value.author ?? ''}
         onChange={(v) => onChange('author', v)}
       />
       <Field
-        label="Category"
+        label={t('skills_bundle.category_label')}
         value={value.category ?? ''}
         onChange={(v) => onChange('category', v)}
         placeholder="coding, ops, …"

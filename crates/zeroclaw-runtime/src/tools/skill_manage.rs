@@ -819,6 +819,14 @@ mod tests {
         }
     }
 
+    fn cfg_with_cooldown(secs: u64) -> zeroclaw_config::schema::SkillImprovementConfig {
+        zeroclaw_config::schema::SkillImprovementConfig {
+            enabled: true,
+            cooldown_secs: secs,
+            ..Default::default()
+        }
+    }
+
     async fn write_skill(workspace: &Path, slug: &str, md: &str) {
         let dir = workspace.join("skills").join(slug);
         tokio::fs::create_dir_all(&dir).await.unwrap();
@@ -968,6 +976,101 @@ mod tests {
                 .join(".SKILL.md.tmp")
                 .exists()
         );
+    }
+
+    #[tokio::test]
+    async fn skill_manage_patch_blocks_when_skill_is_on_cooldown() {
+        // Regression for #6683: with a non-zero cooldown configured, a skill
+        // whose front-matter carries a fresh `updated_at` is on cooldown and
+        // a patch must be refused with a structured error rather than writing.
+        let dir = tempdir();
+        let recent = chrono::Utc::now().to_rfc3339();
+        let md = format!(
+            "---\nname: deploy\ndescription: Run a production deploy\nversion: \"0.1.0\"\nupdated_at: {recent}\n---\n\n# Deploy\nDoes a production deploy.\n"
+        );
+        write_skill(dir.path(), "deploy", &md).await;
+        let tool = SkillManageTool::new(dir.path().to_path_buf(), cfg_with_cooldown(3600), true);
+
+        let result = tool
+            .execute(json!({
+                "action": "patch",
+                "slug": "deploy",
+                "content": IMPROVED_SKILL,
+                "reason": "second rewrite within cooldown",
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("cooldown")),
+            "error must name the cooldown, got {:?}",
+            result.error
+        );
+
+        let on_disk =
+            tokio::fs::read_to_string(dir.path().join("skills").join("deploy").join("SKILL.md"))
+                .await
+                .unwrap();
+        assert!(!on_disk.contains("pre-flight check"));
+    }
+
+    #[tokio::test]
+    async fn skill_manage_patch_proceeds_when_skill_is_stale() {
+        // Regression for #6683: an `updated_at` older than cooldown_secs is
+        // stale and a patch must proceed.
+        let dir = tempdir();
+        let stale = (chrono::Utc::now() - chrono::Duration::seconds(7200)).to_rfc3339();
+        let md = format!(
+            "---\nname: deploy\ndescription: Run a production deploy\nversion: \"0.1.0\"\nupdated_at: {stale}\n---\n\n# Deploy\nDoes a production deploy.\n"
+        );
+        write_skill(dir.path(), "deploy", &md).await;
+        let tool = SkillManageTool::new(dir.path().to_path_buf(), cfg_with_cooldown(3600), true);
+
+        let result = tool
+            .execute(json!({
+                "action": "patch",
+                "slug": "deploy",
+                "content": IMPROVED_SKILL,
+                "reason": "stale skill, rewrite allowed",
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "patch failed: {:?}", result.error);
+
+        let on_disk =
+            tokio::fs::read_to_string(dir.path().join("skills").join("deploy").join("SKILL.md"))
+                .await
+                .unwrap();
+        assert!(on_disk.contains("pre-flight check"));
+    }
+
+    #[tokio::test]
+    async fn skill_manage_patch_proceeds_when_no_updated_at() {
+        // Regression for #6683: a skill with no `updated_at` is not on
+        // cooldown — first patch must proceed even with a cooldown configured.
+        let dir = tempdir();
+        write_skill(dir.path(), "deploy", VALID_SKILL).await;
+        let tool = SkillManageTool::new(dir.path().to_path_buf(), cfg_with_cooldown(3600), true);
+
+        let result = tool
+            .execute(json!({
+                "action": "patch",
+                "slug": "deploy",
+                "content": IMPROVED_SKILL,
+                "reason": "first rewrite, no prior timestamp",
+            }))
+            .await
+            .unwrap();
+        assert!(result.success, "patch failed: {:?}", result.error);
+
+        let on_disk =
+            tokio::fs::read_to_string(dir.path().join("skills").join("deploy").join("SKILL.md"))
+                .await
+                .unwrap();
+        assert!(on_disk.contains("pre-flight check"));
     }
 
     #[tokio::test]

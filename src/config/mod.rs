@@ -122,6 +122,7 @@ mod tests {
             stall_timeout_secs: 0,
             slash_commands: false,
             intents_mask: None,
+            reaction_notifications: zeroclaw_config::schema::DiscordReactionScope::Off,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
