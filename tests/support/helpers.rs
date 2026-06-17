@@ -133,6 +133,7 @@ impl StaticMemoryStrategy {
 impl MemoryStrategy for StaticMemoryStrategy {
     async fn load_context(
         &self,
+        _observer: &dyn Observer,
         _query: &str,
         _session_id: Option<&str>,
     ) -> anyhow::Result<String> {
