@@ -43,7 +43,7 @@ flowchart TB
 |---|---|
 | `zeroclaw-runtime` | Agent loop, security policy enforcement, SOP engine, cron scheduler, SubAgents, RPC layer for zerocode |
 | `zeroclaw-config` | TOML schema, secrets encryption, autonomy levels, workspace resolution |
-| `zeroclaw-api` | Public traits: `ModelProvider`, `Channel`, `Tool`, `Memory`, `Observer`. The kernel ABI |
+| `zeroclaw-api` | Public traits: `ModelProvider`, `Channel`, `Tool`, `Memory`, `Observer`, `RuntimeAdapter`, and `Peripheral`. The kernel ABI |
 | `zeroclaw-providers` | All LLM client impls (Anthropic, OpenAI, Ollama, …) plus the hint-based router and same-provider retry wrapper |
 | `zeroclaw-channels` | 30+ messaging integrations (Discord, Slack, Telegram, Matrix, email, voice, …) |
 | `zeroclaw-gateway` | HTTP / WebSocket gateway, web dashboard, webhook ingress |
@@ -90,13 +90,17 @@ Full detail: [Request lifecycle](./request-lifecycle.md).
 
 ## Extension points
 
-Three trait-based extension points live in `zeroclaw-api`:
+Trait-based extension contracts live in `zeroclaw-api`. The common first-party extension surfaces are:
 
-- **`ModelProvider`**: implement for a new LLM endpoint. See [Custom providers](../providers/custom.md).
-- **`Channel`**: implement for a new messaging platform. Inbound and outbound are separate hooks.
-- **`Tool`**: implement for a new capability the agent can invoke. See [Developing → Plugin protocol](../developing/plugin-protocol.md).
+- **`ModelProvider`**: implement for a new LLM endpoint. See [Custom providers](../providers/custom.md) and [First-party extensions](../developing/first-party-extensions.md).
+- **`Channel`**: implement for a new messaging platform. Inbound and outbound are separate hooks. See [Channels overview](../channels/overview.md) and [First-party extensions](../developing/first-party-extensions.md).
+- **`Tool`**: implement for a new built-in agent capability. See [Tools overview](../tools/overview.md) and [First-party extensions](../developing/first-party-extensions.md).
+- **`Memory`**: implement for a memory backend that preserves agent/session scoping. See [First-party extensions](../developing/first-party-extensions.md).
+- **`Peripheral`**: implement for hardware boards and device surfaces. See [Hardware overview](../hardware/index.md) and [First-party extensions](../developing/first-party-extensions.md).
 
-All three are registered at startup via factory functions; the kernel doesn't know the concrete types. Compile-time feature flags decide which implementations ship in a given binary.
+`Observer` and `RuntimeAdapter` are also public traits, but changes there are usually architecture-sensitive rather than ordinary adapter additions. Start with [Logging](./logging.md), [Request lifecycle](./request-lifecycle.md), and the [RFC process](../contributing/rfcs.md) before changing those contracts.
+
+Concrete implementations are registered through the owning factory, registry, or feature gate for that surface. The kernel depends on the trait contracts rather than concrete implementations, and compile-time feature flags decide which optional implementations ship in a given binary.
 
 ## Where to read next
 
