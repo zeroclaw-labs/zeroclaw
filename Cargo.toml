@@ -4,28 +4,28 @@ resolver = "2"
 exclude = ["plugins/image-gen-fal"]
 
 [workspace.package]
-version = "0.8.0-beta-2"
+version = "0.8.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zeroclaw-labs/zeroclaw"
 rust-version = "1.87"
 
 [workspace.dependencies]
-zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.8.0-beta-2" }
-zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.8.0-beta-2" }
-zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.8.0-beta-2", default-features = false }
-zeroclaw-log = { path = "crates/zeroclaw-log", version = "0.8.0-beta-2" }
-zeroclaw-spawn = { path = "crates/zeroclaw-spawn", version = "0.8.0-beta-2" }
-zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.8.0-beta-2" }
-zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.8.0-beta-2" }
-zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.8.0-beta-2", default-features = false }
-zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.8.0-beta-2" }
-zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.8.0-beta-2", default-features = false }
-zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.8.0-beta-2" }
-zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.8.0-beta-2" }
-zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.8.0-beta-2" }
-zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.8.0-beta-2" }
-zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.8.0-beta-2" }
+zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.8.0" }
+zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.8.0" }
+zeroclaw-config = { path = "crates/zeroclaw-config", version = "0.8.0", default-features = false }
+zeroclaw-log = { path = "crates/zeroclaw-log", version = "0.8.0" }
+zeroclaw-spawn = { path = "crates/zeroclaw-spawn", version = "0.8.0" }
+zeroclaw-providers = { path = "crates/zeroclaw-providers", version = "0.8.0" }
+zeroclaw-memory = { path = "crates/zeroclaw-memory", version = "0.8.0" }
+zeroclaw-channels = { path = "crates/zeroclaw-channels", version = "0.8.0", default-features = false }
+zeroclaw-tools = { path = "crates/zeroclaw-tools", version = "0.8.0" }
+zeroclaw-runtime = { path = "crates/zeroclaw-runtime", version = "0.8.0", default-features = false }
+zeroclaw-plugins = { path = "crates/zeroclaw-plugins", version = "0.8.0" }
+zeroclaw-gateway = { path = "crates/zeroclaw-gateway", version = "0.8.0" }
+zeroclaw-hardware = { path = "crates/zeroclaw-hardware", version = "0.8.0" }
+zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version = "0.8.0" }
+zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.8.0" }
 zerocode = { path = "apps/zerocode", version = "0.8.0-beta-2" }
 aardvark-sys = { path = "crates/aardvark-sys", version = "0.1.0" }
 directories = "6.0"
@@ -238,6 +238,45 @@ mime_guess = { version = "2", optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Installer/surface metadata: which `[features]` are internal aggregates or
+# meta toggles rather than user-selectable rows. This bit is NOT derivable from
+# the feature graph (e.g. `embedded-web` and `whatsapp-web` are structurally
+# identical single cross-crate refs but one is meta and one is a real row), so
+# it lives here in the canonical registry. install.sh and `cargo cmd convert`
+# both read this; neither shadows it with its own list.
+[package.metadata.zeroclaw]
+non_row_features = [
+    "default",
+    "default-channels",
+    "channels-full",
+    "ci-all",
+    "fantoccini",
+    "landlock",
+    "metrics",
+    "embedded-web",
+]
+# Heavyweight non-channel features excluded from the default binary
+# distribution (`Selection::Dist`): they pull large native/ML deps and would
+# bloat the single artifact for users who never use them. Still opt-in via
+# source `--features`, the docker `:all-features` tag, or a nix override. This
+# "too big for the default download" bit is not derivable from the feature
+# graph, so it lives here in the canonical registry; never shadowed.
+heavyweight_features = [
+    "hardware",
+    "browser-native",
+    "rag-pdf",
+    "voice-wake",
+]
+
+# Features whose build needs system C libraries or tooling the minimal static
+# container image (StageX, no system package manager) does not provide. Excluded
+# from the container kitchen-sink (Selection::All) so the all-features image
+# builds; still available via source --features or a nix override. Not derivable
+# from the feature graph, so it lives in the canonical registry.
+container_excluded_features = [
+    "voice-wake",
+]
+
 [features]
 default = [
     "agent-runtime",
@@ -357,6 +396,30 @@ fantoccini = ["browser-native"]
 landlock = ["sandbox-landlock"]
 metrics = ["observability-prometheus"]
 
+# WASM plugin execution choice:
+#
+# Omit all three of the following features and there will not be any WASM plugin
+# support at all — no plugin runtime, no WASM dependencies, and the plugin ABI
+# surface will be unavailable in the agent runtime.
+#
+# Each feature adds a WASM execution strategy; enable the smallest set your targets
+# need. `plugins-wasm-runtime-only` is implied by the other two.
+#
+# - `plugins-wasm-runtime-only`: Fastest startup for plugins and smallest binary size,
+#   but requires plugin authors to compile a specific version for each target
+#   architecture (`.cwasm` files instead of `.wasm`) unless one of the two JIT
+#   compilation feature flags is also used. 
+# - `plugins-wasm-cranelift`: Add the Cranelift JIT compilation engine on top of
+#   the runtime which enables compiling WASM plugins on the host machine, but
+#   results in larger binary size due to the Cranelift dependency. NOTE: Not
+#   supported on all platforms (e.g., ARM32).
+# - `plugins-wasm-pulley`: Most flexible, supports JIT compilation on targets
+#   where Cranelift isn't available (e.g., ARM32), but has the slowest runtime
+#   performance.
+plugins-wasm-runtime-only = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasmtime"]
+plugins-wasm-cranelift    = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasm-cranelift"]
+plugins-wasm-pulley       = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasm-pulley"]
+
 # CI meta-feature
 ci-all = [
     "agent-runtime",
@@ -365,7 +428,8 @@ ci-all = [
     "observability-prometheus", "observability-otel",
     "hardware", "peripheral-rpi",
     "sandbox-landlock", "sandbox-bubblewrap",
-    "browser-native", "plugins-wasm", "probe", "rag-pdf",
+    "browser-native", "probe", "rag-pdf",
+    "plugins-wasm", "plugins-wasm-cranelift",
     "webauthn", "memory-postgres",
 ]
 

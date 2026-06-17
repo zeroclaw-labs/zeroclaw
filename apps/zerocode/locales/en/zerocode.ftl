@@ -310,6 +310,9 @@ zc-quickstart-modal-action-save = save
 zc-quickstart-modal-type-prefix = Type:
 zc-quickstart-field-label-alias = Alias
 zc-quickstart-field-help-alias = Unique identifier for this provider instance. Change from "default" if your config already has one with that alias.
+zc-quickstart-model-loading = Loading models for { $provider }...
+zc-quickstart-model-retrying = Retrying model catalog for { $provider }...
+zc-quickstart-model-catalog-empty = catalog unavailable - type a model name
 zc-quickstart-action-done = Done
 zc-quickstart-no-peer-groups = No peer groups configured. Optional — agents can still send messages to channels.
 
@@ -320,10 +323,8 @@ zc-quickstart-status-created = Created `{ $alias }`. Reloading daemon — Chat w
 zc-quickstart-status-errors = { $count } error(s) — fix selectors and resubmit
 zc-quickstart-status-first-error = { $where }{ $field }: { $message }{ $more }
 zc-quickstart-status-more-errors = { " " }(+{ $count } more)
-zc-quickstart-model-loading = Loading models for { $provider }…
-zc-quickstart-model-catalog-empty = (catalog unavailable — type a model name)
-zc-quickstart-status-can-create = All selectors ✓. Press `{ $chord }` to Create.
-zc-quickstart-status-hint = ↑/↓ to move, Enter to open. `{ $chord }` enables when every selector is ✓.
+zc-quickstart-status-can-create = All required selectors ✓. Press `{ $chord }` to Create.
+zc-quickstart-status-hint = ↑/↓ to move, Enter to open. `{ $chord }` enables when all required selectors are ✓.
 
 zc-quickstart-channels-empty = No channels configured. An agent without channels still works via `zeroclaw agent <name>` from the CLI.
 zc-quickstart-channels-add = + Add channel
@@ -333,6 +334,9 @@ zc-quickstart-block-peers = Peer groups
 zc-quickstart-block-agent = Agent
 zc-quickstart-personality-help = Personality files (e=edit, t=use template, c=clear)
 zc-quickstart-save-and-close = Save & close
+zc-quickstart-no-template = No template is available for `{ $filename }`
+zc-quickstart-agent-name-field = name
+zc-quickstart-file-bytes = { $bytes } bytes
 
 zc-chat-pane-chat = Chat
 zc-chat-pane-acp = ACP
@@ -340,6 +344,8 @@ zc-chat-pane-acp = ACP
 zc-chat-no-agents = No enabled agents yet. Open Quickstart to create one, or use Config to add and enable an agent.
 zc-chat-error-fetch-agents = Failed to fetch agents: { $error }
 zc-chat-error-create-session = Failed to create session: { $error }
+zc-chat-session-restarted = New session started.
+zc-chat-session-restart-error = Failed to start a new session: { $error }
 
 zc-chat-thinking-visible = Thinking output: visible
 zc-chat-thinking-hidden = Thinking output: hidden
@@ -452,6 +458,9 @@ zc-config-status-fetching-templates = Fetching templates...
 zc-config-status-unsaved-discarded = Unsaved changes discarded
 zc-config-status-no-models = No models returned — enter manually
 zc-config-status-model-fetch-failed = Model fetch failed — enter manually
+zc-config-status-loading-aliases = Loading options...
+zc-config-status-no-aliases = None configured yet. Enter manually.
+zc-config-status-alias-fetch-failed = Options fetch failed. Enter manually.
 
 zc-config-footer-action-create = create
 zc-config-footer-action-cancel = cancel

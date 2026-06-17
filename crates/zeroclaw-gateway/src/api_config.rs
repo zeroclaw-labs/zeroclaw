@@ -265,6 +265,7 @@ fn prop_kind_wire(kind: zeroclaw_config::traits::PropKind) -> &'static str {
         PropKind::Integer => "integer",
         PropKind::Float => "float",
         PropKind::Enum => "enum",
+        PropKind::AliasRef => "alias-ref",
         PropKind::StringArray => "string-array",
         PropKind::ObjectArray => "object-array",
         PropKind::Object => "object",
@@ -365,6 +366,7 @@ fn lookup_prop_field(
                         zeroclaw_config::traits::CredentialSurfaceClass::EncryptedSecret,
                     ),
                     tab: zeroclaw_config::traits::ConfigTab::None,
+                    alias_source: None,
                 }
             })
         })
@@ -936,6 +938,28 @@ pub async fn handle_templates(State(state): State<AppState>, headers: HeaderMap)
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct MapPathQuery {
     pub path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct AliasSourceQuery {
+    pub source: zeroclaw_config::traits::AliasSource,
+}
+
+/// `GET /api/config/resolve-alias-source?source=<source>` — list the configured
+/// alias values valid for an alias-reference field, resolved from the live
+/// config via the shared `Config::resolve_alias_source`.
+pub async fn handle_resolve_alias_source(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<AliasSourceQuery>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let cfg = state.config.read().clone();
+    let values = cfg.resolve_alias_source(q.source);
+    axum::Json(serde_json::json!({ "source": q.source, "values": values })).into_response()
 }
 
 /// `GET /api/config/map-keys?path=<section>` — list the current alias keys at

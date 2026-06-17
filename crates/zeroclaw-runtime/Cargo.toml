@@ -112,6 +112,7 @@ rcgen = "0.13"
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 scopeguard = "1.2"
+filetime = "0.2"
 
 # Channel features (forwarded to zeroclaw-channels)
 

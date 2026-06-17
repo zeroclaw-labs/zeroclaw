@@ -17,8 +17,29 @@ pub use types::{
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use types::{SopManifest, SopMeta};
+use zeroclaw_config::schema::SopConfig;
+use zeroclaw_memory::traits::Memory;
+
+/// Build a single shared SopEngine + SopAuditLogger pair.
+///
+/// This is the sole construction site for SOP state within a daemon.
+/// Callers receive `Arc<Mutex<SopEngine>>` and `Arc<SopAuditLogger>`
+/// handles — never call `SopEngine::new` or `SopAuditLogger::new`
+/// directly outside this module.
+pub fn build_sop_engine(
+    config: SopConfig,
+    workspace_dir: &Path,
+    audit_memory: Arc<dyn Memory>,
+) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
+    let mut engine = SopEngine::new(config);
+    engine.reload(workspace_dir);
+    let engine = Arc::new(Mutex::new(engine));
+    let audit = Arc::new(SopAuditLogger::new(audit_memory));
+    (engine, audit)
+}
 
 /// Parse an execution mode string into `SopExecutionMode`, falling back to
 /// `Supervised` for unknown values.
