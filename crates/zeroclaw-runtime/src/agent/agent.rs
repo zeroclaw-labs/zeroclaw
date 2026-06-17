@@ -5356,7 +5356,7 @@ mod tests {
                 .expect("response cache init"),
         );
 
-        let mut agent = Agent::builder()
+        let agent = Agent::builder()
             .model_provider(Box::new(MockModelProvider {
                 responses: Mutex::new(vec![]),
             }))
