@@ -3547,6 +3547,7 @@ dependencies = [
  "toml 0.8.23",
  "xtask",
  "zeroclaw-api",
+ "zeroclaw-providers",
 ]
 
 [[package]]
@@ -14415,6 +14416,7 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-config",
  "zeroclaw-log",
+ "zeroclaw-providers",
  "zeroclaw-spawn",
 ]
 
@@ -14515,6 +14517,7 @@ dependencies = [
  "dialoguer",
  "directories",
  "encoding_rs",
+ "filetime",
  "flate2",
  "fluent",
  "futures-util",

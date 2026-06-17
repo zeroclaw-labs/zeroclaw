@@ -71,6 +71,19 @@ Guided agent creation end to end: pick a provider, paste a key, choose a model f
 
 The daemon's structured log stream, filterable and attribution-aware, in the same terminal you work in.
 
+### Observability
+
+- **OTel memory and RAG observability** — every agent turn now produces visible
+  `memory.recall`, `memory.store`, and `rag.retrieve` spans plus five OTel meter
+  instruments (`zeroclaw.memory.recall.{count,duration}`, `zeroclaw.memory.store.count`,
+  `zeroclaw.rag.retrieve.{count,duration}`). The recall/retrieve spans set
+  `gen_ai.operation.name = "retrieval"` and carry a scrubbed/truncated `query_summary`
+  on `input.value`; the store span uses `db.system` / `db.operation = "INSERT"`. These
+  are partial GenAI-compatible attributes: `SpanKind::Internal` is used, and span names
+  are `memory.recall` / `rag.retrieve` / `memory.store` for compatibility with the
+  existing ZeroClaw / Langfuse retrieval views. New spans and instruments live behind
+  the existing `observability-otel` feature gate (#6190).
+
 ### Providers
 
 - [New providers](https://docs.zeroclawlabs.ai/master/en/providers/catalog.html): Kilo AI Gateway, GitHub Models (#6445), Morph (#6440), Manifest (#6268), atomic-chat (#6513), a dedicated llama.cpp provider (#6417), seven more OpenAI-compatible providers (#7260), and MiniMax split into Global and China entries (#6758).
@@ -122,6 +135,8 @@ For those tracking the beta line, the 184 commits since beta-2 concentrate on st
 - **[Schema V3](https://docs.zeroclawlabs.ai/master/en/reference/config.html)** (#6398): configs migrate automatically on first load. Profile settings are split between runtime behavior and risk policy, cost rates are reorganized per provider, and scheduled jobs must name the agent they run as.
 - **[Lean default channel bundle](https://docs.zeroclawlabs.ai/master/en/channels/overview.html)** (#6904): prebuilt binaries ship a core channel set; social channels move to opt-in build features.
 - **[Logging](https://docs.zeroclawlabs.ai/master/en/architecture/logging.html)** (#6398 train): the legacy trace-event path is retired in favor of the unified structured logging pipeline; third-party logging macros are banned workspace-wide.
+- **Observer events** (#6190): `zeroclaw_api::observability::ObserverEvent` is now `#[non_exhaustive]` and adds `MemoryRecall`, `MemoryStore`, and `RagRetrieve`. Out-of-tree observers that exhaustively match events must add a wildcard arm.
+- **Memory observability hook** (#6190): `MemoryStrategy::load_context` now receives an observer reference so the runtime can emit `MemoryRecall` events at the implicit recall boundary. Out-of-tree strategy implementations must update their signature; implementations that do not emit observability can ignore the parameter.
 
 ## Contributors
 
