@@ -236,8 +236,10 @@ fn count_nonempty_lines(path: &Path) -> Result<usize> {
 
 /// Shared test-time mutex for tests that mutate the global writer state.
 /// Re-exported `pub(crate)` so `macro::tests` etc. can serialize against
-/// the same lock as `writer::tests`.
-#[cfg(test)]
+/// the same lock as `writer::tests`. Always compiled (not gated behind
+/// `#[cfg(test)]`) so peer crates can borrow it via the
+/// `__private_test_writer_lock` helper in `lib.rs`. A `parking_lot::Mutex`
+/// static costs nothing at runtime when untouched.
 pub(crate) static WRITER_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 #[cfg(test)]

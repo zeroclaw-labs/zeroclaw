@@ -3,10 +3,14 @@
 ZeroClaw's architecture is trait-driven and modular.
 To add a new provider, channel, tool, or memory backend, implement the corresponding trait and register it in the factory module.
 
-This page contains minimal, working examples for each core extension point.
+This page contains minimal examples for each core extension point.
+For the architecture checklist that applies to built-in provider, channel, tool,
+memory, and hardware changes, read [First-party extensions](./first-party-extensions.md).
 
 > **Source of truth**: the trait definitions live in `crates/zeroclaw-api/src/`.
-> If an example here conflicts with the trait file, the trait file wins.
+> If an example here conflicts with the trait file, the trait file wins. Real
+> first-party implementations must also satisfy current supertraits such as
+> attribution.
 
 ---
 
@@ -86,6 +90,10 @@ draft methods (`send_draft`, `update_draft`, `finalize_draft`, `cancel_draft`),
 and reaction methods (`add_reaction`, `remove_reaction`).
 
 Register your channel in `crates/zeroclaw-channels/src/lib.rs` and add config to `ChannelsConfig` in `crates/zeroclaw-config/src/schema.rs`.
+The example below shows platform polling only. Pairing, peer groups, and sender
+authorization belong to the canonical config/IAM path; do not store long-lived
+allowlist snapshots such as `allowed_users: Vec<String>` inside the channel
+handle.
 
 ```rust
 // In your crate: use zeroclaw::channels::traits::{Channel, ChannelMessage, SendMessage};
@@ -97,15 +105,13 @@ use tokio::sync::mpsc;
 /// Telegram channel via Bot API.
 pub struct TelegramChannel {
     bot_token: String,
-    allowed_users: Vec<String>,
     client: reqwest::Client,
 }
 
 impl TelegramChannel {
-    pub fn new(bot_token: &str, allowed_users: Vec<String>) -> Self {
+    pub fn new(bot_token: &str) -> Self {
         Self {
             bot_token: bot_token.to_string(),
-            allowed_users,
             client: reqwest::Client::new(),
         }
     }
@@ -155,12 +161,6 @@ impl Channel for TelegramChannel {
                             .unwrap_or("unknown")
                             .to_string();
 
-                        if !self.allowed_users.is_empty()
-                            && !self.allowed_users.contains(&sender)
-                        {
-                            continue;
-                        }
-
                         let chat_id = msg["chat"]["id"].to_string();
 
                         let channel_msg = ChannelMessage {
@@ -170,7 +170,7 @@ impl Channel for TelegramChannel {
                             content: msg["text"].as_str().unwrap_or("").to_string(),
                             channel: "telegram".into(),
                             timestamp: msg["date"].as_u64().unwrap_or(0),
-                            thread_ts: None,
+                            ..Default::default()
                         };
 
                         if tx.send(channel_msg).await.is_err() {
@@ -395,26 +395,12 @@ impl Memory for InMemoryBackend {
 
 ---
 
-## Registration Pattern
+## Registration And Architecture Rules
 
-All extension traits follow the same wiring pattern:
-
-1. Create your implementation file in the relevant `crates/zeroclaw-*/src/` directory.
-2. Register it in the module's factory function (e.g., `default_tools()`, provider match arm).
-3. Add any needed config keys to `crates/zeroclaw-config/src/schema.rs`.
-4. Write focused tests for factory wiring and error paths.
-
----
-
-## Architecture boundary rules
-
-A few invariants that hold across every extension. Breaking these tends to be the source of cross-cutting cleanup PRs later, so internalise them up front:
-
-- **Extend by trait + factory wiring first.** Adding a new provider/channel/tool/peripheral is implementing a trait and registering it in the relevant factory. Avoid cross-module rewrites for what should be an isolated feature.
-- **Dependency direction goes inward to contracts.** Concrete integrations depend on `zeroclaw-api` traits, `zeroclaw-config` schema, and `zeroclaw-infra` utilities, not on each other. Provider code does not import channel internals; tool code does not mutate gateway policy directly.
-- **Module responsibilities stay single-purpose.** Orchestration in `zeroclaw-runtime/src/agent/`, transport in `zeroclaw-channels/`, model I/O in `zeroclaw-providers/`, policy in `zeroclaw-runtime/src/security/`, execution in `zeroclaw-tools/`.
-- **Rule of three for shared abstractions.** Introduce new shared types only after a third real caller materialises. Premature abstractions accrete weight that future contributors have to navigate around.
-- **Config keys are public contract.** Schema changes need defaults, compatibility impact, and a migration/rollback path documented in the PR.
+The examples above show trait shape only. For production first-party
+implementations, use [First-party extensions](./first-party-extensions.md) for
+factory wiring, config ownership, source-of-truth rules, attribution, security,
+localization, docs, and testing expectations.
 
 ## Tool shared state
 

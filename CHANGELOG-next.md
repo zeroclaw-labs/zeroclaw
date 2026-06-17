@@ -93,6 +93,7 @@ The daemon's structured log stream, filterable and attribution-aware, in the sam
 
 - [New channels](https://docs.zeroclawlabs.ai/master/en/channels/overview.html): Twitch chat (#7275), WeCom AI Bot (#6680), AMQP with mutual TLS (#7369), and multi-tenant Linq with per-agent routing (#7041).
 - Per-recipient reply pacing across nine channels (#6389), a configurable in-flight message budget (#7391), webhook retry with exponential backoff (#5838), a reply-intent precheck that can route to a cheaper per-agent classifier model (#6068, #6945), and selective channel builds behind the new lean default bundle (#6866, #6904).
+- **Per-alias webhook routing** (#6312): inbound webhooks for WhatsApp, WATI, Nextcloud Talk, and Linq now route by alias — `POST /<type>/<alias>` reaches the matching channel instance instead of always resolving the first one, so multi-instance configs (e.g. `whatsapp.work` + `whatsapp.personal`) each receive their own traffic. The bare `/<type>` path still works as a **deprecated** fallback that resolves to a single deterministic instance (the lexicographically-first alias) and tags the response with an `X-Zeroclaw-Deprecation` header; an unknown alias now returns **404** instead of a 500. Single-instance deployments need no config change.
 
 ### Tools and plugins
 
