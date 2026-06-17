@@ -175,6 +175,11 @@ fn decode_output(bytes: &[u8]) -> String {
     let cp = unsafe { GetConsoleOutputCP() };
     let cp = if cp == 0 { unsafe { GetACP() } } else { cp };
 
+    decode_output_with_code_page(bytes, cp)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn decode_output_with_code_page(bytes: &[u8], cp: u32) -> String {
     let encoding = windows_code_page_to_encoding(cp);
     if std::ptr::eq(encoding, encoding_rs::UTF_8) {
         String::from_utf8_lossy(bytes).into_owned()
@@ -186,7 +191,7 @@ fn decode_output(bytes: &[u8]) -> String {
 
 /// Map a Windows code page identifier to an `encoding_rs` `Encoding`.
 /// Falls back to UTF-8 (lossy) for unknown code pages.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn windows_code_page_to_encoding(cp: u32) -> &'static encoding_rs::Encoding {
     match cp {
         932 => encoding_rs::SHIFT_JIS,
@@ -1058,7 +1063,6 @@ mod tests {
         assert_eq!(super::decode_output(b""), "");
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn windows_code_page_mapping_covers_cjk() {
         use super::windows_code_page_to_encoding;
@@ -1068,7 +1072,6 @@ mod tests {
         assert_eq!(windows_code_page_to_encoding(950), encoding_rs::BIG5);
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn windows_code_page_mapping_utf8_variants() {
         use super::windows_code_page_to_encoding;
@@ -1076,23 +1079,19 @@ mod tests {
         assert_eq!(windows_code_page_to_encoding(20127), encoding_rs::UTF_8);
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn windows_code_page_mapping_unknown_falls_back_to_utf8() {
         use super::windows_code_page_to_encoding;
         assert_eq!(windows_code_page_to_encoding(99999), encoding_rs::UTF_8);
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
-    fn decode_output_gbk_bytes_transcode_to_utf8() {
+    fn decode_output_with_cp936_gbk_bytes_transcodes_to_utf8() {
         // GBK encoding of "你好" is [0xC4, 0xE3, 0xBA, 0xC3]
         let gbk_bytes: &[u8] = &[0xC4, 0xE3, 0xBA, 0xC3];
-        // When the console code page is GBK (936), windows_code_page_to_encoding
-        // returns GBK and decodes correctly.  We test the transcoding function
-        // directly since we cannot control GetConsoleOutputCP in unit tests.
-        let (cow, _enc, _errors) = encoding_rs::GBK.decode(gbk_bytes);
-        assert_eq!(cow.as_ref(), "你好");
+        let decoded = super::decode_output_with_code_page(gbk_bytes, 936);
+        assert_eq!(decoded, "你好");
+        assert!(!decoded.contains('\u{FFFD}'));
     }
 
     #[test]

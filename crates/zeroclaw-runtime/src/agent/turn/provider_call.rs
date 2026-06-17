@@ -12,7 +12,7 @@ use crate::observability::ObserverEvent;
 use crate::tools::ToolSpec;
 use anyhow::Result;
 use std::time::{Duration, Instant};
-use zeroclaw_providers::{ChatMessage, ChatRequest, ChatResponse, ModelProvider};
+use zeroclaw_providers::{ChatMessage, ChatRequest, ChatResponse, ModelProvider, ProviderDispatch};
 
 /// Result of one provider call.
 ///
@@ -138,24 +138,20 @@ pub(crate) async fn call_provider(
     let mut streamed_protocol_suppressed = false;
 
     let chat_result = if should_consume_provider_stream {
-        use ::zeroclaw_log::Instrument;
-        let provider_span = ::zeroclaw_log::attribution_span!(active_model_provider);
-        let stream_future = ::zeroclaw_log::scope!(
-            model: active_model,
-            =>
-            consume_provider_streaming_response(
-                active_model_provider,
-                prepared_messages,
-                request_tools,
-                active_model,
-                ctx.temperature,
-                ctx.cancellation_token,
-                ctx.on_delta,
-                ctx.event_tx,
-                ctx.strict_tool_parsing,
-            )
-        )
-        .instrument(provider_span);
+        // Attribution is opened by ProviderDispatch::from_ref(...).stream_chat
+        // inside `consume_provider_streaming_response`; the caller does not
+        // wrap a second attribution_span! here.
+        let stream_future = consume_provider_streaming_response(
+            active_model_provider,
+            prepared_messages,
+            request_tools,
+            active_model,
+            ctx.temperature,
+            ctx.cancellation_token,
+            ctx.on_delta,
+            ctx.event_tx,
+            ctx.strict_tool_parsing,
+        );
         match stream_future.await {
             Ok(streamed) => {
                 streamed_live_deltas = streamed.forwarded_live_deltas;
@@ -200,25 +196,19 @@ pub(crate) async fn call_provider(
                     "llm_stream_fallback: provider stream failed, falling back to non-streaming chat"
                 );
                 {
-                    use ::zeroclaw_log::Instrument;
-                    let provider_span = ::zeroclaw_log::attribution_span!(active_model_provider);
-                    let chat_future = ::zeroclaw_log::scope!(
-                        model: active_model,
-                        =>
-                        active_model_provider.chat(
-                            ChatRequest {
-                                messages: prepared_messages,
-                                tools: request_tools,
-                                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                                    .try_with(Clone::clone)
-                                    .ok()
-                                    .flatten(),
-                            },
-                            active_model,
-                            ctx.temperature,
-                        )
-                    )
-                    .instrument(provider_span);
+                    let dispatcher = ProviderDispatch::from_ref(active_model_provider);
+                    let chat_future = dispatcher.chat(
+                        ChatRequest {
+                            messages: prepared_messages,
+                            tools: request_tools,
+                            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                                .try_with(Clone::clone)
+                                .ok()
+                                .flatten(),
+                        },
+                        active_model,
+                        ctx.temperature,
+                    );
                     if let Some(token) = ctx.cancellation_token {
                         tokio::select! {
                             () = token.cancelled() => Err(ToolLoopCancelled.into()),
@@ -233,25 +223,19 @@ pub(crate) async fn call_provider(
     } else {
         // Non-streaming path: wrap with optional per-step timeout from
         // pacing config to catch hung model responses.
-        use ::zeroclaw_log::Instrument;
-        let provider_span = ::zeroclaw_log::attribution_span!(active_model_provider);
-        let chat_future = ::zeroclaw_log::scope!(
-            model: active_model,
-            =>
-            active_model_provider.chat(
-                ChatRequest {
-                    messages: prepared_messages,
-                    tools: request_tools,
-                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                        .try_with(Clone::clone)
-                        .ok()
-                        .flatten(),
-                },
-                active_model,
-                ctx.temperature,
-            )
-        )
-        .instrument(provider_span);
+        let dispatcher = ProviderDispatch::from_ref(active_model_provider);
+        let chat_future = dispatcher.chat(
+            ChatRequest {
+                messages: prepared_messages,
+                tools: request_tools,
+                thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .try_with(Clone::clone)
+                    .ok()
+                    .flatten(),
+            },
+            active_model,
+            ctx.temperature,
+        );
 
         match ctx.pacing.step_timeout_secs {
             Some(step_secs) if step_secs > 0 => {

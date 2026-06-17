@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
+zeroclaw-providers.workspace = true
 zeroclaw-spawn.workspace = true
 zeroclaw-config = { workspace = true, default-features = false }
 anyhow = "1.0"
