@@ -347,6 +347,32 @@ jobs:
           BASE_SHA: ${{ steps.base.outputs.sha }}
         run: bash scripts/ci/docs_quality_gate.sh
 
+  zerocode-rpc-boundary:
+    name: Zerocode RPC Boundary
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Detect zerocode changes
+        id: changed
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="$(git merge-base origin/master HEAD)"
+            if git diff --name-only "$base" HEAD | grep -q '^apps/zerocode/'; then
+              echo "run=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "run=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Guard zerocode RPC-only boundary
+        if: steps.changed.outputs.run == 'true'
+        run: bash scripts/ci/zerocode_no_zeroclaw_dep_gate.sh
+
   installer-drift:
     name: Installer Drift
     needs: [fmt]
@@ -368,7 +394,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, lint, build, check, check-32bit, bench, test, security, nix-eval, docs-style, installer-drift]
+    needs: [fmt, lint, build, check, check-32bit, bench, test, security, nix-eval, docs-style, installer-drift, zerocode-rpc-boundary]
     runs-on: ubuntu-latest
     steps:
       - name: Check results

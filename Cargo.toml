@@ -307,14 +307,14 @@ agent-runtime = [
 # ACP, gateway/webhook ingress, and common first-run external chat/email paths.
 default-channels = [
     "channel-acp-server", "channel-webhook",
-    "channel-email", "channel-telegram",
+    "channel-email", "channel-telegram", "channel-discord",
 ]
 
 # Historical broad channel bundle. Use this for builds that should preserve the
 # pre-#6895 default channel surface.
 channels-full = [
     "default-channels", "zeroclaw-channels/channels-full", "channel-lark",
-    "channel-discord", "channel-slack", "channel-signal",
+    "channel-slack", "channel-signal",
     "channel-mattermost", "channel-irc", "channel-imessage",
     "channel-dingtalk", "channel-qq", "channel-bluesky",
     "channel-twitch", "channel-twitter", "channel-reddit", "channel-notion", "channel-mqtt", "channel-amqp",
