@@ -1967,12 +1967,28 @@ impl RpcDispatcher {
         // blank transcript even though the picker (which reads from the ACP
         // store) reports a non-zero `message_count`. See issue #7799.
         //
-        // Flatten `ConversationMessage` → `ChatMessage` by keeping only the
-        // `Chat(...)` variants. The wire schema for `session/messages` is
-        // `{ role, content }` per message, so tool calls and tool results
-        // cannot be represented here; the TUI's `load_history` also only
-        // renders user/assistant chat, so dropping them changes nothing
-        // visible.
+        // Flatten `ConversationMessage` → `ChatMessage` for the
+        // `{ role, content }` wire schema:
+        //   * `Chat(...)`               → pass through.
+        //   * `AssistantToolCalls { text: Some(t), .. }`
+        //                               → assistant `ChatMessage` carrying
+        //                                 just the visible narration `t`.
+        //                                 The agent's duplicate-narration
+        //                                 guard means this text is stored
+        //                                 ONLY on the `AssistantToolCalls`
+        //                                 entry — there is no paired
+        //                                 `Chat(assistant)` row — so dropping
+        //                                 it would lose visible turns from
+        //                                 the replayed transcript on resume.
+        //   * `AssistantToolCalls { text: None | Some("") , .. }`
+        //                               → drop: nothing to render and the
+        //                                 wire shape can't carry tool-call
+        //                                 metadata.
+        //   * `ToolResults(_)`          → drop: the wire shape can't carry
+        //                                 tool results and the TUI's
+        //                                 `load_history` ignores them.
+        // Surfacing tool-call metadata and tool results in replay is a
+        // separate wire-schema change.
         if raw.is_empty()
             && let Some(store) = self.ctx.acp_session_store.as_ref()
         {
@@ -1984,6 +2000,12 @@ impl RpcDispatcher {
                         .filter_map(|m| {
                             match m {
                             zeroclaw_api::model_provider::ConversationMessage::Chat(c) => Some(c),
+                            zeroclaw_api::model_provider::ConversationMessage::AssistantToolCalls {
+                                text: Some(t),
+                                ..
+                            } if !t.is_empty() => {
+                                Some(zeroclaw_api::model_provider::ChatMessage::assistant(t))
+                            }
                             zeroclaw_api::model_provider::ConversationMessage::AssistantToolCalls {
                                 ..
                             }
@@ -4139,6 +4161,7 @@ mod tests {
     async fn session_messages_falls_back_to_acp_store_for_acp_sessions() {
         use serde_json::from_value;
         use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+        use zeroclaw_providers::{ToolCall, ToolResultMessage};
 
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
@@ -4147,8 +4170,12 @@ mod tests {
             make_persistence_test_dispatcher(config, &data_dir);
 
         // Seed an ACP session directly in the dedicated store, exactly the way
-        // a real Code pane would after a turn: a user message and an assistant
-        // reply, persisted in `acp-sessions.db`. Nothing is written to the
+        // a real Code pane would after a turn: a user message, an assistant
+        // turn that narrates while issuing a tool call (the agent stores the
+        // narration ONLY on the `AssistantToolCalls` row — the
+        // duplicate-narration guard suppresses a paired `Chat(assistant)`
+        // row), the tool result, a second tool-call round with no narration,
+        // and a final plain assistant reply. Nothing is written to the
         // unified `session_backend`, mirroring the production split.
         let sid = "acp-resume-7799";
         acp_store
@@ -4162,6 +4189,34 @@ mod tests {
                         role: "user".into(),
                         content: "hello from prior turn".into(),
                     }),
+                    ConversationMessage::AssistantToolCalls {
+                        text: Some("let me check the logs".into()),
+                        tool_calls: vec![ToolCall {
+                            id: "tc-1".into(),
+                            name: "shell".into(),
+                            arguments: r#"{"command":"tail log"}"#.into(),
+                            extra_content: None,
+                        }],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        tool_call_id: "tc-1".into(),
+                        content: "log contents".into(),
+                    }]),
+                    ConversationMessage::AssistantToolCalls {
+                        text: None,
+                        tool_calls: vec![ToolCall {
+                            id: "tc-2".into(),
+                            name: "shell".into(),
+                            arguments: r#"{"command":"grep err"}"#.into(),
+                            extra_content: None,
+                        }],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        tool_call_id: "tc-2".into(),
+                        content: "no errors".into(),
+                    }]),
                     ConversationMessage::Chat(ChatMessage {
                         role: "assistant".into(),
                         content: "ack from prior turn".into(),
@@ -4187,20 +4242,39 @@ mod tests {
         let parsed: SessionMessagesResult =
             from_value(result).expect("SessionMessagesResult shape");
 
+        // Expected replayed transcript (after flattening for the
+        // `{ role, content }` wire shape):
+        //   0: user      "hello from prior turn"
+        //   1: assistant "let me check the logs"   (narration recovered
+        //                                            from AssistantToolCalls.text;
+        //                                            losing this is the
+        //                                            regression #7903 review
+        //                                            was raised against)
+        //   2: assistant "ack from prior turn"
+        // The text-less AssistantToolCalls and both ToolResults rows are
+        // dropped because the current wire schema can't carry them.
         assert_eq!(parsed.session_id, sid);
         assert_eq!(
-            parsed.total, 2,
-            "ACP-backed sessions must report their full persisted message count"
+            parsed.total, 3,
+            "ACP-backed sessions must report their full replayable message count"
         );
         assert_eq!(
             parsed.messages.len(),
-            2,
+            3,
             "ACP-backed sessions must replay their persisted messages, not a blank transcript"
         );
         assert_eq!(parsed.messages[0].role, "user");
         assert_eq!(parsed.messages[0].content, "hello from prior turn");
         assert_eq!(parsed.messages[1].role, "assistant");
-        assert_eq!(parsed.messages[1].content, "ack from prior turn");
+        assert_eq!(
+            parsed.messages[1].content, "let me check the logs",
+            "assistant narration on an AssistantToolCalls row must be preserved \
+             when flattening for session/messages — the agent stores it ONLY \
+             on that row, so dropping it would lose visible turns from the \
+             replayed transcript"
+        );
+        assert_eq!(parsed.messages[2].role, "assistant");
+        assert_eq!(parsed.messages[2].content, "ack from prior turn");
     }
 
     /// A reaped ACP session (gone from memory, durable row intact) must
