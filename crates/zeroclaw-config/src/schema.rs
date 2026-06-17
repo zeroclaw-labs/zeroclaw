@@ -5269,6 +5269,30 @@ pub enum SkillsPromptInjectionMode {
     Compact,
 }
 
+/// An external, user-configured skill registry ZeroClaw can install from.
+///
+/// Reuses the same git-clone mechanism as the default `zeroclaw-skills`
+/// registry. Install a skill from it with `registry:<name>/<skill>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct ExternalRegistry {
+    /// Short alias used in `registry:<name>/<skill>` install specs.
+    pub name: String,
+    /// Git repository URL of the registry (must expose a top-level `skills/` dir).
+    pub url: String,
+    /// Registry protocol. Only `"git"` is supported today; other protocols
+    /// are reserved for a future additive release.
+    #[serde(default = "default_extra_registry_kind")]
+    pub kind: String,
+    /// Whether this registry is eligible for installs. Default: `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_extra_registry_kind() -> String {
+    "git".to_string()
+}
+
 /// Skills loading configuration (`[skills]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -5290,6 +5314,11 @@ pub struct SkillsConfig {
     /// Default: `https://github.com/zeroclaw-labs/zeroclaw-skills`
     #[serde(default)]
     pub registry_url: Option<String>,
+    /// Additional user-configured skill registries, installed via
+    /// `registry:<name>/<skill>`. Each reuses the git-clone registry path and
+    /// is cloned to its own `extra-registry-<name>/` workspace directory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_registries: Vec<ExternalRegistry>,
     /// Controls how skills are injected into the system prompt.
     /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
     #[serde(default)]
@@ -17131,6 +17160,44 @@ impl Config {
         self.proxy.validate()?;
         self.cloud_ops.validate()?;
 
+        // Skills — extra registries
+        {
+            let mut seen = std::collections::HashSet::new();
+            for (i, reg) in self.skills.extra_registries.iter().enumerate() {
+                if reg.name.trim().is_empty() {
+                    anyhow::bail!("skills.extra_registries[{i}].name must not be empty");
+                }
+                if !seen.insert(reg.name.as_str()) {
+                    anyhow::bail!("skills.extra_registries has duplicate name '{}'", reg.name);
+                }
+                if reg.url.trim().is_empty() {
+                    anyhow::bail!(
+                        "skills.extra_registries[{}].url must not be empty",
+                        reg.name
+                    );
+                }
+                if reg.kind != "git" {
+                    anyhow::bail!(
+                        "skills.extra_registries[{}].kind must be 'git' (got '{}'); other protocols are not yet supported",
+                        reg.name,
+                        reg.kind
+                    );
+                }
+                match reqwest::Url::parse(&reg.url) {
+                    Ok(u) if matches!(u.scheme(), "http" | "https" | "file") => {}
+                    Ok(u) => anyhow::bail!(
+                        "skills.extra_registries[{}].url scheme '{}' is unsupported (use http, https, or file)",
+                        reg.name,
+                        u.scheme()
+                    ),
+                    Err(e) => anyhow::bail!(
+                        "skills.extra_registries[{}].url is not a valid URL: {e}",
+                        reg.name
+                    ),
+                }
+            }
+        }
+
         // Notion
         if self.notion.enabled {
             if self.notion.database_id.trim().is_empty() {
@@ -19271,6 +19338,71 @@ enabled = true
             msg.contains("channels.telegram.default.reply_min_interval_secs"),
             "error must name the offending path; got: {msg}"
         );
+    }
+
+    fn ext_reg(name: &str, url: &str, kind: &str) -> ExternalRegistry {
+        ExternalRegistry {
+            name: name.to_string(),
+            url: url.to_string(),
+            kind: kind.to_string(),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    async fn validate_accepts_git_extra_registry() {
+        let mut config = Config::default();
+        config.skills.extra_registries =
+            vec![ext_reg("team", "https://github.com/acme/skills", "git")];
+        assert!(config.validate().is_ok(), "valid git registry must pass");
+    }
+
+    #[test]
+    async fn validate_rejects_extra_registry_non_git_kind() {
+        let mut config = Config::default();
+        config.skills.extra_registries =
+            vec![ext_reg("team", "https://github.com/acme/skills", "zip-api")];
+        let err = config
+            .validate()
+            .expect_err("non-git kind must be rejected");
+        assert!(err.to_string().contains("kind must be 'git'"), "got: {err}");
+    }
+
+    #[test]
+    async fn validate_rejects_extra_registry_duplicate_names() {
+        let mut config = Config::default();
+        config.skills.extra_registries = vec![
+            ext_reg("team", "https://github.com/acme/a", "git"),
+            ext_reg("team", "https://github.com/acme/b", "git"),
+        ];
+        let err = config
+            .validate()
+            .expect_err("duplicate names must be rejected");
+        assert!(
+            err.to_string().contains("duplicate name 'team'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_extra_registry_empty_name_or_url() {
+        let mut config = Config::default();
+        config.skills.extra_registries = vec![ext_reg("", "https://github.com/acme/a", "git")];
+        assert!(config.validate().is_err(), "empty name must be rejected");
+
+        let mut config = Config::default();
+        config.skills.extra_registries = vec![ext_reg("team", "   ", "git")];
+        assert!(config.validate().is_err(), "empty url must be rejected");
+    }
+
+    #[test]
+    async fn validate_rejects_extra_registry_bad_url_scheme() {
+        let mut config = Config::default();
+        config.skills.extra_registries = vec![ext_reg("team", "ftp://example.com/x", "git")];
+        let err = config
+            .validate()
+            .expect_err("non-http(s)/file scheme must be rejected");
+        assert!(err.to_string().contains("scheme"), "got: {err}");
     }
 
     #[test]

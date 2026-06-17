@@ -68,6 +68,7 @@ cli-skills-remove-about = 移除已安装的技能
 cli-skills-test-about = 为某个技能（或所有技能）运行 TEST.sh 验证
 cli-skills-install-start = 正在安装技能来源：{$source}
 cli-skills-install-resolving-registry = { "  " }正在从技能注册表解析 '{$source}'...
+cli-skills-install-resolving-extra-registry = { "  " }正在从注册表 '{$registry}' 解析 '{$source}'...
 cli-skills-install-installed-audited = { "  " }{$status} 技能已安装并审计：{$path}（已扫描 {$files} 个文件）
 cli-skills-install-security-audit-completed = { "  " }安全审计已成功完成。
 cli-skills-install-tier-official = 正在安装 {$name} v{$version} — 官方（zeroclaw-labs 维护）

@@ -68,6 +68,7 @@ cli-skills-remove-about = インストール済みスキルを削除
 cli-skills-test-about = スキル (またはすべてのスキル) の TEST.sh 検証を実行
 cli-skills-install-start = スキルをインストール中: {$source}
 cli-skills-install-resolving-registry = { "  " }スキルレジストリから '{$source}' を解決中...
+cli-skills-install-resolving-extra-registry = { "  " }レジストリ '{$registry}' から '{$source}' を解決中...
 cli-skills-install-installed-audited = { "  " }{$status} スキルがインストールされ、監査されました: {$path}（{$files} ファイルをスキャン）
 cli-skills-install-security-audit-completed = { "  " }セキュリティ監査が正常に完了しました。
 cli-skills-install-tier-official = {$name} v{$version} をインストール中 — 公式（zeroclaw-labs 管理）

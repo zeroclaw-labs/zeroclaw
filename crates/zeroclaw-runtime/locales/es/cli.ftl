@@ -68,6 +68,7 @@ cli-skills-remove-about = Eliminar una skill instalada
 cli-skills-test-about = Ejecutar la validación TEST.sh para una skill (o todas las skills)
 cli-skills-install-start = Instalando skill desde: {$source}
 cli-skills-install-resolving-registry = { "  " }Resolviendo '{$source}' desde el registro de skills...
+cli-skills-install-resolving-extra-registry = { "  " }Resolviendo '{$source}' desde el registro '{$registry}'...
 cli-skills-install-installed-audited = { "  " }{$status} Skill instalada y auditada: {$path} ({$files} archivos escaneados)
 cli-skills-install-security-audit-completed = { "  " }Auditoría de seguridad completada con éxito.
 cli-skills-install-tier-official = Instalando {$name} v{$version} — Oficial (mantenida por zeroclaw-labs)

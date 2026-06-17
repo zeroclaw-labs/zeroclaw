@@ -159,6 +159,29 @@ pub async fn handle_command(
                     no_tier_banner,
                 )
                 .with_context(|| format!("failed to install skill from registry: {source}"))?
+            } else if is_extra_registry_source(&source) {
+                // `is_extra_registry_source` is `parse_extra_registry_source(..).is_some()`,
+                // so this re-parse always succeeds. `unwrap_or_default` only guards an
+                // unreachable `None` for a cosmetic label rather than panicking in the CLI.
+                let registry_label = parse_extra_registry_source(&source)
+                    .map(|(name, _)| name)
+                    .unwrap_or_default();
+                println!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-skills-install-resolving-extra-registry",
+                        &[("source", &source), ("registry", &registry_label)]
+                    )
+                );
+                install_extra_registry_skill_source(
+                    &source,
+                    &skills_path,
+                    config.skills.allow_scripts,
+                    workspace_dir,
+                    &config.skills.extra_registries,
+                    no_tier_banner,
+                )
+                .with_context(|| format!("failed to install skill from extra registry: {source}"))?
             } else {
                 install_local_skill_source(&source, &skills_path, config.skills.allow_scripts)
                     .with_context(|| format!("failed to install local skill source: {source}"))?
