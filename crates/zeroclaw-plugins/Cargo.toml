@@ -15,6 +15,7 @@ plugins-wasmtime = [
   "dep:wasmtime",
   "dep:wasmtime-wasi",
   "dep:wasmtime-wasi-http",
+  "tokio/fs",
 ]
 plugins-wasm-cranelift = ["plugins-wasmtime", "wasmtime/cranelift"]
 plugins-wasm-pulley = ["plugins-wasmtime", "wasmtime/pulley"]
