@@ -214,6 +214,7 @@ pub struct Config {
     /// Distinct from `[agent.eval]`, which is the in-loop response-quality scorer.
     #[serde(default)]
     #[nested]
+    #[group = "Operations"]
     pub eval: crate::scattered_types::EvalHarnessConfig,
 
     /// Pacing controls for slow/local LLM workloads (`[pacing]`).
