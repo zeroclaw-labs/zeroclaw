@@ -10023,6 +10023,78 @@ fn is_valid_env_var_name(name: &str) -> bool {
 
 // ── Profiles & Bundles ───────────────────────────────────────────
 
+/// Mandatory write-deny list — always blocked regardless of `allow_write`.
+pub const MANDATORY_DENY_WRITE: &[&str] = &[
+    ".bashrc",
+    ".bash_profile",
+    ".zshrc",
+    ".zprofile",
+    ".profile",
+    ".gitconfig",
+    ".gitmodules",
+    ".git/hooks/",
+    ".git/config",
+    ".env",
+    ".mcp.json",
+    ".claude/agents/",
+    ".vscode/",
+    ".idea/",
+];
+
+/// Filesystem and network policy for OS-level sandbox backends
+/// (`[risk_profiles.<alias>.sandbox_policy]`).
+///
+/// Intended as the canonical policy model. `forbidden_paths` and `allowed_roots`
+/// on `RiskProfileConfig` will become compatibility aliases that resolve into
+/// this struct (tracked in the sandbox-policy RFC). Until that wiring lands,
+/// both surfaces are independently readable.
+///
+/// Filesystem read semantics: deny-then-allow (`allow_read` overrides `deny_read`).
+/// Filesystem write semantics: allow-only (`deny_write` overrides `allow_write`).
+/// Network semantics: `denied_domains` checked first, then `allowed_domains`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(default)]
+pub struct SandboxPolicyConfig {
+    /// Paths denied for read access. `~` is expanded to the user home directory.
+    pub deny_read: Vec<String>,
+    /// Paths re-allowed for read within denied regions. Takes precedence over `deny_read`.
+    pub allow_read: Vec<String>,
+    /// Paths allowed for write access. All other paths are denied for writes.
+    pub allow_write: Vec<String>,
+    /// Write exceptions within `allow_write` regions. Takes precedence over `allow_write`.
+    pub deny_write: Vec<String>,
+    /// Network domains the sandbox may reach via proxy. Empty list = no network.
+    /// Wildcard prefix supported: `*.github.com`.
+    pub allowed_domains: Vec<String>,
+    /// Domains explicitly blocked. Checked before `allowed_domains`.
+    pub denied_domains: Vec<String>,
+    /// Unix socket paths the sandbox may access (macOS only; ignored on Linux).
+    pub allow_unix_sockets: Vec<String>,
+    /// Raw extra bwrap flags appended last (Bubblewrap backend only, escape hatch).
+    pub bubblewrap_args: Vec<String>,
+    /// When `true`, `MANDATORY_DENY_WRITE` paths are always blocked regardless of
+    /// `allow_write`. Can be set `false` per profile as an escape hatch; emits a
+    /// WARN log at runtime.
+    pub mandatory_deny_write_enabled: bool,
+}
+
+impl Default for SandboxPolicyConfig {
+    fn default() -> Self {
+        Self {
+            deny_read: vec![],
+            allow_read: vec![],
+            allow_write: vec![".".to_string(), "/tmp".to_string()],
+            deny_write: vec![],
+            allowed_domains: vec![],
+            denied_domains: vec![],
+            allow_unix_sockets: vec![],
+            bubblewrap_args: vec![],
+            mandatory_deny_write_enabled: true,
+        }
+    }
+}
+
 /// Named risk/autonomy profile (`[risk_profiles.<alias>]`).
 ///
 /// Unified policy surface. Agents reference a profile by alias and the
@@ -10079,6 +10151,11 @@ pub struct RiskProfileConfig {
     pub sandbox_backend: Option<String>,
     /// Extra arguments forwarded to firejail when sandbox_backend = "firejail".
     pub firejail_args: Vec<String>,
+    /// OS-level sandbox filesystem and network policy. Intended as the
+    /// canonical model; `forbidden_paths`/`allowed_roots` alias wiring
+    /// is tracked in the sandbox-policy RFC and lands in a follow-up PR.
+    #[serde(default)]
+    pub sandbox_policy: SandboxPolicyConfig,
 }
 
 impl Default for RiskProfileConfig {
@@ -10100,6 +10177,7 @@ impl Default for RiskProfileConfig {
             sandbox_enabled: None,
             sandbox_backend: None,
             firejail_args: Vec::new(),
+            sandbox_policy: SandboxPolicyConfig::default(),
         }
     }
 }
@@ -18670,6 +18748,10 @@ impl HasPropKind for crate::autonomy::DelegationPolicy {
     const PROP_KIND: PropKind = PropKind::Enum;
 }
 
+impl HasPropKind for SandboxPolicyConfig {
+    const PROP_KIND: PropKind = PropKind::Object;
+}
+
 impl HasPropKind for serde_json::Value {
     // `serde_json::Value` is an arbitrary JSON document, not an enum.
     // Classifying it as `Enum` previously made `enum_variants_for::<Value>()`
@@ -21950,6 +22032,61 @@ default_temperature = 0.7
         assert!(
             !parsed.gateway.allow_public_bind,
             "Missing [gateway] must default to allow_public_bind=false"
+        );
+    }
+
+    #[test]
+    async fn sandbox_policy_config_defaults() {
+        let p = SandboxPolicyConfig::default();
+        assert!(
+            p.mandatory_deny_write_enabled,
+            "mandatory deny write must be on by default"
+        );
+        assert!(
+            p.allow_write.contains(&".".to_string()),
+            "default allow_write must include workspace"
+        );
+        assert!(
+            p.allow_write.contains(&"/tmp".to_string()),
+            "default allow_write must include /tmp"
+        );
+        assert!(p.deny_read.is_empty(), "default deny_read must be empty");
+        assert!(
+            p.allowed_domains.is_empty(),
+            "default allowed_domains must be empty (no network)"
+        );
+    }
+
+    #[test]
+    async fn sandbox_policy_config_deserialize_roundtrip() {
+        let toml_in = r#"
+            deny_read = ["~/.ssh"]
+            allow_write = ["."]
+            allowed_domains = ["api.example.com"]
+            mandatory_deny_write_enabled = false
+        "#;
+        let p: SandboxPolicyConfig =
+            toml::from_str(toml_in).expect("deserialize SandboxPolicyConfig");
+        assert_eq!(p.deny_read, vec!["~/.ssh"]);
+        assert_eq!(p.allow_write, vec!["."]);
+        assert_eq!(p.allowed_domains, vec!["api.example.com"]);
+        assert!(!p.mandatory_deny_write_enabled);
+        // fields not set must fall back to default
+        assert!(p.allow_read.is_empty());
+        assert!(p.denied_domains.is_empty());
+    }
+
+    #[test]
+    async fn mandatory_deny_write_list_is_nonempty() {
+        assert!(!MANDATORY_DENY_WRITE.is_empty());
+        assert!(MANDATORY_DENY_WRITE.contains(&".env"), "must block .env");
+        assert!(
+            MANDATORY_DENY_WRITE.contains(&".git/hooks/"),
+            "must block .git/hooks/"
+        );
+        assert!(
+            MANDATORY_DENY_WRITE.contains(&".bashrc"),
+            "must block .bashrc"
         );
     }
 

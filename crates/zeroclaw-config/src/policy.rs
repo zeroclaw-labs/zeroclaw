@@ -2747,6 +2747,7 @@ mod tests {
             sandbox_enabled: Some(true),
             sandbox_backend: Some("firejail".into()),
             firejail_args: vec!["--net=none".into()],
+            sandbox_policy: crate::schema::SandboxPolicyConfig::default(),
         };
 
         let policy = SecurityPolicy::from_profiles(&rp, None, Path::new("/ws"));
