@@ -58,7 +58,7 @@ async fn apply_comments_inserts_comment_above_target_key() {
          got line above: {:?}",
         lines[host_line_idx - 1]
     );
-    let _: toml::Value = result.trim().parse().expect("resulting TOML must parse");
+    let _: toml::Value = toml::from_str(result.trim()).expect("resulting TOML must parse");
     drop(dir);
 }
 
@@ -82,7 +82,7 @@ async fn apply_comments_updates_existing_comment_on_same_key() {
         result.contains("# updated description"),
         "new comment must appear; result:\n{result}"
     );
-    let parsed: toml::Value = result.trim().parse().expect("resulting TOML must parse");
+    let parsed: toml::Value = toml::from_str(result.trim()).expect("resulting TOML must parse");
     assert_eq!(
         parsed.get("host").and_then(toml::Value::as_str),
         Some("localhost")
@@ -127,7 +127,7 @@ async fn apply_comments_multiple_annotations_in_one_call() {
         lines[port_idx - 1]
     );
 
-    let parsed: toml::Value = result.trim().parse().expect("resulting TOML must parse");
+    let parsed: toml::Value = toml::from_str(result.trim()).expect("resulting TOML must parse");
     assert_eq!(
         parsed.get("host").and_then(toml::Value::as_str),
         Some("localhost")
@@ -176,7 +176,7 @@ async fn apply_comments_deep_dotted_traversal() {
         lines[api_key_idx - 1]
     );
 
-    let parsed: toml::Value = result.trim().parse().expect("resulting TOML must parse");
+    let parsed: toml::Value = toml::from_str(result.trim()).expect("resulting TOML must parse");
     let api_key_val = parsed
         .get("providers")
         .and_then(toml::Value::as_table)
@@ -211,7 +211,7 @@ async fn apply_comments_bad_intermediate_path_is_noop() {
         !result.contains("should not appear"),
         "comment must not appear for a bad intermediate path; result:\n{result}"
     );
-    let parsed: toml::Value = result.trim().parse().expect("resulting TOML must parse");
+    let parsed: toml::Value = toml::from_str(result.trim()).expect("resulting TOML must parse");
     assert_eq!(
         parsed.get("host").and_then(toml::Value::as_str),
         Some("localhost")
@@ -242,7 +242,7 @@ async fn apply_comments_nonexistent_key_is_noop() {
         !result.contains("ghost comment"),
         "comment must not appear for a nonexistent key; result:\n{result}"
     );
-    let parsed: toml::Value = result.trim().parse().expect("resulting TOML must parse");
+    let parsed: toml::Value = toml::from_str(result.trim()).expect("resulting TOML must parse");
     assert_eq!(
         parsed.get("host").and_then(toml::Value::as_str),
         Some("localhost")
@@ -317,7 +317,7 @@ async fn apply_comments_preserves_unrelated_content() {
         "blank line before [database] must be preserved"
     );
 
-    let parsed: toml::Value = result.trim().parse().expect("resulting TOML must parse");
+    let parsed: toml::Value = toml::from_str(result.trim()).expect("resulting TOML must parse");
     assert_eq!(
         parsed.get("host").and_then(toml::Value::as_str),
         Some("localhost")
