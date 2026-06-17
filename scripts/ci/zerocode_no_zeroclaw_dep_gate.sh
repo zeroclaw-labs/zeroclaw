@@ -36,12 +36,25 @@ if isinstance(target, dict):
                 dep_tables.append(table)
 
 found = set()
+
+
+def flag(label):
+    if label.startswith("zeroclaw-") or label.startswith("zeroclaw_"):
+        found.add(label)
+
+
 for table in dep_tables:
-    for name in table:
+    for name, spec in table.items():
         if name == own_name:
             continue
-        if name.startswith("zeroclaw-") or name.startswith("zeroclaw_"):
-            found.add(name)
+        flag(name)
+        # Cargo renamed dependencies declare the real crate under `package`
+        # while the table key is an arbitrary local alias. Inspect both so a
+        # rename like `x = { package = "zeroclaw-providers" }` cannot slip past.
+        if isinstance(spec, dict):
+            package = spec.get("package")
+            if isinstance(package, str):
+                flag(package)
 
 for name in sorted(found):
     print(name)
