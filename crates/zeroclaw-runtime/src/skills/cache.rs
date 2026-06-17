@@ -90,7 +90,9 @@ fn cache_enabled() -> bool {
 /// (symlinks). Never follows symlinks, so it can't loop on a cycle and matches
 /// the auditor's no-follow stance. Tying the key to content — not metadata an edit
 /// can preserve — is what keeps a cached "clean" audit verdict from outliving the
-/// bytes it audited. Returns `None` when `dir` is absent or any entry can't be
+/// bytes it audited. Only *regular* files are opened: a non-regular entry (FIFO,
+/// socket, device) makes this return `None` so we never block opening it just to
+/// build a key. Returns `None` too when `dir` is absent or any entry can't be
 /// read; callers treat that as "do not cache" rather than trust a partial digest.
 fn dir_signature(dir: &Path) -> Option<u64> {
     if !dir.exists() {
@@ -119,10 +121,18 @@ fn dir_signature(dir: &Path) -> Option<u64> {
                 entries.insert(path, (2, h.finish()));
             } else if file_type.is_dir() {
                 stack.push(path);
-            } else {
+            } else if file_type.is_file() {
                 // Decline to cache rather than fingerprint a file we can't read.
                 let digest = hash_file_contents(&path)?;
                 entries.insert(path, (1, digest));
+            } else {
+                // Non-regular entry (FIFO, socket, device, ...). Opening a FIFO
+                // for read blocks on a writer, so probing it just to build the
+                // cache key could hang skill loading / prompt building — a far
+                // wider open surface than the uncached loader, which only reads
+                // the manifest it parses. Never open it: decline to cache this
+                // directory and let the uncached path handle whatever it is.
+                return None;
             }
         }
     }
@@ -344,6 +354,43 @@ mod tests {
             calls.load(Ordering::SeqCst),
             2,
             "content change under identical mtime+length must re-audit"
+        );
+    }
+
+    // Audit-boundary regression (review of #7786, round 2): a FIFO (or other
+    // non-regular entry) inside a skills dir must never be opened while building
+    // the cache key — opening a FIFO for read blocks on a writer and would hang
+    // skill loading / prompt building. `dir_signature` must bail to `None` so the
+    // directory simply bypasses the cache. If this regresses, the test hangs.
+    #[cfg(unix)]
+    #[test]
+    fn non_regular_entry_bypasses_cache_without_hanging() {
+        invalidate();
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        write(&skills_dir, "alpha", "# Alpha\n");
+        let fifo = skills_dir.join("alpha/pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo should be available on unix test hosts");
+        assert!(status.success(), "mkfifo failed");
+
+        let calls = AtomicUsize::new(0);
+        let load = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Vec::<Skill>::new()
+        };
+
+        // Must return promptly (no hang) and, because the dir can't be signed,
+        // run the loader every time instead of caching.
+        cached_load(&skills_dir, false, "test", load);
+        cached_load(&skills_dir, false, "test", load);
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a directory containing a non-regular entry must bypass the cache"
         );
     }
 
