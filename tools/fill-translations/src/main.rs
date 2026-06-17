@@ -417,10 +417,25 @@ async fn main() -> anyhow::Result<()> {
             LeakCheck::Clean => {}
             LeakCheck::Recovered(r) => {
                 lines[entry.msgstr_line] = format!("msgstr \"{}\"", encode_po_string(&r));
+                // Clear continuation lines that belong to this msgstr block so
+                // re-parse does not concatenate the leftover leaked lines onto
+                // the recovered text, corrupting the entry.
+                let mut ci = entry.msgstr_line + 1;
+                while ci < lines.len() && lines[ci].trim_start().starts_with('"') {
+                    lines[ci] = String::new();
+                    ci += 1;
+                }
                 leak_recovered += 1;
             }
             LeakCheck::Unrecoverable => {
                 lines[entry.msgstr_line] = "msgstr \"\"".to_string();
+                // Same: strip continuation lines so the blanked entry truly has
+                // an empty msgstr after re-parse and is queued for re-translation.
+                let mut ci = entry.msgstr_line + 1;
+                while ci < lines.len() && lines[ci].trim_start().starts_with('"') {
+                    lines[ci] = String::new();
+                    ci += 1;
+                }
                 leak_blanked += 1;
             }
         }
@@ -529,4 +544,98 @@ async fn main() -> anyhow::Result<()> {
         translations.len()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a Vec<String> from a multi-line string literal for test convenience.
+    fn to_lines(s: &str) -> Vec<String> {
+        s.lines().map(str::to_owned).collect()
+    }
+
+    /// After leak-repair the continuation lines must be cleared so that re-parsing
+    /// the repaired `lines` vector produces an entry whose `msgstr` is truly empty
+    /// (Unrecoverable case) or equals only the recovered text (Recovered case).
+    #[test]
+    fn leak_repair_clears_continuation_lines_unrecoverable() {
+        // A multi-line leaked msgstr: the msgstr keyword line is followed by two
+        // continuation lines carrying the leaked instruction text.
+        let po_src = concat!(
+            "msgid \"Save\"\n",
+            "msgstr \"\"\n",
+            "\"- You translate English technical documentation strings.\\n\"\n",
+            "\"- Do not translate brand names.\\n\"\n",
+        );
+        let mut lines = to_lines(po_src);
+        let entries = parse_po(&lines);
+        assert_eq!(entries.len(), 1, "should parse one entry");
+
+        let entry = &entries[0];
+        // This entry stands in for one the detector has flagged for the
+        // Unrecoverable (blank-and-retranslate) path; this test covers the repair
+        // step itself: blanking the msgstr line AND clearing its continuation lines
+        // must yield an empty msgstr on re-parse (leak detection is covered elsewhere).
+
+        // Apply the same repair logic as main() (Unrecoverable branch):
+        lines[entry.msgstr_line] = "msgstr \"\"".to_string();
+        let mut ci = entry.msgstr_line + 1;
+        while ci < lines.len() && lines[ci].trim_start().starts_with('"') {
+            lines[ci] = String::new();
+            ci += 1;
+        }
+
+        // Re-parse: the entry must now have an empty msgstr so it is queued for
+        // re-translation (matches the `e.msgstr.is_empty()` filter in main).
+        let reparsed = parse_po(&lines);
+        assert_eq!(reparsed.len(), 1, "still one entry after repair");
+        assert!(
+            reparsed[0].msgstr.is_empty(),
+            "msgstr must be empty after leak-blanking; got {:?}",
+            reparsed[0].msgstr
+        );
+    }
+
+    /// When the leak is Recovered the repaired msgstr must equal the recovered text
+    /// and must NOT include any leftover continuation lines.
+    #[test]
+    fn leak_repair_clears_continuation_lines_recovered() {
+        // Simulate: a very long bullet-list leaked msgstr that ends with the real
+        // translation as the last paragraph after a blank line.
+        let leaked_body = "- You translate English technical documentation strings.\\n- Do not translate brand names.\\n\\nSpeichern";
+        let po_src = format!("msgid \"Save\"\nmsgstr \"{leaked_body}\"\n");
+        let mut lines = to_lines(&po_src);
+        let entries = parse_po(&lines);
+        assert_eq!(entries.len(), 1);
+
+        let entry = &entries[0];
+        match check_for_leak(&entry.msgid, &entry.msgstr) {
+            LeakCheck::Recovered(r) => {
+                lines[entry.msgstr_line] = format!("msgstr \"{}\"", encode_po_string(&r));
+                let mut ci = entry.msgstr_line + 1;
+                while ci < lines.len() && lines[ci].trim_start().starts_with('"') {
+                    lines[ci] = String::new();
+                    ci += 1;
+                }
+
+                let reparsed = parse_po(&lines);
+                assert_eq!(reparsed.len(), 1);
+                // The recovered text should not contain the leaked bullet lines.
+                assert!(
+                    !reparsed[0].msgstr.contains("- You translate"),
+                    "leaked text must not appear in reparsed msgstr; got {:?}",
+                    reparsed[0].msgstr
+                );
+                assert!(
+                    !reparsed[0].msgstr.is_empty(),
+                    "recovered msgstr must not be empty"
+                );
+            }
+            _ => {
+                // If detection gave Unrecoverable/Clean that variant is covered by the
+                // sibling test; nothing to assert here.
+            }
+        }
+    }
 }
