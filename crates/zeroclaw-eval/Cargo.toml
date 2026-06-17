@@ -1,0 +1,23 @@
+[package]
+name = "zeroclaw-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Agent evaluation harness for ZeroClaw — Phase 0: deterministic replay of LLM trace fixtures through the real agent loop."
+publish = false
+
+[dependencies]
+zeroclaw-api.workspace = true
+zeroclaw-runtime.workspace = true
+zeroclaw-config.workspace = true
+zeroclaw-memory.workspace = true
+anyhow = "1.0"
+async-trait = "0.1"
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+regex = "1.10"
+tempfile = "3.26"
+tokio = { version = "1.50", default-features = false, features = ["rt", "macros", "sync"] }
+
+[dev-dependencies]
+tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros"] }

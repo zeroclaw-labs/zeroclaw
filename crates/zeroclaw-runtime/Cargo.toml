@@ -108,10 +108,12 @@ sandbox-bubblewrap = []
 
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+encoding_rs = "0.8"
 rcgen = "0.13"
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 scopeguard = "1.2"
+filetime = "0.2"
 
 # Channel features (forwarded to zeroclaw-channels)
 
