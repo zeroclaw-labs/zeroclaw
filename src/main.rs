@@ -3280,9 +3280,10 @@ async fn main() -> Result<()> {
                     .unwrap_or("default");
                 match message {
                     Some(msg) => {
-                        let response = model_provider
-                            .simple_chat(&msg, model_name, Some(final_temperature))
-                            .await?;
+                        let response =
+                            zeroclaw_providers::ProviderDispatch::from_ref(&*model_provider)
+                                .simple_chat(&msg, model_name, Some(final_temperature))
+                                .await?;
                         println!("{response}");
                     }
                     None => {
@@ -3295,9 +3296,10 @@ async fn main() -> Result<()> {
                             if stdin.read_line(&mut line)? == 0 {
                                 break;
                             }
-                            let response = model_provider
-                                .simple_chat(line.trim(), model_name, Some(final_temperature))
-                                .await?;
+                            let response =
+                                zeroclaw_providers::ProviderDispatch::from_ref(&*model_provider)
+                                    .simple_chat(line.trim(), model_name, Some(final_temperature))
+                                    .await?;
                             println!("{response}");
                         }
                     }

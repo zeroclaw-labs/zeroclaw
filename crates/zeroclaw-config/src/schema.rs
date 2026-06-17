@@ -27550,6 +27550,53 @@ allowed_users = []
         }
     }
 
+    /// The dashboard's `/config/channels` global-settings tab filters the
+    /// canonical `prop_fields()` list down to direct `[channels]` fields.
+    /// Keep root settings such as `show_tool_calls` discoverable there without
+    /// mixing per-alias fields into the same editor.
+    #[test]
+    async fn channels_root_settings_stay_on_direct_prop_surface() {
+        let mut config = Config::default();
+        config.init_defaults(None);
+        config
+            .channels
+            .matrix
+            .insert("default".into(), MatrixConfig::default());
+
+        let paths: Vec<_> = config
+            .prop_fields()
+            .into_iter()
+            .map(|field| field.name)
+            .collect();
+        let direct_channel_paths: Vec<_> = paths
+            .iter()
+            .filter_map(|path| {
+                path.strip_prefix("channels.")
+                    .filter(|rest| !rest.contains('.'))
+                    .map(|_| path.as_str())
+            })
+            .collect();
+
+        assert!(
+            direct_channel_paths.contains(&"channels.show_tool_calls"),
+            "root [channels] settings should include show_tool_calls: {direct_channel_paths:?}"
+        );
+        assert!(
+            direct_channel_paths.contains(&"channels.ack_reactions"),
+            "root [channels] settings should include other global channel controls"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path == "channels.matrix.default.enabled"),
+            "fixture should include a nested channel alias field"
+        );
+        assert!(
+            !direct_channel_paths.contains(&"channels.matrix.default.enabled"),
+            "global channel settings must not include per-alias fields"
+        );
+    }
+
     /// Audit gate for RFC #6971 Phase 0: any credential-shaped property path
     /// that reaches the CLI/gateway/TUI property surface must have an explicit
     /// classification. This catches future config additions whose names imply

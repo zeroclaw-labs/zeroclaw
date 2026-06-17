@@ -23,6 +23,7 @@ pub mod bedrock;
 pub mod catalog;
 pub mod compatible;
 pub mod copilot;
+pub mod dispatch;
 pub mod factory;
 pub mod gemini;
 pub mod gemini_cli;
@@ -42,6 +43,7 @@ pub(crate) mod stream_guard;
 pub mod telnyx;
 pub mod traits;
 
+pub use dispatch::{ProviderDispatch, ProviderDispatchRef};
 #[allow(unused_imports)]
 pub use traits::{
     ChatMessage, ChatRequest, ChatResponse, ConversationMessage, ModelProvider,
