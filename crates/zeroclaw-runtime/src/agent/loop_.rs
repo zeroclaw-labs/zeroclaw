@@ -2966,10 +2966,10 @@ pub async fn process_message(
         }
 
         let effective_msg_ref = effective_message.as_str();
-        let runtime_capability_names = tools_registry
+        let runtime_capability_names: Vec<&str> = effective_tool_names
             .iter()
-            .map(|tool| tool.name())
-            .collect::<Vec<_>>();
+            .copied()
+            .collect();
         if let Some(suggestion) = crate::skills::render_missing_skill_install_suggestion(
             effective_msg_ref,
             &skills,
