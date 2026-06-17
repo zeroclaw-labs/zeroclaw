@@ -569,8 +569,8 @@ pub struct Config {
     /// Fluent `.ftl` locale files. Falls back to embedded English, then to
     /// hardcoded descriptions.
     ///
-    /// If omitted or empty, the locale is auto-detected from `ZEROCLAW_LOCALE`,
-    /// `LANG`, or `LC_ALL` environment variables (defaulting to `"en"`).
+    /// If omitted or empty, the locale is auto-detected from the host
+    /// system's locale (defaulting to `"en"` if that can't be determined).
     #[serde(default)]
     pub locale: Option<String>,
 
@@ -2762,6 +2762,31 @@ pub struct MorphModelProviderConfig {
     pub base: ModelProviderConfig,
 }
 
+// ── Manifest ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ManifestEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for ManifestEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://app.manifest.build/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.manifest"]
+pub struct ManifestModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
 // ── GitHub Models ──
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -3175,6 +3200,7 @@ impl_default_family_endpoint! {
     OsaurusModelProviderConfig,
     LitellmModelProviderConfig,
     LeptonModelProviderConfig,
+    ManifestModelProviderConfig,
     MorphModelProviderConfig,
     GithubModelsModelProviderConfig,
     UpstageModelProviderConfig,
@@ -6072,6 +6098,14 @@ fn default_false() -> bool {
     false
 }
 
+fn default_memory_backend() -> String {
+    "sqlite".into()
+}
+
+fn default_tunnel_provider() -> String {
+    "none".into()
+}
+
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
@@ -6583,10 +6617,10 @@ impl Default for BrowserConfig {
 #[prefix = "http_request"]
 pub struct HttpRequestConfig {
     /// Enable `http_request` tool for API interactions
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Allowed domains for HTTP requests (exact or subdomain match)
-    #[serde(default)]
+    #[serde(default = "default_allowed_domains_star")]
     pub allowed_domains: Vec<String>,
     /// Maximum response size in bytes (default: 1MB, 0 = unlimited)
     #[serde(default = "default_http_max_response_size")]
@@ -6632,6 +6666,10 @@ fn default_http_timeout_secs() -> u64 {
     30
 }
 
+fn default_allowed_domains_star() -> Vec<String> {
+    vec!["*".into()]
+}
+
 // ── Web fetch ────────────────────────────────────────────────────
 
 /// Web fetch tool configuration (`[web_fetch]` section).
@@ -6645,7 +6683,7 @@ fn default_http_timeout_secs() -> u64 {
 #[prefix = "web_fetch"]
 pub struct WebFetchConfig {
     /// Enable `web_fetch` tool for fetching web page content
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Allowed domains for web fetch (exact or subdomain match; `["*"]` = all public hosts)
     #[serde(default = "default_web_fetch_allowed_domains")]
@@ -6884,7 +6922,7 @@ pub struct EscalationConfig {
 #[prefix = "web_search"]
 pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), "searxng" (self-hosted), or "jina" (requires API key)
     #[serde(default = "default_web_search_provider")]
@@ -9488,6 +9526,7 @@ pub struct MemoryConfig {
     /// `Config.storage.<backend>.<alias>` at runtime. Bare backend names
     /// (`"sqlite"`) are treated as `"<backend>.default"`. Set to `"none"` to
     /// disable persistence entirely.
+    #[serde(default = "default_memory_backend")]
     pub backend: String,
     /// Auto-save what *you* tell ZeroClaw into memory as conversation history — the agent's own replies are not saved. Turn off if you want memory to only hold things you explicitly record via the memory tool.
     #[serde(default = "default_auto_save")]
@@ -9501,9 +9540,15 @@ pub struct MemoryConfig {
     /// Delete archived files permanently after this many days. Set high if you need long-term history; set low for privacy / disk-space reasons.
     #[serde(default = "default_purge_after_days")]
     pub purge_after_days: u32,
-    /// For the sqlite backend only — drop conversation rows older than this many days to keep the DB lean. Doesn't touch core memories or notes.
+    /// Delete conversation rows older than this many days from the DB (sqlite backend only). Age is measured by `updated_at` (last write time). 0 = keep forever.
     #[serde(default = "default_conversation_retention_days")]
     pub conversation_retention_days: u32,
+    /// Delete daily memory rows older than this many days from the DB. Age is measured by `updated_at` (last write time). 0 = keep forever.
+    #[serde(default = "default_zero_retention")]
+    pub daily_retention_days: u32,
+    /// Delete core memory rows older than this many days from the DB. Age is measured by `created_at` (first-write time). Neither recall nor ordinary rewrites refresh `created_at` under the current SQLite upsert, so core retention is an absolute age limit from first write. Set this to a generously large window for durable core memories, or keep 0 = keep forever.
+    #[serde(default = "default_zero_retention")]
+    pub core_retention_days: u32,
     /// Source of embedding vectors for semantic search. `none` = keyword-only retrieval (no API calls, no vector cost); `openai` = OpenAI's embedding API; `custom:URL` = any OpenAI-compatible embedding endpoint (LiteLLM, local gateway, etc.).
     #[serde(default = "default_embedding_provider")]
     pub embedding_provider: String,
@@ -9662,6 +9707,9 @@ fn default_purge_after_days() -> u32 {
 fn default_conversation_retention_days() -> u32 {
     30
 }
+fn default_zero_retention() -> u32 {
+    0
+}
 fn default_embedding_model() -> String {
     "text-embedding-3-small".into()
 }
@@ -9703,6 +9751,8 @@ impl Default for MemoryConfig {
             archive_after_days: default_archive_after_days(),
             purge_after_days: default_purge_after_days(),
             conversation_retention_days: default_conversation_retention_days(),
+            daily_retention_days: default_zero_retention(),
+            core_retention_days: default_zero_retention(),
             embedding_provider: default_embedding_provider(),
             embedding_model: default_embedding_model(),
             embedding_dimensions: default_embedding_dims(),
@@ -9934,6 +9984,7 @@ pub struct HooksConfig {
     ///
     /// Hooks run in-process with the same privileges as the main runtime.
     /// Keep enabled hook handlers narrowly scoped and auditable.
+    #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
     #[nested]
@@ -9954,6 +10005,7 @@ impl Default for HooksConfig {
 #[prefix = "hooks.builtin"]
 pub struct BuiltinHooksConfig {
     /// Enable the command-logger hook (logs tool calls for auditing).
+    #[serde(default)]
     pub command_logger: bool,
     /// Configuration for the webhook-audit hook.
     ///
@@ -10998,6 +11050,7 @@ impl Default for AcpConfig {
 #[prefix = "tunnel"]
 pub struct TunnelConfig {
     /// How the gateway gets exposed to the public internet so webhooks (Telegram, Slack, etc.) can reach it. `none` = keep it local, no tunnel; `cloudflare` = Cloudflare Tunnel via cloudflared (needs a Zero Trust account and token); `tailscale` = Tailscale Funnel/Serve (tailnet-only or public, no account beyond tailscale); `ngrok` = ngrok agent with auth token; `openvpn` = bring-your-own OpenVPN egress; `pinggy` = Pinggy SSH tunnels (quick one-shot URLs); `custom` = run an arbitrary command you define under `[tunnel.custom]`.
+    #[serde(default = "default_tunnel_provider")]
     pub tunnel_provider: String,
 
     /// Cloudflare Tunnel configuration (used when `tunnel_provider = "cloudflare"`).
@@ -11992,13 +12045,24 @@ pub struct SlackConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
-    /// Slack bot OAuth token (xoxb-...).
+    /// Slack bot OAuth token (xoxb-...). Optional in config: when unset or
+    /// empty it is resolved at channel construction from
+    /// `ZEROCLAW_SLACK_BOT_TOKEN`, then `SLACK_BOT_TOKEN`. `#[serde(default)]`
+    /// so a config that omits it still deserializes - the env fallback then
+    /// supplies it - instead of failing with `missing field 'bot_token'`.
+    /// See #6844 / #6237.
     #[secret]
+    #[serde(default)]
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub bot_token: String,
-    /// Slack app-level token for Socket Mode (xapp-...).
+    pub bot_token: Option<String>,
+    /// Slack app-level token for Socket Mode (xapp-...). When unset or empty,
+    /// resolved at channel construction from `ZEROCLAW_SLACK_APP_TOKEN`, then
+    /// `SLACK_APP_TOKEN`. `#[serde(default)]` makes omission explicit (an
+    /// `Option` field is already omittable, but this keeps it consistent with
+    /// `bot_token`).
     #[secret]
+    #[serde(default)]
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub app_token: Option<String>,
@@ -12091,6 +12155,50 @@ impl ChannelConfig for SlackConfig {
     fn desc() -> &'static str {
         "connect your bot"
     }
+}
+
+impl SlackConfig {
+    /// Resolve the effective Slack bot token: the configured `bot_token` when
+    /// set and non-empty, else the `ZEROCLAW_SLACK_BOT_TOKEN` env var, else
+    /// `SLACK_BOT_TOKEN`. Returns `None` when none is available. Resolving here
+    /// (rather than writing the env value back into the config struct) keeps an
+    /// env-supplied secret out of any config that might later be persisted to
+    /// disk. See #6844 / #6237.
+    pub fn resolved_bot_token(&self) -> Option<String> {
+        resolve_slack_token(self.bot_token.as_deref(), "BOT")
+    }
+
+    /// Resolve the effective Slack app-level (Socket Mode) token: configured
+    /// `app_token` when set and non-empty, else `ZEROCLAW_SLACK_APP_TOKEN`,
+    /// else `SLACK_APP_TOKEN`. Returns `None` when none is available.
+    pub fn resolved_app_token(&self) -> Option<String> {
+        resolve_slack_token(self.app_token.as_deref(), "APP")
+    }
+}
+
+/// Shared token resolution for [`SlackConfig`]: a non-empty configured value
+/// wins; otherwise the `ZEROCLAW_SLACK_<KIND>_TOKEN` env var takes precedence
+/// over the conventional `SLACK_<KIND>_TOKEN`. Blank values (config or env) are
+/// treated as absent. `kind` is `"BOT"` or `"APP"`.
+fn resolve_slack_token(configured: Option<&str>, kind: &str) -> Option<String> {
+    if let Some(value) = configured {
+        let value = value.trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    for var in [
+        format!("ZEROCLAW_SLACK_{kind}_TOKEN"),
+        format!("SLACK_{kind}_TOKEN"),
+    ] {
+        if let Ok(value) = std::env::var(&var) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Mattermost bot channel configuration.
@@ -18837,6 +18945,7 @@ mod tests {
         assert!(both.validate().is_ok());
     }
     use super::*;
+    #[cfg(unix)]
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -18847,11 +18956,13 @@ mod tests {
     use tokio::sync::MutexGuard;
     use tokio::test;
 
+    #[cfg(unix)]
     struct EnvValueGuard {
         key: &'static str,
         previous: Option<OsString>,
     }
 
+    #[cfg(unix)]
     impl EnvValueGuard {
         fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
             let previous = std::env::var_os(key);
@@ -18868,6 +18979,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for EnvValueGuard {
         fn drop(&mut self) {
             // SAFETY: tests that mutate env vars serialize on env_override_lock().
@@ -22374,6 +22486,91 @@ default_temperature = 0.7
         // module serialize against `env_overrides::tests` too. Without
         // this, tests across the two modules race on `ZEROCLAW_*` vars.
         crate::env_overrides::env_test_lock().await
+    }
+
+    #[test]
+    async fn slack_config_deserializes_without_bot_token() {
+        // Regression for #6844 / #6237: before `bot_token` became
+        // `Option<String>` + `#[serde(default)]`, a config that omitted it
+        // failed to deserialize with `missing field 'bot_token'`, aborting
+        // startup before the env-var fallback could ever run.
+        let parsed: SlackConfig = toml::from_str("enabled = true\n")
+            .expect("SlackConfig must deserialize without bot_token");
+        assert!(parsed.bot_token.is_none());
+    }
+
+    #[test]
+    async fn slack_config_deserializes_explicit_bot_token() {
+        let parsed: SlackConfig =
+            toml::from_str("enabled = true\nbot_token = \"xoxb-from-toml\"\n").unwrap();
+        assert_eq!(parsed.bot_token.as_deref(), Some("xoxb-from-toml"));
+    }
+
+    /// Set (`Some`) or clear (`None`) an env var. Callers must hold
+    /// `env_override_lock()`. Used to snapshot-and-restore the Slack token
+    /// vars so these tests leave the process environment exactly as found.
+    fn set_or_clear_env(key: &str, value: Option<&str>) {
+        // SAFETY: callers serialize on env_override_lock().
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    async fn slack_resolved_bot_token_falls_back_to_env() {
+        let _env_guard = env_override_lock().await;
+        let prev_bot = std::env::var("SLACK_BOT_TOKEN").ok();
+        let prev_zc = std::env::var("ZEROCLAW_SLACK_BOT_TOKEN").ok();
+        set_or_clear_env("ZEROCLAW_SLACK_BOT_TOKEN", None);
+        set_or_clear_env("SLACK_BOT_TOKEN", Some("xoxb-from-env"));
+
+        let cfg = SlackConfig {
+            bot_token: None,
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolved_bot_token().as_deref(), Some("xoxb-from-env"));
+
+        set_or_clear_env("SLACK_BOT_TOKEN", prev_bot.as_deref());
+        set_or_clear_env("ZEROCLAW_SLACK_BOT_TOKEN", prev_zc.as_deref());
+    }
+
+    #[test]
+    async fn slack_resolved_bot_token_prefers_zeroclaw_prefix() {
+        let _env_guard = env_override_lock().await;
+        let prev_bot = std::env::var("SLACK_BOT_TOKEN").ok();
+        let prev_zc = std::env::var("ZEROCLAW_SLACK_BOT_TOKEN").ok();
+        set_or_clear_env("SLACK_BOT_TOKEN", Some("xoxb-generic"));
+        set_or_clear_env("ZEROCLAW_SLACK_BOT_TOKEN", Some("xoxb-zeroclaw"));
+
+        let cfg = SlackConfig {
+            bot_token: None,
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolved_bot_token().as_deref(), Some("xoxb-zeroclaw"));
+
+        set_or_clear_env("SLACK_BOT_TOKEN", prev_bot.as_deref());
+        set_or_clear_env("ZEROCLAW_SLACK_BOT_TOKEN", prev_zc.as_deref());
+    }
+
+    #[test]
+    async fn slack_resolved_bot_token_prefers_config_over_env() {
+        let _env_guard = env_override_lock().await;
+        let prev_bot = std::env::var("SLACK_BOT_TOKEN").ok();
+        set_or_clear_env("SLACK_BOT_TOKEN", Some("xoxb-from-env"));
+
+        let cfg = SlackConfig {
+            bot_token: Some("xoxb-from-config".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.resolved_bot_token().as_deref(),
+            Some("xoxb-from-config")
+        );
+
+        set_or_clear_env("SLACK_BOT_TOKEN", prev_bot.as_deref());
     }
 
     #[test]
@@ -28820,5 +29017,65 @@ model_provider = \"ollama.default\"
         let agent = cfg.agents.get("legacy").expect("agent present");
         assert!(agent.delegate_same_risk_profile, "default must be true");
         assert!(agent.delegates.is_empty(), "default must be empty");
+    }
+
+    // ── Serde-default vs struct-Default drift guards ──────────────
+    //
+    // The save path prunes fields whose value equals serde's default.
+    // If `#[serde(default)]` and `impl Default` disagree, a save →
+    // load round-trip silently flips the field to the serde default,
+    // which is #7498.  These tests catch that drift: an empty TOML
+    // table (the extreme case of pruning — all fields pruned away)
+    // must deserialize to the same value as the struct's `Default`.
+
+    #[test]
+    async fn empty_table_round_trips_to_http_request_config_default() {
+        let from_empty: HttpRequestConfig = toml::from_str("").unwrap();
+        let default = HttpRequestConfig::default();
+        assert_eq!(from_empty.enabled, default.enabled);
+        assert_eq!(from_empty.allowed_domains, default.allowed_domains);
+        assert_eq!(from_empty.max_response_size, default.max_response_size);
+    }
+
+    #[test]
+    async fn empty_table_round_trips_to_web_fetch_config_default() {
+        let from_empty: WebFetchConfig = toml::from_str("").unwrap();
+        let default = WebFetchConfig::default();
+        assert_eq!(from_empty.enabled, default.enabled);
+    }
+
+    #[test]
+    async fn empty_table_round_trips_to_web_search_config_default() {
+        let from_empty: WebSearchConfig = toml::from_str("").unwrap();
+        let default = WebSearchConfig::default();
+        assert_eq!(from_empty.enabled, default.enabled);
+    }
+
+    #[test]
+    async fn empty_table_round_trips_to_memory_config_default() {
+        let from_empty: MemoryConfig = toml::from_str("").unwrap();
+        let default = MemoryConfig::default();
+        assert_eq!(from_empty.backend, default.backend);
+    }
+
+    #[test]
+    async fn empty_table_round_trips_to_tunnel_config_default() {
+        let from_empty: TunnelConfig = toml::from_str("").unwrap();
+        let default = TunnelConfig::default();
+        assert_eq!(from_empty.tunnel_provider, default.tunnel_provider);
+    }
+
+    #[test]
+    async fn empty_table_round_trips_to_hooks_config_default() {
+        let from_empty: HooksConfig = toml::from_str("").unwrap();
+        let default = HooksConfig::default();
+        assert_eq!(from_empty.enabled, default.enabled);
+    }
+
+    #[test]
+    async fn empty_table_round_trips_to_builtin_hooks_config_default() {
+        let from_empty: BuiltinHooksConfig = toml::from_str("").unwrap();
+        let default = BuiltinHooksConfig::default();
+        assert_eq!(from_empty.command_logger, default.command_logger);
     }
 }

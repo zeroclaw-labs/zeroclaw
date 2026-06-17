@@ -5753,10 +5753,17 @@ fn build_channel_by_id(
                 Arc::new(move || cfg_arc.read().channel_external_peers("slack", &alias))
             };
             let workspace_dir = one_shot_channel_workspace_dir(&config, "slack", &alias);
+            let bot_token = sl.resolved_bot_token().with_context(|| {
+                format!(
+                    "Slack channel '{alias}': bot_token is not set. Provide it in config \
+                     (channels.slack.{alias}.bot_token) or via the \
+                     ZEROCLAW_SLACK_BOT_TOKEN / SLACK_BOT_TOKEN environment variable."
+                )
+            })?;
             Ok(Arc::new(
                 SlackChannel::new(
-                    sl.bot_token.clone(),
-                    sl.app_token.clone(),
+                    bot_token,
+                    sl.resolved_app_token(),
                     sl.channel_ids.clone(),
                     alias,
                     peer_resolver,
@@ -6817,14 +6824,33 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_external_peers("slack", &alias))
         };
+        let Some(bot_token) = sl.resolved_bot_token() else {
+            // `collect_configured_channels` returns `Vec<ConfiguredChannel>`
+            // (not `Result`) and is fail-soft by contract - one misconfigured
+            // channel must not abort startup for every other channel. So an
+            // enabled-but-tokenless Slack channel is skipped, but logged at
+            // ERROR (an operator's enabled channel failed to come up) with the
+            // alias and the exact env vars to set. The single-channel paths
+            // (`build_channel_by_id`, `deliver_announcement`) instead return a
+            // hard error, because there the caller requested that one channel.
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "alias": alias.clone() })),
+                "Slack channel skipped: bot_token not set in config or via \
+                 ZEROCLAW_SLACK_BOT_TOKEN / SLACK_BOT_TOKEN env"
+            );
+            continue;
+        };
         channels.push(ConfiguredChannel {
             display_name: "Slack",
             alias: Some(alias.clone()),
             channel: crate::paced_channel::PacedChannel::wrap(
                 Arc::new(
                     SlackChannel::new(
-                        sl.bot_token.clone(),
-                        sl.app_token.clone(),
+                        bot_token,
+                        sl.resolved_app_token(),
                         sl.channel_ids.clone(),
                         alias.clone(),
                         peer_resolver,
@@ -8765,6 +8791,7 @@ pub async fn start_channels(
             agent.resolved.compact_context,
             agent.resolved.max_system_prompt_chars,
             true,
+            config.channels.show_tool_calls,
         );
         if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
@@ -9332,9 +9359,16 @@ pub async fn deliver_announcement(
             let peers = config.channel_external_peers("slack", alias);
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
+            let bot_token = sl.resolved_bot_token().with_context(|| {
+                format!(
+                    "Slack channel '{alias}': bot_token is not set. Provide it in config \
+                     (channels.slack.{alias}.bot_token) or via the \
+                     ZEROCLAW_SLACK_BOT_TOKEN / SLACK_BOT_TOKEN environment variable."
+                )
+            })?;
             let ch = SlackChannel::new(
-                sl.bot_token.clone(),
-                sl.app_token.clone(),
+                bot_token,
+                sl.resolved_app_token(),
                 sl.channel_ids.clone(),
                 alias,
                 peer_resolver,
@@ -15373,6 +15407,7 @@ BTC is currently around $65,000 based on latest tool output."#
             false,
             0,
             false,
+            false,
         );
         if expose_text_protocol {
             let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
@@ -15715,6 +15750,7 @@ BTC is currently around $65,000 based on latest tool output."#
             false,
             0,
             false,
+            false,
         );
 
         assert!(
@@ -15746,6 +15782,7 @@ BTC is currently around $65,000 based on latest tool output."#
             zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             false,
             0,
+            false,
             false,
         );
 

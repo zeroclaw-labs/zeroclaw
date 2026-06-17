@@ -1489,6 +1489,7 @@ pub async fn run(
                 eff_compact_context,
                 eff_max_system_prompt_chars,
                 true,
+                config.channels.show_tool_calls,
             );
 
         // Append structured tool-use instructions with schemas (only for non-native model_providers)
@@ -2912,6 +2913,7 @@ pub async fn process_message(
                 eff_compact_context,
                 eff_max_system_prompt_chars,
                 false,
+                config.channels.show_tool_calls,
             );
         if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
@@ -3611,6 +3613,44 @@ mod tests {
         )
         .await
         .expect("suffix alias should execute the unique activated tool");
+
+        assert!(outcome.success);
+        assert_eq!(outcome.output, "counted:ok");
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_recovers_poisoned_activated_tool_lock() {
+        let observer = NoopObserver;
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let activated = Arc::new(std::sync::Mutex::new(crate::tools::ActivatedToolSet::new()));
+        let activated_tool: Arc<dyn Tool> = Arc::new(CountingTool::new(
+            "docker-mcp__extract_text",
+            Arc::clone(&invocations),
+        ));
+        activated
+            .lock()
+            .unwrap()
+            .activate("docker-mcp__extract_text".into(), activated_tool);
+        let poisoned = Arc::clone(&activated);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().expect("test mutex should lock");
+            panic!("poison activated-tools lock");
+        })
+        .join();
+
+        let outcome = execute_one_tool(
+            "extract_text",
+            serde_json::json!({ "value": "ok" }),
+            None,
+            &[],
+            Some(&activated),
+            &observer,
+            None,
+            None,
+        )
+        .await
+        .expect("poisoned activated-tools lock should recover for read");
 
         assert!(outcome.success);
         assert_eq!(outcome.output, "counted:ok");
