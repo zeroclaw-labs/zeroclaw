@@ -45,6 +45,11 @@ pub struct DiscordChannel {
     /// lifecycle exactly: config reloads rebuild channels, which re-derives
     /// the mask.
     intents_mask_override: Option<u64>,
+    /// Which inbound reactions to record (config `reaction_notifications`).
+    /// Anything other than `Off` adds the two reaction intents to the
+    /// IDENTIFY mask. Same connection-scoped snapshot semantics as the
+    /// mask override above.
+    reaction_scope: zeroclaw_config::schema::DiscordReactionScope,
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
@@ -95,11 +100,6 @@ pub struct DiscordChannel {
     /// Resolves skill-derived commands to register alongside `/ask`.
     /// `None` (or an empty resolution) = `/ask` only.
     slash_command_resolver: Option<DiscordSlashCommandResolver>,
-    /// Fingerprint of the last *successfully* reconciled command set —
-    /// READYs with an unchanged set skip the REST round-trip; failures
-    /// reset it so the next READY retries instead of wedging. Arc'd
-    /// because reconciliation runs in a spawned task.
-    registered_commands_hash: Arc<Mutex<Option<u64>>>,
 }
 
 /// Credentials needed to answer a deferred interaction later: the followup
@@ -161,6 +161,7 @@ impl DiscordChannel {
             listen_to_bots,
             mention_only,
             intents_mask_override: None,
+            reaction_scope: zeroclaw_config::schema::DiscordReactionScope::Off,
             typing_handles: Mutex::new(HashMap::new()),
             proxy_url: None,
             transcription: None,
@@ -180,7 +181,6 @@ impl DiscordChannel {
             slash_commands: false,
             pending_interactions: Arc::new(Mutex::new(HashMap::new())),
             slash_command_resolver: None,
-            registered_commands_hash: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -211,13 +211,28 @@ impl DiscordChannel {
         self
     }
 
+    /// Record inbound reaction events at the given scope. Anything other
+    /// than `Off` adds the (unprivileged) reaction intents to the IDENTIFY
+    /// mask.
+    pub fn with_reaction_notifications(
+        mut self,
+        scope: zeroclaw_config::schema::DiscordReactionScope,
+    ) -> Self {
+        self.reaction_scope = scope;
+        self
+    }
+
     /// Gateway intent mask for IDENTIFY: the raw `intents_mask` override
-    /// when set, otherwise the fixed baseline.
+    /// when set, otherwise the fixed baseline plus feature-implied intents.
     fn gateway_intents(&self) -> u64 {
         if let Some(mask) = self.intents_mask_override {
             return mask;
         }
-        BASELINE_INTENTS
+        let mut mask = BASELINE_INTENTS;
+        if self.reaction_scope != zeroclaw_config::schema::DiscordReactionScope::Off {
+            mask |= INTENT_GUILD_MESSAGE_REACTIONS | INTENT_DIRECT_MESSAGE_REACTIONS;
+        }
+        mask
     }
 
     pub fn with_approval_timeout_secs(mut self, secs: u64) -> Self {
@@ -489,6 +504,166 @@ impl DiscordChannel {
         let updated = format!("{base}{marker}");
         self.restore_archived_entry(archive_mem, &key, &updated, &existing)
             .await;
+    }
+
+    /// Record (or un-record) an inbound reaction event according to
+    /// `reaction_scope`. Reactions land in the archive sidecar under a
+    /// `discord_reaction_{message}_{user}_{emoji}` key so `discord_search`
+    /// finds them; a MESSAGE_REACTION_REMOVE forgets the same key. The bot's
+    /// own reactions (ack/failure emoji) echo back as gateway events and are
+    /// skipped, as are reactors outside the peer allowlist and events outside
+    /// the guild/channel allowlists. Reactions from *other* bots are recorded
+    /// (deliberately not gated by `listen_to_bots` — the peer allowlist
+    /// already governs who is recorded at all).
+    ///
+    /// The key uses the custom emoji `id` when present (stable across guild
+    /// renames; unicode emoji have no id and key by the glyph). The
+    /// human-readable name only appears in the entry content.
+    ///
+    /// Scope `Own` keys off `message_author_id`, which Discord includes on
+    /// MESSAGE_REACTION_ADD only — REMOVE events skip the author gate and
+    /// rely on the key existence check `forget` performs anyway: a reaction
+    /// that was never recorded can't be un-recorded.
+    async fn handle_reaction_event(
+        &self,
+        event_type: &str,
+        d: &serde_json::Value,
+        bot_user_id: &str,
+    ) {
+        use zeroclaw_config::schema::DiscordReactionScope;
+
+        let user_id = d.get("user_id").and_then(|u| u.as_str()).unwrap_or("");
+        let message_id = d.get("message_id").and_then(|m| m.as_str()).unwrap_or("");
+        let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("");
+        if user_id.is_empty() || message_id.is_empty() {
+            return;
+        }
+        // Our own ack/failure reactions arrive back as events — never record them.
+        if user_id == bot_user_id {
+            return;
+        }
+        if !self.is_user_allowed(user_id) {
+            return;
+        }
+        if !self.guild_ids.is_empty()
+            && let Some(g) = d.get("guild_id").and_then(serde_json::Value::as_str)
+            && !self.guild_ids.iter().any(|allowed| allowed == g)
+        {
+            return;
+        }
+        if !self.channel_ids.is_empty() {
+            let parent_id =
+                if !channel_id.is_empty() && !self.channel_ids.iter().any(|c| c == channel_id) {
+                    self.thread_parent(&self.http_client(), channel_id).await
+                } else {
+                    None
+                };
+            if !channel_passes_filter(&self.channel_ids, channel_id, parent_id.as_deref()) {
+                return;
+            }
+        }
+
+        // Key identity: custom-emoji `id` first — names are mutable guild
+        // state (rename/delete between ADD and REMOVE would orphan the
+        // entry, and two same-named emoji would collide). Unicode emoji have
+        // no id and key by the glyph itself.
+        let emoji_key = d.get("emoji").and_then(|e| {
+            e.get("id")
+                .and_then(|i| i.as_str())
+                .or_else(|| e.get("name").and_then(|n| n.as_str()))
+        });
+        let Some(emoji_key) = emoji_key else {
+            // Neither id nor name — nothing meaningful to record or forget.
+            return;
+        };
+        let emoji_display = d
+            .get("emoji")
+            .and_then(|e| e.get("name").and_then(|n| n.as_str()))
+            .unwrap_or(emoji_key);
+        let key = format!("discord_reaction_{message_id}_{user_id}_{emoji_key}");
+
+        let Some(ref archive_mem) = self.archive_memory else {
+            // Nowhere to record without the archive sidecar; still useful in
+            // the trace for live diagnostics.
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "event_type": event_type,
+                        "emoji": emoji_display,
+                        "message_id": message_id,
+                    })),
+                "discord reaction event (archive disabled, not recorded)"
+            );
+            return;
+        };
+
+        if event_type == "MESSAGE_REACTION_REMOVE" {
+            // A failed forget leaves the same stale entry a missed event
+            // would — log it like the store path does.
+            if let Err(e) = archive_mem.forget(&key).await {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error": format!("{e}"),
+                            "key": key,
+                        })),
+                    "failed to forget archived discord reaction"
+                );
+            }
+            return;
+        }
+
+        // Scope `Own`: only reactions to the bot's own messages.
+        if self.reaction_scope == DiscordReactionScope::Own {
+            let message_author = d
+                .get("message_author_id")
+                .and_then(|a| a.as_str())
+                .unwrap_or("");
+            if message_author != bot_user_id {
+                return;
+            }
+        }
+
+        let username = d
+            .get("member")
+            .and_then(|m| m.get("user"))
+            .and_then(|u| u.get("username"))
+            .and_then(|n| n.as_str())
+            .unwrap_or(user_id);
+        let is_dm_event = d.get("guild_id").is_none();
+        let channel_display = if is_dm_event { "dm" } else { channel_id };
+        let ts = chrono::Utc::now().to_rfc3339();
+        let content = format!(
+            "@{username} reacted {emoji_display} to message {message_id} in #{channel_display} at {ts}"
+        );
+        let session = if channel_id.is_empty() {
+            None
+        } else {
+            Some(channel_id)
+        };
+        if let Err(e) = archive_mem
+            .store(
+                &key,
+                &content,
+                zeroclaw_memory::MemoryCategory::Custom("discord".to_string()),
+                session,
+            )
+            .await
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "error": format!("{e}"),
+                        "key": key,
+                    })),
+                "failed to archive discord reaction"
+            );
+        }
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -1626,6 +1801,25 @@ fn command_projection(cmd: &serde_json::Value) -> serde_json::Value {
 /// Discord REST base; injectable in `reconcile_slash_commands` for tests.
 const DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 
+/// Outcome of a slash-command reconcile pass.
+#[derive(Debug)]
+enum ReconcileOutcome {
+    /// The command set was reconciled (or was already current).
+    Reconciled,
+    /// Discord rate-limited the pass; the caller must persist this cooldown and
+    /// not retry until the given unix-seconds deadline.
+    RateLimited { until: i64 },
+}
+
+/// Turn a `429` response into a unix-seconds deadline before which no further
+/// reconcile should run, reading Discord's `retry_after` body / headers.
+async fn rate_limit_deadline(resp: reqwest::Response) -> i64 {
+    let now = crate::discord_slash_state::now_unix();
+    let headers = resp.headers().clone();
+    let body = resp.json::<serde_json::Value>().await.ok();
+    crate::discord_slash_state::retry_after_deadline(&headers, body.as_ref(), now)
+}
+
 /// Reconcile the application's global commands with the desired set:
 /// upsert each desired command (POST upserts by name) and delete stale
 /// skill-shaped commands left over from uninstalled skills. Commands
@@ -1645,7 +1839,7 @@ async fn reconcile_slash_commands(
     app_id: &str,
     desired: &serde_json::Value,
     api_base: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ReconcileOutcome> {
     let base = format!("{api_base}/applications/{app_id}/commands");
     let auth = format!("Bot {bot_token}");
     let Some(desired) = desired.as_array() else {
@@ -1667,6 +1861,11 @@ async fn reconcile_slash_commands(
         .send()
         .await
         .map_err(reqwest::Error::without_url)?;
+    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Ok(ReconcileOutcome::RateLimited {
+            until: rate_limit_deadline(resp).await,
+        });
+    }
     if !resp.status().is_success() {
         anyhow::bail!("listing global commands failed ({})", resp.status());
     }
@@ -1731,6 +1930,19 @@ async fn reconcile_slash_commands(
             .send()
             .await
             .map_err(reqwest::Error::without_url)?;
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            // Stop on the first 429 and surface the cooldown rather than
+            // hammering the remaining upserts into the same rate limit.
+            let until = rate_limit_deadline(resp).await;
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"command": name, "retry_after_until": until})),
+                "discord slash command reconcile rate-limited; backing off"
+            );
+            return Ok(ReconcileOutcome::RateLimited { until });
+        }
         if !resp.status().is_success() {
             let status = resp.status();
             let err = resp.text().await.unwrap_or_default();
@@ -1752,7 +1964,7 @@ async fn reconcile_slash_commands(
              reconcile not recorded, next READY retries"
         );
     }
-    Ok(())
+    Ok(ReconcileOutcome::Reconciled)
 }
 
 /// Acknowledge an interaction within Discord's 3-second window with a
@@ -2281,7 +2493,9 @@ const INTENT_GUILDS: u64 = 1 << 0;
 const INTENT_GUILD_MEMBERS: u64 = 1 << 1; // privileged
 const INTENT_GUILD_PRESENCES: u64 = 1 << 8; // privileged
 const INTENT_GUILD_MESSAGES: u64 = 1 << 9;
+const INTENT_GUILD_MESSAGE_REACTIONS: u64 = 1 << 10;
 const INTENT_DIRECT_MESSAGES: u64 = 1 << 12;
+const INTENT_DIRECT_MESSAGE_REACTIONS: u64 = 1 << 13;
 const INTENT_MESSAGE_CONTENT: u64 = 1 << 15; // privileged
 
 /// The intents every Discord channel needs: guild topology plus guild/DM
@@ -2296,12 +2510,14 @@ const BASELINE_INTENTS: u64 =
 /// `intents_mask` override) are reported as one hex remainder entry rather
 /// than silently dropped.
 fn intent_names(mask: u64) -> Vec<String> {
-    let known: [(u64, &str); 6] = [
+    let known: [(u64, &str); 8] = [
         (INTENT_GUILDS, "guilds"),
         (INTENT_GUILD_MEMBERS, "guild_members"),
         (INTENT_GUILD_PRESENCES, "guild_presences"),
         (INTENT_GUILD_MESSAGES, "guild_messages"),
+        (INTENT_GUILD_MESSAGE_REACTIONS, "guild_message_reactions"),
         (INTENT_DIRECT_MESSAGES, "direct_messages"),
+        (INTENT_DIRECT_MESSAGE_REACTIONS, "direct_message_reactions"),
         (INTENT_MESSAGE_CONTENT, "message_content"),
     ];
     let mut names = Vec::new();
@@ -2806,7 +3022,7 @@ impl Channel for DiscordChannel {
                                     let client = self.http_client();
                                     let bot_token = self.bot_token.clone();
                                     let resolver = self.slash_command_resolver.clone();
-                                    let hash_store = Arc::clone(&self.registered_commands_hash);
+                                    let workspace_dir = self.workspace_dir.clone();
                                     zeroclaw_spawn::spawn!(async move {
                                         let specs = match resolver {
                                             Some(resolve) => {
@@ -2832,21 +3048,38 @@ impl Channel for DiscordChannel {
                                             body.to_string().hash(&mut h);
                                             h.finish()
                                         };
-                                        // Skip only when the set matches the
-                                        // last *successful* reconcile —
-                                        // failures reset the fingerprint so
-                                        // the next READY retries.
-                                        if *hash_store.lock() == Some(fingerprint) {
+                                        use crate::discord_slash_state::SlashReconcileState;
+                                        let now = crate::discord_slash_state::now_unix();
+                                        let state =
+                                            SlashReconcileState::load(workspace_dir.as_deref(), &app_id);
+                                        // Honour a persisted rate-limit cooldown across restarts: a
+                                        // 429'd reconcile must not re-hammer Discord on the next READY.
+                                        if state.rate_limited(now) {
+                                            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"retry_after_until": state.retry_after_until})), "discord slash command reconcile in rate-limit cooldown; skipping");
+                                            return;
+                                        }
+                                        // Skip only when the set matches the last *successful*
+                                        // reconcile. The fingerprint is persisted, so an unchanged
+                                        // set is skipped after a restart too (no daily-budget churn).
+                                        if state.fingerprint == Some(fingerprint) {
                                             ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"commands": specs.len() + 1})), "discord slash command set unchanged; skipping re-registration");
                                             return;
                                         }
                                         match reconcile_slash_commands(&client, &bot_token, &app_id, &body, DISCORD_API_BASE).await {
-                                            Ok(()) => {
-                                                *hash_store.lock() = Some(fingerprint);
+                                            Ok(ReconcileOutcome::Reconciled) => {
+                                                SlashReconcileState::record_success(workspace_dir.as_deref(), &app_id, fingerprint, now);
                                                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"commands": specs.len() + 1})), "discord slash commands registered");
                                             }
+                                            Ok(ReconcileOutcome::RateLimited { until }) => {
+                                                // Persist the cooldown (keeping the prior fingerprint)
+                                                // so the next READY/restart waits it out.
+                                                SlashReconcileState::record_retry_after(workspace_dir.as_deref(), &app_id, &state, until);
+                                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"retry_after_until": until})), "discord slash command reconcile rate-limited; cooldown persisted");
+                                            }
                                             Err(e) => {
-                                                *hash_store.lock() = None;
+                                                // Hard failure: leave persisted state untouched. The
+                                                // new fingerprint differs from the stored one, so the
+                                                // next READY retries without a forced reset.
                                                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord slash command registration failed");
                                             }
                                         }
@@ -3142,6 +3375,24 @@ impl Channel for DiscordChannel {
                         if let Some(d) = event.get("d") {
                             self.sync_archive_for_message_event(event_type, d, &bot_user_id)
                                 .await;
+                        }
+                        continue;
+                    }
+
+                    // Inbound reaction events — only delivered at all when
+                    // the IDENTIFY mask included the reaction intents. The
+                    // scope re-check matters when a raw `intents_mask`
+                    // override requested the reaction bits while
+                    // `reaction_notifications = off`, or on a resumed
+                    // session that negotiated a wider mask.
+                    if event_type == "MESSAGE_REACTION_ADD"
+                        || event_type == "MESSAGE_REACTION_REMOVE"
+                    {
+                        if self.reaction_scope
+                            != zeroclaw_config::schema::DiscordReactionScope::Off
+                            && let Some(d) = event.get("d")
+                        {
+                            self.handle_reaction_event(event_type, d, &bot_user_id).await;
                         }
                         continue;
                     }
@@ -4331,6 +4582,39 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn reconcile_returns_rate_limited_on_post_429() {
+        // A 429 on an upsert must surface as RateLimited (with the body's
+        // retry_after deadline) so the caller persists a cooldown instead of
+        // re-hammering the daily command budget on the next READY.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(
+                ResponseTemplate::new(429).set_body_json(serde_json::json!({"retry_after": 5.0})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[]); // /ask → one POST
+        let now = crate::discord_slash_state::now_unix();
+        let outcome = reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri())
+            .await
+            .unwrap();
+        match outcome {
+            ReconcileOutcome::RateLimited { until } => assert!(until >= now + 5),
+            ReconcileOutcome::Reconciled => panic!("expected RateLimited on a POST 429"),
+        }
+    }
+
     #[test]
     fn command_projection_ignores_server_side_decorations() {
         // Discord's GET response decorates commands with id/version/etc.;
@@ -4760,6 +5044,237 @@ mod tests {
         // actionable message instead of a dangling empty list.
         let bare = disallowed_intents_hint(INTENT_GUILDS);
         assert!(bare.contains("mask 0x1"));
+    }
+
+    use zeroclaw_config::schema::DiscordReactionScope;
+
+    fn reaction_test_channel(
+        scope: DiscordReactionScope,
+    ) -> (
+        DiscordChannel,
+        std::sync::Arc<dyn zeroclaw_memory::Memory>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let mem: std::sync::Arc<dyn zeroclaw_memory::Memory> = std::sync::Arc::new(
+            zeroclaw_memory::SqliteMemory::new_named("sqlite", dir.path(), "discord").unwrap(),
+        );
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(|| vec!["*".to_string()]),
+            false,
+            false,
+        )
+        .with_archive_memory(std::sync::Arc::clone(&mem))
+        .with_reaction_notifications(scope);
+        (ch, mem, dir)
+    }
+
+    #[test]
+    fn reaction_scope_adds_reaction_intents_to_the_mask() {
+        let (off, _m1, _d1) = reaction_test_channel(DiscordReactionScope::Off);
+        assert_eq!(off.gateway_intents(), 37377);
+
+        let (own, _m2, _d2) = reaction_test_channel(DiscordReactionScope::Own);
+        assert_eq!(
+            own.gateway_intents(),
+            37377 | INTENT_GUILD_MESSAGE_REACTIONS | INTENT_DIRECT_MESSAGE_REACTIONS
+        );
+        // The reactions-on mask is OpenClaw's static base — parity by arithmetic.
+        assert_eq!(own.gateway_intents(), 46593);
+    }
+
+    #[tokio::test]
+    async fn reaction_add_is_archived_and_remove_forgets_it() {
+        let (ch, mem, _dir) = reaction_test_channel(DiscordReactionScope::All);
+        let add = serde_json::json!({
+            "user_id": "u1", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "👍"},
+            "member": {"user": {"username": "bob"}}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_ADD", &add, "botid")
+            .await;
+
+        let key = "discord_reaction_m1_u1_👍";
+        let entry = mem.get(key).await.unwrap().unwrap();
+        assert!(
+            entry
+                .content
+                .contains("@bob reacted 👍 to message m1 in #c1")
+        );
+
+        let remove = serde_json::json!({
+            "user_id": "u1", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "👍"}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_REMOVE", &remove, "botid")
+            .await;
+        assert!(mem.get(key).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn own_scope_only_records_reactions_to_bot_messages() {
+        let (ch, mem, _dir) = reaction_test_channel(DiscordReactionScope::Own);
+
+        let to_other = serde_json::json!({
+            "user_id": "u1", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "👍"},
+            "message_author_id": "someone_else"
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_ADD", &to_other, "botid")
+            .await;
+        assert!(
+            mem.get("discord_reaction_m1_u1_👍")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let to_bot = serde_json::json!({
+            "user_id": "u1", "message_id": "m2", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "🎉"},
+            "message_author_id": "botid"
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_ADD", &to_bot, "botid")
+            .await;
+        assert!(
+            mem.get("discord_reaction_m2_u1_🎉")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn bots_own_reactions_are_never_recorded() {
+        // Ack/failure emoji the bot adds itself echo back as gateway events.
+        let (ch, mem, _dir) = reaction_test_channel(DiscordReactionScope::All);
+        let own_ack = serde_json::json!({
+            "user_id": "botid", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "⚡️"},
+            "message_author_id": "u1"
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_ADD", &own_ack, "botid")
+            .await;
+        assert!(
+            mem.get("discord_reaction_m1_botid_⚡️")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_emoji_keys_by_stable_id_so_rename_cannot_orphan_entries() {
+        // Discord sends {id, name} for custom emoji; the name is mutable
+        // guild state. ADD records by id, and a REMOVE arriving after the
+        // emoji was renamed or deleted (name: null) must still forget it.
+        let (ch, mem, _dir) = reaction_test_channel(DiscordReactionScope::All);
+        let add = serde_json::json!({
+            "user_id": "u1", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1",
+            "emoji": {"id": "424242", "name": "partyclaw"}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_ADD", &add, "botid")
+            .await;
+        let entry = mem.get("discord_reaction_m1_u1_424242").await.unwrap();
+        // Content keeps the human-readable name; the key uses the id.
+        assert!(entry.unwrap().content.contains("reacted partyclaw"));
+
+        let remove = serde_json::json!({
+            "user_id": "u1", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1",
+            "emoji": {"id": "424242", "name": serde_json::Value::Null}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_REMOVE", &remove, "botid")
+            .await;
+        assert!(
+            mem.get("discord_reaction_m1_u1_424242")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn identityless_emoji_are_ignored() {
+        // No id and no name: nothing meaningful to record (or forget).
+        let (ch, mem, _dir) = reaction_test_channel(DiscordReactionScope::All);
+        let add = serde_json::json!({
+            "user_id": "u1", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_ADD", &add, "botid")
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn reaction_filters_mirror_the_message_path() {
+        // Peer allowlist: a reactor outside the peer set is never recorded.
+        let dir = tempfile::tempdir().unwrap();
+        let mem: std::sync::Arc<dyn zeroclaw_memory::Memory> = std::sync::Arc::new(
+            zeroclaw_memory::SqliteMemory::new_named("sqlite", dir.path(), "discord").unwrap(),
+        );
+        let gated = DiscordChannel::new(
+            "fake".into(),
+            vec!["g1".into()],
+            "discord_test_alias",
+            Arc::new(|| vec!["friend".to_string()]),
+            false,
+            false,
+        )
+        .with_channel_ids(vec!["c1".into()])
+        .with_archive_memory(std::sync::Arc::clone(&mem))
+        .with_reaction_notifications(DiscordReactionScope::All);
+
+        let stranger = serde_json::json!({
+            "user_id": "stranger", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "👍"}
+        });
+        gated
+            .handle_reaction_event("MESSAGE_REACTION_ADD", &stranger, "botid")
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 0);
+
+        // Guild allowlist: wrong guild is dropped even for an allowed peer.
+        let wrong_guild = serde_json::json!({
+            "user_id": "friend", "message_id": "m2", "channel_id": "c1",
+            "guild_id": "g2", "emoji": {"name": "👍"}
+        });
+        gated
+            .handle_reaction_event("MESSAGE_REACTION_ADD", &wrong_guild, "botid")
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 0);
+
+        // All gates pass: recorded.
+        let ok = serde_json::json!({
+            "user_id": "friend", "message_id": "m3", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "👍"}
+        });
+        gated
+            .handle_reaction_event("MESSAGE_REACTION_ADD", &ok, "botid")
+            .await;
+        assert!(
+            mem.get("discord_reaction_m3_friend_👍")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_without_prior_add_is_a_noop() {
+        let (ch, mem, _dir) = reaction_test_channel(DiscordReactionScope::All);
+        let remove = serde_json::json!({
+            "user_id": "u1", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "👍"}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_REMOVE", &remove, "botid")
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 0);
     }
 
     #[test]
