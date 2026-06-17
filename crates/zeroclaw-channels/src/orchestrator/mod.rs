@@ -5252,7 +5252,7 @@ async fn process_channel_message_body(
                 );
                 if let Some(ref draft_id) = draft_message_id {
                     let _ = channel
-                        .finalize_draft(&msg.reply_target, draft_id, error_text)
+                        .finalize_draft(&msg.reply_target, draft_id, error_text.as_str())
                         .await;
                 } else {
                     let _ = channel
