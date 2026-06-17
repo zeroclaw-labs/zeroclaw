@@ -104,12 +104,15 @@ struct DataMessage {
     group_info: Option<GroupInfo>,
     #[serde(default)]
     attachments: Option<Vec<serde_json::Value>>,
-    /// Poll-vote payload. signal-cli-rest-api surfaces poll responses
+    /// Poll-vote payload. Some signal-cli builds surface poll responses
     /// as `pollAnswer` on the inbound dataMessage; without this field
     /// the deserializer silently dropped the data and consumers never
     /// learned the user voted.
     #[serde(rename = "pollAnswer", default)]
     poll_answer: Option<PollAnswer>,
+    /// Native signal-cli daemon 0.14.x emits poll responses as `pollVote`.
+    #[serde(rename = "pollVote", default)]
+    poll_vote: Option<PollAnswer>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,11 +123,10 @@ struct GroupInfo {
 
 /// Inbound poll-vote payload.
 ///
-/// signal-cli's JSON wraps the answer as the indices and (when
-/// `displayName` resolution succeeded server-side) the option titles.
-/// We accept both because we want the title for round-tripping the
-/// option's identifier back to the agent layer, but indices are a
-/// fallback when titles aren't materialized.
+/// signal-cli's JSON wraps the answer as the indices and, in some
+/// builds, the option titles. We accept both because we want the title
+/// for round-tripping the option's identifier back to the agent layer,
+/// but indices are a fallback when titles aren't materialized.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PollAnswer {
     /// Server-assigned poll id this answer is for. Useful when the
@@ -135,7 +137,7 @@ pub struct PollAnswer {
     /// 0-based indices of the options the user selected. Single-choice
     /// polls (the common case for agent prompts) yield a 1-element
     /// vec; multi-select would yield more.
-    #[serde(rename = "selectedIndices", default)]
+    #[serde(rename = "selectedIndices", alias = "optionIndexes", default)]
     pub selected_indices: Vec<u32>,
     /// Display titles of the selected options, if signal-cli expanded
     /// them. May be empty in older signal-cli builds; consumers should
@@ -286,6 +288,39 @@ impl SignalChannel {
         Ok(params)
     }
 
+    /// Build the JSON-RPC params for signal-cli's native `sendPollCreate`
+    /// method.
+    ///
+    /// Signal poll answers correlate by rendered option title when the daemon
+    /// supplies one, or by option index otherwise, so callback ids are
+    /// intentionally not represented in this wire shape. `Channel::send_choice`
+    /// documents that callers needing stable callback ids must maintain that
+    /// mapping above the channel layer.
+    fn build_poll_params(
+        &self,
+        recipient: &str,
+        question: &str,
+        options: &[String],
+        multiple_choice: bool,
+    ) -> serde_json::Value {
+        match Self::parse_recipient_target(recipient) {
+            RecipientTarget::Direct(number) => serde_json::json!({
+                "recipient": [number],
+                "account": &self.account,
+                "question": question,
+                "options": options,
+                "multi": multiple_choice,
+            }),
+            RecipientTarget::Group(group_id) => serde_json::json!({
+                "groupId": group_id,
+                "account": &self.account,
+                "question": question,
+                "options": options,
+                "multi": multiple_choice,
+            }),
+        }
+    }
+
     /// Check whether the message passes the group/DM filter.
     ///
     /// - `dm_only = true`: only DMs accepted; all group messages rejected.
@@ -403,7 +438,11 @@ impl SignalChannel {
         // Skip attachment-only messages when configured
         if self.ignore_attachments {
             let has_attachments = data_msg.attachments.as_ref().is_some_and(|a| !a.is_empty());
-            if has_attachments && data_msg.message.is_none() && data_msg.poll_answer.is_none() {
+            if has_attachments
+                && data_msg.message.is_none()
+                && data_msg.poll_answer.is_none()
+                && data_msg.poll_vote.is_none()
+            {
                 return Vec::new();
             }
         }
@@ -439,7 +478,11 @@ impl SignalChannel {
         // emit one entry per selected title (or per selected index when
         // titles are absent). For text messages, emit one entry with
         // the raw body.
-        let contents: Vec<String> = if let Some(pa) = data_msg.poll_answer.as_ref() {
+        let contents: Vec<String> = if let Some(pa) = data_msg
+            .poll_answer
+            .as_ref()
+            .or(data_msg.poll_vote.as_ref())
+        {
             if !pa.selected_titles.is_empty() {
                 pa.selected_titles
                     .iter()
@@ -509,11 +552,12 @@ impl SignalChannel {
     /// Send a multiple-choice poll to `recipient` (E.164 number, UUID,
     /// or `group:<id>`).
     ///
-    /// Sent via signal-cli-rest-api `/v2/send` with `pollDetails`.
-    /// The poll renders as native UI in modern Signal clients and
-    /// emits a `pollAnswer` event back through the SSE stream when
-    /// the user votes — see `process_envelope` for how that flows back
-    /// to consumers as a synthetic `[choice]<title>` `ChannelMessage`.
+    /// Sent via signal-cli daemon's JSON-RPC `sendPollCreate` method. The
+    /// poll renders as native UI in modern Signal clients and emits a
+    /// poll-vote event (`pollAnswer` or `pollVote`, depending on signal-cli
+    /// version) back through the SSE stream when the user votes — see
+    /// `process_envelope` for how that flows back to consumers as a synthetic
+    /// `[choice]<title>` or `[choice-index]N` `ChannelMessage`.
     ///
     /// `multiple_choice = false` → single-select poll (the common case
     /// for "pick one of N" agent prompts). Pass `true` to allow
@@ -531,50 +575,8 @@ impl SignalChannel {
                 options.len()
             );
         }
-        let url = format!("{}/v2/send", self.http_url);
-        let body = match Self::parse_recipient_target(recipient) {
-            RecipientTarget::Direct(number) => serde_json::json!({
-                "number": &self.account,
-                "recipients": [number],
-                "message": "",
-                "pollDetails": {
-                    "question": question,
-                    "options": options,
-                    "multiple_choice": multiple_choice,
-                },
-            }),
-            RecipientTarget::Group(group_id) => serde_json::json!({
-                "number": &self.account,
-                "recipients": [format!("group.{group_id}")],
-                "message": "",
-                "pollDetails": {
-                    "question": question,
-                    "options": options,
-                    "multiple_choice": multiple_choice,
-                },
-            }),
-        };
-
-        let resp = match self.http_client().post(&url).json(&body).send().await {
-            Ok(resp) => resp,
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"url": url, "error": e.to_string()})),
-                    "Signal send_poll request failed"
-                );
-                return Err(anyhow::Error::msg(format!(
-                    "Signal send_poll request failed: {e}"
-                )));
-            }
-        };
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Signal send_poll {} returned {}: {}", url, status, text);
-        }
+        let params = self.build_poll_params(recipient, question, options, multiple_choice);
+        self.rpc_request("sendPollCreate", params).await?;
         Ok(())
     }
 }
@@ -618,8 +620,8 @@ impl Channel for SignalChannel {
         prompt: &str,
         options: &[(String, String)],
     ) -> anyhow::Result<()> {
-        // Signal supports native polls via signal-cli-rest-api `/v2/send`
-        // pollDetails. Single-select (multi=false) is the right default
+        // Signal supports native polls via signal-cli JSON-RPC
+        // sendPollCreate. Single-select (multi=false) is the right default
         // for "pick one of N" prompts; consumers needing multi-select
         // should call SignalChannel::send_poll directly.
         //
@@ -965,6 +967,7 @@ mod tests {
                 group_info: None,
                 attachments: None,
                 poll_answer: None,
+                poll_vote: None,
             }),
             story_message: None,
             timestamp: Some(1_700_000_000_000),
@@ -1137,6 +1140,7 @@ mod tests {
             group_info: None,
             attachments: None,
             poll_answer: None,
+            poll_vote: None,
         };
         assert!(ch.matches_group(&dm));
 
@@ -1148,6 +1152,7 @@ mod tests {
             }),
             attachments: None,
             poll_answer: None,
+            poll_vote: None,
         };
         assert!(ch.matches_group(&group));
     }
@@ -1175,6 +1180,7 @@ mod tests {
             }),
             attachments: None,
             poll_answer: None,
+            poll_vote: None,
         };
         assert!(ch.matches_group(&matching));
 
@@ -1186,6 +1192,7 @@ mod tests {
             }),
             attachments: None,
             poll_answer: None,
+            poll_vote: None,
         };
         assert!(!ch.matches_group(&non_matching));
     }
@@ -1211,6 +1218,7 @@ mod tests {
             group_info: None,
             attachments: None,
             poll_answer: None,
+            poll_vote: None,
         };
         assert!(ch.matches_group(&dm));
 
@@ -1222,6 +1230,7 @@ mod tests {
             }),
             attachments: None,
             poll_answer: None,
+            poll_vote: None,
         };
         assert!(!ch.matches_group(&group));
     }
@@ -1247,6 +1256,7 @@ mod tests {
             group_info: None,
             attachments: None,
             poll_answer: None,
+            poll_vote: None,
         };
         assert_eq!(ch.reply_target(&dm, "+1111111111"), "+1111111111");
     }
@@ -1274,6 +1284,7 @@ mod tests {
             }),
             attachments: None,
             poll_answer: None,
+            poll_vote: None,
         };
         assert_eq!(ch.reply_target(&group, "+1111111111"), "group:group123");
     }
@@ -1378,6 +1389,7 @@ mod tests {
                 group_info: None,
                 attachments: None,
                 poll_answer: None,
+                poll_vote: None,
             }),
             story_message: None,
             timestamp: Some(1_700_000_000_000),
@@ -1436,6 +1448,7 @@ mod tests {
                 }),
                 attachments: None,
                 poll_answer: None,
+                poll_vote: None,
             }),
             story_message: None,
             timestamp: Some(1_700_000_000_000),
@@ -1603,6 +1616,7 @@ mod tests {
                 group_info: None,
                 attachments: Some(vec![serde_json::json!({"contentType": "image/png"})]),
                 poll_answer: None,
+                poll_vote: None,
             }),
             story_message: None,
             timestamp: Some(1_700_000_000_000),
@@ -1636,6 +1650,7 @@ mod tests {
                 }),
                 attachments: None,
                 poll_answer: None,
+                poll_vote: None,
             }),
             story_message: None,
             timestamp: Some(1_700_000_000_000),
@@ -1691,6 +1706,7 @@ mod tests {
                 }),
                 attachments: None,
                 poll_answer: None,
+                poll_vote: None,
             }),
             story_message: None,
             timestamp: Some(1_700_000_000_000),
@@ -1920,6 +1936,7 @@ mod tests {
                 group_info: None,
                 attachments: None,
                 poll_answer: None,
+                poll_vote: None,
             }),
             story_message: None,
             timestamp: Some(1_700_000_000_000),
@@ -1946,6 +1963,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn build_poll_params_dm_uses_send_poll_create_shape() {
+        let ch = make_reaction_channel();
+        let options = vec!["Alpha".to_string(), "Beta".to_string()];
+        let params = ch.build_poll_params("+1111111111", "Pick one", &options, false);
+
+        assert_eq!(
+            params["recipient"],
+            serde_json::json!(["+1111111111".to_string()])
+        );
+        assert!(params.get("groupId").is_none());
+        assert_eq!(params["account"], "+1234567890");
+        assert_eq!(params["question"], "Pick one");
+        assert_eq!(params["options"], serde_json::json!(["Alpha", "Beta"]));
+        assert_eq!(params["multi"], false);
+    }
+
+    #[test]
+    fn build_poll_params_group_preserves_multi_select() {
+        let ch = make_reaction_channel();
+        let options = vec!["Alpha".to_string(), "Beta".to_string()];
+        let params = ch.build_poll_params("group:abc", "Pick any", &options, true);
+
+        assert_eq!(params["groupId"], "abc");
+        assert!(params.get("recipient").is_none());
+        assert_eq!(params["account"], "+1234567890");
+        assert_eq!(params["question"], "Pick any");
+        assert_eq!(params["options"], serde_json::json!(["Alpha", "Beta"]));
+        assert_eq!(params["multi"], true);
+    }
+
     fn poll_envelope(
         sender: Option<&str>,
         selected_titles: Vec<&str>,
@@ -1963,6 +2011,28 @@ mod tests {
                     poll_id: Some(1),
                     selected_indices,
                     selected_titles: selected_titles.iter().map(|s| s.to_string()).collect(),
+                }),
+                poll_vote: None,
+            }),
+            story_message: None,
+            timestamp: Some(1_700_000_000_000),
+        }
+    }
+
+    fn poll_vote_envelope(sender: Option<&str>, option_indexes: Vec<u32>) -> Envelope {
+        Envelope {
+            source: sender.map(String::from),
+            source_number: sender.map(String::from),
+            data_message: Some(DataMessage {
+                message: None,
+                timestamp: Some(1_700_000_000_000),
+                group_info: None,
+                attachments: None,
+                poll_answer: None,
+                poll_vote: Some(PollAnswer {
+                    poll_id: Some(1),
+                    selected_indices: option_indexes,
+                    selected_titles: Vec::new(),
                 }),
             }),
             story_message: None,
@@ -1989,6 +2059,43 @@ mod tests {
         let msgs = ch.process_envelope(&env);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "[choice-index]3");
+    }
+
+    #[test]
+    fn process_envelope_poll_vote_falls_back_to_index() {
+        let ch = make_channel();
+        // signal-cli daemon 0.14.x emits native poll votes as
+        // dataMessage.pollVote.optionIndexes.
+        let env = poll_vote_envelope(Some("+1111111111"), vec![0]);
+        let msgs = ch.process_envelope(&env);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "[choice-index]1");
+    }
+
+    #[test]
+    fn poll_vote_option_indexes_deserializes_from_signal_cli_shape() {
+        let env: Envelope = serde_json::from_value(serde_json::json!({
+            "source": "+1111111111",
+            "sourceNumber": "+1111111111",
+            "timestamp": 1_700_000_000_000_u64,
+            "dataMessage": {
+                "timestamp": 1_700_000_000_000_u64,
+                "pollVote": {
+                    "targetSentTimestamp": 1_700_000_000_000_u64,
+                    "optionIndexes": [0],
+                    "voteCount": 1
+                }
+            }
+        }))
+        .unwrap();
+
+        let vote = env
+            .data_message
+            .as_ref()
+            .and_then(|dm| dm.poll_vote.as_ref())
+            .unwrap();
+        assert_eq!(vote.selected_indices, vec![0]);
+        assert!(vote.selected_titles.is_empty());
     }
 
     #[test]
