@@ -4,7 +4,7 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\.]{8,}))"#).unwrap()
+    Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\./+=]{8,}))"#).unwrap()
 });
 
 /// Scrub credentials from tool output to prevent accidental exfiltration.
@@ -51,4 +51,29 @@ pub fn scrub_credentials(input: &str) -> String {
             }
         })
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scrub_credentials;
+
+    #[test]
+    fn scrub_credentials_redacts_unquoted_base64_credential_values() {
+        let input = "token=QWxh+GRpbjpvcGVu/IHNlc2FtZQ== next=public";
+        let scrubbed = scrub_credentials(input);
+
+        assert_eq!(scrubbed, "token=QWxh*[REDACTED] next=public");
+        assert!(!scrubbed.contains("IHNlc2FtZQ"));
+        assert!(!scrubbed.contains("=="));
+    }
+
+    #[test]
+    fn scrub_credentials_redacts_quoted_base64_credential_values() {
+        let input = r#"secret="QWxhZGRpbjpvcGVu/IHNlc2FtZQ==""#;
+        let scrubbed = scrub_credentials(input);
+
+        assert_eq!(scrubbed, r#"secret="QWxh*[REDACTED]""#);
+        assert!(!scrubbed.contains("IHNlc2FtZQ"));
+        assert!(!scrubbed.contains("=="));
+    }
 }
