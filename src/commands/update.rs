@@ -576,11 +576,18 @@ async fn validate_binary(path: &Path) -> Result<()> {
 /// returns a descriptive error instead of the opaque "Exec format error
 /// (os error 8)" (Unix) or its Windows equivalent.
 async fn check_binary_arch(path: &Path) -> Result<()> {
-    // Enough bytes to cover a PE file's DOS stub and reach the COFF machine
-    // field pointed to by `e_lfanew` (well under 4 KiB in practice).
-    let header = tokio::fs::read(path)
+    use tokio::io::AsyncReadExt;
+
+    // Read only the header — enough to cover a PE file's DOS stub and reach the
+    // COFF machine field pointed to by `e_lfanew` (well under 4 KiB in practice)
+    // — instead of pulling the whole multi-megabyte binary into memory.
+    let mut header = Vec::new();
+    tokio::fs::File::open(path)
         .await
-        .map(|bytes| bytes.into_iter().take(4096).collect::<Vec<u8>>())
+        .context("failed to open binary to read header")?
+        .take(4096)
+        .read_to_end(&mut header)
+        .await
         .context("failed to read binary header")?;
 
     if header.len() < 20 {
@@ -603,29 +610,34 @@ async fn check_binary_arch(path: &Path) -> Result<()> {
 }
 
 /// Detect the CPU architecture from an ELF, Mach-O, or PE binary header.
+///
+/// Returns `None` when the container format or its machine type is not
+/// recognized, so callers treat "can't tell" as "skip the check" rather than a
+/// mismatch (returning a placeholder string here would make a known host arch
+/// compare unequal and falsely report an architecture mismatch).
 fn detect_arch_from_header(header: &[u8]) -> Option<&'static str> {
     // ELF magic: 0x7f 'E' 'L' 'F'
     if header.len() >= 20 && header[0..4] == [0x7f, b'E', b'L', b'F'] {
         // e_machine is at offset 18 (2 bytes, little-endian for LE binaries)
         let e_machine = u16::from_le_bytes([header[18], header[19]]);
-        return Some(match e_machine {
-            0x3E => "x86_64",
-            0xB7 => "aarch64",
-            0x03 => "x86",
-            0x28 => "arm",
-            0xF3 => "riscv",
-            _ => "unknown-elf",
-        });
+        return match e_machine {
+            0x3E => Some("x86_64"),
+            0xB7 => Some("aarch64"),
+            0x03 => Some("x86"),
+            0x28 => Some("arm"),
+            0xF3 => Some("riscv"),
+            _ => None,
+        };
     }
 
     // Mach-O magic (64-bit little-endian): 0xFEEDFACF
     if header.len() >= 8 && header[0..4] == [0xCF, 0xFA, 0xED, 0xFE] {
         let cputype = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-        return Some(match cputype {
-            0x0100_0007 => "x86_64",
-            0x0100_000C => "aarch64",
-            _ => "unknown-macho",
-        });
+        return match cputype {
+            0x0100_0007 => Some("x86_64"),
+            0x0100_000C => Some("aarch64"),
+            _ => None,
+        };
     }
 
     // PE (Windows): "MZ" DOS header; the PE header offset is stored at 0x3C and
@@ -639,13 +651,13 @@ fn detect_arch_from_header(header: &[u8]) -> Option<&'static str> {
         {
             if &coff[0..4] == b"PE\0\0" {
                 let machine = u16::from_le_bytes([coff[4], coff[5]]);
-                return Some(match machine {
-                    0x8664 => "x86_64",
-                    0xAA64 => "aarch64",
-                    0x014C => "x86",
-                    0x01C0 => "arm",
-                    _ => "unknown-pe",
-                });
+                return match machine {
+                    0x8664 => Some("x86_64"),
+                    0xAA64 => Some("aarch64"),
+                    0x014C => Some("x86"),
+                    0x01C0 => Some("arm"),
+                    _ => None,
+                };
             }
         }
     }
@@ -1275,6 +1287,22 @@ mod tests {
             detect_arch_from_header(&make_pe_header(0xAA64)),
             Some("aarch64")
         );
+    }
+
+    #[test]
+    fn detect_arch_pe_unknown_machine_returns_none() {
+        // A valid PE container with an unrecognized machine must yield None so
+        // the caller skips the check instead of reporting a false mismatch.
+        assert_eq!(detect_arch_from_header(&make_pe_header(0xFFFF)), None);
+    }
+
+    #[test]
+    fn detect_arch_elf_unknown_machine_returns_none() {
+        let mut header = vec![0u8; 20];
+        header[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        header[18] = 0xEE; // not a recognized e_machine
+        header[19] = 0x00;
+        assert_eq!(detect_arch_from_header(&header), None);
     }
 
     #[test]
