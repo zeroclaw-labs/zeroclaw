@@ -399,6 +399,13 @@ fn cron_agent_run_security_policy(base: &SecurityPolicy, job: &CronJob) -> Secur
     policy
 }
 
+fn cron_agent_session_path(target: &SessionTarget, run_session_id: &str) -> std::path::PathBuf {
+    match target {
+        SessionTarget::Main => std::path::PathBuf::from("main"),
+        SessionTarget::Isolated => std::path::PathBuf::from(format!("cron-{run_session_id}")),
+    }
+}
+
 async fn execute_job_with_retry(
     config: &Config,
     security: &SecurityPolicy,
@@ -617,12 +624,12 @@ async fn run_agent_job(
     let mut cron_config = config.clone();
     cron_config.memory.auto_save = false;
 
-    // Assign a unique session ID so memories written during this run can be
-    // purged atomically if the run fails (prevents snowball accumulation).
-    // Doubles as the SubAgent run_id in the tracing span so a failed
-    // memory purge can be correlated with its sub-run.
+    // Assign a unique run ID for tracing. Isolated jobs also use it in the
+    // session path so failed-run memory purge stays scoped per execution.
+    // Main-target jobs reuse the stable `main` session path documented in
+    // `session_target`.
     let run_session_id = uuid::Uuid::new_v4().to_string();
-    let session_path = std::path::PathBuf::from(format!("cron-{run_session_id}"));
+    let session_path = cron_agent_session_path(&job.session_target, &run_session_id);
 
     let subagent_span = zeroclaw_log::info_span!(
         "subagent",
@@ -683,26 +690,28 @@ async fn run_agent_job(
             },
         ),
         Err(e) => {
-            // Purge memories written during this failed run so they don't
-            // pollute future recall and cause context snowball. Routes
-            // through the cron-owning agent's per-agent memory wrapper
-            // so the purge stays scoped to the agent that wrote them.
-            // Sanitize the session key so it matches what the runtime
-            // writes via the orchestrator session-key sanitizer.
-            let mem_session_key = zeroclaw_api::session_keys::sanitize_session_key(&format!(
-                "cli:{}",
-                session_path.display()
-            ));
-            if let Ok(mem) = zeroclaw_memory::create_memory_for_agent(
-                config,
-                agent_alias,
-                config
-                    .model_provider_for_agent(agent_alias)
-                    .and_then(|e| e.api_key.as_deref()),
-            )
-            .await
-            {
-                let _ = mem.purge_session(&mem_session_key).await;
+            if matches!(job.session_target, SessionTarget::Isolated) {
+                // Purge memories written during this failed run so they don't
+                // pollute future recall and cause context snowball. Routes
+                // through the cron-owning agent's per-agent memory wrapper
+                // so the purge stays scoped to the agent that wrote them.
+                // Sanitize the session key so it matches what the runtime
+                // writes via the orchestrator session-key sanitizer.
+                let mem_session_key = zeroclaw_api::session_keys::sanitize_session_key(&format!(
+                    "cli:{}",
+                    session_path.display()
+                ));
+                if let Ok(mem) = zeroclaw_memory::create_memory_for_agent(
+                    config,
+                    agent_alias,
+                    config
+                        .model_provider_for_agent(agent_alias)
+                        .and_then(|e| e.api_key.as_deref()),
+                )
+                .await
+                {
+                    let _ = mem.purge_session(&mem_session_key).await;
+                }
             }
             (false, format!("agent job failed: {e}"))
         }
@@ -1196,6 +1205,18 @@ mod tests {
             ..test_job("echo test")
         };
         assert!(!is_high_frequency_agent_job(&job));
+    }
+
+    #[test]
+    fn cron_agent_session_path_main_is_stable() {
+        assert_eq!(
+            cron_agent_session_path(&SessionTarget::Main, "ignored"),
+            std::path::PathBuf::from("main")
+        );
+        assert_eq!(
+            cron_agent_session_path(&SessionTarget::Isolated, "abc").to_string_lossy(),
+            "cron-abc"
+        );
     }
 
     #[test]
