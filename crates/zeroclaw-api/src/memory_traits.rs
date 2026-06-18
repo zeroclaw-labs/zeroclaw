@@ -256,6 +256,26 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         anyhow::bail!("purge_agent not supported by this memory backend")
     }
 
+    /// Export every memory row attributed to `agent_alias`, for the agent-
+    /// deletion archive (export-then-delete, #7175). Pairs with
+    /// [`Self::purge_agent`]: the surface exports these rows to the archive,
+    /// then purges. Default: empty (backends without per-agent export).
+    async fn export_agent(&self, _agent_alias: &str) -> anyhow::Result<Vec<MemoryEntry>> {
+        Ok(Vec::new())
+    }
+
+    /// Re-point every memory row from the `from` alias to the `to` alias,
+    /// returning the number of rows re-pointed. Called when an alias is renamed
+    /// (#7468). For the SQL backends (sqlite/postgres) memory rows ride the
+    /// agent's UUID, so this is a single `UPDATE agents SET alias` and the count
+    /// is the agents-row count (0 or 1); payload-keyed backends (qdrant) rewrite
+    /// the alias on every matching memory point and return that count.
+    /// Default: unsupported error; backends with per-agent storage override.
+    /// Markdown/none keep the default and the caller logs a warning.
+    async fn rename_agent(&self, _from: &str, _to: &str) -> anyhow::Result<usize> {
+        anyhow::bail!("rename_agent not supported by this memory backend")
+    }
+
     /// Count total memories
     async fn count(&self) -> anyhow::Result<usize>;
 
@@ -433,7 +453,12 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
 #[async_trait]
 pub trait MemoryStrategy: Send + Sync {
     /// Load and format relevant memory context for a conversation turn.
-    async fn load_context(&self, query: &str, session_id: Option<&str>) -> anyhow::Result<String>;
+    async fn load_context(
+        &self,
+        observer: &dyn crate::observability_traits::Observer,
+        query: &str,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<String>;
 
     /// Consolidate a conversation turn into long-term memory.
     async fn consolidate_turn(

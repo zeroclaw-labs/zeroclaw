@@ -540,8 +540,8 @@ mod tests {
         config.agents.entry("test-agent".to_string()).or_insert(
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "openrouter.test-agent".into(),
-                risk_profile: "test-agent".to_string(),
-                runtime_profile: "test-agent".to_string(),
+                risk_profile: "test-agent".into(),
+                runtime_profile: "test-agent".into(),
                 ..Default::default()
             },
         );

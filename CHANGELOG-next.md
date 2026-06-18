@@ -71,6 +71,19 @@ Guided agent creation end to end: pick a provider, paste a key, choose a model f
 
 The daemon's structured log stream, filterable and attribution-aware, in the same terminal you work in.
 
+### Observability
+
+- **OTel memory and RAG observability** — every agent turn now produces visible
+  `memory.recall`, `memory.store`, and `rag.retrieve` spans plus five OTel meter
+  instruments (`zeroclaw.memory.recall.{count,duration}`, `zeroclaw.memory.store.count`,
+  `zeroclaw.rag.retrieve.{count,duration}`). The recall/retrieve spans set
+  `gen_ai.operation.name = "retrieval"` and carry a scrubbed/truncated `query_summary`
+  on `input.value`; the store span uses `db.system` / `db.operation = "INSERT"`. These
+  are partial GenAI-compatible attributes: `SpanKind::Internal` is used, and span names
+  are `memory.recall` / `rag.retrieve` / `memory.store` for compatibility with the
+  existing ZeroClaw / Langfuse retrieval views. New spans and instruments live behind
+  the existing `observability-otel` feature gate (#6190).
+
 ### Providers
 
 - [New providers](https://docs.zeroclawlabs.ai/master/en/providers/catalog.html): Kilo AI Gateway, GitHub Models (#6445), Morph (#6440), Manifest (#6268), atomic-chat (#6513), a dedicated llama.cpp provider (#6417), seven more OpenAI-compatible providers (#7260), and MiniMax split into Global and China entries (#6758).
@@ -80,6 +93,7 @@ The daemon's structured log stream, filterable and attribution-aware, in the sam
 
 - [New channels](https://docs.zeroclawlabs.ai/master/en/channels/overview.html): Twitch chat (#7275), WeCom AI Bot (#6680), AMQP with mutual TLS (#7369), and multi-tenant Linq with per-agent routing (#7041).
 - Per-recipient reply pacing across nine channels (#6389), a configurable in-flight message budget (#7391), webhook retry with exponential backoff (#5838), a reply-intent precheck that can route to a cheaper per-agent classifier model (#6068, #6945), and selective channel builds behind the new lean default bundle (#6866, #6904).
+- **Per-alias webhook routing** (#6312): inbound webhooks for WhatsApp, WATI, Nextcloud Talk, and Linq now route by alias — `POST /<type>/<alias>` reaches the matching channel instance instead of always resolving the first one, so multi-instance configs (e.g. `whatsapp.work` + `whatsapp.personal`) each receive their own traffic. The bare `/<type>` path still works as a **deprecated** fallback that resolves to a single deterministic instance (the lexicographically-first alias) and tags the response with an `X-Zeroclaw-Deprecation` header; an unknown alias now returns **404** instead of a 500. Single-instance deployments need no config change.
 
 ### Tools and plugins
 
@@ -116,12 +130,15 @@ For those tracking the beta line, the 184 commits since beta-2 concentrate on st
 - **Channel delivery**: only the final assistant turn reaches channels (#7239), internal tool-result markup is stripped from replies (#5796), truncated tool-call fragments are dropped at delivery (#7370), webp images are normalized for vision models (#7135), Telegram preserves code fences across message splits (#6701) and restores forwarded-message attribution (#7251), WhatsApp delivery and reply-mentions work for the new ID format (#7008, #7226), and Matrix keeps separate session state per configured account while repairing key backups (#7388).
 - **Cron**: disabling startup catch-up actually skips overdue jobs (#7348), one-shot reminders can be scheduled relative to now (#7188), schedules set in the past get a clear diagnostic (#7165), and DingTalk is available as a delivery channel (#7091).
 - **Runtime**: history trimming can no longer empty the conversation entirely (#7403), parallel SubAgents and delegates return reliably (#7442), writing files into a container with no mounted workspace fails loudly instead of silently (#7129), and the gateway survives transient connection-accept errors instead of crashing (#7402).
+- **Dashboard**: Integrations category tabs and headings now render human labels such as `Tools & Automation` instead of raw enum keys such as `TOOLSAUTOMATION` (#6488).
 
 ## Breaking changes
 
 - **[Schema V3](https://docs.zeroclawlabs.ai/master/en/reference/config.html)** (#6398): configs migrate automatically on first load. Profile settings are split between runtime behavior and risk policy, cost rates are reorganized per provider, and scheduled jobs must name the agent they run as.
 - **[Lean default channel bundle](https://docs.zeroclawlabs.ai/master/en/channels/overview.html)** (#6904): prebuilt binaries ship a core channel set; social channels move to opt-in build features.
 - **[Logging](https://docs.zeroclawlabs.ai/master/en/architecture/logging.html)** (#6398 train): the legacy trace-event path is retired in favor of the unified structured logging pipeline; third-party logging macros are banned workspace-wide.
+- **Observer events** (#6190): `zeroclaw_api::observability::ObserverEvent` is now `#[non_exhaustive]` and adds `MemoryRecall`, `MemoryStore`, and `RagRetrieve`. Out-of-tree observers that exhaustively match events must add a wildcard arm.
+- **Memory observability hook** (#6190): `MemoryStrategy::load_context` now receives an observer reference so the runtime can emit `MemoryRecall` events at the implicit recall boundary. Out-of-tree strategy implementations must update their signature; implementations that do not emit observability can ignore the parameter.
 
 ## Contributors
 

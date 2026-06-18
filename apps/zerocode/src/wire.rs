@@ -2,14 +2,9 @@
 //! wire between `zerocode` and the ZeroClaw daemon.
 //!
 //! These mirrors exist so `apps/zerocode/Cargo.toml` carries zero
-//! workspace dependencies in `[dependencies]`. The TUI talks JSON-RPC
+//! `zeroclaw-*` crate dependencies. The TUI talks JSON-RPC
 //! to whatever daemon is at the configured address; the wire shape is
 //! the contract, not a shared Rust type.
-//!
-//! Drift between these mirrors and the canonical workspace types is
-//! caught by `apps/zerocode/tests/wire_drift.rs`, which pulls the
-//! canonical types via `[dev-dependencies]` and asserts JSON-byte
-//! equality after a serialize / deserialize / re-serialize cycle.
 //!
 //! Some mirrors here are unused by the running TUI today — they
 //! exist to lock the wire contract for every type the daemon emits
@@ -21,6 +16,59 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+// ── Doctor result shapes ────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DoctorSeverity {
+    Ok,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct DoctorResultEntry {
+    pub severity: DoctorSeverity,
+    pub category: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct DoctorSummary {
+    pub ok: usize,
+    pub warnings: usize,
+    pub errors: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct DoctorRunResult {
+    pub results: Vec<DoctorResultEntry>,
+    pub summary: DoctorSummary,
+}
+
+#[cfg(test)]
+mod doctor_wire_tests {
+    use super::*;
+
+    #[test]
+    fn doctor_run_result_round_trips_canonical_rpc_shape() {
+        let canonical_json = serde_json::json!({
+            "results": [
+                { "severity": "ok", "category": "config", "message": "config ok" },
+                { "severity": "warn", "category": "workspace", "message": "workspace warning" },
+                { "severity": "error", "category": "daemon", "message": "daemon error" }
+            ],
+            "summary": { "ok": 1, "warnings": 1, "errors": 1 }
+        });
+        let mirror: DoctorRunResult = serde_json::from_value(canonical_json.clone()).unwrap();
+
+        assert_eq!(serde_json::to_value(&mirror).unwrap(), canonical_json);
+    }
+}
 
 // ── Quickstart submission shapes ────────────────────────────────
 
@@ -219,6 +267,7 @@ pub enum PropKind {
     Integer,
     Float,
     Enum,
+    AliasRef,
     StringArray,
     ObjectArray,
     Object,
@@ -235,11 +284,30 @@ impl PropKind {
             Self::Integer => "integer",
             Self::Float => "float",
             Self::Enum => "enum",
+            Self::AliasRef => "alias_ref",
             Self::StringArray => "string_array",
             Self::ObjectArray => "object_array",
             Self::Object => "object",
         }
     }
+}
+
+/// Alias namespace for `PropKind::AliasRef` fields. Wire mirror of
+/// `zeroclaw_config::traits::AliasSource`; zerocode does not depend on
+/// `zeroclaw-config`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AliasSource {
+    ModelProviders,
+    TtsProviders,
+    TranscriptionProviders,
+    Channels,
+    RiskProfiles,
+    RuntimeProfiles,
+    Agents,
+    SkillBundles,
+    KnowledgeBundles,
+    McpBundles,
 }
 
 /// Schema-defined config tab grouping. Mirrors
@@ -330,6 +398,8 @@ pub struct ConfigFieldEntry {
     pub section: Option<String>,
     #[serde(default, skip_serializing_if = "ConfigTab::is_none")]
     pub tab: ConfigTab,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias_source: Option<AliasSource>,
 }
 
 /// Section-page shape returned by `config/sections`. Mirrors

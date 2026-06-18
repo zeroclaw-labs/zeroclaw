@@ -19,6 +19,7 @@ use serde_json::Value;
 // Consumers can `use zeroclaw_runtime::rpc::types::*` and get everything.
 
 pub use crate::cron::{CronJob, CronJobPatch, CronRun, DeliveryConfig, Schedule};
+pub use crate::doctor::{DiagResult, Severity as DoctorSeverity};
 pub use crate::rpc::session::SessionOverrides;
 pub use crate::skills::frontmatter::SkillFrontmatter;
 pub use zeroclaw_api::memory_traits::{MemoryCategory, MemoryEntry};
@@ -100,6 +101,21 @@ rpc_type! {
 }
 
 // Health: no params, result is `Value` from `health::snapshot_json()`.
+
+rpc_type! {
+    pub struct DoctorSummary {
+        pub ok: usize,
+        pub warnings: usize,
+        pub errors: usize,
+    }
+}
+
+rpc_type! {
+    pub struct DoctorRunResult {
+        pub results: Vec<DiagResult>,
+        pub summary: DoctorSummary,
+    }
+}
 
 // ══════════════════════════════════════════════════════════════════════
 // ── TUI ──────────────────────────────────────────────────────────────
@@ -615,6 +631,19 @@ rpc_type! {
     pub struct ConfigMapKeysResult {
         pub path: String,
         pub keys: Vec<String>,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigResolveAliasSourceParams {
+        pub source: zeroclaw_config::traits::AliasSource,
+    }
+}
+
+rpc_type! {
+    pub struct ConfigResolveAliasSourceResult {
+        pub source: zeroclaw_config::traits::AliasSource,
+        pub values: Vec<String>,
     }
 }
 

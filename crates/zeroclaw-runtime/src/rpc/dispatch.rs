@@ -42,6 +42,7 @@ pub enum Method {
     Initialize,
     Status,
     Health,
+    DoctorRun,
 
     // Sessions (agent chat lives here — session/prompt + session/update
     // notifications is the RPC equivalent of the gateway's ws/chat)
@@ -84,6 +85,7 @@ pub enum Method {
     ConfigList,
     ConfigDelete,
     ConfigMapKeys,
+    ConfigResolveAliasSource,
     ConfigMapKeyCreate,
     ConfigMapKeyDelete,
     ConfigMapKeyRename,
@@ -145,6 +147,7 @@ impl Method {
         (Method::Initialize, "initialize"),
         (Method::Status, "status"),
         (Method::Health, "health"),
+        (Method::DoctorRun, "doctor/run"),
         // Sessions
         (Method::SessionNew, "session/new"),
         (Method::SessionClose, "session/close"),
@@ -182,6 +185,10 @@ impl Method {
         (Method::ConfigList, "config/list"),
         (Method::ConfigDelete, "config/delete"),
         (Method::ConfigMapKeys, "config/map-keys"),
+        (
+            Method::ConfigResolveAliasSource,
+            "config/resolve-alias-source",
+        ),
         (Method::ConfigMapKeyCreate, "config/map-key-create"),
         (Method::ConfigMapKeyDelete, "config/map-key-delete"),
         (Method::ConfigMapKeyRename, "config/map-key-rename"),
@@ -261,6 +268,23 @@ fn not_yet_implemented(method: Method) -> RpcResult {
         INTERNAL_ERROR,
         format!("{}: not yet implemented", method.wire_name()),
     ))
+}
+
+fn doctor_summary(results: &[DiagResult]) -> DoctorSummary {
+    DoctorSummary {
+        ok: results
+            .iter()
+            .filter(|r| r.severity == crate::doctor::Severity::Ok)
+            .count(),
+        warnings: results
+            .iter()
+            .filter(|r| r.severity == crate::doctor::Severity::Warn)
+            .count(),
+        errors: results
+            .iter()
+            .filter(|r| r.severity == crate::doctor::Severity::Error)
+            .count(),
+    }
 }
 
 fn personality_template_context(
@@ -425,6 +449,7 @@ impl RpcDispatcher {
             Method::Initialize => self.handle_initialize(&req.params).await,
             Method::Status => self.handle_status().await,
             Method::Health => self.handle_health(),
+            Method::DoctorRun => self.handle_doctor_run().await,
 
             // Sessions
             Method::SessionNew => self.handle_session_new(&req.params).await,
@@ -485,6 +510,9 @@ impl RpcDispatcher {
             Method::ConfigList => self.handle_config_list(&req.params),
             Method::ConfigDelete => self.handle_config_delete(&req.params).await,
             Method::ConfigMapKeys => self.handle_config_map_keys(&req.params),
+            Method::ConfigResolveAliasSource => {
+                self.handle_config_resolve_alias_source(&req.params)
+            }
             Method::ConfigMapKeyCreate => self.handle_config_map_key_create(&req.params).await,
             Method::ConfigMapKeyDelete => self.handle_config_map_key_delete(&req.params).await,
             Method::ConfigMapKeyRename => self.handle_config_map_key_rename(&req.params).await,
@@ -653,6 +681,13 @@ impl RpcDispatcher {
         Ok(val)
     }
 
+    async fn handle_doctor_run(&self) -> RpcResult {
+        let config = self.ctx.config.read().clone();
+        let results = crate::doctor::run_structured(&config).await;
+        let summary = doctor_summary(&results);
+        to_result(DoctorRunResult { results, summary })
+    }
+
     // ── TUI handlers ─────────────────────────────────────────────
 
     fn handle_tui_list(&self) -> RpcResult {
@@ -679,6 +714,11 @@ impl RpcDispatcher {
     #[cfg(test)]
     pub async fn handle_session_new_for_test(&self, params: &Value) -> RpcResult {
         self.handle_session_new(params).await
+    }
+
+    #[cfg(test)]
+    pub async fn handle_session_messages_for_test(&self, params: &Value) -> RpcResult {
+        self.handle_session_messages(params).await
     }
 
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
@@ -749,6 +789,8 @@ impl RpcDispatcher {
             false,
             exclude_memory,
             tui_env,
+            self.ctx.sop_engine.clone(),
+            self.ctx.sop_audit.clone(),
         )
         .await
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to create agent: {e}")))?;
@@ -1146,6 +1188,8 @@ impl RpcDispatcher {
             false,
             exclude_memory,
             tui_env,
+            self.ctx.sop_engine.clone(),
+            self.ctx.sop_audit.clone(),
         )
         .await
         .ok()?;
@@ -1549,13 +1593,19 @@ impl RpcDispatcher {
             }
             Ok(TurnOutcome::Cancelled { partial_text, .. }) => {
                 let cancel_message = match cancel_cause {
-                    Some(crate::rpc::session::CancelCause::ClientRpc) => {
-                        format!("turn cancelled by user in RPC_SESSION {}", req.session_id)
-                    }
                     Some(cause) => {
-                        format!("turn cancelled by daemon: {}", cause.as_str())
+                        format!(
+                            "turn cancelled via {} in RPC_SESSION {}",
+                            cause.as_str(),
+                            req.session_id
+                        )
                     }
-                    None => "turn cancelled by daemon: unattributed".to_string(),
+                    None => {
+                        format!(
+                            "turn cancelled (cause unattributed) in RPC_SESSION {}",
+                            req.session_id
+                        )
+                    }
                 };
                 ::zeroclaw_log::record!(
                     INFO,
@@ -1913,6 +1963,72 @@ impl RpcDispatcher {
             if !loaded.is_empty() {
                 raw = loaded;
                 break;
+            }
+        }
+
+        // Fallback: ACP sessions live in a dedicated store (`acp-sessions.db`)
+        // and are keyed by their raw UUID — they will never be found in the
+        // unified `session_backend` above. Without this branch the Code
+        // (ACP) pane in the TUI resumes a persisted session and renders a
+        // blank transcript even though the picker (which reads from the ACP
+        // store) reports a non-zero `message_count`. See issue #7799.
+        //
+        // Flatten `ConversationMessage` → `ChatMessage` for the
+        // `{ role, content }` wire schema:
+        //   * `Chat(...)`               → pass through.
+        //   * `AssistantToolCalls { text: Some(t), .. }`
+        //                               → assistant `ChatMessage` carrying
+        //                                 just the visible narration `t`.
+        //                                 The agent's duplicate-narration
+        //                                 guard means this text is stored
+        //                                 ONLY on the `AssistantToolCalls`
+        //                                 entry — there is no paired
+        //                                 `Chat(assistant)` row — so dropping
+        //                                 it would lose visible turns from
+        //                                 the replayed transcript on resume.
+        //   * `AssistantToolCalls { text: None | Some("") , .. }`
+        //                               → drop: nothing to render and the
+        //                                 wire shape can't carry tool-call
+        //                                 metadata.
+        //   * `ToolResults(_)`          → drop: the wire shape can't carry
+        //                                 tool results and the TUI's
+        //                                 `load_history` ignores them.
+        // Surfacing tool-call metadata and tool results in replay is a
+        // separate wire-schema change.
+        if raw.is_empty()
+            && let Some(store) = self.ctx.acp_session_store.as_ref()
+        {
+            match store.load_session(&req.session_id) {
+                Ok(Some(data)) => {
+                    raw = data
+                        .messages
+                        .into_iter()
+                        .filter_map(|m| {
+                            match m {
+                            zeroclaw_api::model_provider::ConversationMessage::Chat(c) => Some(c),
+                            zeroclaw_api::model_provider::ConversationMessage::AssistantToolCalls {
+                                text: Some(t),
+                                ..
+                            } if !t.is_empty() => {
+                                Some(zeroclaw_api::model_provider::ChatMessage::assistant(t))
+                            }
+                            zeroclaw_api::model_provider::ConversationMessage::AssistantToolCalls {
+                                ..
+                            }
+                            | zeroclaw_api::model_provider::ConversationMessage::ToolResults(_) => {
+                                None
+                            }
+                        }
+                        })
+                        .collect();
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Failed to load ACP session messages: {e}"),
+                    ));
+                }
             }
         }
 
@@ -2494,6 +2610,16 @@ impl RpcDispatcher {
         })
     }
 
+    fn handle_config_resolve_alias_source(&self, params: &Value) -> RpcResult {
+        let req: ConfigResolveAliasSourceParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let values = config.resolve_alias_source(req.source);
+        to_result(ConfigResolveAliasSourceResult {
+            source: req.source,
+            values,
+        })
+    }
+
     fn handle_config_map_keys(&self, params: &Value) -> RpcResult {
         let req: ConfigMapKeysParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
@@ -3015,7 +3141,9 @@ impl RpcDispatcher {
                     has_picker,
                     completed,
                     ready: false,
-                    group: String::new(),
+                    group: zeroclaw_config::sections::section_group_for_key(&key)
+                        .label()
+                        .to_string(),
                     is_quickstart: wizard.is_some(),
                     shape: wizard.map(Section::shape),
                     label,
@@ -3469,6 +3597,15 @@ mod tests {
         serde_json::from_str(s).unwrap()
     }
 
+    fn make_approval_test_dispatcher() -> RpcDispatcher {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(zeroclaw_config::schema::Config::default(), sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        RpcDispatcher::new(ctx, tx, "test-peer-approval:pid=1".into())
+    }
+
     #[test]
     fn method_from_wire_roundtrip() {
         for (method, wire) in Method::ALL {
@@ -3487,11 +3624,95 @@ mod tests {
     }
 
     #[test]
+    fn doctor_run_method_is_registered() {
+        assert_eq!(Method::from_wire("doctor/run"), Some(Method::DoctorRun));
+        assert_eq!(Method::DoctorRun.wire_name(), "doctor/run");
+    }
+
+    #[test]
+    fn doctor_summary_counts_each_severity_bucket() {
+        let results = vec![
+            DiagResult {
+                severity: crate::doctor::Severity::Ok,
+                category: "config".to_string(),
+                message: "ok".to_string(),
+            },
+            DiagResult {
+                severity: crate::doctor::Severity::Warn,
+                category: "config".to_string(),
+                message: "warning".to_string(),
+            },
+            DiagResult {
+                severity: crate::doctor::Severity::Warn,
+                category: "runtime".to_string(),
+                message: "warning".to_string(),
+            },
+            DiagResult {
+                severity: crate::doctor::Severity::Error,
+                category: "workspace".to_string(),
+                message: "error".to_string(),
+            },
+        ];
+
+        let summary = doctor_summary(&results);
+
+        assert_eq!(summary.ok, 1);
+        assert_eq!(summary.warnings, 2);
+        assert_eq!(summary.errors, 1);
+    }
+
+    #[test]
     fn method_all_no_duplicates() {
         let mut seen = std::collections::HashSet::new();
         for (_, wire) in Method::ALL {
             assert!(seen.insert(*wire), "duplicate wire name: {wire}");
         }
+    }
+
+    #[test]
+    fn session_approve_resolves_pending_request() {
+        let dispatcher = make_approval_test_dispatcher();
+        let (tx, mut rx) =
+            tokio::sync::oneshot::channel::<zeroclaw_api::channel::ChannelApprovalResponse>();
+        dispatcher
+            .ctx
+            .approval_pending
+            .insert("req-allow".to_string(), tx);
+
+        let result = dispatcher
+            .handle_session_approve(&json!({
+                "session_id": "sess-1",
+                "request_id": "req-allow",
+                "decision": "allow_once"
+            }))
+            .unwrap();
+
+        assert_eq!(result["session_id"], "sess-1");
+        assert_eq!(result["request_id"], "req-allow");
+        assert_eq!(result["acknowledged"], true);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            zeroclaw_api::channel::ChannelApprovalResponse::Approve
+        );
+        assert!(!dispatcher.ctx.approval_pending.contains("req-allow"));
+    }
+
+    #[test]
+    fn session_approve_unknown_request_is_acknowledged_noop() {
+        let dispatcher = make_approval_test_dispatcher();
+
+        let result = dispatcher
+            .handle_session_approve(&json!({
+                "session_id": "sess-1",
+                "request_id": "timed-out-req",
+                "decision": "allow_once"
+            }))
+            .unwrap();
+
+        assert_eq!(result["session_id"], "sess-1");
+        assert_eq!(result["request_id"], "timed-out-req");
+        assert_eq!(result["acknowledged"], true);
+        assert!(!dispatcher.ctx.approval_pending.contains("timed-out-req"));
     }
 
     #[test]
@@ -3729,7 +3950,7 @@ mod tests {
             AliasedAgentConfig {
                 enabled: true,
                 model_provider: "openai.test-provider".into(),
-                risk_profile: "test-profile".to_string(),
+                risk_profile: "test-profile".into(),
                 ..Default::default()
             },
         );
@@ -3934,6 +4155,132 @@ mod tests {
             chat_backend.load(&format!("rpc_{sid}")).is_empty(),
             "ACP session must NOT touch chat session_backend"
         );
+    }
+
+    /// Regression for #7799: `session/messages` must fall back to the dedicated
+    /// ACP session store when the requested session is an ACP session whose
+    /// messages live there (and NOT in the unified `session_backend`). Without
+    /// this, the Code (ACP) pane resumes a saved session and renders a blank
+    /// transcript even though the picker (which reads `session/list-acp`)
+    /// reports a non-zero `message_count`.
+    #[tokio::test]
+    async fn session_messages_falls_back_to_acp_store_for_acp_sessions() {
+        use serde_json::from_value;
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+        use zeroclaw_providers::{ToolCall, ToolResultMessage};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        // Seed an ACP session directly in the dedicated store, exactly the way
+        // a real Code pane would after a turn: a user message, an assistant
+        // turn that narrates while issuing a tool call (the agent stores the
+        // narration ONLY on the `AssistantToolCalls` row — the
+        // duplicate-narration guard suppresses a paired `Chat(assistant)`
+        // row), the tool result, a second tool-call round with no narration,
+        // and a final plain assistant reply. Nothing is written to the
+        // unified `session_backend`, mirroring the production split.
+        let sid = "acp-resume-7799";
+        acp_store
+            .create_session(sid, "test-agent", "/tmp/ws")
+            .expect("ACP session row");
+        acp_store
+            .append_turn(
+                sid,
+                &[
+                    ConversationMessage::Chat(ChatMessage {
+                        role: "user".into(),
+                        content: "hello from prior turn".into(),
+                    }),
+                    ConversationMessage::AssistantToolCalls {
+                        text: Some("let me check the logs".into()),
+                        tool_calls: vec![ToolCall {
+                            id: "tc-1".into(),
+                            name: "shell".into(),
+                            arguments: r#"{"command":"tail log"}"#.into(),
+                            extra_content: None,
+                        }],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        tool_call_id: "tc-1".into(),
+                        content: "log contents".into(),
+                    }]),
+                    ConversationMessage::AssistantToolCalls {
+                        text: None,
+                        tool_calls: vec![ToolCall {
+                            id: "tc-2".into(),
+                            name: "shell".into(),
+                            arguments: r#"{"command":"grep err"}"#.into(),
+                            extra_content: None,
+                        }],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::ToolResults(vec![ToolResultMessage {
+                        tool_call_id: "tc-2".into(),
+                        content: "no errors".into(),
+                    }]),
+                    ConversationMessage::Chat(ChatMessage {
+                        role: "assistant".into(),
+                        content: "ack from prior turn".into(),
+                    }),
+                ],
+            )
+            .expect("append turn");
+
+        // Sanity: the unified backend really is empty for this id under any
+        // candidate key. If this ever changes the test below stops being a
+        // regression for the ACP-store fallback.
+        for key in [sid.to_string(), format!("rpc_{sid}"), format!("gw_{sid}")] {
+            assert!(
+                chat_backend.load(&key).is_empty(),
+                "precondition: unified backend has no rows for {key}"
+            );
+        }
+
+        let result = dispatcher
+            .handle_session_messages_for_test(&json!({ "session_id": sid }))
+            .await
+            .expect("session/messages should succeed");
+        let parsed: SessionMessagesResult =
+            from_value(result).expect("SessionMessagesResult shape");
+
+        // Expected replayed transcript (after flattening for the
+        // `{ role, content }` wire shape):
+        //   0: user      "hello from prior turn"
+        //   1: assistant "let me check the logs"   (narration recovered
+        //                                            from AssistantToolCalls.text;
+        //                                            losing this is the
+        //                                            regression #7903 review
+        //                                            was raised against)
+        //   2: assistant "ack from prior turn"
+        // The text-less AssistantToolCalls and both ToolResults rows are
+        // dropped because the current wire schema can't carry them.
+        assert_eq!(parsed.session_id, sid);
+        assert_eq!(
+            parsed.total, 3,
+            "ACP-backed sessions must report their full replayable message count"
+        );
+        assert_eq!(
+            parsed.messages.len(),
+            3,
+            "ACP-backed sessions must replay their persisted messages, not a blank transcript"
+        );
+        assert_eq!(parsed.messages[0].role, "user");
+        assert_eq!(parsed.messages[0].content, "hello from prior turn");
+        assert_eq!(parsed.messages[1].role, "assistant");
+        assert_eq!(
+            parsed.messages[1].content, "let me check the logs",
+            "assistant narration on an AssistantToolCalls row must be preserved \
+             when flattening for session/messages — the agent stores it ONLY \
+             on that row, so dropping it would lose visible turns from the \
+             replayed transcript"
+        );
+        assert_eq!(parsed.messages[2].role, "assistant");
+        assert_eq!(parsed.messages[2].content, "ack from prior turn");
     }
 
     /// A reaped ACP session (gone from memory, durable row intact) must

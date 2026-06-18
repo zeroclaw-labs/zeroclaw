@@ -432,6 +432,20 @@ impl Memory for LucidMemory {
             .await
     }
 
+    async fn purge_agent(&self, agent_alias: &str) -> anyhow::Result<usize> {
+        self.local.purge_agent(agent_alias).await
+    }
+
+    async fn export_agent(&self, agent_alias: &str) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.local.export_agent(agent_alias).await
+    }
+
+    async fn rename_agent(&self, from: &str, to: &str) -> anyhow::Result<usize> {
+        // The remote Lucid daemon has no agent_id concept; alias→UUID lives in
+        // the local SQLite mirror, so rename is a local update (mirrors purge).
+        self.local.rename_agent(from, to).await
+    }
+
     async fn count(&self) -> anyhow::Result<usize> {
         self.local.count().await
     }
@@ -503,15 +517,15 @@ mod tests {
 
     fn write_fake_lucid_script(dir: &Path) -> String {
         let script_path = dir.join("fake-lucid.sh");
-        let script = r#"#!/usr/bin/env bash
-set -euo pipefail
+        let script = r#"#!/bin/sh
+set -eu
 
-if [[ "${1:-}" == "store" ]]; then
+if [ "${1:-}" = "store" ]; then
   echo '{"success":true,"id":"mem_1"}'
   exit 0
 fi
 
-if [[ "${1:-}" == "context" ]]; then
+if [ "${1:-}" = "context" ]; then
   cat <<'EOF'
 <lucid-context>
 Auth context snapshot
@@ -535,15 +549,15 @@ exit 1
 
     fn write_delayed_lucid_script(dir: &Path) -> String {
         let script_path = dir.join("delayed-lucid.sh");
-        let script = r#"#!/usr/bin/env bash
-set -euo pipefail
+        let script = r#"#!/bin/sh
+set -eu
 
-if [[ "${1:-}" == "store" ]]; then
+if [ "${1:-}" = "store" ]; then
   echo '{"success":true,"id":"mem_1"}'
   exit 0
 fi
 
-if [[ "${1:-}" == "context" ]]; then
+if [ "${1:-}" = "context" ]; then
   # Simulate a cold start that is slower than 120ms but below the 500ms timeout.
   sleep 0.2
   cat <<'EOF'
@@ -569,15 +583,15 @@ exit 1
         let script_path = dir.join("probe-lucid.sh");
         let marker = marker_path.display().to_string();
         let script = format!(
-            r#"#!/usr/bin/env bash
-set -euo pipefail
+            r#"#!/bin/sh
+set -eu
 
-if [[ "${{1:-}}" == "store" ]]; then
+if [ "${{1:-}}" = "store" ]; then
   echo '{{"success":true,"id":"mem_store"}}'
   exit 0
 fi
 
-if [[ "${{1:-}}" == "context" ]]; then
+if [ "${{1:-}}" = "context" ]; then
   printf 'context\n' >> "{marker}"
   cat <<'EOF'
 <lucid-context>
@@ -739,15 +753,15 @@ exit 1
         let script_path = dir.join("failing-lucid.sh");
         let marker = marker_path.display().to_string();
         let script = format!(
-            r#"#!/usr/bin/env bash
-set -euo pipefail
+            r#"#!/bin/sh
+set -eu
 
-if [[ "${{1:-}}" == "store" ]]; then
+if [ "${{1:-}}" = "store" ]; then
   echo '{{"success":true,"id":"mem_store"}}'
   exit 0
 fi
 
-if [[ "${{1:-}}" == "context" ]]; then
+if [ "${{1:-}}" = "context" ]; then
   printf 'context\n' >> "{marker}"
   echo "simulated lucid failure" >&2
   exit 1

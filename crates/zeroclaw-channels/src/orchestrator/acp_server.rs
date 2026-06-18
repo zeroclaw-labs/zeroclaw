@@ -108,6 +108,10 @@ pub struct AcpServer {
     /// that `/ws/canvas/:id` WebSocket subscribers read from.  `None` in
     /// standalone `zeroclaw acp` mode where no gateway is running.
     canvas_store: Option<CanvasStore>,
+    /// Shared SOP engine from the daemon. `None` in standalone mode — agents
+    /// build their own engine from config.
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 }
 
 impl AcpServer {
@@ -159,6 +163,8 @@ impl AcpServer {
             loading_sessions: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             store,
             canvas_store: None,
+            sop_engine: None,
+            sop_audit: None,
         }
     }
 
@@ -167,6 +173,18 @@ impl AcpServer {
     /// `/ws/canvas/:id` WebSocket endpoint serves.
     pub fn with_canvas_store(mut self, canvas_store: CanvasStore) -> Self {
         self.canvas_store = Some(canvas_store);
+        self
+    }
+
+    /// Attach the shared SOP engine from the daemon so that agents created by
+    /// this server share a single SOP engine with the rest of the daemon.
+    pub fn with_sop_engine(
+        mut self,
+        sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+        sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    ) -> Self {
+        self.sop_engine = sop_engine;
+        self.sop_audit = sop_audit;
         self
     }
 
@@ -561,6 +579,9 @@ impl AcpServer {
             Some(std::path::Path::new(&workspace_dir)),
             false,
             true,
+            self.sop_engine.clone(),
+            self.sop_audit.clone(),
+            self.canvas_store.clone(),
         )
         .await
         .map_err(|e| RpcError {
@@ -771,6 +792,9 @@ impl AcpServer {
             Some(&workspace_dir),
             false,
             true,
+            self.sop_engine.clone(),
+            self.sop_audit.clone(),
+            self.canvas_store.clone(),
         )
         .await
         .map_err(|e| RpcError {
@@ -970,6 +994,9 @@ impl AcpServer {
             Some(&workspace_dir),
             false,
             true,
+            self.sop_engine.clone(),
+            self.sop_audit.clone(),
+            self.canvas_store.clone(),
         )
         .await
         .map_err(|e| RpcError {
@@ -1367,6 +1394,8 @@ impl AcpServer {
                     })),
                 "ACP session/prompt turn cancelled"
             );
+            self.write_notification(&Self::turn_cancelled_notification(&session_id))
+                .await;
             return Ok(Self::cancelled_prompt_result(session_id, &accumulated_text));
         }
 
@@ -1475,13 +1504,36 @@ impl AcpServer {
     }
 
     fn cancelled_prompt_result(session_id: String, accumulated_text: &str) -> Value {
-        let marker = zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
+        let marker = zeroclaw_runtime::i18n::get_required_cli_string("turn-cancelled-client-rpc");
         let content = if accumulated_text.is_empty() {
             marker
         } else {
             format!("{accumulated_text}\n\n{marker}")
         };
         Self::prompt_result(session_id, "cancelled", content)
+    }
+
+    fn turn_cancelled_notification(session_id: &str) -> JsonRpcNotification {
+        let marker = zeroclaw_runtime::i18n::get_required_cli_string("turn-cancelled-client-rpc");
+        JsonRpcNotification {
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: serde_json::json!({
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": format!("turn-cancelled-{session_id}"),
+                    "name": "turn-cancelled",
+                    "title": "turn-cancelled",
+                    "kind": "think",
+                    "status": "completed",
+                    "content": [{
+                        "type": "content",
+                        "content": { "type": "text", "text": marker }
+                    }]
+                }
+            }),
+        }
     }
 
     fn parse_prompt(params: &Value) -> std::result::Result<String, RpcError> {
@@ -1979,6 +2031,27 @@ fn history_notifications_for_message(
 ) -> Vec<JsonRpcNotification> {
     match msg {
         ConversationMessage::Chat(chat) => {
+            if chat.is_pruned_tool_exchange_summary() {
+                return vec![JsonRpcNotification {
+                    jsonrpc: "2.0",
+                    method: "session/update",
+                    params: serde_json::json!({
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "tool_call",
+                            "toolCallId": format!("history-pruner-{session_id}"),
+                            "name": "history-pruner",
+                            "title": "history-pruner",
+                            "kind": "think",
+                            "status": "completed",
+                            "content": [{
+                                "type": "content",
+                                "content": { "type": "text", "text": &chat.content }
+                            }]
+                        }
+                    }),
+                }];
+            }
             let update_type = match chat.role.as_str() {
                 "user" => "user_message_chunk",
                 "assistant" => "agent_message_chunk",
@@ -2275,7 +2348,7 @@ mod tests {
             "test-agent".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "openrouter.default".into(),
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..Default::default()
             },
         );
@@ -2325,7 +2398,7 @@ mod tests {
             "only-agent".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "openrouter.default".into(),
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..Default::default()
             },
         );
@@ -2400,7 +2473,7 @@ mod tests {
             "agent-alpha".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "openrouter.default".into(),
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..Default::default()
             },
         );
@@ -2408,7 +2481,7 @@ mod tests {
             "agent-beta".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "openrouter.default".into(),
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..Default::default()
             },
         );
@@ -2458,7 +2531,7 @@ mod tests {
             "agent-alpha".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "openrouter.default".into(),
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..Default::default()
             },
         );
@@ -2466,7 +2539,7 @@ mod tests {
             "agent-beta".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "openrouter.default".into(),
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..Default::default()
             },
         );
@@ -2618,14 +2691,14 @@ mod tests {
             with_partial["content"],
             format!(
                 "partial text\n\n{}",
-                zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user")
+                zeroclaw_runtime::i18n::get_required_cli_string("turn-cancelled-client-rpc")
             )
         );
 
         let marker_only = AcpServer::cancelled_prompt_result("test-sid".to_string(), "");
         assert_eq!(
             marker_only["content"],
-            zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user")
+            zeroclaw_runtime::i18n::get_required_cli_string("turn-cancelled-client-rpc")
         );
     }
 
@@ -2874,7 +2947,7 @@ mod tests {
             "test-agent".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "anthropic.default".into(),
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..Default::default()
             },
         );
@@ -2990,7 +3063,7 @@ mod tests {
             "test-agent".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
                 model_provider: "anthropic.default".into(),
-                risk_profile: "default".to_string(),
+                risk_profile: "default".into(),
                 ..Default::default()
             },
         );
@@ -3302,6 +3375,51 @@ mod tests {
             .expect_err("session/load for active session must fail");
 
         assert_eq!(err.code, INVALID_PARAMS);
+    }
+
+    #[test]
+    fn turn_cancelled_notification_is_styled_tool_call() {
+        let note = AcpServer::turn_cancelled_notification("sess-c");
+        let update = &note.params["update"];
+        assert_eq!(update["sessionUpdate"], "tool_call");
+        assert_eq!(update["name"], "turn-cancelled");
+        assert_eq!(update["status"], "completed");
+        assert!(
+            update["content"][0]["content"]["text"]
+                .as_str()
+                .is_some_and(|t| !t.is_empty())
+        );
+    }
+
+    #[test]
+    fn history_pruner_marker_replays_as_tool_call_not_agent_message() {
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+        let marker = ChatMessage::pruned_tool_exchange_summary(3);
+        let msg = ConversationMessage::Chat(ChatMessage::assistant(&marker));
+        let notes = history_notifications_for_message("sess-x", &msg);
+        assert_eq!(notes.len(), 1);
+        let update = &notes[0].params["update"];
+        assert_eq!(update["sessionUpdate"], "tool_call");
+        assert_eq!(update["name"], "history-pruner");
+        assert_eq!(update["content"][0]["content"]["text"], marker);
+
+        let plain = ConversationMessage::Chat(ChatMessage::assistant("normal reply"));
+        let plain_notes = history_notifications_for_message("sess-x", &plain);
+        assert_eq!(
+            plain_notes[0].params["update"]["sessionUpdate"],
+            "agent_message_chunk"
+        );
+
+        // Sessions pruned before #7684 carry the legacy marker; they must still
+        // replay as the styled tool_call, not leak the raw marker as agent text.
+        let legacy = ConversationMessage::Chat(ChatMessage::assistant(
+            "[Tool exchange: 3 tool call(s) results collapsed]",
+        ));
+        let legacy_notes = history_notifications_for_message("sess-x", &legacy);
+        assert_eq!(
+            legacy_notes[0].params["update"]["sessionUpdate"],
+            "tool_call"
+        );
     }
 
     #[tokio::test]
