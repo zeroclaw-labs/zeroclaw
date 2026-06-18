@@ -1910,6 +1910,11 @@ pub async fn handle_claude_code_hook(
     Json(serde_json::json!({ "ok": true }))
 }
 
+// Shared test helper: `api_config` tests reuse this AppState builder for the
+// agent rename/delete cascade handlers (#7907 regression coverage).
+#[cfg(test)]
+pub(crate) use tests::test_state;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2075,7 +2080,7 @@ mod tests {
         config
     }
 
-    fn test_state(config: zeroclaw_config::schema::Config) -> AppState {
+    pub(crate) fn test_state(config: zeroclaw_config::schema::Config) -> AppState {
         AppState {
             config: Arc::new(RwLock::new(config)),
             model_provider: Arc::new(MockModelProvider),
