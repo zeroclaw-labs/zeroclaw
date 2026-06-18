@@ -270,7 +270,16 @@ mod tests {
         }
         event
     }
-
+    fn make_event_with_ts_and_id(ts: &str, id: &str, action: &str) -> LogEvent {
+        let mut event = LogEvent::new(
+            crate::event::Severity::Info,
+            action,
+            crate::event::EventCategory::Agent,
+        );
+        event.timestamp = ts.to_string();
+        event.id = id.to_string();
+        event
+    }
     #[test]
     fn empty_file_returns_at_end() {
         let tmp = tempfile::tempdir().unwrap();
@@ -401,5 +410,113 @@ mod tests {
         assert_eq!(older_page.events[1].message.as_deref(), Some("event-1"));
         assert_eq!(older_page.events[2].message.as_deref(), Some("event-0"));
         assert!(older_page.at_end);
+    }
+
+    #[test]
+    fn same_timestamp_pagination_no_duplicates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trace.jsonl");
+
+        let ts = "2026-01-01T00:00:00.000Z";
+        let events = vec![
+            make_event_with_ts_and_id(ts, "a", "act1"),
+            make_event_with_ts_and_id(ts, "b", "act2"),
+            make_event_with_ts_and_id(ts, "c", "act3"),
+            make_event_with_ts_and_id(ts, "d", "act4"),
+            make_event_with_ts_and_id(ts, "e", "act5"),
+        ];
+
+        write_jsonl(&path, &events);
+
+        let page1 = load_page(&path, &LogFilter::default(), 2).unwrap();
+        assert_eq!(page1.events.len(), 2);
+        let (cursor_ts, cursor_id) = page1.next_cursor.unwrap();
+
+        let older_filter = LogFilter {
+            until_ts: Some(cursor_ts),
+            until_id: Some(cursor_id),
+            ..Default::default()
+        };
+
+        let page2 = load_page(&path, &older_filter, 2).unwrap();
+        assert_eq!(page2.events.len(), 2);
+
+        // 不重复
+        let ids1: Vec<_> = page1.events.iter().map(|e| &e.id).collect();
+        let ids2: Vec<_> = page2.events.iter().map(|e| &e.id).collect();
+        for id in &ids1 {
+            assert!(!ids2.contains(id));
+        }
+    }
+    #[test]
+    fn same_timestamp_ordering_is_stable_by_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trace.jsonl");
+
+        let ts = "2026-01-01T00:00:00.000Z";
+        let events = vec![
+            make_event_with_ts_and_id(ts, "z", "last"),
+            make_event_with_ts_and_id(ts, "m", "middle"),
+            make_event_with_ts_and_id(ts, "a", "first"),
+        ];
+
+        write_jsonl(&path, &events);
+
+        let page = load_page(&path, &LogFilter::default(), 10).unwrap();
+
+        // newest first ⇒ z, m, a
+        assert_eq!(page.events[0].id, "z");
+        assert_eq!(page.events[1].id, "m");
+        assert_eq!(page.events[2].id, "a");
+    }
+    #[test]
+    fn same_timestamp_last_page_reports_at_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trace.jsonl");
+
+        let ts = "2026-01-01T00:00:00.000Z";
+        let events = vec![
+            make_event_with_ts_and_id(ts, "a", "x"),
+            make_event_with_ts_and_id(ts, "b", "y"),
+        ];
+
+        write_jsonl(&path, &events);
+
+        let page = load_page(&path, &LogFilter::default(), 10).unwrap();
+        assert!(page.at_end);
+    }
+    #[test]
+    fn mixed_timestamps_with_same_timestamp_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trace.jsonl");
+
+        let events = vec![
+            make_event_with_ts_and_id("2026-01-01T00:00:02.000Z", "a", "new"),
+            make_event_with_ts_and_id("2026-01-01T00:00:01.000Z", "b", "mid"),
+            make_event_with_ts_and_id("2026-01-01T00:00:00.000Z", "c", "old1"),
+            make_event_with_ts_and_id("2026-01-01T00:00:00.000Z", "d", "old2"),
+        ];
+
+        write_jsonl(&path, &events);
+
+        let page1 = load_page(&path, &LogFilter::default(), 2).unwrap();
+        assert_eq!(page1.events[0].id, "a");
+        assert_eq!(page1.events[1].id, "b");
+
+        let (ts, id) = page1.next_cursor.unwrap();
+        let page2 = load_page(
+            &path,
+            &LogFilter {
+                until_ts: Some(ts),
+                until_id: Some(id),
+                ..Default::default()
+            },
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(page2.events[0].id, "d");
+        assert_eq!(page2.events[1].id, "c");
+        assert!(page2.at_end);
     }
 }

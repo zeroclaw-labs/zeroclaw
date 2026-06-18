@@ -544,4 +544,47 @@ mod tests {
         assert_eq!(meta.message_count, 2);
         assert!(meta.name.is_none());
     }
+    #[test]
+fn list_sessions_with_metadata_ordered_by_mtime_desc() {
+    let tmp = TempDir::new().unwrap();
+    let store = SessionStore::new(tmp.path()).unwrap();
+
+    // 人为制造不同时间的 session 文件
+    store
+        .append("old", &ChatMessage::user("old"))
+        .unwrap();
+
+    // 强制时间差
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    store
+        .append("new", &ChatMessage::user("new"))
+        .unwrap();
+
+    let metas = store.list_sessions_with_metadata();
+    assert_eq!(metas.len(), 2);
+
+    // newest first
+    assert_eq!(metas[0].key, "new");
+    assert_eq!(metas[1].key, "old");
+
+    // strict ordering
+    assert!(metas[0].last_activity >= metas[1].last_activity);
+}
+#[test]
+fn list_sessions_with_metadata_stable_when_mtime_equal() {
+    let tmp = TempDir::new().unwrap();
+    let store = SessionStore::new(tmp.path()).unwrap();
+
+    // 两个 session 几乎同时写入，mtime 可能相同
+    store.append("a", &ChatMessage::user("a")).unwrap();
+    store.append("b", &ChatMessage::user("b")).unwrap();
+
+    let mut metas = store.list_sessions_with_metadata();
+    metas.sort_by_key(|m| m.key.clone());
+
+    assert_eq!(metas.len(), 2);
+    assert!(metas.iter().any(|m| m.key == "a"));
+    assert!(metas.iter().any(|m| m.key == "b"));
+}
 }

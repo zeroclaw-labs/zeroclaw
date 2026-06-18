@@ -912,7 +912,29 @@ impl SessionBackend for SqliteSessionBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{DateTime, Duration, Utc};
     use tempfile::TempDir;
+
+    /// Insert a session with a specific created_at timestamp and return its key.
+    fn insert_session_with_time(backend: &SqliteSessionBackend, key: &str, ts: DateTime<Utc>) {
+        let conn = backend.conn.lock();
+        let ts_str = ts.to_rfc3339();
+        conn.execute(
+            "INSERT INTO sessions (session_key, role, content, created_at)
+            VALUES (?1, 'user', 'test', ?2)",
+            params![key, ts_str],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count)
+            VALUES (?1, ?2, ?2, 1)
+            ON CONFLICT(session_key) DO UPDATE SET
+                last_activity = excluded.last_activity,
+                message_count = message_count + 1",
+            params![key, ts_str],
+        )
+        .unwrap();
+    }
 
     #[test]
     fn round_trip_sqlite() {
@@ -1542,5 +1564,79 @@ mod tests {
         assert_eq!(single.name, from_list.name);
         assert_eq!(single.created_at, from_list.created_at);
         assert_eq!(single.last_activity, from_list.last_activity);
+    }
+    #[test]
+    fn load_with_timestamps_preserves_precision() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        // Use a non-round timestamp (millisecond precision)
+        let ts = Utc::now() - Duration::seconds(37) - Duration::milliseconds(123);
+        insert_session_with_time(&backend, "s1", ts);
+
+        let msgs = backend.load_with_timestamps("s1");
+        assert_eq!(msgs.len(), 1);
+        let loaded = msgs[0].created_at.unwrap();
+
+        // Should be within 1 second (SQLite stores RFC 3339 with sub-second)
+        assert!((loaded - ts).num_milliseconds().abs() < 1000);
+    }
+    #[test]
+    fn list_sessions_ordering_by_last_activity() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        let t1 = Utc::now() - Duration::hours(2);
+        let t2 = Utc::now() - Duration::hours(1);
+        let t3 = Utc::now();
+
+        insert_session_with_time(&backend, "old", t1);
+        insert_session_with_time(&backend, "mid", t2);
+        insert_session_with_time(&backend, "new", t3);
+
+        let sessions = backend.list_sessions_with_metadata();
+        assert_eq!(sessions.len(), 3);
+        assert_eq!(sessions[0].key, "new");
+        assert_eq!(sessions[1].key, "mid");
+        assert_eq!(sessions[2].key, "old");
+    }
+    #[test]
+    fn metadata_timestamps_use_utc_not_local() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        // Insert directly with a fixed UTC timestamp
+        let fixed = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        insert_session_with_time(&backend, "utc_session", fixed);
+
+        let meta = backend.get_session_metadata("utc_session").unwrap();
+        assert_eq!(meta.created_at, fixed);
+        assert_eq!(meta.last_activity, fixed);
+    }
+    #[test]
+    fn sessions_with_missing_timestamp_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        // Manually insert with empty created_at to test fallback
+        let conn = backend.conn.lock();
+        conn.execute(
+            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count)
+            VALUES ('bad_ts', '', '', 0)",
+            [],
+        )
+        .unwrap();
+
+        let meta = backend.list_sessions_with_metadata();
+        assert_eq!(meta.len(), 1);
+        // Should fallback to Utc::now() rather than panic
+        assert!(
+            meta[0].created_at
+                > DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+        );
     }
 }

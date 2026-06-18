@@ -3750,4 +3750,131 @@ mod tests {
         let entry = mem.get("global").await.unwrap().expect("row should exist");
         assert!(entry.session_id.is_none());
     }
+    #[tokio::test]
+async fn recall_ordering_stable_when_timestamps_are_equal() {
+    let tmp = TempDir::new().unwrap();
+    let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+
+    // 用固定时间戳写入多条记录（模拟同秒内的多次存储）
+    let fixed_ts = "2026-06-18T12:00:00Z";
+    for i in 0..5 {
+        mem.store(
+            &format!("key_{i}"),
+            &format!("content {i}"),
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        // 手动覆盖 updated_at 使它们完全相同
+    }
+
+    // 强制把所有行的 updated_at 设为同一个值
+    {
+        let conn = mem.conn.lock();
+        conn.execute(
+            "UPDATE memories SET updated_at = ?1",
+            rusqlite::params![fixed_ts],
+        )
+        .unwrap();
+    }
+
+    // recall 不带关键词 → 按 updated_at DESC 排序，同时间戳内按插入顺序（id 排序）
+    let results = mem.recall("", 10, None, None, None).await.unwrap();
+    assert_eq!(results.len(), 5);
+
+    // 同时间戳时，排序应稳定（不 panic、不丢数据）
+    let keys: Vec<&str> = results.iter().map(|e| e.key.as_str()).collect();
+    assert!(
+        keys.contains(&"key_0")
+            && keys.contains(&"key_1")
+            && keys.contains(&"key_2")
+            && keys.contains(&"key_3")
+            && keys.contains(&"key_4"),
+        "All 5 records must be present when timestamps are equal"
+    );
+
+    // 再次查询，顺序应一致（稳定性）
+    let results2 = mem.recall("", 10, None, None, None).await.unwrap();
+    let keys2: Vec<&str> = results2.iter().map(|e| e.key.as_str()).collect();
+    assert_eq!(
+        keys, keys2,
+        "Ordering must be stable across repeated queries with equal timestamps"
+    );
+}
+#[tokio::test]
+async fn timestamp_roundtrip_preserves_utc_precision() {
+    let tmp = TempDir::new().unwrap();
+    let mem = SqliteMemory::new("test", tmp.path()).unwrap();
+
+    // 用不同精度和时区偏移的时间戳写入
+    let timestamps = [
+        "2026-01-01T00:00:00Z",          // 整秒
+        "2026-01-01T00:00:00.123Z",      // 毫秒
+        "2026-01-01T00:00:00.456789Z",   // 微秒
+        "2026-06-18T12:30:45.000Z",      // 另一个整秒
+    ];
+
+    for (i, ts) in timestamps.iter().enumerate() {
+        mem.store_with_metadata(
+            &format!("ts_{i}"),
+            &format!("timestamp test {i}"),
+            MemoryCategory::Core,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        // 覆盖为精确的时间戳字符串
+        let conn = mem.conn.lock();
+        conn.execute(
+            "UPDATE memories SET created_at = ?1, updated_at = ?1 WHERE key = ?2",
+            rusqlite::params![ts, format!("ts_{i}")],
+        )
+        .unwrap();
+    }
+
+    // 用 since/until 精确过滤
+    let results = mem
+        .recall(
+            "*",
+            10,
+            None,
+            Some("2026-01-01T00:00:00Z"),
+            Some("2026-01-01T00:00:01Z"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        results.len(),
+        3,
+        "Should find exactly 3 entries within the time range"
+    );
+
+    // 验证每个结果的时间戳都 >= since 且 <= until
+    for entry in &results {
+        assert!(
+            entry.timestamp >= "2026-01-01T00:00:00Z"
+                && entry.timestamp <= "2026-01-01T00:00:01Z",
+            "Timestamp {} is outside the expected range",
+            entry.timestamp
+        );
+    }
+
+    // 用精确匹配查单个
+    let single = mem
+        .recall(
+            "*",
+            10,
+            None,
+            Some("2026-06-18T12:30:45Z"),
+            Some("2026-06-18T12:30:46Z"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(single.len(), 1);
+    assert_eq!(single[0].key, "ts_3");
+}
 }
