@@ -779,6 +779,19 @@ impl Agent {
             return None;
         }
 
+        // Skip response-cache for multimodal prompts.  Messages carrying
+        // `[IMAGE:...]` (or other inline-asset) markers are normalised to
+        // data URIs later in the turn loop; cache keys built on the raw
+        // markers would either miss (different normalised payload) or
+        // collide (same marker path but different image content).
+        if messages
+            .iter()
+            .filter(|message| message.role != "system")
+            .any(|message| message.content.contains("[IMAGE:"))
+        {
+            return None;
+        }
+
         let system = messages
             .iter()
             .find(|message| message.role == "system")
@@ -961,6 +974,7 @@ impl Agent {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -983,6 +997,7 @@ impl Agent {
         exclude_memory: bool,
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
+        canvas_store: Option<tools::CanvasStore>,
     ) -> Result<Self> {
         Self::from_config_with_session_cwd_and_mcp_approval_mode(
             config,
@@ -994,6 +1009,7 @@ impl Agent {
             None,
             sop_engine,
             sop_audit,
+            canvas_store,
         )
         .await
     }
@@ -1022,6 +1038,7 @@ impl Agent {
             tui_env,
             sop_engine,
             sop_audit,
+            None,
         )
         .await
     }
@@ -1036,6 +1053,7 @@ impl Agent {
         tui_env: Option<std::collections::HashMap<String, String>>,
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
+        canvas_store: Option<tools::CanvasStore>,
     ) -> Result<Self> {
         let agent_cfg = config
             .agent(agent_alias)
@@ -1160,7 +1178,7 @@ impl Agent {
             &config.agents,
             agent_model_provider.and_then(|e| e.api_key.as_deref()),
             config,
-            None,
+            canvas_store,
             false,
             tui_env,
             sop_engine,
@@ -5331,6 +5349,62 @@ mod tests {
             seen_b.lock().len(),
             1,
             "fresh transcript must not reuse a cache entry written for a different prior transcript"
+        );
+    }
+
+    /// Response-cache key must return `None` when messages contain `[IMAGE:]`
+    /// markers, preventing stale or semantically wrong cache hits on
+    /// multimodal prompts.
+    #[test]
+    fn response_cache_key_skips_multimodal_image_markers() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let cache = Arc::new(
+            zeroclaw_memory::response_cache::ResponseCache::new(tmp.path(), 60, 100)
+                .expect("response cache init"),
+        );
+
+        let agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(vec![Box::new(MockTool)])
+            .memory(Arc::from(
+                zeroclaw_memory::create_memory(
+                    &zeroclaw_config::schema::MemoryConfig {
+                        backend: "none".into(),
+                        ..zeroclaw_config::schema::MemoryConfig::default()
+                    },
+                    std::path::Path::new("/tmp"),
+                    None,
+                )
+                .expect("memory"),
+            ))
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .response_cache(Some(cache))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_name("test-model".into())
+            .temperature(Some(0.0))
+            .build()
+            .expect("agent builder");
+
+        // Plain text messages should produce a cache key.
+        let plain_messages = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("hello"),
+        ];
+        let key = agent.response_cache_key_for_messages(&plain_messages, "test-model");
+        assert!(key.is_some(), "plain text prompt must produce a cache key");
+
+        // Messages containing `[IMAGE:]` must return None (skip cache).
+        let multimodal_messages = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("describe this image [IMAGE:/tmp/photo.png]"),
+        ];
+        let key = agent.response_cache_key_for_messages(&multimodal_messages, "test-model");
+        assert!(
+            key.is_none(),
+            "multimodal prompt with [IMAGE:] marker must skip response cache"
         );
     }
 

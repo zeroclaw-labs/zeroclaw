@@ -605,6 +605,91 @@ impl Memory for PostgresMemory {
         .await
     }
 
+    async fn purge_agent(&self, agent_alias: &str) -> Result<usize> {
+        let client = self.client.get().clone();
+        let qualified_table = self.qualified_table.clone();
+        let qualified_agents = self.qualified_agents.clone();
+        let alias = agent_alias.to_string();
+
+        run_on_os_thread(move || -> Result<usize> {
+            let mut client = client.lock();
+            let stmt = format!(
+                "DELETE FROM {qualified_table} WHERE agent_id = (SELECT id FROM {qualified_agents} WHERE alias = $1)"
+            );
+            let deleted = client.execute(&stmt, &[&alias])?;
+            usize::try_from(deleted).context("PostgreSQL returned an oversized delete count")
+        })
+        .await
+    }
+
+    async fn export_agent(&self, agent_alias: &str) -> Result<Vec<MemoryEntry>> {
+        let client = self.client.get().clone();
+        let qualified_table = self.qualified_table.clone();
+        let qualified_agents = self.qualified_agents.clone();
+        let alias = agent_alias.to_string();
+
+        run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
+            let mut client = client.lock();
+            let stmt = format!(
+                "
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id
+                FROM {qualified_table} m
+                LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+                WHERE m.agent_id = (SELECT id FROM {qualified_agents} WHERE alias = $1)
+                ORDER BY m.created_at ASC
+                "
+            );
+            let rows = client.query(&stmt, &[&alias])?;
+            rows.iter()
+                .map(Self::row_to_entry)
+                .collect::<Result<Vec<MemoryEntry>>>()
+        })
+        .await
+    }
+
+    async fn rename_agent(&self, from: &str, to: &str) -> Result<usize> {
+        let client = self.client.get().clone();
+        let qualified_agents = self.qualified_agents.clone();
+        let qualified_table = self.qualified_table.clone();
+        let from = from.to_string();
+        let to = to.to_string();
+
+        run_on_os_thread(move || -> Result<usize> {
+            let mut client = client.lock();
+            // Memory rows ride `agent_id` (FK → agents.id); only the alias moves.
+            // Collision-safety (see the SQLite impl): `agents.alias` is UNIQUE and
+            // delete leaves an orphan agents row, so a bare UPDATE onto a
+            // previously-used-then-deleted `to` alias would violate the
+            // constraint. Run inside a transaction: refuse if `to` still owns
+            // memory rows (a real conflict), else drop the orphan `to` row first.
+            let mut tx = client.transaction()?;
+            let to_rows: i64 = tx
+                .query_one(
+                    &format!(
+                        "SELECT COUNT(*) FROM {qualified_table} WHERE agent_id = (SELECT id FROM {qualified_agents} WHERE alias = $1)"
+                    ),
+                    &[&to],
+                )?
+                .get(0);
+            if to_rows > 0 {
+                anyhow::bail!(
+                    "cannot rename agent memory to `{to}`: an existing memory store under that alias has {to_rows} row(s); refusing to merge"
+                );
+            }
+            tx.execute(
+                &format!("DELETE FROM {qualified_agents} WHERE alias = $1"),
+                &[&to],
+            )?;
+            let updated = tx.execute(
+                &format!("UPDATE {qualified_agents} SET alias = $2 WHERE alias = $1"),
+                &[&from, &to],
+            )?;
+            tx.commit()?;
+            usize::try_from(updated).context("PostgreSQL returned an oversized update count")
+        })
+        .await
+    }
+
     async fn count(&self) -> Result<usize> {
         let client = self.client.get().clone();
         let qualified_table = self.qualified_table.clone();

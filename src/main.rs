@@ -231,6 +231,7 @@ fn pause_after_no_command_help() {
 
 #[cfg(feature = "agent-runtime")]
 mod agent;
+mod alias_cli;
 #[cfg(feature = "agent-runtime")]
 mod approval;
 #[cfg(feature = "agent-runtime")]
@@ -288,6 +289,8 @@ mod providers;
 #[cfg(feature = "agent-runtime")]
 mod security;
 #[cfg(feature = "agent-runtime")]
+mod security_status;
+#[cfg(feature = "agent-runtime")]
 mod service;
 #[cfg(feature = "agent-runtime")]
 mod skillforge;
@@ -310,9 +313,9 @@ use config::Config;
 
 // Re-export so binary modules can use crate::<CommandEnum> while keeping a single source of truth.
 pub use zeroclaw::{
-    ChannelCommands, CronCommands, GatewayCommands, HardwareCommands, IntegrationCommands,
-    MigrateCommands, PeripheralCommands, ServiceCommands, SkillBundleCommands, SkillCommands,
-    SopCommands,
+    AgentsCommands, ChannelCommands, ChannelsCommands, CronCommands, GatewayCommands,
+    HardwareCommands, IntegrationCommands, MigrateCommands, PeripheralCommands, ProvidersCommands,
+    ServiceCommands, SkillBundleCommands, SkillCommands, SopCommands,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -641,6 +644,13 @@ Examples:
         format: Option<String>,
     },
 
+    /// Inspect the active security posture derived from local config and host detection
+    #[cfg(feature = "agent-runtime")]
+    Security {
+        #[command(subcommand)]
+        security_command: SecurityCommands,
+    },
+
     /// Engage, inspect, and resume emergency-stop states.
     ///
     /// Examples:
@@ -704,8 +714,15 @@ Examples:
         model_command: ModelCommands,
     },
 
-    /// List supported AI model_providers
-    Providers,
+    /// List supported AI model providers, or manage provider aliases.
+    ///
+    /// With no subcommand, prints the catalog of supported provider types. With
+    /// `create`/`list`/`rename`/`delete`, manages configured provider aliases
+    /// under `[providers.<category>.<family>.<alias>]`.
+    Providers {
+        #[command(subcommand)]
+        providers_command: Option<ProvidersCommands>,
+    },
 
     /// Manage channels (telegram, discord, slack)
     // i18n-exempt: clap derive help — framework requires a compile-time literal
@@ -726,6 +743,19 @@ Examples:
     Channel {
         #[command(subcommand)]
         channel_command: ChannelCommands,
+    },
+
+    /// Manage agent aliases (create/list/rename/delete). Distinct from `agent`,
+    /// which runs an agent.
+    Agents {
+        #[command(subcommand)]
+        agents_command: AgentsCommands,
+    },
+
+    /// Manage channel aliases (create/list/rename/delete)
+    Channels {
+        #[command(subcommand)]
+        channels_command: ChannelsCommands,
     },
 
     /// Browse 50+ integrations
@@ -2662,6 +2692,21 @@ enum ConfigCommands {
     },
 }
 
+#[cfg(feature = "agent-runtime")]
+#[derive(Subcommand, Debug)]
+enum SecurityCommands {
+    /// Show security posture for the default or selected agent risk profile
+    Status {
+        /// Agent alias whose effective runtime security posture should be inspected.
+        #[arg(long)]
+        agent: String,
+
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 enum EstopSubcommands {
     /// Print current estop status.
@@ -4418,6 +4463,19 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
+        #[cfg(feature = "agent-runtime")]
+        Commands::Security {
+            security_command: SecurityCommands::Status { agent, json },
+        } => {
+            let report = security_status::build_report(&config, &agent)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                security_status::print_report(&report);
+            }
+            Ok(())
+        }
+
         Commands::Estop {
             estop_command,
             level,
@@ -4438,7 +4496,9 @@ async fn main() -> Result<()> {
             _ => doctor::run_models(&config, None, false, false).await,
         },
 
-        Commands::Providers => {
+        Commands::Providers {
+            providers_command: None,
+        } => {
             let model_providers = zeroclaw_providers::list_model_providers();
             let configured_types: std::collections::HashSet<&str> = config
                 .providers
@@ -4475,6 +4535,10 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+
+        Commands::Providers {
+            providers_command: Some(providers_command),
+        } => Box::pin(alias_cli::handle_providers(providers_command, &mut config)).await,
 
         Commands::Service {
             service_command,
@@ -4535,6 +4599,13 @@ async fn main() -> Result<()> {
             ChannelCommands::Doctor => Box::pin(channels::doctor_channels(config)).await,
             other => Box::pin(channels::handle_command(other, &config)).await,
         },
+
+        Commands::Agents { agents_command } => {
+            Box::pin(alias_cli::handle_agents(agents_command, &mut config)).await
+        }
+        Commands::Channels { channels_command } => {
+            Box::pin(alias_cli::handle_channels(channels_command, &mut config)).await
+        }
 
         Commands::Integrations {
             integration_command,
@@ -7053,6 +7124,27 @@ mod tests {
                 assert_eq!(host.as_deref(), Some("192.168.1.20"));
             }
             other => panic!("expected gateway get-paircode command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn security_status_cli_requires_agent_and_parses_json_form() {
+        let err = Cli::try_parse_from(["zeroclaw", "security", "status"])
+            .expect_err("security status requires --agent");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+
+        let cli =
+            Cli::try_parse_from(["zeroclaw", "security", "status", "--agent", "ops", "--json"])
+                .expect("security status --agent --json should parse");
+        match cli.command {
+            Commands::Security {
+                security_command: SecurityCommands::Status { agent, json },
+            } => {
+                assert_eq!(agent, "ops");
+                assert!(json);
+            }
+            other => panic!("expected security status command, got {other:?}"),
         }
     }
 

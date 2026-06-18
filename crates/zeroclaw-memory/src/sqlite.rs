@@ -1242,6 +1242,48 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn rename_agent(&self, from: &str, to: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.clone();
+        let from = from.to_string();
+        let to = to.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = conn.lock();
+            // Memory rows ride `memories.agent_id` (FK → agents.id, a stable
+            // UUID); only the human `alias` column moves, so this is a single
+            // agents-row update. An unknown `from` matches nothing → Ok(0).
+            //
+            // Collision-safety: `agents.alias` is UNIQUE, and deleting an agent
+            // purges its memories but leaves the `agents` row behind (an orphan
+            // holding the alias). A bare UPDATE onto a previously-used-then-
+            // deleted `to` alias would hit the UNIQUE constraint and fail. We
+            // hold the connection lock across the whole sequence (single writer),
+            // so: refuse if `to` still has memory rows (a genuine conflict we
+            // won't silently merge), otherwise drop the orphan `to` row and
+            // proceed. (`COUNT(*)` over a NULL subselect when no `to` row exists
+            // is 0, so the common no-collision path falls straight through.)
+            let to_rows: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM memories WHERE agent_id = (SELECT id FROM agents WHERE alias = ?1 LIMIT 1)",
+                params![to],
+                |row| row.get(0),
+            )?;
+            if to_rows > 0 {
+                anyhow::bail!(
+                    "cannot rename agent memory to `{to}`: an existing memory store under that alias has {to_rows} row(s); refusing to merge"
+                );
+            }
+            // Drop any orphan `to` agents row (verified above to own no memories).
+            conn.execute("DELETE FROM agents WHERE alias = ?1", params![to])?;
+            let affected = conn.execute(
+                "UPDATE agents SET alias = ?2 WHERE alias = ?1",
+                params![from, to],
+            )?;
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            Ok(affected)
+        })
+        .await?
+    }
+
     async fn count(&self) -> anyhow::Result<usize> {
         let conn = self.conn.clone();
 
@@ -1385,6 +1427,43 @@ impl Memory for SqliteMemory {
                 })
             })?;
 
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            Ok(results)
+        })
+        .await?
+    }
+
+    async fn export_agent(&self, agent_alias: &str) -> anyhow::Result<Vec<MemoryEntry>> {
+        let conn = self.conn.clone();
+        let agent_alias = agent_alias.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, a.alias, m.agent_id \
+                 FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
+                 WHERE m.agent_id = (SELECT id FROM agents WHERE alias = ?1 LIMIT 1) \
+                 ORDER BY m.created_at ASC",
+            )?;
+            let rows = stmt.query_map(params![agent_alias], |row| {
+                Ok(MemoryEntry {
+                    id: row.get(0)?,
+                    key: row.get(1)?,
+                    content: row.get(2)?,
+                    category: Self::str_to_category(&row.get::<_, String>(3)?),
+                    timestamp: row.get(4)?,
+                    session_id: row.get(5)?,
+                    score: None,
+                    namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
+                    importance: row.get(7)?,
+                    superseded_by: row.get(8)?,
+                    agent_alias: row.get(9)?,
+                    agent_id: row.get(10)?,
+                })
+            })?;
             let mut results = Vec::new();
             for row in rows {
                 results.push(row?);
@@ -1746,6 +1825,127 @@ mod tests {
         let purged_ghost = mem.purge_agent("ghost").await.unwrap();
         assert_eq!(purged_ghost, 0);
         assert_eq!(mem.count().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn sqlite_rename_agent_repoints_rows_under_new_alias() {
+        let (_tmp, mem) = temp_sqlite();
+        let alpha = mem.ensure_agent_uuid("alpha").await.unwrap();
+        for idx in 0..3 {
+            mem.store_with_agent(
+                &format!("alpha-{idx}"),
+                "alpha row",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(&alpha),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Rename alpha → beta: memory rows ride the UUID, so this updates exactly
+        // one `agents` row and the rows now resolve under the new alias.
+        let renamed = mem.rename_agent("alpha", "beta").await.unwrap();
+        assert_eq!(renamed, 1, "exactly one agents row re-aliased");
+
+        // The rows now resolve under `beta`, and `alpha` resolves to nothing.
+        assert_eq!(mem.export_agent("beta").await.unwrap().len(), 3);
+        assert_eq!(mem.export_agent("alpha").await.unwrap().len(), 0);
+        assert_eq!(mem.count().await.unwrap(), 3, "no rows lost on rename");
+
+        // Unknown source → nothing updated.
+        assert_eq!(mem.rename_agent("ghost", "phantom").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn sqlite_rename_agent_reclaims_orphan_and_refuses_live_collision() {
+        let (_tmp, mem) = temp_sqlite();
+        let alpha = mem.ensure_agent_uuid("alpha").await.unwrap();
+        mem.store_with_agent(
+            "a-0",
+            "alpha row",
+            MemoryCategory::Core,
+            None,
+            None,
+            None,
+            Some(&alpha),
+        )
+        .await
+        .unwrap();
+
+        // Simulate a prior delete of `beta`: its memories were purged but the
+        // agents row survives (delete never removes it) — an orphan in the
+        // UNIQUE alias slot. A bare UPDATE alpha→beta would hit the constraint.
+        let _beta = mem.ensure_agent_uuid("beta").await.unwrap();
+        assert_eq!(mem.purge_agent("beta").await.unwrap(), 0); // no memories anyway
+        // Rename succeeds: the orphan `beta` row is dropped, alpha→beta proceeds.
+        assert_eq!(mem.rename_agent("alpha", "beta").await.unwrap(), 1);
+        assert_eq!(mem.export_agent("beta").await.unwrap().len(), 1);
+        assert_eq!(mem.export_agent("alpha").await.unwrap().len(), 0);
+
+        // Now `beta` has a live memory. Renaming another agent ONTO it must
+        // refuse (we won't silently merge two agents' memories).
+        let gamma = mem.ensure_agent_uuid("gamma").await.unwrap();
+        mem.store_with_agent(
+            "g-0",
+            "gamma row",
+            MemoryCategory::Core,
+            None,
+            None,
+            None,
+            Some(&gamma),
+        )
+        .await
+        .unwrap();
+        let err = mem.rename_agent("gamma", "beta").await.unwrap_err();
+        assert!(
+            err.to_string().contains("refusing to merge"),
+            "expected merge-refusal, got: {err}"
+        );
+        // Nothing changed: both still resolve under their own aliases.
+        assert_eq!(mem.export_agent("beta").await.unwrap().len(), 1);
+        assert_eq!(mem.export_agent("gamma").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_export_agent_returns_only_that_agents_rows() {
+        let (_tmp, mem) = temp_sqlite();
+        let alpha = mem.ensure_agent_uuid("alpha").await.unwrap();
+        let rogue = mem.ensure_agent_uuid("rogue").await.unwrap();
+        for idx in 0..3 {
+            mem.store_with_agent(
+                &format!("alpha-{idx}"),
+                "alpha row",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(&alpha),
+            )
+            .await
+            .unwrap();
+        }
+        mem.store_with_agent(
+            "rogue-0",
+            "rogue row",
+            MemoryCategory::Core,
+            None,
+            None,
+            None,
+            Some(&rogue),
+        )
+        .await
+        .unwrap();
+
+        let exported = mem.export_agent("alpha").await.unwrap();
+        assert_eq!(exported.len(), 3, "export only alpha's rows");
+        assert!(exported.iter().all(|e| e.key.starts_with("alpha-")));
+        assert_eq!(mem.export_agent("rogue").await.unwrap().len(), 1);
+        assert!(mem.export_agent("ghost").await.unwrap().is_empty());
+        // export does NOT delete.
+        assert_eq!(mem.count().await.unwrap(), 4);
     }
 
     #[tokio::test]

@@ -1,5 +1,6 @@
 zc-pane-dashboard = Dashboard
 zc-pane-config = Config
+zc-pane-doctor = Doctor
 zc-pane-code = Code
 zc-pane-chat = Chat
 zc-pane-logs = Logs
@@ -161,6 +162,27 @@ zc-logs-help-page = Page down / up
 zc-logs-help-open-detail = Open detail pane
 zc-logs-help-mouse-label = Mouse
 zc-logs-help-mouse-desc = Click to select, scroll wheel, double-click detail
+
+zc-doctor-title = Doctor
+zc-doctor-loading = Loading diagnostics...
+zc-doctor-error = Doctor failed: { $error }
+zc-doctor-error-unsupported-daemon = Doctor RPC is not available on this daemon yet. Restart the daemon with a build that includes doctor/run.
+zc-doctor-no-results = No diagnostics yet
+zc-doctor-summary = { $ok } ok  { $warnings } warnings  { $errors } errors
+zc-doctor-filter-status = filter: { $filter }
+zc-doctor-filter-all = All
+zc-doctor-filter-problems = Problems
+zc-doctor-filter-errors = Errors
+zc-doctor-list-title = Diagnostics ({ $filter })
+zc-doctor-detail-title = Detail
+zc-doctor-no-selection = No diagnostic selected
+zc-doctor-label-message = Message
+zc-doctor-help-rerun = Run diagnostics again
+zc-doctor-help-move = Move cursor
+zc-doctor-help-filter = Change filter
+zc-doctor-help-scroll-detail = Scroll detail pane
+zc-doctor-help-this-help = This help
+zc-doctor-help-mouse = Mouse: click filter/select, scroll wheel
 
 zc-dashboard-tab-overview = Overview
 zc-dashboard-tab-sessions = Sessions

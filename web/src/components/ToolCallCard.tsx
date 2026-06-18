@@ -11,6 +11,7 @@ export interface ToolCallInfo {
   name: string;
   args?: unknown;
   output?: string;       // undefined = executing; string = completed
+  id?: string;           // gateway tool_call_id; correlates result to card
 }
 
 interface ToolCallCardProps {

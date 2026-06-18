@@ -802,6 +802,14 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Remote media is also accepted via http:// or https:// URLs in the same marker form.\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n",
         ),
+        "whatsapp" | "whatsapp-web" => Some(
+            "When responding on WhatsApp Web:\n\
+             - Be concise and direct\n\
+             - For media attachments use markers: [IMAGE:<path>], [DOCUMENT:<path>], [VIDEO:<path>], [AUDIO:<path>], or [VOICE:<path>]\n\
+             - Marker paths must refer to local files inside the configured workspace directory. Absolute paths and workspace-relative paths are accepted when they stay inside that workspace.\n\
+             - Do not use http://, https://, data:, file:, or any other URL scheme in WhatsApp Web media markers.\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n",
+        ),
         "telegram" => Some(
             "When responding on Telegram:\n\
              - Include media markers for files or URLs that should be sent as attachments\n\
@@ -3752,6 +3760,46 @@ async fn process_channel_message(
     .await;
 }
 
+/// Resolve the effective `ack_reactions` value for a channel message.
+///
+/// Per-channel overrides (e.g. `[channels.lark.work].ack_reactions`)
+/// take precedence over the global `[channels].ack_reactions` setting.
+/// This mirrors the resolution performed during channel construction
+/// (see `with_ack_reactions`), so the orchestrator's reaction gates
+/// agree with the channel's own internal gate.
+fn resolve_channel_ack_reactions(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> bool {
+    let Some(ref alias) = msg.channel_alias else {
+        return ctx.ack_reactions;
+    };
+    match msg.channel.as_str() {
+        "lark" | "feishu" => ctx
+            .prompt_config
+            .channels
+            .lark
+            .get(alias)
+            .and_then(|c| c.ack_reactions)
+            .unwrap_or(ctx.ack_reactions),
+        "telegram" => ctx
+            .prompt_config
+            .channels
+            .telegram
+            .get(alias)
+            .and_then(|c| c.ack_reactions)
+            .unwrap_or(ctx.ack_reactions),
+        "matrix" => ctx
+            .prompt_config
+            .channels
+            .matrix
+            .get(alias)
+            .and_then(|c| c.ack_reactions)
+            .unwrap_or(ctx.ack_reactions),
+        _ => ctx.ack_reactions,
+    }
+}
+
 async fn process_channel_message_body(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
@@ -4257,7 +4305,11 @@ async fn process_channel_message_body(
         // pattern so operators with reactions disabled don't suddenly see
         // them. Best-effort: log on failure, never propagate. Channels that
         // don't implement add_reaction get the trait's no-op default.
-        if ctx.ack_reactions
+        //
+        // Resolve per-channel overrides: channels like Lark, Telegram,
+        // and Matrix allow `<channel>.ack_reactions` to take precedence
+        // over the global `[channels].ack_reactions`.
+        if resolve_channel_ack_reactions(&ctx, &msg)
             && let Some(channel) = target_channel.as_ref()
         {
             let emoji = kind.emoji();
@@ -4395,7 +4447,7 @@ async fn process_channel_message_body(
     };
 
     // React with 👀 to acknowledge the incoming message
-    if ctx.ack_reactions
+    if resolve_channel_ack_reactions(&ctx, &msg)
         && let Some(channel) = target_channel.as_ref()
         && let Err(e) = channel
             .add_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
@@ -5219,7 +5271,7 @@ async fn process_channel_message_body(
     }
 
     // Swap 👀 → ✅ (or ⚠️ on error) to signal processing is complete
-    if ctx.ack_reactions
+    if resolve_channel_ack_reactions(&ctx, &msg)
         && let Some(channel) = target_channel.as_ref()
     {
         let _ = channel
@@ -5648,6 +5700,7 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
     feature = "channel-slack",
     feature = "channel-telegram",
     feature = "channel-wechat",
+    feature = "whatsapp-web",
 ))]
 fn one_shot_channel_workspace_dir(config: &Config, channel_type: &str, alias: &str) -> PathBuf {
     config.channel_workspace_dir(&format!("{channel_type}.{alias}"))
@@ -5892,7 +5945,11 @@ fn build_channel_by_id(
                     let alias = alias.clone();
                     Arc::new(move || cfg_arc.read().channel_external_peers("whatsapp", &alias))
                 };
-                Ok(Arc::new(WhatsAppWebChannel::new(wa, alias, peer_resolver)))
+                let workspace_dir = one_shot_channel_workspace_dir(&config, "whatsapp", &alias);
+                Ok(Arc::new(
+                    WhatsAppWebChannel::new(wa, alias, peer_resolver)
+                        .with_workspace_dir(workspace_dir),
+                ))
             }
             #[cfg(not(feature = "whatsapp-web"))]
             {
@@ -5941,6 +5998,9 @@ fn build_channel_by_id(
                     LarkChannel::from_config(lk, alias, peer_resolver)
                         .with_approval_timeout_secs(lk.approval_timeout_secs)
                         .with_per_user_session(lk.per_user_session)
+                        .with_ack_reactions(
+                            lk.ack_reactions.unwrap_or(config.channels.ack_reactions),
+                        )
                         .with_streaming(lk.stream_mode, lk.draft_update_interval_ms),
                 ))
             }
@@ -7149,6 +7209,7 @@ fn collect_configured_channels(
                         let alias = alias.clone();
                         Arc::new(move || cfg_arc.read().channel_external_peers("whatsapp", &alias))
                     };
+                    let workspace_dir = config.channel_workspace_dir(&format!("whatsapp.{alias}"));
                     channels.push(ConfiguredChannel {
                         display_name: "WhatsApp",
                         alias: Some(alias.clone()),
@@ -7157,6 +7218,7 @@ fn collect_configured_channels(
                                 WhatsAppWebChannel::new(wa, alias.clone(), peer_resolver)
                                     .with_transcription(config.transcription.clone())
                                     .with_tts(&config)
+                                    .with_workspace_dir(workspace_dir)
                                     .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
                                     .with_group_mention_patterns(wa.group_mention_patterns.clone()),
                             ),
@@ -7526,6 +7588,7 @@ fn collect_configured_channels(
                 LarkChannel::from_config(lk, alias.clone(), peer_resolver)
                     .with_approval_timeout_secs(lk.approval_timeout_secs)
                     .with_per_user_session(lk.per_user_session)
+                    .with_ack_reactions(lk.ack_reactions.unwrap_or(config.channels.ack_reactions))
                     .with_streaming(lk.stream_mode, lk.draft_update_interval_ms)
                     .with_transcription(config.transcription.clone()),
             ),
@@ -9443,6 +9506,7 @@ pub async fn deliver_announcement(
             let ch = LarkChannel::from_config(lk, alias, peer_resolver)
                 .with_approval_timeout_secs(lk.approval_timeout_secs)
                 .with_per_user_session(lk.per_user_session)
+                .with_ack_reactions(lk.ack_reactions.unwrap_or(config.channels.ack_reactions))
                 .with_streaming(lk.stream_mode, lk.draft_update_interval_ms);
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
@@ -9515,7 +9579,8 @@ pub async fn deliver_announcement(
             let peers = config.channel_external_peers("whatsapp", alias);
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
-            let ch = WhatsAppWebChannel::new(wa, alias.to_string(), peer_resolver);
+            let ch = WhatsAppWebChannel::new(wa, alias.to_string(), peer_resolver)
+                .with_workspace_dir(config.channel_workspace_dir(&format!("whatsapp.{alias}")));
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(not(feature = "whatsapp-web"))]
@@ -17403,6 +17468,37 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    #[test]
+    fn channel_delivery_instructions_for_whatsapp_web_match_local_marker_contract() {
+        let block = channel_delivery_instructions("whatsapp")
+            .expect("whatsapp channel must have a delivery-instructions block");
+        assert!(
+            block.contains("When responding on WhatsApp Web:"),
+            "whatsapp block must identify itself"
+        );
+        assert!(
+            block.contains("[IMAGE:<path>]"),
+            "whatsapp block must describe marker syntax"
+        );
+        assert!(
+            block.contains("inside the configured workspace directory"),
+            "whatsapp block must describe workspace bounds"
+        );
+        assert!(
+            block.contains("Absolute paths and workspace-relative paths are accepted"),
+            "whatsapp block must match the validator's local path contract"
+        );
+        assert!(
+            block.contains("Do not use http://, https://, data:, file:"),
+            "whatsapp block must say URL schemes are refused"
+        );
+        assert_eq!(
+            channel_delivery_instructions("whatsapp-web"),
+            Some(block),
+            "the compatibility alias should use the same WhatsApp Web guidance"
+        );
+    }
+
     // Regression guard for #6646: web_search_tool / web_fetch never fired via
     // the Telegram channel because the delivery-instructions block told the
     // model to "answer the latest user message directly" and to "use tool
@@ -20689,6 +20785,7 @@ Done."#;
                 app_secret: "secret".to_string(),
                 approval_timeout_secs: 300,
                 per_user_session: false,
+                ack_reactions: None,
                 ..Default::default()
             },
         );

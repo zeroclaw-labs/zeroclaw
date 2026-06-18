@@ -18,7 +18,10 @@ use zeroclaw_providers::ModelProvider;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CancelCause {
-    /// Explicit `session/cancel` RPC from the client (e.g. zerocode Ctrl+D).
+    /// `session/cancel` RPC arrived over the client channel. The actor is not
+    /// verified here: a human interrupt and a programmatic client cancel (new
+    /// prompt superseding an in-flight turn, reconnect, client-side timeout,
+    /// pane teardown) all land on this path. Attribute to the channel, not a user.
     ClientRpc,
     /// Explicit `session/kill` from the dashboard or admin RPC.
     AdminKill,

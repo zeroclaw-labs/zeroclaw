@@ -25,9 +25,10 @@ pub(crate) async fn record_executed_outcomes(
         .zip(executable_calls.iter())
         .zip(executed_outcomes)
     {
-        if let Some(tx) = ctx.event_tx {
-            super::events::emit_tool_call_pair(tx, call, &outcome).await;
-        }
+        // The pending ToolCall and terminal ToolResult are emitted by the
+        // executor (execute_one_tool) at dispatch and completion time so serial
+        // batches interleave call->result per tool. Post-exec only records the
+        // outcome to history, logs, hooks, and ordered_results.
 
         ::zeroclaw_log::record!(
             INFO,

@@ -999,20 +999,17 @@ impl From<RawResponseMessage> for ResponseMessage {
 }
 
 impl ResponseMessage {
-    /// Extract text content, falling back to `reasoning_content` when `content`
-    /// is missing or empty. Reasoning/thinking models (Qwen3, GLM-4, etc.)
-    /// often return their output solely in `reasoning_content`.
+    /// Extract text content from the `content` field only. Does NOT fall
+    /// back to `reasoning_content` — thinking/reasoning models (GLM-5.1,
+    /// DeepSeek, Qwen) return their thinking in `reasoning_content` which
+    /// must not leak into the user-visible response text. The
+    /// `reasoning_content` is preserved separately in
+    /// `ChatResponse.reasoning_content` for history round-tripping.
+    ///
     /// Strips `<think>...</think>` blocks that some models (e.g. MiniMax) embed
     /// inline in `content` instead of using a separate field.
     fn effective_content(&self) -> String {
-        if let Some(content) = self.content.as_ref().filter(|c| !c.is_empty()) {
-            let stripped = strip_think_tags(content);
-            if !stripped.is_empty() {
-                return stripped;
-            }
-        }
-
-        self.reasoning_content
+        self.content
             .as_ref()
             .map(|c| strip_think_tags(c))
             .filter(|c| !c.is_empty())
@@ -1020,14 +1017,7 @@ impl ResponseMessage {
     }
 
     fn effective_content_optional(&self) -> Option<String> {
-        if let Some(content) = self.content.as_ref().filter(|c| !c.is_empty()) {
-            let stripped = strip_think_tags(content);
-            if !stripped.is_empty() {
-                return Some(stripped);
-            }
-        }
-
-        self.reasoning_content
+        self.content
             .as_ref()
             .map(|c| strip_think_tags(c))
             .filter(|c| !c.is_empty())
@@ -4946,31 +4936,36 @@ mod tests {
     // ----------------------------------------------------------
 
     #[test]
-    fn reasoning_content_fallback_when_content_empty() {
-        // Reasoning models (Qwen3, GLM-4) return content: "" with reasoning_content populated
+    fn reasoning_content_does_not_leak_when_content_empty() {
+        // reasoning_content must NOT leak into effective_content —
+        // it is preserved separately in ChatResponse.reasoning_content
         let json = r#"{"choices":[{"message":{"content":"","reasoning_content":"Thinking output here"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
-        assert_eq!(msg.effective_content(), "Thinking output here");
+        assert_eq!(msg.effective_content(), "");
+        assert_eq!(
+            msg.reasoning_content.as_deref(),
+            Some("Thinking output here")
+        );
     }
 
     #[test]
-    fn reasoning_content_fallback_when_content_null() {
-        // Some models may return content: null with reasoning_content
+    fn reasoning_content_does_not_leak_when_content_null() {
         let json =
             r#"{"choices":[{"message":{"content":null,"reasoning_content":"Fallback text"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
-        assert_eq!(msg.effective_content(), "Fallback text");
+        assert_eq!(msg.effective_content(), "");
+        assert_eq!(msg.reasoning_content.as_deref(), Some("Fallback text"));
     }
 
     #[test]
-    fn reasoning_content_fallback_when_content_missing() {
-        // content field absent entirely, reasoning_content present
+    fn reasoning_content_does_not_leak_when_content_missing() {
         let json = r#"{"choices":[{"message":{"reasoning_content":"Only reasoning"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
-        assert_eq!(msg.effective_content(), "Only reasoning");
+        assert_eq!(msg.effective_content(), "");
+        assert_eq!(msg.reasoning_content.as_deref(), Some("Only reasoning"));
     }
 
     #[test]
@@ -4983,15 +4978,16 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_content_used_when_content_only_think_tags() {
-        let json = r#"{"choices":[{"message":{"content":"<think>secret</think>","reasoning_content":"Fallback text"}}]}"#;
+    fn reasoning_content_preserved_when_content_only_think_tags() {
+        // When content only has <think> tags (stripped to empty),
+        // effective_content returns "" — reasoning_content is preserved
+        // separately, not leaked into the response text.
+        let json = r#"{"choices":[{"message":{"content":"<think>secret</think>","reasoning_content":"Thinking text"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
-        assert_eq!(msg.effective_content(), "Fallback text");
-        assert_eq!(
-            msg.effective_content_optional().as_deref(),
-            Some("Fallback text")
-        );
+        assert_eq!(msg.effective_content(), "");
+        assert_eq!(msg.effective_content_optional(), None);
+        assert_eq!(msg.reasoning_content.as_deref(), Some("Thinking text"));
     }
 
     #[test]
@@ -5080,8 +5076,9 @@ mod tests {
             Some("chain-of-thought via vllm"),
             "the `reasoning` alias must populate the canonical reasoning_content field",
         );
-        // effective_content should also surface the reasoning when content is missing.
-        assert_eq!(msg.effective_content(), "chain-of-thought via vllm");
+        // effective_content returns "" when content is None — reasoning
+        // is preserved separately, not leaked into the response text.
+        assert_eq!(msg.effective_content(), "");
     }
 
     #[test]
