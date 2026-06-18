@@ -4631,7 +4631,17 @@ async fn process_channel_message_body(
                 ) => LlmExecutionResult::Completed(result),
             };
 
-            // Handle model switch: re-create the model_provider and retry
+            // Handle model switch: re-create the model_provider and retry.
+            //
+            // Resolves the requested provider to a configured
+            // `<type>.<alias>` ref, picks up any route-specific `api_key`
+            // from `ctx.model_routes`, then reuses `get_or_create_provider`
+            // so the new provider lands in the cache (consistent with the
+            // normal route-selection path) and is built with the proper
+            // credentials. The resolved route is persisted via
+            // `set_route_selection` only after the provider is built, so
+            // subsequent messages from this sender keep using the switched
+            // model instead of reverting to the default (#6173).
             if let LlmExecutionResult::Completed(Ok(Err(ref e))) = loop_result
                 && let Some((new_model_provider, new_model)) = is_model_switch_requested(e)
             {
@@ -4665,19 +4675,52 @@ async fn process_channel_message_body(
                     }
                 };
 
+                // Resolve a route-specific api_key by matching the switched
+                // provider/model against `model_routes` (the same lookup the
+                // `/model` command uses). Falls back to None so
+                // `get_or_create_provider` resolves credentials strictly from
+                // the requested provider's own config entry.
+                let resolved_api_key = ctx
+                    .model_routes
+                    .iter()
+                    .find(|r| {
+                        r.model_provider.eq_ignore_ascii_case(&new_model_provider)
+                            && (r.model.eq_ignore_ascii_case(&new_model)
+                                || r.hint.eq_ignore_ascii_case(&new_model))
+                    })
+                    .and_then(|r| r.api_key.clone());
+
                 match get_or_create_provider(
                     ctx.as_ref(),
                     &resolved_model_provider,
-                    None,
+                    resolved_api_key.as_deref(),
                     &runtime_defaults,
                 )
                 .await
                 {
                     Ok(new_prov) => {
+                        // Commit state only after the provider was built
+                        // successfully, so a failure leaves the turn on the
+                        // original provider/model pair instead of a
+                        // half-switched state.
                         active_model_provider = new_prov;
                         route.model_provider = resolved_model_provider;
                         route.model = new_model;
+                        route.api_key = resolved_api_key;
                         clear_model_switch_request();
+
+                        // Persist the route override so subsequent messages
+                        // from this sender continue using the switched model.
+                        set_route_selection(
+                            ctx.as_ref(),
+                            &history_key,
+                            ChannelRouteSelection {
+                                model_provider: route.model_provider.clone(),
+                                model: route.model.clone(),
+                                api_key: route.api_key.clone(),
+                            },
+                            &runtime_defaults,
+                        );
 
                         ctx.observer.record_event(&ObserverEvent::AgentStart {
                             model_provider: route.model_provider.clone(),
@@ -13753,6 +13796,253 @@ BTC is currently around $65,000 based on latest tool output."#
                 .as_slice(),
             &["route-model".to_string()]
         );
+    }
+
+    /// Regression for #6173: when a `model_switch` request is pending
+    /// (set by the `model_switch` tool during the previous tool
+    /// iteration), `process_channel_message` must:
+    ///
+    /// 1. resolve the route-specific `api_key` from `ctx.model_routes`
+    ///    when the switched provider/model matches a route entry,
+    /// 2. route provider construction through `get_or_create_provider`
+    ///    (so the new provider lands in the provider cache),
+    /// 3. persist the resolved route via `set_route_selection` so the
+    ///    next inbound message for the same sender uses the switched
+    ///    provider/model/key.
+    ///
+    /// The test pre-sets `MODEL_SWITCH_REQUEST` to simulate a previous
+    /// turn's tool call. `run_tool_call_loop` short-circuits to
+    /// `ModelSwitchRequested` on its first iteration because the
+    /// pending request already differs from the active route, exercising
+    /// the orchestrator's switch handler.
+    #[tokio::test]
+    async fn process_channel_message_persists_model_switch_with_route_credential() {
+        // Serialize on the process-wide model-switch state so this test
+        // doesn't race other tests that also touch the same static.
+        // `tokio::sync::Mutex` is held across the awaits below; the
+        // `OnceLock` wrapper gives us a `'static` initializer in a
+        // `static` context without `lazy_static`.
+        static MODEL_SWITCH_TEST_GUARD: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+            std::sync::OnceLock::new();
+        let _guard = MODEL_SWITCH_TEST_GUARD
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        clear_model_switch_request();
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let default_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
+        let default_model_provider: Arc<dyn ModelProvider> = default_model_provider_impl.clone();
+        let switched_model_provider_impl = Arc::new(ModelCaptureModelProvider::default());
+        let switched_model_provider: Arc<dyn ModelProvider> = switched_model_provider_impl.clone();
+
+        // The switch handler resolves the requested provider `openrouter` to
+        // a configured `<type>.<alias>` ref via
+        // `resolve_provider_ref_for_runtime_switch`, so the provider that is
+        // built, cached, and persisted is the dotted form.
+        let switched_provider_ref = "openrouter.default";
+        let switched_key = Some("route-specific-key");
+
+        // Seed the provider cache so `get_or_create_provider` returns our
+        // mock for the switched provider instead of constructing a real one.
+        // The cache key hashes the route-specific api_key together with the
+        // resolved (dotted) provider ref at the current (startup) generation.
+        let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
+        provider_cache_seed.insert(
+            "test-provider".to_string(),
+            Arc::clone(&default_model_provider),
+        );
+        provider_cache_seed.insert(
+            provider_cache_key(switched_provider_ref, switched_key, 0),
+            Arc::clone(&switched_model_provider),
+        );
+
+        let model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".to_string(),
+            model_provider: "openrouter".to_string(),
+            model: "switched-model".to_string(),
+            api_key: Some("route-specific-key".to_string()),
+        }];
+
+        // `resolve_provider_ref_for_runtime_switch` resolves `openrouter`
+        // against the configured providers, so the prompt config must define
+        // the `openrouter.default` entry for the switch to resolve and build.
+        let prompt_config = {
+            let mut cfg = zeroclaw_config::schema::Config::default();
+            {
+                let entry = cfg
+                    .providers
+                    .models
+                    .ensure("openrouter", "default")
+                    .expect("openrouter.default provider slot must be creatable");
+                entry.api_key = Some("config-openrouter-key".to_string());
+                entry.model = Some("switched-model".to_string());
+            }
+            Arc::new(cfg)
+        };
+
+        // Pre-set the model_switch request — simulates the tool having
+        // been called on a previous turn and waiting to be consumed.
+        {
+            let state = get_model_switch_state();
+            let mut guard = state.lock().unwrap();
+            *guard = Some(("openrouter".to_string(), "switched-model".to_string()));
+        }
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: Arc::clone(&default_model_provider),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::clone(&prompt_config),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(model_routes),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-switch-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "trigger model switch".to_string(),
+                subject: None,
+                channel: "telegram".to_string(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        // After the switch handler runs, the route override must be
+        // persisted for this sender with the resolved api_key.
+        let route_key = "telegram_chat-1_alice";
+        let persisted = runtime_ctx
+            .route_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(route_key)
+            .cloned()
+            .expect(
+                "switch handler must persist a route override under the sender's history key \
+                 (this is the regression #6173 — previously the new model was used only for \
+                 the current turn and the next inbound message reverted to the default)",
+            );
+        assert_eq!(persisted.model_provider, switched_provider_ref);
+        assert_eq!(persisted.model, "switched-model");
+        assert_eq!(
+            persisted.api_key.as_deref(),
+            Some("route-specific-key"),
+            "the route-specific api_key from model_routes must be persisted, \
+             not the global key or None — otherwise the next turn loses route auth"
+        );
+
+        // Send a second message from the same sender, with no pending
+        // model_switch this time. The persisted route override must be
+        // honored — `get_route_selection` should return the switched
+        // route and the switched provider should handle the request.
+        let calls_before = switched_model_provider_impl
+            .call_count
+            .load(Ordering::SeqCst);
+        process_channel_message(
+            runtime_ctx.clone(),
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-switch-2".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "follow-up after switch".to_string(),
+                subject: None,
+                channel: "telegram".to_string(),
+                channel_alias: None,
+                timestamp: 2,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let calls_after = switched_model_provider_impl
+            .call_count
+            .load(Ordering::SeqCst);
+        assert!(
+            calls_after > calls_before,
+            "follow-up message must be served by the switched provider (the persisted \
+             route override), not by the original default provider"
+        );
+
+        // Clean up shared global state so we don't leak into other tests.
+        clear_model_switch_request();
     }
 
     #[tokio::test]
