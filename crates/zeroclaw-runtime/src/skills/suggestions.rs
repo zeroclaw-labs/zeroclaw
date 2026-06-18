@@ -310,6 +310,7 @@ mod tests {
             tools: vec![],
             prompts: vec![],
             slash_options: Vec::new(),
+            always: false,
             location: None,
         }
     }

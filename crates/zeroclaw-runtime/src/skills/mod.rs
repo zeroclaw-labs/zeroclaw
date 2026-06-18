@@ -72,6 +72,10 @@ pub struct Skill {
     /// then fall back to a single free-text option. See [`SkillSlashOption`].
     #[serde(default)]
     pub slash_options: Vec<SkillSlashOption>,
+    /// If true, this skill's instructions are always injected in compact mode.
+    /// Use for skills with critical operational instructions that should not be deferred.
+    #[serde(default)]
+    pub always: bool,
     #[serde(skip)]
     pub location: Option<PathBuf>,
 }
@@ -187,6 +191,8 @@ struct SkillMeta {
     prompts: Vec<String>,
     #[serde(default)]
     slash_options: Vec<SkillSlashOption>,
+    #[serde(default)]
+    always: bool,
 }
 
 /// Provenance metadata emitted by the SkillForge integrator (see
@@ -237,6 +243,7 @@ struct SkillMarkdownMeta {
     version: Option<String>,
     author: Option<String>,
     tags: Vec<String>,
+    always: bool,
 }
 
 fn default_version() -> String {
@@ -1064,6 +1071,7 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         tools: manifest.tools,
         prompts,
         slash_options: manifest.skill.slash_options,
+        always: manifest.skill.always,
         location: Some(path.to_path_buf()),
     })
 }
@@ -1091,6 +1099,7 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         tools: Vec::new(),
         prompts: vec![parsed.body],
         slash_options: Vec::new(),
+        always: parsed.meta.always,
         location: Some(path.to_path_buf()),
     })
 }
@@ -1131,6 +1140,7 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
         tools: Vec::new(),
         prompts: vec![parsed.body],
         slash_options: Vec::new(),
+        always: parsed.meta.always,
         location: Some(path.to_path_buf()),
     }))
 }
@@ -1230,6 +1240,10 @@ fn parse_simple_frontmatter(s: &str) -> SkillMarkdownMeta {
                         .filter(|t| !t.is_empty())
                         .collect();
                 }
+            }
+            "always" => {
+                // Parse boolean values (true/false, yes/no, on/off)
+                meta.always = matches!(val.to_lowercase().as_str(), "true" | "yes" | "on" | "1");
             }
             _ => {}
         }
@@ -1360,10 +1374,12 @@ pub fn skills_to_prompt_with_mode(
         // In Full mode, inline both instructions and tools.
         // In Compact mode, skip instructions (loaded on demand) but keep tools
         // so the LLM knows which skill tools are available.
-        if matches!(
-            mode,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Full
-        ) && !skill.prompts.is_empty()
+        // Exception: skills with `always: true` have their instructions injected even in compact mode.
+        if (!skill.prompts.is_empty())
+            && (matches!(
+                mode,
+                zeroclaw_config::schema::SkillsPromptInjectionMode::Full
+            ) || skill.always)
         {
             let _ = writeln!(prompt, "    <instructions>");
             for instruction in &skill.prompts {
@@ -2979,6 +2995,7 @@ mod prompt_callable_name_tests {
             tools: vec![tool("run.lint", "shell")],
             prompts: Vec::new(),
             slash_options: Vec::new(),
+            always: false,
             location: None,
         };
 

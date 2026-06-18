@@ -486,6 +486,7 @@ mod tests {
             }],
             prompts: vec!["Run smoke tests before deploy.".into()],
             slash_options: Vec::new(),
+            always: false,
             location: None,
         }];
 
@@ -534,6 +535,7 @@ mod tests {
             }],
             prompts: vec!["Run smoke tests before deploy.".into()],
             slash_options: Vec::new(),
+            always: false,
             location: Some(Path::new("/tmp/workspace/skills/deploy/SKILL.md").to_path_buf()),
         }];
 
@@ -615,6 +617,7 @@ mod tests {
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
             slash_options: Vec::new(),
+            always: false,
             location: None,
         }];
         let ctx = PromptContext {

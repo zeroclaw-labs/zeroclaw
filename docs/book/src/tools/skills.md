@@ -49,11 +49,11 @@ tags: [release, docs]
 Review the release notes, changelog, version tags, and migration notes before confirming that a release is ready.
 ```
 
-Supported frontmatter fields are `name`, `description`, `version`, `author`, and `tags`.
+Supported frontmatter fields are `name`, `description`, `version`, `author`, `tags`, and `always`. The `always` field (boolean) marks a skill whose instructions should be preloaded even in compact prompt mode. Use it sparingly for skills with critical operational instructions that should never be deferred to on-demand loading.
 
 ## Create a TOML skill
 
-A skill can also be a structured TOML manifest (`SKILL.toml`). The `[skill]` table requires `name` and `description`; `version` defaults to `0.1.0` when omitted; `author`, `tags`, and `prompts` are optional. Tool entries may use `kind = "shell"`, `kind = "http"`, or `kind = "script"`. Keep tool descriptions narrow and concrete so the model knows when to use them.
+A skill can also be a structured TOML manifest (`SKILL.toml`). The `[skill]` table requires `name` and `description`; `version` defaults to `0.1.0` when omitted; `author`, `tags`, `prompts`, and `always` are optional. The `always` field (boolean) marks a skill whose instructions should be preloaded even in compact prompt mode. Tool entries may use `kind = "shell"`, `kind = "http"`, or `kind = "script"`. Keep tool descriptions narrow and concrete so the model knows when to use them.
 
 ## Manage installed skills
 
