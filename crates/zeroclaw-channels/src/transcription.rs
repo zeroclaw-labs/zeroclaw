@@ -183,6 +183,33 @@ impl TranscriptionProvider for GroqProvider {
 
 // ── OpenAiWhisperProvider ───────────────────────────────────────
 
+/// Resolve the OpenAI STT API key from explicit config, then env vars.
+///
+/// Resolution order:
+/// 1. Non-empty `configured` value (from `[transcription.openai].api_key`)
+/// 2. `TRANSCRIPTION_API_KEY` env var
+/// 3. `OPENAI_API_KEY` env var
+fn resolve_openai_stt_api_key(configured: Option<&str>) -> Result<String> {
+    if let Some(value) = configured {
+        let value = value.trim();
+        if !value.is_empty() {
+            return Ok(value.to_string());
+        }
+    }
+    for var in ["TRANSCRIPTION_API_KEY", "OPENAI_API_KEY"] {
+        if let Ok(value) = std::env::var(var) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Ok(value.to_string());
+            }
+        }
+    }
+    anyhow::bail!(
+        "Missing OpenAI STT API key: set [transcription.openai].api_key, \
+         TRANSCRIPTION_API_KEY, or OPENAI_API_KEY"
+    )
+}
+
 /// OpenAI Whisper API transcription_provider.
 pub struct OpenAiWhisperProvider {
     alias: String,
@@ -191,17 +218,17 @@ pub struct OpenAiWhisperProvider {
 }
 
 impl OpenAiWhisperProvider {
+    /// Build from `OpenAiSttConfig`.
+    ///
+    /// Credential resolution order:
+    /// 1. `[transcription.openai].api_key` (explicit config)
+    /// 2. `TRANSCRIPTION_API_KEY` env var
+    /// 3. `OPENAI_API_KEY` env var
     pub fn from_config(
         alias: &str,
         config: &zeroclaw_config::schema::OpenAiSttConfig,
     ) -> Result<Self> {
-        let api_key = config
-            .api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(ToOwned::to_owned)
-            .context("Missing OpenAI STT API key: set [transcription.openai].api_key")?;
+        let api_key = resolve_openai_stt_api_key(config.api_key.as_deref())?;
 
         Ok(Self {
             alias: alias.to_string(),

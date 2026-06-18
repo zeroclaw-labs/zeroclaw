@@ -5053,6 +5053,9 @@ pub struct ToolFilterGroup {
 #[prefix = "transcription.openai"]
 pub struct OpenAiSttConfig {
     /// OpenAI API key for Whisper transcription.
+    ///
+    /// When unset or empty at construction time, the provider falls back to
+    /// the `TRANSCRIPTION_API_KEY` env var, then `OPENAI_API_KEY`.
     #[serde(default)]
     #[secret]
     #[credential_class = "encrypted_secret"]
