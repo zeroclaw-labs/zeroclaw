@@ -1651,10 +1651,10 @@ mod native_backend {
     fn selector_for_find(by: &str, value: &str) -> String {
         let escaped = css_attr_escape(value);
         match by {
-            "role" => format!(r#"[role=\"{escaped}\"]"#),
+            "role" => format!("[role=\"{escaped}\"]"),
             "label" => format!("label={value}"),
-            "placeholder" => format!(r#"[placeholder=\"{escaped}\"]"#),
-            "testid" => format!(r#"[data-testid=\"{escaped}\"]"#),
+            "placeholder" => format!("[placeholder=\"{escaped}\"]"),
+            "testid" => format!("[data-testid=\"{escaped}\"]"),
             _ => format!("text={value}"),
         }
     }
@@ -1742,7 +1742,7 @@ mod native_backend {
 
         if trimmed.starts_with('@') {
             let escaped = css_attr_escape(trimmed);
-            return SelectorKind::Css(format!(r#"[data-zc-ref=\"{escaped}\"]"#));
+            return SelectorKind::Css(format!("[data-zc-ref=\"{escaped}\"]"));
         }
 
         SelectorKind::Css(trimmed.to_string())
@@ -1812,7 +1812,7 @@ mod native_backend {
             .unwrap_or_else(|| "null".to_string());
 
         format!(
-            r#"(() => {{
+            r#"return (() => {{
   const interactiveOnly = {interactive_only};
   const compact = {compact};
   const maxDepth = {depth_literal};
