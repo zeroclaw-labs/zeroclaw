@@ -38,6 +38,9 @@ mod slash_options;
 mod components;
 mod custom_id;
 mod pending;
+// Buttoned tool-approval surface (Allow-once / Session / Always / Deny) +
+// the server-side decision enum a click resolves the approval `oneshot` with.
+mod approval;
 // Imported bare so the type-3 arm (where a local `pending` var shadows the
 // module) can still name it.
 use pending::ComponentIntent;
@@ -737,6 +740,70 @@ impl DiscordChannel {
                 );
             }
         }
+    }
+
+    /// The legacy plaintext approval prompt: the operator replies
+    /// "`<token> yes|no|always`" in the channel, parsed back by
+    /// `parse_approval_reply` on the inbound MESSAGE_CREATE path. Used when the
+    /// interaction pipe isn't live (buttons would be dead controls).
+    async fn send_plaintext_approval(
+        &self,
+        channel_id: &str,
+        token: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<()> {
+        let text = format!(
+            "APPROVAL REQUIRED [{}]\nTool: {}\nArgs: {}\n\nReply: \"{} yes\", \"{} no\", or \"{} always\"",
+            token, request.tool_name, request.arguments_summary, token, token, token,
+        );
+        self.send(&SendMessage::new(text, channel_id)).await
+    }
+
+    /// The buttoned approval prompt: an Allow-once / Session / Always / Deny
+    /// action row. Each button is registered in `pending_components` under its
+    /// own `custom_id` carrying the server-side [`approval::ApprovalDecision`]
+    /// (NOT read from the wire) and the approval `token` (the key into
+    /// `pending_approvals`). A click is dispatched by the type-3 arm, which —
+    /// after fail-closed `interaction_gate` — `take`s the entry (single-use)
+    /// and resolves the `oneshot` with the bound decision.
+    ///
+    /// The bindings are registered BEFORE the send so a fast click can never
+    /// race an absent entry; the token already lives in `pending_approvals` and
+    /// the caller drops it on any error.
+    async fn send_buttoned_approval(
+        &self,
+        channel_id: &str,
+        token: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<()> {
+        let (row, bindings) = approval::build_approval_row(token);
+        // Register every button's intent first. Single-use is enforced by the
+        // registry's `take`; the per-click `interaction_gate` is enforced by the
+        // type-3 dispatch before any `take`.
+        {
+            let mut reg = self.pending_components.lock();
+            for (cid, decision) in &bindings {
+                if let Some(wire) = cid.encode() {
+                    reg.register(
+                        wire,
+                        ComponentIntent::Approval {
+                            token: token.to_string(),
+                            decision: *decision,
+                        },
+                    );
+                }
+            }
+        }
+
+        let text = format!(
+            "APPROVAL REQUIRED\nTool: {}\nArgs: {}",
+            request.tool_name, request.arguments_summary,
+        );
+        let outgoing = DiscordOutgoing::with_components(text, vec![row]);
+        let client = self.http_client();
+        send_discord_outgoing(&client, &self.bot_token, channel_id, &outgoing)
+            .await
+            .map(|_id| ())
     }
 }
 
@@ -2288,6 +2355,7 @@ impl Channel for DiscordChannel {
                                     let thread_channels = Arc::clone(&self.thread_channels);
                                     let pending = Arc::clone(&self.pending_interactions);
                                     let pending_components = Arc::clone(&self.pending_components);
+                                    let pending_approvals = Arc::clone(&self.pending_approvals);
                                     let alias = self.alias.clone();
                                     let tx = tx.clone();
 
@@ -2345,18 +2413,54 @@ impl Channel for DiscordChannel {
                                         }
 
                                         // Single-use: drain the intent bound to
-                                        // this custom_id. Absent/expired/replayed
-                                        // (incl. a forged-but-zc1 id we never
-                                        // registered) → refuse, don't act.
+                                        // this custom_id. The `take` runs ONLY
+                                        // after the fail-closed gate above, so an
+                                        // unauthorized click never drains an
+                                        // entry. Absent/expired/replayed (incl. a
+                                        // forged-but-zc1 id we never registered)
+                                        // → refuse, don't act.
                                         let intent = pending_components.lock().take(&custom_id_raw);
-                                        let Some(ComponentIntent::ResolveIntoTurn { prompt }) = intent else {
-                                            let msg = i18n::get_required_cli_string(
-                                                "channel-discord-component-expired",
-                                            );
-                                            if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
-                                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord component expired-notice failed");
+                                        let prompt = match intent {
+                                            // Buttoned approval: resolve the parked
+                                            // `oneshot` keyed by the registered
+                                            // token with the SERVER-bound decision
+                                            // (never derived from the wire
+                                            // custom_id). Ack the click; do NOT
+                                            // enqueue a turn.
+                                            Some(ComponentIntent::Approval { token, decision }) => {
+                                                let resolved = {
+                                                    let mut guard = pending_approvals.lock().await;
+                                                    approval::resolve_parked_approval(
+                                                        &mut guard, &token, decision,
+                                                    )
+                                                };
+                                                // Ack the interaction so the
+                                                // operator doesn't see "did not
+                                                // respond". An already-resolved
+                                                // token (raced/timed-out) just
+                                                // means the buttons are stale.
+                                                let key = if resolved {
+                                                    "channel-discord-approval-recorded"
+                                                } else {
+                                                    "channel-discord-component-expired"
+                                                };
+                                                let msg = i18n::get_required_cli_string(key);
+                                                if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
+                                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord approval ack failed");
+                                                }
+                                                return;
                                             }
-                                            return;
+                                            Some(ComponentIntent::ResolveIntoTurn { prompt }) => prompt,
+                                            // Absent / expired / replayed / forged.
+                                            None => {
+                                                let msg = i18n::get_required_cli_string(
+                                                    "channel-discord-component-expired",
+                                                );
+                                                if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
+                                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord component expired-notice failed");
+                                                }
+                                                return;
+                                            }
                                         };
 
                                         // A modal submit appends its typed-in
@@ -2416,6 +2520,92 @@ impl Channel for DiscordChannel {
                                         };
                                         if tx.send(channel_msg).await.is_err() {
                                             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "orchestrator channel closed; dropping component prompt");
+                                        }
+                                    });
+                                }
+                            } else if itype == 4 {
+                                // type 4 = APPLICATION_COMMAND_AUTOCOMPLETE.
+                                // Fired on EVERY keystroke in a focused option,
+                                // so it must be cheap and side-effect-free: it
+                                // answers inline with a type-8
+                                // (AUTOCOMPLETE_RESULT) choice set and NEVER
+                                // defers or posts an ephemeral. Authorization
+                                // reuses the same `interaction_gate`
+                                // (fail-closed) as the other arms, but evaluated
+                                // WITHOUT the reject side-effect — an
+                                // unauthorized keystroke gets an empty choice
+                                // set (no policy leak, no hang), exactly like a
+                                // query with no matches.
+                                let interaction_id = d.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let interaction_token = d.get("token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let user_id = d
+                                    .get("member")
+                                    .and_then(|m| m.get("user"))
+                                    .or_else(|| d.get("user"))
+                                    .and_then(|u| u.get("id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let interaction_guild = d
+                                    .get("guild_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(ToString::to_string);
+                                let interaction_channel = d
+                                    .get("channel_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+                                if !interaction_id.is_empty() && !interaction_token.is_empty() {
+                                    let client = self.http_client();
+                                    let peers = (self.peer_resolver)();
+                                    let guild_filter = guild_filter.clone();
+                                    let channel_filter = channel_filter.clone();
+
+                                    zeroclaw_spawn::spawn!(async move {
+                                        // Fail-closed authz, side-effect-free:
+                                        // `interaction_gate` is a pure check (the
+                                        // reject/defer side-effects in the other
+                                        // arms are separate REST calls we simply
+                                        // don't make here). On denial OR no
+                                        // matches we answer an empty choice set.
+                                        //
+                                        // No thread-parent REST lookup: it is an
+                                        // authenticated round-trip per keystroke
+                                        // and would defeat the side-effect-free
+                                        // requirement, so a channel-filtered
+                                        // thread simply yields no completions
+                                        // (fail-closed) rather than probing.
+                                        let authorized = interaction_gate(
+                                            &peers,
+                                            &guild_filter,
+                                            &channel_filter,
+                                            &user_id,
+                                            interaction_guild.as_deref(),
+                                            &interaction_channel,
+                                            None,
+                                        )
+                                        .is_ok();
+
+                                        // LIMITATION: choices come from EPIC D's
+                                        // typed-option model, which is not wired
+                                        // in this branch. Until then an
+                                        // authorized keystroke answers an empty
+                                        // (valid) choice set — the dispatch +
+                                        // fail-closed gate are the deliverable
+                                        // here; populated choices land with D.
+                                        let choices: Vec<(String, String)> = Vec::new();
+                                        let answer: &[(String, String)] =
+                                            if authorized { &choices } else { &[] };
+
+                                        if let Err(e) = discord_answer_autocomplete(
+                                            &client,
+                                            &interaction_id,
+                                            &interaction_token,
+                                            answer,
+                                        )
+                                        .await
+                                        {
+                                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord autocomplete answer failed");
                                         }
                                     });
                                 }
@@ -3265,10 +3455,6 @@ impl Channel for DiscordChannel {
             anyhow::bail!("approval prompts are not supported over interaction replies");
         }
         let token = crate::util::new_approval_token();
-        let text = format!(
-            "APPROVAL REQUIRED [{}]\nTool: {}\nArgs: {}\n\nReply: \"{} yes\", \"{} no\", or \"{} always\"",
-            token, request.tool_name, request.arguments_summary, token, token, token,
-        );
 
         let (tx, rx) = oneshot::channel();
         self.pending_approvals
@@ -3278,11 +3464,27 @@ impl Channel for DiscordChannel {
 
         // Strip thread suffix — approval message goes to the channel root.
         let channel_id = recipient.split(':').next().unwrap_or(recipient);
-        if let Err(err) = self.send(&SendMessage::new(text, channel_id)).await {
+
+        // Prefer the buttoned prompt when the interaction pipe is live: a click
+        // can only be dispatched (type-3) and thus resolve the `oneshot` when
+        // `slash_commands` is enabled (the INTERACTION_CREATE handler is gated
+        // on it). Emitting buttons without that pipe would leave the operator
+        // with dead controls — so fall back to the plaintext-token prompt the
+        // inbound MESSAGE_CREATE path parses (`parse_approval_reply`).
+        let emitted = if self.slash_commands {
+            self.send_buttoned_approval(channel_id, &token, request)
+                .await
+        } else {
+            self.send_plaintext_approval(channel_id, &token, request)
+                .await
+        };
+        if let Err(err) = emitted {
             self.pending_approvals.lock().await.remove(&token);
             return Err(err);
         }
 
+        // Timeout → Deny, preserving the deny-by-default silence semantics. The
+        // pending entry is dropped so a late click can't resolve a stale token.
         let response =
             match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
                 Ok(Ok(resp)) => resp,
@@ -6035,5 +6237,217 @@ mod tests {
         let sender = ch.pending_approvals.lock().await.remove("abc123").unwrap();
         sender.send(ChannelApprovalResponse::Deny).unwrap();
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Deny);
+    }
+
+    // ── Buttoned approval: dispatch composition (the security invariants) ──
+    //
+    // The live type-3 arm runs: cheap peer check → `interaction_gate`
+    // (fail-closed) → `pending_components.take` (single-use) → resolve the
+    // parked `oneshot`. These tests wire the *real* primitives in that exact
+    // order so the gate-before-take and single-use invariants are locked, then
+    // assert resolution behaviour. (The arm itself lives inside the gateway
+    // listen loop and can't be driven without a socket; the resolution logic it
+    // calls is `approval::resolve_parked_approval`, unit-tested in `approval`.)
+
+    /// Faithful model of the type-3 dispatch's post-peer-check sequence: gate
+    /// first, and ONLY on success take + resolve. Mirrors mod.rs so the test
+    /// asserts the real ordering contract.
+    fn dispatch_approval_click(
+        peers: &[String],
+        user_id: &str,
+        custom_id: &str,
+        pending_components: &parking_lot::Mutex<pending::PendingComponents>,
+        pending_approvals: &mut std::collections::HashMap<
+            String,
+            oneshot::Sender<ChannelApprovalResponse>,
+        >,
+    ) -> bool {
+        // Fail-closed authz BEFORE any take. DM-style (no guild/channel filter)
+        // with an empty peer list = nobody, exactly like the message path.
+        if interaction_gate(peers, &[], &[], user_id, None, "c1", None).is_err() {
+            return false; // unauthorized: must not drain or resolve anything
+        }
+        let intent = pending_components.lock().take(custom_id);
+        match intent {
+            Some(ComponentIntent::Approval { token, decision }) => {
+                approval::resolve_parked_approval(pending_approvals, &token, decision)
+            }
+            _ => false,
+        }
+    }
+
+    #[tokio::test]
+    async fn authorized_click_resolves_with_the_bound_decision() {
+        let token = "tok123";
+        let (cid, decision) =
+            approval::approval_button_binding(token, approval::ApprovalDecision::AllowOnce);
+        let wire = cid.encode().unwrap();
+
+        let reg = parking_lot::Mutex::new(pending::PendingComponents::default());
+        reg.lock().register(
+            wire.clone(),
+            ComponentIntent::Approval {
+                token: token.to_string(),
+                decision,
+            },
+        );
+        let mut approvals = std::collections::HashMap::new();
+        let (tx, rx) = oneshot::channel();
+        approvals.insert(token.to_string(), tx);
+
+        let resolved =
+            dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &mut approvals);
+        assert!(resolved, "authorized click resolves the oneshot");
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+    }
+
+    #[tokio::test]
+    async fn unauthorized_click_neither_resolves_nor_drains() {
+        let token = "tok123";
+        let (cid, decision) =
+            approval::approval_button_binding(token, approval::ApprovalDecision::AllowOnce);
+        let wire = cid.encode().unwrap();
+
+        let reg = parking_lot::Mutex::new(pending::PendingComponents::default());
+        reg.lock().register(
+            wire.clone(),
+            ComponentIntent::Approval {
+                token: token.to_string(),
+                decision,
+            },
+        );
+        let mut approvals = std::collections::HashMap::new();
+        let (tx, mut rx) = oneshot::channel();
+        approvals.insert(token.to_string(), tx);
+
+        // "intruder" is not in the (specific, non-wildcard) peer list → gate
+        // denies BEFORE the take.
+        let resolved = dispatch_approval_click(
+            &[String::from("u1")],
+            "intruder",
+            &wire,
+            &reg,
+            &mut approvals,
+        );
+        assert!(!resolved, "unauthorized click resolves nothing");
+        // The oneshot is unresolved (rx still pending, sender still parked).
+        assert!(rx.try_recv().is_err(), "no decision delivered");
+        assert!(
+            approvals.contains_key(token),
+            "the approval entry is NOT drained by an unauthorized click"
+        );
+        // And the pending component entry survives: an authorized user could
+        // still click it (the intruder didn't burn the single use).
+        assert!(
+            reg.lock().take(&wire).is_some(),
+            "the component entry was not drained by the unauthorized click"
+        );
+    }
+
+    #[tokio::test]
+    async fn replayed_click_is_refused_single_use() {
+        let token = "tok123";
+        let (cid, decision) =
+            approval::approval_button_binding(token, approval::ApprovalDecision::Deny);
+        let wire = cid.encode().unwrap();
+
+        let reg = parking_lot::Mutex::new(pending::PendingComponents::default());
+        reg.lock().register(
+            wire.clone(),
+            ComponentIntent::Approval {
+                token: token.to_string(),
+                decision,
+            },
+        );
+        let mut approvals = std::collections::HashMap::new();
+        let (tx, rx) = oneshot::channel();
+        approvals.insert(token.to_string(), tx);
+
+        assert!(dispatch_approval_click(
+            &[String::from("*")],
+            "u1",
+            &wire,
+            &reg,
+            &mut approvals
+        ));
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Deny);
+        // The component entry is gone (single-use take), so a replay of the same
+        // custom_id resolves nothing even from an authorized user.
+        assert!(
+            !dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &mut approvals),
+            "replayed click refused"
+        );
+    }
+
+    #[test]
+    fn buttoned_approval_registers_four_resolvable_bindings() {
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "token".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        );
+        // Register exactly what send_buttoned_approval registers, then confirm
+        // every button id resolves to its bound decision (and only its own).
+        let token = "abc123";
+        let (_, bindings) = approval::build_approval_row(token);
+        {
+            let mut reg = ch.pending_components.lock();
+            for (cid, decision) in &bindings {
+                reg.register(
+                    cid.encode().unwrap(),
+                    ComponentIntent::Approval {
+                        token: token.to_string(),
+                        decision: *decision,
+                    },
+                );
+            }
+        }
+        for (cid, decision) in &bindings {
+            let got = ch.pending_components.lock().take(&cid.encode().unwrap());
+            assert_eq!(
+                got,
+                Some(ComponentIntent::Approval {
+                    token: token.to_string(),
+                    decision: *decision,
+                }),
+                "each button resolves to its server-bound decision"
+            );
+        }
+    }
+
+    #[test]
+    fn autocomplete_authz_is_side_effect_free() {
+        // The type-4 arm authorizes a keystroke with `interaction_gate` and then
+        // answers a type-8 choice set — it never calls reject/defer. The gate
+        // itself is a pure function (no &self, no REST), so it is safe to
+        // evaluate per-keystroke. Assert it is callable as a pure predicate and
+        // is fail-closed for an unauthorized user (→ empty choices).
+        assert!(
+            interaction_gate(&[String::from("*")], &[], &[], "u1", None, "c1", None).is_ok(),
+            "authorized keystroke gates open"
+        );
+        assert!(
+            interaction_gate(
+                &[String::from("u1")],
+                &[],
+                &[],
+                "intruder",
+                None,
+                "c1",
+                None
+            )
+            .is_err(),
+            "unauthorized keystroke fails closed → empty choice set, no side effect"
+        );
+        // DM (no guild) with an empty peer list = nobody, same as messages.
+        assert!(
+            interaction_gate(&[], &[], &[], "u1", None, "c1", None).is_err(),
+            "empty peer list denies"
+        );
     }
 }

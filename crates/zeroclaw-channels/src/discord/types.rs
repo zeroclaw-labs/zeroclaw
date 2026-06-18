@@ -46,6 +46,20 @@ impl DiscordOutgoing {
         }
     }
 
+    /// A payload carrying text plus one or more component action rows — the
+    /// shape the buttoned approval prompt sends. Rows are capped to Discord's
+    /// per-message limit at serialization time via `to_rest_json`.
+    pub(crate) fn with_components(
+        content: impl Into<String>,
+        components: Vec<DiscordActionRow>,
+    ) -> Self {
+        Self {
+            content: Some(content.into()),
+            components,
+            ..Default::default()
+        }
+    }
+
     /// Build the REST message JSON. Keys for `embeds`/`components`/`flags` are
     /// omitted while empty/zero, so a content-only payload serialises to exactly
     /// `{"content": <content>}` — the behaviour-neutrality invariant for EPIC A.

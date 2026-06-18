@@ -84,6 +84,47 @@ pub(crate) async fn discord_open_modal(
     Ok(())
 }
 
+/// Answer an APPLICATION_COMMAND_AUTOCOMPLETE (type 4) interaction with a
+/// callback type 8 (APPLICATION_COMMAND_AUTOCOMPLETE_RESULT) carrying inline
+/// choices. Discord shows up to 25 choices; over that it 400s, so the caller's
+/// list is truncated here. An empty list is a valid answer (clears the
+/// suggestion box) — used when authz fails or no choices are available, so a
+/// per-keystroke event never hangs or leaks a policy decision.
+///
+/// Unlike `discord_reject_interaction`/`discord_defer_interaction`, this is the
+/// ONLY response an autocomplete keystroke may produce: it neither defers nor
+/// posts an ephemeral, so authorization stays side-effect-free.
+pub(crate) async fn discord_answer_autocomplete(
+    client: &reqwest::Client,
+    interaction_id: &str,
+    interaction_token: &str,
+    choices: &[(String, String)],
+) -> anyhow::Result<()> {
+    let url = format!(
+        "https://discord.com/api/v10/interactions/{interaction_id}/{interaction_token}/callback"
+    );
+    let rendered: Vec<serde_json::Value> = choices
+        .iter()
+        .take(25)
+        .map(|(name, value)| json!({ "name": name, "value": value }))
+        .collect();
+    // type 8 = APPLICATION_COMMAND_AUTOCOMPLETE_RESULT
+    let body = json!({ "type": 8, "data": { "choices": rendered } });
+    // without_url: transport errors embed the token-bearing URL.
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err = resp.text().await.unwrap_or_default();
+        anyhow::bail!("interaction autocomplete answer failed ({status}): {err}");
+    }
+    Ok(())
+}
+
 /// Extract a string option (`d.data.options[name].value`) from an
 /// APPLICATION_COMMAND interaction payload. Empty string when absent.
 pub(crate) fn interaction_string_option(d: &serde_json::Value, name: &str) -> String {

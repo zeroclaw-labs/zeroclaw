@@ -388,6 +388,7 @@ channel-discord-interaction-unauthorized = You're not authorized to use this com
 channel-discord-interaction-malformed = Unknown or malformed command.
 channel-discord-interaction-unavailable = That command is no longer available, or its input was empty.
 channel-discord-component-expired = This button or menu has expired or was already used.
+channel-discord-approval-recorded = Your decision has been recorded.
 channel-discord-delivery-failure-note-one = (note: I couldn't deliver {$count} file.)
 channel-discord-delivery-failure-note-many = (note: I couldn't deliver {$count} files.)
 channel-whatsapp-web-delivery-failure-note-one = (note: I could not deliver {$count} WhatsApp media attachment.)

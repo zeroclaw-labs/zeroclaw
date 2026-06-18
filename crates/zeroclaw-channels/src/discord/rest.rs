@@ -58,6 +58,40 @@ pub(crate) async fn send_discord_message_payload(
     extract_message_id(resp).await
 }
 
+/// POST a message built from a full [`DiscordOutgoing`] (content + components),
+/// returning the new message's ID. The plain-text path stays
+/// [`send_discord_message_json`]; this is the components-bearing send (e.g. the
+/// buttoned approval prompt). `components` serialize through the same
+/// `to_rest_json` chokepoint, so an action row whose buttons all fail to encode
+/// simply omits the key. (EPIC B)
+pub(crate) async fn send_discord_outgoing(
+    client: &reqwest::Client,
+    bot_token: &str,
+    recipient: &str,
+    outgoing: &DiscordOutgoing,
+) -> anyhow::Result<String> {
+    let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
+    let body = outgoing.to_rest_json();
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bot {bot_token}"))
+        .json(&body)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+        anyhow::bail!("Discord send message failed ({status}): {err}");
+    }
+
+    extract_message_id(resp).await
+}
+
 /// POST a full message envelope with file attachments via multipart,
 /// returning the new message's ID. Callers that don't need the ID can discard it.
 pub(crate) async fn send_discord_message_payload_with_files(

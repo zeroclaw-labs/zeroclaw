@@ -18,17 +18,26 @@ use std::time::{Duration, Instant};
 const COMPONENT_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// What a registered component does when clicked. Phase 2 resolves into an agent
-/// turn; EPIC B Phase 4 adds an approval variant that resolves a parked
-/// `oneshot` instead of enqueuing.
-// Constructed by the *sender* side (a feature that emits a component +
-// registers its intent) — the first such caller lands in Phase 4 (buttoned
-// approval). The dispatch already `take`s and matches it.
-#[allow(dead_code)]
+/// turn; Phase 4 adds an approval variant that resolves a parked `oneshot`
+/// instead of enqueuing.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ComponentIntent {
     /// Enqueue this prompt as an agent turn — the click drives the agent, whose
-    /// reply is delivered through the interaction followup.
+    /// reply is delivered through the interaction followup. The dispatch arm
+    /// `take`s and matches it; the *emitter* (a feature that renders a
+    /// resolve-into-turn button) lands in a later phase, so no production code
+    /// constructs it yet — only the dispatch + tests reference it.
+    #[allow(dead_code)]
     ResolveIntoTurn { prompt: String },
+    /// Resolve a parked tool-approval `oneshot` keyed by `token` in
+    /// `pending_approvals` with the server-bound `decision`. The decision is a
+    /// fixed enum captured when the button was emitted — NEVER derived from the
+    /// clicked `custom_id` — so a crafted id cannot turn a deny button into an
+    /// allow. The click resolves the approval; it does not enqueue a turn.
+    Approval {
+        token: String,
+        decision: super::approval::ApprovalDecision,
+    },
 }
 
 struct Entry {
@@ -47,9 +56,6 @@ impl PendingComponents {
     /// Register a component's intent under its `custom_id`, sweeping expired
     /// entries first (bounded by the emit rate, so the map can't grow without
     /// bound from never-clicked components).
-    // Sender-side: first caller is Phase 4 (emit a component, register its
-    // intent). `take` (the dispatch consumer) is already live.
-    #[allow(dead_code)]
     pub(crate) fn register(&mut self, custom_id: String, intent: ComponentIntent) {
         self.sweep();
         self.entries.insert(
@@ -70,8 +76,6 @@ impl PendingComponents {
         (entry.created.elapsed() < COMPONENT_TTL).then_some(entry.intent)
     }
 
-    // Only reached via `register` (sender-side), so dead until Phase 4.
-    #[allow(dead_code)]
     fn sweep(&mut self) {
         self.entries
             .retain(|_, e| e.created.elapsed() < COMPONENT_TTL);
