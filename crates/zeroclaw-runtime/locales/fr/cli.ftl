@@ -433,6 +433,7 @@ cli-cron-added-oneshot = ✅ Tâche cron à exécution unique {$id} ajoutée
 cli-cron-added-interval-agent = ✅ Tâche cron d'agent par intervalle {$id} ajoutée
 cli-cron-added-interval = ✅ Tâche cron par intervalle {$id} ajoutée
 cli-cron-updated = ✅ Tâche cron {$id} mise à jour
+cli-cron-removed = ✅ Tâche cron {$id} supprimée
 cli-cron-paused = ⏸️  Tâche cron {$id} en pause
 cli-cron-resumed = ▶️  Tâche cron {$id} reprise
 cli-cron-expr = {"  "}Expr  : {$v}

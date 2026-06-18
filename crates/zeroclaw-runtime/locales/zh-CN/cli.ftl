@@ -429,6 +429,7 @@ cli-cron-added-oneshot = ✅ 已添加一次性 cron 任务 {$id}
 cli-cron-added-interval-agent = ✅ 已添加间隔 agent cron 任务 {$id}
 cli-cron-added-interval = ✅ 已添加间隔 cron 任务 {$id}
 cli-cron-updated = ✅ 已更新 cron 任务 {$id}
+cli-cron-removed = ✅ 已移除 cron 任务 {$id}
 cli-cron-paused = ⏸️  已暂停 cron 任务 {$id}
 cli-cron-resumed = ▶️  已恢复 cron 任务 {$id}
 cli-cron-expr = {"  "}表达式  : {$v}
