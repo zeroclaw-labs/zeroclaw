@@ -130,13 +130,32 @@ pub(crate) struct EmbedSpec {
     #[serde(default)]
     pub(crate) footer: Option<EmbedFooterSpec>,
     #[serde(default)]
-    pub(crate) image: Option<String>,
+    pub(crate) image: Option<EmbedMediaSpec>,
     #[serde(default)]
-    pub(crate) thumbnail: Option<String>,
+    pub(crate) thumbnail: Option<EmbedMediaSpec>,
     #[serde(default)]
     pub(crate) author: Option<EmbedAuthorSpec>,
     #[serde(default)]
     pub(crate) fields: Vec<EmbedFieldSpec>,
+}
+
+/// An embed `image`/`thumbnail` value. Discord models these as objects
+/// (`{ "url": … }`), which is what an agent following the "Discord embed JSON
+/// object" affordance emits; a bare URL string is also accepted for leniency.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub(crate) enum EmbedMediaSpec {
+    Url(String),
+    Object { url: String },
+}
+
+impl EmbedMediaSpec {
+    fn into_url(self) -> String {
+        match self {
+            Self::Url(url) => url,
+            Self::Object { url } => url,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -310,8 +329,8 @@ pub(crate) fn spec_to_embed(
         url: vet(a.url),
         icon_url: vet(a.icon_url),
     });
-    let image = vet(spec.image).map(|url| EmbedMedia { url });
-    let thumbnail = vet(spec.thumbnail).map(|url| EmbedMedia { url });
+    let image = vet(spec.image.map(EmbedMediaSpec::into_url)).map(|url| EmbedMedia { url });
+    let thumbnail = vet(spec.thumbnail.map(EmbedMediaSpec::into_url)).map(|url| EmbedMedia { url });
     let url = vet(spec.url);
     let fields = spec
         .fields
@@ -713,7 +732,7 @@ mod embed_tests {
     fn spec_to_embed_keeps_http_image_and_links() {
         let spec = EmbedSpec {
             title: Some("T".to_string()),
-            image: Some("https://example.com/i.png".to_string()),
+            image: Some(EmbedMediaSpec::Url("https://example.com/i.png".to_string())),
             url: Some("http://example.com".to_string()),
             ..Default::default()
         };
@@ -728,10 +747,34 @@ mod embed_tests {
     }
 
     #[test]
+    fn image_and_thumbnail_accept_discord_nested_object_and_bare_string() {
+        // Discord models image/thumbnail as `{ "url": … }`, which is what an
+        // agent following the "Discord embed JSON object" affordance emits.
+        let (_, mut specs) = parse_embed_markers(
+            r#"[EMBED:{"title":"T","image":{"url":"https://e.com/i.png"},"thumbnail":{"url":"https://e.com/t.png"}}]"#,
+        );
+        assert_eq!(
+            specs.len(),
+            1,
+            "the nested-media embed parses (does not reject)"
+        );
+        let (embed, failures) = spec_to_embed(specs.remove(0), None);
+        let embed = embed.expect("renders");
+        assert_eq!(embed.image.as_ref().unwrap().url, "https://e.com/i.png");
+        assert_eq!(embed.thumbnail.as_ref().unwrap().url, "https://e.com/t.png");
+        assert!(failures.is_empty());
+
+        // The bare-string form is still accepted.
+        let (_, mut bare) = parse_embed_markers(r#"[EMBED:{"image":"https://e.com/b.png"}]"#);
+        let (embed, _) = spec_to_embed(bare.remove(0), None);
+        assert_eq!(embed.unwrap().image.unwrap().url, "https://e.com/b.png");
+    }
+
+    #[test]
     fn spec_to_embed_drops_disallowed_scheme_url_but_keeps_text() {
         let spec = EmbedSpec {
             title: Some("Kept".to_string()),
-            image: Some("file:///etc/passwd".to_string()),
+            image: Some(EmbedMediaSpec::Url("file:///etc/passwd".to_string())),
             ..Default::default()
         };
         let (embed, failures) = spec_to_embed(spec, None);
@@ -751,7 +794,7 @@ mod embed_tests {
         let abs = std::fs::canonicalize(&file).unwrap();
         let spec = EmbedSpec {
             description: Some("body".to_string()),
-            thumbnail: Some(abs.to_string_lossy().to_string()),
+            thumbnail: Some(EmbedMediaSpec::Url(abs.to_string_lossy().to_string())),
             ..Default::default()
         };
         let (embed, failures) = spec_to_embed(spec, Some(dir.path()));
@@ -763,7 +806,7 @@ mod embed_tests {
     #[test]
     fn spec_to_embed_returns_none_when_nothing_renders() {
         let spec = EmbedSpec {
-            image: Some("file:///etc/passwd".to_string()),
+            image: Some(EmbedMediaSpec::Url("file:///etc/passwd".to_string())),
             ..Default::default()
         };
         let (embed, failures) = spec_to_embed(spec, None);
