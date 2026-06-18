@@ -507,7 +507,10 @@ mod tests {
             })
         }
 
-        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
             self.invocations.fetch_add(1, Ordering::SeqCst);
             Ok(crate::tools::ToolResult {
                 success: true,
@@ -553,9 +556,10 @@ mod tests {
             "docker-mcp__extract_text",
             serde_json::json!({}),
             None,
-            &[],  // no static tools — force activated-tools path
+            &[], // no static tools — force activated-tools path
             Some(&activated),
             &NoopObserver,
+            None,
             None,
             None,
         )
@@ -567,7 +571,9 @@ mod tests {
             "activated tool execution should succeed after poisoned lock recovery"
         );
         assert!(
-            outcome.output.contains("executed via poisoned lock recovery"),
+            outcome
+                .output
+                .contains("executed via poisoned lock recovery"),
             "tool output should come from the recovered activated tool"
         );
         assert_eq!(
