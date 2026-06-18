@@ -683,6 +683,122 @@ impl DiscordChannel {
         }
     }
 
+    /// Forget archived reaction rows in bulk for the two "clear" gateway
+    /// events that carry no `user_id`, so the sidecar doesn't keep orphaned
+    /// reaction rows after Discord wipes them server-side:
+    ///
+    /// * `MESSAGE_REACTION_REMOVE_ALL` — every reaction on a message is
+    ///   cleared. `emoji_key` is `None`: sweep all
+    ///   `discord_reaction_{message_id}_*` rows (all users, all emoji).
+    /// * `MESSAGE_REACTION_REMOVE_EMOJI` — every reaction of one emoji on a
+    ///   message is cleared. `emoji_key` is `Some(_)`: sweep
+    ///   `discord_reaction_{message_id}_*_{emoji_key}` rows (all users, that
+    ///   emoji), keying the emoji the same way [`handle_reaction_event`]
+    ///   does — custom-emoji `id` first, else the unicode glyph.
+    ///
+    /// Both events arrive under the reaction intents already negotiated when
+    /// `reaction_scope != Off`, and are gated by the same guild/channel
+    /// allowlists as the single-reaction path. There is no per-reactor peer
+    /// gate here: the reactors are exactly those whose rows the ADD path
+    /// already admitted, so the prefix sweep only ever touches admitted rows.
+    /// Scope `Own` needs no extra check — REMOVE_ALL/REMOVE_EMOJI only forget
+    /// keys that exist, and `Own` is what decided whether they exist.
+    async fn sweep_message_reactions(&self, event_type: &str, d: &serde_json::Value) {
+        let message_id = d.get("message_id").and_then(|m| m.as_str()).unwrap_or("");
+        let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("");
+        if message_id.is_empty() {
+            return;
+        }
+        if !self.guild_ids.is_empty()
+            && let Some(g) = d.get("guild_id").and_then(serde_json::Value::as_str)
+            && !self.guild_ids.iter().any(|allowed| allowed == g)
+        {
+            return;
+        }
+        if !self.channel_ids.is_empty() {
+            let parent_id =
+                if !channel_id.is_empty() && !self.channel_ids.iter().any(|c| c == channel_id) {
+                    self.thread_parent(&self.http_client(), channel_id).await
+                } else {
+                    None
+                };
+            if !channel_passes_filter(&self.channel_ids, channel_id, parent_id.as_deref()) {
+                return;
+            }
+        }
+
+        // REMOVE_EMOJI carries one `emoji` object; REMOVE_ALL carries none.
+        // Same identity rule as the single-reaction key: custom-emoji id
+        // first, else the glyph. An emoji object with neither is unkeyable —
+        // nothing to scope the sweep to.
+        let emoji_key = if event_type == "MESSAGE_REACTION_REMOVE_EMOJI" {
+            let key = d.get("emoji").and_then(|e| {
+                e.get("id")
+                    .and_then(|i| i.as_str())
+                    .or_else(|| e.get("name").and_then(|n| n.as_str()))
+            });
+            let Some(key) = key else {
+                return;
+            };
+            Some(key)
+        } else {
+            None
+        };
+
+        let Some(ref archive_mem) = self.archive_memory else {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "event_type": event_type,
+                        "message_id": message_id,
+                    })),
+                "discord reaction sweep (archive disabled, nothing to forget)"
+            );
+            return;
+        };
+
+        // No prefix/suffix delete API on the Memory trait, so list the
+        // archive's discord rows and filter by key in memory. The sidecar
+        // category is the same `Custom("discord")` the store path writes.
+        let category = zeroclaw_memory::MemoryCategory::Custom("discord".to_string());
+        let entries = match archive_mem.list(Some(&category), None).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error": format!("{e}"),
+                            "event_type": event_type,
+                            "message_id": message_id,
+                        })),
+                    "failed to list archived discord reactions for sweep"
+                );
+                return;
+            }
+        };
+
+        for entry in entries {
+            if !reaction_sweep_matches(&entry.key, message_id, emoji_key) {
+                continue;
+            }
+            if let Err(e) = archive_mem.forget(&entry.key).await {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error": format!("{e}"),
+                            "key": entry.key,
+                        })),
+                    "failed to forget archived discord reaction during sweep"
+                );
+            }
+        }
+    }
+
     fn http_client(&self) -> reqwest::Client {
         zeroclaw_config::schema::build_channel_proxy_client(
             "channel.discord",
@@ -890,6 +1006,31 @@ fn channel_passes_filter(
         return channel_filter.iter().any(|c| c == parent);
     }
     false
+}
+
+/// Pure key-match for the bulk reaction-removal sweep. Reaction rows key as
+/// `discord_reaction_{message_id}_{user_id}_{emoji_key}` (see
+/// [`DiscordChannel::handle_reaction_event`]); `user_id` is a numeric
+/// snowflake and `emoji_key` is a custom-emoji id (numeric) or a single
+/// unicode glyph — neither contains `_`, so the message-id prefix and the
+/// emoji-key suffix are unambiguous.
+///
+/// * `emoji_key == None` (REMOVE_ALL): match every reaction row for the
+///   message — prefix `discord_reaction_{message_id}_`.
+/// * `emoji_key == Some(e)` (REMOVE_EMOJI): additionally require the row to
+///   key on that emoji — suffix `_{e}`.
+///
+/// The trailing `_` on the prefix is what stops `m1` from matching `m12`'s
+/// rows.
+fn reaction_sweep_matches(key: &str, message_id: &str, emoji_key: Option<&str>) -> bool {
+    let prefix = format!("discord_reaction_{message_id}_");
+    if !key.starts_with(&prefix) {
+        return false;
+    }
+    match emoji_key {
+        None => true,
+        Some(emoji) => key.ends_with(&format!("_{emoji}")),
+    }
 }
 
 /// Process Discord message attachments in a single pass.
@@ -2642,6 +2783,24 @@ impl Channel for DiscordChannel {
                             && let Some(d) = event.get("d")
                         {
                             self.handle_reaction_event(event_type, d, &bot_user_id).await;
+                        }
+                        continue;
+                    }
+
+                    // Bulk reaction-removal events (whole message, or one
+                    // emoji across the message) carry no `user_id`, so they
+                    // can't go through `handle_reaction_event`. Same intents,
+                    // same scope/guild/channel gate — they sweep the matching
+                    // `discord_reaction_{message}_*` rows so the archive
+                    // doesn't keep orphaned reactions.
+                    if event_type == "MESSAGE_REACTION_REMOVE_ALL"
+                        || event_type == "MESSAGE_REACTION_REMOVE_EMOJI"
+                    {
+                        if self.reaction_scope
+                            != zeroclaw_config::schema::DiscordReactionScope::Off
+                            && let Some(d) = event.get("d")
+                        {
+                            self.sweep_message_reactions(event_type, d).await;
                         }
                         continue;
                     }
@@ -4690,6 +4849,213 @@ mod tests {
             "guild_id": "g1", "emoji": {"name": "👍"}
         });
         ch.handle_reaction_event("MESSAGE_REACTION_REMOVE", &remove, "botid")
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 0);
+    }
+
+    #[test]
+    fn reaction_sweep_predicate_scopes_by_message_then_emoji() {
+        // REMOVE_ALL: every row for m1, regardless of user or emoji.
+        assert!(reaction_sweep_matches(
+            "discord_reaction_m1_u1_👍",
+            "m1",
+            None
+        ));
+        assert!(reaction_sweep_matches(
+            "discord_reaction_m1_u2_🎉",
+            "m1",
+            None
+        ));
+        // ...but never another message's rows, and the trailing `_` on the
+        // prefix keeps `m1` from swallowing `m12`.
+        assert!(!reaction_sweep_matches(
+            "discord_reaction_m2_u1_👍",
+            "m1",
+            None
+        ));
+        assert!(!reaction_sweep_matches(
+            "discord_reaction_m12_u1_👍",
+            "m1",
+            None
+        ));
+
+        // REMOVE_EMOJI: the message AND that one emoji (any user).
+        assert!(reaction_sweep_matches(
+            "discord_reaction_m1_u1_👍",
+            "m1",
+            Some("👍")
+        ));
+        assert!(reaction_sweep_matches(
+            "discord_reaction_m1_u2_👍",
+            "m1",
+            Some("👍")
+        ));
+        // Right message, wrong emoji: untouched.
+        assert!(!reaction_sweep_matches(
+            "discord_reaction_m1_u1_🎉",
+            "m1",
+            Some("👍")
+        ));
+        // Right emoji, wrong message: untouched.
+        assert!(!reaction_sweep_matches(
+            "discord_reaction_m2_u1_👍",
+            "m1",
+            Some("👍")
+        ));
+        // Custom-emoji rows key by id; REMOVE_EMOJI scopes by that same id.
+        assert!(reaction_sweep_matches(
+            "discord_reaction_m1_u1_424242",
+            "m1",
+            Some("424242")
+        ));
+        assert!(!reaction_sweep_matches(
+            "discord_reaction_m1_u1_424242",
+            "m1",
+            Some("999")
+        ));
+    }
+
+    #[tokio::test]
+    async fn remove_all_sweeps_only_that_messages_reactions() {
+        let (ch, mem, _dir) = reaction_test_channel(DiscordReactionScope::All);
+        // Two users react with two different emoji on m1, plus an unrelated
+        // reaction on m2 that must survive the sweep.
+        for (user, emoji) in [("u1", "👍"), ("u2", "🎉")] {
+            let add = serde_json::json!({
+                "user_id": user, "message_id": "m1", "channel_id": "c1",
+                "guild_id": "g1", "emoji": {"name": emoji},
+                "member": {"user": {"username": user}}
+            });
+            ch.handle_reaction_event("MESSAGE_REACTION_ADD", &add, "botid")
+                .await;
+        }
+        let other = serde_json::json!({
+            "user_id": "u1", "message_id": "m2", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "👍"}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_ADD", &other, "botid")
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 3);
+
+        let clear = serde_json::json!({
+            "message_id": "m1", "channel_id": "c1", "guild_id": "g1"
+        });
+        ch.sweep_message_reactions("MESSAGE_REACTION_REMOVE_ALL", &clear)
+            .await;
+
+        assert!(
+            mem.get("discord_reaction_m1_u1_👍")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            mem.get("discord_reaction_m1_u2_🎉")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // m2's reaction is untouched.
+        assert!(
+            mem.get("discord_reaction_m2_u1_👍")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(mem.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_emoji_sweeps_only_that_emoji_on_the_message() {
+        let (ch, mem, _dir) = reaction_test_channel(DiscordReactionScope::All);
+        // Same emoji from two users, plus a different emoji that must survive.
+        for user in ["u1", "u2"] {
+            let add = serde_json::json!({
+                "user_id": user, "message_id": "m1", "channel_id": "c1",
+                "guild_id": "g1", "emoji": {"name": "👍"}
+            });
+            ch.handle_reaction_event("MESSAGE_REACTION_ADD", &add, "botid")
+                .await;
+        }
+        let keep = serde_json::json!({
+            "user_id": "u1", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "🎉"}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_ADD", &keep, "botid")
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 3);
+
+        let clear = serde_json::json!({
+            "message_id": "m1", "channel_id": "c1", "guild_id": "g1",
+            "emoji": {"name": "👍"}
+        });
+        ch.sweep_message_reactions("MESSAGE_REACTION_REMOVE_EMOJI", &clear)
+            .await;
+
+        // Both 👍 rows gone; the 🎉 row survives.
+        assert!(
+            mem.get("discord_reaction_m1_u1_👍")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            mem.get("discord_reaction_m1_u2_👍")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            mem.get("discord_reaction_m1_u1_🎉")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(mem.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn bulk_removal_respects_guild_and_channel_gates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem: std::sync::Arc<dyn zeroclaw_memory::Memory> = std::sync::Arc::new(
+            zeroclaw_memory::SqliteMemory::new_named("sqlite", dir.path(), "discord").unwrap(),
+        );
+        let gated = DiscordChannel::new(
+            "fake".into(),
+            vec!["g1".into()],
+            "discord_test_alias",
+            Arc::new(|| vec!["*".to_string()]),
+            false,
+            false,
+        )
+        .with_channel_ids(vec!["c1".into()])
+        .with_archive_memory(std::sync::Arc::clone(&mem))
+        .with_reaction_notifications(DiscordReactionScope::All);
+
+        let add = serde_json::json!({
+            "user_id": "friend", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "👍"}
+        });
+        gated
+            .handle_reaction_event("MESSAGE_REACTION_ADD", &add, "botid")
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 1);
+
+        // Wrong guild: sweep is a no-op, the row stays.
+        let wrong_guild = serde_json::json!({
+            "message_id": "m1", "channel_id": "c1", "guild_id": "g2"
+        });
+        gated
+            .sweep_message_reactions("MESSAGE_REACTION_REMOVE_ALL", &wrong_guild)
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 1);
+
+        // Right guild and channel: swept.
+        let ok = serde_json::json!({
+            "message_id": "m1", "channel_id": "c1", "guild_id": "g1"
+        });
+        gated
+            .sweep_message_reactions("MESSAGE_REACTION_REMOVE_ALL", &ok)
             .await;
         assert_eq!(mem.count().await.unwrap(), 0);
     }
