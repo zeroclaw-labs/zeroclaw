@@ -974,6 +974,7 @@ impl Agent {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -996,6 +997,7 @@ impl Agent {
         exclude_memory: bool,
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
+        canvas_store: Option<tools::CanvasStore>,
     ) -> Result<Self> {
         Self::from_config_with_session_cwd_and_mcp_approval_mode(
             config,
@@ -1007,6 +1009,7 @@ impl Agent {
             None,
             sop_engine,
             sop_audit,
+            canvas_store,
         )
         .await
     }
@@ -1035,6 +1038,7 @@ impl Agent {
             tui_env,
             sop_engine,
             sop_audit,
+            None,
         )
         .await
     }
@@ -1049,6 +1053,7 @@ impl Agent {
         tui_env: Option<std::collections::HashMap<String, String>>,
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
+        canvas_store: Option<tools::CanvasStore>,
     ) -> Result<Self> {
         let agent_cfg = config
             .agent(agent_alias)
@@ -1173,7 +1178,7 @@ impl Agent {
             &config.agents,
             agent_model_provider.and_then(|e| e.api_key.as_deref()),
             config,
-            None,
+            canvas_store,
             false,
             tui_env,
             sop_engine,
@@ -2295,14 +2300,16 @@ impl Agent {
             ..zeroclaw_config::schema::PacingConfig::default()
         };
 
-        // Usage-only cost context, as in `Agent::turn`: per-call token totals
-        // feed the AgentEnd guard without persisting cost records or
-        // enforcing budgets (this path never did either). One context spans
-        // every round, so its snapshot is cumulative. The loop calls below
-        // must stay plain `.await`s on this task — caller-scoped task-locals
-        // (ws.rs session key, rpc thread id, tool-choice/thinking overrides)
-        // silently vanish across a spawn.
-        let cost_context = crate::agent::loop_::ToolLoopCostTrackingContext::usage_only();
+        // Reuse any caller-scoped cost context (gateway WS / RPC) so streamed
+        // turns keep the real tracker + pricing wiring instead of shadowing it
+        // with a usage-only fallback. When no outer scope exists, preserve the
+        // legacy Agent behavior by synthesizing a local accumulation-only
+        // context for AgentEnd token reporting.
+        let cost_context = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
+            .try_with(Clone::clone)
+            .ok()
+            .flatten()
+            .unwrap_or_else(crate::agent::loop_::ToolLoopCostTrackingContext::usage_only);
 
         // ── Round loop: one tool-call-loop run per steering round ──────────
         for round in 0..self.config.resolved.max_tool_iterations {
@@ -6104,6 +6111,7 @@ mod tests {
                 })
                 .collect(),
             prompts: vec![],
+            slash_options: Vec::new(),
             location: None,
         }
     }
@@ -6192,6 +6200,7 @@ mod tests {
                 timeout_secs: None,
             }],
             prompts: vec![],
+            slash_options: Vec::new(),
             location: None,
         };
         tools::register_skill_tools_with_context(
@@ -6574,6 +6583,110 @@ mod tests {
         assert!(
             llm_response_idx < end_idx,
             "AgentEnd must follow LlmResponse"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_reuses_outer_cost_tracking_context() {
+        use crate::agent::cost::{
+            TOOL_LOOP_COST_TRACKING_CONTEXT, TOOL_LOOP_TURN_USAGE, ToolLoopCostTrackingContext,
+            TurnUsage,
+        };
+        use crate::cost::CostTracker;
+        use std::collections::HashMap;
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let workspace = tempfile::TempDir::new().expect("temp dir");
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: true,
+                    track_per_agent: true,
+                    ..zeroclaw_config::schema::CostConfig::default()
+                },
+                workspace.path(),
+            )
+            .expect("cost tracker should initialize"),
+        );
+        let pricing = Arc::new(HashMap::from([(
+            "mock-provider".to_string(),
+            HashMap::from([
+                ("test-model.input".to_string(), 3.0),
+                ("test-model.output".to_string(), 15.0),
+            ]),
+        )]));
+        let cost_context = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), pricing)
+            .with_agent_alias("streamed-agent");
+        let turn_usage = Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                    text: Some("streamed cost".into()),
+                    tool_calls: vec![],
+                    usage: Some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(1_000),
+                        cached_input_tokens: None,
+                        output_tokens: Some(200),
+                    }),
+                    reasoning_content: None,
+                }]),
+            }))
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(Arc::from(crate::observability::NoopObserver {}) as Arc<dyn Observer>)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_name("test-model".into())
+            .model_provider_name("mock-provider".into())
+            .agent_alias("streamed-agent".into())
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let outcome = TOOL_LOOP_TURN_USAGE
+            .scope(
+                Some(Arc::clone(&turn_usage)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                    Some(cost_context),
+                    agent.turn_streamed_with_steering_state("hello", event_tx, None, None),
+                ),
+            )
+            .await
+            .expect("streamed turn should succeed");
+
+        assert_eq!(outcome.response, "streamed cost");
+        while event_rx.recv().await.is_some() {}
+
+        let recorded = *turn_usage.lock();
+        assert_eq!(recorded.input_tokens, 1_000);
+        assert_eq!(recorded.output_tokens, 200);
+        assert!(
+            recorded.cost_usd > 0.0,
+            "outer turn usage should accumulate non-zero cost from scoped pricing"
+        );
+
+        let summary = tracker.get_summary().expect("cost summary");
+        assert_eq!(summary.request_count, 1);
+        assert_eq!(summary.total_tokens, 1_200);
+        assert!(
+            summary.session_cost_usd > 0.0,
+            "scoped tracker should persist streamed-turn usage"
+        );
+        let agent_summary = tracker
+            .get_summary_for_agent("streamed-agent")
+            .expect("agent-scoped summary");
+        assert_eq!(agent_summary.request_count, 1);
+        assert!(
+            agent_summary.session_cost_usd > 0.0,
+            "agent alias should flow through persisted streamed-turn usage"
         );
     }
 

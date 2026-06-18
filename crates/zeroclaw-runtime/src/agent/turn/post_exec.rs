@@ -43,7 +43,7 @@ pub(crate) async fn record_executed_outcomes(
                     "model": ctx.model,
                     "iteration": iteration + 1,
                     "tool": call.name.clone(),
-                    "error_reason": outcome.error_reason,
+                    "error_reason": outcome.error_reason.as_deref().map(scrub_credentials),
                     "output": scrub_credentials(&outcome.output),
                     "trace_id": ctx.turn_id,
                 })),
@@ -65,17 +65,12 @@ pub(crate) async fn record_executed_outcomes(
         // ── Progress: tool completion ───────────────────────
         if let Some(tx) = ctx.on_delta {
             let secs = outcome.duration.as_secs();
-            let progress_msg = if outcome.success {
-                format!("\u{2705} {} ({secs}s)\n", call.name)
-            } else if let Some(ref reason) = outcome.error_reason {
-                format!(
-                    "\u{274c} {} ({secs}s): {}\n",
-                    call.name,
-                    truncate_with_ellipsis(reason, 200)
-                )
-            } else {
-                format!("\u{274c} {} ({secs}s)\n", call.name)
-            };
+            let progress_msg = render_completion_progress(
+                &call.name,
+                secs,
+                outcome.success,
+                outcome.error_reason.as_deref(),
+            );
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -86,5 +81,59 @@ pub(crate) async fn record_executed_outcomes(
         }
 
         ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
+    }
+}
+
+/// Build the CLI completion-progress line. Failure text is scrubbed here
+/// because the progress channel is a human-facing rendering surface; the
+/// source `error_reason` carries raw bytes on the data path.
+fn render_completion_progress(
+    tool: &str,
+    secs: u64,
+    success: bool,
+    error_reason: Option<&str>,
+) -> String {
+    if success {
+        format!("\u{2705} {tool} ({secs}s)\n")
+    } else if let Some(reason) = error_reason {
+        format!(
+            "\u{274c} {tool} ({secs}s): {}\n",
+            truncate_with_ellipsis(&scrub_credentials(reason), 200)
+        )
+    } else {
+        format!("\u{274c} {tool} ({secs}s)\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_completion_progress;
+
+    /// The CLI progress line is a rendering surface, so credential-shaped
+    /// failure text must be scrubbed even though `error_reason` is raw on the
+    /// data path.
+    #[test]
+    fn completion_progress_scrubs_credential_error_reason() {
+        let line = render_completion_progress(
+            "config_read",
+            2,
+            false,
+            Some("api_key = \"sk-live-abcd1234efgh5678\""),
+        );
+        assert!(
+            line.contains("[REDACTED]"),
+            "expected scrubbed line: {line}"
+        );
+        assert!(
+            !line.contains("abcd1234efgh5678"),
+            "raw secret leaked: {line}"
+        );
+    }
+
+    #[test]
+    fn completion_progress_success_has_no_error_text() {
+        let line = render_completion_progress("echo", 0, true, None);
+        assert!(line.starts_with('\u{2705}'));
+        assert!(!line.contains(':'));
     }
 }

@@ -776,8 +776,55 @@ cli-channels-configure-hint = To configure:      zeroclaw config set channels.<n
 # Appended to (or persisted as) assistant output when a turn is cut short;
 # shown to end users across every transport (channels, WS, RPC, ACP, CLI).
 turn-interrupted-by-user = [interrupted by user]
+# Shown when a turn ends because the client RPC channel cancelled it. The actor
+# is not verified: human interrupt and programmatic client cancels both arrive
+# on this path, so the wording names the channel, not a user.
+turn-cancelled-client-rpc = [turn cancelled via client]
 turn-stream-interrupted = [stream interrupted]
 turn-tool-interrupted-before-result = [interrupted by user before this tool produced a result]
 # Safe reply delivered when the model repeatedly emits malformed internal
 # tool-call protocol and the turn gives up retrying.
 channel-runtime-malformed-tool-output = I generated an internal tool-call format error and could not complete this request. Please try again.
+
+# ── Alias CRUD CLI — zeroclaw {agents,providers,channels} {create,list,rename,delete} (#7468 / #7175) ──
+cli-alias-list-empty = (no entries under {$section})
+cli-alias-created = created {$section}.{$alias}
+cli-alias-exists = {$section}.{$alias} already exists (no change)
+cli-alias-impact-scrub-header = deleting {$section}.{$alias} would scrub {$count} reference(s):
+cli-alias-impact-blocked-header = deleting {$section}.{$alias} is BLOCKED by {$count} hard reference(s):
+cli-alias-impact-blocker = ✗ {$path} (hard reference)
+cli-alias-impact-scrub = • {$path} (would be scrubbed)
+cli-alias-no-changes = No changes made. Re-run with --yes to apply (or --dry-run to preview).
+cli-alias-warn-workspace-archive = warning: workspace archive failed: {$error}
+cli-alias-owned-cascaded = owned-state cascaded: memory {$memory} · cron {$cron} · acp {$acp} · sessions {$sessions} → {$archive}
+cli-alias-owned-repointed = owned-state re-pointed: memory {$memory} · cron {$cron} · acp {$acp} · sessions {$sessions}
+cli-alias-warn-workspace-move = warning: workspace move failed: {$error}
+cli-alias-warn = warning: {$warning}
+cli-alias-deleted = deleted {$section}.{$alias} (scrubbed {$count} reference(s))
+cli-alias-delete-refused-header = refused: {$count} hard reference(s) block the delete:
+cli-alias-delete-refused-hint = delete refused — resolve the hard references first
+cli-alias-not-configured = {$path} is not configured
+cli-alias-delete-failed = delete failed: {$error}
+cli-alias-delete-reserved-default = the `default` agent is reserved and cannot be deleted
+cli-alias-renamed = renamed {$section}.{$from} → {$section}.{$to} (rewrote {$count} reference path(s))
+cli-alias-rename-invalid = invalid new alias: {$message}
+cli-alias-rename-reserved = alias `{$alias}` is reserved and cannot be renamed
+cli-alias-rename-postcondition = rename cascade post-condition failed: {$message}
+cli-alias-unknown-provider-category = unknown provider category `{$category}` (expected models | tts | transcription)
+cli-alias-no-such-section = no such config section: {$section}
+cli-alias-live-acp-sessions = {$count} live ACP session(s) for `{$alias}` — end them first
+cli-alias-owned-state-unavailable = note: config references were updated, but the agent's owned state (memory rows, workspace dir, cron/acp/session rows) was NOT cascaded by this CLI yet — use the gateway API for the full owned-state cascade.
+cli-bundle-not-configured = skill bundle '{$alias}' is not configured
+cli-bundle-rename-failed = rename failed: {$error}
+
+# ── Skill-bundle CLI — zeroclaw skills bundle {add,remove,rename} (#7468 / #7175) ──
+cli-bundle-exists = skill bundle '{$alias}' already exists (no change)
+cli-bundle-created = created skill_bundles.{$alias} (dir: {$dir})
+cli-bundle-created-warn = created skill_bundles.{$alias} (warning: dir resolve failed: {$error})
+cli-bundle-impact-header = deleting skill_bundles.{$alias} would strip it from {$count} agent reference(s):
+cli-bundle-no-changes = No changes made. Re-run with --yes to apply.
+cli-bundle-archived = archived bundle directory → {$path}
+cli-bundle-warn-archive = warning: bundle directory archive failed: {$error}
+cli-bundle-deleted = deleted skill_bundles.{$alias} (stripped from {$count} agent(s))
+cli-bundle-warn-move = warning: bundle directory move failed: {$error}
+cli-bundle-renamed = renamed skill_bundles.{$from} → skill_bundles.{$to}

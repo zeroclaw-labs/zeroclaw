@@ -6,6 +6,8 @@
 
 use std::sync::Arc;
 
+use super::slash_options::OptionSpec;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Outbound message envelope
 //
@@ -87,12 +89,16 @@ impl DiscordOutgoing {
 /// command name; `skill_name` is the skill's manifest name (sanitized of
 /// quotes and newlines at spec-build time, since it is interpolated into
 /// the synthesized agent prompt); `description` is truncated to Discord's
-/// 100-char limit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 100-char limit; `options` are the typed command options (empty → the legacy
+/// single free-text `input`).
+///
+/// `Eq` is not derived: [`OptionSpec`] carries `f64` numeric bounds.
+#[derive(Debug, Clone, PartialEq)]
 pub struct DiscordSlashCommandSpec {
     pub skill_name: String,
     pub slug: String,
     pub description: String,
+    pub options: Vec<OptionSpec>,
 }
 
 /// Resolves the current skill-derived command set from canonical state at
