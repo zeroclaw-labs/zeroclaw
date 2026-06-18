@@ -9558,6 +9558,12 @@ pub struct MemoryConfig {
     /// Vector width produced by the embedding model — must match the model's native dimension or vectors won't store correctly. Look up the number on the model_provider's model page.
     #[serde(default = "default_embedding_dims")]
     pub embedding_dimensions: usize,
+    /// Optional API key for the embedding endpoint. When set, embedding calls use this key instead of inheriting one from the seed model provider — decoupling embeddings from the chat model. Use it when the chat model runs on a provider that carries no usable embedding credential (e.g. an OAuth-only provider) while embeddings keep hitting an `openai`/`custom:` endpoint with their own key. Leave unset to inherit the seed provider's key (backward-compatible default).
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_api_key: Option<String>,
     /// How heavily vector (semantic) similarity counts when `search_mode = hybrid`. Raise toward 1.0 to favor meaning-based matches; lower it to lean on keyword overlap instead.
     #[serde(default = "default_vector_weight")]
     pub vector_weight: f64,
@@ -9756,6 +9762,7 @@ impl Default for MemoryConfig {
             embedding_provider: default_embedding_provider(),
             embedding_model: default_embedding_model(),
             embedding_dimensions: default_embedding_dims(),
+            embedding_api_key: None,
             vector_weight: default_vector_weight(),
             keyword_weight: default_keyword_weight(),
             search_mode: SearchMode::default(),

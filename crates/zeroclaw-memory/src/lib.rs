@@ -221,15 +221,29 @@ fn resolve_embedding_config(
     embedding_routes: &[EmbeddingRouteConfig],
     api_key: Option<&str>,
 ) -> ResolvedEmbeddingConfig {
-    let fallback_api_key = api_key
+    // Key resolution precedence (highest first):
+    //   1. per-route `api_key` override (handled in the routed branch below)
+    //   2. `[memory].embedding_api_key` — operator-set, decoupled from chat
+    //   3. the seed model provider's key, inherited via `api_key`
+    // (2) lets embeddings keep their own credential when the chat model runs on
+    // a provider that carries no usable embedding key; (3) preserves the prior
+    // behavior verbatim when neither override is set.
+    let inherited_api_key = api_key
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let configured_api_key = config
+        .embedding_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let base_api_key = configured_api_key.or(inherited_api_key);
     let fallback = ResolvedEmbeddingConfig {
         model_provider: config.embedding_provider.trim().to_string(),
         model: config.embedding_model.trim().to_string(),
         dimensions: config.embedding_dimensions,
-        api_key: fallback_api_key.clone(),
+        api_key: base_api_key.clone(),
     };
 
     let Some(hint) = config
@@ -280,7 +294,7 @@ fn resolve_embedding_config(
         model_provider: model_provider.to_string(),
         model: model.to_string(),
         dimensions,
-        api_key: routed_api_key.or(fallback_api_key),
+        api_key: routed_api_key.or(base_api_key),
     }
 }
 
@@ -903,5 +917,103 @@ mod tests {
         let resolved = resolve_embedding_config(&cfg, &[], Some("caller-supplied-key"));
 
         assert_eq!(resolved.api_key.as_deref(), Some("caller-supplied-key"));
+    }
+
+    #[test]
+    fn resolve_embedding_config_memory_key_overrides_inherited() {
+        let cfg = MemoryConfig {
+            embedding_provider: "custom:https://generativelanguage.googleapis.com/v1beta/openai"
+                .into(),
+            embedding_model: "gemini-embedding-001".into(),
+            embedding_dimensions: 3072,
+            embedding_api_key: Some("memory-embed-key".into()),
+            ..MemoryConfig::default()
+        };
+
+        // The seed/chat provider supplies a different (here: unusable) key; the
+        // explicit `[memory].embedding_api_key` must win so embeddings stay
+        // decoupled from the chat model provider.
+        let resolved = resolve_embedding_config(&cfg, &[], Some("chat-provider-key"));
+
+        assert_eq!(resolved.api_key.as_deref(), Some("memory-embed-key"));
+    }
+
+    #[test]
+    fn resolve_embedding_config_memory_key_used_when_no_inherited_key() {
+        let cfg = MemoryConfig {
+            embedding_provider: "custom:https://api.example.com/v1".into(),
+            embedding_model: "custom-embed".into(),
+            embedding_dimensions: 1024,
+            embedding_api_key: Some("memory-embed-key".into()),
+            ..MemoryConfig::default()
+        };
+
+        // OAuth-only chat provider → no inherited key. The memory key fills the gap.
+        let resolved = resolve_embedding_config(&cfg, &[], None);
+
+        assert_eq!(resolved.api_key.as_deref(), Some("memory-embed-key"));
+    }
+
+    #[test]
+    fn resolve_embedding_config_blank_memory_key_is_ignored() {
+        let cfg = MemoryConfig {
+            embedding_provider: "openai".into(),
+            embedding_model: "text-embedding-3-small".into(),
+            embedding_dimensions: 1536,
+            embedding_api_key: Some("   ".into()),
+            ..MemoryConfig::default()
+        };
+
+        // Whitespace-only override is treated as unset → inheritance preserved.
+        let resolved = resolve_embedding_config(&cfg, &[], Some("chat-provider-key"));
+
+        assert_eq!(resolved.api_key.as_deref(), Some("chat-provider-key"));
+    }
+
+    #[test]
+    fn resolve_embedding_config_route_key_beats_memory_key() {
+        let cfg = MemoryConfig {
+            embedding_provider: "none".into(),
+            embedding_model: "hint:semantic".into(),
+            embedding_dimensions: 1536,
+            embedding_api_key: Some("memory-embed-key".into()),
+            ..MemoryConfig::default()
+        };
+        let routes = vec![EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            model_provider: "custom:https://api.example.com/v1".into(),
+            model: "custom-embed-v2".into(),
+            dimensions: Some(1024),
+            api_key: Some("route-key".into()),
+        }];
+
+        // Precedence: per-route override > [memory].embedding_api_key > inherited.
+        let resolved = resolve_embedding_config(&cfg, &routes, Some("chat-provider-key"));
+
+        assert_eq!(resolved.api_key.as_deref(), Some("route-key"));
+    }
+
+    #[test]
+    fn resolve_embedding_config_memory_key_used_for_route_without_override() {
+        let cfg = MemoryConfig {
+            embedding_provider: "none".into(),
+            embedding_model: "hint:semantic".into(),
+            embedding_dimensions: 1536,
+            embedding_api_key: Some("memory-embed-key".into()),
+            ..MemoryConfig::default()
+        };
+        let routes = vec![EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            model_provider: "custom:https://api.example.com/v1".into(),
+            model: "custom-embed-v2".into(),
+            dimensions: Some(1024),
+            api_key: None,
+        }];
+
+        // Route carries no key of its own → falls through to the memory key
+        // before the inherited chat-provider key.
+        let resolved = resolve_embedding_config(&cfg, &routes, Some("chat-provider-key"));
+
+        assert_eq!(resolved.api_key.as_deref(), Some("memory-embed-key"));
     }
 }

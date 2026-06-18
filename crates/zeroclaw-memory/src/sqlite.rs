@@ -1521,10 +1521,29 @@ impl Memory for SqliteMemory {
         importance: Option<f64>,
         agent_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        let embedding_bytes = self
-            .get_or_compute_embedding(content)
-            .await?
-            .map(|emb| vector::vec_to_bytes(&emb));
+        // Graceful degrade: an embedding failure (provider 404/401, rate limit,
+        // outage, rotated key) must NOT discard the write. Persist the row with
+        // a NULL vector and log a recoverable warning — `zeroclaw memory
+        // reindex` backfills NULL embeddings from the retained `content` once
+        // the embedder is healthy again. Propagating the error here previously
+        // turned a transient credential fault into silent, permanent data loss.
+        let embedding_bytes = match self.get_or_compute_embedding(content).await {
+            Ok(emb) => emb.map(|emb| vector::vec_to_bytes(&emb)),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "key": key,
+                            "error": format!("{e}"),
+                        })),
+                    "memory store: embedding failed; persisting row without a vector \
+                     (run `zeroclaw memory reindex` to backfill once the embedder recovers)"
+                );
+                None
+            }
+        };
 
         let conn = self.conn.clone();
         let key = key.to_string();
@@ -2376,6 +2395,58 @@ mod tests {
         .unwrap();
         let entry = mem.get("timeout_key").await.unwrap().unwrap();
         assert_eq!(entry.content, "value with timeout");
+    }
+
+    // ── Graceful degrade on embedding failure ────────────────────
+
+    /// Embedder that advertises a real dimension but always fails to embed,
+    /// simulating a provider 404/401/outage (e.g. a wrong or revoked embedding
+    /// key — exactly the live failure that silently dropped 6 days of writes).
+    struct FailingEmbedding;
+
+    #[async_trait::async_trait]
+    impl super::super::embeddings::EmbeddingProvider for FailingEmbedding {
+        fn name(&self) -> &str {
+            "failing"
+        }
+        fn dimensions(&self) -> usize {
+            1536
+        }
+        async fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            anyhow::bail!("Embedding API error 404 Not Found — \"Requested entity was not found.\"")
+        }
+    }
+
+    #[tokio::test]
+    async fn store_degrades_gracefully_when_embedding_fails() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            Arc::new(FailingEmbedding),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::default(),
+        )
+        .unwrap();
+
+        // A failing embedder must NOT cost us the write. The row has to persist
+        // with a NULL vector rather than the whole store aborting — that abort
+        // was the data-loss bug. `reindex` can backfill the vector later.
+        mem.store(
+            "survives",
+            "this content must be retained",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .expect("store must succeed even when the embedder fails");
+
+        assert_eq!(mem.count().await.unwrap(), 1, "row must be persisted");
+        let entry = mem.get("survives").await.unwrap().unwrap();
+        assert_eq!(entry.content, "this content must be retained");
     }
 
     // ── With-embedder constructor test ───────────────────────────
