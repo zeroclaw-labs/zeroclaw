@@ -20,3 +20,7 @@ pub mod profiles {
     #[allow(unused_imports)]
     pub use zeroclaw_providers::auth::profiles::*;
 }
+pub mod xai_oauth {
+    #[allow(unused_imports)]
+    pub use zeroclaw_providers::auth::xai_oauth::*;
+}

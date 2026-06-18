@@ -119,8 +119,8 @@ cli-cron-update-about = Update one or more fields of an existing scheduled task
 cli-cron-pause-about = Pause a scheduled task
 cli-cron-resume-about = Resume a paused task
 
-cli-auth-login-about = Login with OAuth (OpenAI Codex or Gemini)
-cli-auth-refresh-about = Refresh OpenAI Codex access token using refresh token
+cli-auth-login-about = Login with OAuth (OpenAI Codex, Gemini, or xAI)
+cli-auth-refresh-about = Refresh OAuth access token using refresh token
 cli-auth-logout-about = Remove auth profile
 cli-auth-use-about = Set active profile for a provider
 cli-auth-list-about = List auth profiles
