@@ -248,7 +248,7 @@ fn map_options_cap(specs: &mut Vec<DiscordSlashCommandSpec>) {
 pub(crate) fn slash_command_registration_body(
     specs: &[DiscordSlashCommandSpec],
 ) -> serde_json::Value {
-    let mut commands = vec![json!({
+    let mut ask = json!({
         "name": "ask",
         "description": "Ask the agent a question",
         "type": 1, // CHAT_INPUT
@@ -258,18 +258,29 @@ pub(crate) fn slash_command_registration_body(
             "type": 3, // STRING
             "required": true
         }]
-    })];
+    });
+    if let Some(loc) = localizations_object(builtin_localizations::ASK_COMMAND) {
+        ask["description_localizations"] = loc;
+    }
+    if let Some(loc) = localizations_object(builtin_localizations::ASK_PROMPT_OPTION) {
+        ask["options"][0]["description_localizations"] = loc;
+    }
+    let mut commands = vec![ask];
     for spec in specs {
         // A skill that declares no typed options keeps the legacy single
         // required string `input` (backward-compatible + the ownership marker
         // for reaping); one that declares options registers them instead.
         let options: Vec<serde_json::Value> = if spec.options.is_empty() {
-            vec![json!({
+            let mut input = json!({
                 "name": "input",
                 "description": SKILL_COMMAND_OPTION_DESCRIPTION,
                 "type": 3, // STRING
                 "required": true
-            })]
+            });
+            if let Some(loc) = localizations_object(builtin_localizations::SKILL_INPUT_OPTION) {
+                input["description_localizations"] = loc;
+            }
+            vec![input]
         } else {
             spec.options
                 .iter()
@@ -292,6 +303,52 @@ pub(crate) fn slash_command_registration_body(
 /// required string option named `input`) is generic enough that foreign
 /// tooling could collide with it.
 pub(crate) const SKILL_COMMAND_OPTION_DESCRIPTION: &str = "What to send to the skill";
+
+/// Compiled-in Discord-locale translations for the channel's own built-in
+/// command/option descriptions. Compiled in (rather than sourced from the i18n
+/// FTL machinery) because that machinery only compiles in `en`/`zh-CN` — es/fr/ja
+/// load from a runtime locale dir that may not be deployed, so a stock binary
+/// would silently drop them. `en` is the default (the literal description) and
+/// is omitted. Initial translations — open to native-speaker refinement; skill
+/// authors localize their own commands via the skill manifest.
+mod builtin_localizations {
+    /// `/ask` command description ("Ask the agent a question").
+    pub(super) const ASK_COMMAND: &[(&str, &str)] = &[
+        ("es-ES", "Hazle una pregunta al agente"),
+        ("fr", "Poser une question à l'agent"),
+        ("ja", "エージェントに質問する"),
+        ("zh-CN", "向智能体提问"),
+    ];
+    /// `/ask` `prompt` option description ("What to ask").
+    pub(super) const ASK_PROMPT_OPTION: &[(&str, &str)] = &[
+        ("es-ES", "Qué preguntar"),
+        ("fr", "Que demander"),
+        ("ja", "質問内容"),
+        ("zh-CN", "要问什么"),
+    ];
+    /// Default skill `input` option description (`SKILL_COMMAND_OPTION_DESCRIPTION`).
+    pub(super) const SKILL_INPUT_OPTION: &[(&str, &str)] = &[
+        ("es-ES", "Qué enviar a la habilidad"),
+        ("fr", "Que envoyer à la compétence"),
+        ("ja", "スキルに送る内容"),
+        ("zh-CN", "发送给技能的内容"),
+    ];
+}
+
+/// Build a Discord `*_localizations` object from a `(discord_locale, text)`
+/// table. Empty input → `None`, so the caller omits the key entirely and the
+/// command body stays byte-stable when there are no translations (preserving
+/// the reconcile no-op for un-localized commands).
+fn localizations_object(entries: &[(&str, &str)]) -> Option<serde_json::Value> {
+    if entries.is_empty() {
+        return None;
+    }
+    let map: serde_json::Map<String, serde_json::Value> = entries
+        .iter()
+        .map(|(loc, text)| ((*loc).to_string(), json!(text)))
+        .collect();
+    Some(serde_json::Value::Object(map))
+}
 
 /// Ownership fingerprint for commands this feature owns: exactly one
 /// required string option named `input` carrying this feature's exact
@@ -338,6 +395,14 @@ pub(crate) fn is_skill_command_shape(cmd: &serde_json::Value) -> bool {
 pub(crate) fn command_projection(cmd: &serde_json::Value) -> serde_json::Value {
     json!({
         "description": cmd.get("description").cloned().unwrap_or_default(),
+        // Localizations participate in change detection (with the GET's
+        // `with_localizations=true`): Discord echoes `null` when none, which
+        // equals our omitted key — so un-localized commands stay a no-op while
+        // a translation change forces exactly one re-registration.
+        "description_localizations": cmd
+            .get("description_localizations")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
         "options": cmd
             .get("options")
             .and_then(|o| o.as_array())
@@ -349,6 +414,10 @@ pub(crate) fn command_projection(cmd: &serde_json::Value) -> serde_json::Value {
                             "type": o.get("type").cloned().unwrap_or_default(),
                             "required": o.get("required").cloned().unwrap_or(json!(false)),
                             "description": o.get("description").cloned().unwrap_or_default(),
+                            "description_localizations": o
+                                .get("description_localizations")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null),
                             "choices": o
                                 .get("choices")
                                 .and_then(|c| c.as_array())
@@ -556,8 +625,12 @@ async fn reconcile_one_endpoint(
     // mid-pass: the upserts still run, but the pass reports Err at the end
     // so the fingerprint is not recorded and the next READY retries.
     let mut failed_deletes = 0usize;
+    // `with_localizations=true` so the listing echoes back the full
+    // `*_localizations` dictionaries; without it Discord returns them null and
+    // every localized command would mismatch the projection and re-register on
+    // each READY (burning the daily command-create budget).
     let resp = client
-        .get(base)
+        .get(format!("{base}?with_localizations=true"))
         .header("Authorization", auth)
         .send()
         .await
@@ -708,6 +781,29 @@ mod typed_option_tests {
             opts[0]["description"],
             json!(SKILL_COMMAND_OPTION_DESCRIPTION)
         );
+    }
+
+    #[test]
+    fn builtin_commands_carry_compiled_in_localizations() {
+        let body = slash_command_registration_body(&[spec_with(Vec::new())]);
+        let cmds = body.as_array().unwrap();
+        // /ask command + its prompt option are localized.
+        let ask = &cmds[0];
+        assert_eq!(ask["name"], json!("ask"));
+        assert_eq!(
+            ask["description_localizations"]["fr"],
+            json!("Poser une question à l'agent")
+        );
+        assert_eq!(
+            ask["options"][0]["description_localizations"]["ja"],
+            json!("質問内容")
+        );
+        // The default skill `input` option is localized too, while keeping its
+        // canonical (English) description as the reap-ownership marker.
+        let input = &cmds[1]["options"][0];
+        assert_eq!(input["name"], json!("input"));
+        assert_eq!(input["description"], json!(SKILL_COMMAND_OPTION_DESCRIPTION));
+        assert!(input["description_localizations"]["zh-CN"].is_string());
     }
 
     #[test]

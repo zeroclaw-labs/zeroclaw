@@ -4708,14 +4708,16 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
-        let existing_ask = serde_json::json!({
-            "id": "a1", "name": "ask",
-            "description": "Ask the agent a question", "type": 1,
-            "options": [{
-                "name": "prompt", "description": "What to ask",
-                "type": 3, "required": true
-            }]
-        });
+        // Echo back exactly what we'd register for `/ask` (incl. its
+        // `description_localizations`, which the GET requests via
+        // `with_localizations=true`) plus a server-side id — so the projection
+        // matches and no upsert fires. Deriving it keeps the test agnostic to
+        // the built-in translation table.
+        let mut existing_ask = slash_command_registration_body(&[])
+            .as_array()
+            .unwrap()[0]
+            .clone();
+        existing_ask["id"] = serde_json::json!("a1");
         let foreign = serde_json::json!({
             "id": "f1", "name": "run",
             "description": "external tool", "type": 1,
