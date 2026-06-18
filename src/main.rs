@@ -2429,8 +2429,14 @@ fn prompt_for_field(
         {
             Ok(pw) => {
                 if !pw.is_empty() {
-                    // i18n-exempt: non-sensitive confirmation echo (checkmark + char count only)
-                    eprintln!("  \u{2713} Secret received ({})", pw.len());
+                    eprintln!(
+                        "{}",
+                        ta(
+                            "cli-secret-received",
+                            &[("count", &pw.len().to_string())],
+                            "  ✓ Secret received"
+                        )
+                    );
                 }
                 return Ok(Some(pw));
             }
@@ -5048,8 +5054,14 @@ async fn main() -> Result<()> {
                         .interact()?;
                     let secret_value = secret_value.trim().to_string();
                     if !secret_value.is_empty() {
-                        // i18n-exempt: non-sensitive confirmation echo (checkmark + char count only)
-                        eprintln!("  \u{2713} Secret received ({})", secret_value.len());
+                        eprintln!(
+                            "{}",
+                            ta(
+                                "cli-secret-received",
+                                &[("count", &secret_value.len().to_string())],
+                                "  ✓ Secret received"
+                            )
+                        );
                     }
                     if secret_value.is_empty() {
                         anyhow::bail!("Value cannot be empty.");
@@ -5834,8 +5846,14 @@ fn handle_estop_command(
                         .with_prompt("Enter OTP code")
                         .allow_empty_password(false)
                         .interact()?;
-                    // i18n-exempt: non-sensitive confirmation echo (checkmark + char count only)
-                    eprintln!("  \u{2713} OTP received ({})", entered.len());
+                    eprintln!(
+                        "{}",
+                        ta(
+                            "cli-otp-received",
+                            &[("count", &entered.len().to_string())],
+                            "  ✓ OTP received"
+                        )
+                    );
                     otp_code = Some(entered);
                 }
 
@@ -6427,8 +6445,14 @@ fn read_auth_input(prompt: &str) -> Result<String> {
         .interact()?;
     let trimmed = input.trim().to_string();
     if !trimmed.is_empty() {
-        // i18n-exempt: non-sensitive confirmation echo (checkmark + char count only)
-        eprintln!("  \u{2713} Secret received ({})", trimmed.len());
+        eprintln!(
+            "{}",
+            ta(
+                "cli-secret-received",
+                &[("count", &trimmed.len().to_string())],
+                "  ✓ Secret received"
+            )
+        );
     }
     Ok(trimmed)
 }
