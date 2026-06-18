@@ -802,6 +802,14 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Remote media is also accepted via http:// or https:// URLs in the same marker form.\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n",
         ),
+        "whatsapp" | "whatsapp-web" => Some(
+            "When responding on WhatsApp Web:\n\
+             - Be concise and direct\n\
+             - For media attachments use markers: [IMAGE:<path>], [DOCUMENT:<path>], [VIDEO:<path>], [AUDIO:<path>], or [VOICE:<path>]\n\
+             - Marker paths must refer to local files inside the configured workspace directory. Absolute paths and workspace-relative paths are accepted when they stay inside that workspace.\n\
+             - Do not use http://, https://, data:, file:, or any other URL scheme in WhatsApp Web media markers.\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n",
+        ),
         "telegram" => Some(
             "When responding on Telegram:\n\
              - Include media markers for files or URLs that should be sent as attachments\n\
@@ -5696,6 +5704,7 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
     feature = "channel-slack",
     feature = "channel-telegram",
     feature = "channel-wechat",
+    feature = "whatsapp-web",
 ))]
 fn one_shot_channel_workspace_dir(config: &Config, channel_type: &str, alias: &str) -> PathBuf {
     config.channel_workspace_dir(&format!("{channel_type}.{alias}"))
@@ -5940,7 +5949,11 @@ fn build_channel_by_id(
                     let alias = alias.clone();
                     Arc::new(move || cfg_arc.read().channel_external_peers("whatsapp", &alias))
                 };
-                Ok(Arc::new(WhatsAppWebChannel::new(wa, alias, peer_resolver)))
+                let workspace_dir = one_shot_channel_workspace_dir(&config, "whatsapp", &alias);
+                Ok(Arc::new(
+                    WhatsAppWebChannel::new(wa, alias, peer_resolver)
+                        .with_workspace_dir(workspace_dir),
+                ))
             }
             #[cfg(not(feature = "whatsapp-web"))]
             {
@@ -7200,6 +7213,7 @@ fn collect_configured_channels(
                         let alias = alias.clone();
                         Arc::new(move || cfg_arc.read().channel_external_peers("whatsapp", &alias))
                     };
+                    let workspace_dir = config.channel_workspace_dir(&format!("whatsapp.{alias}"));
                     channels.push(ConfiguredChannel {
                         display_name: "WhatsApp",
                         alias: Some(alias.clone()),
@@ -7208,6 +7222,7 @@ fn collect_configured_channels(
                                 WhatsAppWebChannel::new(wa, alias.clone(), peer_resolver)
                                     .with_transcription(config.transcription.clone())
                                     .with_tts(&config)
+                                    .with_workspace_dir(workspace_dir)
                                     .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
                                     .with_group_mention_patterns(wa.group_mention_patterns.clone()),
                             ),
@@ -9133,45 +9148,12 @@ pub async fn start_channels(
             .map(|tracker| {
                 // The cost tracker's lookup site (`record_tool_loop_cost_usage`
                 // in zeroclaw-runtime) receives the bare provider type — the
-                // composite alias isn't threaded through the agent loop. Build
-                // the pricing map keyed by `<type>` and merge each alias's
-                // `pricing` table into the type-level slot. Rates are per
-                // (provider type, model); they don't differ between an
-                // operator's `anthropic.work` and `anthropic.personal` keys.
-                let mut by_type: std::collections::HashMap<
-                    String,
-                    std::collections::HashMap<String, f64>,
-                > = std::collections::HashMap::new();
-                for (type_k, _alias_k, profile) in config.providers.models.iter_entries() {
-                    if profile.pricing.is_empty() {
-                        continue;
-                    }
-                    let slot = by_type.entry(type_k.to_string()).or_default();
-                    for (key, value) in &profile.pricing {
-                        slot.insert(key.clone(), *value);
-                    }
-                }
-                // Merge the `[cost.rates.providers.models.<type>.<model>]`
-                // section. Keys land as `"<model>.input"` / `"<model>.output"`
-                // / `"<model>.cached_input"` so the existing lookup
-                // (`resolve_rates`) finds them with no further changes. The
-                // rate sheet wins on conflict — it's the forward-looking
-                // surface, the legacy per-alias `pricing` table is the
-                // fallback for installs that haven't migrated.
-                for (provider_type, model_id, rates) in
-                    config.cost.rates.providers.models.iter_entries()
-                {
-                    let slot = by_type.entry(provider_type.to_string()).or_default();
-                    if let Some(input) = rates.input_per_mtok {
-                        slot.insert(format!("{model_id}.input"), input);
-                    }
-                    if let Some(output) = rates.output_per_mtok {
-                        slot.insert(format!("{model_id}.output"), output);
-                    }
-                    if let Some(cached) = rates.cached_input_per_mtok {
-                        slot.insert(format!("{model_id}.cached_input"), cached);
-                    }
-                }
+                // composite alias isn't threaded through the channel agent
+                // loop. Build the pricing map keyed by `<type>`, merging each
+                // alias's legacy `pricing` table and the `cost.rates` sheet
+                // into the type-level slot. `cost.rates` wins on conflict.
+                let by_type =
+                    zeroclaw_runtime::agent::cost::build_type_level_model_provider_pricing(&config);
                 ChannelCostTrackingState {
                     tracker,
                     model_provider_pricing: Arc::new(by_type),
@@ -9601,7 +9583,8 @@ pub async fn deliver_announcement(
             let peers = config.channel_external_peers("whatsapp", alias);
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
-            let ch = WhatsAppWebChannel::new(wa, alias.to_string(), peer_resolver);
+            let ch = WhatsAppWebChannel::new(wa, alias.to_string(), peer_resolver)
+                .with_workspace_dir(config.channel_workspace_dir(&format!("whatsapp.{alias}")));
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(not(feature = "whatsapp-web"))]
@@ -15605,6 +15588,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timeout_secs: None,
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
+            slash_options: Vec::new(),
             location: None,
         }];
 
@@ -15646,6 +15630,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timeout_secs: None,
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
+            slash_options: Vec::new(),
             location: None,
         }];
 
@@ -15697,6 +15682,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timeout_secs: None,
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
+            slash_options: Vec::new(),
             location: None,
         }];
 
@@ -17488,6 +17474,37 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             block.contains("[IMAGE:<absolute-path>]"),
             "discord block must show the absolute-path marker form"
+        );
+    }
+
+    #[test]
+    fn channel_delivery_instructions_for_whatsapp_web_match_local_marker_contract() {
+        let block = channel_delivery_instructions("whatsapp")
+            .expect("whatsapp channel must have a delivery-instructions block");
+        assert!(
+            block.contains("When responding on WhatsApp Web:"),
+            "whatsapp block must identify itself"
+        );
+        assert!(
+            block.contains("[IMAGE:<path>]"),
+            "whatsapp block must describe marker syntax"
+        );
+        assert!(
+            block.contains("inside the configured workspace directory"),
+            "whatsapp block must describe workspace bounds"
+        );
+        assert!(
+            block.contains("Absolute paths and workspace-relative paths are accepted"),
+            "whatsapp block must match the validator's local path contract"
+        );
+        assert!(
+            block.contains("Do not use http://, https://, data:, file:"),
+            "whatsapp block must say URL schemes are refused"
+        );
+        assert_eq!(
+            channel_delivery_instructions("whatsapp-web"),
+            Some(block),
+            "the compatibility alias should use the same WhatsApp Web guidance"
         );
     }
 

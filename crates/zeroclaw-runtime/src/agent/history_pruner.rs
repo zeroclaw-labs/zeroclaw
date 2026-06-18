@@ -834,13 +834,28 @@ mod tests {
     }
 
     #[test]
+    fn legacy_tool_exchange_marker_still_detected() {
+        assert!(
+            msg("assistant", &ChatMessage::pruned_tool_exchange_summary(2))
+                .is_pruned_tool_exchange_summary()
+        );
+        assert!(
+            msg(
+                "assistant",
+                "[Tool exchange: 2 tool call(s) — results collapsed]"
+            )
+            .is_pruned_tool_exchange_summary()
+        );
+        assert!(
+            !msg("assistant", "[Tool exchange: in progress]").is_pruned_tool_exchange_summary()
+        );
+    }
+
+    #[test]
     fn prune_removes_dangling_tool_call_after_collapsed_summary() {
         let mut messages = vec![
             msg("system", "sys"),
-            msg(
-                "assistant",
-                "[Tool exchange: 1 tool call(s) — results collapsed]",
-            ),
+            msg("assistant", &ChatMessage::pruned_tool_exchange_summary(1)),
             msg(
                 "assistant",
                 r#"{"content":null,"tool_calls":[{"id":"dangling","name":"shell","arguments":"{}"}]}"#,

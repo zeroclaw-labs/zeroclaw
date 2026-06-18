@@ -267,6 +267,17 @@ jobs:
             mkdir -p "$TAG"
             rsync -a --delete "$TAG_SRC/" "$TAG/"
 
+            # Rustdoc is shared site-wide at '/api', owned by master (same rule
+            # as _shared). master rewrites it each deploy; a tag only seeds it
+            # when bootstrapping the first deploy, never regressing newer docs.
+            API_SRC="${GITHUB_WORKSPACE}/docs/book/book/api"
+            if [ -d "$API_SRC" ]; then
+              if [ "$TAG" = "master" ] || [ ! -d "api" ]; then
+                mkdir -p api
+                rsync -a --delete "$API_SRC/" "api/"
+              fi
+            fi
+
             # No stable/ tree: Stable is a pointer to a real version dir, never a
             # duplicate copy. The committed pointer (docs/book/stable-version.txt)
             # is published to the gh-pages root as stable-version.txt; gen-versions,

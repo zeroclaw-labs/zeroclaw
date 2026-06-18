@@ -226,6 +226,58 @@ pub fn remove_job(config: &Config, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Cron jobs owned by `agent_alias`, for the agent-deletion export-then-delete
+/// archive (#7175).
+pub fn list_jobs_by_agent(config: &Config, agent_alias: &str) -> Result<Vec<CronJob>> {
+    let Some(jobs) = with_read_connection(config, |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
+                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                    allowed_tools, source, uses_memory, agent_alias
+             FROM cron_jobs WHERE agent_alias = ?1 ORDER BY next_run ASC",
+        )?;
+        let rows = stmt.query_map(params![agent_alias], map_cron_job_row)?;
+        let mut jobs = Vec::new();
+        for row in rows {
+            jobs.push(row?);
+        }
+        Ok(jobs)
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+    Ok(jobs)
+}
+
+/// Delete every cron job owned by `agent_alias`, returning the row count
+/// (`cron_runs` cascade via their `job_id` FK). A job whose owning agent is gone
+/// can never run, so the agent-deletion cascade removes it (#7175).
+pub fn remove_jobs_by_agent(config: &Config, agent_alias: &str) -> Result<usize> {
+    let changed = with_initialized_connection(config, |conn| {
+        conn.execute(
+            "DELETE FROM cron_jobs WHERE agent_alias = ?1",
+            params![agent_alias],
+        )
+        .context("Failed to delete cron jobs for agent")
+    })?;
+    Ok(changed)
+}
+
+/// Re-point every cron job owned by `from` to `to`, returning the row count.
+/// Called by the agent-rename cascade (#7468): the job keeps running, just
+/// under the renamed owner. `agent_alias` is plain TEXT (not a UUID), so this
+/// is a direct column update.
+pub fn rename_jobs_by_agent(config: &Config, from: &str, to: &str) -> Result<usize> {
+    let changed = with_initialized_connection(config, |conn| {
+        conn.execute(
+            "UPDATE cron_jobs SET agent_alias = ?2 WHERE agent_alias = ?1",
+            params![from, to],
+        )
+        .context("Failed to rename cron job owner")
+    })?;
+    Ok(changed)
+}
+
 pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     let lim = i64::try_from(config.scheduler.max_tasks.max(1))
         .context("Scheduler max_tasks overflows i64")?;
