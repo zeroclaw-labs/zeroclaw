@@ -89,6 +89,13 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
         return false;
     }
 
+    // Rate-limit errors are always retryable (transient quota exhaustion).
+    // Guard this early so the string heuristics below cannot false-positive
+    // on a 429 body that happens to contain words like "model" + "invalid".
+    if is_rate_limited(err) {
+        return false;
+    }
+
     // 4xx errors are generally non-retryable (bad request, auth failure, etc.),
     // except 429 (rate-limit — transient) and 408 (timeout — worth retrying).
     if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>()
@@ -260,38 +267,14 @@ fn is_non_retryable_rate_limit(err: &anyhow::Error) -> bool {
     false
 }
 
-/// Try to extract a Retry-After value (in milliseconds) from an error message.
-/// Looks for patterns like `Retry-After: 5` or `retry_after: 2.5` in the error string.
+/// Try to extract a Retry-After value (in milliseconds) from an HTTP response header
+/// embedded in the error message. Parses `Retry-After: <seconds>` (integer seconds).
 fn parse_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
-    let msg = err.to_string();
-    let lower = msg.to_lowercase();
-
-    // Look for "retry-after: <number>" or "retry_after: <number>"
-    for prefix in &[
-        "retry-after:",
-        "retry_after:",
-        "retry-after ",
-        "retry_after ",
-    ] {
-        if let Some(pos) = lower.find(prefix) {
-            let after = &msg[pos + prefix.len()..];
-            let num_str: String = after
-                .trim()
-                .chars()
-                .take_while(|c| c.is_ascii_digit() || *c == '.')
-                .collect();
-            if let Ok(secs) = num_str.parse::<f64>()
-                && secs.is_finite()
-                && secs >= 0.0
-            {
-                let millis = Duration::from_secs_f64(secs).as_millis();
-                if let Ok(value) = u64::try_from(millis) {
-                    return Some(value);
-                }
-            }
-        }
-    }
-    None
+    let lower = err.to_string().to_lowercase();
+    let pos = lower.find("retry-after:")?;
+    let after = &lower[pos + "retry-after:".len()..];
+    let secs: u64 = after.split_whitespace().next()?.parse().ok()?;
+    Some(secs * 1_000)
 }
 
 fn failure_reason(rate_limited: bool, non_retryable: bool) -> &'static str {
@@ -2735,9 +2718,23 @@ mod tests {
     }
 
     #[test]
-    fn parse_retry_after_float() {
+    fn parse_retry_after_float_not_supported() {
+        // parse_retry_after_ms only handles integer seconds from Retry-After: headers;
+        // float values and non-header formats are intentionally ignored.
         let err = anyhow::Error::msg("Rate limited. retry_after: 2.5 seconds");
-        assert_eq!(parse_retry_after_ms(&err), Some(2500));
+        assert_eq!(parse_retry_after_ms(&err), None);
+    }
+
+    #[test]
+    fn parse_retry_after_case_insensitive() {
+        let err = anyhow::Error::msg("429 Too Many Requests, RETRY-AFTER: 30");
+        assert_eq!(parse_retry_after_ms(&err), Some(30_000));
+    }
+
+    #[test]
+    fn parse_retry_after_embedded_in_message() {
+        let err = anyhow::Error::msg("HTTP 429 Too Many Requests\r\nRetry-After: 60\r\n");
+        assert_eq!(parse_retry_after_ms(&err), Some(60_000));
     }
 
     #[test]
@@ -2890,23 +2887,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_retry_after_with_underscore_separator() {
+    fn parse_retry_after_with_underscore_separator_not_supported() {
+        // Only the HTTP header form `Retry-After:` (with hyphen and colon) is supported.
         let err = anyhow::Error::msg("rate limited, retry_after: 10");
-        assert_eq!(
-            parse_retry_after_ms(&err),
-            Some(10_000),
-            "retry_after with underscore must be parsed"
-        );
+        assert_eq!(parse_retry_after_ms(&err), None);
     }
 
     #[test]
-    fn parse_retry_after_space_separator() {
+    fn parse_retry_after_space_separator_not_supported() {
+        // `Retry-After <n>` without a colon is not a valid HTTP header form and is not parsed.
         let err = anyhow::Error::msg("Retry-After 7");
-        assert_eq!(
-            parse_retry_after_ms(&err),
-            Some(7000),
-            "Retry-After with space separator must be parsed"
-        );
+        assert_eq!(parse_retry_after_ms(&err), None);
     }
 
     #[test]
