@@ -1233,6 +1233,95 @@ pub async fn handle_map_key(
     axum::Json(MapKeyResponse { path, key, created }).into_response()
 }
 
+/// A single config reference site to an aliased entry, for the delete preview.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct RefSiteDto {
+    /// Dotted config path that references the alias, e.g.
+    /// `agents.forge.model_provider` or `heartbeat.agent`.
+    pub path: String,
+    /// The stored reference text, e.g. `anthropic.default`.
+    pub raw_value: String,
+}
+
+/// Dry-run impact of deleting an aliased entry — the cascade preview a surface
+/// renders before confirming. Pure/read-only: computed from `plan_delete` (the
+/// same reference walk the real delete uses) plus the live-ACP gate for agents.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct DeletePlanResponse {
+    pub path: String,
+    pub key: String,
+    /// True iff nothing HARD blocks the delete (no hard config reference and,
+    /// for agents, no live ACP session). Mirrors the real delete's refusal gate.
+    pub allowed: bool,
+    /// HARD references that block the delete — the operator must change these
+    /// first (e.g. an enabled `heartbeat.agent`).
+    pub blockers: Vec<RefSiteDto>,
+    /// SOFT references the delete would scrub automatically.
+    pub scrubs: Vec<RefSiteDto>,
+    /// Agent delete only: number of live ACP sessions (a non-zero count blocks
+    /// the delete; `null` for non-agent sections or if the count couldn't be
+    /// read — in which case the delete fails closed too).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_acp_sessions: Option<usize>,
+    /// Agent delete only: the agent's owned non-config state (memory / cron /
+    /// session history) is exported and removed on delete. Counts are not
+    /// enumerated in the preview.
+    pub cascades_owned_state: bool,
+}
+
+/// `GET /api/config/delete-plan?path=<section>&key=<alias>` — dry-run the delete
+/// cascade for an aliased entry. Read-only; never mutates.
+pub async fn handle_delete_plan(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<MapKeyQuery>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let config = state.config.read().clone();
+    let to_dto = |s: &zeroclaw_config::alias_refs::RefSite| RefSiteDto {
+        path: s.path.clone(),
+        raw_value: s.raw_value.clone(),
+    };
+    let Some(kind) = parse_alias_kind(&q.path) else {
+        // Non-aliased section (e.g. `mcp.servers`): generic key removal with no
+        // reference cascade — nothing to preview.
+        return axum::Json(DeletePlanResponse {
+            path: q.path,
+            key: q.key,
+            allowed: true,
+            blockers: Vec::new(),
+            scrubs: Vec::new(),
+            live_acp_sessions: None,
+            cascades_owned_state: false,
+        })
+        .into_response();
+    };
+    let plan = zeroclaw_config::alias_refs::plan_delete(&config, &kind, &q.key);
+    let is_agent = matches!(kind, zeroclaw_config::alias_refs::AliasKind::Agent);
+    // For agents the live-ACP gate also blocks; it fails closed (an error
+    // counting sessions ⇒ "not allowed"), matching the real delete.
+    let live_acp = if is_agent {
+        crate::agent_owned_state::live_acp_session_count(&config, &q.key).ok()
+    } else {
+        None
+    };
+    let allowed = plan.allowed && (!is_agent || live_acp == Some(0));
+    axum::Json(DeletePlanResponse {
+        path: q.path,
+        key: q.key,
+        allowed,
+        blockers: plan.blockers.iter().map(to_dto).collect(),
+        scrubs: plan.scrubs.iter().map(to_dto).collect(),
+        live_acp_sessions: live_acp,
+        cascades_owned_state: is_agent,
+    })
+    .into_response()
+}
+
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct RenameMapKeyBody {

@@ -1594,6 +1594,7 @@ pub async fn run_gateway(
             post(api_config::handle_map_key).delete(api_config::handle_delete_map_key),
         )
         .route("/api/config/rename-map-key", post(api_config::handle_rename_map_key))
+        .route("/api/config/delete-plan", get(api_config::handle_delete_plan))
         .route("/api/config/catalog", get(api_sections::handle_catalog))
         .route(
             "/api/config/catalog/models",

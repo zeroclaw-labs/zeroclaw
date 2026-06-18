@@ -1511,6 +1511,9 @@ export interface MapKeyMutResponse {
   key: string;
   renamed?: boolean;
   created?: boolean;
+  /** Agent rename only: owned-state cascade warnings — stores (memory / cron /
+   *  acp / session) that did NOT follow the rename and need operator attention. */
+  warnings?: string[];
 }
 
 export async function deleteMapKey(
@@ -1528,16 +1531,48 @@ export async function deleteMapKey(
   return result;
 }
 
-export function renameMapKey(
+export async function renameMapKey(
   path: string,
   from: string,
   to: string,
 ): Promise<MapKeyMutResponse> {
-  return apiFetch<MapKeyMutResponse>("/api/config/rename-map-key", {
+  const result = await apiFetch<MapKeyMutResponse>("/api/config/rename-map-key", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ path, from, to }),
   });
+  // The alias changed: invalidate caches (⌘K search index, etc.).
+  window.dispatchEvent(new Event("zeroclaw-config-mutated"));
+  return result;
+}
+
+/** A config reference site to an aliased entry, surfaced in the delete preview. */
+export interface DeletePlanRefSite {
+  path: string;
+  raw_value: string;
+}
+
+/** Dry-run impact of deleting an aliased entry (GET /api/config/delete-plan). */
+export interface DeletePlan {
+  path: string;
+  key: string;
+  /** True iff nothing HARD blocks the delete (no hard ref, no live ACP session). */
+  allowed: boolean;
+  /** HARD references that block the delete (must be changed first). */
+  blockers: DeletePlanRefSite[];
+  /** SOFT references the delete would scrub automatically. */
+  scrubs: DeletePlanRefSite[];
+  /** Agent delete: live ACP sessions (a non-zero count blocks the delete). */
+  live_acp_sessions?: number | null;
+  /** Agent delete: owned non-config state (memory/cron/session) is removed. */
+  cascades_owned_state: boolean;
+}
+
+/** Preview the delete cascade for an aliased entry — read-only, no mutation. */
+export function getDeletePlan(path: string, key: string): Promise<DeletePlan> {
+  return apiFetch<DeletePlan>(
+    `/api/config/delete-plan?path=${encodeURIComponent(path)}&key=${encodeURIComponent(key)}`,
+  );
 }
 
 // ── Daemon admin (localhost-only on the gateway) ─────────────────────
