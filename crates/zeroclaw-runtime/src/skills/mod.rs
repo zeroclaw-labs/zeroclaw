@@ -67,6 +67,8 @@ pub struct Skill {
     pub tools: Vec<SkillTool>,
     #[serde(default)]
     pub prompts: Vec<String>,
+    #[serde(default)]
+    pub always: bool,
     #[serde(skip)]
     pub location: Option<PathBuf>,
 }
@@ -1313,11 +1315,14 @@ pub fn skills_to_prompt_with_mode(
         // In Full mode, inline both instructions and tools.
         // In Compact mode, skip instructions (loaded on demand) but keep tools
         // so the LLM knows which skill tools are available.
-        if matches!(
+        // Exception: skills with `always: true` have their instructions injected
+        // even in compact mode.
+        let should_inline_instructions = matches!(
             mode,
             zeroclaw_config::schema::SkillsPromptInjectionMode::Full
-        ) && !skill.prompts.is_empty()
-        {
+        ) || (skill.always && !skill.prompts.is_empty());
+
+        if should_inline_instructions && !skill.prompts.is_empty() {
             let _ = writeln!(prompt, "    <instructions>");
             for instruction in &skill.prompts {
                 write_xml_text_element(&mut prompt, 6, "instruction", instruction);
@@ -2889,6 +2894,79 @@ mod prompt_callable_name_tests {
             !prompt.contains("pr-review-toolkit:code-reviewer__run.lint"),
             "prompt advertised the raw, unsanitized composed name:\n{prompt}",
         );
+    }
+
+    /// Regression test for #7904: verify that skills with `always: true`
+    /// have their instructions injected even in compact prompt mode.
+    #[test]
+    fn test_always_skill_injected_in_compact_mode() {
+        let always_skill = Skill {
+            name: "critical-skill".to_string(),
+            description: "A skill that must always be followed.".to_string(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: Vec::new(),
+            prompts: vec!["Always do X when Y happens.".to_string()],
+            always: true,
+            location: None,
+        };
+
+        let normal_skill = Skill {
+            name: "normal-skill".to_string(),
+            description: "A normal skill.".to_string(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: Vec::new(),
+            prompts: vec!["Do Z when W happens.".to_string()],
+            always: false,
+            location: None,
+        };
+
+        let prompt = skills_to_prompt_with_mode(
+            &[always_skill, normal_skill],
+            Path::new("/tmp"),
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
+        );
+
+        // The always skill's instructions should be present
+        assert!(
+            prompt.contains("Always do X when Y happens."),
+            "compact mode should include always skill instructions:\n{prompt}"
+        );
+
+        // The normal skill's instructions should NOT be present in compact mode
+        assert!(
+            !prompt.contains("Do Z when W happens."),
+            "compact mode should omit normal skill instructions:\n{prompt}"
+        );
+    }
+
+    #[test]
+    fn test_always_skill_without_prompts_does_not_crash() {
+        let always_skill = Skill {
+            name: "always-no-prompts".to_string(),
+            description: "Always skill but no instructions.".to_string(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: Vec::new(),
+            prompts: Vec::new(),
+            always: true,
+            location: None,
+        };
+
+        // Should not panic even with always=true but no prompts
+        let prompt = skills_to_prompt_with_mode(
+            &[always_skill],
+            Path::new("/tmp"),
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact,
+        );
+
+        // Should contain skill summary but no instructions section
+        assert!(prompt.contains("<name>always-no-prompts</name>"));
+        assert!(!prompt.contains("<instructions>"));
     }
 }
 
