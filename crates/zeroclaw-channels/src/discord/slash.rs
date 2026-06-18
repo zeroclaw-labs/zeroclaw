@@ -10,7 +10,7 @@
 use serde_json::json;
 
 use super::slash_options::{Choice, OptKind, OptionSpec};
-use super::types::{DiscordSlashCommandSpec, ReconcileOutcome};
+use super::types::{DiscordSlashCommandSpec, ReconcileOutcome, SlashScope};
 
 /// Discord caps an application at 100 global commands; stay under it with
 /// headroom for `/ask` and future built-ins.
@@ -424,8 +424,9 @@ pub(crate) async fn reconcile_slash_commands(
     app_id: &str,
     desired: &serde_json::Value,
     api_base: &str,
+    scope: SlashScope,
+    guild_ids: &[String],
 ) -> anyhow::Result<ReconcileOutcome> {
-    let base = format!("{api_base}/applications/{app_id}/commands");
     let auth = format!("Bot {bot_token}");
     let Some(desired) = desired.as_array() else {
         anyhow::bail!("desired command set is not an array");
@@ -435,14 +436,56 @@ pub(crate) async fn reconcile_slash_commands(
         .filter_map(|c| c.get("name").and_then(|n| n.as_str()))
         .collect();
 
-    // Reap stale skill commands first so the 100-command cap never blocks
-    // the upserts that follow. Delete failures are counted, not fatal
-    // mid-pass: the upserts still run, but the pass reports Err at the end
-    // so the fingerprint is not recorded and the next READY retries.
-    let mut failed_deletes = 0usize;
+    let global_base = format!("{api_base}/applications/{app_id}/commands");
+    let guild_base = |g: &str| format!("{api_base}/applications/{app_id}/guilds/{g}/commands");
+    // Active = where the commands live now; inactive = the other scope, whose
+    // leftover skill commands we reap so flipping `slash_command_scope` never
+    // leaves the same command registered in both places (the guild-scope
+    // migration hazard). `guild_ids` drives the active set under Guild and the
+    // reap set under Global.
+    let (active, inactive): (Vec<String>, Vec<String>) = match scope {
+        SlashScope::Global => (
+            vec![global_base],
+            guild_ids.iter().map(|g| guild_base(g)).collect(),
+        ),
+        SlashScope::Guild => (
+            guild_ids.iter().map(|g| guild_base(g)).collect(),
+            vec![global_base],
+        ),
+    };
+    // Best-effort cleanup of the now-inactive scope first; a 429 surfaces the
+    // cooldown like any active-scope pass would.
+    for base in &inactive {
+        if let ReconcileOutcome::RateLimited { until } =
+            reap_all_owned_commands(client, &auth, base).await?
+        {
+            return Ok(ReconcileOutcome::RateLimited { until });
+        }
+    }
+    // Reconcile each active endpoint (one for Global; one per guild for Guild).
+    for base in &active {
+        if let ReconcileOutcome::RateLimited { until } =
+            reconcile_one_endpoint(client, &auth, base, desired, &desired_names).await?
+        {
+            return Ok(ReconcileOutcome::RateLimited { until });
+        }
+    }
+    Ok(ReconcileOutcome::Reconciled)
+}
+
+/// Reap every command this channel owns (`/ask` + skill-shaped) from an
+/// endpoint without upserting — used to clear the inactive scope after a
+/// `slash_command_scope` switch. Best-effort: a failed listing (e.g. the bot
+/// lacks `applications.commands` in a guild it has left) is logged and skipped,
+/// never fatal to the active-scope reconcile.
+async fn reap_all_owned_commands(
+    client: &reqwest::Client,
+    auth: &str,
+    base: &str,
+) -> anyhow::Result<ReconcileOutcome> {
     let resp = client
-        .get(&base)
-        .header("Authorization", &auth)
+        .get(base)
+        .header("Authorization", auth)
         .send()
         .await
         .map_err(reqwest::Error::without_url)?;
@@ -452,7 +495,80 @@ pub(crate) async fn reconcile_slash_commands(
         });
     }
     if !resp.status().is_success() {
-        anyhow::bail!("listing global commands failed ({})", resp.status());
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"status": resp.status().as_u16()})),
+            "inactive-scope command listing failed; skipping cross-scope cleanup"
+        );
+        return Ok(ReconcileOutcome::Reconciled);
+    }
+    let existing: Vec<serde_json::Value> = resp.json().await?;
+    for cmd in &existing {
+        let name = cmd.get("name").and_then(|n| n.as_str()).unwrap_or("");
+        if name != "ask" && !is_skill_command_shape(cmd) {
+            continue;
+        }
+        let Some(id) = cmd.get("id").and_then(|i| i.as_str()) else {
+            continue;
+        };
+        let del = client
+            .delete(format!("{base}/{id}"))
+            .header("Authorization", auth)
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?;
+        if del.status().is_success() || del.status() == reqwest::StatusCode::NOT_FOUND {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"command": name})),
+                "reaped command from inactive slash scope"
+            );
+        } else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "command": name,
+                        "status": del.status().as_u16(),
+                    })),
+                "failed to reap command from inactive slash scope (best-effort)"
+            );
+        }
+    }
+    Ok(ReconcileOutcome::Reconciled)
+}
+
+/// Reconcile the skill command set at a single endpoint (`base`): reap stale
+/// skill commands, then upsert each desired command whose projection differs
+/// from what's registered. Steady-state restarts converge to ~zero writes.
+async fn reconcile_one_endpoint(
+    client: &reqwest::Client,
+    auth: &str,
+    base: &str,
+    desired: &[serde_json::Value],
+    desired_names: &std::collections::HashSet<&str>,
+) -> anyhow::Result<ReconcileOutcome> {
+    // Reap stale skill commands first so the 100-command cap never blocks
+    // the upserts that follow. Delete failures are counted, not fatal
+    // mid-pass: the upserts still run, but the pass reports Err at the end
+    // so the fingerprint is not recorded and the next READY retries.
+    let mut failed_deletes = 0usize;
+    let resp = client
+        .get(base)
+        .header("Authorization", auth)
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)?;
+    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Ok(ReconcileOutcome::RateLimited {
+            until: rate_limit_deadline(resp).await,
+        });
+    }
+    if !resp.status().is_success() {
+        anyhow::bail!("listing commands failed ({})", resp.status());
     }
     let existing: Vec<serde_json::Value> = resp.json().await?;
     for cmd in &existing {
@@ -465,7 +581,7 @@ pub(crate) async fn reconcile_slash_commands(
         };
         let del = client
             .delete(format!("{base}/{id}"))
-            .header("Authorization", &auth)
+            .header("Authorization", auth)
             .send()
             .await
             .map_err(reqwest::Error::without_url)?;
@@ -509,8 +625,8 @@ pub(crate) async fn reconcile_slash_commands(
             continue;
         }
         let resp = client
-            .post(&base)
-            .header("Authorization", &auth)
+            .post(base)
+            .header("Authorization", auth)
             .json(cmd)
             .send()
             .await

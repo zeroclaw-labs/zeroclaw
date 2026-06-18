@@ -133,6 +133,18 @@ pub struct DiscordSlashCommandSpec {
 /// the gateway listen loop.
 pub type DiscordSlashCommandResolver = Arc<dyn Fn() -> Vec<DiscordSlashCommandSpec> + Send + Sync>;
 
+/// Which Discord command scope a reconcile targets. Mapped from
+/// `DiscordConfig.slash_command_scope` + `guild_ids` in the channel wiring:
+/// `Global` registers application-wide; `Guild` registers to each configured
+/// guild (instant propagation). Either way the reconcile reaps the channel's
+/// commands from the *other* scope, so flipping the scope never leaves the same
+/// command registered in both places.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SlashScope {
+    Global,
+    Guild,
+}
+
 /// Outcome of a slash-command reconcile pass.
 #[derive(Debug)]
 pub(crate) enum ReconcileOutcome {

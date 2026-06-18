@@ -136,6 +136,11 @@ pub struct DiscordChannel {
     /// Construction-time wiring of `DiscordConfig.slash_commands` — config
     /// is the source of truth; reloads rebuild the channel.
     slash_commands: bool,
+    /// Registration scope for slash commands (`global`/`guild`), wired from
+    /// `DiscordConfig.slash_command_scope`. Under `guild`, commands register to
+    /// each `guild_ids` entry (instant propagation); empty `guild_ids` falls
+    /// back to global at reconcile time.
+    slash_command_scope: zeroclaw_config::schema::SlashCommandScope,
     /// Live interaction credentials, held channel-locally so the bearer
     /// token never enters reply targets, logs, session keys, or memory
     /// rows. Keyed by interaction id; swept on insert; entries expire with
@@ -195,6 +200,7 @@ impl DiscordChannel {
             thread_channels: Arc::new(AsyncMutex::new(HashMap::new())),
             gateway_session: Mutex::new(DiscordGatewaySession::default()),
             slash_commands: false,
+            slash_command_scope: zeroclaw_config::schema::SlashCommandScope::Global,
             pending_interactions: Arc::new(Mutex::new(HashMap::new())),
             pending_components: Arc::new(Mutex::new(pending::PendingComponents::default())),
             slash_command_resolver: None,
@@ -211,6 +217,17 @@ impl DiscordChannel {
     /// Enable Discord slash commands (register + serve over the Gateway).
     pub fn with_slash_commands(mut self, enabled: bool) -> Self {
         self.slash_commands = enabled;
+        self
+    }
+
+    /// Set the slash-command registration scope (`global`/`guild`), wired from
+    /// `DiscordConfig.slash_command_scope`. Only consulted when slash commands
+    /// are enabled.
+    pub fn with_slash_command_scope(
+        mut self,
+        scope: zeroclaw_config::schema::SlashCommandScope,
+    ) -> Self {
+        self.slash_command_scope = scope;
         self
     }
 
@@ -2356,6 +2373,8 @@ impl Channel for DiscordChannel {
                                     let bot_token = self.bot_token.clone();
                                     let resolver = self.slash_command_resolver.clone();
                                     let workspace_dir = self.workspace_dir.clone();
+                                    let slash_command_scope = self.slash_command_scope;
+                                    let guild_ids = self.guild_ids.clone();
                                     zeroclaw_spawn::spawn!(async move {
                                         let specs = match resolver {
                                             Some(resolve) => {
@@ -2375,10 +2394,36 @@ impl Channel for DiscordChannel {
                                             None => Vec::new(),
                                         };
                                         let body = slash_command_registration_body(&specs);
+                                        // Resolve the registration target: `guild` with no guild_ids
+                                        // can't register anywhere, so fall back to global.
+                                        let effective_scope = match slash_command_scope {
+                                            zeroclaw_config::schema::SlashCommandScope::Guild
+                                                if guild_ids.is_empty() =>
+                                            {
+                                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "slash_command_scope=guild but guild_ids is empty; falling back to global slash registration");
+                                                SlashScope::Global
+                                            }
+                                            zeroclaw_config::schema::SlashCommandScope::Guild => {
+                                                SlashScope::Guild
+                                            }
+                                            zeroclaw_config::schema::SlashCommandScope::Global => {
+                                                SlashScope::Global
+                                            }
+                                        };
                                         let fingerprint = {
                                             use std::hash::{Hash, Hasher};
                                             let mut h = std::collections::hash_map::DefaultHasher::new();
                                             body.to_string().hash(&mut h);
+                                            // Fold the registration target in: a scope or guild-set
+                                            // change must force a reconcile even when the command
+                                            // bodies are byte-identical, else flipping
+                                            // `slash_command_scope` would be silently skipped.
+                                            match effective_scope {
+                                                SlashScope::Global => 0u8,
+                                                SlashScope::Guild => 1u8,
+                                            }
+                                            .hash(&mut h);
+                                            guild_ids.hash(&mut h);
                                             h.finish()
                                         };
                                         use crate::discord_slash_state::SlashReconcileState;
@@ -2398,7 +2443,7 @@ impl Channel for DiscordChannel {
                                             ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"commands": specs.len() + 1})), "discord slash command set unchanged; skipping re-registration");
                                             return;
                                         }
-                                        match reconcile_slash_commands(&client, &bot_token, &app_id, &body, DISCORD_API_BASE).await {
+                                        match reconcile_slash_commands(&client, &bot_token, &app_id, &body, DISCORD_API_BASE, effective_scope, &guild_ids).await {
                                             Ok(ReconcileOutcome::Reconciled) => {
                                                 SlashReconcileState::record_success(workspace_dir.as_deref(), &app_id, fingerprint, now);
                                                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"commands": specs.len() + 1})), "discord slash commands registered");
@@ -4515,7 +4560,7 @@ mod tests {
 
         let client = reqwest::Client::new();
         let desired = slash_command_registration_body(&[]);
-        let err = reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri())
+        let err = reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri(), SlashScope::Global, &[])
             .await
             .unwrap_err();
         assert!(err.to_string().contains("stale skill command delete"));
@@ -4548,9 +4593,111 @@ mod tests {
 
         let client = reqwest::Client::new();
         let desired = slash_command_registration_body(&[]);
-        reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri())
+        reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri(), SlashScope::Global, &[])
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn guild_scope_registers_to_the_guild_endpoint() {
+        // scope=Guild with one guild routes the upsert to
+        // /applications/{app}/guilds/{gid}/commands; the (empty) global
+        // endpoint is listed for cross-scope cleanup but has nothing to reap.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/guilds/g1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/applications/app1/guilds/g1/commands"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[]);
+        reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Guild,
+            &["g1".to_string()],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn scope_switch_reaps_owned_commands_from_the_inactive_scope() {
+        // Switching to guild scope reaps our `/ask` + skill commands left on the
+        // now-inactive global endpoint, so the same command isn't registered in
+        // both scopes at once (the guild-scope migration hazard).
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let stale_ask = serde_json::json!({
+            "id": "a1", "name": "ask",
+            "description": "Ask the agent a question", "type": 1,
+            "options": [{ "name": "prompt", "description": "What to ask", "type": 3, "required": true }]
+        });
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                stale_ask,
+                stale_skill_command("c1", "ghost-skill")
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/applications/app1/commands/a1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/applications/app1/commands/c1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/guilds/g1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/applications/app1/guilds/g1/commands"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[]);
+        reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Guild,
+            &["g1".to_string()],
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -4591,7 +4738,7 @@ mod tests {
 
         let client = reqwest::Client::new();
         let desired = slash_command_registration_body(&[]);
-        reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri())
+        reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri(), SlashScope::Global, &[])
             .await
             .unwrap();
     }
@@ -4620,7 +4767,7 @@ mod tests {
         let client = reqwest::Client::new();
         let desired = slash_command_registration_body(&[]); // /ask → one POST
         let now = crate::discord_slash_state::now_unix();
-        let outcome = reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri())
+        let outcome = reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri(), SlashScope::Global, &[])
             .await
             .unwrap();
         match outcome {

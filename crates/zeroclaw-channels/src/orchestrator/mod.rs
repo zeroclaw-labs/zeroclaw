@@ -7056,6 +7056,7 @@ fn collect_configured_channels(
         .with_stall_timeout(dc.stall_timeout_secs)
         .with_approval_timeout_secs(dc.approval_timeout_secs)
         .with_slash_commands(dc.slash_commands)
+        .with_slash_command_scope(dc.slash_command_scope)
         .with_intents_mask(dc.intents_mask)
         .with_reaction_notifications(dc.reaction_notifications);
         if dc.slash_commands {
