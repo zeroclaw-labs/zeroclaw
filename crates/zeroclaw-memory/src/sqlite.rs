@@ -3750,4 +3750,125 @@ mod tests {
         let entry = mem.get("global").await.unwrap().expect("row should exist");
         assert!(entry.session_id.is_none());
     }
+
+    // ── §4.8 Issue #7694: storage-reader timestamp / ordering coverage ──
+    //
+    // These tests guard regressions in the storage reader's timestamp
+    // loading and session-metadata ordering paths. They use neutral
+    // fixture data only (no user-provided content) and rely on the
+    // public `Memory` trait surface so they catch breakage at the
+    // boundary a real caller would observe.
+
+    /// Regression test for issue #7694: every recalled entry must expose
+    /// a parseable RFC 3339 timestamp. A regression here would silently
+    /// break UI rendering and time-windowed recall filters.
+    #[tokio::test]
+    async fn sqlite_timestamp_loading_is_rfc3339_round_trippable() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store(
+            "ts-key-1",
+            "content one",
+            MemoryCategory::Core,
+            Some("sess-7694"),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        mem.store(
+            "ts-key-2",
+            "content two",
+            MemoryCategory::Core,
+            Some("sess-7694"),
+        )
+        .await
+        .unwrap();
+
+        let entries = mem.list(None, Some("sess-7694")).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        for entry in &entries {
+            // RFC 3339 / ISO 8601 with timezone designator and millisecond
+            // precision — chrono's default serialization. Anything else
+            // would mean the schema or row mapper silently changed.
+            let parsed =
+                chrono::DateTime::parse_from_rfc3339(&entry.timestamp).unwrap_or_else(|err| {
+                    panic!(
+                        "entry {:?} returned non-RFC3339 timestamp {:?}: {err}",
+                        entry.key, entry.timestamp
+                    )
+                });
+            // Round-trip must preserve the original instant.
+            assert_eq!(parsed.to_rfc3339(), entry.timestamp);
+        }
+    }
+
+    /// Regression test for issue #7694: `list()` must return rows for a
+    /// single session in stable `updated_at DESC` order so that the UI
+    /// doesn't reshuffle rows on every refresh.
+    #[tokio::test]
+    async fn sqlite_session_metadata_ordering_is_stable_descending() {
+        let (_tmp, mem) = temp_sqlite();
+        // Seed with sleep gaps wide enough that updated_at strictly differs.
+        let keys = ["ord-a", "ord-b", "ord-c", "ord-d"];
+        for key in keys {
+            mem.store(key, "body", MemoryCategory::Core, Some("sess-order"))
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        }
+
+        // First read: capture the ordering.
+        let first = mem.list(None, Some("sess-order")).await.unwrap();
+        assert_eq!(first.len(), keys.len());
+        let first_order: Vec<&str> = first.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            first_order,
+            vec!["ord-d", "ord-c", "ord-b", "ord-a"],
+            "list() must order rows by updated_at DESC (newest first)"
+        );
+
+        // Second read with no writes in between: order must be identical.
+        let second = mem.list(None, Some("sess-order")).await.unwrap();
+        let second_order: Vec<&str> = second.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            first_order, second_order,
+            "ordering must be stable across reads"
+        );
+
+        // And every row must carry the session metadata we asked for.
+        for entry in &first {
+            assert_eq!(entry.session_id.as_deref(), Some("sess-order"));
+        }
+    }
+
+    /// Regression test for issue #7694: when two rows in the same
+    /// session share an `updated_at` boundary timestamp, `list()` must
+    /// still return them deterministically (not randomly swap order on
+    /// each read). We force the tie by writing from the same `Instant`
+    /// bucket via two writes back-to-back with no observable sleep.
+    #[tokio::test]
+    async fn sqlite_session_metadata_ordering_ties_are_deterministic() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("tie-x", "x", MemoryCategory::Core, Some("sess-tie"))
+            .await
+            .unwrap();
+        mem.store("tie-y", "y", MemoryCategory::Core, Some("sess-tie"))
+            .await
+            .unwrap();
+
+        let first = mem.list(None, Some("sess-tie")).await.unwrap();
+        assert_eq!(first.len(), 2);
+        // Capture the order once.
+        let snapshot: Vec<String> = first.iter().map(|e| e.key.clone()).collect();
+
+        // Five more reads must all agree with the snapshot. If ordering
+        // were non-deterministic at a tied timestamp, this would flake.
+        for _ in 0..5 {
+            let again = mem.list(None, Some("sess-tie")).await.unwrap();
+            let again_keys: Vec<String> = again.iter().map(|e| e.key.clone()).collect();
+            assert_eq!(
+                again_keys, snapshot,
+                "list() must yield a deterministic order across reads"
+            );
+        }
+    }
 }
