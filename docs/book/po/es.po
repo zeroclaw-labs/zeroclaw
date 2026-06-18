@@ -1,7 +1,7 @@
 msgid ""
 msgstr ""
 "Project-Id-Version: ZeroClaw Docs\n"
-"POT-Creation-Date: 2026-06-19T08:43:21+10:00\n"
+"POT-Creation-Date: 2026-06-19T09:18:08+10:00\n"
 "PO-Revision-Date: 2026-04-24T20:47:42+10:00\n"
 "Last-Translator: Automatically generated\n"
 "Language-Team: none\n"
@@ -3980,6 +3980,10 @@ msgstr "**Bajo** (solo lectura, sin efectos secundarios): `file_read`, `memory_r
 #: src/foundations/fnd-001-intentional-architecture.md
 msgid "**MAJOR**"
 msgstr "**MAJOR**"
+
+#: src/tools/overview.md
+msgid "**MCP exception**: when `allowed_tools` is non-empty, runtime-discovered MCP tools (any name containing `__`, the `<server>__<tool>` convention) are auto-admitted into the effective allow-list without having to be listed there individually. This keeps the post-#7464 eager-MCP default usable for agents that already pin an explicit allow-list. To block individual MCP tools, list them in `excluded_tools`."
+msgstr ""
 
 #: src/foundations/fnd-001-intentional-architecture.md
 msgid "**MINOR**"
@@ -10410,6 +10414,10 @@ msgid "Apply the recovery key to ZeroClaw:"
 msgstr "Aplica la clave de recuperación a ZeroClaw:"
 
 #: src/tools/mcp.md
+msgid "Approval gates _when_ a tool call needs a human green-light. Authorization gates _whether_ the agent can call a tool at all. The two are independent."
+msgstr ""
+
+#: src/tools/mcp.md
 msgid "Approval policy"
 msgstr "Política de aprobación"
 
@@ -10764,6 +10772,10 @@ msgstr "Creación de una herramienta"
 #: src/channels/mattermost.md
 msgid "Authorization for DM senders still goes through the channel's peer-group resolver, same as any other channel. `discover_dms` is a knob, not a security boundary; peer groups decide who is allowed to address the agent."
 msgstr "La autorización para los remitentes de DM sigue pasando por el resolutor de grupos de pares del canal, igual que cualquier otro canal. `discover_dms` es un ajuste, no un límite de seguridad; los grupos de pares deciden quién está autorizado a dirigirse al agente."
+
+#: src/tools/mcp.md
+msgid "Authorization: `allowed_tools` / `excluded_tools`"
+msgstr "Autorización: `allowed_tools` / `excluded_tools`"
 
 #: src/channels/email.md
 msgid "Authorize the agent's Gmail access and store the resulting token via the secret path above"
@@ -16865,10 +16877,6 @@ msgstr "Para los PRs con `risk: high`, verifica un ejemplo concreto en cada cate
 msgid "For a given agent, the runtime walks every group the agent appears in, unions the other members' aliases (as agent peers) and the group's `external_peers` on the group's channel, then subtracts the `ignore` list. The agent's own alias is removed defensively to avoid a self-loop. An agent on no peer group runs solo with no cross-agent dispatch."
 msgstr "Para un agente dado, el runtime recorre cada grupo en el que aparece el agente, une los alias de los demás miembros (como pares del agente) y los `external_peers` del grupo en el canal del grupo, y luego resta la lista `ignore`. El alias propio del agente se elimina de forma defensiva para evitar un bucle consigo mismo. Un agente que no pertenece a ningún grupo de pares se ejecuta en solitario sin despacho entre agentes."
 
-#: src/tools/mcp.md
-msgid "For a hard allowlist, include the MCP tool's prefixed name in `allowed_tools` as well as any approval rule:"
-msgstr "Para una lista de permitidos estricta, incluye el nombre prefijado de la herramienta MCP en `allowed_tools`, así como cualquier regla de aprobación:"
-
 #: src/providers/catalog.md
 msgid "For a worked example per family, see [Configuration](./configuration.md). If your vendor isn't listed, use the `custom` slot ([Custom providers](./custom.md))."
 msgstr "Para ver un ejemplo práctico por familia, consulta [Configuración](./configuration.md). Si tu proveedor no aparece en la lista, usa el espacio `custom` ([Proveedores personalizados](./custom.md))."
@@ -17073,6 +17081,10 @@ msgstr "Para configuraciones rootless, también ejecuta `loginctl enable-linger 
 #: src/foundations/fnd-003-governance.md
 msgid "For routine decisions, adding a label, closing a stale issue, updating documentation, Core Team members operate under **lazy consensus**: if you announce your intention in the relevant issue and no Core Team member objects within 48 hours, you proceed. This prevents the paralysis of requiring explicit approval for everything while maintaining visibility."
 msgstr "Para decisiones rutinarias, como añadir una etiqueta, cerrar un issue inactivo o actualizar la documentación, los miembros del Core Team operan bajo **consenso tácito**: si anuncias tu intención en el issue correspondiente y ningún miembro del Core Team objeta en un plazo de 48 horas, procedes. Esto evita la parálisis de requerir aprobación explícita para todo, manteniendo a la vez la visibilidad."
+
+#: src/tools/mcp.md
+msgid "For runtime-discovered MCP tools the capability contract has an MCP-specific exception:"
+msgstr ""
 
 #: src/tools/browser.md
 msgid "For sensitive sites, use `--session-name` to persist auth state"
@@ -18317,6 +18329,10 @@ msgstr "Si `[agents.<alias>.workspace.unrestricted_filesystem]` es `true`, desac
 msgid "If `[theme].name` (or a per-agent override below) names a theme this build does not have, a typo, or a config written by a newer build, zerocode falls back to the `terminal` theme rather than refusing to start."
 msgstr "Si `[theme].name` (o una anulación por agente más abajo) nombra un tema que esta compilación no tiene, un error tipográfico, o una configuración escrita por una compilación más reciente, zerocode recurre al tema `terminal` en lugar de negarse a iniciar."
 
+#: src/tools/mcp.md
+msgid "If `allowed_tools` is non-empty, any MCP tool whose name contains `__` (the `<server>__<tool>` convention) is auto-admitted into the effective allow-list without being listed there individually. Non-MCP built-ins still need an exact entry."
+msgstr ""
+
 #: src/channels/matrix.md
 msgid "If `device_id` is missing from the response, set it manually (see [§5H](#h-finding-device_id-for-an-existing-token))."
 msgstr "Si `device_id` falta en la respuesta, configúrelo manualmente (consulte [§5H](#h-finding-device_id-for-an-existing-token))."
@@ -18569,6 +18585,10 @@ msgstr "Si la nueva versión requiere migraciones de configuración, el registro
 msgid "If the paths differ between `zeroclaw config list` (as you) and the service (as its user), either:"
 msgstr "Si las rutas difieren entre `zeroclaw config list` (como tú) y el servicio (como su usuario), puedes:"
 
+#: src/tools/mcp.md
+msgid "If the risk profile's `allowed_tools` is empty or omitted, no authorization constraint applies; every discovered tool (MCP or built-in) is reachable. The TOML config does not distinguish an omitted field from `allowed_tools = []`; both deserialize to the same \"no authorization constraint\" state at the risk-profile level. If you need an explicit deny-all gate, do it on the caller-supplied per-run `allowed_tools` (cron jobs and other narrowers pass that list in directly) or via `excluded_tools` covering the specific tools you want blocked."
+msgstr ""
+
 #: src/providers/custom.md
 msgid "If the service speaks OpenAI chat-completions, this is a config-only change. The `custom` slot requires `uri` (the family's endpoint enum has no default); reference it from an agent's `model_provider`."
 msgstr "Si el servicio habla chat-completions de OpenAI, este es un cambio que solo afecta a la configuración. El slot `custom` requiere `uri` (el enum de endpoint de la familia no tiene valor predeterminado); referéncielo desde el `model_provider` de un agente."
@@ -18696,6 +18716,10 @@ msgstr "Si usas la forma estándar `command`/`command_args`, envuelve el inicio 
 #: src/hardware/raspberry-pi-setup.md
 msgid "If you want skills to drive GPIO pins (LEDs, buttons, sensors, etc.):"
 msgstr "Si quieres que las skills controlen pines GPIO (LEDs, botones, sensores, etc.):"
+
+#: src/tools/mcp.md
+msgid "If you want the strict pattern from before this change, where you only admit MCP tools you list explicitly with no `__` auto-admit, combine an explicit `allowed_tools` entry with an `excluded_tools` entry per destructive sibling you need blocked:"
+msgstr ""
 
 #: src/contributing/privacy.md
 msgid "If you're capturing an incident trace, log payload, or external response in a test fixture: redact and anonymize before committing. Real session IDs, real user IDs, real hostnames, and real auth tokens all need to go through a scrubbing pass first. The redacted version is what ships; the original stays out of git."
@@ -20663,13 +20687,13 @@ msgstr "Mantén las banderas `--os linux --arch amd64` en cada `run` (no solo en
 msgid "Keep the daemon bound to localhost unless you have put it behind your own authenticated network boundary. The daemon can send and receive as the linked Signal account."
 msgstr "Mantén el daemon enlazado a localhost a menos que lo hayas colocado detrás de tu propio límite de red autenticado. El daemon puede enviar y recibir como la cuenta de Signal vinculada."
 
-#: src/tools/mcp.md
-msgid "Keep the exposure and approval controls separate:"
-msgstr "Mantén separados los controles de exposición y aprobación:"
-
 #: src/maintainers/labels.md
 msgid "Keep the split based on update frequency:"
 msgstr "Mantén la división basada en la frecuencia de actualización:"
+
+#: src/tools/mcp.md
+msgid "Keep the three MCP tool controls on their own axes:"
+msgstr "Mantén los tres controles de herramientas MCP en sus propios ejes:"
 
 #: src/foundations/fnd-002-documentation-standards.md
 msgid "Keep them short. An `AGENTS.md` that is longer than 60 lines will not be read. Each file answers five questions:"
@@ -31393,6 +31417,14 @@ msgstr "La imagen de Linux se comporta exactamente como se documenta en [Docker 
 msgid "The Linux-native path. Zero setup, kernel-enforced, very low overhead. Requires kernel 5.13+."
 msgstr "La ruta nativa de Linux. Sin configuración, aplicada por el kernel, con una sobrecarga muy baja. Requiere el kernel 5.13 o posterior."
 
+#: src/tools/mcp.md
+msgid "The MCP `__` auto-admit exception is scoped to the **risk profile**'s `allowed_tools` only. Caller-supplied per-run allow-lists, like a cron job `allowed_tools` or any other narrowed invocation that passes an explicit list into the runtime, are still treated as strict explicit-list intersections, with no `__` auto-admit on top. A cron job that narrows itself to `allowed_tools = [\"cron_add\"]` will not surface `filesystem__write_file` to the model even when the agent's risk profile would otherwise auto-admit it via the `__` convention; the per-run narrowing remains a reliable capability boundary regardless of how many MCP servers are configured."
+msgstr ""
+
+#: src/tools/overview.md
+msgid "The MCP exception is scoped to the **risk profile**'s `allowed_tools` only. Caller-supplied per-run allow-lists (cron job `allowed_tools`, narrowed delegate invocations, etc.) are still treated as strict explicit-list intersections. A job that narrows itself to `allowed_tools = [\"cron_add\"]` will not surface runtime-discovered MCP wrappers it did not name, even when the agent's risk profile would auto-admit them."
+msgstr ""
+
 #: src/ops/troubleshooting.md
 msgid "The Matrix E2EE stack (`matrix-sdk`, `ruma`, `vodozemac`) and TLS/crypto native deps (`aws-lc-sys`, `ring`) are the main cost. Opt out if you don't need them:"
 msgstr "La pila E2EE de Matrix (`matrix-sdk`, `ruma`, `vodozemac`) y las dependencias nativas de TLS/cifrado (`aws-lc-sys`, `ring`) son el principal costo. Desactívalas si no las necesitas:"
@@ -32938,6 +32970,10 @@ msgstr "La pregunta que debes hacerte antes de escribir cualquier mensaje de reg
 #: src/philosophy/how-decisions-get-made.md
 msgid "The ratified foundational RFCs, the maturity framework this project is built on, live in the book as the [Foundations](../foundations/) section, versioned alongside the code. Start there for the canonical, always-current set rather than a list duplicated here."
 msgstr "Las RFCs fundacionales ratificadas, el marco de madurez sobre el que está construido este proyecto, viven en el libro como la sección [Foundations](../foundations/), versionadas junto con el código. Comienza allí para obtener el conjunto canónico y siempre actualizado en lugar de una lista duplicada aquí."
+
+#: src/tools/mcp.md
+msgid "The rationale: before this exception, every agent that pinned an `allowed_tools` list to lock down its built-in surface would silently lose every MCP tool, even ones the operator explicitly configured. The cost is that the deny-list is now the operator's primary lever for blocking destructive MCP capabilities under an allow-list-pinned profile."
+msgstr ""
 
 #: src/agents/internals.md
 msgid "The read-only allowlist is honored by `file_read` (and other read-side tools); the read-write allowlist gates `file_write`, `file_edit`, `git_operations`, and the shell tool's path-touching invocations. POSIX device files (`/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom`) are always readable so shell idioms keep working without per-agent config."
@@ -43544,21 +43580,16 @@ msgid ""
 "  \"file_read\",\n"
 "  \"filesystem__read_file\",\n"
 "]\n"
+"# Block the destructive sibling that would otherwise be auto-admitted via\n"
+"# the `__` exception above.\n"
+"excluded_tools = [\n"
+"  \"filesystem__write_file\",\n"
+"]\n"
 "auto_approve = [\n"
 "  \"filesystem__read_file\",\n"
 "]\n"
 "```"
 msgstr ""
-"```toml\n"
-"[risk_profiles.assistant]\n"
-"allowed_tools = [\n"
-"  \"file_read\",\n"
-"  \"filesystem__read_file\",\n"
-"]\n"
-"auto_approve = [\n"
-"  \"filesystem__read_file\",\n"
-"]\n"
-"```"
 
 #: src/hardware/android-setup.md
 msgid "`aarch64-apple-darwin`"
@@ -43841,8 +43872,8 @@ msgid "`allowed_tools` / `excluded_tools`"
 msgstr "`allowed_tools` / `excluded_tools`"
 
 #: src/tools/overview.md
-msgid "`allowed_tools` is the inverse: an allowlist of tools the agent may call in agentic mode (empty means no authorization constraint)."
-msgstr "`allowed_tools` es lo inverso: una lista de tools permitidas que el agente puede invocar en modo agéntico (vacía significa que no hay restricción de autorización)."
+msgid "`allowed_tools` is the inverse: an allowlist of tools the agent may call in agentic mode (empty or omitted means no authorization constraint; the TOML config does not distinguish the two)."
+msgstr ""
 
 #: src/reference/config.md
 msgid "`allowed_workspace_roots`"
@@ -45740,9 +45771,13 @@ msgstr "`example.com`, `host.invalid`, `192.0.2.x` (rango de documentación RFC 
 msgid "`excluded_tools`"
 msgstr "`excluded_tools`"
 
+#: src/tools/mcp.md
+msgid "`excluded_tools` always subtracts, including from the auto-admitted MCP set. To block a single MCP tool like `filesystem__write_file` while keeping the rest of the `filesystem` server reachable, put it in `excluded_tools`."
+msgstr ""
+
 #: src/tools/overview.md
-msgid "`excluded_tools` removes the listed tools from every non-CLI channel (Discord, Telegram, Bluesky, Matrix, Slack, etc.) while leaving the local CLI untouched. The granularity is binary (CLI vs non-CLI), not per-channel."
-msgstr "`excluded_tools` elimina las herramientas listadas de todos los canales que no son CLI (Discord, Telegram, Bluesky, Matrix, Slack, etc.) mientras deja la CLI local intacta. La granularidad es binaria (CLI vs no CLI), no por canal."
+msgid "`excluded_tools` removes the listed tools from every non-CLI channel (Discord, Telegram, Bluesky, Matrix, Slack, etc.) while leaving the local CLI untouched. The granularity is binary (CLI vs non-CLI), not per-channel. It also subtracts from the agentic-delegate allow-list resolved at runtime, which is the only way to block individual `<server>__<tool>` MCP names that would otherwise be auto-admitted by the rule below."
+msgstr ""
 
 #: src/architecture/rpc-socket.md
 msgid "`execute_turn()` shared turn executor"
