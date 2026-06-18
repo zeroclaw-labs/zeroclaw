@@ -2690,8 +2690,6 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             self.strip_native_tool_messages(&effective_messages)
         };
 
-        // When wire_api = "responses", route all turns through the responses API.
-
         let tools = self.convert_tool_specs_for_model(request.tools, model);
         let native_request = self.build_native_tool_chat_request(
             &effective_messages,
@@ -2700,6 +2698,24 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             temperature,
             !merge,
         );
+        let tools_count = native_request.tools.as_ref().map_or(0, Vec::len);
+        if ::zeroclaw_log::debug_enabled() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                    .with_attrs(::serde_json::json!({
+                        "provider": &self.name,
+                        "alias": &self.alias,
+                        "request_api": "chat_completions",
+                        "model": model,
+                        "stream": false,
+                        "native_tool_calling": self.native_tool_calling,
+                        "tools_count": tools_count,
+                        "tool_choice": native_request.tool_choice.as_deref(),
+                    })),
+                "compatible provider request prepared"
+            );
+        }
 
         let url = self.chat_completions_url();
         let response = match self
@@ -2813,6 +2829,24 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let effective_messages = Self::flatten_system_messages(&normalized, merge);
             let effective_messages = provider.strip_native_tool_messages(&effective_messages);
             let tools = provider.convert_tool_specs_for_model(tools_owned.as_deref(), &model);
+            let tools_count = tools.as_ref().map_or(0, Vec::len);
+            if ::zeroclaw_log::debug_enabled() {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                        .with_attrs(::serde_json::json!({
+                            "provider": &provider.name,
+                            "alias": &provider.alias,
+                            "request_api": "chat_completions",
+                            "model": &model,
+                            "stream": options_enabled,
+                            "native_tool_calling": provider.native_tool_calling,
+                            "tools_count": tools_count,
+                            "tool_choice": tools.as_ref().map(|_| "auto"),
+                        })),
+                    "compatible streaming provider request prepared"
+                );
+            }
 
             let payload_result = if has_tools {
                 serde_json::to_value(NativeChatRequest {
