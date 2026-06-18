@@ -6,6 +6,7 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
+use zeroclaw_api::platform::is_android;
 use zeroclaw_api::tool::{Tool, ToolResult, with_ephemeral_workspace_warning};
 
 /// Maximum output size in bytes (1MB).
@@ -175,6 +176,11 @@ fn decode_output(bytes: &[u8]) -> String {
     let cp = unsafe { GetConsoleOutputCP() };
     let cp = if cp == 0 { unsafe { GetACP() } } else { cp };
 
+    decode_output_with_code_page(bytes, cp)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn decode_output_with_code_page(bytes: &[u8], cp: u32) -> String {
     let encoding = windows_code_page_to_encoding(cp);
     if std::ptr::eq(encoding, encoding_rs::UTF_8) {
         String::from_utf8_lossy(bytes).into_owned()
@@ -186,7 +192,7 @@ fn decode_output(bytes: &[u8]) -> String {
 
 /// Map a Windows code page identifier to an `encoding_rs` `Encoding`.
 /// Falls back to UTF-8 (lossy) for unknown code pages.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn windows_code_page_to_encoding(cp: u32) -> &'static encoding_rs::Encoding {
     match cp {
         932 => encoding_rs::SHIFT_JIS,
@@ -238,6 +244,18 @@ fn collect_allowed_shell_env_vars(security: &SecurityPolicy) -> Vec<String> {
         }
     }
     out
+}
+
+/// Name of the environment variable that carries the in-flight session key
+/// into shell tools.
+pub(crate) const SESSION_ID_ENV_VAR: &str = "ZEROCLAW_SESSION_ID";
+
+fn get_session_id() -> Option<String> {
+    zeroclaw_api::TOOL_LOOP_SESSION_KEY
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .filter(|key| !key.is_empty())
 }
 
 #[async_trait]
@@ -338,6 +356,11 @@ impl Tool for ShellTool {
             }
         }
 
+        // Injected after env_clear so it survives; absent when the turn is unscoped.
+        if let Some(session_id) = get_session_id() {
+            cmd.env(SESSION_ID_ENV_VAR, session_id);
+        }
+
         // Overlay TUI env on top of the safe-env snapshot. TUI vars win on
         // conflict — the user's real PATH etc. should take precedence over
         // whatever the daemon process inherited.
@@ -345,6 +368,20 @@ impl Tool for ShellTool {
             for (k, v) in tui_env {
                 cmd.env(k, v);
             }
+        }
+
+        // Android: platform tools (sh, getprop, am, dumpsys, content, pm, ...)
+        // live in /system/bin and /system/xbin. The cleared+rebuilt PATH above
+        // may omit them, leaving the shell unable to resolve any platform tool.
+        // Detect Android at runtime (works for bionic and musl builds).
+        if is_android() {
+            let ambient = std::env::var("PATH").unwrap_or_default();
+            let tui_path = self
+                .tui_env
+                .as_ref()
+                .and_then(|env| env.get("PATH"))
+                .map(String::as_str);
+            cmd.env("PATH", android_child_path(tui_path, &ambient));
         }
 
         let timeout_secs = self.timeout_secs;
@@ -476,12 +513,68 @@ where
     buf
 }
 
+/// Compose the child `PATH` for an Android shell: the platform tool dirs
+/// (`/system/bin:/system/xbin`) are prefixed onto the curated PATH, with a
+/// TUI-provided PATH winning over the daemon's ambient PATH. Yields the bare
+/// platform dirs when the resolved base is empty.
+fn android_child_path(tui_path: Option<&str>, ambient_path: &str) -> String {
+    let base = tui_path.unwrap_or(ambient_path);
+    if base.is_empty() {
+        "/system/bin:/system/xbin".to_string()
+    } else {
+        format!("/system/bin:/system/xbin:{base}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn android_child_path_prefixes_platform_dirs_with_tui_path_winning() {
+        assert_eq!(
+            super::android_child_path(Some("/usr/local/bin"), "/daemon"),
+            "/system/bin:/system/xbin:/usr/local/bin"
+        );
+        assert_eq!(
+            super::android_child_path(None, "/daemon"),
+            "/system/bin:/system/xbin:/daemon"
+        );
+        assert_eq!(
+            super::android_child_path(None, ""),
+            "/system/bin:/system/xbin"
+        );
+    }
+
+    #[test]
+    fn is_android_returns_bool_without_panicking() {
+        let _ = zeroclaw_api::platform::is_android();
+    }
     use super::*;
     use crate::platform::{NativeRuntime, RuntimeAdapter};
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
+
+    #[tokio::test]
+    async fn get_session_id_returns_scoped_session_key() {
+        let got = crate::agent::loop_::scope_session_key(Some("gw_abc-123".to_string()), async {
+            get_session_id()
+        })
+        .await;
+        assert_eq!(got, Some("gw_abc-123".to_string()));
+    }
+
+    #[test]
+    fn get_session_id_none_outside_a_scoped_turn() {
+        assert_eq!(get_session_id(), None);
+    }
+
+    #[tokio::test]
+    async fn get_session_id_none_for_empty_session_key() {
+        let got =
+            crate::agent::loop_::scope_session_key(Some(String::new()), async { get_session_id() })
+                .await;
+        assert_eq!(got, None);
+    }
 
     fn test_security(autonomy: AutonomyLevel) -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
@@ -1019,7 +1112,6 @@ mod tests {
         assert_eq!(super::decode_output(b""), "");
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn windows_code_page_mapping_covers_cjk() {
         use super::windows_code_page_to_encoding;
@@ -1029,7 +1121,6 @@ mod tests {
         assert_eq!(windows_code_page_to_encoding(950), encoding_rs::BIG5);
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn windows_code_page_mapping_utf8_variants() {
         use super::windows_code_page_to_encoding;
@@ -1037,23 +1128,19 @@ mod tests {
         assert_eq!(windows_code_page_to_encoding(20127), encoding_rs::UTF_8);
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn windows_code_page_mapping_unknown_falls_back_to_utf8() {
         use super::windows_code_page_to_encoding;
         assert_eq!(windows_code_page_to_encoding(99999), encoding_rs::UTF_8);
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
-    fn decode_output_gbk_bytes_transcode_to_utf8() {
+    fn decode_output_with_cp936_gbk_bytes_transcodes_to_utf8() {
         // GBK encoding of "你好" is [0xC4, 0xE3, 0xBA, 0xC3]
         let gbk_bytes: &[u8] = &[0xC4, 0xE3, 0xBA, 0xC3];
-        // When the console code page is GBK (936), windows_code_page_to_encoding
-        // returns GBK and decodes correctly.  We test the transcoding function
-        // directly since we cannot control GetConsoleOutputCP in unit tests.
-        let (cow, _enc, _errors) = encoding_rs::GBK.decode(gbk_bytes);
-        assert_eq!(cow.as_ref(), "你好");
+        let decoded = super::decode_output_with_code_page(gbk_bytes, 936);
+        assert_eq!(decoded, "你好");
+        assert!(!decoded.contains('\u{FFFD}'));
     }
 
     #[test]

@@ -636,6 +636,8 @@ pub async fn agent_turn(
     model_switch_callback: Option<ModelSwitchCallback>,
     strict_tool_parsing: bool,
     parallel_tools: bool,
+    max_tool_result_chars: usize,
+    context_token_budget: usize,
     channel: Option<&dyn Channel>,
 ) -> Result<String> {
     run_tool_call_loop(
@@ -662,9 +664,9 @@ pub async fn agent_turn(
         &zeroclaw_config::schema::PacingConfig::default(),
         strict_tool_parsing,
         parallel_tools,
-        0,    // max_tool_result_chars: 0 = disabled (legacy callers)
-        0,    // context_token_budget: 0 = disabled (legacy callers)
-        None, // shared_budget: no shared budget for legacy callers
+        max_tool_result_chars,
+        context_token_budget,
+        None, // shared_budget: no shared budget for agent_turn callers
         channel,
         None, // receipt_generator
         None, // collected_receipts
@@ -823,10 +825,27 @@ fn resolved_agent_for_turn(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
 ) -> Result<zeroclaw_config::schema::AliasedAgentConfig> {
-    config
+    let agent = config
         .resolved_agent_config(agent_alias)
-        .with_context(|| format!("agents.{agent_alias} is not configured"))
+        .with_context(|| format!("agents.{agent_alias} is not configured"))?;
+    #[cfg(test)]
+    if let Some(hook) = RESOLVED_AGENT_FOR_TURN_TEST_HOOK
+        .lock()
+        .expect("resolved-agent test hook lock should not be poisoned")
+        .as_ref()
+        .cloned()
+    {
+        hook(agent_alias, agent.resolved.max_tool_iterations);
+    }
+    Ok(agent)
 }
+
+#[cfg(test)]
+type ResolvedAgentForTurnTestHook = Arc<dyn Fn(&str, usize) + Send + Sync>;
+
+#[cfg(test)]
+static RESOLVED_AGENT_FOR_TURN_TEST_HOOK: LazyLock<Mutex<Option<ResolvedAgentForTurnTestHook>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 /// Resolve (api_key, uri) for `provider_name`, preferring the alias-specific
 /// config when `provider_name` is a dotted `<family>.<alias>` reference.
@@ -1489,6 +1508,7 @@ pub async fn run(
                 eff_compact_context,
                 eff_max_system_prompt_chars,
                 true,
+                config.channels.show_tool_calls,
             );
 
         // Append structured tool-use instructions with schemas (only for non-native model_providers)
@@ -2912,6 +2932,7 @@ pub async fn process_message(
                 eff_compact_context,
                 eff_max_system_prompt_chars,
                 false,
+                config.channels.show_tool_calls,
             );
         if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
@@ -3042,6 +3063,8 @@ pub async fn process_message(
                     None,
                     agent.resolved.strict_tool_parsing,
                     agent.resolved.parallel_tools,
+                    agent.resolved.max_tool_result_chars,
+                    agent.resolved.max_context_tokens,
                     None, // channel: process_message path has no channel ref
                 ),
             )
@@ -3075,6 +3098,9 @@ mod tests {
         DelayTool,
         FailingTool,
         NamedMockTool,
+        CompletesAndSignalsTool,
+        CancelsTurnTool,
+        VerboseTool,
     );
 
     // ── maybe_inject_channel_delivery_defaults tests ──────────────
@@ -3577,6 +3603,7 @@ mod tests {
             &observer,
             None,
             None,
+            None,
         )
         .await;
         assert!(result.is_ok(), "execute_one_tool should not panic or error");
@@ -3609,9 +3636,49 @@ mod tests {
             &observer,
             None,
             None, // receipt_generator
+            None, // event_tx
         )
         .await
         .expect("suffix alias should execute the unique activated tool");
+
+        assert!(outcome.success);
+        assert_eq!(outcome.output, "counted:ok");
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_recovers_poisoned_activated_tool_lock() {
+        let observer = NoopObserver;
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let activated = Arc::new(std::sync::Mutex::new(crate::tools::ActivatedToolSet::new()));
+        let activated_tool: Arc<dyn Tool> = Arc::new(CountingTool::new(
+            "docker-mcp__extract_text",
+            Arc::clone(&invocations),
+        ));
+        activated
+            .lock()
+            .unwrap()
+            .activate("docker-mcp__extract_text".into(), activated_tool);
+        let poisoned = Arc::clone(&activated);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().expect("test mutex should lock");
+            panic!("poison activated-tools lock");
+        })
+        .join();
+
+        let outcome = execute_one_tool(
+            "extract_text",
+            serde_json::json!({ "value": "ok" }),
+            None,
+            &[],
+            Some(&activated),
+            &observer,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("poisoned activated-tools lock should recover for read");
 
         assert!(outcome.success);
         assert_eq!(outcome.output, "counted:ok");
@@ -3632,6 +3699,7 @@ mod tests {
             &observer,
             None,
             None, // receipt_generator
+            None, // event_tx
         )
         .await
         .expect("empty successful tool output should still execute");
@@ -3676,6 +3744,7 @@ mod tests {
             &observer,
             None,
             None, // receipt_generator
+            None, // event_tx
         )
         .await
         .expect("tool should execute");
@@ -5431,6 +5500,179 @@ mod tests {
                 msg.content
             );
         }
+    }
+
+    struct CompletesAndSignalsTool {
+        completed_tx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    #[async_trait]
+    impl Tool for CompletesAndSignalsTool {
+        fn name(&self) -> &str {
+            "fast_tool"
+        }
+        fn description(&self) -> &str {
+            "Completes immediately and signals a sibling to cancel the turn"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{}})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            if let Some(tx) = self.completed_tx.lock().await.take() {
+                let _ = tx.send(());
+            }
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "fast-done".to_string(),
+                error: None,
+            })
+        }
+    }
+
+    struct CancelsTurnTool {
+        token: CancellationToken,
+        wait_for: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    impl Tool for CancelsTurnTool {
+        fn name(&self) -> &str {
+            "cancel_tool"
+        }
+        fn description(&self) -> &str {
+            "Waits for a sibling to finish, cancels the turn, then never returns"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{}})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            if let Some(rx) = self.wait_for.lock().await.take() {
+                let _ = rx.await;
+            }
+            self.token.cancel();
+            // The executor's select drops this future once the token fires; the
+            // pending await keeps this call from ever returning Ok.
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    }
+
+    // A parallel sibling that finished before the cancellation already emitted
+    // its real terminal ToolResult; the cancel cleanup must not emit a second,
+    // interrupted result for that same tool_call_id (#7778 regression).
+    #[tokio::test]
+    async fn run_tool_call_loop_parallel_cancel_no_double_terminal_for_completed_call() {
+        let model_provider = ScriptedModelProvider::from_native_tool_calls(
+            vec![
+                ("call_fast", "fast_tool", "{}"),
+                ("call_cancel", "cancel_tool", "{}"),
+            ],
+            "done",
+        );
+
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        let token = CancellationToken::new();
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(CompletesAndSignalsTool {
+                completed_tx: tokio::sync::Mutex::new(Some(completed_tx)),
+            }),
+            Box::new(CancelsTurnTool {
+                token: token.clone(),
+                wait_for: tokio::sync::Mutex::new(Some(completed_rx)),
+            }),
+        ];
+
+        let approval_cfg = zeroclaw_config::schema::RiskProfileConfig {
+            level: crate::security::AutonomyLevel::Full,
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
+        };
+        let approval_mgr = ApprovalManager::from_risk_profile(&approval_cfg);
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run two tool calls"),
+        ];
+        let observer = NoopObserver;
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+
+        let _ = run_tool_call_loop(
+            &model_provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            Some(0.0),
+            true,
+            Some(&approval_mgr),
+            "telegram",
+            None,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            Some(token.clone()),
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            false,
+            true, // parallel_tools
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            Some(event_tx),
+            None,
+            None,
+            &LoopKnobs::default(),
+            None,
+        )
+        .await;
+
+        drop(tools_registry);
+        let mut results_by_id: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let zeroclaw_api::agent::TurnEvent::ToolResult { id, output, .. } = event {
+                results_by_id.entry(id).or_default().push(output);
+            }
+        }
+
+        let fast_results = results_by_id
+            .get("call_fast")
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        assert_eq!(
+            fast_results.len(),
+            1,
+            "completed parallel call must get exactly one terminal ToolResult, got: {fast_results:?}"
+        );
+        assert_eq!(fast_results[0], "fast-done");
+
+        let cancel_results = results_by_id
+            .get("call_cancel")
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        assert_eq!(
+            cancel_results.len(),
+            1,
+            "cancelled-in-flight call must get exactly one interrupted ToolResult, got: {cancel_results:?}"
+        );
+        assert_eq!(
+            cancel_results[0],
+            crate::i18n::get_required_cli_string("turn-tool-interrupted-before-result")
+        );
     }
 
     #[tokio::test]
@@ -8931,6 +9173,8 @@ This is an example, not an invocation."#;
                 None,
                 false,
                 false, // parallel_tools
+                0,     // max_tool_result_chars: disabled for test
+                0,     // context_token_budget: disabled for test
                 None,  // channel
             )
             .await
@@ -8997,6 +9241,8 @@ This is an example, not an invocation."#;
                 None,
                 true,
                 false, // parallel_tools
+                0,     // max_tool_result_chars: disabled for test
+                0,     // context_token_budget: disabled for test
                 None,  // channel
             )
             .await
@@ -9010,6 +9256,221 @@ This is an example, not an invocation."#;
             assert!(
                 !result.contains("private reasoning"),
                 "strict parser should still strip think tags from final text, got: {result}"
+            );
+        });
+    }
+
+    // ── Regression tests for trimming-budget forwarding through agent_turn ────
+
+    /// A mock tool that produces a configurable-length output string for
+    /// testing that `max_tool_result_chars` is forwarded through
+    /// `agent_turn` to `run_tool_call_loop`.
+    struct VerboseTool {
+        name: String,
+        output_len: usize,
+        invocations: Arc<AtomicUsize>,
+    }
+
+    impl VerboseTool {
+        fn new(name: &str, output_len: usize, invocations: Arc<AtomicUsize>) -> Self {
+            Self {
+                name: name.to_string(),
+                output_len,
+                invocations,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for VerboseTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "Returns a long output for trimming-budget regression tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "value": { "type": "string" }
+                }
+            })
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.invocations.fetch_add(1, Ordering::SeqCst);
+            let output = format!(
+                "verbose-start-{}-{}",
+                self.name,
+                "X".repeat(self.output_len)
+            );
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output,
+                error: None,
+            })
+        }
+    }
+
+    /// When `max_tool_result_chars` is set to a non-zero value, `agent_turn`
+    /// should forward it to `run_tool_call_loop`, which truncates oversized
+    /// tool results. This test verifies the old hardcoded-0 bug (where
+    /// trimming was silently disabled) does not regress.
+    #[test]
+    fn agent_turn_forwards_max_tool_result_chars_to_truncate_tool_result() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should initialize");
+
+        runtime.block_on(async {
+            let model_provider = ScriptedModelProvider::from_text_responses(vec![
+                r#"<tool_call>
+{"name":"verbose_checker","arguments":{"value":"check"}}
+</tool_call>"#,
+                "done",
+            ]);
+
+            let invocations = Arc::new(AtomicUsize::new(0));
+            let verbose_tool: Box<dyn Tool> = Box::new(VerboseTool::new(
+                "verbose_checker",
+                500, // produce 500+ chars of output
+                Arc::clone(&invocations),
+            ));
+            let tools_registry: Vec<Box<dyn Tool>> = vec![verbose_tool];
+            let mut history = vec![
+                ChatMessage::system("test-system"),
+                ChatMessage::user("check"),
+            ];
+            let observer = NoopObserver;
+
+            let _result = agent_turn(
+                &model_provider,
+                &mut history,
+                &tools_registry,
+                &observer,
+                "mock-provider",
+                "mock-model",
+                Some(0.0),
+                true,
+                "daemon",
+                None,
+                &zeroclaw_config::schema::MultimodalConfig::default(),
+                4,
+                None,
+                &[],
+                &[],
+                None,
+                None,
+                false,
+                false,
+                100, // max_tool_result_chars: truncate at 100 chars
+                0,   // context_token_budget: disabled
+                None,
+            )
+            .await
+            .expect("agent_turn should complete");
+
+            assert_eq!(
+                invocations.load(Ordering::SeqCst),
+                1,
+                "tool should be called once"
+            );
+
+            // The tool result in history should be truncated (contain the
+            // truncation marker "...") rather than preserving the full 500+ char output.
+            let all_content: String = history
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<&str>>()
+                .join(" ");
+
+            assert!(
+                !all_content.contains(&"X".repeat(500)),
+                "tool result should not contain 500 consecutive X chars when truncated to 100 chars"
+            );
+        });
+    }
+
+    /// Control test: when `max_tool_result_chars = 0` (disabled), the full
+    /// tool result must be preserved in history without truncation.
+    #[test]
+    fn agent_turn_with_zero_budget_preserves_full_tool_result() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should initialize");
+
+        runtime.block_on(async {
+            let model_provider = ScriptedModelProvider::from_text_responses(vec![
+                r#"<tool_call>
+{"name":"verbose_checker","arguments":{"value":"check"}}
+</tool_call>"#,
+                "done",
+            ]);
+
+            let invocations = Arc::new(AtomicUsize::new(0));
+            let verbose_tool: Box<dyn Tool> = Box::new(VerboseTool::new(
+                "verbose_checker",
+                500,
+                Arc::clone(&invocations),
+            ));
+            let tools_registry: Vec<Box<dyn Tool>> = vec![verbose_tool];
+            let mut history = vec![
+                ChatMessage::system("test-system"),
+                ChatMessage::user("check"),
+            ];
+            let observer = NoopObserver;
+
+            let _result = agent_turn(
+                &model_provider,
+                &mut history,
+                &tools_registry,
+                &observer,
+                "mock-provider",
+                "mock-model",
+                Some(0.0),
+                true,
+                "daemon",
+                None,
+                &zeroclaw_config::schema::MultimodalConfig::default(),
+                4,
+                None,
+                &[],
+                &[],
+                None,
+                None,
+                false,
+                false,
+                0, // max_tool_result_chars: disabled (no truncation)
+                0, // context_token_budget: disabled
+                None,
+            )
+            .await
+            .expect("agent_turn should complete");
+
+            assert_eq!(invocations.load(Ordering::SeqCst), 1);
+
+            // Check that the full output is preserved somewhere in history
+            // (tool results may appear under different roles depending on the
+            // message format used by run_tool_call_loop).
+            let all_content: String = history
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<&str>>()
+                .join(" ");
+
+            assert!(
+                all_content.contains(&"X".repeat(500)),
+                "full tool result should be preserved somewhere in history when max_tool_result_chars=0, \
+                 history roles: {:?}",
+                history.iter().map(|m| m.role.clone()).collect::<Vec<_>>()
             );
         });
     }
@@ -11413,6 +11874,81 @@ Let me check the result."#;
             agent.resolved.max_tool_iterations, 25,
             "direct agent turns must honor runtime_profiles.*.max_tool_iterations \
              instead of the skipped AliasedAgentConfig::resolved default"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_entrypoints_resolve_runtime_profile_tunables_before_provider_setup() {
+        use zeroclaw_config::providers::RuntimeProfileRef;
+        use zeroclaw_config::schema::{AliasedAgentConfig, RuntimeProfileConfig};
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.runtime_profiles.insert(
+            "entrypoint-profile".to_string(),
+            RuntimeProfileConfig {
+                max_tool_iterations: 3,
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "entrypoint-profile-agent".to_string(),
+            AliasedAgentConfig {
+                runtime_profile: RuntimeProfileRef::new("entrypoint-profile"),
+                ..Default::default()
+            },
+        );
+
+        let seen = Arc::new(Mutex::new(Vec::<(String, usize)>::new()));
+        let seen_for_hook = Arc::clone(&seen);
+        {
+            let mut hook = RESOLVED_AGENT_FOR_TURN_TEST_HOOK
+                .lock()
+                .expect("resolved-agent test hook lock should not be poisoned");
+            *hook = Some(Arc::new(move |alias, max_tool_iterations| {
+                seen_for_hook
+                    .lock()
+                    .expect("seen lock should not be poisoned")
+                    .push((alias.to_string(), max_tool_iterations));
+            }));
+        }
+
+        let _ = super::run(
+            config.clone(),
+            "entrypoint-profile-agent",
+            Some("hello".to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            None,
+            None,
+            super::AgentRunOverrides::default(),
+        )
+        .await;
+        let _ =
+            super::process_message(config, "entrypoint-profile-agent", "hello", Some("session"))
+                .await;
+
+        {
+            let mut hook = RESOLVED_AGENT_FOR_TURN_TEST_HOOK
+                .lock()
+                .expect("resolved-agent test hook lock should not be poisoned");
+            *hook = None;
+        }
+
+        let seen = seen.lock().expect("seen lock should not be poisoned");
+        let matching = seen
+            .iter()
+            .filter(|(alias, max_tool_iterations)| {
+                alias == "entrypoint-profile-agent" && *max_tool_iterations == 3
+            })
+            .count();
+
+        assert_eq!(
+            matching, 2,
+            "run and process_message must both resolve runtime_profiles.*.max_tool_iterations \
+             before provider setup; observed {seen:?}"
         );
     }
 

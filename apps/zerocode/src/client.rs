@@ -14,7 +14,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
-use crate::wire::{ConfigFieldEntry, FsListDirResponse, SectionShape};
+use crate::wire::{ConfigFieldEntry, DoctorRunResult, FsListDirResponse, SectionShape};
 
 // ── Platform local-stream shim ──────────────────────────────────
 
@@ -90,6 +90,7 @@ pub mod method {
     // Dashboard
     pub const STATUS: &str = "status";
     pub const HEALTH: &str = "health";
+    pub const DOCTOR_RUN: &str = "doctor/run";
     pub const COST_QUERY: &str = "cost/query";
     pub const SESSION_LIST: &str = "session/list";
     pub const SESSION_LIST_ACP: &str = "session/list-acp";
@@ -1137,6 +1138,10 @@ impl RpcClient {
         self.call(method::HEALTH, serde_json::json!({})).await
     }
 
+    pub async fn doctor_run(&self) -> Result<DoctorRunResult> {
+        self.call(method::DOCTOR_RUN, serde_json::json!({})).await
+    }
+
     pub async fn cost_query(&self, agent: Option<&str>) -> Result<CostSummaryResult> {
         self.call(method::COST_QUERY, serde_json::json!({ "agent": agent }))
             .await
@@ -1978,8 +1983,6 @@ pub struct TuiListEntry {
 pub struct TuiListResult {
     pub tuis: Vec<TuiListEntry>,
 }
-
-// ── Tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod session_method_tests {

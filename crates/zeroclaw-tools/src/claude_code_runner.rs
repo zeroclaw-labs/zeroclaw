@@ -9,6 +9,13 @@ use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_config::schema::ClaudeCodeRunnerConfig;
 
 /// Environment variables safe to pass through to the `claude` subprocess.
+///
+/// Note: This runner is Unix/WSL-only because it depends on `tmux` for session
+/// management. Windows native execution should use the foreground
+/// [`ClaudeCodeTool`](super::claude_code::ClaudeCodeTool) which handles the
+/// Windows-specific binary resolution and environment allowlist. The
+/// `clean_verbatim_path()` call in this runner is purely path hygiene for
+/// tmux compatibility and does not provide Windows subprocess launch support.
 const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
@@ -225,7 +232,11 @@ impl Tool for ClaudeCodeRunnerTool {
         let create_result = Command::new("tmux")
             .args(["new-session", "-d", "-s", &session_name])
             .arg("-c")
-            .arg(work_dir.to_str().unwrap_or("."))
+            .arg(
+                crate::util_helpers::clean_verbatim_path(&work_dir)
+                    .to_str()
+                    .unwrap_or("."),
+            )
             .output()
             .await;
 

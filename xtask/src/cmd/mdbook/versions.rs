@@ -73,8 +73,7 @@ pub fn is_version_dir(name: &str) -> bool {
     name == "master" || parse_version(name).is_some()
 }
 
-/// Root-level directories that are not version dirs but must survive pruning.
-const ROOT_KEEP_DIRS: &[&str] = &["_shared", ".git"];
+const ROOT_KEEP_DIRS: &[&str] = &["_shared", "api", ".git"];
 
 /// Remove orphaned root *directories* left over from the pre-versioned docs
 /// layout (e.g. top-level `en/`, `fr/`, `api/`). Keeps the shared chrome dir
