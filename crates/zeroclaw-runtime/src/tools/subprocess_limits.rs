@@ -6,7 +6,7 @@ const BYTES_PER_MIB: u64 = 1024 * 1024;
 
 pub(crate) struct MemoryLimitGuard {
     #[cfg(windows)]
-    job: Option<windows::Win32::Foundation::HANDLE>,
+    job: Option<usize>,
 }
 
 impl MemoryLimitGuard {
@@ -23,7 +23,9 @@ impl Drop for MemoryLimitGuard {
     fn drop(&mut self) {
         if let Some(job) = self.job.take() {
             unsafe {
-                let _ = windows::Win32::Foundation::CloseHandle(job);
+                let _ = windows::Win32::Foundation::CloseHandle(
+                    windows::Win32::Foundation::HANDLE(job as _),
+                );
             }
         }
     }
@@ -53,7 +55,7 @@ pub(crate) fn apply_pre_spawn_memory_limit(
                     rlim_cur: limit,
                     rlim_max: limit,
                 };
-                if libc::setrlimit(unix_memory_limit_resource(), &rlimit) != 0 {
+                if libc::setrlimit(libc::RLIMIT_AS as _, &rlimit) != 0 {
                     return Err(io::Error::last_os_error());
                 }
                 Ok(())
@@ -78,7 +80,7 @@ pub(crate) fn apply_post_spawn_memory_limit(
 ) -> io::Result<MemoryLimitGuard> {
     #[cfg(windows)]
     {
-        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::io::RawHandle;
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::System::JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
@@ -96,7 +98,9 @@ pub(crate) fn apply_post_spawn_memory_limit(
             )
         })?;
         let job = unsafe { CreateJobObjectW(None, None) }.map_err(windows_error)?;
-        let guard = MemoryLimitGuard { job: Some(job) };
+        let guard = MemoryLimitGuard {
+            job: Some(job.0 as usize),
+        };
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY;
         info.ProcessMemoryLimit = limit;
@@ -109,7 +113,7 @@ pub(crate) fn apply_post_spawn_memory_limit(
                 std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             )
             .map_err(windows_error)?;
-            AssignProcessToJobObject(job, HANDLE(child.as_raw_handle() as _))
+            AssignProcessToJobObject(job, HANDLE(child.raw_handle() as RawHandle as _))
                 .map_err(windows_error)?;
         }
         return Ok(guard);
@@ -193,11 +197,6 @@ fn memory_limit_bytes(max_memory_mb: u64) -> io::Result<Option<u64>> {
                 "shell_max_memory_mb is too large to convert to bytes",
             )
         })
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn unix_memory_limit_resource() -> libc::c_int {
-    libc::RLIMIT_AS
 }
 
 #[cfg(windows)]
