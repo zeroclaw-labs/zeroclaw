@@ -609,25 +609,67 @@ fn host_architecture() -> Option<&'static str> {
 }
 
 async fn swap_binary(new: &Path, target: &Path) -> Result<()> {
-    // On Linux, a running binary cannot be overwritten in place (ETXTBSY).
-    // Remove the old file first, then copy the new one into the now-free path.
-    // This works because the kernel keeps the inode alive until the process exits.
-    tokio::fs::remove_file(target)
-        .await
-        .context("failed to remove old binary")?;
-    tokio::fs::copy(new, target)
-        .await
-        .context("failed to write new binary")?;
-    Ok(())
+    #[cfg(windows)]
+    {
+        // Windows locks a running process's image file, so we cannot remove-then-copy.
+        // Instead: rename the running exe aside to a PID-unique .old sidecar,
+        // copy the new binary in, and restore on failure.
+        let pid = std::process::id();
+        let sidecar = target.with_extension(format!("{}.old", pid));
+
+        // Rename the running binary aside
+        tokio::fs::rename(target, &sidecar)
+            .await
+            .context("failed to rename running binary (Windows)")?;
+
+        // Copy the new binary into place
+        if let Err(copy_err) = tokio::fs::copy(new, target).await {
+            // Restore the old binary on failure
+            let _ = tokio::fs::rename(&sidecar, target).await;
+            return Err(copy_err).context("failed to copy new binary (Windows)");
+        }
+
+        // Sweep the stale sidecar on next run (best-effort, non-fatal)
+        let _ = tokio::fs::remove_file(&sidecar).await;
+
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    {
+        // On Linux, a running binary cannot be overwritten in place (ETXTBSY).
+        // Remove the old file first, then copy the new one into the now-free path.
+        // This works because the kernel keeps the inode alive until the process exits.
+        tokio::fs::remove_file(target)
+            .await
+            .context("failed to remove old binary")?;
+        tokio::fs::copy(new, target)
+            .await
+            .context("failed to write new binary")?;
+        Ok(())
+    }
 }
 
 async fn rollback_binary(backup: &Path, target: &Path) -> Result<()> {
-    // Remove-then-copy to avoid ETXTBSY if the target is somehow still mapped.
-    let _ = tokio::fs::remove_file(target).await;
-    tokio::fs::copy(backup, target)
-        .await
-        .context("failed to restore backup binary")?;
-    Ok(())
+    #[cfg(windows)]
+    {
+        // Windows: the backup is already in place from the failed swap attempt.
+        // Just ensure the target exists by copying the backup.
+        tokio::fs::copy(backup, target)
+            .await
+            .context("failed to restore backup binary (Windows)")?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    {
+        // Remove-then-copy to avoid ETXTBSY if the target is somehow still mapped.
+        let _ = tokio::fs::remove_file(target).await;
+        tokio::fs::copy(backup, target)
+            .await
+            .context("failed to restore backup binary")?;
+        Ok(())
+    }
 }
 
 async fn smoke_test(binary: &Path) -> Result<()> {
@@ -1244,5 +1286,96 @@ mod tests {
             result.unwrap_err().to_string().contains("does not contain"),
             "should report missing zeroclaw.exe"
         );
+    }
+
+    /// Windows-specific: verify swap_binary renames the running binary aside
+    /// to a PID-unique .old sidecar before copying the new binary.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_windows_swap_binary_with_sidecar() {
+        use std::process::id;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("zeroclaw.exe");
+        let new_binary = tmp.path().join("zeroclaw_new.exe");
+
+        // Create fake old binary
+        std::fs::write(&target, b"old binary").unwrap();
+        // Create fake new binary
+        std::fs::write(&new_binary, b"new binary").unwrap();
+
+        // Run swap
+        swap_binary(&new_binary, &target).await.unwrap();
+
+        // Verify new binary is in place
+        let content = std::fs::read(&target).unwrap();
+        assert_eq!(content, b"new binary");
+
+        // Verify sidecar was cleaned up (best-effort sweep)
+        let sidecar = target.with_extension(format!("{}.old", id()));
+        assert!(!sidecar.exists(), "sidecar should be swept");
+    }
+
+    /// Windows-specific: verify rollback_binary restores the backup.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_windows_rollback_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("zeroclaw.exe");
+        let backup = tmp.path().join("zeroclaw.bak");
+
+        // Create fake backup binary
+        std::fs::write(&backup, b"backup binary").unwrap();
+        // Create fake target (simulating failed swap state)
+        std::fs::write(&target, b"partial new binary").unwrap();
+
+        // Run rollback
+        rollback_binary(&backup, &target).await.unwrap();
+
+        // Verify backup was restored
+        let content = std::fs::read(&target).unwrap();
+        assert_eq!(content, b"backup binary");
+    }
+
+    /// Unix-specific: verify swap_binary removes-then-copies.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_unix_swap_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("zeroclaw");
+        let new_binary = tmp.path().join("zeroclaw_new");
+
+        // Create fake old binary
+        std::fs::write(&target, b"old binary").unwrap();
+        // Create fake new binary
+        std::fs::write(&new_binary, b"new binary").unwrap();
+
+        // Run swap
+        swap_binary(&new_binary, &target).await.unwrap();
+
+        // Verify new binary is in place
+        let content = std::fs::read(&target).unwrap();
+        assert_eq!(content, b"new binary");
+    }
+
+    /// Unix-specific: verify rollback_binary removes-then-copies.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_unix_rollback_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("zeroclaw");
+        let backup = tmp.path().join("zeroclaw.bak");
+
+        // Create fake backup binary
+        std::fs::write(&backup, b"backup binary").unwrap();
+        // Create fake target
+        std::fs::write(&target, b"current binary").unwrap();
+
+        // Run rollback
+        rollback_binary(&backup, &target).await.unwrap();
+
+        // Verify backup was restored
+        let content = std::fs::read(&target).unwrap();
+        assert_eq!(content, b"backup binary");
     }
 }
