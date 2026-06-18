@@ -1599,9 +1599,13 @@ mod tests {
         assert_eq!(missing, None);
 
         // Delete removes the entry.
-        AppSyncStore::delete_mutation_macs(&store, "critical_block", std::slice::from_ref(&index_mac))
-            .await
-            .unwrap();
+        AppSyncStore::delete_mutation_macs(
+            &store,
+            "critical_block",
+            std::slice::from_ref(&index_mac),
+        )
+        .await
+        .unwrap();
         let after_delete = AppSyncStore::get_mutation_mac(&store, "critical_block", &index_mac)
             .await
             .unwrap();
