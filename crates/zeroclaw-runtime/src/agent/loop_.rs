@@ -3092,6 +3092,7 @@ mod tests {
 
     zeroclaw_api::mock_tool_attribution!(
         CountingTool,
+        CredentialOutputTool,
         EmptySuccessTool,
         RecordingArgsTool,
         DelayTool,
@@ -3706,6 +3707,60 @@ mod tests {
         assert!(outcome.success);
         assert_eq!(outcome.output, "(no output)");
         assert!(outcome.error_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_keeps_data_path_raw_and_scrubs_only_observer() {
+        struct CapturingResults {
+            results: std::sync::Mutex<Vec<Option<String>>>,
+        }
+        impl crate::observability::Observer for CapturingResults {
+            fn record_event(&self, event: &crate::observability::ObserverEvent) {
+                if let crate::observability::ObserverEvent::ToolCall { result, .. } = event {
+                    self.results.lock().unwrap().push(result.clone());
+                }
+            }
+            fn record_metric(&self, _metric: &crate::observability::traits::ObserverMetric) {}
+            fn name(&self) -> &str {
+                "capturing-results"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn flush(&self) {}
+        }
+
+        let observer = CapturingResults {
+            results: std::sync::Mutex::new(Vec::new()),
+        };
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(CredentialOutputTool)];
+
+        let outcome = execute_one_tool(
+            "credential_output",
+            serde_json::json!({}),
+            None,
+            &tools,
+            None,
+            &observer,
+            None,
+            None, // receipt_generator
+            None, // event_tx
+        )
+        .await
+        .expect("tool should execute");
+
+        // Data path (fed to the model and HMAC receipts) carries raw bytes.
+        assert_eq!(outcome.output, "api_key = \"sk-live-abcd1234efgh5678\"");
+        assert!(!outcome.output.contains("[REDACTED]"));
+
+        // Observer (human-facing log/dashboard render) is scrubbed.
+        let captured = observer.results.lock().unwrap();
+        let result = captured
+            .first()
+            .and_then(|r| r.as_deref())
+            .expect("observer must receive a tool result");
+        assert!(result.contains("[REDACTED]"));
+        assert!(!result.contains("abcd1234efgh5678"));
     }
     use crate::observability::NoopObserver;
     use tempfile::TempDir;
@@ -4350,6 +4405,37 @@ mod tests {
             Ok(crate::tools::ToolResult {
                 success: true,
                 output: format!("counted:{value}"),
+                error: None,
+            })
+        }
+    }
+
+    struct CredentialOutputTool;
+
+    #[async_trait]
+    impl Tool for CredentialOutputTool {
+        fn name(&self) -> &str {
+            "credential_output"
+        }
+
+        fn description(&self) -> &str {
+            "Returns success with a credential-shaped value in its output"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "api_key = \"sk-live-abcd1234efgh5678\"".to_string(),
                 error: None,
             })
         }
@@ -11631,9 +11717,85 @@ Let me check the result."#;
             !super::eager_mcp_tool_allowed("slack__post", access_policy.as_ref()),
             "policy excluded_tools must block eager MCP registration"
         );
+        // `github__search` is in the caller list AND its `__` prefix triggers
+        // the risk-profile MCP auto-admit, so both independent gates pass it.
         assert!(
-            !super::eager_mcp_tool_allowed("github__search", access_policy.as_ref()),
-            "caller allowlist must compose with SecurityPolicy for run() eager MCP"
+            super::eager_mcp_tool_allowed("github__search", access_policy.as_ref()),
+            "name auto-admitted by risk-profile MCP exception and listed by \
+             the caller must be registered eagerly"
+        );
+    }
+
+    /// PR #7547 review (Audacity88 / singlerider) — second-round blocking:
+    /// the MCP `<server>__<tool>` auto-admit exception must apply only to
+    /// the risk-profile gate. A caller-supplied per-run `allowed_tools`
+    /// list (cron job, narrowed delegate invocation, …) must still narrow
+    /// the visible set strictly, even when the risk-profile auto-admit
+    /// would otherwise pass an MCP name.
+    ///
+    /// Concrete scenario from the review: a cron job narrows
+    /// `allowed_tools = ["cron_add"]`. The risk profile is broader and
+    /// includes `cron_add` (so the cron tool itself survives both gates),
+    /// but the risk-profile MCP exception would happily admit
+    /// `filesystem__write_file` — the caller list does not include it,
+    /// so eager MCP registration must reject it.
+    #[test]
+    fn eager_mcp_policy_caller_per_run_list_does_not_leak_mcp_auto_admit() {
+        // Risk profile is permissive enough that the MCP auto-admit
+        // fires on its own gate (a non-empty list activates the `__`
+        // exception). It also covers `cron_add` so the per-run narrowing
+        // can pin that tool through both gates.
+        let policy = TestPolicy {
+            allowed_tools: Some(vec!["cron_add".into(), "fs__read_file".into()]),
+            ..TestPolicy::default()
+        };
+        // Caller-supplied per-run list narrows to a single non-MCP tool.
+        let caller = vec!["cron_add".to_string()];
+        let access_policy = super::mcp_tool_access_policy(&policy, Some(&caller));
+
+        assert!(
+            super::eager_mcp_tool_allowed("cron_add", access_policy.as_ref()),
+            "explicitly-narrowed tool must be admitted by both gates"
+        );
+        assert!(
+            !super::eager_mcp_tool_allowed("filesystem__write_file", access_policy.as_ref()),
+            "MCP wrapper outside the caller-supplied per-run list must be \
+             rejected — the per-run gate does not honor the risk-profile \
+             MCP auto-admit exception (PR #7547 review regression)"
+        );
+        assert!(
+            !super::eager_mcp_tool_allowed("fs__read_file", access_policy.as_ref()),
+            "even risk-profile-listed MCP names are rejected when the \
+             caller-supplied per-run list does not include them"
+        );
+    }
+
+    /// Same scenario as above, but proving the deferred (`tool_search`)
+    /// path also honors the per-run narrowing. `mcp_allowed_tool_count`
+    /// is what guards the `tool_search` registration: if it returns 0
+    /// the deferred-MCP `tool_search` tool is not even added to the
+    /// agent's tool list, so the LLM cannot ask for the MCP wrapper.
+    #[test]
+    fn deferred_mcp_caller_per_run_list_does_not_leak_mcp_auto_admit() {
+        let policy = TestPolicy {
+            allowed_tools: Some(vec!["cron_add".into(), "fs__read_file".into()]),
+            ..TestPolicy::default()
+        };
+        let caller = vec!["cron_add".to_string()];
+        let access_policy = super::mcp_tool_access_policy(&policy, Some(&caller));
+
+        // The two stubs are MCP-shaped wrappers that the risk-profile
+        // auto-admit would otherwise pass, but the caller-supplied
+        // per-run list does not include either of them.
+        assert_eq!(
+            super::mcp_allowed_tool_count(
+                ["filesystem__write_file", "github__search"],
+                access_policy.as_ref()
+            ),
+            0,
+            "deferred MCP `tool_search` must not be registered when the \
+             caller-supplied per-run list admits no MCP stub (PR #7547 \
+             review regression)"
         );
     }
 
@@ -11649,9 +11811,10 @@ Let me check the result."#;
             super::eager_mcp_tool_allowed("fs__read_file", access_policy.as_ref()),
             "process_message eager MCP should use the agent SecurityPolicy allowlist"
         );
+        // github__search contains "__" → auto-admitted even though not in allowed_tools
         assert!(
-            !super::eager_mcp_tool_allowed("github__search", access_policy.as_ref()),
-            "non-allowlisted eager MCP names must not be registered on process_message"
+            super::eager_mcp_tool_allowed("github__search", access_policy.as_ref()),
+            "runtime-discovered MCP tools are auto-admitted (subject only to excluded_tools)"
         );
     }
 
@@ -11691,12 +11854,14 @@ Let me check the result."#;
             Some(&delegate_handle),
             access_policy.as_ref(),
         ));
-        assert!(!super::register_eager_mcp_tool_if_allowed(
+        // github__search contains "__" → auto-admitted
+        assert!(super::register_eager_mcp_tool_if_allowed(
             mock_tool_arc("github__search"),
             &mut tools,
             Some(&delegate_handle),
             access_policy.as_ref(),
         ));
+        // slack__post is explicitly excluded → denied
         assert!(!super::register_eager_mcp_tool_if_allowed(
             mock_tool_arc("slack__post"),
             &mut tools,
@@ -11704,13 +11869,13 @@ Let me check the result."#;
             access_policy.as_ref(),
         ));
 
-        assert_eq!(tool_names(&tools), vec!["fs__read_file"]);
+        assert_eq!(tool_names(&tools), vec!["fs__read_file", "github__search"]);
         let delegate_names: Vec<String> = delegate_handle
             .read()
             .iter()
             .map(|tool| tool.name().to_string())
             .collect();
-        assert_eq!(delegate_names, vec!["fs__read_file"]);
+        assert_eq!(delegate_names, vec!["fs__read_file", "github__search"]);
     }
 
     // ── agent_provider_composite regression ───────────────────────────────
