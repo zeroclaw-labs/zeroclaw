@@ -258,6 +258,7 @@ mod tests {
         assert!(is_channel_type_compiled("email"));
         assert!(is_channel_type_compiled("webhook"));
         assert!(is_channel_type_compiled("acp-server"));
+        assert!(is_channel_type_compiled("discord"));
         assert_eq!(
             is_channel_type_compiled("nextcloud-talk"),
             cfg!(feature = "channel-nextcloud")

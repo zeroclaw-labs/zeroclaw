@@ -170,6 +170,7 @@ md5 = { version = "0.8", optional = true }
 default = ["default-channels"]
 default-channels = [
   "channel-acp-server",
+  "channel-discord",
   "channel-email",
   "channel-telegram",
   "channel-webhook",

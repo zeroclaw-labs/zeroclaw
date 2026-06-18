@@ -17,7 +17,7 @@ pinned_tag = "default-features-v0.8.0"
 floating_tag = "default-features"
 dockerfile = "Dockerfile"
 flags = ""
-features = "acp-bridge,agent-runtime,channel-acp-server,channel-email,channel-telegram,channel-webhook,gateway,observability-prometheus,schema-export"
+features = "acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-telegram,channel-webhook,gateway,observability-prometheus,schema-export"
 
 [[tags]]
 stem = "dist"

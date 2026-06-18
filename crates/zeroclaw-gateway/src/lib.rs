@@ -13,6 +13,7 @@
 //! - Header sanitization (handled by axum/hyper)
 
 pub mod acp;
+pub mod agent_owned_state;
 pub mod api;
 pub mod api_browse;
 pub mod api_config;
@@ -594,7 +595,7 @@ pub async fn run_gateway(
         None
     };
 
-    let addr: SocketAddr = match format!("{host}:{port}").parse() {
+    let addr: SocketAddr = match zeroclaw_infra::parse_gateway_bind_socket_addr(host, port) {
         Ok(a) => a,
         Err(e) => {
             ::zeroclaw_log::record!(
@@ -610,7 +611,7 @@ pub async fn run_gateway(
                  127.0.0.1 so the gateway can still boot. Fix [gateway] host and \
                  POST /admin/reload."
             );
-            SocketAddr::from(([127, 0, 0, 1], port))
+            zeroclaw_infra::fallback_gateway_bind_socket_addr(port)
         }
     };
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -1381,15 +1382,9 @@ pub async fn run_gateway(
         println!("     └──────────────┘");
         println!("     Send: POST {pfx}/pair with header X-Pairing-Code: {code}");
     } else if pairing.require_pairing() {
-        println!("  🔒 Pairing: ACTIVE (bearer token required)");
-        println!(
-            "     To pair a new device: {}",
-            format_paircode_recovery_command(host, actual_port)
-        );
-        println!(
-            "     Fallback: {}",
-            format_paircode_recovery_curl(host, actual_port, pfx)
-        );
+        for line in already_paired_pairing_notice(host, actual_port, pfx) {
+            println!("{line}");
+        }
         println!();
     } else {
         println!("  ⚠️  Pairing: DISABLED (all requests accepted)");
@@ -1954,6 +1949,36 @@ fn format_paircode_recovery_command(_host: &str, port: u16) -> String {
     format!("zeroclaw gateway get-paircode --new --port {port}")
 }
 
+/// Startup-banner lines for the "pairing required, but no code exists because
+/// the gateway is already paired" state.
+///
+/// By design a fresh one-time code is NOT minted on restart once paired (see
+/// [`zeroclaw_config::pairing::PairingGuard::new`]) — that would reopen a
+/// standing, brute-forceable pairing window. The earlier banner ("Pairing:
+/// ACTIVE (bearer token required)") never said a code was *absent*, so an
+/// operator opening the dashboard hit a 6-digit prompt with no code printed
+/// anywhere and no in-band way out (#5266). This notice states the absence
+/// plainly and points at the commands that mint a code on demand.
+///
+/// Returned as lines (rather than printed inline in `run_gateway`) so the
+/// wording is the single, unit-tested source of truth and can be reused by any
+/// other operator-facing surface.
+fn already_paired_pairing_notice(host: &str, port: u16, path_prefix: &str) -> Vec<String> {
+    vec![
+        "  🔒 Pairing: ACTIVE — this gateway is already paired, so no new \
+         one-time code was generated on this start."
+            .to_string(),
+        format!(
+            "     To pair another device, run: {}",
+            format_paircode_recovery_command(host, port)
+        ),
+        format!(
+            "     Fallback (localhost only): {}",
+            format_paircode_recovery_curl(host, port, path_prefix)
+        ),
+    ]
+}
+
 fn format_paircode_recovery_curl(host: &str, port: u16, path_prefix: &str) -> String {
     // Admin paircode routes are localhost-only, so the curl fallback must point
     // at loopback. Bind-only hosts and non-loopback advertised hosts are
@@ -2163,7 +2188,7 @@ pub(crate) async fn persist_pairing_tokens(
 }
 
 /// Result of a gateway chat turn. Carries the response text plus per-turn
-/// token / cost totals captured from the cost-tracking scope (when present)
+/// token / cost totals collected from `TOOL_LOOP_TURN_USAGE` (when scoped)
 /// so callers can populate observer-event annotations without racing
 /// concurrent webhook traffic that shares the same `CostTracker`.
 struct GatewayChatOutcome {
@@ -2285,50 +2310,42 @@ async fn run_gateway_chat_with_tools(
         let config = state.config.read().clone();
         let agent_alias = require_gateway_chat_agent_alias(&config, agent_override)?;
 
-        // Scope the cost tracking context so per-LLM-call usage flows into the
-        // gateway's cost tracker and costs.jsonl. Without this scope, the
-        // tracker exists on AppState but never receives any records from the
-        // runtime tool loop. The context's per-scope `turn_usage` accumulator
-        // also lets us read out this turn's tokens / cost after the scope
-        // exits without racing concurrent webhook traffic that shares the
-        // same tracker. Pricing comes from the V3 per-provider shape
-        // (`config.providers.models[*][*].pricing`), keyed as
-        // `<type>.<alias>` to match how the channels orchestrator builds
-        // its `ModelProviderPricing`.
+        // Scope the cost tracking context so per-LLM-call usage flows into
+        // the gateway's cost tracker and costs.jsonl. A separate
+        // `TOOL_LOOP_TURN_USAGE` task-local accumulates this turn's totals
+        // so callers can read the per-turn cost without racing concurrent
+        // requests sharing the same tracker. Pricing is built from the
+        // unified `build_model_provider_pricing` (alias-keyed, `cost.rates`
+        // wins over legacy per-alias pricing).
         let cost_tracking_context = state.cost_tracker.as_ref().map(|tracker| {
-            let pricing: zeroclaw_runtime::agent::cost::ModelProviderPricing = config
-                .providers
-                .models
-                .iter_entries()
-                .filter(|(_, _, base)| !base.pricing.is_empty())
-                .map(|(type_k, alias_k, base)| {
-                    (format!("{type_k}.{alias_k}"), base.pricing.clone())
-                })
-                .collect();
+            let pricing = zeroclaw_runtime::agent::cost::build_model_provider_pricing(&config);
             zeroclaw_runtime::agent::cost::ToolLoopCostTrackingContext::new(
                 tracker.clone(),
                 std::sync::Arc::new(pricing),
             )
             .with_agent_alias(&agent_alias)
         });
-        let captured_usage = cost_tracking_context
-            .as_ref()
-            .map(|ctx| ctx.turn_usage.clone());
-        let response = Box::pin(
+        let turn_usage = state.cost_tracker.as_ref().map(|_| {
+            std::sync::Arc::new(parking_lot::Mutex::new(
+                zeroclaw_runtime::agent::cost::TurnUsage::default(),
+            ))
+        });
+        let response = Box::pin(zeroclaw_runtime::agent::cost::TOOL_LOOP_TURN_USAGE.scope(
+            turn_usage.clone(),
             zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 cost_tracking_context,
                 zeroclaw_runtime::agent::process_message(config, &agent_alias, message, session_id),
             ),
-        )
+        ))
         .await?;
-        let usage = captured_usage
+        let usage = turn_usage
             .map(|cell| *cell.lock())
-            .filter(|u| u.input_tokens > 0 || u.output_tokens > 0);
+            .filter(|usage| usage.input_tokens > 0 || usage.output_tokens > 0);
         let (input_tokens, output_tokens, cost_usd) = match usage {
-            Some(u) => (
-                Some(u.input_tokens),
-                Some(u.output_tokens),
-                Some(u.cost_usd),
+            Some(usage) => (
+                Some(usage.input_tokens),
+                Some(usage.output_tokens),
+                Some(usage.cost_usd),
             ),
             None => (None, None, None),
         };
@@ -4186,6 +4203,45 @@ mod tests {
     }
 
     #[test]
+    fn already_paired_notice_states_no_code_was_generated() {
+        // Regression for #5266: the banner must say plainly that NO code exists
+        // (already paired), not just "Pairing: ACTIVE" — otherwise the operator
+        // hits the dashboard's 6-digit prompt with no code printed anywhere.
+        let lines = already_paired_pairing_notice("127.0.0.1", 3001, "");
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("already paired"),
+            "notice must say the gateway is already paired: {joined}"
+        );
+        assert!(
+            joined.contains("no new") && joined.contains("code"),
+            "notice must state that no new code was generated: {joined}"
+        );
+    }
+
+    #[test]
+    fn already_paired_notice_includes_recovery_command_and_curl() {
+        // The notice is the single source of truth for the on-demand recovery
+        // commands; it must reuse the loopback-safe builders so the banner and
+        // any future surface never drift from #6561's no-`--host` rule.
+        let lines = already_paired_pairing_notice("192.168.1.20", 3001, "/gw");
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains(&format_paircode_recovery_command("192.168.1.20", 3001)),
+            "notice must surface the get-paircode recovery command: {joined}"
+        );
+        assert!(
+            joined.contains(&format_paircode_recovery_curl("192.168.1.20", 3001, "/gw")),
+            "notice must surface the curl fallback (honoring the path prefix): {joined}"
+        );
+        // #6561: never advertise the non-loopback bound host in the hint.
+        assert!(
+            !joined.contains("192.168.1.20"),
+            "notice must not advertise the non-loopback bound host: {joined}"
+        );
+    }
+
+    #[test]
     fn paircode_recovery_curl_normalizes_unspecified_bind_hosts() {
         assert_eq!(
             format_paircode_recovery_curl("0.0.0.0", 42617, ""),
@@ -4497,6 +4553,31 @@ mod tests {
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["success"], false);
+    }
+
+    /// The on-demand mint endpoint is the recovery path advertised to operators
+    /// (banner + dashboard "Generate pairing code" button) for the already-paired
+    /// state in #5266. It MUST stay localhost-only: a remote peer minting a code
+    /// would reopen the brute-forceable pairing window the design deliberately
+    /// closes once paired. The dashboard relies on this 403 to fall back to the
+    /// CLI hint for non-loopback origins.
+    #[tokio::test]
+    async fn admin_paircode_new_rejects_remote_peer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+
+        let remote = ConnectInfo(SocketAddr::from(([203, 0, 113, 7], 40_000)));
+        let (status, _json) = admin_paircode_response_json(
+            handle_admin_paircode_new(State(state), remote, Query(AdminPaircodeQuery::default()))
+                .await,
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "minting a pairing code must be rejected for non-loopback peers"
+        );
     }
 
     #[test]
