@@ -635,6 +635,11 @@ pub struct LarkChannel {
     /// [`Self::with_per_user_session`] from
     /// `[channels.lark.<alias>].per_user_session`.
     per_user_session: bool,
+    /// Whether to add acknowledgement reactions (👀, ✅, ⚠️) to incoming
+    /// messages. Set by the orchestrator from the per-channel
+    /// `[channels.lark.<alias>].ack_reactions` override, falling back to
+    /// `[channels].ack_reactions`. Default `true`.
+    ack_reactions: bool,
     /// Cache of `(message_id, unicode_emoji) -> reaction_id` populated by
     /// `add_reaction` so a subsequent `remove_reaction` call can issue
     /// `DELETE /im/v1/messages/{message_id}/reactions/{reaction_id}`
@@ -725,6 +730,7 @@ impl LarkChannel {
             pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             approval_timeout_secs: 120,
             per_user_session: false,
+            ack_reactions: true,
             reaction_ids: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: 1000,
@@ -774,6 +780,16 @@ impl LarkChannel {
     /// Set by the orchestrator from `[channels.lark.<alias>].per_user_session`.
     pub fn with_per_user_session(mut self, enabled: bool) -> Self {
         self.per_user_session = enabled;
+        self
+    }
+
+    /// Override the resolved `ack_reactions` value for this Lark/Feishu
+    /// instance. The orchestrator computes
+    /// `lk.ack_reactions.unwrap_or(config.channels.ack_reactions)` and passes
+    /// the result here. When `false`, no emoji reactions (👀 on receipt,
+    /// ✅/⚠️ on completion) are posted to incoming messages.
+    pub fn with_ack_reactions(mut self, enabled: bool) -> Self {
+        self.ack_reactions = enabled;
         self
     }
 
@@ -1318,6 +1334,11 @@ impl LarkChannel {
                     // pipeline (which can take several seconds before the generic
                     // Channel::add_reaction call would otherwise fire).
                     //
+                    // Gated by `self.ack_reactions` — when the per-channel or
+                    // global `[channels].ack_reactions` is `false`, this fast-ack
+                    // is skipped. The later generic orchestrator call also checks
+                    // `ctx.ack_reactions` and will be a no-op when disabled.
+                    //
                     // CRITICAL: this spawn MUST go through the trait
                     // `Channel::add_reaction` so that Feishu's returned
                     // reaction_id is written into the shared `reaction_ids`
@@ -1331,17 +1352,18 @@ impl LarkChannel {
                     // beside the completion marker. See lifecycle regression
                     // tests `lark_inbound_ack_lifecycle_*` and
                     // `lark_fast_ack_and_generic_path_dedupe_on_cache_hit`.
-                    let reaction_channel = self.clone();
-                    let reaction_message_id = lark_msg.message_id.clone();
-                    let reaction_reply_target = lark_msg.chat_id.clone();
-                    zeroclaw_spawn::spawn!(async move {
-                        if let Err(e) = <LarkChannel as Channel>::add_reaction(
-                            &reaction_channel,
-                            &reaction_reply_target,
-                            &reaction_message_id,
-                            "\u{1F440}",
-                        )
-                        .await
+                    if self.ack_reactions {
+                        let reaction_channel = self.clone();
+                        let reaction_message_id = lark_msg.message_id.clone();
+                        let reaction_reply_target = lark_msg.chat_id.clone();
+                        zeroclaw_spawn::spawn!(async move {
+                            if let Err(e) = <LarkChannel as Channel>::add_reaction(
+                                &reaction_channel,
+                                &reaction_reply_target,
+                                &reaction_message_id,
+                                "\u{1F440}",
+                            )
+                            .await
                         {
                             ::zeroclaw_log::record!(
                                 DEBUG,
@@ -1358,6 +1380,7 @@ impl LarkChannel {
                             );
                         }
                     });
+                    } // if self.ack_reactions
 
                     let channel_msg = ChannelMessage {
                         id: lark_msg.message_id.clone(),
@@ -2388,6 +2411,14 @@ impl Channel for LarkChannel {
         message_id: &str,
         emoji: &str,
     ) -> anyhow::Result<()> {
+        // When the per-channel or global `[channels].ack_reactions` is
+        // `false`, all reaction paths (Lark-local fast-ack spawns in
+        // `listen_ws` / `listen_http` and the generic orchestrator
+        // add_reaction / remove_reaction calls) become no-ops.
+        if !self.ack_reactions {
+            return Ok(());
+        }
+
         if message_id.is_empty() {
             return Ok(());
         }
@@ -2509,6 +2540,12 @@ impl Channel for LarkChannel {
         message_id: &str,
         emoji: &str,
     ) -> anyhow::Result<()> {
+        // When the per-channel or global `[channels].ack_reactions` is
+        // `false`, all reaction paths become no-ops.
+        if !self.ack_reactions {
+            return Ok(());
+        }
+
         if message_id.is_empty() {
             return Ok(());
         }
@@ -3341,7 +3378,9 @@ impl LarkChannel {
 
             // Parse event messages first; then issue an inbound fast-ack via
             // the same trait-level Channel::add_reaction path that the generic
-            // orchestrator uses. The trait impl writes Feishu's returned
+            // orchestrator uses. The trait impl checks `self.ack_reactions`
+            // first — when disabled this spawn is skipped entirely to avoid
+            // unnecessary work. The trait impl writes Feishu's returned
             // reaction_id into the shared reaction_ids cache and dedupes
             // subsequent duplicate POSTs via a cache-hit fast-path, so the
             // later generic orchestrator add_reaction("👀") call becomes a
@@ -3350,6 +3389,7 @@ impl LarkChannel {
             // `lark_fast_ack_and_generic_path_dedupe_on_cache_hit` test.
             let messages = state.channel.parse_event_payload_async(&payload).await;
             if !messages.is_empty()
+                && state.channel.ack_reactions
                 && let Some(message_id) = payload
                     .pointer("/event/message/message_id")
                     .and_then(|m| m.as_str())
@@ -4300,6 +4340,7 @@ mod tests {
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
+            ack_reactions: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
         };
@@ -4327,6 +4368,7 @@ mod tests {
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
+            ack_reactions: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
         };
@@ -4365,6 +4407,7 @@ mod tests {
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
+            ack_reactions: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
         };
@@ -4395,6 +4438,7 @@ mod tests {
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
+            ack_reactions: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
         };
@@ -4425,6 +4469,7 @@ mod tests {
             excluded_tools: vec![],
             approval_timeout_secs: 456,
             per_user_session: false,
+            ack_reactions: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
         };
@@ -4744,6 +4789,7 @@ mod tests {
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
+            ack_reactions: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
         };

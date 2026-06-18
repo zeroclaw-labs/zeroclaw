@@ -5,6 +5,7 @@
 //! `--features browser-native` and selected through config.
 //! Computer-use (OS-level) actions are supported via an optional sidecar endpoint.
 
+use crate::helpers::domain_guard;
 use anyhow::Context;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -232,7 +233,10 @@ impl BrowserTool {
     ) -> anyhow::Result<Self> {
         Ok(Self {
             security,
-            allowed_domains: normalize_allowed_domains(allowed_domains)?,
+            allowed_domains: domain_guard::normalize_allowed_domains(
+                allowed_domains,
+                "browser.allowed_domains",
+            )?,
             session_name,
             backend,
             headed,
@@ -328,7 +332,7 @@ impl BrowserTool {
             anyhow::Error::msg("browser.computer_use.endpoint must include host")
         })?;
 
-        let host_is_private = is_private_host(host);
+        let host_is_private = domain_guard::is_private_or_local_host(host);
         if !self.computer_use.allow_remote_endpoint && !host_is_private {
             anyhow::bail!(
                 "browser.computer_use.endpoint host '{host}' is public. Set browser.computer_use.allow_remote_endpoint=true to allow it"
@@ -454,11 +458,11 @@ impl BrowserTool {
 
         let host = extract_host(url)?;
 
-        if is_private_host(&host) {
+        if domain_guard::is_private_or_local_host(&host) {
             anyhow::bail!("Blocked local/private host: {host}");
         }
 
-        if !host_matches_allowlist(&host, &self.allowed_domains) {
+        if !domain_guard::host_matches_allowlist(&host, &self.allowed_domains) {
             anyhow::bail!("Host '{host}' not in browser.allowed_domains");
         }
 
@@ -2191,68 +2195,6 @@ fn is_recoverable_rust_native_error(err: &anyhow::Error) -> bool {
     message.contains("webdriver") && (message.contains("timed out") || message.contains("timeout"))
 }
 
-fn normalize_allowed_domains(domains: Vec<String>) -> anyhow::Result<Vec<String>> {
-    let mut rejected = Vec::new();
-    let mut normalized = domains
-        .into_iter()
-        .filter_map(|d| {
-            normalize_domain(&d).or_else(|| {
-                rejected.push(d.clone());
-                None
-            })
-        })
-        .collect::<Vec<_>>();
-    if !rejected.is_empty() {
-        anyhow::bail!(
-            "Invalid browser.allowed_domains entry(s): [{}]. Each entry must be a valid domain, hostname, IPv4, or IPv6 address.",
-            rejected.join(", ")
-        );
-    }
-    normalized.sort_unstable();
-    normalized.dedup();
-    Ok(normalized)
-}
-
-fn normalize_domain(raw: &str) -> Option<String> {
-    let input = raw.trim();
-    if input.is_empty() || input.chars().any(char::is_whitespace) {
-        return None;
-    }
-
-    let bare_ip = match (input.starts_with('['), input.ends_with(']')) {
-        (true, true) => &input[1..input.len() - 1],
-        (false, false) => input,
-        _ => return None,
-    };
-    if let Ok(ip) = bare_ip.parse::<std::net::IpAddr>() {
-        return Some(ip.to_string().to_lowercase());
-    }
-
-    let parsed = reqwest::Url::parse(input)
-        .or_else(|_| reqwest::Url::parse(&format!("https://{input}")))
-        .ok()?;
-
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return None;
-    }
-
-    let host = parsed.host_str()?;
-    let trimmed = host.trim();
-    let host_no_brackets = match (trimmed.starts_with('['), trimmed.ends_with(']')) {
-        (true, true) => &trimmed[1..trimmed.len() - 1],
-        (false, false) => trimmed,
-        _ => return None,
-    };
-    let normalized = host_no_brackets
-        .trim_start_matches('.')
-        .trim_end_matches('.');
-    if normalized.is_empty() {
-        return None;
-    }
-
-    Some(normalized.to_lowercase())
-}
-
 fn endpoint_reachable(endpoint: &reqwest::Url, timeout: Duration) -> bool {
     let host = match endpoint.host_str() {
         Some(host) if !host.is_empty() => host,
@@ -2304,72 +2246,6 @@ fn extract_host(url_str: &str) -> anyhow::Result<String> {
     Ok(host.to_lowercase())
 }
 
-fn is_private_host(host: &str) -> bool {
-    // Strip brackets from IPv6 addresses like [::1]
-    let bare = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-
-    if bare == "localhost" || bare.ends_with(".localhost") {
-        return true;
-    }
-
-    // .local TLD (mDNS)
-    if bare
-        .rsplit('.')
-        .next()
-        .is_some_and(|label| label == "local")
-    {
-        return true;
-    }
-
-    // Parse as IP address to catch all representations (decimal, hex, octal, mapped)
-    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
-        return match ip {
-            std::net::IpAddr::V4(v4) => is_non_global_v4(v4),
-            std::net::IpAddr::V6(v6) => is_non_global_v6(v6),
-        };
-    }
-
-    false
-}
-
-/// Returns `true` for any IPv4 address that is not globally routable.
-fn is_non_global_v4(v4: std::net::Ipv4Addr) -> bool {
-    let [a, b, _, _] = v4.octets();
-    v4.is_loopback()
-        || v4.is_private()
-        || v4.is_link_local()
-        || v4.is_unspecified()
-        || v4.is_broadcast()
-        || v4.is_multicast()
-        // Shared address space (100.64/10)
-        || (a == 100 && (64..=127).contains(&b))
-        // Reserved (240.0.0.0/4)
-        || a >= 240
-        // Documentation (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24)
-        || (a == 192 && b == 0)
-        || (a == 198 && b == 51)
-        || (a == 203 && b == 0)
-        // Benchmarking (198.18.0.0/15)
-        || (a == 198 && (18..=19).contains(&b))
-}
-
-/// Returns `true` for any IPv6 address that is not globally routable.
-fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
-    let segs = v6.segments();
-    v6.is_loopback()
-        || v6.is_unspecified()
-        || v6.is_multicast()
-        // Unique-local (fc00::/7) — IPv6 equivalent of RFC 1918
-        || (segs[0] & 0xfe00) == 0xfc00
-        // Link-local (fe80::/10)
-        || (segs[0] & 0xffc0) == 0xfe80
-        // IPv4-mapped addresses
-        || v6.to_ipv4_mapped().is_some_and(is_non_global_v4)
-}
-
 /// Detect whether the current process is running inside a service environment
 /// (e.g. systemd, OpenRC, or launchd) where the browser sandbox and
 /// environment setup may be restricted.
@@ -2408,55 +2284,9 @@ fn ensure_browser_env(cmd: &mut Command) {
     }
 }
 
-fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {
-    allowed.iter().any(|pattern| {
-        if pattern == "*" {
-            return true;
-        }
-        if pattern.starts_with("*.") {
-            // Wildcard subdomain match
-            let suffix = &pattern[1..]; // ".example.com"
-            host.ends_with(suffix) || host == &pattern[2..]
-        } else {
-            // Exact match or subdomain
-            host == pattern || host.ends_with(&format!(".{pattern}"))
-        }
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn normalize_allowed_domains_works() {
-        let domains = vec![
-            "  Example.COM  ".into(),
-            "docs.example.com".into(),
-            "example.com".into(),
-        ];
-        let normalized = normalize_allowed_domains(domains).unwrap();
-        assert_eq!(normalized, vec!["docs.example.com", "example.com"]);
-    }
-
-    #[test]
-    fn normalize_allowed_domains_rejects_invalid() {
-        let err =
-            normalize_allowed_domains(vec!["".into(), "  ".into(), "user@example.com".into()])
-                .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("Invalid browser.allowed_domains entry")
-        );
-    }
-
-    #[test]
-    fn normalize_domain_rejects_unmatched_brackets() {
-        assert!(normalize_domain("[::1").is_none());
-        assert!(normalize_domain("::1]").is_none());
-        assert!(normalize_domain("[127.0.0.1").is_none());
-        assert!(normalize_domain("127.0.0.1]").is_none());
-    }
 
     #[test]
     fn extract_host_works() {
@@ -2484,56 +2314,6 @@ mod tests {
     }
 
     #[test]
-    fn is_private_host_detects_local() {
-        assert!(is_private_host("localhost"));
-        assert!(is_private_host("app.localhost"));
-        assert!(is_private_host("printer.local"));
-        assert!(is_private_host("127.0.0.1"));
-        assert!(is_private_host("192.168.1.1"));
-        assert!(is_private_host("10.0.0.1"));
-        assert!(!is_private_host("example.com"));
-        assert!(!is_private_host("google.com"));
-    }
-
-    #[test]
-    fn is_private_host_blocks_multicast_and_reserved() {
-        assert!(is_private_host("224.0.0.1")); // multicast
-        assert!(is_private_host("255.255.255.255")); // broadcast
-        assert!(is_private_host("100.64.0.1")); // shared address space
-        assert!(is_private_host("240.0.0.1")); // reserved
-        assert!(is_private_host("192.0.2.1")); // documentation
-        assert!(is_private_host("198.51.100.1")); // documentation
-        assert!(is_private_host("203.0.113.1")); // documentation
-        assert!(is_private_host("198.18.0.1")); // benchmarking
-    }
-
-    #[test]
-    fn is_private_host_catches_ipv6() {
-        assert!(is_private_host("::1"));
-        assert!(is_private_host("[::1]"));
-        assert!(is_private_host("0.0.0.0"));
-    }
-
-    #[test]
-    fn is_private_host_catches_mapped_ipv4() {
-        // IPv4-mapped IPv6 addresses
-        assert!(is_private_host("::ffff:127.0.0.1"));
-        assert!(is_private_host("::ffff:10.0.0.1"));
-        assert!(is_private_host("::ffff:192.168.1.1"));
-    }
-
-    #[test]
-    fn is_private_host_catches_ipv6_private_ranges() {
-        // Unique-local (fc00::/7)
-        assert!(is_private_host("fd00::1"));
-        assert!(is_private_host("fc00::1"));
-        // Link-local (fe80::/10)
-        assert!(is_private_host("fe80::1"));
-        // Public IPv6 should pass
-        assert!(!is_private_host("2001:db8::1"));
-    }
-
-    #[test]
     fn validate_url_blocks_ipv6_ssrf() {
         let security = Arc::new(SecurityPolicy::default());
         let tool = BrowserTool::new(security, vec!["*".into()], None).unwrap();
@@ -2543,29 +2323,6 @@ mod tests {
             tool.validate_url("https://[::ffff:10.0.0.1]:8080/")
                 .is_err()
         );
-    }
-
-    #[test]
-    fn host_matches_allowlist_exact() {
-        let allowed = vec!["example.com".into()];
-        assert!(host_matches_allowlist("example.com", &allowed));
-        assert!(host_matches_allowlist("sub.example.com", &allowed));
-        assert!(!host_matches_allowlist("notexample.com", &allowed));
-    }
-
-    #[test]
-    fn host_matches_allowlist_wildcard() {
-        let allowed = vec!["*.example.com".into()];
-        assert!(host_matches_allowlist("sub.example.com", &allowed));
-        assert!(host_matches_allowlist("example.com", &allowed));
-        assert!(!host_matches_allowlist("other.com", &allowed));
-    }
-
-    #[test]
-    fn host_matches_allowlist_star() {
-        let allowed = vec!["*".into()];
-        assert!(host_matches_allowlist("anything.com", &allowed));
-        assert!(host_matches_allowlist("example.org", &allowed));
     }
 
     #[test]

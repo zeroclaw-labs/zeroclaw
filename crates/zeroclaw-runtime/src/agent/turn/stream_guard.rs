@@ -1,4 +1,4 @@
-//! Streaming-text guards: protocol-fragment buffering and <think> tag stripping.
+//! Streaming-text guards: protocol-fragment buffering and `<think>` tag stripping.
 
 use super::protocol_detect::{
     complete_json_fence_protocol_state, complete_non_protocol_json,
