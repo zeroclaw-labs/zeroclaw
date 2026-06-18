@@ -29,6 +29,10 @@ pub struct AppState {
     pub alias: String,
     /// Realtime bridge config for calls; `None` uses Inkbox STT/TTS.
     pub realtime: Option<super::realtime::RealtimeConfig>,
+    /// Inkbox client + identity handle, for the realtime bridge to resolve the
+    /// agent's own identity (so the model speaks as ZeroClaw with real contacts).
+    pub inkbox: std::sync::Arc<inkbox::Inkbox>,
+    pub identity: String,
 }
 
 /// Build the loopback router: the call-media WebSocket on its fixed path, and

@@ -71,23 +71,55 @@ pub async fn ws_handler(
         // Outbound calls carry a `context_token` written by `inkbox_place_call`;
         // it resolves the purpose/opening to inject. Inbound calls have none.
         let meta = super::realtime::load_call_meta(params.get("context_token").map(String::as_str));
-        let tx = state.tx.clone();
-        let alias = state.alias.clone();
-        let mut resp = ws
-            .on_upgrade(move |socket| {
-                super::realtime::run_realtime_bridge(socket, rt, meta, tx, alias)
-            })
-            .into_response();
-        let headers = resp.headers_mut();
-        headers.insert(
-            HeaderName::from_static("x-use-inkbox-speech-to-text"),
-            HeaderValue::from_static("false"),
-        );
-        headers.insert(
-            HeaderName::from_static("x-use-inkbox-text-to-speech"),
-            HeaderValue::from_static("false"),
-        );
-        return resp;
+        // Pre-flight the OpenAI connection so `realtime_fallback` can drop to
+        // Inkbox STT/TTS when the model is unreachable, instead of a dead call.
+        match super::realtime::connect_openai(&rt).await {
+            Ok(openai) => {
+                let tx = state.tx.clone();
+                let alias = state.alias.clone();
+                let client = state.inkbox.clone();
+                let identity = state.identity.clone();
+                let mut resp = ws
+                    .on_upgrade(move |socket| {
+                        super::realtime::run_realtime_bridge(
+                            socket, openai, rt, meta, tx, alias, client, identity,
+                        )
+                    })
+                    .into_response();
+                let headers = resp.headers_mut();
+                headers.insert(
+                    HeaderName::from_static("x-use-inkbox-speech-to-text"),
+                    HeaderValue::from_static("false"),
+                );
+                headers.insert(
+                    HeaderName::from_static("x-use-inkbox-text-to-speech"),
+                    HeaderValue::from_static("false"),
+                );
+                return resp;
+            }
+            Err(e) if rt.fallback => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    format!("[inkbox] realtime connect failed; falling back to Inkbox STT/TTS: {e}"),
+                );
+                // fall through to the STT/TTS path below
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    format!("[inkbox] realtime connect failed and fallback disabled: {e}"),
+                );
+                return (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "realtime bridge unavailable",
+                )
+                    .into_response();
+            }
+        }
     }
 
     let mut resp = ws.on_upgrade(move |socket| bridge(socket, state)).into_response();

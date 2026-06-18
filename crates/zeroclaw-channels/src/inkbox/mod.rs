@@ -275,6 +275,8 @@ impl Channel for InkboxChannel {
             signing_key: self.signing_key.clone(),
             alias: self.alias.clone(),
             realtime: self.realtime.clone(),
+            inkbox: self.inkbox.clone(),
+            identity: self.identity.clone(),
         });
         let server = tokio::spawn(async move { axum::serve(listener, app).await });
 

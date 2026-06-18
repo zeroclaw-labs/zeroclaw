@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -42,6 +43,8 @@ pub struct RealtimeConfig {
     pub model: String,
     /// Voice (e.g. `cedar`).
     pub voice: String,
+    /// Fall back to Inkbox STT/TTS if the realtime bridge can't connect.
+    pub fallback: bool,
 }
 
 impl RealtimeConfig {
@@ -62,6 +65,11 @@ pub struct CallMeta {
     pub purpose: Option<String>,
     /// Outbound opening line to say verbatim, when set.
     pub opening: Option<String>,
+    /// Our own agent identity (resolved at call start) so the model speaks as
+    /// ZeroClaw with the right contact details.
+    pub agent_handle: String,
+    pub agent_email: Option<String>,
+    pub agent_phone: Option<String>,
 }
 
 const OPENAI_REALTIME_URL: &str = "wss://api.openai.com/v1/realtime";
@@ -119,6 +127,7 @@ pub(super) fn load_call_meta(context_token: Option<&str>) -> CallMeta {
                 contact_name: None,
                 purpose: pick("purpose"),
                 opening: pick("opening_message"),
+                ..Default::default()
             }
         }
         // Token present but file gone: still an outbound call, just no context.
@@ -131,26 +140,49 @@ pub(super) fn load_call_meta(context_token: Option<&str>) -> CallMeta {
 // ── instructions / greeting / session ──────────────────────────────────────
 
 fn build_instructions(meta: &CallMeta) -> String {
-    let who = meta.contact_name.as_deref().unwrap_or("the caller");
+    let name = if meta.agent_handle.is_empty() {
+        "ZeroClaw".to_string()
+    } else {
+        format!("ZeroClaw (agent handle \"{}\")", meta.agent_handle)
+    };
     let mut s = format!(
-        "You are a helpful voice assistant on a live phone call with {who}. Speak \
-         naturally and concisely, one short turn at a time — this is spoken audio, \
-         no markdown, no monologues. Direction: {dir}.\n\n\
-         Tools:\n\
-         - Use `agent_consult` whenever the caller needs current data, memory, or a \
-         tool action (look up an email/text, check a contact, send something). It \
-         pauses the call, asks the main agent, and returns a spoken-friendly answer \
-         to read back. Do NOT use it for greetings or small talk.\n\
-         - Use `register_post_call_action` to queue follow-up work for after the call \
-         (send an email/SMS, save a note). Tell the caller it's queued; don't claim \
-         it's done. `edit_post_call_action` / `delete_post_call_action` adjust the queue.\n\
-         - Use `hang_up_call` only when the caller says goodbye or is done: the FIRST \
-         call prompts you to say a brief goodbye; call it AGAIN to actually end.",
-        dir = if meta.direction.is_empty() { "inbound" } else { &meta.direction }
+        "You are {name}, an AI assistant, on a live phone call. You ARE the assistant the caller \
+         is talking to — always speak in the first person. Never refer to yourself in the third \
+         person, and never say you'll \"ask the main agent\", \"check with the team\", or \"the \
+         backend\": you do the work yourself.\n"
     );
-    if let Some(p) = meta.purpose.as_deref().filter(|p| !p.is_empty()) {
-        s.push_str(&format!("\n\nReason for this call: {p}"));
+    let mut id_bits = Vec::new();
+    if let Some(e) = meta.agent_email.as_deref().filter(|e| !e.is_empty()) {
+        id_bits.push(format!("your email address is {e}"));
     }
+    if let Some(p) = meta.agent_phone.as_deref().filter(|p| !p.is_empty()) {
+        id_bits.push(format!("your phone number is {p}"));
+    }
+    if !id_bits.is_empty() {
+        s.push_str(&format!("Your identity: {}.\n", id_bits.join("; ")));
+    }
+    let who = meta.contact_name.as_deref().unwrap_or("the caller");
+    s.push_str(&format!("You are speaking with {who}.\n"));
+    if meta.direction == "outbound" {
+        s.push_str("You placed this call.\n");
+        if let Some(p) = meta.purpose.as_deref().filter(|p| !p.is_empty()) {
+            s.push_str(&format!("Reason you're calling: {p}\n"));
+        }
+    }
+    s.push_str(
+        "\nSpeak naturally and concisely — one short turn at a time. This is spoken audio: no \
+         markdown, no long monologues.\n\n\
+         When the caller needs current information, something from your memory, or an action — \
+         look up or send an email or text, check or save a contact, take a note — use the \
+         `agent_consult` tool. It briefly pauses the call, does the work with your full toolset, \
+         and returns the result for you to read back. This is YOU doing the work; never describe \
+         it as asking someone else. Don't use it for greetings or small talk.\n\
+         To queue follow-up work for after the call (send an email/text, save a note, update a \
+         contact), use `register_post_call_action` — tell the caller it's queued, not already \
+         done; `edit_post_call_action` / `delete_post_call_action` adjust the queue.\n\
+         To end the call use `hang_up_call`: it is two-step — the first call prompts you to say a \
+         brief goodbye, then call it again to actually hang up. Only when the caller is done.",
+    );
     s
 }
 
@@ -171,7 +203,7 @@ fn build_greeting(meta: &CallMeta) -> String {
         .as_deref()
         .map(|n| n.split_whitespace().next().unwrap_or(n).to_string())
         .unwrap_or_else(|| "there".to_string());
-    format!("Greet the caller now: say something like \"Hi {who}, how can I help?\" One short sentence, then wait.")
+    format!("Greet the caller now: say something like \"Hi {who}, this is ZeroClaw — how can I help?\" One short sentence, then wait.")
 }
 
 /// The realtime function tools exposed to the model (ported from hermes).
@@ -180,7 +212,7 @@ fn realtime_tools() -> Value {
         {
             "type": "function",
             "name": "agent_consult",
-            "description": "Pause the live voice conversation and ask the main agent to do tool work that needs the full agent loop (look up an email/text, check a contact, send/queue something, hit an API, compute). The result is a spoken-friendly answer; read it back to the caller. Use whenever the caller needs current external data, memory, or a tool call. Do NOT use it for greetings, small talk, or generic answers.",
+            "description": "Do work that needs your tools — look up or send an email/text, check or save a contact, recall something from memory, hit an API, or compute. Briefly pauses the call, does the work with your full toolset, and returns the answer for you to read back. This is YOU doing the work, not a handoff to anyone. Use whenever the caller needs current data, memory, or an action; never for greetings or small talk.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -297,11 +329,14 @@ fn function_call_output(call_id: &str, output: &Value) -> WsMessage {
     )
 }
 
-async fn connect_openai(
-    cfg: &RealtimeConfig,
-) -> anyhow::Result<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-> {
+/// A connected OpenAI Realtime WebSocket stream.
+pub(super) type OpenAiWs =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Connect to the OpenAI Realtime API (Bearer auth). The voice handler calls
+/// this as a pre-flight so `realtime_fallback` can drop to Inkbox STT/TTS when
+/// the model is unreachable, and passes the live stream into the bridge.
+pub(super) async fn connect_openai(cfg: &RealtimeConfig) -> anyhow::Result<OpenAiWs> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let url = format!(
         "{OPENAI_REALTIME_URL}?model={}",
@@ -338,25 +373,40 @@ fn now_secs() -> u64 {
 
 /// Run the realtime bridge between the (already-upgraded) Inkbox call-media
 /// WebSocket and the OpenAI Realtime API. Returns when either side closes.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_realtime_bridge(
     inkbox_ws: WebSocket,
+    openai: OpenAiWs,
     cfg: RealtimeConfig,
     meta: CallMeta,
     tx: mpsc::Sender<ChannelMessage>,
     alias: String,
+    client: Arc<inkbox::Inkbox>,
+    identity: String,
 ) {
-    let openai = match connect_openai(&cfg).await {
-        Ok(ws) => ws,
-        Err(e) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                format!("[inkbox] realtime bridge connect failed: {e}"),
-            );
-            return;
+    // Resolve our own identity so the model introduces itself as ZeroClaw with
+    // the right email/phone (blocking SDK call on the blocking pool).
+    let mut meta = meta;
+    {
+        let client = client.clone();
+        let handle = identity.clone();
+        if let Ok((h, email, phone)) = tokio::task::spawn_blocking(move || match client
+            .get_identity(&handle)
+        {
+            Ok(id) => (
+                id.agent_handle(),
+                id.email_address(),
+                id.phone_number().map(|p| p.number),
+            ),
+            Err(_) => (handle, None, None),
+        })
+        .await
+        {
+            meta.agent_handle = h;
+            meta.agent_email = email;
+            meta.agent_phone = phone;
         }
-    };
+    }
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
