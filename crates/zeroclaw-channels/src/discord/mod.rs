@@ -21,6 +21,11 @@ pub use types::{DiscordSlashCommandResolver, DiscordSlashCommandSpec};
 // Contract types/codec/consts used throughout this module and its siblings.
 pub(crate) use types::*;
 
+// Contract tier: the typed slash-command option model the command spec carries.
+// Consumers (`types`, `slash`, dispatch) import `super::slash_options::…`
+// explicitly — no crate-wide re-export needed.
+mod slash_options;
+
 mod chunk;
 pub(crate) use chunk::*;
 
@@ -725,6 +730,29 @@ const fn is_thread_channel_type(channel_type: u64) -> bool {
 /// is a safety bound so a hung request cannot stall the listener.
 const THREAD_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Deliver a (deferred) interaction's answer, splitting it across Discord's
+/// 2000-char limit: the first chunk edits the @original deferred message and any
+/// remaining chunks are posted as followups. The chunking lives here in the
+/// wiring layer so `interaction` need not depend on `chunk` (preserving the
+/// no-impl-to-impl module boundary).
+async fn deliver_interaction_answer(
+    client: &reqwest::Client,
+    app_id: &str,
+    interaction_token: &str,
+    api_base: &str,
+    content: &str,
+) -> anyhow::Result<()> {
+    let chunks = split_message_for_discord(content);
+    let mut chunks = chunks.iter();
+    let first = chunks.next().map(String::as_str).unwrap_or("");
+    discord_edit_interaction_response(client, app_id, interaction_token, api_base, first).await?;
+    for chunk in chunks {
+        discord_post_interaction_followup(client, app_id, interaction_token, api_base, chunk)
+            .await?;
+    }
+    Ok(())
+}
+
 /// Pure channel-filter decision: does `msg_channel` pass the allowlist?
 ///
 /// A channel passes when:
@@ -1371,10 +1399,11 @@ impl Channel for DiscordChannel {
             }
             let content = crate::util::strip_tool_call_tags(&message.content);
             let client = self.http_client();
-            return discord_edit_interaction_response(
+            return deliver_interaction_answer(
                 &client,
                 &pending.app_id,
                 &pending.token,
+                DISCORD_API_BASE,
                 &content,
             )
             .await;
@@ -1911,6 +1940,9 @@ impl Channel for DiscordChannel {
                                 // routing happens in the spawned task.
                                 let prompt = interaction_string_option(d, "prompt");
                                 let input = interaction_string_option(d, "input");
+                                // Extract typed-option values here (owned) so the
+                                // spawned 'static task doesn't borrow `event`.
+                                let submitted = slash_options::extract_submitted_options(d);
                                 let interaction_guild = d
                                     .get("guild_id")
                                     .and_then(serde_json::Value::as_str)
@@ -2063,12 +2095,10 @@ impl Channel for DiscordChannel {
                                                 None => Vec::new(),
                                             };
                                             match specs.into_iter().find(|spec| spec.slug == command) {
-                                                Some(spec) if !input.is_empty() => Some(format!(
-                                                    "Use the '{}' skill for this request: {input}",
-                                                    spec.skill_name
-                                                )),
-                                                Some(_) => None, // known command, empty input
-                                                None => None,    // stale or foreign command
+                                                Some(spec) => {
+                                                    skill_command_prompt(&spec, &input, &submitted)
+                                                }
+                                                None => None, // stale or foreign command
                                             }
                                         };
                                         let Some(content) = content else {
@@ -2079,7 +2109,7 @@ impl Channel for DiscordChannel {
                                             let msg = i18n::get_required_cli_string(
                                                 "channel-discord-interaction-unavailable",
                                             );
-                                            if let Err(e) = discord_edit_interaction_response(&client, &app_id, &interaction_token, &msg).await {
+                                            if let Err(e) = discord_edit_interaction_response(&client, &app_id, &interaction_token, DISCORD_API_BASE, &msg).await {
                                                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord interaction unavailable-notice failed");
                                             }
                                             pending.lock().remove(&interaction_id);
@@ -3021,6 +3051,60 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn interaction_answer_over_2000_chars_chunks_into_edit_plus_followup() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // The first chunk edits the deferred @original message.
+        Mock::given(method("PATCH"))
+            .and(path("/webhooks/app1/tok/messages/@original"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // The remaining chunk is delivered as a followup POST (not truncated).
+        Mock::given(method("POST"))
+            .and(path("/webhooks/app1/tok"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        // 3000 contiguous chars (no break point) → a 2000-char chunk + a 1000.
+        let content = "a".repeat(3000);
+        deliver_interaction_answer(&client, "app1", "tok", &server.uri(), &content)
+            .await
+            .unwrap();
+        // wiremock verifies the expect(1) counts when the server drops.
+    }
+
+    #[tokio::test]
+    async fn short_interaction_answer_only_edits_original() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/webhooks/app1/tok/messages/@original"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // A short reply must not trigger any followup POST.
+        Mock::given(method("POST"))
+            .and(path("/webhooks/app1/tok"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        deliver_interaction_answer(&client, "app1", "tok", &server.uri(), "short answer")
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn interaction_reply_target_roundtrips() {
         let target = discord_interaction_reply_target("123456789");
@@ -3076,6 +3160,7 @@ mod tests {
             tags: tags.iter().map(|t| (*t).to_string()).collect(),
             tools: vec![],
             prompts: vec![],
+            slash_options: Vec::new(),
             location: None,
         }
     }
@@ -3156,6 +3241,7 @@ mod tests {
             skill_name: "deploy status".to_string(),
             slug: "deploy-status".to_string(),
             description: "Check deploy state".to_string(),
+            options: Vec::new(),
         }];
         let body = slash_command_registration_body(&specs);
         let commands = body.as_array().unwrap();
