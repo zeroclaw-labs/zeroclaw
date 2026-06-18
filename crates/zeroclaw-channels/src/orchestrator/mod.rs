@@ -15849,6 +15849,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let skills = vec![zeroclaw_runtime::skills::Skill {
             name: "code-review".into(),
             description: "Review code for bugs".into(),
+            description_localizations: Default::default(),
             version: "1.0.0".into(),
             author: None,
             tags: vec![],
@@ -15891,6 +15892,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let skills = vec![zeroclaw_runtime::skills::Skill {
             name: "code-review".into(),
             description: "Review code for bugs".into(),
+            description_localizations: Default::default(),
             version: "1.0.0".into(),
             author: None,
             tags: vec![],
@@ -15943,6 +15945,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let skills = vec![zeroclaw_runtime::skills::Skill {
             name: "code<review>&".into(),
             description: "Review \"unsafe\" and 'risky' bits".into(),
+            description_localizations: Default::default(),
             version: "1.0.0".into(),
             author: None,
             tags: vec![],

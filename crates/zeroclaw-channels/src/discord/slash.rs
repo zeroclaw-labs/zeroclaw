@@ -100,6 +100,11 @@ pub fn discord_slash_specs_from_skills(
             skill_name,
             slug,
             description: description.chars().take(100).collect(),
+            description_localizations: valid_discord_localizations(
+                &skill.description_localizations,
+                &skill.name,
+                "command",
+            ),
             options: map_skill_slash_options(skill),
         });
     }
@@ -160,6 +165,11 @@ fn map_skill_slash_options(skill: &zeroclaw_runtime::skills::Skill) -> Vec<Optio
         options.push(OptionSpec {
             name,
             description: decl.description.chars().take(100).collect(),
+            description_localizations: valid_discord_localizations(
+                &decl.description_localizations,
+                &skill.name,
+                &decl.name,
+            ),
             kind,
             required: decl.required,
             choices,
@@ -187,6 +197,49 @@ fn warn_drop_option(skill: &zeroclaw_runtime::skills::Skill, option: &str, reaso
             })),
         "dropping invalid skill slash option"
     );
+}
+
+/// Discord's supported command-localization locale codes
+/// (<https://discord.com/developers/docs/reference#locales>). Registering with
+/// any other key is a 400 that would wedge the reconcile in a retry loop, so a
+/// skill-authored localization map is filtered to these before registration.
+const DISCORD_LOCALES: &[&str] = &[
+    "id", "da", "de", "en-GB", "en-US", "es-ES", "es-419", "fr", "hr", "it", "lt", "hu", "nl",
+    "no", "pl", "pt-BR", "ro", "fi", "sv-SE", "vi", "tr", "cs", "el", "bg", "ru", "uk", "hi", "th",
+    "zh-CN", "ja", "zh-TW", "ko",
+];
+
+/// Filter a skill-authored localization map to Discord-supported locale codes
+/// (case-sensitive, as Discord requires) and truncate each value to Discord's
+/// 100-char description limit. An authoring typo drops just that entry with a
+/// WARN rather than 400-ing the whole command registration; an empty result
+/// lets the caller omit the `*_localizations` key entirely.
+fn valid_discord_localizations(
+    raw: &std::collections::BTreeMap<String, String>,
+    skill: &str,
+    context: &str,
+) -> std::collections::BTreeMap<String, String> {
+    raw.iter()
+        .filter(|(loc, _)| {
+            if DISCORD_LOCALES.contains(&loc.as_str()) {
+                true
+            } else {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "skill": skill,
+                            "context": context,
+                            "locale": loc,
+                        })),
+                    "dropping unsupported Discord locale from slash localization"
+                );
+                false
+            }
+        })
+        .map(|(k, v)| (k.clone(), v.chars().take(100).collect()))
+        .collect()
 }
 
 /// Build the agent prompt for a skill slash command: the legacy single `input`
@@ -287,12 +340,16 @@ pub(crate) fn slash_command_registration_body(
                 .map(OptionSpec::to_registration_json)
                 .collect()
         };
-        commands.push(json!({
+        let mut cmd = json!({
             "name": spec.slug,
             "description": spec.description,
             "type": 1, // CHAT_INPUT
             "options": options,
-        }));
+        });
+        if !spec.description_localizations.is_empty() {
+            cmd["description_localizations"] = json!(spec.description_localizations);
+        }
+        commands.push(cmd);
     }
     serde_json::Value::Array(commands)
 }
@@ -751,6 +808,7 @@ mod typed_option_tests {
             skill_name: "s".to_string(),
             slug: "s".to_string(),
             description: "d".to_string(),
+            description_localizations: Default::default(),
             options,
         }
     }
@@ -759,6 +817,7 @@ mod typed_option_tests {
         OptionSpec {
             name: name.to_string(),
             description: name.to_string(),
+            description_localizations: Default::default(),
             kind,
             required,
             choices: Vec::new(),
@@ -802,8 +861,47 @@ mod typed_option_tests {
         // canonical (English) description as the reap-ownership marker.
         let input = &cmds[1]["options"][0];
         assert_eq!(input["name"], json!("input"));
-        assert_eq!(input["description"], json!(SKILL_COMMAND_OPTION_DESCRIPTION));
+        assert_eq!(
+            input["description"],
+            json!(SKILL_COMMAND_OPTION_DESCRIPTION)
+        );
         assert!(input["description_localizations"]["zh-CN"].is_string());
+    }
+
+    #[test]
+    fn skill_localizations_flow_through_and_bad_locales_are_dropped() {
+        use std::collections::BTreeMap;
+        let mut cmd_loc = BTreeMap::new();
+        cmd_loc.insert("fr".to_string(), "Vérifier le déploiement".to_string());
+        // An authoring typo must be dropped, not 400 the whole registration.
+        cmd_loc.insert("xx-INVALID".to_string(), "ignored".to_string());
+        let mut opt_loc = BTreeMap::new();
+        opt_loc.insert("ja".to_string(), "クエリ".to_string());
+
+        let mut option = sso("query", "string");
+        option.description_localizations = opt_loc;
+        let mut skill = skill_with(vec![option]);
+        skill.description_localizations = cmd_loc;
+
+        let specs = discord_slash_specs_from_skills(std::slice::from_ref(&skill));
+        let spec = &specs[0];
+        assert_eq!(
+            spec.description_localizations.get("fr").map(String::as_str),
+            Some("Vérifier le déploiement")
+        );
+        assert!(!spec.description_localizations.contains_key("xx-INVALID"));
+
+        let body = slash_command_registration_body(&specs);
+        let cmd = &body.as_array().unwrap()[1]; // [0] is /ask
+        assert_eq!(
+            cmd["description_localizations"]["fr"],
+            json!("Vérifier le déploiement")
+        );
+        assert!(cmd["description_localizations"].get("xx-INVALID").is_none());
+        assert_eq!(
+            cmd["options"][0]["description_localizations"]["ja"],
+            json!("クエリ")
+        );
     }
 
     #[test]
@@ -907,6 +1005,7 @@ Write it.
         let skill = zeroclaw_runtime::skills::Skill {
             name: "s".to_string(),
             description: "d".to_string(),
+            description_localizations: Default::default(),
             version: "0".to_string(),
             author: None,
             tags: vec!["slash".to_string()],
@@ -918,6 +1017,7 @@ Write it.
                     description: "o".to_string(),
                     kind: "string".to_string(),
                     required: false,
+                    description_localizations: Default::default(),
                     choices: Vec::new(),
                     min: None,
                     max: None,
@@ -929,6 +1029,7 @@ Write it.
                     description: "r".to_string(),
                     kind: "integer".to_string(),
                     required: true,
+                    description_localizations: Default::default(),
                     choices: Vec::new(),
                     min: None,
                     max: None,
@@ -940,6 +1041,7 @@ Write it.
                     description: "b".to_string(),
                     kind: "bogus".to_string(),
                     required: false,
+                    description_localizations: Default::default(),
                     choices: Vec::new(),
                     min: None,
                     max: None,
@@ -960,6 +1062,7 @@ Write it.
         zeroclaw_runtime::skills::SkillSlashOption {
             name: name.to_string(),
             description: "d".to_string(),
+            description_localizations: Default::default(),
             kind: kind.to_string(),
             required: false,
             choices: Vec::new(),
@@ -976,6 +1079,7 @@ Write it.
         zeroclaw_runtime::skills::Skill {
             name: "s".to_string(),
             description: "d".to_string(),
+            description_localizations: Default::default(),
             version: "0".to_string(),
             author: None,
             tags: vec!["slash".to_string()],

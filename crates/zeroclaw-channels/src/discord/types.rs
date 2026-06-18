@@ -123,6 +123,10 @@ pub struct DiscordSlashCommandSpec {
     pub skill_name: String,
     pub slug: String,
     pub description: String,
+    /// Discord-locale-keyed translations of `description` (from the skill
+    /// manifest, already filtered to Discord-supported locale codes). Empty for
+    /// unlocalized commands → no `description_localizations` key is registered.
+    pub description_localizations: std::collections::BTreeMap<String, String>,
     pub options: Vec<OptionSpec>,
 }
 

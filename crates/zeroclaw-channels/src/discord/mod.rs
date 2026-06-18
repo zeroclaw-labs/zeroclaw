@@ -4380,6 +4380,7 @@ mod tests {
         zeroclaw_runtime::skills::Skill {
             name: name.to_string(),
             description: description.to_string(),
+            description_localizations: Default::default(),
             version: "1.0.0".to_string(),
             author: None,
             tags: tags.iter().map(|t| (*t).to_string()).collect(),
@@ -4466,6 +4467,7 @@ mod tests {
             skill_name: "deploy status".to_string(),
             slug: "deploy-status".to_string(),
             description: "Check deploy state".to_string(),
+            description_localizations: Default::default(),
             options: Vec::new(),
         }];
         let body = slash_command_registration_body(&specs);
@@ -4560,9 +4562,17 @@ mod tests {
 
         let client = reqwest::Client::new();
         let desired = slash_command_registration_body(&[]);
-        let err = reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri(), SlashScope::Global, &[])
-            .await
-            .unwrap_err();
+        let err = reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Global,
+            &[],
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("stale skill command delete"));
     }
 
@@ -4593,9 +4603,17 @@ mod tests {
 
         let client = reqwest::Client::new();
         let desired = slash_command_registration_body(&[]);
-        reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri(), SlashScope::Global, &[])
-            .await
-            .unwrap();
+        reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Global,
+            &[],
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -4713,10 +4731,7 @@ mod tests {
         // `with_localizations=true`) plus a server-side id — so the projection
         // matches and no upsert fires. Deriving it keeps the test agnostic to
         // the built-in translation table.
-        let mut existing_ask = slash_command_registration_body(&[])
-            .as_array()
-            .unwrap()[0]
-            .clone();
+        let mut existing_ask = slash_command_registration_body(&[]).as_array().unwrap()[0].clone();
         existing_ask["id"] = serde_json::json!("a1");
         let foreign = serde_json::json!({
             "id": "f1", "name": "run",
@@ -4740,9 +4755,17 @@ mod tests {
 
         let client = reqwest::Client::new();
         let desired = slash_command_registration_body(&[]);
-        reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri(), SlashScope::Global, &[])
-            .await
-            .unwrap();
+        reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Global,
+            &[],
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -4769,9 +4792,17 @@ mod tests {
         let client = reqwest::Client::new();
         let desired = slash_command_registration_body(&[]); // /ask → one POST
         let now = crate::discord_slash_state::now_unix();
-        let outcome = reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri(), SlashScope::Global, &[])
-            .await
-            .unwrap();
+        let outcome = reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Global,
+            &[],
+        )
+        .await
+        .unwrap();
         match outcome {
             ReconcileOutcome::RateLimited { until } => assert!(until >= now + 5),
             ReconcileOutcome::Reconciled => panic!("expected RateLimited on a POST 429"),

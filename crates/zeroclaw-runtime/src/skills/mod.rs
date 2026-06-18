@@ -60,6 +60,12 @@ const SKILLS_REGISTRY_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24;
 pub struct Skill {
     pub name: String,
     pub description: String,
+    /// Per-locale translations of `description`, keyed by Discord locale code
+    /// (e.g. `fr`, `es-ES`, `ja`). Consumed by slash-capable channels to
+    /// localize the command description; empty for unlocalized skills. Declared
+    /// in SKILL.toml under `[skill]` as `description_localizations`.
+    #[serde(default)]
+    pub description_localizations: BTreeMap<String, String>,
     pub version: String,
     #[serde(default)]
     pub author: Option<String>,
@@ -86,6 +92,11 @@ pub struct Skill {
 pub struct SkillSlashOption {
     pub name: String,
     pub description: String,
+    /// Per-locale translations of `description`, keyed by Discord locale code.
+    /// Empty for unlocalized options. Declared under
+    /// `[[skill.slash_options]]` as `description_localizations`.
+    #[serde(default)]
+    pub description_localizations: BTreeMap<String, String>,
     /// `string` | `integer` | `number` | `boolean` | `user` | `channel` |
     /// `role` | `mentionable`. Unknown values are dropped by the channel.
     #[serde(rename = "type")]
@@ -179,6 +190,8 @@ struct SkillManifest {
 struct SkillMeta {
     name: String,
     description: String,
+    #[serde(default)]
+    description_localizations: BTreeMap<String, String>,
     #[serde(default = "default_version")]
     version: String,
     #[serde(default)]
@@ -1065,6 +1078,7 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
     Ok(Skill {
         name: manifest.skill.name,
         description: manifest.skill.description,
+        description_localizations: manifest.skill.description_localizations,
         version: manifest.skill.version,
         author: manifest.skill.author,
         tags: manifest.skill.tags,
@@ -1092,6 +1106,8 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
             .description
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| extract_description(&parsed.body)),
+        // SKILL.md frontmatter carries no localizations.
+        description_localizations: Default::default(),
         version: parsed.meta.version.unwrap_or_else(default_version),
         author: parsed.meta.author,
         tags: parsed.meta.tags,
@@ -1126,6 +1142,8 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
             .description
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| extract_description(&parsed.body)),
+        // SKILL.md frontmatter carries no localizations.
+        description_localizations: Default::default(),
         version: parsed
             .meta
             .version
@@ -2615,6 +2633,50 @@ choices = [
     }
 
     #[test]
+    fn description_localizations_parse_at_command_and_option_level() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_manifest(
+            tmp.path(),
+            r#"
+[skill]
+name = "search"
+description = "Search the web"
+version = "0.1.0"
+tags = ["slash"]
+description_localizations = { fr = "Rechercher sur le web", ja = "ウェブを検索" }
+
+[[skill.slash_options]]
+name = "query"
+description = "The search query"
+type = "string"
+description_localizations = { fr = "La requête de recherche" }
+"#,
+        );
+        let skill = load_skill_toml(&path).unwrap();
+        assert_eq!(
+            skill
+                .description_localizations
+                .get("fr")
+                .map(String::as_str),
+            Some("Rechercher sur le web")
+        );
+        assert_eq!(
+            skill
+                .description_localizations
+                .get("ja")
+                .map(String::as_str),
+            Some("ウェブを検索")
+        );
+        assert_eq!(
+            skill.slash_options[0]
+                .description_localizations
+                .get("fr")
+                .map(String::as_str),
+            Some("La requête de recherche")
+        );
+    }
+
+    #[test]
     fn skills_without_slash_options_default_to_empty() {
         let tmp = TempDir::new().unwrap();
         let path = write_manifest(
@@ -3062,6 +3124,7 @@ mod prompt_callable_name_tests {
         let skill = Skill {
             name: "pr-review-toolkit:code-reviewer".to_string(),
             description: "review".to_string(),
+            description_localizations: Default::default(),
             version: "1.0.0".to_string(),
             author: None,
             tags: Vec::new(),
