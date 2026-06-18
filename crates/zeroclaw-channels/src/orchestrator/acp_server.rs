@@ -1501,7 +1501,7 @@ impl AcpServer {
     }
 
     fn cancelled_prompt_result(session_id: String, accumulated_text: &str) -> Value {
-        let marker = zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
+        let marker = zeroclaw_runtime::i18n::get_required_cli_string("turn-cancelled-client-rpc");
         let content = if accumulated_text.is_empty() {
             marker
         } else {
@@ -2688,14 +2688,14 @@ mod tests {
             with_partial["content"],
             format!(
                 "partial text\n\n{}",
-                zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user")
+                zeroclaw_runtime::i18n::get_required_cli_string("turn-cancelled-client-rpc")
             )
         );
 
         let marker_only = AcpServer::cancelled_prompt_result("test-sid".to_string(), "");
         assert_eq!(
             marker_only["content"],
-            zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user")
+            zeroclaw_runtime::i18n::get_required_cli_string("turn-cancelled-client-rpc")
         );
     }
 
