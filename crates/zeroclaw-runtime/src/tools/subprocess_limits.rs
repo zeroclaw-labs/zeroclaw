@@ -42,13 +42,15 @@ pub(crate) fn apply_pre_spawn_memory_limit(
         let Some(limit) = memory_limit_bytes(max_memory_mb)? else {
             return Ok(());
         };
-        if limit > libc::rlim_t::MAX as u64 {
-            return Err(io::Error::new(
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        let limit: libc::rlim_t = limit;
+        #[cfg(not(any(target_os = "android", target_os = "linux")))]
+        let limit: libc::rlim_t = limit.try_into().map_err(|_| {
+            io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "shell_max_memory_mb exceeds platform rlimit capacity",
-            ));
-        }
-        let limit = limit as libc::rlim_t;
+            )
+        })?;
 
         unsafe {
             cmd.as_std_mut().pre_exec(move || {
