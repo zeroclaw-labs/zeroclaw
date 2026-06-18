@@ -50,6 +50,40 @@ pub(crate) async fn discord_defer_interaction(
     Ok(())
 }
 
+/// Open a modal in response to a button/slash interaction (callback type 9).
+/// The caller must register the modal's `custom_id` in the pending registry
+/// first so the eventual type-5 submit can resolve it. Sender-side — the first
+/// caller lands with a feature that opens a modal (EPIC B Phase 4 onward).
+#[allow(dead_code)]
+pub(crate) async fn discord_open_modal(
+    client: &reqwest::Client,
+    interaction_id: &str,
+    interaction_token: &str,
+    modal: &super::components::DiscordModal,
+) -> anyhow::Result<()> {
+    let Some(data) = modal.to_api() else {
+        anyhow::bail!("modal custom_id exceeds Discord's 100-char limit; cannot open");
+    };
+    let url = format!(
+        "https://discord.com/api/v10/interactions/{interaction_id}/{interaction_token}/callback"
+    );
+    // type 9 = MODAL
+    let body = json!({ "type": 9, "data": data });
+    // without_url: transport errors embed the token-bearing URL.
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err = resp.text().await.unwrap_or_default();
+        anyhow::bail!("modal open failed ({status}): {err}");
+    }
+    Ok(())
+}
+
 /// Extract a string option (`d.data.options[name].value`) from an
 /// APPLICATION_COMMAND interaction payload. Empty string when absent.
 pub(crate) fn interaction_string_option(d: &serde_json::Value, name: &str) -> String {

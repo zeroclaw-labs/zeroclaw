@@ -2227,8 +2227,13 @@ impl Channel for DiscordChannel {
                                         }
                                     });
                                 }
-                            } else if itype == 3 {
-                                // type 3 = MESSAGE_COMPONENT (button / select click)
+                            } else if itype == 3 || itype == 5 {
+                                // type 3 = MESSAGE_COMPONENT (button / select click);
+                                // type 5 = MODAL_SUBMIT. Both echo back a `zc1`
+                                // custom_id and share the whole lifecycle (authz →
+                                // single-use take → defer → resolve-into-turn); the
+                                // modal additionally carries submitted field values
+                                // that are appended to the enqueued prompt.
                                 let interaction_id = d.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                 let interaction_token = d.get("token").and_then(|v| v.as_str()).unwrap_or("").to_string();
                                 let app_id = d.get("application_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -2238,6 +2243,13 @@ impl Channel for DiscordChannel {
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("")
                                     .to_string();
+                                // Modal submits carry their typed-in field values;
+                                // a component click carries none.
+                                let modal_fields = if itype == 5 {
+                                    components::extract_modal_fields(d)
+                                } else {
+                                    Vec::new()
+                                };
                                 let user_id = d
                                     .get("member")
                                     .and_then(|m| m.get("user"))
@@ -2347,6 +2359,20 @@ impl Channel for DiscordChannel {
                                             return;
                                         };
 
+                                        // A modal submit appends its typed-in
+                                        // fields ("label: value" lines) to the
+                                        // registered prompt; a component click has
+                                        // none, so the prompt is used as-is.
+                                        let content = if modal_fields.is_empty() {
+                                            prompt
+                                        } else {
+                                            let mut c = prompt;
+                                            for (field, value) in &modal_fields {
+                                                c.push_str(&format!("\n{field}: {value}"));
+                                            }
+                                            c
+                                        };
+
                                         // Stash creds before the defer so a fast
                                         // reply can't race an absent entry.
                                         {
@@ -2376,7 +2402,7 @@ impl Channel for DiscordChannel {
                                             id: format!("discord_interaction_{interaction_id}"),
                                             sender: user_id,
                                             reply_target: discord_interaction_reply_target(&interaction_id),
-                                            content: prompt,
+                                            content,
                                             channel: "discord".to_string(),
                                             channel_alias: Some(alias),
                                             timestamp: std::time::SystemTime::now()

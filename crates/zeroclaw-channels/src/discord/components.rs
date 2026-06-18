@@ -282,6 +282,111 @@ pub(crate) fn cap_rows(rows: Vec<DiscordActionRow>) -> Vec<DiscordActionRow> {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Modals (opened via interaction response type 9; submitted as type 5)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A modal text-input style (Discord component type-4 `style`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextInputStyle {
+    Short,
+    Paragraph,
+}
+
+impl TextInputStyle {
+    fn wire(self) -> u64 {
+        match self {
+            TextInputStyle::Short => 1,
+            TextInputStyle::Paragraph => 2,
+        }
+    }
+}
+
+/// One text-input field in a modal (Discord component type 4). `custom_id` here
+/// is the *field* id echoed back on submit — an arbitrary label, NOT a `zc1`
+/// routing token (the routing token is the modal's own `custom_id`).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ModalField {
+    pub(crate) custom_id: String,
+    pub(crate) label: String,
+    pub(crate) style: TextInputStyle,
+    pub(crate) required: bool,
+    pub(crate) placeholder: Option<String>,
+    pub(crate) min_length: Option<u16>,
+    pub(crate) max_length: Option<u16>,
+}
+
+/// A modal opened in response to a button/slash interaction (response type 9).
+/// The modal's `custom_id` is the `zc1` routing token its submit (type 5)
+/// dispatches on; each field becomes its own action row (Discord requires
+/// exactly one text input per modal row, ≤5 rows).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DiscordModal {
+    pub(crate) custom_id: CustomId,
+    pub(crate) title: String,
+    pub(crate) fields: Vec<ModalField>,
+}
+
+impl DiscordModal {
+    /// Serialize to the `data` object of a type-9 (MODAL) interaction response.
+    /// `None` when the routing `custom_id` won't encode (over 100 chars).
+    pub(crate) fn to_api(&self) -> Option<Value> {
+        let rows: Vec<Value> = self
+            .fields
+            .iter()
+            .take(MAX_ROWS_PER_MESSAGE)
+            .map(|f| {
+                let mut input = json!({
+                    "type": 4,
+                    "custom_id": f.custom_id,
+                    "label": f.label,
+                    "style": f.style.wire(),
+                    "required": f.required,
+                });
+                if let Some(p) = &f.placeholder {
+                    input["placeholder"] = json!(p);
+                }
+                if let Some(m) = f.min_length {
+                    input["min_length"] = json!(m);
+                }
+                if let Some(m) = f.max_length {
+                    input["max_length"] = json!(m);
+                }
+                json!({ "type": 1, "components": [input] })
+            })
+            .collect();
+        Some(json!({
+            "custom_id": self.custom_id.encode()?,
+            "title": self.title,
+            "components": rows,
+        }))
+    }
+}
+
+/// Extract the submitted fields of a type-5 (modal submit) interaction payload
+/// from `data.components[][]` as `(field_custom_id, value)` pairs, in order.
+pub(crate) fn extract_modal_fields(d: &Value) -> Vec<(String, String)> {
+    d.get("data")
+        .and_then(|x| x.get("components"))
+        .and_then(|c| c.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r.get("components").and_then(|c| c.as_array()))
+                .flatten()
+                .filter_map(|input| {
+                    let id = input.get("custom_id")?.as_str()?.to_string();
+                    let value = input
+                        .get("value")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    Some((id, value))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,5 +489,52 @@ mod tests {
     fn cap_rows_limits_to_five() {
         let rows = cap_rows((0..8).map(|_| DiscordActionRow::default()).collect());
         assert_eq!(rows.len(), 5);
+    }
+
+    #[test]
+    fn modal_serializes_to_type9_data() {
+        let modal = DiscordModal {
+            custom_id: CustomId::new("report", "i1"),
+            title: "Report".into(),
+            fields: vec![ModalField {
+                custom_id: "reason".into(),
+                label: "Reason".into(),
+                style: TextInputStyle::Paragraph,
+                required: true,
+                placeholder: Some("why?".into()),
+                min_length: None,
+                max_length: Some(500),
+            }],
+        };
+        let api = modal.to_api().unwrap();
+        assert_eq!(api["custom_id"], json!("zc1|report|i1"));
+        assert_eq!(api["title"], json!("Report"));
+        let row = &api["components"][0];
+        assert_eq!(row["type"], json!(1));
+        let input = &row["components"][0];
+        assert_eq!(input["type"], json!(4)); // text input
+        assert_eq!(input["custom_id"], json!("reason"));
+        assert_eq!(input["style"], json!(2)); // paragraph
+        assert_eq!(input["max_length"], json!(500));
+        assert!(input.get("min_length").is_none());
+    }
+
+    #[test]
+    fn extract_modal_fields_reads_submitted_values_in_order() {
+        let payload = json!({
+            "data": { "custom_id": "zc1|report|i1", "components": [
+                { "type": 1, "components": [{ "type": 4, "custom_id": "reason", "value": "spam" }] },
+                { "type": 1, "components": [{ "type": 4, "custom_id": "detail", "value": "lots" }] },
+            ]}
+        });
+        assert_eq!(
+            extract_modal_fields(&payload),
+            vec![
+                ("reason".to_string(), "spam".to_string()),
+                ("detail".to_string(), "lots".to_string()),
+            ]
+        );
+        // A submit with no components yields no fields.
+        assert!(extract_modal_fields(&json!({ "data": { "custom_id": "x" } })).is_empty());
     }
 }
