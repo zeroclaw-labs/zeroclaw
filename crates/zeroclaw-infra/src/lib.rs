@@ -1,14 +1,18 @@
-//! Channel infrastructure: session backends, debouncing, and stall watchdog.
+//! Channel infrastructure: session backends, debouncing, stall watchdog, and temp file cleanup.
 //!
 //! These are cross-cutting utilities used by multiple channel implementations.
 
 pub mod acp_session_store;
+pub mod cleanup_rule;
 pub mod debounce;
+pub mod dir_monitor;
 pub mod session_backend;
 pub mod session_queue;
 pub mod session_sqlite;
 pub mod session_store;
 pub mod stall_watchdog;
+pub mod strategy;
+pub mod temp_file_manager;
 
 use std::path::Path;
 use std::sync::Arc;

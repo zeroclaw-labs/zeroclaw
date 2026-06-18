@@ -234,6 +234,13 @@ pub struct Config {
     #[group = "Agent"]
     pub pipeline: PipelineConfig,
 
+    /// Temporary file cleanup configuration (`[files_cleanup]`).
+    /// Manages automatic cleanup of temporary files (QQ attachments, Node camera snapshots, custom directories).
+    #[serde(default)]
+    #[nested]
+    #[group = "Operations"]
+    pub files_cleanup: TempFileCleanupConfig,
+
     /// Automatic query classification — maps user messages to model hints.
     #[serde(default)]
     #[nested]
@@ -11403,6 +11410,113 @@ pub struct ChannelsConfig {
     pub debounce_ms: u64,
 }
 
+// ── Temporary File Cleanup Configuration ─────────────────────────
+
+/// Configuration for a single temporary file cleanup rule.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "files_cleanup.rules"]
+pub struct TempCleanupRule {
+    /// Path relative to the install root and bounded within it.
+    /// Examples: `"data/sessions"`, `"data/state/cache"`, `"shared/tmp"`.
+    pub path: String,
+
+    /// Filename glob pattern (e.g., "*.log", "*.tmp"), None means match all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+
+    /// Retention time in hours, 0 = no time limit.
+    #[serde(default)]
+    pub retention_hours: u64,
+
+    /// Maximum total size in MB, 0 = no size limit.
+    #[serde(default)]
+    pub max_size_mb: u64,
+}
+
+/// Temporary file cleanup configuration (`[files_cleanup]`).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "files_cleanup"]
+pub struct TempFileCleanupConfig {
+    /// Enable automatic temporary file cleanup (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Legacy compatibility field. No built-in cleanup paths are registered automatically.
+    #[serde(default = "default_temp_retention_hours")]
+    pub temp_file_retention_hours: u64,
+
+    /// Legacy compatibility field. No built-in cleanup paths are registered automatically.
+    #[serde(default = "default_temp_max_size_mb")]
+    pub temp_file_max_size_mb: u64,
+
+    /// Enable scheduled periodic cleanup scan (default: false).
+    /// When enabled, a background task scans and cleans up expired files at the configured interval.
+    #[serde(default)]
+    pub scheduled_cleanup_enabled: bool,
+
+    /// Scheduled cleanup interval in hours (default: 1.0).
+    /// Only used when `scheduled_cleanup_enabled` is true.
+    /// Supports fractional hours for minute-level precision (e.g., 0.1 = 6 minutes, 0.0167 ≈ 1 minute).
+    #[serde(default = "default_scheduled_cleanup_interval_hours")]
+    pub scheduled_cleanup_interval_hours: f64,
+
+    /// User-defined custom cleanup rules.
+    #[serde(default)]
+    #[nested]
+    pub rules: Vec<TempCleanupRule>,
+}
+
+fn default_temp_retention_hours() -> u64 {
+    24
+}
+
+fn default_temp_max_size_mb() -> u64 {
+    50
+}
+
+fn default_scheduled_cleanup_interval_hours() -> f64 {
+    1.0
+}
+
+impl Default for TempFileCleanupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            temp_file_retention_hours: default_temp_retention_hours(),
+            temp_file_max_size_mb: default_temp_max_size_mb(),
+            scheduled_cleanup_enabled: false,
+            scheduled_cleanup_interval_hours: default_scheduled_cleanup_interval_hours(),
+            rules: vec![],
+        }
+    }
+}
+
+impl TempFileCleanupConfig {
+    /// Validate the configuration
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.scheduled_cleanup_enabled {
+            if self.scheduled_cleanup_interval_hours <= 0.0 {
+                anyhow::bail!("scheduled_cleanup_interval_hours must be positive");
+            }
+
+            if self.scheduled_cleanup_interval_hours < 0.0167 {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "scheduled_cleanup_interval_hours": self.scheduled_cleanup_interval_hours
+                        })),
+                    "scheduled_cleanup_interval_hours is less than 1 minute; this may cause high CPU usage"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 impl ChannelsConfig {
     /// Returns metadata and configuration status for every known channel type.
     ///
@@ -15189,6 +15303,7 @@ impl Default for Config {
             pacing: PacingConfig::default(),
             skills: SkillsConfig::default(),
             pipeline: PipelineConfig::default(),
+            files_cleanup: TempFileCleanupConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             cron: HashMap::new(),
             acp: AcpConfig::default(),
@@ -20195,6 +20310,7 @@ auto_save = true
             link_enricher: LinkEnricherConfig::default(),
             text_browser: TextBrowserConfig::default(),
             web_search: WebSearchConfig::default(),
+            files_cleanup: TempFileCleanupConfig::default(),
             project_intel: ProjectIntelConfig::default(),
             google_workspace: GoogleWorkspaceConfig::default(),
             proxy: ProxyConfig::default(),
@@ -20858,6 +20974,7 @@ default_temperature = 0.7
             link_enricher: LinkEnricherConfig::default(),
             text_browser: TextBrowserConfig::default(),
             web_search: WebSearchConfig::default(),
+            files_cleanup: TempFileCleanupConfig::default(),
             project_intel: ProjectIntelConfig::default(),
             google_workspace: GoogleWorkspaceConfig::default(),
             proxy: ProxyConfig::default(),

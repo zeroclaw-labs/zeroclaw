@@ -1330,16 +1330,20 @@ mod tests {
     #[tokio::test]
     async fn allows_readonly_ops_in_readonly_mode() {
         let tmp = TempDir::new().unwrap();
+        git_init_no_sign(tmp.path(), &[]);
+
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
         let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
 
-        // This will fail because there's no git repo, but it shouldn't be blocked by autonomy
         let result = tool.execute(json!({"operation": "status"})).await.unwrap();
-        // The error should be about git (not about autonomy/read-only mode)
-        assert!(!result.success, "Expected failure due to missing git repo");
+        assert!(
+            result.success,
+            "status should be allowed in read-only mode, got: {:?}",
+            result.error
+        );
         let error_msg = result.error.as_deref().unwrap_or("");
         assert!(
             !error_msg.contains("read-only") && !error_msg.contains("autonomy"),
@@ -1536,7 +1540,14 @@ mod tests {
     /// modifications when later edited — `git stash` only handles tracked
     /// files by default, so all stash test fixtures must use this seam.
     async fn bootstrap_repo(dir: &std::path::Path, tracked_files: &[&str]) {
-        git_init_no_sign(dir, &["-b", "master"]);
+        git_init_no_sign(dir, &[]);
+        // `git init -b master` is not available on older git versions
+        // (e.g. 2.27 in CI), so move HEAD explicitly instead.
+        std::process::Command::new("git")
+            .args(["symbolic-ref", "HEAD", "refs/heads/master"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
         std::fs::write(dir.join("README.md"), "hello").unwrap();
         for f in tracked_files {
             std::fs::write(dir.join(f), "initial").unwrap();

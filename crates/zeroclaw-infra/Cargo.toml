@@ -12,12 +12,15 @@ zeroclaw-api.workspace = true
 zeroclaw-spawn.workspace = true
 anyhow = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+glob = "0.3"
 parking_lot = "0.12"
 portable-atomic = "1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
+thiserror = "2.0"
 tokio = { version = "1.50", default-features = false, features = ["sync", "time"] }
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 
 [dev-dependencies]
 tempfile = "3.26"

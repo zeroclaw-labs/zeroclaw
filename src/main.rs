@@ -3879,6 +3879,92 @@ async fn main() -> Result<()> {
                 // first iteration; reload would otherwise see a moved value.
                 let canvas_store_for_gateway = canvas_store_for_gateway.clone();
                 let canvas_store_for_channels = canvas_store_for_channels.clone();
+                let scheduled_cleanup_task = if current_config.files_cleanup.enabled {
+                    use zeroclaw_infra::temp_file_manager::TempFileManager;
+
+                    let cleanup_root = current_config
+                        .config_path
+                        .parent()
+                        .unwrap_or(current_config.data_dir.as_path());
+
+                    match TempFileManager::from_params(
+                        cleanup_root,
+                        current_config.files_cleanup.enabled,
+                        current_config.files_cleanup.scheduled_cleanup_enabled,
+                        current_config
+                            .files_cleanup
+                            .scheduled_cleanup_interval_hours,
+                        current_config.files_cleanup.rules.iter().map(|rule| {
+                            (
+                                rule.path.as_str(),
+                                rule.pattern.as_deref(),
+                                rule.retention_hours,
+                                rule.max_size_mb,
+                            )
+                        }),
+                    ) {
+                        Ok(manager) => {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "rules_count": manager.rules_count(),
+                                })),
+                                "Temporary file manager initialized"
+                            );
+                            let manager = Arc::new(manager);
+                            if manager.scheduled_cleanup_enabled() && manager.is_enabled() {
+                                let cancel_token = tokio_util::sync::CancellationToken::new();
+                                let cancel_token_for_task = cancel_token.clone();
+                                let manager = Arc::clone(&manager);
+                                Some((
+                                    cancel_token,
+                                    zeroclaw_spawn::spawn!(async move {
+                                        if let Err(error) = manager
+                                            .start_scheduled_cleanup(cancel_token_for_task)
+                                            .await
+                                        {
+                                            ::zeroclaw_log::record!(
+                                                WARN,
+                                                ::zeroclaw_log::Event::new(
+                                                    module_path!(),
+                                                    ::zeroclaw_log::Action::Fail
+                                                )
+                                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                                .with_attrs(::serde_json::json!({
+                                                    "error": error.to_string(),
+                                                })),
+                                                "Scheduled cleanup task failed"
+                                            );
+                                        }
+                                    }),
+                                ))
+                            } else {
+                                None
+                            }
+                        }
+                        Err(error) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Fail
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "error": error.to_string(),
+                                })),
+                                "Failed to initialize temporary file manager"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 let mut registry = daemon::DaemonRegistry::new();
 
                 // Build SOP engine + audit per iteration from current_config.
@@ -4022,8 +4108,12 @@ async fn main() -> Result<()> {
                     registry,
                     ephemeral,
                 ))
-                .await?;
-                match exit {
+                .await;
+                if let Some((cancel_token, handle)) = scheduled_cleanup_task {
+                    cancel_token.cancel();
+                    let _ = handle.await;
+                }
+                match exit? {
                     daemon::DaemonExit::Shutdown => break,
                     daemon::DaemonExit::Reload => {
                         ::zeroclaw_log::record!(
