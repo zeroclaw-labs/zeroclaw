@@ -6,7 +6,7 @@
 
 use serde_json::json;
 
-use super::types::{DISCORD_MAX_MESSAGE_LENGTH, DiscordOutgoing};
+use super::types::DiscordOutgoing;
 
 /// Credentials needed to answer a deferred interaction later: the followup
 /// webhook is addressed by application id + interaction token.
@@ -100,34 +100,24 @@ pub(crate) async fn discord_reject_interaction(
     Ok(())
 }
 
-/// Deliver the agent's answer by editing the deferred interaction response
-/// (`PATCH /webhooks/{app_id}/{token}/messages/@original`). The token is valid
-/// for 15 minutes; no bot auth header is required for the followup webhook.
+/// Edit the deferred interaction's @original message
+/// (`PATCH {api_base}/webhooks/{app_id}/{token}/messages/@original`). The token
+/// is valid for 15 minutes; no bot auth header is required for the followup
+/// webhook. `content` must be within Discord's 2000-char limit — callers whose
+/// reply may exceed it chunk first and post the remainder via
+/// [`discord_post_interaction_followup`].
 pub(crate) async fn discord_edit_interaction_response(
     client: &reqwest::Client,
     app_id: &str,
     interaction_token: &str,
+    api_base: &str,
     content: &str,
 ) -> anyhow::Result<()> {
-    let url = format!(
-        "https://discord.com/api/v10/webhooks/{app_id}/{interaction_token}/messages/@original"
-    );
-    let trimmed: String = content.chars().take(DISCORD_MAX_MESSAGE_LENGTH).collect();
-    if trimmed.chars().count() < content.chars().count() {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({
-                    "content_chars": content.chars().count(),
-                })),
-            "interaction reply truncated to Discord's 2000-char limit (chunked followups are a planned follow-up)"
-        );
-    }
+    let url = format!("{api_base}/webhooks/{app_id}/{interaction_token}/messages/@original");
     // without_url: transport errors embed the token-bearing URL.
     let resp = client
         .patch(&url)
-        .json(&DiscordOutgoing::text(trimmed).to_rest_json())
+        .json(&DiscordOutgoing::text(content).to_rest_json())
         .send()
         .await
         .map_err(reqwest::Error::without_url)?;
@@ -135,6 +125,31 @@ pub(crate) async fn discord_edit_interaction_response(
         let status = resp.status();
         let err = resp.text().await.unwrap_or_default();
         anyhow::bail!("interaction followup edit failed ({status}): {err}");
+    }
+    Ok(())
+}
+
+/// Post an additional interaction followup message
+/// (`POST {api_base}/webhooks/{app_id}/{token}`), used to deliver the answer
+/// chunks beyond the first when a reply exceeds Discord's 2000-char limit.
+pub(crate) async fn discord_post_interaction_followup(
+    client: &reqwest::Client,
+    app_id: &str,
+    interaction_token: &str,
+    api_base: &str,
+    content: &str,
+) -> anyhow::Result<()> {
+    let url = format!("{api_base}/webhooks/{app_id}/{interaction_token}");
+    let resp = client
+        .post(&url)
+        .json(&DiscordOutgoing::text(content).to_rest_json())
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err = resp.text().await.unwrap_or_default();
+        anyhow::bail!("interaction followup post failed ({status}): {err}");
     }
     Ok(())
 }

@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-
 /// Token usage information from a single API call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenUsage {
@@ -36,6 +35,10 @@ impl TokenUsage {
         }
     }
 
+    pub fn billable_input_tokens(&self) -> u64 {
+        self.input_tokens.saturating_sub(self.cached_input_tokens)
+    }
+
     /// Create a new token usage record. Cached input tokens are billed at
     /// `cached_input_price_per_million`; the rest of `input_tokens` at the
     /// standard `input_price_per_million`. When `cached_input_price` is 0
@@ -50,6 +53,27 @@ impl TokenUsage {
         input_price_per_million: f64,
         output_price_per_million: f64,
         cached_input_price_per_million: f64,
+    ) -> Self {
+        Self::new_with_cache(
+            model,
+            input_tokens,
+            cached_input_tokens,
+            output_tokens,
+            input_price_per_million,
+            cached_input_price_per_million,
+            output_price_per_million,
+        )
+    }
+
+    /// Create a new token usage record with cache-aware input pricing.
+    pub fn new_with_cache(
+        model: impl Into<String>,
+        input_tokens: u64,
+        cached_input_tokens: u64,
+        output_tokens: u64,
+        input_price_per_million: f64,
+        cached_input_price_per_million: f64,
+        output_price_per_million: f64,
     ) -> Self {
         let model = model.into();
         let input_price_per_million = Self::sanitize_price(input_price_per_million);
@@ -211,17 +235,17 @@ pub struct ModelStats {
     pub model: String,
     /// Total cost for this model.
     pub cost_usd: f64,
-    /// Total tokens for this model (input + output).
-    pub total_tokens: u64,
-    /// Input tokens (uncached + cached).
+    /// Total input tokens for this model
     #[serde(default)]
     pub input_tokens: u64,
-    /// Output tokens.
-    #[serde(default)]
-    pub output_tokens: u64,
-    /// Cached input tokens served from the prompt cache.
+    /// Total cached input tokens for this model
     #[serde(default)]
     pub cached_input_tokens: u64,
+    /// Total output tokens for this model
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// Total tokens for this model
+    pub total_tokens: u64,
     /// Number of LLM responses for this model.
     pub request_count: usize,
 }
@@ -251,9 +275,10 @@ mod tests {
         // Expected: (1000/1M)*3 + (500/1M)*15 = 0.003 + 0.0075 = 0.0105
         assert!((usage.cost_usd - 0.0105).abs() < 0.0001);
         assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.cached_input_tokens, 0);
+        assert_eq!(usage.billable_input_tokens(), 1000);
         assert_eq!(usage.output_tokens, 500);
         assert_eq!(usage.total_tokens, 1500);
-        assert_eq!(usage.cached_input_tokens, 0);
     }
 
     #[test]
@@ -274,6 +299,18 @@ mod tests {
         let with_cache = TokenUsage::new("test/model", 1000, 500, 200, 3.0, 15.0, 0.0);
         let without_cache = TokenUsage::new("test/model", 1000, 500, 0, 3.0, 15.0, 0.0);
         assert!((with_cache.cost_usd - without_cache.cost_usd).abs() < 1e-9);
+    }
+
+    #[test]
+    fn token_usage_cache_aware_calculation() {
+        let usage = TokenUsage::new_with_cache("test/model", 1_000, 800, 500, 3.0, 0.3, 15.0);
+
+        // Expected: uncached=(200/1M)*3 + cached=(800/1M)*0.3 + output=(500/1M)*15
+        let expected = 0.0006 + 0.00024 + 0.0075;
+        assert!((usage.cost_usd - expected).abs() < 0.0001);
+        assert_eq!(usage.cached_input_tokens, 800);
+        assert_eq!(usage.billable_input_tokens(), 200);
+        assert_eq!(usage.total_tokens, 1500);
     }
 
     #[test]

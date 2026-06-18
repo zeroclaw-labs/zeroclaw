@@ -32,7 +32,6 @@ impl CostTracker {
     /// Create a new cost tracker.
     pub fn new(config: CostConfig, workspace_dir: &Path) -> Result<Self> {
         let storage_path = resolve_storage_path(workspace_dir)?;
-
         let storage = CostStorage::new(&storage_path).with_context(|| {
             format!(
                 "Failed to open cost storage at {}",
@@ -475,7 +474,6 @@ impl CostStorage {
                 )
             })?;
         }
-
         let now = Utc::now();
         let mut storage = Self {
             path: path.to_path_buf(),
@@ -485,7 +483,6 @@ impl CostStorage {
             cached_year: now.year(),
             cached_month: now.month(),
         };
-
         storage.rebuild_aggregates(
             storage.cached_day,
             storage.cached_year,
@@ -695,6 +692,7 @@ impl CostStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use tempfile::TempDir;
 
     fn enabled_config() -> CostConfig {
