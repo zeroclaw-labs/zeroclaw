@@ -2116,11 +2116,28 @@ impl OpenAiCompatibleModelProvider {
     /// - **assistant messages with `tool_calls`** are converted to plain
     ///   text by extracting only the `content` field (or dropped when the
     ///   content is empty).
+    fn should_skip_internal_pruning_marker(messages: &[ChatMessage], index: usize) -> bool {
+        let Some(msg) = messages.get(index) else {
+            return false;
+        };
+        if msg.is_pruned_tool_exchange_summary() {
+            return true;
+        }
+        msg.is_pruned_context_separator()
+            && index
+                .checked_sub(1)
+                .and_then(|previous| messages.get(previous))
+                .is_some_and(ChatMessage::is_pruned_tool_exchange_summary)
+    }
+
     fn strip_native_tool_messages(&self, messages: &[ChatMessage]) -> Vec<ChatMessage> {
         if self.native_tool_calling {
             return messages.to_vec();
         }
-        let intermediate = messages.iter().filter_map(|msg| {
+        let intermediate = messages.iter().enumerate().filter_map(|(index, msg)| {
+            if Self::should_skip_internal_pruning_marker(messages, index) {
+                return None;
+            }
             if msg.role == "tool" {
                 return None;
             }
@@ -2142,20 +2159,22 @@ impl OpenAiCompatibleModelProvider {
             Some(msg.clone())
         });
 
-        // Coalesce adjacent assistant messages.
+        // Coalesce adjacent same-role chat messages after tool stripping.
         //
-        // A typical trace is:
+        // One common trace is:
         //     user → assistant{content, tool_calls} → tool{result} → assistant{reply}
         // After the filter_map above the `tool` message is gone and the first
         // assistant has been rewritten to plain text, leaving two assistant
-        // messages in a row. Providers targeted by the `native_tool_calling =
+        // messages in a row. A user continuation immediately after a dropped
+        // tool result can also leave two user messages in a row. Providers
+        // targeted by the `native_tool_calling =
         // false` path (Anthropic upstream, MiniMax, and other OpenAI-compat
         // wrappers) reject consecutive same-role messages with HTTP 400, so we
-        // merge them here.
+        // merge adjacent non-system roles here.
         let mut coalesced: Vec<ChatMessage> = Vec::with_capacity(messages.len());
         for msg in intermediate {
             match coalesced.last_mut() {
-                Some(last) if last.role == "assistant" && msg.role == "assistant" => {
+                Some(last) if last.role == msg.role && msg.role != "system" => {
                     if !last.content.is_empty() && !msg.content.is_empty() {
                         last.content.push_str("\n\n");
                     }
@@ -5828,6 +5847,68 @@ mod tests {
              got {:?}",
             stripped[1].content
         );
+    }
+
+    /// Regression for #7804.
+    ///
+    /// A tool-heavy resumed history can contain a user continuation after a
+    /// native tool result. When this OpenAI-compatible prompt-guided path drops
+    /// the `tool` message, the two surrounding user messages become adjacent.
+    /// Anthropic-family backends reached through compatible gateways reject
+    /// that shape with `messages: roles must alternate`.
+    #[test]
+    fn strip_native_tool_messages_coalesces_adjacent_users() {
+        let messages = vec![
+            ChatMessage::user("summarize this build output"),
+            ChatMessage::assistant(
+                r#"{"content":"","tool_calls":[{"id":"t1","name":"shell","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(r#"{"tool_call_id":"t1","content":"cargo output"}"#),
+            ChatMessage::user("go on"),
+        ];
+        let p = OpenAiCompatibleModelProvider::new_merge_system_into_user(
+            "test",
+            "Anthropic-compatible",
+            "https://example.test/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+        );
+        let stripped = p.strip_native_tool_messages(&messages);
+        let roles: Vec<&str> = stripped.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["user"]);
+        assert!(
+            stripped[0].content.contains("summarize this build output")
+                && stripped[0].content.contains("go on"),
+            "merged user message should preserve the original prompt and continuation; got {:?}",
+            stripped[0].content
+        );
+    }
+
+    #[test]
+    fn strip_native_tool_messages_drops_internal_pruning_markers_before_coalescing() {
+        let messages = vec![
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: ChatMessage::pruned_tool_exchange_summary(1),
+            },
+            ChatMessage::pruned_context_separator(),
+            ChatMessage::assistant(
+                r#"{"content":"","tool_calls":[{"id":"t1","name":"shell","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(r#"{"tool_call_id":"t1","content":"cargo output"}"#),
+            ChatMessage::user("go on"),
+        ];
+        let p = OpenAiCompatibleModelProvider::new_merge_system_into_user(
+            "test",
+            "Anthropic-compatible",
+            "https://example.test/v1",
+            Some("k"),
+            AuthStyle::Bearer,
+        );
+        let stripped = p.strip_native_tool_messages(&messages);
+        let roles: Vec<&str> = stripped.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["user"]);
+        assert_eq!(stripped[0].content, "go on");
     }
 
     /// Complementary regression for #5825: when the narration content is
