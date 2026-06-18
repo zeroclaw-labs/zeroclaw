@@ -1230,6 +1230,11 @@ struct NativeMessage {
     /// See #6584.
     #[serde(skip_serializing_if = "Option::is_none", rename = "reasoning")]
     reasoning: Option<String>,
+    /// Tool name for `role: "tool"` messages. Groq native tool calling
+    /// requires this field on every tool-result message; omitting it causes
+    /// HTTP 400 "Tools should have a name!". See #7896 / #5531.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
 }
 
 // ---------------------------------------------------------------
@@ -2054,6 +2059,7 @@ impl OpenAiCompatibleModelProvider {
         let mut used_tool_call_ids = std::collections::HashSet::new();
         let mut tool_call_id_map = std::collections::HashMap::new();
         let mut last_assistant_tool_call_ids: Vec<String> = Vec::new();
+        let mut tool_name_map = std::collections::HashMap::new();
 
         messages
             .iter()
@@ -2066,27 +2072,32 @@ impl OpenAiCompatibleModelProvider {
                 {
                     let tool_calls = parsed_calls
                         .into_iter()
-                        .map(|tc| ToolCall {
-                            id: Some({
-                                let normalized_id = reserve_tool_call_id_for_contract(
-                                    targets_mistral_tool_call_contract,
-                                    Some(tc.id.clone()),
-                                    &mut used_tool_call_ids,
-                                );
-                                tool_call_id_map.insert(tc.id, normalized_id.clone());
-                                normalized_id
-                            }),
-                            kind: Some("function".to_string()),
-                            function: Some(Function {
-                                name: Some(tc.name),
-                                arguments: Some(tc.arguments),
-                            }),
-                            name: None,
-                            arguments: None,
-                            parameters: None,
-                            // Round-trip extra_content (e.g. Gemini
-                            // thoughtSignature) — dropping it here was the bug.
-                            extra_content: tc.extra_content,
+                        .map(|tc| {
+                            let tc_id = tc.id.clone();
+                            let tc_name = tc.name.clone();
+                            tool_name_map.insert(tc_id, tc_name);
+                            ToolCall {
+                                id: Some({
+                                    let normalized_id = reserve_tool_call_id_for_contract(
+                                        targets_mistral_tool_call_contract,
+                                        Some(tc.id.clone()),
+                                        &mut used_tool_call_ids,
+                                    );
+                                    tool_call_id_map.insert(tc.id.clone(), normalized_id.clone());
+                                    normalized_id
+                                }),
+                                kind: Some("function".to_string()),
+                                function: Some(Function {
+                                    name: Some(tc.name),
+                                    arguments: Some(tc.arguments),
+                                }),
+                                name: None,
+                                arguments: None,
+                                parameters: None,
+                                // Round-trip extra_content (e.g. Gemini
+                                // thoughtSignature) — dropping it here was the bug.
+                                extra_content: tc.extra_content,
+                            }
                         })
                         .collect::<Vec<_>>();
 
@@ -2113,6 +2124,7 @@ impl OpenAiCompatibleModelProvider {
                         tool_calls: Some(tool_calls),
                         reasoning_content,
                         reasoning,
+                        name: None,
                     };
                 }
 
@@ -2149,6 +2161,7 @@ impl OpenAiCompatibleModelProvider {
                         tool_calls: None,
                         reasoning_content,
                         reasoning,
+                        name: None,
                     };
                 }
 
@@ -2196,6 +2209,21 @@ impl OpenAiCompatibleModelProvider {
                         })
                         .or_else(|| Some(MessageContent::Text(message.content.clone())));
 
+                    // Groq native tool calling requires the tool `name` on
+                    // every role-tool message; look it up from the paired
+                    // assistant tool-call, falling back to any name carried
+                    // in the tool message content itself. See #7896 / #5531.
+                    let tool_name = value
+                        .get("tool_call_id")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|raw_id| tool_name_map.get(raw_id).cloned())
+                        .or_else(|| {
+                            value
+                                .get("name")
+                                .and_then(serde_json::Value::as_str)
+                                .map(ToString::to_string)
+                        });
+
                     return NativeMessage {
                         role: "tool".to_string(),
                         content,
@@ -2203,6 +2231,7 @@ impl OpenAiCompatibleModelProvider {
                         tool_calls: None,
                         reasoning_content: None,
                         reasoning: None,
+                        name: tool_name,
                     };
                 }
 
@@ -2217,6 +2246,7 @@ impl OpenAiCompatibleModelProvider {
                     tool_calls: None,
                     reasoning_content: None,
                     reasoning: None,
+                    name: None,
                 }
             })
             .collect()
@@ -3618,6 +3648,7 @@ mod tests {
                 tool_calls: None,
                 reasoning_content: None,
                 reasoning: None,
+                name: None,
             }],
             temperature: Some(0.7),
             stream: Some(true),
@@ -5941,6 +5972,7 @@ mod tests {
             tool_calls: None,
             reasoning_content: None,
             reasoning: None,
+            name: None,
         };
         let json = serde_json::to_string(&msg_without).unwrap();
         assert!(
@@ -5955,6 +5987,7 @@ mod tests {
             tool_calls: None,
             reasoning_content: Some("thinking...".to_string()),
             reasoning: None,
+            name: None,
         };
         let json = serde_json::to_string(&msg_with).unwrap();
         assert!(
