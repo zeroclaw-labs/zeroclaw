@@ -6,6 +6,7 @@
 
 use serde_json::json;
 
+use super::embed::DiscordEmbed;
 use super::types::{DISCORD_MAX_MESSAGE_LENGTH, DiscordOutgoing};
 
 /// Credentials needed to answer a deferred interaction later: the followup
@@ -101,17 +102,20 @@ pub(crate) async fn discord_reject_interaction(
 }
 
 /// Deliver the agent's answer by editing the deferred interaction response
-/// (`PATCH /webhooks/{app_id}/{token}/messages/@original`). The token is valid
-/// for 15 minutes; no bot auth header is required for the followup webhook.
+/// (`PATCH {api_base}/webhooks/{app_id}/{token}/messages/@original`). The token
+/// is valid for 15 minutes; no bot auth header is required for the followup
+/// webhook. Renders any `[EMBED:…]` the agent emitted: `embeds` is attached
+/// alongside the (2000-char-capped) content via the same `DiscordOutgoing`
+/// envelope the normal send path uses. `api_base` is injectable for tests.
 pub(crate) async fn discord_edit_interaction_response(
     client: &reqwest::Client,
     app_id: &str,
     interaction_token: &str,
+    api_base: &str,
     content: &str,
+    embeds: &[DiscordEmbed],
 ) -> anyhow::Result<()> {
-    let url = format!(
-        "https://discord.com/api/v10/webhooks/{app_id}/{interaction_token}/messages/@original"
-    );
+    let url = format!("{api_base}/webhooks/{app_id}/{interaction_token}/messages/@original");
     let trimmed: String = content.chars().take(DISCORD_MAX_MESSAGE_LENGTH).collect();
     if trimmed.chars().count() < content.chars().count() {
         ::zeroclaw_log::record!(
@@ -124,10 +128,15 @@ pub(crate) async fn discord_edit_interaction_response(
             "interaction reply truncated to Discord's 2000-char limit (chunked followups are a planned follow-up)"
         );
     }
+    let payload = DiscordOutgoing {
+        content: Some(trimmed),
+        embeds: embeds.to_vec(),
+        ..Default::default()
+    };
     // without_url: transport errors embed the token-bearing URL.
     let resp = client
         .patch(&url)
-        .json(&DiscordOutgoing::text(trimmed).to_rest_json())
+        .json(&payload.to_rest_json())
         .send()
         .await
         .map_err(reqwest::Error::without_url)?;
@@ -137,4 +146,58 @@ pub(crate) async fn discord_edit_interaction_response(
         anyhow::bail!("interaction followup edit failed ({status}): {err}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod embed_reply_tests {
+    use super::*;
+    use wiremock::matchers::{body_json, body_partial_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn slash_reply_attaches_embeds_to_the_original_edit() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/webhooks/app/tok/messages/@original"))
+            .and(body_partial_json(serde_json::json!({
+                "content": "see below",
+                "embeds": [{ "title": "Report" }]
+            })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let embed = DiscordEmbed {
+            title: Some("Report".to_string()),
+            ..Default::default()
+        };
+        discord_edit_interaction_response(
+            &client,
+            "app",
+            "tok",
+            &server.uri(),
+            "see below",
+            std::slice::from_ref(&embed),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn content_only_slash_reply_omits_the_embeds_key() {
+        // No embeds → the @original edit body stays byte-stable {"content": …}.
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/webhooks/app/tok/messages/@original"))
+            .and(body_json(serde_json::json!({ "content": "hi" })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        discord_edit_interaction_response(&client, "app", "tok", &server.uri(), "hi", &[])
+            .await
+            .unwrap();
+    }
 }

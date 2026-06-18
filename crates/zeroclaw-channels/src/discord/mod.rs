@@ -1400,13 +1400,22 @@ impl Channel for DiscordChannel {
             if pending.created.elapsed() > INTERACTION_TOKEN_TTL {
                 anyhow::bail!("interaction followup token expired (id {interaction_id}, >15min)");
             }
-            let content = crate::util::strip_tool_call_tags(&message.content);
+            // Render embeds on slash-command replies too: lift `[EMBED:…]` out
+            // and attach it to the @original edit, the same as a normal send.
+            // (Bad-URL / truncation reactions aren't surfaced on an interaction
+            // @original edit — consistent with how it doesn't surface attachment
+            // failures either; the embed still renders without the bad field.)
+            let raw = crate::util::strip_tool_call_tags(&message.content);
+            let (content, embeds, _embed_failures, _embeds_truncated) =
+                prepare_outgoing_embeds(&raw, self.workspace_dir.as_deref());
             let client = self.http_client();
             return discord_edit_interaction_response(
                 &client,
                 &pending.app_id,
                 &pending.token,
+                DISCORD_API_BASE,
                 &content,
+                &embeds,
             )
             .await;
         }
@@ -2144,7 +2153,7 @@ impl Channel for DiscordChannel {
                                             let msg = i18n::get_required_cli_string(
                                                 "channel-discord-interaction-unavailable",
                                             );
-                                            if let Err(e) = discord_edit_interaction_response(&client, &app_id, &interaction_token, &msg).await {
+                                            if let Err(e) = discord_edit_interaction_response(&client, &app_id, &interaction_token, DISCORD_API_BASE, &msg, &[]).await {
                                                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord interaction unavailable-notice failed");
                                             }
                                             pending.lock().remove(&interaction_id);
@@ -2792,7 +2801,12 @@ impl Channel for DiscordChannel {
         self.last_draft_edit.lock().remove(recipient);
 
         let text = &crate::util::strip_tool_call_tags(text);
-        let (cleaned_content, parsed_attachments) = parse_attachment_markers(text);
+        // Lift `[EMBED:…]` out before the media-marker scan (its JSON can contain
+        // `[`/`]`); embeds attach to the first finalized message below, so a
+        // streaming/draft reply renders embeds the same as a normal send.
+        let (text_without_embeds, embeds, _embed_failures, _embeds_truncated) =
+            prepare_outgoing_embeds(text, self.workspace_dir.as_deref());
+        let (cleaned_content, parsed_attachments) = parse_attachment_markers(&text_without_embeds);
         let (mut local_files, remote_urls, failures) =
             classify_outgoing_attachments(&parsed_attachments, self.workspace_dir.as_deref());
         let body = with_inline_attachment_urls(&cleaned_content, &remote_urls);
@@ -2813,11 +2827,17 @@ impl Channel for DiscordChannel {
             let mut first_message_id: Option<String> = None;
             for (i, chunk) in chunks.iter().enumerate() {
                 let new_id = if i == 0 {
-                    send_discord_message_with_files(
+                    // Embeds + files ride the first message.
+                    let payload = DiscordOutgoing {
+                        content: Some(chunk.clone()),
+                        embeds: embeds.clone(),
+                        ..Default::default()
+                    };
+                    send_discord_message_payload_with_files(
                         &client,
                         &self.bot_token,
                         recipient,
-                        chunk,
+                        &payload,
                         &local_files,
                     )
                     .await?
@@ -2843,8 +2863,18 @@ impl Channel for DiscordChannel {
             let chunks = split_message_for_discord(&content);
             let mut first_message_id: Option<String> = None;
             for (i, chunk) in chunks.iter().enumerate() {
-                let new_id =
-                    send_discord_message_json(&client, &self.bot_token, recipient, chunk).await?;
+                let new_id = if i == 0 {
+                    // Embeds ride the first message.
+                    let payload = DiscordOutgoing {
+                        content: Some(chunk.clone()),
+                        embeds: embeds.clone(),
+                        ..Default::default()
+                    };
+                    send_discord_message_payload(&client, &self.bot_token, recipient, &payload)
+                        .await?
+                } else {
+                    send_discord_message_json(&client, &self.bot_token, recipient, chunk).await?
+                };
                 if first_message_id.is_none() {
                     first_message_id = Some(new_id);
                 }
@@ -2857,27 +2887,38 @@ impl Channel for DiscordChannel {
             return Ok(());
         }
 
-        // Path 3: simple case — edit in-place; fall back to delete + POST on failure.
-        // The reaction target is the draft message_id when the edit lands;
-        // when the fallback fires it's the freshly posted message instead.
-        let reaction_target =
-            match edit_discord_message(&client, &self.bot_token, recipient, message_id, &content)
-                .await
-            {
-                Ok(()) => message_id.to_string(),
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"e": e.to_string()})),
-                        "Discord finalize_draft edit failed: ; falling back to delete+send"
-                    );
-                    let _ = delete_discord_message(&client, &self.bot_token, recipient, message_id)
-                        .await;
-                    send_discord_message_json(&client, &self.bot_token, recipient, &content).await?
-                }
-            };
+        // Path 3: simple case — edit in-place (with any embeds); fall back to
+        // delete + POST on failure. The reaction target is the draft message_id
+        // when the edit lands; when the fallback fires it's the freshly posted
+        // message instead.
+        let payload = DiscordOutgoing {
+            content: Some(content.clone()),
+            embeds: embeds.clone(),
+            ..Default::default()
+        };
+        let reaction_target = match edit_discord_message_payload(
+            &client,
+            &self.bot_token,
+            recipient,
+            message_id,
+            &payload,
+        )
+        .await
+        {
+            Ok(()) => message_id.to_string(),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                    "Discord finalize_draft edit failed: ; falling back to delete+send"
+                );
+                let _ =
+                    delete_discord_message(&client, &self.bot_token, recipient, message_id).await;
+                send_discord_message_payload(&client, &self.bot_token, recipient, &payload).await?
+            }
+        };
         self.apply_failure_reactions(recipient, Some(&reaction_target), &reactions)
             .await;
 
@@ -3069,6 +3110,27 @@ mod tests {
         assert!(embeds.is_empty());
         assert!(failures.is_empty());
         assert!(!truncated);
+    }
+
+    #[test]
+    fn finalize_draft_builds_a_first_message_payload_carrying_embeds() {
+        // finalize_draft (and the slash-reply path) lift embeds out of the final
+        // text and attach them to the first message's DiscordOutgoing — the same
+        // transformation send() does. Pin that so neither path regresses to
+        // content-only and leaks the raw [EMBED:…] marker.
+        let raw = "Result [EMBED:{\"title\":\"Report\"}]";
+        let (content, embeds, _failures, _truncated) = prepare_outgoing_embeds(raw, None);
+        assert_eq!(content, "Result");
+        assert_eq!(embeds.len(), 1);
+        let payload = DiscordOutgoing {
+            content: Some(content),
+            embeds,
+            ..Default::default()
+        };
+        assert_eq!(
+            payload.to_rest_json(),
+            serde_json::json!({ "content": "Result", "embeds": [{ "title": "Report" }] })
+        );
     }
 
     #[test]

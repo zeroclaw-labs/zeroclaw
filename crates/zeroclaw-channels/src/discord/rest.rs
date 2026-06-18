@@ -58,25 +58,6 @@ pub(crate) async fn send_discord_message_payload(
     extract_message_id(resp).await
 }
 
-/// POST a content-only message with file attachments via multipart. A thin
-/// adapter over [`send_discord_message_payload_with_files`].
-pub(crate) async fn send_discord_message_with_files(
-    client: &reqwest::Client,
-    bot_token: &str,
-    recipient: &str,
-    content: &str,
-    files: &[PathBuf],
-) -> anyhow::Result<String> {
-    send_discord_message_payload_with_files(
-        client,
-        bot_token,
-        recipient,
-        &DiscordOutgoing::text(content),
-        files,
-    )
-    .await
-}
-
 /// POST a full message envelope with file attachments via multipart,
 /// returning the new message's ID. Callers that don't need the ID can discard it.
 pub(crate) async fn send_discord_message_payload_with_files(
@@ -155,10 +136,8 @@ async fn extract_message_id(resp: reqwest::Response) -> anyhow::Result<String> {
         })
 }
 
-/// Edit an existing Discord message via PATCH.
-///
-/// Returns `Ok(())` on success. On HTTP 429 (rate limited), logs at debug
-/// level and returns `Ok(())` since skipping a mid-stream edit is harmless.
+/// Edit an existing Discord message with content only. A thin adapter over
+/// [`edit_discord_message_payload`].
 pub(crate) async fn edit_discord_message(
     client: &reqwest::Client,
     bot_token: &str,
@@ -166,8 +145,30 @@ pub(crate) async fn edit_discord_message(
     message_id: &str,
     content: &str,
 ) -> anyhow::Result<()> {
+    edit_discord_message_payload(
+        client,
+        bot_token,
+        channel_id,
+        message_id,
+        &DiscordOutgoing::text(content),
+    )
+    .await
+}
+
+/// Edit an existing Discord message with a full envelope (content plus embeds)
+/// via PATCH.
+///
+/// Returns `Ok(())` on success. On HTTP 429 (rate limited), logs at debug
+/// level and returns `Ok(())` since skipping a mid-stream edit is harmless.
+pub(crate) async fn edit_discord_message_payload(
+    client: &reqwest::Client,
+    bot_token: &str,
+    channel_id: &str,
+    message_id: &str,
+    payload: &DiscordOutgoing,
+) -> anyhow::Result<()> {
     let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}");
-    let body = DiscordOutgoing::text(content).to_rest_json();
+    let body = payload.to_rest_json();
 
     let resp = client
         .patch(&url)
