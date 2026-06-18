@@ -925,7 +925,6 @@ pub async fn run(
         // Profile values (when set) override the agent's inline fields.
         // See `Config::resolved_agent_config` for precedence rules.
         let eff_max_history_messages = agent.resolved.max_history_messages;
-        let eff_max_context_tokens = agent.resolved.max_context_tokens;
         let eff_compact_context = agent.resolved.compact_context;
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
         let eff_max_context_tokens = config.effective_model_context_window(agent_alias);
