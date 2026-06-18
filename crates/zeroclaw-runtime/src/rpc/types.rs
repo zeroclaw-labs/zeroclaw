@@ -1213,6 +1213,11 @@ rpc_type! {
         pub until_ts: Option<String>,
         #[serde(default)]
         pub until_id: Option<String>,
+        /// Byte offset to resume reading from. Set from the previous
+        /// `LogsQueryResult::next_cursor_line_offset` for deterministic
+        /// pagination regardless of id ordering.
+        #[serde(default)]
+        pub until_line_offset: Option<u64>,
         #[serde(default)]
         pub severity_min: Option<u8>,
         #[serde(default)]
@@ -1236,6 +1241,10 @@ rpc_type! {
     pub struct LogsQueryResult {
         pub events: Vec<serde_json::Value>,
         pub next_cursor: Option<(String, String)>,
+        /// Byte offset past the last event on this page. Callers should
+        /// pass this back as `until_line_offset` on the next request to
+        /// resume without re-scanning already-read bytes.
+        pub next_cursor_line_offset: Option<u64>,
         pub at_end: bool,
     }
 }
