@@ -1,5 +1,18 @@
 use crate::approval::ApprovalManager;
 
+/// Format token count with thousands separators.
+fn format_tokens(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, ch) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
 /// CLI channel factory, injected by the binary. Returns a `Box<dyn Channel>` for interactive mode.
 pub static CLI_CHANNEL_FN: std::sync::OnceLock<
     Box<dyn Fn() -> Box<dyn zeroclaw_api::channel::Channel> + Send + Sync>,
@@ -839,7 +852,10 @@ pub async fn run(
         // See `Config::effective_*` helpers for precedence rules.
         let _eff_max_tool_iterations = config.effective_max_tool_iterations(agent_alias);
         let eff_max_history_messages = config.effective_max_history_messages(agent_alias);
-        let eff_max_context_tokens = config.effective_max_context_tokens(agent_alias);
+        // Output budget (max tokens to send per request) — from runtime profile
+        let _eff_max_output_tokens = config.effective_max_context_tokens(agent_alias);
+        // Model's context window (max input tokens) — from provider config
+        let eff_max_context_tokens = config.effective_model_context_window(agent_alias);
         let eff_compact_context = config.effective_compact_context(agent_alias);
         let eff_max_system_prompt_chars = config.effective_max_system_prompt_chars(agent_alias);
         let _eff_max_tool_result_chars = config.effective_max_tool_result_chars(agent_alias);
@@ -1602,7 +1618,7 @@ pub async fn run(
                                 agent.resolved.strict_tool_parsing,
                                 agent.resolved.parallel_tools,
                                 agent.resolved.max_tool_result_chars,
-                                agent.resolved.max_context_tokens,
+                                eff_max_context_tokens,
                                 None, // shared_budget
                                 None, // channel: CLI mode — uses prompt_cli
                                 None, // receipt_generator
@@ -2020,7 +2036,7 @@ pub async fn run(
                                     agent.resolved.strict_tool_parsing,
                                     agent.resolved.parallel_tools,
                                     agent.resolved.max_tool_result_chars,
-                                    agent.resolved.max_context_tokens,
+                                    eff_max_context_tokens,
                                     None, // shared_budget
                                     None, // channel: interactive CLI — uses prompt_cli
                                     None, // receipt_generator
@@ -2174,6 +2190,34 @@ pub async fn run(
                     eprintln!("\nError sending CLI response: {e}\n");
                 }
                 observer.record_event(&ObserverEvent::TurnComplete);
+
+                // Display context usage for this turn.
+                if let Some(ref ctx) = cost_tracking_context {
+                    let usage = ctx.snapshot_turn_usage();
+                    if usage.input_tokens > 0 || usage.output_tokens > 0 {
+                        let max_ctx = eff_max_context_tokens as u64;
+                        let pct = if max_ctx > 0 {
+                            (usage.input_tokens as f64 / max_ctx as f64 * 100.0).min(100.0)
+                        } else {
+                            0.0
+                        };
+                        let bar_width: usize = 16;
+                        let filled = ((pct / 100.0) * bar_width as f64).round() as usize;
+                        let empty = bar_width.saturating_sub(filled);
+                        let bar = format!(
+                            "[{}{}]",
+                            "\u{2588}".repeat(filled),
+                            "\u{2591}".repeat(empty)
+                        );
+                        eprintln!(
+                            "\x1b[2mctx: {:>7} / {:>7}  {}  {:.0}%\x1b[0m",
+                            format_tokens(usage.input_tokens),
+                            format_tokens(max_ctx),
+                            bar,
+                            pct
+                        );
+                    }
+                }
 
                 // Context compression before hard trimming to preserve long-context signal.
                 {

@@ -1157,6 +1157,78 @@ pub async fn handle_rename_map_key(
     .into_response()
 }
 
+/// `POST /api/config/model-providers/{type}/{alias}/refresh-context-window`
+/// — fetch and update `context_window` from the provider's /models endpoint.
+///
+/// Returns the updated config value. Only works for providers that expose
+/// `context_length`/`context_window` in their `/models` endpoint
+/// (OpenRouter, Together, Groq, Fireworks, DeepInfra, Hyperbolic, Anyscale, Novita, Nebius).
+///
+/// If the provider doesn't support it or the fetch fails, returns 400 with an error.
+pub async fn handle_refresh_context_window(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path((provider_type, alias)): axum::extract::Path<(String, String)>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let mut working = state.config.read().clone();
+    let path = format!("providers.models.{provider_type}.{alias}");
+
+    // Verify the entry exists
+    if working.get_prop(&format!("{path}.model")).is_err() {
+        return error_response(
+            ConfigApiError::new(ConfigApiCode::PathNotFound, format!("model provider '{provider_type}.{alias}' not found"))
+                .with_path(&path),
+        );
+    }
+
+    // Build minimal provider config for fetch
+    let model = working.get_prop(&format!("{path}.model")).ok().unwrap_or_default();
+    let uri = working.get_prop(&format!("{path}.uri")).ok();
+
+    let provider_config = zeroclaw_config::schema::ModelProviderConfig {
+        model: Some(model),
+        uri,
+        ..Default::default()
+    };
+
+    // Fetch context window from provider
+    let context_window = match zeroclaw_providers::fetch_context_window(&provider_type, &provider_config).await {
+        Some(ctx) => ctx,
+        None => {
+            return error_response(
+                ConfigApiError::new(
+                    ConfigApiCode::InvalidFormat,
+                    format!("provider '{provider_type}' does not support context window auto-detection or fetch failed"),
+                )
+                .with_path(&path),
+            );
+        }
+    };
+
+    // Update config
+    if let Err(e) = working.set_prop_persistent(&format!("{path}.context_window"), &context_window.to_string()) {
+        return error_response(
+            ConfigApiError::new(ConfigApiCode::InternalError, format!("failed to persist context_window: {e}"))
+                .with_path(&path),
+        );
+    }
+
+    working.mark_dirty(&format!("{path}.context_window"));
+    if let Err(e) = persist_and_swap(&state, working).await {
+        return error_response(e);
+    }
+
+    axum::Json(serde_json::json!({
+        "path": path,
+        "context_window": context_window,
+    }))
+    .into_response()
+}
+
 /// PATCH /api/config — apply a JSON Patch document atomically.
 ///
 /// Body is an array of operations executed in order against an in-memory

@@ -397,6 +397,93 @@ pub async fn run_models(
     Ok(())
 }
 
+/// Update context_window in config.toml from provider /models endpoints.
+/// Returns the number of providers updated.
+pub async fn update_context_windows(
+    config: &mut zeroclaw_config::schema::Config,
+    provider_override: Option<&str>,
+    dry_run: bool,
+) -> anyhow::Result<usize> {
+    let mut updated = 0usize;
+
+    // Collect all the data we need first to avoid borrow conflicts
+    let targets: Vec<(String, String, Option<String>, Option<usize>)> = if let Some(model_provider) = provider_override {
+        // Single provider - use find_by_name to look up by "type.alias" format
+        if let Some((_, _, entry)) = config.providers.models.find_by_name(model_provider) {
+            vec![(model_provider.to_string(), entry.model.clone().unwrap_or_default(), entry.uri.clone(), entry.context_window)]
+        } else {
+            anyhow::bail!("Model provider '{model_provider}' not found in config");
+        }
+    } else {
+        // All providers
+        config
+            .providers
+            .models
+            .iter_entries()
+            .map(|(t, a, e)| (format!("{t}.{a}"), e.model.clone().unwrap_or_default(), e.uri.clone(), e.context_window))
+            .collect()
+    };
+
+    for (provider_ref, model, uri, existing_context_window) in targets {
+        // Skip if already has context_window set
+        if existing_context_window.is_some() {
+            println!("  {provider_ref}: already has context_window = {}", existing_context_window.unwrap());
+            continue;
+        }
+
+        // Skip if no model configured
+        if model.is_empty() {
+            println!("  {provider_ref}: no model configured, skipping");
+            continue;
+        }
+
+        // Build minimal provider config for fetch
+        let provider_type = provider_ref.split('.').next().unwrap_or("");
+
+        // Fetch context window from provider
+        match zeroclaw_providers::fetch_context_window(provider_type, &zeroclaw_config::schema::ModelProviderConfig {
+            model: Some(model.clone()),
+            uri: uri.clone(),
+            ..Default::default()
+        }).await {
+            Some(ctx) => {
+                if dry_run {
+                    println!("  {provider_ref}: would set context_window = {ctx} (dry run)");
+                } else {
+                    // Update the config - need to find and mutate
+                    let mut found = false;
+                    for entry_mut in config.providers.models.iter_entries_mut() {
+                        if entry_mut.2.model.as_deref() == Some(model.as_str()) && entry_mut.2.uri == uri {
+                            entry_mut.2.context_window = Some(ctx);
+                            updated += 1;
+                            println!("  {provider_ref}: set context_window = {ctx}");
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        println!("  {provider_ref}: could not find entry to update");
+                    }
+                }
+            }
+            None => {
+                println!("  {provider_ref}: provider does not expose context window or fetch failed");
+            }
+        }
+    }
+
+    if !dry_run && updated > 0 {
+        config.save().await?;
+        println!("\nSaved {updated} updates to config.toml");
+    } else if dry_run {
+        println!("\nDry run complete — no changes written. Run without --dry-run to apply.");
+    } else {
+        println!("\nNo updates needed.");
+    }
+
+    Ok(updated)
+}
+
 pub fn run_traces(
     config: &Config,
     id: Option<&str>,
