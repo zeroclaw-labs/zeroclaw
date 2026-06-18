@@ -981,15 +981,15 @@ impl Tool for GitOperationsTool {
             }
 
             if !found_git {
+                let path_display = working_dir.display().to_string();
+                let error_msg = crate::i18n::get_required_tool_string_with_args(
+                    "tool-git-operations-error-not-in-repo",
+                    &[("path", &path_display)],
+                );
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!(
-                        "Not in a git repository (checked path: {}). \
-                        Pass `path` to target a subdirectory inside a Git worktree, \
-                        or initialize a repository with `git init` before running git_operations.",
-                        working_dir.display()
-                    )),
+                    error: Some(error_msg),
                 });
             }
         }
@@ -1788,17 +1788,20 @@ mod tests {
         assert!(!result.success, "expected failure in a non-git directory");
         let error_msg = result.error.expect("expected an error message");
 
-        // The error must contain the checked path so the user knows where we looked.
+        // The error is routed through the `tool-git-operations-error-not-in-repo`
+        // Fluent key. The checked path is a locale-independent argument, so it is
+        // present in every translation and the user always sees where we looked.
         let path_str = tmp.path().display().to_string();
         assert!(
             error_msg.contains(&path_str),
             "error message should contain the checked path ({path_str:?}), got: {error_msg:?}"
         );
 
-        // The error must contain the recovery keyword so the user knows what to do.
+        // The error must carry an actionable recovery hint. Tests resolve to the
+        // `en` catalogue, whose message tells the user to initialize a repository.
         assert!(
-            error_msg.contains("git init"),
-            "error message should contain recovery hint \"git init\", got: {error_msg:?}"
+            error_msg.contains("initialize"),
+            "error message should contain a recovery hint (\"initialize\"), got: {error_msg:?}"
         );
     }
 }
