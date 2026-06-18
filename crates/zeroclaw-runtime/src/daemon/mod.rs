@@ -1411,6 +1411,7 @@ fn has_supervised_channels(config: &Config) -> bool {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use zeroclaw_config::schema::MattermostListenMode;
 
     fn test_config(tmp: &TempDir) -> Config {
         let config = Config {
@@ -1658,6 +1659,7 @@ mod tests {
                 mention_only: Some(false),
                 interrupt_on_new_message: false,
                 proxy_url: None,
+                listen_mode: MattermostListenMode::default(),
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
