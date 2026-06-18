@@ -717,6 +717,19 @@ pub fn all_tools_with_runtime(
         }
     }
 
+    // Inkbox tools — registered for the first enabled inkbox identity so the
+    // agent can send/triage/call proactively (the channel handles inbound).
+    #[cfg(feature = "inkbox-tools")]
+    {
+        if let Some(ic) = root_config.channels.inkbox.values().find(|c| c.enabled) {
+            for tool in
+                zeroclaw_tools::inkbox::build_inkbox_tools(&ic.api_key, &ic.identity, &ic.base_url)
+            {
+                tool_arcs.push(tool);
+            }
+        }
+    }
+
     // LLM task tool — registered using the calling agent's provider
     if let Some((family, alias, entry)) = root_config.resolved_model_provider_for_agent(agent_alias)
     {

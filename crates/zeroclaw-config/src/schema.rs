@@ -11937,6 +11937,12 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub imessage: HashMap<String, IMessageConfig>,
+    /// Inkbox channel instances (`[channels.inkbox.<alias>]`). Email, SMS/MMS,
+    /// iMessage, and voice for an agent identity, delivered over the Inkbox
+    /// tunnel.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub inkbox: HashMap<String, InkboxConfig>,
     /// Matrix channel instances (`[channels.matrix.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -12130,6 +12136,12 @@ impl ChannelsConfig {
                 configured: !self.imessage.is_empty(),
             },
             ChannelInfo {
+                kind: "inkbox",
+                name: "Inkbox",
+                desc: "email, SMS, iMessage, and voice for an agent identity",
+                configured: !self.inkbox.is_empty(),
+            },
+            ChannelInfo {
                 kind: "matrix",
                 name: "Matrix",
                 desc: "self-hosted chat",
@@ -12318,6 +12330,7 @@ impl ChannelsConfig {
             || self.mattermost.values().any(|c| c.enabled)
             || self.webhook.values().any(|c| c.enabled)
             || self.imessage.values().any(|c| c.enabled)
+            || self.inkbox.values().any(|c| c.enabled)
             || self.matrix.values().any(|c| c.enabled)
             || self.signal.values().any(|c| c.enabled)
             || self.whatsapp.values().any(|c| c.enabled)
@@ -12355,7 +12368,7 @@ impl ChannelsConfig {
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
     /// instead of accepting a target the delivery layer silently drops.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 34] {
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 35] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),
@@ -12363,6 +12376,7 @@ impl ChannelsConfig {
             ("mattermost", !self.mattermost.is_empty(), true),
             ("webhook", !self.webhook.is_empty(), true),
             ("imessage", !self.imessage.is_empty(), true),
+            ("inkbox", !self.inkbox.is_empty(), true),
             ("matrix", !self.matrix.is_empty(), true),
             ("signal", !self.signal.is_empty(), true),
             ("whatsapp", !self.whatsapp.is_empty(), true),
@@ -12447,6 +12461,7 @@ impl Default for ChannelsConfig {
             mattermost: HashMap::new(),
             webhook: HashMap::new(),
             imessage: HashMap::new(),
+            inkbox: HashMap::new(),
             matrix: HashMap::new(),
             signal: HashMap::new(),
             whatsapp: HashMap::new(),
@@ -12547,6 +12562,79 @@ fn default_channel_approval_timeout_secs() -> u64 {
 
 fn default_matrix_draft_update_interval_ms() -> u64 {
     1500
+}
+
+fn default_inkbox_base_url() -> String {
+    "https://inkbox.ai".to_string()
+}
+
+/// Inkbox channel configuration.
+///
+/// One instance per agent identity. Inbound email/SMS/iMessage/voice arrive
+/// over the Inkbox tunnel; outbound replies go through the Inkbox API.
+/// `[channels.inkbox.default]` is the conventional single-instance key.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.inkbox"]
+pub struct InkboxConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default `false`.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub enabled: bool,
+    /// Inkbox API key (`X-API-Key`). Agent-scoped keys are recommended.
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub api_key: String,
+    /// Inkbox agent identity handle. Also the tunnel name the data plane opens.
+    #[tab(Connection)]
+    pub identity: String,
+    /// Webhook signing key (`whsec_...`) used to verify inbound events. When
+    /// empty, inbound events fail verification and are dropped.
+    #[secret]
+    #[tab(Connection)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default)]
+    pub signing_key: String,
+    /// Inkbox API base URL. Defaults to `https://inkbox.ai`.
+    #[tab(Connection)]
+    #[serde(default = "default_inkbox_base_url")]
+    pub base_url: String,
+    /// Tools excluded from this channel's tool spec.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub excluded_tools: Vec<String>,
+    /// Per-(channel, recipient) outbound pacing floor in seconds (0 disables).
+    #[serde(default)]
+    pub reply_min_interval_secs: u64,
+    /// Per-(channel, recipient) outbound pacing queue depth.
+    #[serde(default)]
+    pub reply_queue_depth_max: u16,
+}
+
+impl Default for InkboxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: String::new(),
+            identity: String::new(),
+            signing_key: String::new(),
+            base_url: default_inkbox_base_url(),
+            excluded_tools: Vec::new(),
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
+        }
+    }
+}
+
+impl ChannelConfig for InkboxConfig {
+    fn name() -> &'static str {
+        "Inkbox"
+    }
+    fn desc() -> &'static str {
+        "email, SMS, iMessage, and voice for an agent identity"
+    }
 }
 
 /// Telegram bot channel configuration.
@@ -13625,6 +13713,7 @@ impl_reply_pacing!(
     MatrixConfig,
     SignalConfig,
     WhatsAppConfig,
+    InkboxConfig,
 );
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
@@ -17436,6 +17525,7 @@ impl Config {
             .chain(rows("mattermost", &c.mattermost))
             .chain(rows("webhook", &c.webhook))
             .chain(rows("imessage", &c.imessage))
+            .chain(rows("inkbox", &c.inkbox))
             .chain(rows("matrix", &c.matrix))
             .chain(rows("signal", &c.signal))
             .chain(rows("whatsapp", &c.whatsapp))
@@ -21883,6 +21973,7 @@ auto_save = true
                 mattermost: HashMap::new(),
                 webhook: HashMap::new(),
                 imessage: HashMap::new(),
+                inkbox: HashMap::new(),
                 matrix: HashMap::new(),
                 signal: HashMap::new(),
                 whatsapp: HashMap::new(),
@@ -23910,6 +24001,7 @@ allowed_numbers = ["+1", "+2"]
             mattermost: HashMap::new(),
             webhook: HashMap::new(),
             imessage: HashMap::new(),
+            inkbox: HashMap::new(),
             matrix: HashMap::new(),
             signal: HashMap::new(),
             whatsapp: HashMap::from([(

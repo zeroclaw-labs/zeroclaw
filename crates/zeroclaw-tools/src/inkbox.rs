@@ -1,0 +1,895 @@
+//! Inkbox agent tools — proactive actions the model can call.
+//!
+//! The native [`crate::inkbox`](super) channel handles *inbound* email / SMS /
+//! iMessage / voice and lets the agent *reply*. These tools add the *outbound*
+//! surface the OpenClaw / Hermes plugins exposed: send on any channel, place a
+//! call, and triage conversations — without waiting for an inbound message.
+//!
+//! Each tool acts as one configured Inkbox identity (`[channels.inkbox.<alias>]`).
+//! The `inkbox` SDK is blocking, so every call runs on the blocking pool via
+//! [`InkboxCtx::run`]; the `AgentIdentity` facade is `!Send`, so it is resolved
+//! and used entirely inside that closure.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use inkbox::contacts::resources::contacts::{
+    CreateContactParams, ListContactsParams, UpdateContactParams,
+};
+use inkbox::contacts::types::{ContactEmail, ContactPhone};
+use inkbox::phone::resources::texts::TextRecipients;
+use inkbox::{AgentIdentity, Inkbox, InkboxError};
+use serde_json::{json, Value};
+use zeroclaw_api::attribution::ToolKind;
+use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool_attribution;
+
+/// Shared per-identity context: one Inkbox client and the identity handle every
+/// tool acts as.
+struct InkboxCtx {
+    client: Arc<Inkbox>,
+    identity: String,
+}
+
+impl InkboxCtx {
+    /// Resolve the identity and run a blocking SDK closure on the blocking pool,
+    /// rendering its JSON value as the tool output (or the error as a failure).
+    ///
+    /// # Arguments
+    /// * `f` - closure given the resolved `AgentIdentity`, returning the JSON to
+    ///   surface to the model.
+    ///
+    /// # Returns
+    /// A [`ToolResult`] — success with pretty-printed JSON, or a failure
+    /// carrying the SDK error string.
+    async fn run<F>(&self, f: F) -> ToolResult
+    where
+        // `anyhow::Result` keeps the `Err` variant small (a thin boxed pointer);
+        // `?` still converts the SDK's large `InkboxError` automatically.
+        F: FnOnce(&AgentIdentity) -> anyhow::Result<Value> + Send + 'static,
+    {
+        let client = self.client.clone();
+        let handle = self.identity.clone();
+        let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+            let identity = client.get_identity(&handle)?;
+            f(&identity)
+        })
+        .await;
+        match joined {
+            Ok(Ok(value)) => ToolResult {
+                success: true,
+                output: serde_json::to_string_pretty(&value)
+                    .unwrap_or_else(|_| value.to_string()),
+                error: None,
+            },
+            Ok(Err(e)) => fail(e.to_string()),
+            Err(e) => fail(format!("inkbox tool task failed: {e}")),
+        }
+    }
+
+    /// Like [`Self::run`], but hands the closure the org-level client directly
+    /// (no identity resolution) — for org-scoped resources like contacts.
+    async fn run_client<F>(&self, f: F) -> ToolResult
+    where
+        F: FnOnce(&Inkbox) -> anyhow::Result<Value> + Send + 'static,
+    {
+        let client = self.client.clone();
+        let joined =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Value> { f(&client) }).await;
+        match joined {
+            Ok(Ok(value)) => ToolResult {
+                success: true,
+                output: serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
+                error: None,
+            },
+            Ok(Err(e)) => fail(e.to_string()),
+            Err(e) => fail(format!("inkbox tool task failed: {e}")),
+        }
+    }
+}
+
+// ── arg helpers ──────────────────────────────────────────────────────────
+
+/// Non-empty string arg, or `None`.
+fn str_arg(args: &Value, key: &str) -> Option<String> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// String-or-array arg flattened to a `Vec<String>` (drops empties).
+fn str_list(args: &Value, key: &str) -> Vec<String> {
+    match args.get(key) {
+        Some(Value::String(s)) if !s.is_empty() => vec![s.clone()],
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(|v| v.as_str().filter(|s| !s.is_empty()).map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `str_list` as `Option`, `None` when empty.
+fn opt_list(args: &Value, key: &str) -> Option<Vec<String>> {
+    let v = str_list(args, key);
+    (!v.is_empty()).then_some(v)
+}
+
+fn int_arg(args: &Value, key: &str, default: i64) -> i64 {
+    args.get(key).and_then(Value::as_i64).unwrap_or(default)
+}
+
+fn bool_arg(args: &Value, key: &str, default: bool) -> bool {
+    args.get(key).and_then(Value::as_bool).unwrap_or(default)
+}
+
+/// Parse the `to` arg (E.164 string or list) into SMS recipients.
+fn text_recipients(args: &Value) -> Option<TextRecipients> {
+    match args.get("to") {
+        Some(Value::String(s)) if !s.is_empty() => Some(TextRecipients::One(s.clone())),
+        Some(Value::Array(_)) => {
+            let many = str_list(args, "to");
+            (!many.is_empty()).then_some(TextRecipients::Many(many))
+        }
+        _ => None,
+    }
+}
+
+/// A validation/usage failure surfaced to the model (not a transport error).
+fn fail(msg: impl Into<String>) -> ToolResult {
+    ToolResult {
+        success: false,
+        output: String::new(),
+        error: Some(msg.into()),
+    }
+}
+
+// ── tools ────────────────────────────────────────────────────────────────
+
+/// `inkbox_whoami` — report the configured identity's channels.
+pub struct InkboxWhoami {
+    ctx: Arc<InkboxCtx>,
+}
+
+#[async_trait]
+impl Tool for InkboxWhoami {
+    fn name(&self) -> &str {
+        "inkbox_whoami"
+    }
+    fn description(&self) -> &str {
+        "Return the configured Inkbox identity: handle, mailbox, phone number, \
+         iMessage status, and tunnel host."
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+    async fn execute(&self, _args: Value) -> anyhow::Result<ToolResult> {
+        Ok(self
+            .ctx
+            .run(|id| {
+                Ok(json!({
+                    "agent_handle": id.agent_handle(),
+                    "display_name": id.display_name(),
+                    "email_address": id.email_address(),
+                    "phone_number": id.phone_number().map(|p| p.number),
+                    "imessage_enabled": id.imessage_enabled(),
+                    "tunnel_public_host": id.tunnel().map(|t| t.public_host),
+                }))
+            })
+            .await)
+    }
+}
+tool_attribution!(InkboxWhoami, ToolKind::Plugin);
+
+/// `inkbox_send_email` — send mail from the identity's mailbox.
+pub struct InkboxSendEmail {
+    ctx: Arc<InkboxCtx>,
+}
+
+#[async_trait]
+impl Tool for InkboxSendEmail {
+    fn name(&self) -> &str {
+        "inkbox_send_email"
+    }
+    fn description(&self) -> &str {
+        "Send an email from the agent's Inkbox mailbox."
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "to": { "type": "array", "items": { "type": "string" }, "description": "Recipient email addresses." },
+                "subject": { "type": "string" },
+                "body_text": { "type": "string", "description": "Plain-text body." },
+                "cc": { "type": "array", "items": { "type": "string" } },
+                "bcc": { "type": "array", "items": { "type": "string" } },
+                "in_reply_to_message_id": { "type": "string", "description": "RFC 5322 Message-ID to thread a reply." }
+            },
+            "required": ["to", "subject"]
+        })
+    }
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        let to = str_list(&args, "to");
+        if to.is_empty() {
+            return Ok(fail("`to` must include at least one recipient"));
+        }
+        let subject = str_arg(&args, "subject").unwrap_or_else(|| "(no subject)".to_string());
+        let body = str_arg(&args, "body_text");
+        let cc = opt_list(&args, "cc");
+        let bcc = opt_list(&args, "bcc");
+        let in_reply_to = str_arg(&args, "in_reply_to_message_id");
+        Ok(self
+            .ctx
+            .run(move |id| {
+                let msg = id.send_email(
+                    &to,
+                    &subject,
+                    body.as_deref(),
+                    None,
+                    cc.as_deref(),
+                    bcc.as_deref(),
+                    in_reply_to.as_deref(),
+                    None,
+                )?;
+                Ok(serde_json::to_value(msg)?)
+            })
+            .await)
+    }
+}
+tool_attribution!(InkboxSendEmail, ToolKind::Plugin);
+
+/// `inkbox_send_sms` — send an SMS/MMS from the identity's phone number.
+pub struct InkboxSendSms {
+    ctx: Arc<InkboxCtx>,
+}
+
+#[async_trait]
+impl Tool for InkboxSendSms {
+    fn name(&self) -> &str {
+        "inkbox_send_sms"
+    }
+    fn description(&self) -> &str {
+        "Send a text from the agent's Inkbox number. Provide `conversation_id` to \
+         reply into an existing thread, or `to` (one E.164 number, or a list for a \
+         group MMS)."
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "text": { "type": "string", "description": "Message body." },
+                "to": { "description": "One E.164 recipient or a list (group MMS). Mutually exclusive with conversation_id.",
+                        "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }] },
+                "conversation_id": { "type": "string", "description": "Existing conversation UUID to reply into." },
+                "media_urls": { "type": "array", "items": { "type": "string" }, "description": "Optional MMS media URLs." }
+            },
+            "required": ["text"]
+        })
+    }
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        let Some(text) = str_arg(&args, "text") else {
+            return Ok(fail("`text` is required"));
+        };
+        let conversation_id = str_arg(&args, "conversation_id");
+        let recipients = text_recipients(&args);
+        if recipients.is_some() == conversation_id.is_some() {
+            return Ok(fail("specify exactly one of `to` or `conversation_id`"));
+        }
+        let media = opt_list(&args, "media_urls");
+        Ok(self
+            .ctx
+            .run(move |id| {
+                let msg = id.send_text(
+                    recipients,
+                    conversation_id.as_deref(),
+                    Some(&text),
+                    media.as_deref(),
+                )?;
+                Ok(serde_json::to_value(msg)?)
+            })
+            .await)
+    }
+}
+tool_attribution!(InkboxSendSms, ToolKind::Plugin);
+
+/// `inkbox_send_imessage` — send an iMessage from the identity.
+pub struct InkboxSendImessage {
+    ctx: Arc<InkboxCtx>,
+}
+
+#[async_trait]
+impl Tool for InkboxSendImessage {
+    fn name(&self) -> &str {
+        "inkbox_send_imessage"
+    }
+    fn description(&self) -> &str {
+        "Send an iMessage from the agent. Reply into a known `conversation_id`, or \
+         `to` an E.164 number that has already connected to this agent over iMessage."
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "text": { "type": "string" },
+                "to": { "type": "string", "description": "E.164 recipient. Mutually exclusive with conversation_id." },
+                "conversation_id": { "type": "string", "description": "Existing iMessage conversation UUID." },
+                "media_urls": { "type": "array", "items": { "type": "string" }, "description": "At most one media URL." }
+            }
+        })
+    }
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        let text = str_arg(&args, "text");
+        let media = opt_list(&args, "media_urls");
+        if text.is_none() && media.is_none() {
+            return Ok(fail("provide `text`, `media_urls`, or both"));
+        }
+        let to = str_arg(&args, "to");
+        let conversation_id = str_arg(&args, "conversation_id");
+        if to.is_some() == conversation_id.is_some() {
+            return Ok(fail("specify exactly one of `to` or `conversation_id`"));
+        }
+        Ok(self
+            .ctx
+            .run(move |id| {
+                let cid = match conversation_id {
+                    Some(c) => Some(uuid::Uuid::parse_str(&c).map_err(|e| {
+                        InkboxError::InvalidArgument(format!("invalid conversation_id {c:?}: {e}"))
+                    })?),
+                    None => None,
+                };
+                let msg = id.send_imessage(
+                    to.as_deref(),
+                    cid.as_ref(),
+                    text.as_deref(),
+                    media.as_deref(),
+                    None,
+                )?;
+                Ok(serde_json::to_value(msg)?)
+            })
+            .await)
+    }
+}
+tool_attribution!(InkboxSendImessage, ToolKind::Plugin);
+
+/// `inkbox_place_call` — place an outbound call, bridged to the agent's voice WS.
+pub struct InkboxPlaceCall {
+    ctx: Arc<InkboxCtx>,
+}
+
+#[async_trait]
+impl Tool for InkboxPlaceCall {
+    fn name(&self) -> &str {
+        "inkbox_place_call"
+    }
+    fn description(&self) -> &str {
+        "Place an outbound call from the agent's Inkbox number. The call's audio \
+         bridges to the agent over the tunnel's call-media WebSocket so the agent \
+         speaks the conversation live."
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "to_number": { "type": "string", "description": "Recipient E.164 number." },
+                "client_websocket_url": { "type": "string", "description": "Optional explicit call-media WS URL; defaults to the agent's tunnel." }
+            },
+            "required": ["to_number"]
+        })
+    }
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        let Some(to_number) = str_arg(&args, "to_number") else {
+            return Ok(fail("`to_number` is required"));
+        };
+        let explicit_ws = str_arg(&args, "client_websocket_url");
+        Ok(self
+            .ctx
+            .run(move |id| {
+                // Default the media leg to this identity's tunnel so the call
+                // bridges through the channel's `/phone/media/ws` handler.
+                let ws = explicit_ws.or_else(|| {
+                    id.tunnel()
+                        .map(|t| t.public_host)
+                        .map(|host| format!("wss://{host}/phone/media/ws"))
+                });
+                let call = id.place_call(&to_number, ws.as_deref())?;
+                Ok(serde_json::to_value(call)?)
+            })
+            .await)
+    }
+}
+tool_attribution!(InkboxPlaceCall, ToolKind::Plugin);
+
+/// `inkbox_list_text_conversations` — triage SMS/MMS threads.
+pub struct InkboxListTextConversations {
+    ctx: Arc<InkboxCtx>,
+}
+
+#[async_trait]
+impl Tool for InkboxListTextConversations {
+    fn name(&self) -> &str {
+        "inkbox_list_text_conversations"
+    }
+    fn description(&self) -> &str {
+        "List the agent's text conversation summaries (newest first), returning \
+         conversation IDs to reply into."
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "limit": { "type": "integer", "default": 25 },
+                "offset": { "type": "integer", "default": 0 },
+                "include_groups": { "type": "boolean", "default": true }
+            }
+        })
+    }
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        let limit = int_arg(&args, "limit", 25);
+        let offset = int_arg(&args, "offset", 0);
+        let include_groups = bool_arg(&args, "include_groups", true);
+        Ok(self
+            .ctx
+            .run(move |id| {
+                let convos = id.list_text_conversations(limit, offset, None, include_groups)?;
+                Ok(serde_json::to_value(convos)?)
+            })
+            .await)
+    }
+}
+tool_attribution!(InkboxListTextConversations, ToolKind::Plugin);
+
+/// `inkbox_list_imessage_conversations` — triage iMessage threads.
+pub struct InkboxListImessageConversations {
+    ctx: Arc<InkboxCtx>,
+}
+
+#[async_trait]
+impl Tool for InkboxListImessageConversations {
+    fn name(&self) -> &str {
+        "inkbox_list_imessage_conversations"
+    }
+    fn description(&self) -> &str {
+        "List the agent's iMessage conversation summaries (newest first), with \
+         conversation IDs and assignment status."
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "limit": { "type": "integer", "default": 25 },
+                "offset": { "type": "integer", "default": 0 }
+            }
+        })
+    }
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        let limit = int_arg(&args, "limit", 25);
+        let offset = int_arg(&args, "offset", 0);
+        Ok(self
+            .ctx
+            .run(move |id| {
+                let convos = id.list_imessage_conversations(limit, offset, None)?;
+                Ok(serde_json::to_value(convos)?)
+            })
+            .await)
+    }
+}
+tool_attribution!(InkboxListImessageConversations, ToolKind::Plugin);
+
+/// `inkbox_get_text_conversation` — read an SMS/MMS thread.
+pub struct InkboxGetTextConversation {
+    ctx: Arc<InkboxCtx>,
+}
+
+#[async_trait]
+impl Tool for InkboxGetTextConversation {
+    fn name(&self) -> &str {
+        "inkbox_get_text_conversation"
+    }
+    fn description(&self) -> &str {
+        "Read messages in one text conversation (newest first). `conversation` is \
+         the conversation UUID or the remote E.164 number."
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "conversation": { "type": "string", "description": "Conversation UUID or remote E.164 number." },
+                "limit": { "type": "integer", "default": 50 },
+                "offset": { "type": "integer", "default": 0 }
+            },
+            "required": ["conversation"]
+        })
+    }
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        let Some(conversation) = str_arg(&args, "conversation") else {
+            return Ok(fail("`conversation` is required"));
+        };
+        let limit = int_arg(&args, "limit", 50);
+        let offset = int_arg(&args, "offset", 0);
+        Ok(self
+            .ctx
+            .run(move |id| {
+                let msgs = id.get_text_conversation(&conversation, limit, offset)?;
+                Ok(serde_json::to_value(msgs)?)
+            })
+            .await)
+    }
+}
+tool_attribution!(InkboxGetTextConversation, ToolKind::Plugin);
+
+/// `inkbox_get_imessage_conversation` — read an iMessage thread.
+pub struct InkboxGetImessageConversation {
+    ctx: Arc<InkboxCtx>,
+}
+
+#[async_trait]
+impl Tool for InkboxGetImessageConversation {
+    fn name(&self) -> &str {
+        "inkbox_get_imessage_conversation"
+    }
+    fn description(&self) -> &str {
+        "Read one iMessage conversation by its UUID, including any tapback reactions."
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "conversation_id": { "type": "string", "description": "iMessage conversation UUID." }
+            },
+            "required": ["conversation_id"]
+        })
+    }
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        let Some(cid) = str_arg(&args, "conversation_id") else {
+            return Ok(fail("`conversation_id` is required"));
+        };
+        Ok(self
+            .ctx
+            .run(move |id| {
+                let uuid = uuid::Uuid::parse_str(&cid).map_err(|e| {
+                    InkboxError::InvalidArgument(format!("invalid conversation_id {cid:?}: {e}"))
+                })?;
+                let convo = id.get_imessage_conversation(&uuid)?;
+                Ok(serde_json::to_value(convo)?)
+            })
+            .await)
+    }
+}
+tool_attribution!(InkboxGetImessageConversation, ToolKind::Plugin);
+
+/// `inkbox_list_emails` — list inbox messages for triage.
+pub struct InkboxListEmails {
+    ctx: Arc<InkboxCtx>,
+}
+
+#[async_trait]
+impl Tool for InkboxListEmails {
+    fn name(&self) -> &str {
+        "inkbox_list_emails"
+    }
+    fn description(&self) -> &str {
+        "List the agent's emails (newest first) for triage. Use inkbox_get_email \
+         for the full body of a specific message."
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "limit": { "type": "integer", "default": 25, "description": "Messages per page (1-100)." }
+            }
+        })
+    }
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        let limit = int_arg(&args, "limit", 25);
+        Ok(self
+            .ctx
+            .run(move |id| {
+                let msgs = id.iter_emails(Some(limit), None)?;
+                Ok(serde_json::to_value(msgs)?)
+            })
+            .await)
+    }
+}
+tool_attribution!(InkboxListEmails, ToolKind::Plugin);
+
+/// `inkbox_get_email` — read one email with its full body.
+pub struct InkboxGetEmail {
+    ctx: Arc<InkboxCtx>,
+}
+
+#[async_trait]
+impl Tool for InkboxGetEmail {
+    fn name(&self) -> &str {
+        "inkbox_get_email"
+    }
+    fn description(&self) -> &str {
+        "Fetch a single email by its message UUID, including the full body."
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "message_id": { "type": "string", "description": "Inkbox message UUID (the `id` field, not the RFC Message-ID)." }
+            },
+            "required": ["message_id"]
+        })
+    }
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        let Some(mid) = str_arg(&args, "message_id") else {
+            return Ok(fail("`message_id` is required"));
+        };
+        Ok(self
+            .ctx
+            .run(move |id| {
+                let detail = id.get_message(&mid)?;
+                Ok(serde_json::to_value(detail)?)
+            })
+            .await)
+    }
+}
+tool_attribution!(InkboxGetEmail, ToolKind::Plugin);
+
+/// `inkbox_lookup_contact` — find a contact by email or phone.
+pub struct InkboxLookupContact {
+    ctx: Arc<InkboxCtx>,
+}
+
+#[async_trait]
+impl Tool for InkboxLookupContact {
+    fn name(&self) -> &str {
+        "inkbox_lookup_contact"
+    }
+    fn description(&self) -> &str {
+        "Look up a contact in the org address book by email or phone (E.164). \
+         Provide exactly one. Useful to resolve who a sender is."
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "email": { "type": "string" },
+                "phone": { "type": "string", "description": "E.164 number." }
+            }
+        })
+    }
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        let email = str_arg(&args, "email");
+        let phone = str_arg(&args, "phone");
+        if email.is_some() == phone.is_some() {
+            return Ok(fail("provide exactly one of `email` or `phone`"));
+        }
+        Ok(self
+            .ctx
+            .run_client(move |c| {
+                let found = c
+                    .contacts()
+                    .lookup(email.as_deref(), None, None, phone.as_deref(), None)?;
+                Ok(serde_json::to_value(found)?)
+            })
+            .await)
+    }
+}
+tool_attribution!(InkboxLookupContact, ToolKind::Plugin);
+
+/// `inkbox_list_contacts` — list/search the org address book.
+pub struct InkboxListContacts {
+    ctx: Arc<InkboxCtx>,
+}
+
+#[async_trait]
+impl Tool for InkboxListContacts {
+    fn name(&self) -> &str {
+        "inkbox_list_contacts"
+    }
+    fn description(&self) -> &str {
+        "List or search contacts in the org address book. `q` is a case-insensitive \
+         substring filter across names, company, job title, and notes."
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "q": { "type": "string", "description": "Search filter." },
+                "limit": { "type": "integer", "default": 25 },
+                "offset": { "type": "integer", "default": 0 }
+            }
+        })
+    }
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        let params = ListContactsParams {
+            q: str_arg(&args, "q"),
+            order: None,
+            limit: Some(int_arg(&args, "limit", 25)),
+            offset: Some(int_arg(&args, "offset", 0)),
+        };
+        Ok(self
+            .ctx
+            .run_client(move |c| Ok(serde_json::to_value(c.contacts().list(&params)?)?))
+            .await)
+    }
+}
+tool_attribution!(InkboxListContacts, ToolKind::Plugin);
+
+/// `inkbox_create_contact` — add a contact to the org address book.
+pub struct InkboxCreateContact {
+    ctx: Arc<InkboxCtx>,
+}
+
+#[async_trait]
+impl Tool for InkboxCreateContact {
+    fn name(&self) -> &str {
+        "inkbox_create_contact"
+    }
+    fn description(&self) -> &str {
+        "Create a contact in the org address book."
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "given_name": { "type": "string" },
+                "family_name": { "type": "string" },
+                "company_name": { "type": "string" },
+                "job_title": { "type": "string" },
+                "notes": { "type": "string" },
+                "emails": { "type": "array", "items": { "type": "string" } },
+                "phones": { "type": "array", "items": { "type": "string" }, "description": "E.164 numbers." }
+            }
+        })
+    }
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        let emails = opt_list(&args, "emails").map(|v| {
+            v.into_iter()
+                .map(|value| ContactEmail { label: None, value, is_primary: false })
+                .collect::<Vec<_>>()
+        });
+        let phones = opt_list(&args, "phones").map(|v| {
+            v.into_iter()
+                .map(|value| ContactPhone { label: None, value, is_primary: false })
+                .collect::<Vec<_>>()
+        });
+        let params = CreateContactParams {
+            given_name: str_arg(&args, "given_name"),
+            family_name: str_arg(&args, "family_name"),
+            company_name: str_arg(&args, "company_name"),
+            job_title: str_arg(&args, "job_title"),
+            notes: str_arg(&args, "notes"),
+            emails,
+            phones,
+            ..Default::default()
+        };
+        Ok(self
+            .ctx
+            .run_client(move |c| Ok(serde_json::to_value(c.contacts().create(&params)?)?))
+            .await)
+    }
+}
+tool_attribution!(InkboxCreateContact, ToolKind::Plugin);
+
+/// `inkbox_update_contact` — edit fields on an existing contact.
+pub struct InkboxUpdateContact {
+    ctx: Arc<InkboxCtx>,
+}
+
+#[async_trait]
+impl Tool for InkboxUpdateContact {
+    fn name(&self) -> &str {
+        "inkbox_update_contact"
+    }
+    fn description(&self) -> &str {
+        "Update fields on a contact by id. Only provided fields change."
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "contact_id": { "type": "string" },
+                "given_name": { "type": "string" },
+                "family_name": { "type": "string" },
+                "company_name": { "type": "string" },
+                "job_title": { "type": "string" },
+                "notes": { "type": "string" }
+            },
+            "required": ["contact_id"]
+        })
+    }
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        let Some(id) = str_arg(&args, "contact_id") else {
+            return Ok(fail("`contact_id` is required"));
+        };
+        // `Option<Option<T>>`: outer None omits (unchanged), `Some(Some(v))` sets it.
+        let params = UpdateContactParams {
+            given_name: str_arg(&args, "given_name").map(Some),
+            family_name: str_arg(&args, "family_name").map(Some),
+            company_name: str_arg(&args, "company_name").map(Some),
+            job_title: str_arg(&args, "job_title").map(Some),
+            notes: str_arg(&args, "notes").map(Some),
+            ..Default::default()
+        };
+        Ok(self
+            .ctx
+            .run_client(move |c| Ok(serde_json::to_value(c.contacts().update(&id, &params)?)?))
+            .await)
+    }
+}
+tool_attribution!(InkboxUpdateContact, ToolKind::Plugin);
+
+/// `inkbox_delete_contact` — remove a contact by id.
+pub struct InkboxDeleteContact {
+    ctx: Arc<InkboxCtx>,
+}
+
+#[async_trait]
+impl Tool for InkboxDeleteContact {
+    fn name(&self) -> &str {
+        "inkbox_delete_contact"
+    }
+    fn description(&self) -> &str {
+        "Delete a contact from the org address book by id."
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "contact_id": { "type": "string" } },
+            "required": ["contact_id"]
+        })
+    }
+    async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        let Some(id) = str_arg(&args, "contact_id") else {
+            return Ok(fail("`contact_id` is required"));
+        };
+        Ok(self
+            .ctx
+            .run_client(move |c| {
+                c.contacts().delete(&id)?;
+                Ok(json!({ "deleted": id }))
+            })
+            .await)
+    }
+}
+tool_attribution!(InkboxDeleteContact, ToolKind::Plugin);
+
+/// Build the Inkbox tool set for one configured identity. Returns an empty
+/// vector when the client can't be constructed (bad base URL / key) — the caller
+/// simply registers no Inkbox tools in that case.
+///
+/// # Arguments
+/// * `api_key` - the identity's Inkbox API key.
+/// * `identity` - the agent identity handle to act as.
+/// * `base_url` - API base URL (e.g. `https://inkbox.ai`).
+pub fn build_inkbox_tools(api_key: &str, identity: &str, base_url: &str) -> Vec<Arc<dyn Tool>> {
+    // `reqwest::blocking::Client::build` spins up and drops a temporary tokio
+    // runtime internally; on a tokio worker thread that drop panics with "cannot
+    // drop a runtime in an async context". Build off-runtime on a plain OS
+    // thread (the resulting `Arc<Inkbox>` is `Send`).
+    let (key, base) = (api_key.to_string(), base_url.to_string());
+    let built = std::thread::spawn(move || Inkbox::builder(key).base_url(base).build()).join();
+    let client = match built {
+        Ok(Ok(client)) => client,
+        _ => return Vec::new(),
+    };
+    let ctx = Arc::new(InkboxCtx {
+        client,
+        identity: identity.to_string(),
+    });
+    let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(InkboxWhoami { ctx: ctx.clone() }),
+        Arc::new(InkboxSendEmail { ctx: ctx.clone() }),
+        Arc::new(InkboxSendSms { ctx: ctx.clone() }),
+        Arc::new(InkboxSendImessage { ctx: ctx.clone() }),
+        Arc::new(InkboxPlaceCall { ctx: ctx.clone() }),
+        Arc::new(InkboxListTextConversations { ctx: ctx.clone() }),
+        Arc::new(InkboxListImessageConversations { ctx: ctx.clone() }),
+        Arc::new(InkboxGetTextConversation { ctx: ctx.clone() }),
+        Arc::new(InkboxGetImessageConversation { ctx: ctx.clone() }),
+        Arc::new(InkboxListEmails { ctx: ctx.clone() }),
+        Arc::new(InkboxGetEmail { ctx: ctx.clone() }),
+        Arc::new(InkboxLookupContact { ctx: ctx.clone() }),
+        Arc::new(InkboxListContacts { ctx: ctx.clone() }),
+        Arc::new(InkboxCreateContact { ctx: ctx.clone() }),
+        Arc::new(InkboxUpdateContact { ctx: ctx.clone() }),
+        Arc::new(InkboxDeleteContact { ctx }),
+    ];
+    tools
+}

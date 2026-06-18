@@ -166,6 +166,13 @@ cbc = { version = "0.1", optional = true }
 ecb = { version = "0.1", optional = true }
 md5 = { version = "0.8", optional = true }
 
+# Inkbox channel (optional) — local fork integration. Path dependency on the
+# in-repo Rust SDK; `tunnels-runtime` pulls in the HTTP/2 reverse-proxy data
+# plane that delivers inbound webhooks + call media over the Inkbox tunnel.
+inkbox = { path = "../../../inkbox/sdk/rust", default-features = false, features = [
+  "tunnels-runtime",
+], optional = true }
+
 [features]
 default = ["default-channels"]
 default-channels = [
@@ -200,6 +207,7 @@ channels-full = [
   "channel-wati",
   "channel-wecom",
   "channel-wecom-ws",
+  "channel-inkbox",
   "channel-whatsapp-cloud",
   "default-channels",
 ]
@@ -257,6 +265,7 @@ channel-wechat = [
 ]
 channel-wecom = []
 channel-wecom-ws = ["dep:aes", "dep:cbc"]
+channel-inkbox = ["dep:inkbox"]
 channel-clawdtalk = []
 channel-webhook = []
 channel-whatsapp-cloud = []

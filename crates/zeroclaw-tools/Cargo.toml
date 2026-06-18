@@ -53,8 +53,13 @@ rustls-pki-types = "1.14.0"
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "1.0.6"
 
+# Inkbox SDK (REST surface only — the tunnel data plane lives in the channel).
+inkbox = { path = "../../../inkbox/sdk/rust", default-features = false, optional = true }
+
 [features]
 default = []
+# Inkbox agent tools (send/triage/call). Pulls the inkbox SDK REST client.
+inkbox = ["dep:inkbox"]
 browser-native = ["dep:fantoccini"]
 rag-pdf = ["dep:pdf-extract"]
 probe = ["dep:probe-rs"]

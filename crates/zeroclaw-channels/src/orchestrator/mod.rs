@@ -7410,6 +7410,69 @@ fn collect_configured_channels(
         );
     }
 
+    #[cfg(feature = "channel-inkbox")]
+    for (alias, ic) in &config.channels.inkbox {
+        if !active_channel_aliases.contains(&format!("inkbox.{alias}")) {
+            continue;
+        }
+        if !ic.enabled {
+            continue;
+        }
+        // The Inkbox client embeds `reqwest::blocking`, whose construction spins
+        // up and drops a temporary tokio runtime — and dropping a runtime on a
+        // tokio worker panics ("cannot drop a runtime in an async context").
+        // This collection runs inside the async daemon, so build the client on a
+        // plain OS thread; the resulting `Arc<Inkbox>` is `Send`.
+        let api_key = ic.api_key.clone();
+        let base_url = ic.base_url.clone();
+        let built = std::thread::spawn(move || {
+            ::inkbox::Inkbox::builder(api_key).base_url(base_url).build()
+        })
+        .join();
+        let client = match built {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    format!("[inkbox] skipping channel inkbox.{alias}: {e}"),
+                );
+                continue;
+            }
+            Err(_) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    format!("[inkbox] skipping channel inkbox.{alias}: client build panicked"),
+                );
+                continue;
+            }
+        };
+        channels.push(ConfiguredChannel {
+            display_name: "Inkbox",
+            alias: Some(alias.clone()),
+            channel: Arc::new(crate::inkbox::InkboxChannel::new(
+                client,
+                ic.identity.clone(),
+                ic.signing_key.clone(),
+                alias.clone(),
+            )),
+        });
+    }
+
+    #[cfg(not(feature = "channel-inkbox"))]
+    if !config.channels.inkbox.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Inkbox channel is configured but this build was compiled without \
+             `channel-inkbox`; skipping Inkbox."
+        );
+    }
+
     #[cfg(feature = "channel-discord")]
     for (alias, dc) in &config.channels.discord {
         if !active_channel_aliases.contains(&format!("discord.{alias}")) {
