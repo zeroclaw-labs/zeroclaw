@@ -549,13 +549,30 @@ pub async fn run_realtime_bridge(
                     }
                     Some("response.audio_transcript.done")
                     | Some("response.output_audio_transcript.done") => {
-                        if let Some(t) = ev.get("transcript").and_then(Value::as_str) {
+                        if let Some(t) = ev
+                            .get("transcript")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                        {
                             transcript.push(("agent".into(), t.to_string()));
+                            // Realtime runs raw-audio, so Inkbox does no STT and would
+                            // record nothing. Mirror each finalized turn back as a
+                            // `transcript` frame so it lands in the Inkbox call record
+                            // (party: local=agent, remote=caller). Ported from the
+                            // Claude Code plugin's `_relay_transcript`.
+                            let f = json!({ "event": "transcript", "party": "local", "text": t, "is_final": true });
+                            let _ = ink_tx.send(Message::Text(f.to_string().into())).await;
                         }
                     }
                     Some("conversation.item.input_audio_transcription.completed") => {
-                        if let Some(t) = ev.get("transcript").and_then(Value::as_str) {
+                        if let Some(t) = ev
+                            .get("transcript")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                        {
                             transcript.push(("caller".into(), t.to_string()));
+                            let f = json!({ "event": "transcript", "party": "remote", "text": t, "is_final": true });
+                            let _ = ink_tx.send(Message::Text(f.to_string().into())).await;
                         }
                     }
                     // function-call streaming
