@@ -6,7 +6,7 @@ use crate::multimodal;
 use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    ModelProvider, StreamChunk, StreamError, StreamEvent, StreamOptions, StreamResult, TokenUsage,
+    ModelProvider, StreamChunk, StreamError, StreamEvent, StreamOptions, StreamResult,
     ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
@@ -793,12 +793,86 @@ struct ApiChatResponse {
     usage: Option<UsageInfo>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct UsageInfo {
     #[serde(default)]
     prompt_tokens: Option<u64>,
     #[serde(default)]
     completion_tokens: Option<u64>,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+    #[serde(default, deserialize_with = "deserialize_optional_token_count")]
+    prompt_cache_hit_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct PromptTokensDetails {
+    #[serde(default, deserialize_with = "deserialize_optional_token_count")]
+    cached_tokens: Option<u64>,
+}
+
+impl UsageInfo {
+    fn cached_input_tokens(&self) -> Option<u64> {
+        self.prompt_cache_hit_tokens.or_else(|| {
+            self.prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.cached_tokens)
+        })
+    }
+
+    fn into_provider_usage(self) -> zeroclaw_api::model_provider::TokenUsage {
+        let cached_input_tokens = self.cached_input_tokens();
+        zeroclaw_api::model_provider::TokenUsage {
+            input_tokens: self.prompt_tokens,
+            output_tokens: self.completion_tokens,
+            cached_input_tokens,
+        }
+    }
+}
+
+fn deserialize_optional_token_count<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(normalize_token_count_value))
+}
+
+fn normalize_token_count_value(value: serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(number) => {
+            if let Some(value) = number.as_u64() {
+                Some(value)
+            } else if let Some(value) = number.as_i64() {
+                if value < 0 {
+                    None
+                } else {
+                    u64::try_from(value).ok()
+                }
+            } else {
+                number.as_f64().and_then(normalize_token_count_float)
+            }
+        }
+        serde_json::Value::String(value) => value
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .and_then(normalize_token_count_float),
+        _ => None,
+    }
+}
+
+fn normalize_token_count_float(value: f64) -> Option<u64> {
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    if value < 1.0 {
+        return Some(0);
+    }
+    if value > u64::MAX as f64 {
+        return None;
+    }
+    Some(value.floor() as u64)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1638,12 +1712,8 @@ fn sse_bytes_to_events_for_contract(
                             }
                         }
 
-                        if let Some(usage) = chunk.usage.as_ref() {
-                            let token_usage = zeroclaw_api::model_provider::TokenUsage {
-                                input_tokens: usage.prompt_tokens,
-                                output_tokens: usage.completion_tokens,
-                                cached_input_tokens: None,
-                            };
+                        if let Some(usage) = chunk.usage.clone() {
+                            let token_usage = usage.into_provider_usage();
                             if tx.send(Ok(StreamEvent::Usage(token_usage))).await.is_err() {
                                 return;
                             }
@@ -2628,11 +2698,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let body = response.text().await?;
         let chat_response = parse_chat_response_body(&self.name, &body)?;
-        let usage = chat_response.usage.map(|u| TokenUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-            cached_input_tokens: None,
-        });
+        let usage = chat_response.usage.map(UsageInfo::into_provider_usage);
         let choice = chat_response.choices.into_iter().next().ok_or_else(|| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -2753,11 +2819,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         }
 
         let native_response: ApiChatResponse = response.json().await?;
-        let usage = native_response.usage.map(|u| TokenUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-            cached_input_tokens: None,
-        });
+        let usage = native_response.usage.map(UsageInfo::into_provider_usage);
         let message = native_response
             .choices
             .into_iter()
@@ -5232,6 +5294,114 @@ mod tests {
     }
 
     #[test]
+    fn api_response_parses_openai_cached_tokens() {
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {
+                "prompt_tokens": 150,
+                "completion_tokens": 60,
+                "prompt_tokens_details": {"cached_tokens": 120}
+            }
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap().into_provider_usage();
+        assert_eq!(usage.input_tokens, Some(150));
+        assert_eq!(usage.output_tokens, Some(60));
+        assert_eq!(usage.cached_input_tokens, Some(120));
+    }
+
+    #[test]
+    fn api_response_parses_deepseek_cached_tokens() {
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {
+                "prompt_tokens": 150,
+                "completion_tokens": 60,
+                "prompt_cache_hit_tokens": 100,
+                "prompt_tokens_details": {"cached_tokens": 80}
+            }
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap().into_provider_usage();
+        assert_eq!(usage.cached_input_tokens, Some(100));
+    }
+
+    #[test]
+    fn api_response_parses_non_integer_cached_tokens_lossily() {
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {
+                "prompt_tokens": 150,
+                "completion_tokens": 60,
+                "prompt_tokens_details": {"cached_tokens": "2.5e2"}
+            }
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap().into_provider_usage();
+        assert_eq!(usage.cached_input_tokens, Some(250));
+    }
+
+    #[test]
+    fn api_response_ignores_invalid_cached_tokens_without_losing_usage() {
+        let json = r#"{
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {
+                "prompt_tokens": 150,
+                "completion_tokens": 60,
+                "prompt_cache_hit_tokens": -1,
+                "prompt_tokens_details": {"cached_tokens": "not-a-number"}
+            }
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.unwrap().into_provider_usage();
+        assert_eq!(usage.input_tokens, Some(150));
+        assert_eq!(usage.output_tokens, Some(60));
+        assert_eq!(usage.cached_input_tokens, None);
+    }
+
+    #[test]
+    fn stream_chunk_parses_cached_tokens() {
+        let json = r#"{
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 99,
+                "completion_tokens": 11,
+                "prompt_tokens_details": {"cached_tokens": 42}
+            }
+        }"#;
+        let chunk: StreamChunkResponse = serde_json::from_str(json).unwrap();
+        let usage = chunk.usage.unwrap().into_provider_usage();
+        assert_eq!(usage.input_tokens, Some(99));
+        assert_eq!(usage.output_tokens, Some(11));
+        assert_eq!(usage.cached_input_tokens, Some(42));
+    }
+
+    #[test]
+    fn stream_chunk_prefers_deepseek_prompt_cache_hit_tokens() {
+        let json = r#"{
+            "id":"14037a3e-81f7-4559-b9ae-161bcb17c34c",
+            "object":"chat.completion.chunk",
+            "created":1780971871,
+            "model":"deepseek-v4-flash",
+            "choices":[{"index":0,"delta":{"content":"","reasoning_content":null},"finish_reason":"tool_calls"}],
+            "usage": {
+                "prompt_tokens": 13313,
+                "completion_tokens": 175,
+                "total_tokens": 13488,
+                "prompt_tokens_details": {"cached_tokens": 384},
+                "completion_tokens_details": {"reasoning_tokens": 100},
+                "prompt_cache_hit_tokens": 384,
+                "prompt_cache_miss_tokens": 12929
+            }
+        }"#;
+        let chunk: StreamChunkResponse = serde_json::from_str(json).unwrap();
+        let usage = chunk.usage.unwrap().into_provider_usage();
+        assert_eq!(usage.input_tokens, Some(13313));
+        assert_eq!(usage.output_tokens, Some(175));
+        assert_eq!(usage.cached_input_tokens, Some(384));
+    }
+
+    #[test]
     fn api_response_parses_without_usage() {
         let json = r#"{"choices": [{"message": {"content": "Hello"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
@@ -5882,5 +6052,303 @@ mod tests {
         let p =
             make_model_provider("test", "https://example.com", None).with_public_model_listing();
         assert!(p.public_model_listing);
+    }
+
+    // ── `normalize_token_count_value` edge-case tests ───────────────────
+    // The deserializer must handle int, float, string, negative,
+    // non-finite, and other JSON types without panicking or silently
+    // producing garbage counts. Each edge case gets its own test so a
+    // breaking provider response-format change can be traced to a
+    // specific shape.
+
+    #[test]
+    fn token_count_u64_positive() {
+        assert_eq!(normalize_token_count_value(serde_json::json!(42)), Some(42));
+    }
+
+    #[test]
+    fn token_count_u64_zero() {
+        assert_eq!(normalize_token_count_value(serde_json::json!(0)), Some(0));
+    }
+
+    #[test]
+    fn token_count_large_u64() {
+        assert_eq!(
+            normalize_token_count_value(serde_json::json!(u64::MAX)),
+            Some(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn token_count_i64_positive() {
+        assert_eq!(
+            normalize_token_count_value(serde_json::json!(100i64)),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn token_count_i64_negative() {
+        assert_eq!(
+            normalize_token_count_value(serde_json::json!(-1i64)),
+            None,
+            "negative token counts must be rejected"
+        );
+    }
+
+    #[test]
+    fn token_count_f64_positive_integer() {
+        assert_eq!(
+            normalize_token_count_value(serde_json::json!(15.0)),
+            Some(15)
+        );
+    }
+
+    #[test]
+    fn token_count_f64_fractional() {
+        assert_eq!(
+            normalize_token_count_value(serde_json::json!(3.7)),
+            Some(3),
+            "fractional floats floor toward zero"
+        );
+    }
+
+    #[test]
+    fn token_count_f64_less_than_one() {
+        assert_eq!(
+            normalize_token_count_value(serde_json::json!(0.5)),
+            Some(0),
+            "fractional token < 1 counts as zero (avoids noise)"
+        );
+    }
+
+    #[test]
+    fn token_count_f64_negative() {
+        assert_eq!(
+            normalize_token_count_value(serde_json::json!(-0.5)),
+            None,
+            "negative float token counts must be rejected"
+        );
+    }
+
+    #[test]
+    fn token_count_f64_nan() {
+        let nan: f64 = f64::NAN;
+        assert_eq!(
+            normalize_token_count_value(serde_json::json!(nan)),
+            None,
+            "NaN must be rejected"
+        );
+    }
+
+    #[test]
+    fn token_count_f64_infinity() {
+        assert_eq!(
+            normalize_token_count_value(serde_json::json!(f64::INFINITY)),
+            None,
+            "+Infinity must be rejected"
+        );
+    }
+
+    #[test]
+    fn token_count_f64_neg_infinity() {
+        assert_eq!(
+            normalize_token_count_value(serde_json::json!(f64::NEG_INFINITY)),
+            None,
+            "-Infinity must be rejected"
+        );
+    }
+
+    #[test]
+    fn token_count_f64_exceeds_u64_max() {
+        assert_eq!(
+            normalize_token_count_value(serde_json::json!(u64::MAX as f64 * 2.0)),
+            None,
+            "value > u64::MAX must be rejected"
+        );
+    }
+
+    #[test]
+    fn token_count_string_integer() {
+        assert_eq!(
+            normalize_token_count_value(serde_json::json!("15")),
+            Some(15)
+        );
+    }
+
+    #[test]
+    fn token_count_string_float() {
+        assert_eq!(
+            normalize_token_count_value(serde_json::json!("3.7")),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn token_count_string_whitespace() {
+        assert_eq!(
+            normalize_token_count_value(serde_json::json!(" 20 ")),
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn token_count_string_negative() {
+        assert_eq!(normalize_token_count_value(serde_json::json!("-5")), None);
+    }
+
+    #[test]
+    fn token_count_string_garbage() {
+        assert_eq!(
+            normalize_token_count_value(serde_json::json!("not-a-number")),
+            None
+        );
+    }
+
+    #[test]
+    fn token_count_null() {
+        assert_eq!(normalize_token_count_value(serde_json::Value::Null), None);
+    }
+
+    #[test]
+    fn token_count_bool() {
+        assert_eq!(
+            normalize_token_count_value(serde_json::json!(true)),
+            None,
+            "boolean must not be misinterpreted as token count"
+        );
+    }
+
+    #[test]
+    fn token_count_array() {
+        assert_eq!(
+            normalize_token_count_value(serde_json::json!([1, 2, 3])),
+            None
+        );
+    }
+
+    #[test]
+    fn token_count_object() {
+        assert_eq!(
+            normalize_token_count_value(serde_json::json!({"count": 10})),
+            None
+        );
+    }
+
+    // ── `deserialize_optional_token_count` round-trip tests ────────────
+    // Validate the full deserialize path through a UsageInfo-shaped struct
+    // so the serde attribute wiring is exercised as well.
+
+    #[derive(Debug, Deserialize)]
+    struct TestUsage {
+        #[serde(default, deserialize_with = "deserialize_optional_token_count")]
+        prompt_cache_hit_tokens: Option<u64>,
+        #[serde(default, deserialize_with = "deserialize_optional_token_count")]
+        prompt_tokens: Option<u64>,
+    }
+
+    #[test]
+    fn deserialize_token_count_integer() {
+        let usage: TestUsage =
+            serde_json::from_str(r#"{"prompt_tokens": 5000, "prompt_cache_hit_tokens": 3000}"#)
+                .unwrap();
+        assert_eq!(usage.prompt_tokens, Some(5000));
+        assert_eq!(usage.prompt_cache_hit_tokens, Some(3000));
+    }
+
+    #[test]
+    fn deserialize_token_count_float() {
+        let usage: TestUsage =
+            serde_json::from_str(r#"{"prompt_tokens": 12.8, "prompt_cache_hit_tokens": 100.3}"#)
+                .unwrap();
+        assert_eq!(usage.prompt_tokens, Some(12));
+        assert_eq!(usage.prompt_cache_hit_tokens, Some(100));
+    }
+
+    #[test]
+    fn deserialize_token_count_string() {
+        let usage: TestUsage =
+            serde_json::from_str(r#"{"prompt_tokens": "1000", "prompt_cache_hit_tokens": "500"}"#)
+                .unwrap();
+        assert_eq!(usage.prompt_tokens, Some(1000));
+        assert_eq!(usage.prompt_cache_hit_tokens, Some(500));
+    }
+
+    #[test]
+    fn deserialize_token_count_null() {
+        let usage: TestUsage =
+            serde_json::from_str(r#"{"prompt_tokens": null, "prompt_cache_hit_tokens": null}"#)
+                .unwrap();
+        assert_eq!(usage.prompt_tokens, None);
+        assert_eq!(usage.prompt_cache_hit_tokens, None);
+    }
+
+    #[test]
+    fn deserialize_token_count_negative() {
+        let usage: TestUsage =
+            serde_json::from_str(r#"{"prompt_tokens": -1, "prompt_cache_hit_tokens": 0}"#).unwrap();
+        assert_eq!(
+            usage.prompt_tokens, None,
+            "negative values must be rejected"
+        );
+        assert_eq!(usage.prompt_cache_hit_tokens, Some(0));
+    }
+
+    #[test]
+    fn deserialize_token_count_missing_field() {
+        let usage: TestUsage = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(usage.prompt_tokens, None);
+        assert_eq!(usage.prompt_cache_hit_tokens, None);
+    }
+
+    // ── `UsageInfo::cached_input_tokens` priority tests ─────────────────
+    // `prompt_cache_hit_tokens` (DeepSeek-style) takes priority over
+    // `prompt_tokens_details.cached_tokens` (OpenAI-style).
+
+    #[test]
+    fn usageinfo_cached_input_prefers_prompt_cache_hit_tokens() {
+        let json = serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "prompt_cache_hit_tokens": 60,
+            "prompt_tokens_details": {"cached_tokens": 20}
+        });
+        let usage: UsageInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(usage.cached_input_tokens(), Some(60));
+    }
+
+    #[test]
+    fn usageinfo_cached_input_falls_back_to_details() {
+        let json = serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 50,
+            "prompt_tokens_details": {"cached_tokens": 20}
+        });
+        let usage: UsageInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(usage.cached_input_tokens(), Some(20));
+    }
+
+    #[test]
+    fn usageinfo_cached_input_returns_none_when_absent() {
+        let json = serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 50
+        });
+        let usage: UsageInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(usage.cached_input_tokens(), None);
+    }
+
+    #[test]
+    fn usageinfo_into_provider_usage_forwards_cached_tokens() {
+        let json = serde_json::json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 200,
+            "prompt_cache_hit_tokens": 400
+        });
+        let usage: UsageInfo = serde_json::from_value(json).unwrap();
+        let out = usage.into_provider_usage();
+        assert_eq!(out.input_tokens, Some(1000));
+        assert_eq!(out.output_tokens, Some(200));
+        assert_eq!(out.cached_input_tokens, Some(400));
     }
 }
