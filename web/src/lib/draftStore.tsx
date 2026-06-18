@@ -41,6 +41,8 @@ type ConfigDraftCtx = ConfigDraftState & {
   clearComment: (path: string) => void;
   stageTombstone: (path: string) => void;
   unstageTombstone: (path: string) => void;
+  /** Drop drafts / comments / tombstones for exactly these paths. */
+  discardPaths: (paths: readonly string[]) => void;
   /** Drop every draft / comment / tombstone whose path begins with `prefix`. */
   discardSection: (prefix: string) => void;
   /** Drop everything. */
@@ -104,6 +106,47 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
       const next = new Set(prev);
       next.delete(path);
       return next;
+    });
+  }, []);
+
+  const discardPaths = useCallback((paths: readonly string[]) => {
+    const discard = new Set(paths);
+    if (discard.size === 0) return;
+    setDrafts((prev) => {
+      const next: Record<string, DraftEntry> = {};
+      let changed = false;
+      for (const [k, v] of Object.entries(prev)) {
+        if (discard.has(k)) {
+          changed = true;
+        } else {
+          next[k] = v;
+        }
+      }
+      return changed ? next : prev;
+    });
+    setComments((prev) => {
+      const next: Record<string, string> = {};
+      let changed = false;
+      for (const [k, v] of Object.entries(prev)) {
+        if (discard.has(k)) {
+          changed = true;
+        } else {
+          next[k] = v;
+        }
+      }
+      return changed ? next : prev;
+    });
+    setTombstones((prev) => {
+      let changed = false;
+      const next = new Set<string>();
+      for (const k of prev) {
+        if (discard.has(k)) {
+          changed = true;
+        } else {
+          next.add(k);
+        }
+      }
+      return changed ? next : prev;
     });
   }, []);
 
@@ -199,6 +242,7 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
       clearComment,
       stageTombstone,
       unstageTombstone,
+      discardPaths,
       discardSection,
       discardAll,
       saveAll,
@@ -213,6 +257,7 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
       clearComment,
       stageTombstone,
       unstageTombstone,
+      discardPaths,
       discardSection,
       discardAll,
       saveAll,

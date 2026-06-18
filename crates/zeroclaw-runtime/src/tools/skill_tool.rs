@@ -1075,6 +1075,7 @@ mod tests {
                 timeout_secs: None,
             }],
             prompts: vec![],
+            slash_options: Vec::new(),
             location: None,
         };
         crate::tools::register_skill_tools_with_context(

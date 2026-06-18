@@ -101,9 +101,8 @@ function statusBadge(status: Integration['status']) {
 // Display labels for the integration `category` enum, keyed by the stable
 // enum-variant value the API emits (Chat / AiModel / ToolsAutomation /
 // Platform). Routed through t() at the call site so the label localizes;
-// unknown/future variants fall back to the raw key. Values mirror the backend
-// IntegrationCategory::label() (zeroclaw-labs/zeroclaw#6490), which we cannot
-// consume directly since we ship web-only.
+// unknown/future variants fall back to the API's derived display label, then
+// the raw key. Values mirror the backend IntegrationCategory::label().
 const CATEGORY_LABEL_KEYS: Record<string, string> = {
   Chat: 'integrations.cat_chat',
   AiModel: 'integrations.cat_ai_model',
@@ -139,12 +138,13 @@ export default function Integrations() {
   }, {});
 
   // Resolve a category enum key to its human label. 'all' is the synthetic
-  // filter pseudo-category; real keys map through CATEGORY_LABEL_KEYS, and
-  // anything unrecognized falls back to the raw key rather than rendering blank.
+  // filter pseudo-category; known keys localize in the web bundle, and future
+  // API keys can still render their backend-derived label.
   const labelFor = (cat: string): string => {
     if (cat === 'all') return t('integrations.cat_all');
     const key = CATEGORY_LABEL_KEYS[cat];
-    return key ? t(key) : cat;
+    if (key) return t(key);
+    return integrations.find((integration) => integration.category === cat)?.category_label ?? cat;
   };
 
   if (error) {

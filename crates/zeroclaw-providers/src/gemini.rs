@@ -1652,6 +1652,10 @@ mod tests {
             resolve(r#"{"currentCloudaicompanionProject":{"id":"current-obj"}}"#),
             Some("current-obj".into())
         );
+        assert_eq!(
+            resolve(r#"{"currentCloudaicompanionProject":{"projectId":"current-alias"}}"#),
+            Some("current-alias".into())
+        );
     }
 
     #[test]

@@ -13,7 +13,7 @@ import { ThemeProvider } from "./contexts/ThemeContext";
 import { loadLocale, saveLocale } from "./contexts/ThemeContext";
 import { AuthProvider, useAuth } from "./hooks/useAuth";
 import { DraftContext, useDraftStore } from "./hooks/useDraft";
-import { getAdminPairCode, getQuickstartState } from "./lib/api";
+import { getAdminPairCode, generatePairCode, PairCodeForbiddenError, getQuickstartState } from "./lib/api";
 import { basePath } from "./lib/basePath";
 import { ConfigDraftProvider } from "./lib/draftStore";
 import { setLocale, type Locale } from "./lib/i18n";
@@ -138,6 +138,22 @@ function PairingDialog({
   const [loading, setLoading] = useState(false);
   const [displayCode, setDisplayCode] = useState<string | null>(null);
   const [codeLoading, setCodeLoading] = useState(true);
+  const [generating, setGenerating] = useState(false);
+  // True once minting from the browser is impossible (remote/non-loopback origin,
+  // a 403, or pairing disabled) — collapse to the copy-able CLI command instead.
+  const [showCliFallback, setShowCliFallback] = useState(false);
+
+  // The admin mint endpoint is localhost-only, so a self-serve "Generate" button
+  // can only work when the dashboard itself is served from loopback. Remote /
+  // Docker origins must use the CLI on the gateway host instead.
+  const isLocalhost = ["localhost", "127.0.0.1", "::1", "[::1]"].includes(
+    window.location.hostname,
+  );
+  // The browser knows the gateway's real host:port (it is talking to it), so it
+  // can show the exact recovery command — including the alternate port that made
+  // the config-default `get-paircode` miss the running instance (#5266).
+  const gatewayPort = window.location.port;
+  const cliRecoveryCommand = `zeroclaw gateway get-paircode --new${gatewayPort ? ` --port ${gatewayPort}` : ""}`;
 
   // Fetch the current pairing code (public endpoint works in Docker too)
   useEffect(() => {
@@ -173,6 +189,36 @@ function PairingDialog({
     }
   };
 
+  // Mint a fresh code on demand against the localhost-only admin endpoint. This
+  // is the in-band escape from the #5266 dead end: an already-paired gateway
+  // prints no code at startup, so without this the dashboard's 6-digit prompt
+  // has no code to enter and no obvious way forward.
+  const handleGenerate = async () => {
+    setGenerating(true);
+    setError("");
+    try {
+      const data = await generatePairCode();
+      if (data.pairing_code) {
+        setDisplayCode(data.pairing_code);
+        setCode(data.pairing_code); // auto-fill so the user just clicks "Pair"
+      } else {
+        // Pairing required but no code minted (e.g. disabled) — point at the CLI.
+        setShowCliFallback(true);
+      }
+    } catch (err: unknown) {
+      if (err instanceof PairCodeForbiddenError) {
+        // Non-loopback origin: the browser can't mint; show the CLI command.
+        setShowCliFallback(true);
+      } else {
+        setError(
+          err instanceof Error ? err.message : "Failed to generate pairing code",
+        );
+      }
+    } finally {
+      setGenerating(false);
+    }
+  };
+
   return (
     <div
       className="min-h-screen flex items-center justify-center"
@@ -193,11 +239,67 @@ function PairingDialog({
             ZeroClaw
           </h1>
           <p className="text-sm" style={{ color: "var(--pc-text-muted)" }}>
-            {displayCode
-              ? "Your pairing code — click Pair to connect"
-              : "Enter the pairing code from your terminal"}
+            {codeLoading
+              ? "Checking pairing status…"
+              : displayCode
+                ? "Your pairing code — click Pair to connect"
+                : "This gateway is already paired — generate a code to add this device"}
           </p>
         </div>
+
+        {/* Already paired, no code minted at startup (#5266): offer a self-serve
+            mint on localhost, or the equivalent CLI command everywhere else. */}
+        {!codeLoading && !displayCode && (
+          <div
+            className="mb-6 p-4 rounded-2xl border text-center text-sm"
+            style={{
+              background: "var(--pc-bg-elevated)",
+              borderColor: "var(--pc-border)",
+              color: "var(--pc-text-muted)",
+            }}
+          >
+            {isLocalhost && !showCliFallback ? (
+              <>
+                <p className="mb-3">
+                  No pairing code was generated because a device is already
+                  paired.
+                </p>
+                <button
+                  type="button"
+                  onClick={handleGenerate}
+                  disabled={generating}
+                  className="btn-electric w-full py-3 text-sm font-semibold tracking-wide"
+                >
+                  {generating ? (
+                    <span className="flex items-center justify-center gap-2">
+                      <span className="h-4 w-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                      Generating…
+                    </span>
+                  ) : (
+                    "Generate pairing code"
+                  )}
+                </button>
+              </>
+            ) : (
+              <>
+                <p className="mb-2">
+                  {isLocalhost
+                    ? "Couldn't generate a code from the browser. On the machine running the gateway, run:"
+                    : "Pairing codes can only be generated on the machine running the gateway. Run:"}
+                </p>
+                <code
+                  className="block px-3 py-2 rounded-lg font-mono text-xs break-all select-all"
+                  style={{
+                    background: "var(--pc-bg-code)",
+                    color: "var(--pc-text-primary)",
+                  }}
+                >
+                  {cliRecoveryCommand}
+                </code>
+              </>
+            )}
+          </div>
+        )}
 
         {/* Show the pairing code if available (localhost) */}
         {!codeLoading && displayCode && (

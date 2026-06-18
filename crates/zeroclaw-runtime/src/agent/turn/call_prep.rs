@@ -219,10 +219,19 @@ pub(crate) async fn prepare_tool_calls(
         }
 
         executable_indices.push(idx);
+        let call_id = super::events::resolve_tool_call_id(&ParsedToolCall {
+            name: tool_name.clone(),
+            arguments: tool_args.clone(),
+            tool_call_id: call.tool_call_id.clone(),
+        });
+        // Pin the resolved id onto the executable call so the pending ToolCall
+        // and the terminal ToolResult (both emitted by the executor at dispatch
+        // and completion) share one correlation id, even for id-less
+        // text-protocol calls.
         executable_calls.push(ParsedToolCall {
             name: tool_name,
             arguments: tool_args,
-            tool_call_id: call.tool_call_id.clone(),
+            tool_call_id: Some(call_id),
         });
     }
 

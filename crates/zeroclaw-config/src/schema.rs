@@ -210,6 +210,13 @@ pub struct Config {
     #[group = "Agent"]
     pub scheduler: SchedulerConfig,
 
+    /// Agent evaluation harness (`[eval]`) — surfaced via `zeroclaw eval`.
+    /// Distinct from `[agent.eval]`, which is the in-loop response-quality scorer.
+    #[serde(default)]
+    #[nested]
+    #[group = "Operations"]
+    pub eval: crate::scattered_types::EvalHarnessConfig,
+
     /// Pacing controls for slow/local LLM workloads (`[pacing]`).
     #[serde(default)]
     #[nested]
@@ -562,8 +569,8 @@ pub struct Config {
     /// Fluent `.ftl` locale files. Falls back to embedded English, then to
     /// hardcoded descriptions.
     ///
-    /// If omitted or empty, the locale is auto-detected from `ZEROCLAW_LOCALE`,
-    /// `LANG`, or `LC_ALL` environment variables (defaulting to `"en"`).
+    /// If omitted or empty, the locale is auto-detected from the host
+    /// system's locale (defaulting to `"en"` if that can't be determined).
     #[serde(default)]
     pub locale: Option<String>,
 
@@ -2001,6 +2008,33 @@ pub struct VeniceModelProviderConfig {
     pub base: ModelProviderConfig,
 }
 
+// ── NEAR AI Cloud ──
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum NearaiEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for NearaiEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://cloud-api.near.ai/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.nearai"]
+pub struct NearaiModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
 // ── Novita ──
 
 #[derive(
@@ -2728,6 +2762,31 @@ pub struct MorphModelProviderConfig {
     pub base: ModelProviderConfig,
 }
 
+// ── Manifest ──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ManifestEndpoint {
+    #[default]
+    Default,
+}
+impl ModelEndpoint for ManifestEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => "https://app.manifest.build/v1",
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.manifest"]
+pub struct ManifestModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
 // ── GitHub Models ──
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -3119,6 +3178,7 @@ impl_default_family_endpoint! {
     AvianModelProviderConfig,
     DeepmystModelProviderConfig,
     VeniceModelProviderConfig,
+    NearaiModelProviderConfig,
     NovitaModelProviderConfig,
     NvidiaModelProviderConfig,
     TelnyxModelProviderConfig,
@@ -3140,6 +3200,7 @@ impl_default_family_endpoint! {
     OsaurusModelProviderConfig,
     LitellmModelProviderConfig,
     LeptonModelProviderConfig,
+    ManifestModelProviderConfig,
     MorphModelProviderConfig,
     GithubModelsModelProviderConfig,
     UpstageModelProviderConfig,
@@ -3448,7 +3509,7 @@ pub struct ChannelAliasInfo {
 }
 
 impl Config {
-    /// Resolve the configured alias values valid for an [`AliasSource`].
+    /// Resolve the configured alias values valid for an [`crate::traits::AliasSource`].
     /// Two-tier sources return dotted `<type>.<alias>` keys; flat sources
     /// return bare alias keys. The single resolver every surface uses for
     /// `PropKind::AliasRef` pickers and validation.
@@ -6037,6 +6098,14 @@ fn default_false() -> bool {
     false
 }
 
+fn default_memory_backend() -> String {
+    "sqlite".into()
+}
+
+fn default_tunnel_provider() -> String {
+    "none".into()
+}
+
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
@@ -6548,10 +6617,10 @@ impl Default for BrowserConfig {
 #[prefix = "http_request"]
 pub struct HttpRequestConfig {
     /// Enable `http_request` tool for API interactions
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Allowed domains for HTTP requests (exact or subdomain match)
-    #[serde(default)]
+    #[serde(default = "default_allowed_domains_star")]
     pub allowed_domains: Vec<String>,
     /// Maximum response size in bytes (default: 1MB, 0 = unlimited)
     #[serde(default = "default_http_max_response_size")]
@@ -6597,6 +6666,10 @@ fn default_http_timeout_secs() -> u64 {
     30
 }
 
+fn default_allowed_domains_star() -> Vec<String> {
+    vec!["*".into()]
+}
+
 // ── Web fetch ────────────────────────────────────────────────────
 
 /// Web fetch tool configuration (`[web_fetch]` section).
@@ -6610,7 +6683,7 @@ fn default_http_timeout_secs() -> u64 {
 #[prefix = "web_fetch"]
 pub struct WebFetchConfig {
     /// Enable `web_fetch` tool for fetching web page content
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Allowed domains for web fetch (exact or subdomain match; `["*"]` = all public hosts)
     #[serde(default = "default_web_fetch_allowed_domains")]
@@ -6849,7 +6922,7 @@ pub struct EscalationConfig {
 #[prefix = "web_search"]
 pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), "searxng" (self-hosted), or "jina" (requires API key)
     #[serde(default = "default_web_search_provider")]
@@ -8579,6 +8652,45 @@ fn validate_proxy_url(field: &str, url: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_http_base_url(field: &str, url: &str) -> Result<()> {
+    if url.trim().is_empty() {
+        validation_bail!(
+            RequiredFieldEmpty,
+            field.to_string(),
+            "{field} must not be empty"
+        );
+    }
+
+    let parsed = match reqwest::Url::parse(url) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            validation_bail!(
+                InvalidFormat,
+                field.to_string(),
+                "{field} must be a valid URL: {err}"
+            );
+        }
+    };
+
+    if !matches!(parsed.scheme(), "http" | "https") {
+        validation_bail!(
+            InvalidFormat,
+            field.to_string(),
+            "{field} must use http:// or https://"
+        );
+    }
+
+    if parsed.host_str().is_none() {
+        validation_bail!(
+            InvalidFormat,
+            field.to_string(),
+            "{field} must include a host"
+        );
+    }
+
+    Ok(())
+}
+
 fn set_proxy_env_pair(key: &str, value: Option<&str>) {
     let lowercase_key = key.to_ascii_lowercase();
     if let Some(value) = value.and_then(|candidate| normalize_proxy_url_option(Some(candidate))) {
@@ -9414,6 +9526,7 @@ pub struct MemoryConfig {
     /// `Config.storage.<backend>.<alias>` at runtime. Bare backend names
     /// (`"sqlite"`) are treated as `"<backend>.default"`. Set to `"none"` to
     /// disable persistence entirely.
+    #[serde(default = "default_memory_backend")]
     pub backend: String,
     /// Auto-save what *you* tell ZeroClaw into memory as conversation history — the agent's own replies are not saved. Turn off if you want memory to only hold things you explicitly record via the memory tool.
     #[serde(default = "default_auto_save")]
@@ -9427,9 +9540,15 @@ pub struct MemoryConfig {
     /// Delete archived files permanently after this many days. Set high if you need long-term history; set low for privacy / disk-space reasons.
     #[serde(default = "default_purge_after_days")]
     pub purge_after_days: u32,
-    /// For the sqlite backend only — drop conversation rows older than this many days to keep the DB lean. Doesn't touch core memories or notes.
+    /// Delete conversation rows older than this many days from the DB (sqlite backend only). Age is measured by `updated_at` (last write time). 0 = keep forever.
     #[serde(default = "default_conversation_retention_days")]
     pub conversation_retention_days: u32,
+    /// Delete daily memory rows older than this many days from the DB. Age is measured by `updated_at` (last write time). 0 = keep forever.
+    #[serde(default = "default_zero_retention")]
+    pub daily_retention_days: u32,
+    /// Delete core memory rows older than this many days from the DB. Age is measured by `created_at` (first-write time). Neither recall nor ordinary rewrites refresh `created_at` under the current SQLite upsert, so core retention is an absolute age limit from first write. Set this to a generously large window for durable core memories, or keep 0 = keep forever.
+    #[serde(default = "default_zero_retention")]
+    pub core_retention_days: u32,
     /// Source of embedding vectors for semantic search. `none` = keyword-only retrieval (no API calls, no vector cost); `openai` = OpenAI's embedding API; `custom:URL` = any OpenAI-compatible embedding endpoint (LiteLLM, local gateway, etc.).
     #[serde(default = "default_embedding_provider")]
     pub embedding_provider: String,
@@ -9588,6 +9707,9 @@ fn default_purge_after_days() -> u32 {
 fn default_conversation_retention_days() -> u32 {
     30
 }
+fn default_zero_retention() -> u32 {
+    0
+}
 fn default_embedding_model() -> String {
     "text-embedding-3-small".into()
 }
@@ -9629,6 +9751,8 @@ impl Default for MemoryConfig {
             archive_after_days: default_archive_after_days(),
             purge_after_days: default_purge_after_days(),
             conversation_retention_days: default_conversation_retention_days(),
+            daily_retention_days: default_zero_retention(),
+            core_retention_days: default_zero_retention(),
             embedding_provider: default_embedding_provider(),
             embedding_model: default_embedding_model(),
             embedding_dimensions: default_embedding_dims(),
@@ -9860,6 +9984,7 @@ pub struct HooksConfig {
     ///
     /// Hooks run in-process with the same privileges as the main runtime.
     /// Keep enabled hook handlers narrowly scoped and auditable.
+    #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
     #[nested]
@@ -9880,6 +10005,7 @@ impl Default for HooksConfig {
 #[prefix = "hooks.builtin"]
 pub struct BuiltinHooksConfig {
     /// Enable the command-logger hook (logs tool calls for auditing).
+    #[serde(default)]
     pub command_logger: bool,
     /// Configuration for the webhook-audit hook.
     ///
@@ -10924,6 +11050,7 @@ impl Default for AcpConfig {
 #[prefix = "tunnel"]
 pub struct TunnelConfig {
     /// How the gateway gets exposed to the public internet so webhooks (Telegram, Slack, etc.) can reach it. `none` = keep it local, no tunnel; `cloudflare` = Cloudflare Tunnel via cloudflared (needs a Zero Trust account and token); `tailscale` = Tailscale Funnel/Serve (tailnet-only or public, no account beyond tailscale); `ngrok` = ngrok agent with auth token; `openvpn` = bring-your-own OpenVPN egress; `pinggy` = Pinggy SSH tunnels (quick one-shot URLs); `custom` = run an arbitrary command you define under `[tunnel.custom]`.
+    #[serde(default = "default_tunnel_provider")]
     pub tunnel_provider: String,
 
     /// Cloudflare Tunnel configuration (used when `tunnel_provider = "cloudflare"`).
@@ -11535,6 +11662,82 @@ impl ChannelsConfig {
             || self.mqtt.values().any(|c| c.enabled)
             || self.amqp.values().any(|c| c.enabled)
     }
+
+    /// One `(canonical_name, configured, deliverable)` row per channel in the
+    /// registry. Single source for name-addressed channel lookups so no surface
+    /// has to hardcode a subset of the channel list. `deliverable` is `false`
+    /// for input-only transports whose `Channel::send` is a no-op (mqtt and
+    /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
+    /// outbound surface such as `heartbeat.target` can refuse them at validation
+    /// instead of accepting a target the delivery layer silently drops.
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 34] {
+        [
+            ("telegram", !self.telegram.is_empty(), true),
+            ("discord", !self.discord.is_empty(), true),
+            ("slack", !self.slack.is_empty(), true),
+            ("mattermost", !self.mattermost.is_empty(), true),
+            ("webhook", !self.webhook.is_empty(), true),
+            ("imessage", !self.imessage.is_empty(), true),
+            ("matrix", !self.matrix.is_empty(), true),
+            ("signal", !self.signal.is_empty(), true),
+            ("whatsapp", !self.whatsapp.is_empty(), true),
+            ("linq", !self.linq.is_empty(), true),
+            ("wati", !self.wati.is_empty(), true),
+            ("nextcloud_talk", !self.nextcloud_talk.is_empty(), true),
+            ("email", !self.email.is_empty(), true),
+            ("gmail_push", !self.gmail_push.is_empty(), true),
+            ("irc", !self.irc.is_empty(), true),
+            ("twitch", !self.twitch.is_empty(), true),
+            ("lark", !self.lark.is_empty(), true),
+            ("line", !self.line.is_empty(), true),
+            ("dingtalk", !self.dingtalk.is_empty(), true),
+            ("wecom", !self.wecom.is_empty(), true),
+            ("wecom_ws", !self.wecom_ws.is_empty(), true),
+            ("wechat", !self.wechat.is_empty(), true),
+            ("qq", !self.qq.is_empty(), true),
+            ("twitter", !self.twitter.is_empty(), true),
+            ("mochat", !self.mochat.is_empty(), true),
+            ("nostr", !self.nostr.is_empty(), true),
+            ("clawdtalk", !self.clawdtalk.is_empty(), true),
+            ("reddit", !self.reddit.is_empty(), true),
+            ("bluesky", !self.bluesky.is_empty(), true),
+            ("voice_call", !self.voice_call.is_empty(), true),
+            ("voice_wake", !self.voice_wake.is_empty(), false),
+            ("voice_duplex", !self.voice_duplex.is_empty(), false),
+            ("mqtt", !self.mqtt.is_empty(), false),
+            ("amqp", !self.amqp.is_empty(), false),
+        ]
+    }
+
+    /// Whether a channel named `name` (case-insensitive) is a known channel
+    /// with at least one configured instance. Used by name-addressed surfaces
+    /// (e.g. `heartbeat.target`) without hardcoding a subset of the registry.
+    pub fn is_channel_configured(&self, name: &str) -> bool {
+        let needle = name.to_ascii_lowercase();
+        self.channel_presence()
+            .iter()
+            .any(|(canonical, configured, _)| *configured && *canonical == needle)
+    }
+
+    /// Whether `name` (case-insensitive) names a channel in the registry,
+    /// regardless of whether it is configured.
+    pub fn is_known_channel(&self, name: &str) -> bool {
+        let needle = name.to_ascii_lowercase();
+        self.channel_presence()
+            .iter()
+            .any(|(canonical, _, _)| *canonical == needle)
+    }
+
+    /// Whether `name` (case-insensitive) names a channel that can actually
+    /// deliver an outbound message. Input-only transports (mqtt, amqp,
+    /// voice_wake) are known and may be configured, but their `Channel::send`
+    /// is a no-op, so they are not valid outbound targets.
+    pub fn is_channel_deliverable(&self, name: &str) -> bool {
+        let needle = name.to_ascii_lowercase();
+        self.channel_presence()
+            .iter()
+            .any(|(canonical, _, deliverable)| *deliverable && *canonical == needle)
+    }
 }
 
 fn default_channel_message_timeout_secs() -> u64 {
@@ -11628,6 +11831,12 @@ fn default_telegram_approval_timeout_secs() -> u64 {
     120
 }
 
+pub const TELEGRAM_OFFICIAL_API_BASE_URL: &str = "https://api.telegram.org";
+
+fn default_telegram_api_base_url() -> String {
+    TELEGRAM_OFFICIAL_API_BASE_URL.to_string()
+}
+
 fn default_channel_approval_timeout_secs() -> u64 {
     300
 }
@@ -11637,7 +11846,7 @@ fn default_matrix_draft_update_interval_ms() -> u64 {
 }
 
 /// Telegram bot channel configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.telegram"]
 pub struct TelegramConfig {
@@ -11653,6 +11862,11 @@ pub struct TelegramConfig {
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub bot_token: String,
+    /// Telegram Bot API base URL. Defaults to the official Telegram endpoint;
+    /// set to a local Bot API server URL when self-hosting Telegram's bot API.
+    #[tab(Connection)]
+    #[serde(default = "default_telegram_api_base_url")]
+    pub api_base_url: String,
     /// Streaming mode for progressive response delivery via message edits.
     #[tab(Behavior)]
     #[serde(default)]
@@ -11704,6 +11918,26 @@ pub struct TelegramConfig {
     /// newest send is dropped and a `WARN` is logged.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
+}
+
+impl Default for TelegramConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bot_token: String::new(),
+            api_base_url: default_telegram_api_base_url(),
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: default_draft_update_interval_ms(),
+            interrupt_on_new_message: false,
+            mention_only: false,
+            ack_reactions: None,
+            proxy_url: None,
+            approval_timeout_secs: default_telegram_approval_timeout_secs(),
+            excluded_tools: Vec::new(),
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
+        }
+    }
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -11887,13 +12121,24 @@ pub struct SlackConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
-    /// Slack bot OAuth token (xoxb-...).
+    /// Slack bot OAuth token (xoxb-...). Optional in config: when unset or
+    /// empty it is resolved at channel construction from
+    /// `ZEROCLAW_SLACK_BOT_TOKEN`, then `SLACK_BOT_TOKEN`. `#[serde(default)]`
+    /// so a config that omits it still deserializes - the env fallback then
+    /// supplies it - instead of failing with `missing field 'bot_token'`.
+    /// See #6844 / #6237.
     #[secret]
+    #[serde(default)]
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub bot_token: String,
-    /// Slack app-level token for Socket Mode (xapp-...).
+    pub bot_token: Option<String>,
+    /// Slack app-level token for Socket Mode (xapp-...). When unset or empty,
+    /// resolved at channel construction from `ZEROCLAW_SLACK_APP_TOKEN`, then
+    /// `SLACK_APP_TOKEN`. `#[serde(default)]` makes omission explicit (an
+    /// `Option` field is already omittable, but this keeps it consistent with
+    /// `bot_token`).
     #[secret]
+    #[serde(default)]
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub app_token: Option<String>,
@@ -11986,6 +12231,50 @@ impl ChannelConfig for SlackConfig {
     fn desc() -> &'static str {
         "connect your bot"
     }
+}
+
+impl SlackConfig {
+    /// Resolve the effective Slack bot token: the configured `bot_token` when
+    /// set and non-empty, else the `ZEROCLAW_SLACK_BOT_TOKEN` env var, else
+    /// `SLACK_BOT_TOKEN`. Returns `None` when none is available. Resolving here
+    /// (rather than writing the env value back into the config struct) keeps an
+    /// env-supplied secret out of any config that might later be persisted to
+    /// disk. See #6844 / #6237.
+    pub fn resolved_bot_token(&self) -> Option<String> {
+        resolve_slack_token(self.bot_token.as_deref(), "BOT")
+    }
+
+    /// Resolve the effective Slack app-level (Socket Mode) token: configured
+    /// `app_token` when set and non-empty, else `ZEROCLAW_SLACK_APP_TOKEN`,
+    /// else `SLACK_APP_TOKEN`. Returns `None` when none is available.
+    pub fn resolved_app_token(&self) -> Option<String> {
+        resolve_slack_token(self.app_token.as_deref(), "APP")
+    }
+}
+
+/// Shared token resolution for [`SlackConfig`]: a non-empty configured value
+/// wins; otherwise the `ZEROCLAW_SLACK_<KIND>_TOKEN` env var takes precedence
+/// over the conventional `SLACK_<KIND>_TOKEN`. Blank values (config or env) are
+/// treated as absent. `kind` is `"BOT"` or `"APP"`.
+fn resolve_slack_token(configured: Option<&str>, kind: &str) -> Option<String> {
+    if let Some(value) = configured {
+        let value = value.trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    for var in [
+        format!("ZEROCLAW_SLACK_{kind}_TOKEN"),
+        format!("SLACK_{kind}_TOKEN"),
+    ] {
+        if let Ok(value) = std::env::var(&var) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Mattermost bot channel configuration.
@@ -13295,6 +13584,13 @@ pub struct LarkConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub per_user_session: bool,
+
+    /// Override for the top-level `ack_reactions` setting. When `None`, the
+    /// channel falls back to `[channels].ack_reactions`. When set
+    /// explicitly, it takes precedence.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub ack_reactions: Option<bool>,
 
     /// Streaming mode for the LLM response: `off` (default) routes every
     /// response through `send()`; `partial` opens a Feishu interactive
@@ -14889,6 +15185,7 @@ impl Default for Config {
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
+            eval: crate::scattered_types::EvalHarnessConfig::default(),
             pacing: PacingConfig::default(),
             skills: SkillsConfig::default(),
             pipeline: PipelineConfig::default(),
@@ -16293,6 +16590,13 @@ impl Config {
                     "{path} = {depth} is out of range; must be 0..={REPLY_QUEUE_DEPTH_CEILING}"
                 );
             }
+        }
+
+        for (alias, tg) in &self.channels.telegram {
+            validate_http_base_url(
+                &format!("channels.telegram.{alias}.api_base_url"),
+                &tg.api_base_url,
+            )?;
         }
 
         for name in self.http_request.secrets.keys() {
@@ -18724,6 +19028,7 @@ mod tests {
         assert!(both.validate().is_ok());
     }
     use super::*;
+    #[cfg(unix)]
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -18734,11 +19039,13 @@ mod tests {
     use tokio::sync::MutexGuard;
     use tokio::test;
 
+    #[cfg(unix)]
     struct EnvValueGuard {
         key: &'static str,
         previous: Option<OsString>,
     }
 
+    #[cfg(unix)]
     impl EnvValueGuard {
         fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
             let previous = std::env::var_os(key);
@@ -18755,6 +19062,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for EnvValueGuard {
         fn drop(&mut self) {
             // SAFETY: tests that mutate env vars serialize on env_override_lock().
@@ -19223,6 +19531,72 @@ enabled = true
     }
 
     #[test]
+    async fn telegram_api_base_url_default_uses_official_endpoint() {
+        assert_eq!(
+            TelegramConfig::default().api_base_url,
+            "https://api.telegram.org"
+        );
+    }
+
+    #[test]
+    async fn telegram_api_base_url_missing_toml_defaults_to_official_endpoint() {
+        let parsed: TelegramConfig = toml::from_str(r#"bot_token = "tok""#).unwrap();
+
+        assert_eq!(parsed.api_base_url, "https://api.telegram.org");
+    }
+
+    #[test]
+    async fn telegram_api_base_url_parses_custom_endpoint() {
+        let parsed: TelegramConfig = toml::from_str(
+            r#"
+bot_token = "tok"
+api_base_url = "http://127.0.0.1:8081"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.api_base_url, "http://127.0.0.1:8081");
+    }
+
+    #[test]
+    async fn validate_rejects_empty_telegram_api_base_url() {
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "default".to_string(),
+            TelegramConfig {
+                bot_token: "tok".into(),
+                api_base_url: "   ".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("empty Telegram API base URL must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("channels.telegram.default.api_base_url"));
+    }
+
+    #[test]
+    async fn validate_rejects_malformed_telegram_api_base_url() {
+        let mut config = Config::default();
+        config.channels.telegram.insert(
+            "default".to_string(),
+            TelegramConfig {
+                bot_token: "tok".into(),
+                api_base_url: "not a url".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("malformed Telegram API base URL must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("channels.telegram.default.api_base_url"));
+    }
+
+    #[test]
     async fn observability_enums_deserialize_legacy_string_values() {
         // Backward compat: TOML configs written before the enum conversion
         // stored these as bare strings. They must still parse.
@@ -19666,6 +20040,7 @@ auto_save = true
     #[test]
     async fn config_toml_roundtrip() {
         let config = Config {
+            eval: crate::scattered_types::EvalHarnessConfig::default(),
             degraded_security: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: {
@@ -19748,6 +20123,7 @@ auto_save = true
                     TelegramConfig {
                         enabled: true,
                         bot_token: "123:ABC".into(),
+                        api_base_url: default_telegram_api_base_url(),
                         stream_mode: StreamMode::default(),
                         draft_update_interval_ms: default_draft_update_interval_ms(),
                         interrupt_on_new_message: false,
@@ -20439,6 +20815,7 @@ default_temperature = 0.7
             },
         );
         let config = Config {
+            eval: crate::scattered_types::EvalHarnessConfig::default(),
             degraded_security: Vec::new(),
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers,
@@ -20638,6 +21015,7 @@ default_temperature = 0.7
                 excluded_tools: vec![],
                 approval_timeout_secs: 300,
                 per_user_session: false,
+                ack_reactions: None,
                 stream_mode: StreamMode::default(),
                 draft_update_interval_ms: default_draft_update_interval_ms(),
             },
@@ -20980,6 +21358,7 @@ default_temperature = 0.7
         let tc = TelegramConfig {
             enabled: true,
             bot_token: "123:XYZ".into(),
+            api_base_url: default_telegram_api_base_url(),
             stream_mode: StreamMode::Partial,
             draft_update_interval_ms: 500,
             interrupt_on_new_message: true,
@@ -21006,6 +21385,7 @@ default_temperature = 0.7
         assert_eq!(parsed.stream_mode, StreamMode::Off);
         assert_eq!(parsed.draft_update_interval_ms, 1000);
         assert!(!parsed.interrupt_on_new_message);
+        assert_eq!(parsed.api_base_url, "https://api.telegram.org");
     }
 
     #[test]
@@ -22193,6 +22573,91 @@ default_temperature = 0.7
     }
 
     #[test]
+    async fn slack_config_deserializes_without_bot_token() {
+        // Regression for #6844 / #6237: before `bot_token` became
+        // `Option<String>` + `#[serde(default)]`, a config that omitted it
+        // failed to deserialize with `missing field 'bot_token'`, aborting
+        // startup before the env-var fallback could ever run.
+        let parsed: SlackConfig = toml::from_str("enabled = true\n")
+            .expect("SlackConfig must deserialize without bot_token");
+        assert!(parsed.bot_token.is_none());
+    }
+
+    #[test]
+    async fn slack_config_deserializes_explicit_bot_token() {
+        let parsed: SlackConfig =
+            toml::from_str("enabled = true\nbot_token = \"xoxb-from-toml\"\n").unwrap();
+        assert_eq!(parsed.bot_token.as_deref(), Some("xoxb-from-toml"));
+    }
+
+    /// Set (`Some`) or clear (`None`) an env var. Callers must hold
+    /// `env_override_lock()`. Used to snapshot-and-restore the Slack token
+    /// vars so these tests leave the process environment exactly as found.
+    fn set_or_clear_env(key: &str, value: Option<&str>) {
+        // SAFETY: callers serialize on env_override_lock().
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    async fn slack_resolved_bot_token_falls_back_to_env() {
+        let _env_guard = env_override_lock().await;
+        let prev_bot = std::env::var("SLACK_BOT_TOKEN").ok();
+        let prev_zc = std::env::var("ZEROCLAW_SLACK_BOT_TOKEN").ok();
+        set_or_clear_env("ZEROCLAW_SLACK_BOT_TOKEN", None);
+        set_or_clear_env("SLACK_BOT_TOKEN", Some("xoxb-from-env"));
+
+        let cfg = SlackConfig {
+            bot_token: None,
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolved_bot_token().as_deref(), Some("xoxb-from-env"));
+
+        set_or_clear_env("SLACK_BOT_TOKEN", prev_bot.as_deref());
+        set_or_clear_env("ZEROCLAW_SLACK_BOT_TOKEN", prev_zc.as_deref());
+    }
+
+    #[test]
+    async fn slack_resolved_bot_token_prefers_zeroclaw_prefix() {
+        let _env_guard = env_override_lock().await;
+        let prev_bot = std::env::var("SLACK_BOT_TOKEN").ok();
+        let prev_zc = std::env::var("ZEROCLAW_SLACK_BOT_TOKEN").ok();
+        set_or_clear_env("SLACK_BOT_TOKEN", Some("xoxb-generic"));
+        set_or_clear_env("ZEROCLAW_SLACK_BOT_TOKEN", Some("xoxb-zeroclaw"));
+
+        let cfg = SlackConfig {
+            bot_token: None,
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolved_bot_token().as_deref(), Some("xoxb-zeroclaw"));
+
+        set_or_clear_env("SLACK_BOT_TOKEN", prev_bot.as_deref());
+        set_or_clear_env("ZEROCLAW_SLACK_BOT_TOKEN", prev_zc.as_deref());
+    }
+
+    #[test]
+    async fn slack_resolved_bot_token_prefers_config_over_env() {
+        let _env_guard = env_override_lock().await;
+        let prev_bot = std::env::var("SLACK_BOT_TOKEN").ok();
+        set_or_clear_env("SLACK_BOT_TOKEN", Some("xoxb-from-env"));
+
+        let cfg = SlackConfig {
+            bot_token: Some("xoxb-from-config".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.resolved_bot_token().as_deref(),
+            Some("xoxb-from-config")
+        );
+
+        set_or_clear_env("SLACK_BOT_TOKEN", prev_bot.as_deref());
+    }
+
+    #[test]
     async fn v1_known_provider_migrates_with_globals_folded_onto_typed_slot() {
         // Top-level `model_provider` + `model` + `default_temperature` flow
         // onto the migrated typed-slot entry. Vendor-canonical names like
@@ -22892,6 +23357,7 @@ default_model = "legacy-model"
                 excluded_tools: vec![],
                 approval_timeout_secs: 300,
                 per_user_session: false,
+                ack_reactions: None,
                 stream_mode: StreamMode::default(),
                 draft_update_interval_ms: default_draft_update_interval_ms(),
             },
@@ -23459,6 +23925,7 @@ api_token = "tok"
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
+            ack_reactions: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: default_draft_update_interval_ms(),
         };
@@ -23487,6 +23954,7 @@ api_token = "tok"
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
+            ack_reactions: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: default_draft_update_interval_ms(),
         };
@@ -24643,6 +25111,7 @@ require_otp_to_resume = true
             TelegramConfig {
                 enabled: true,
                 bot_token: plaintext_token.into(),
+                api_base_url: default_telegram_api_base_url(),
                 stream_mode: StreamMode::default(),
                 draft_update_interval_ms: default_draft_update_interval_ms(),
                 interrupt_on_new_message: false,
@@ -27550,6 +28019,53 @@ allowed_users = []
         }
     }
 
+    /// The dashboard's `/config/channels` global-settings tab filters the
+    /// canonical `prop_fields()` list down to direct `[channels]` fields.
+    /// Keep root settings such as `show_tool_calls` discoverable there without
+    /// mixing per-alias fields into the same editor.
+    #[test]
+    async fn channels_root_settings_stay_on_direct_prop_surface() {
+        let mut config = Config::default();
+        config.init_defaults(None);
+        config
+            .channels
+            .matrix
+            .insert("default".into(), MatrixConfig::default());
+
+        let paths: Vec<_> = config
+            .prop_fields()
+            .into_iter()
+            .map(|field| field.name)
+            .collect();
+        let direct_channel_paths: Vec<_> = paths
+            .iter()
+            .filter_map(|path| {
+                path.strip_prefix("channels.")
+                    .filter(|rest| !rest.contains('.'))
+                    .map(|_| path.as_str())
+            })
+            .collect();
+
+        assert!(
+            direct_channel_paths.contains(&"channels.show_tool_calls"),
+            "root [channels] settings should include show_tool_calls: {direct_channel_paths:?}"
+        );
+        assert!(
+            direct_channel_paths.contains(&"channels.ack_reactions"),
+            "root [channels] settings should include other global channel controls"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path == "channels.matrix.default.enabled"),
+            "fixture should include a nested channel alias field"
+        );
+        assert!(
+            !direct_channel_paths.contains(&"channels.matrix.default.enabled"),
+            "global channel settings must not include per-alias fields"
+        );
+    }
+
     /// Audit gate for RFC #6971 Phase 0: any credential-shaped property path
     /// that reaches the CLI/gateway/TUI property surface must have an explicit
     /// classification. This catches future config additions whose names imply
@@ -28588,5 +29104,85 @@ model_provider = \"ollama.default\"
         let agent = cfg.agents.get("legacy").expect("agent present");
         assert!(agent.delegate_same_risk_profile, "default must be true");
         assert!(agent.delegates.is_empty(), "default must be empty");
+    }
+
+    #[test]
+    async fn channel_presence_names_are_unique_and_undeliverable_set_is_fixed() {
+        let presence = ChannelsConfig::default().channel_presence();
+        let mut seen = std::collections::HashSet::new();
+        for (name, _, _) in presence {
+            assert!(seen.insert(name), "duplicate channel_presence name: {name}");
+        }
+        let mut undeliverable: Vec<&str> = presence
+            .iter()
+            .filter(|(_, _, deliverable)| !*deliverable)
+            .map(|(name, _, _)| *name)
+            .collect();
+        undeliverable.sort_unstable();
+        assert_eq!(
+            undeliverable,
+            ["amqp", "mqtt", "voice_duplex", "voice_wake"],
+            "only input-only transports may be non-deliverable; update channel_presence and is_channel_deliverable together"
+        );
+    }
+
+    // ── Serde-default vs struct-Default drift guards ──────────────
+    //
+    // The save path prunes fields whose value equals serde's default.
+    // If `#[serde(default)]` and `impl Default` disagree, a save →
+    // load round-trip silently flips the field to the serde default,
+    // which is #7498.  These tests catch that drift: an empty TOML
+    // table (the extreme case of pruning — all fields pruned away)
+    // must deserialize to the same value as the struct's `Default`.
+
+    #[test]
+    async fn empty_table_round_trips_to_http_request_config_default() {
+        let from_empty: HttpRequestConfig = toml::from_str("").unwrap();
+        let default = HttpRequestConfig::default();
+        assert_eq!(from_empty.enabled, default.enabled);
+        assert_eq!(from_empty.allowed_domains, default.allowed_domains);
+        assert_eq!(from_empty.max_response_size, default.max_response_size);
+    }
+
+    #[test]
+    async fn empty_table_round_trips_to_web_fetch_config_default() {
+        let from_empty: WebFetchConfig = toml::from_str("").unwrap();
+        let default = WebFetchConfig::default();
+        assert_eq!(from_empty.enabled, default.enabled);
+    }
+
+    #[test]
+    async fn empty_table_round_trips_to_web_search_config_default() {
+        let from_empty: WebSearchConfig = toml::from_str("").unwrap();
+        let default = WebSearchConfig::default();
+        assert_eq!(from_empty.enabled, default.enabled);
+    }
+
+    #[test]
+    async fn empty_table_round_trips_to_memory_config_default() {
+        let from_empty: MemoryConfig = toml::from_str("").unwrap();
+        let default = MemoryConfig::default();
+        assert_eq!(from_empty.backend, default.backend);
+    }
+
+    #[test]
+    async fn empty_table_round_trips_to_tunnel_config_default() {
+        let from_empty: TunnelConfig = toml::from_str("").unwrap();
+        let default = TunnelConfig::default();
+        assert_eq!(from_empty.tunnel_provider, default.tunnel_provider);
+    }
+
+    #[test]
+    async fn empty_table_round_trips_to_hooks_config_default() {
+        let from_empty: HooksConfig = toml::from_str("").unwrap();
+        let default = HooksConfig::default();
+        assert_eq!(from_empty.enabled, default.enabled);
+    }
+
+    #[test]
+    async fn empty_table_round_trips_to_builtin_hooks_config_default() {
+        let from_empty: BuiltinHooksConfig = toml::from_str("").unwrap();
+        let default = BuiltinHooksConfig::default();
+        assert_eq!(from_empty.command_logger, default.command_logger);
     }
 }

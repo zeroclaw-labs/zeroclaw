@@ -14,6 +14,7 @@ use zip::ZipArchive;
 
 pub mod audit;
 pub mod bundle;
+pub mod cache;
 pub mod constants;
 pub mod creator;
 pub mod document;
@@ -66,8 +67,50 @@ pub struct Skill {
     pub tools: Vec<SkillTool>,
     #[serde(default)]
     pub prompts: Vec<String>,
+    /// Typed slash-command options a `slash`-tagged skill exposes (e.g. on
+    /// Discord). Empty for skills that take no structured input — slash channels
+    /// then fall back to a single free-text option. See [`SkillSlashOption`].
+    #[serde(default)]
+    pub slash_options: Vec<SkillSlashOption>,
     #[serde(skip)]
     pub location: Option<PathBuf>,
+}
+
+/// A typed option a `slash`-tagged skill exposes on its slash command. Shaped
+/// after the Discord Application Command Option model but channel-agnostic; a
+/// slash-capable channel maps `kind` to its wire option type. Declared in
+/// SKILL.toml under `[[skill.slash_options]]`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkillSlashOption {
+    pub name: String,
+    pub description: String,
+    /// `string` | `integer` | `number` | `boolean` | `user` | `channel` |
+    /// `role` | `mentionable`. Unknown values are dropped by the channel.
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub required: bool,
+    /// Predefined choices (string/integer/number options only). The `value` is
+    /// kept as text and coerced to the option's type by the channel.
+    #[serde(default)]
+    pub choices: Vec<SkillSlashChoice>,
+    /// Inclusive bounds for integer/number options.
+    #[serde(default)]
+    pub min: Option<f64>,
+    #[serde(default)]
+    pub max: Option<f64>,
+    /// Length bounds for string options.
+    #[serde(default)]
+    pub min_length: Option<u32>,
+    #[serde(default)]
+    pub max_length: Option<u32>,
+}
+
+/// A predefined choice for a typed slash option.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkillSlashChoice {
+    pub name: String,
+    pub value: String,
 }
 
 impl ::zeroclaw_api::attribution::Attributable for Skill {
@@ -142,6 +185,8 @@ struct SkillMeta {
     tags: Vec<String>,
     #[serde(default)]
     prompts: Vec<String>,
+    #[serde(default)]
+    slash_options: Vec<SkillSlashOption>,
 }
 
 /// Provenance metadata emitted by the SkillForge integrator (see
@@ -519,6 +564,12 @@ fn load_workspace_skills(workspace_dir: &Path, allow_scripts: bool) -> Vec<Skill
 }
 
 pub fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
+    cache::cached_load(skills_dir, allow_scripts, "workspace", || {
+        load_skills_from_directory_uncached(skills_dir, allow_scripts)
+    })
+}
+
+fn load_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
     if !skills_dir.exists() {
         return Vec::new();
     }
@@ -612,6 +663,12 @@ fn finalize_open_skill(mut skill: Skill) -> Skill {
 }
 
 fn load_open_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
+    cache::cached_load(skills_dir, allow_scripts, "open-skills", || {
+        load_open_skills_from_directory_uncached(skills_dir, allow_scripts)
+    })
+}
+
+fn load_open_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
     if !skills_dir.exists() {
         return Vec::new();
     }
@@ -1006,6 +1063,7 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         tags: manifest.skill.tags,
         tools: manifest.tools,
         prompts,
+        slash_options: manifest.skill.slash_options,
         location: Some(path.to_path_buf()),
     })
 }
@@ -1032,6 +1090,7 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         tags: parsed.meta.tags,
         tools: Vec::new(),
         prompts: vec![parsed.body],
+        slash_options: Vec::new(),
         location: Some(path.to_path_buf()),
     })
 }
@@ -1071,6 +1130,7 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
         tags: parsed.meta.tags,
         tools: Vec::new(),
         prompts: vec![parsed.body],
+        slash_options: Vec::new(),
         location: Some(path.to_path_buf()),
     }))
 }
@@ -2471,6 +2531,68 @@ prompts = ["If asked about XYZZY, respond YES"]
     }
 
     #[test]
+    fn typed_slash_options_are_parsed_from_the_skill_table() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_manifest(
+            tmp.path(),
+            r#"
+[skill]
+name = "search"
+description = "Search the web"
+version = "0.1.0"
+tags = ["slash"]
+
+[[skill.slash_options]]
+name = "query"
+description = "The search query"
+type = "string"
+required = true
+max_length = 200
+
+[[skill.slash_options]]
+name = "sort"
+description = "Sort order"
+type = "string"
+choices = [
+    { name = "Newest", value = "new" },
+    { name = "Oldest", value = "old" },
+]
+"#,
+        );
+        let skill = load_skill_toml(&path).unwrap();
+        assert_eq!(skill.slash_options.len(), 2);
+
+        let query = &skill.slash_options[0];
+        assert_eq!(query.name, "query");
+        assert_eq!(query.kind, "string");
+        assert!(query.required);
+        assert_eq!(query.max_length, Some(200));
+
+        let sort = &skill.slash_options[1];
+        assert_eq!(sort.name, "sort");
+        assert!(!sort.required);
+        assert_eq!(sort.choices.len(), 2);
+        assert_eq!(sort.choices[0].name, "Newest");
+        assert_eq!(sort.choices[0].value, "new");
+    }
+
+    #[test]
+    fn skills_without_slash_options_default_to_empty() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_manifest(
+            tmp.path(),
+            r#"
+[skill]
+name = "probe"
+description = "test"
+version = "0.1.0"
+"#,
+        );
+        let skill = load_skill_toml(&path).unwrap();
+        assert!(skill.slash_options.is_empty());
+    }
+
+    #[test]
     fn prompts_at_root_level_still_work() {
         let tmp = TempDir::new().unwrap();
         let path = write_manifest(
@@ -2856,6 +2978,7 @@ mod prompt_callable_name_tests {
             tags: Vec::new(),
             tools: vec![tool("run.lint", "shell")],
             prompts: Vec::new(),
+            slash_options: Vec::new(),
             location: None,
         };
 

@@ -1,16 +1,17 @@
 // Schema-driven config editor (#6175). Curated section explorer
 // but lands on a per-section overview: pick a section in the sidebar, see
 // what's currently configured under it, click an item to edit, click +Add
-// to instantiate a new entry.
+// to instantiate a new entry. Sections with root-level controls can also
+// compose a filtered FieldForm beside the picker.
 //
 // URL structure:
-//   /config/:section             — section overview (configured items list)
+//   /config/:section             — section overview plus root settings when any
 //   /config/:section/:type       — alias list for a provider/channel type
 //   /config/:section/:type/:alias — field form for a specific alias
 //
-// All section list / picker / field rendering comes from the shared
-// SectionPicker + FieldForm components. NO hardcoded section names, field
-// labels, dropdown options, or provider lists.
+// Section list / picker / field rendering comes from the shared
+// SectionPicker + FieldForm components. Per-section composition is limited to
+// routing and filtering around those shared surfaces, not duplicate schema data.
 
 import { useEffect, useMemo, useState } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
@@ -445,8 +446,7 @@ export default function Config() {
       );
     }
 
-    // /config/:section — overview + picker
-    return (
+    const sectionOverview = (
       <SectionOverview
         section={activeSection}
         onPickType={(typeKey) => {
@@ -488,6 +488,38 @@ export default function Config() {
         drifted={drifted}
       />
     );
+
+    if (activeSection.key === "channels") {
+      return (
+        <SectionTabs
+          tabs={[
+            {
+              key: "types",
+              label: "Channel types",
+              render: () => sectionOverview,
+            },
+            {
+              key: "global",
+              label: "Global settings",
+              render: () => (
+                <FieldForm
+                  key={`${reloadKey}-channels-global`}
+                  prefix="channels"
+                  title="Global channel settings"
+                  onSaved={fetchDrift}
+                  drift={drifted}
+                  includePath={isDirectChannelSetting}
+                  scopeActionsToIncludedPaths
+                />
+              ),
+            },
+          ]}
+        />
+      );
+    }
+
+    // /config/:section — overview + picker
+    return sectionOverview;
   })();
 
   // Breadcrumb segments
@@ -880,6 +912,13 @@ function costCategoryForSection(sectionKey: string): CostRatesCategory | null {
   if (sectionKey === "providers.tts") return "tts";
   if (sectionKey === "providers.transcription") return "transcription";
   return null;
+}
+
+function isDirectChannelSetting(path: string): boolean {
+  const prefix = "channels.";
+  if (!path.startsWith(prefix)) return false;
+  const rest = path.slice(prefix.length);
+  return rest.length > 0 && !rest.includes(".");
 }
 
 /**

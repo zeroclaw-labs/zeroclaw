@@ -422,6 +422,7 @@ async fn handle_socket(
             false,
             state.sop_engine.clone(),
             state.sop_audit.clone(),
+            Some(state.canvas_store.clone()),
         )
         .await
         {

@@ -1245,9 +1245,8 @@ impl BedrockModelProvider {
             .to_string();
         let result = value
             .get("content")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string();
+            .map(Self::tool_result_content_text)
+            .unwrap_or_default();
         Some(ConverseMessage {
             role: "user".to_string(),
             content: vec![ContentBlock::ToolResult(ToolResultWrapper {
@@ -1258,6 +1257,15 @@ impl BedrockModelProvider {
                 },
             })],
         })
+    }
+
+    // Bedrock toolResult content is text-only. Preserve string tool output as-is;
+    // encode structured output compactly so object/array results are not dropped.
+    fn tool_result_content_text(value: &serde_json::Value) -> String {
+        value
+            .as_str()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| value.to_string())
     }
 
     // ── Tool conversion ─────────────────────────────────────────
@@ -2411,6 +2419,38 @@ mod tests {
         assert!(msg.is_some());
         if let ContentBlock::ToolResult(ref wrapper) = msg.unwrap().content[0] {
             assert_eq!(wrapper.tool_result.tool_use_id, "x");
+            assert_eq!(wrapper.tool_result.content[0].text, "ok");
+        } else {
+            panic!("Expected ToolResult");
+        }
+    }
+
+    #[test]
+    fn parse_tool_result_preserves_structured_content_as_json_text() {
+        let object_msg = BedrockModelProvider::parse_tool_result_message(
+            r#"{"tool_call_id":"obj","content":{"ok":true,"count":2}}"#,
+        )
+        .expect("object content should parse");
+        if let ContentBlock::ToolResult(ref wrapper) = object_msg.content[0] {
+            assert_eq!(wrapper.tool_result.tool_use_id, "obj");
+            assert_eq!(
+                wrapper.tool_result.content[0].text,
+                r#"{"count":2,"ok":true}"#
+            );
+        } else {
+            panic!("Expected ToolResult");
+        }
+
+        let array_msg = BedrockModelProvider::parse_tool_result_message(
+            r#"{"tool_call_id":"arr","content":["alpha",{"beta":1}]}"#,
+        )
+        .expect("array content should parse");
+        if let ContentBlock::ToolResult(ref wrapper) = array_msg.content[0] {
+            assert_eq!(wrapper.tool_result.tool_use_id, "arr");
+            assert_eq!(
+                wrapper.tool_result.content[0].text,
+                r#"["alpha",{"beta":1}]"#
+            );
         } else {
             panic!("Expected ToolResult");
         }
