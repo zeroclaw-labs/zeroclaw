@@ -21360,6 +21360,91 @@ Done."#;
         assert_eq!(sm.in_reply_to.as_deref(), Some("<abc123@mail.example>"));
         assert!(sm.subject.is_none());
     }
+
+    /// Regression: the channel tool-loop must receive
+    /// `strict_tool_parsing` and `parallel_tools` from
+    /// `ctx.agent_cfg.resolved` (populated by
+    /// `Config::resolved_agent_config`) rather than from
+    /// `ctx.prompt_config.agent(...).resolved` (which is the
+    /// serde-skipped default copy).
+    ///
+    /// Before the fix, the orchestrator passed
+    /// `ctx.prompt_config.agent(alias).resolved.strict_tool_parsing`
+    /// and `ctx.prompt_config.agent(alias).resolved.parallel_tools`
+    /// to `run_tool_call_loop`. Because `AliasedAgentConfig.resolved`
+    /// is `#[serde(skip)]`, that field is always
+    /// `ResolvedRuntime::default()` — `strict_tool_parsing` is always
+    /// `false` and `parallel_tools` is always `false`, regardless of
+    /// what the runtime profile actually specifies.
+    ///
+    /// This test proves that `ctx.agent_cfg.resolved` carries the
+    /// correct values when the runtime profile sets them to `true`,
+    /// while `ctx.prompt_config.agent(alias).resolved` remains the
+    /// default (`false`). The test should fail on the old code (which
+    /// read from `prompt_config`) and pass with the fix (which reads
+    /// from `agent_cfg`).
+    #[test]
+    fn resolved_agent_config_carries_strict_tool_parsing_and_parallel_tools() {
+        let mut prompt_config = zeroclaw_config::schema::Config::default();
+
+        // Insert a runtime profile with strict_tool_parsing=true and
+        // parallel_tools=true.
+        prompt_config.runtime_profiles.insert(
+            "strict-parallel".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                strict_tool_parsing: true,
+                parallel_tools: Some(true),
+                ..Default::default()
+            },
+        );
+
+        // Insert an agent that references the profile.
+        let agent_alias = "test-agent";
+        prompt_config.agents.insert(
+            agent_alias.to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                runtime_profile: zeroclaw_config::providers::RuntimeProfileRef::from(
+                    "strict-parallel",
+                ),
+                ..Default::default()
+            },
+        );
+
+        // resolved_agent_config populates the resolved field from the
+        // runtime profile.
+        let agent_cfg = prompt_config
+            .resolved_agent_config(agent_alias)
+            .expect("agent must resolve");
+
+        // Verify that agent_cfg.resolved carries the correct values
+        // from the runtime profile.
+        assert!(
+            agent_cfg.resolved.strict_tool_parsing,
+            "resolved.strict_tool_parsing should be true from the runtime profile"
+        );
+        assert!(
+            agent_cfg.resolved.parallel_tools,
+            "resolved.parallel_tools should be true from the runtime profile"
+        );
+
+        // Verify that prompt_config.agent(alias).resolved still
+        // carries the serde-skipped defaults (false). This is the
+        // bug source: the old code read from this path and always got
+        // false.
+        let raw_agent = prompt_config
+            .agent(agent_alias)
+            .expect("agent must exist in prompt_config");
+        assert!(
+            !raw_agent.resolved.strict_tool_parsing,
+            "raw agent resolved.strict_tool_parsing should be false (serde-skipped default) \
+             — this is the stale source the old code read from"
+        );
+        assert!(
+            !raw_agent.resolved.parallel_tools,
+            "raw agent resolved.parallel_tools should be false (serde-skipped default) \
+             — this is the stale source the old code read from"
+        );
+    }
 }
 
 #[cfg(test)]
