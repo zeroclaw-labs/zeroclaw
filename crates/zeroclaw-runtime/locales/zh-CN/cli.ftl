@@ -744,3 +744,7 @@ cli-bundle-warn-archive = 警告：bundle 目录归档失败：{$error}
 cli-bundle-deleted = 已删除 skill_bundles.{$alias}（已从 {$count} 个 agent 中移除）
 cli-bundle-warn-move = 警告：bundle 目录移动失败：{$error}
 cli-bundle-renamed = 已重命名 skill_bundles.{$from} → skill_bundles.{$to}
+
+cli-models-set-ok = 默认模型已设置为 "{ $model }" (provider: { $provider })。
+cli-models-status-current = 默认模型: { $model } (provider: { $provider })
+cli-models-status-none = 未配置默认模型。
