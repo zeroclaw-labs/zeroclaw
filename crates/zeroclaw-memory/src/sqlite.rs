@@ -3808,12 +3808,17 @@ mod tests {
     async fn sqlite_session_metadata_ordering_is_stable_descending() {
         let (_tmp, mem) = temp_sqlite();
         // Seed with sleep gaps wide enough that updated_at strictly differs.
+        // 50ms is well above the SQLite `created_at`/`updated_at` millisecond
+        // resolution and stays comfortably under any reasonable CI time
+        // budget; 15ms (the original value) was observed to flake on slow
+        // shared runners where two adjacent writes landed within the same
+        // millisecond bucket.
         let keys = ["ord-a", "ord-b", "ord-c", "ord-d"];
         for key in keys {
             mem.store(key, "body", MemoryCategory::Core, Some("sess-order"))
                 .await
                 .unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
         // First read: capture the ordering.
