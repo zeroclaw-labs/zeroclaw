@@ -452,27 +452,40 @@ pub async fn update_context_windows(
     let mut updated = 0usize;
 
     // Collect all the data we need first to avoid borrow conflicts
-    let targets: Vec<(String, String, Option<String>, Option<usize>)> = if let Some(model_provider) = provider_override {
-        // Single provider - use find_by_name to look up by "type.alias" format
-        if let Some((_, _, entry)) = config.providers.models.find_by_name(model_provider) {
-            vec![(model_provider.to_string(), entry.model.clone().unwrap_or_default(), entry.uri.clone(), entry.context_window)]
+    let targets: Vec<(String, String, Option<String>, Option<usize>)> =
+        if let Some(model_provider) = provider_override {
+            // Single provider - use find_by_name to look up by "type.alias" format
+            if let Some((_, _, entry)) = config.providers.models.find_by_name(model_provider) {
+                vec![(
+                    model_provider.to_string(),
+                    entry.model.clone().unwrap_or_default(),
+                    entry.uri.clone(),
+                    entry.context_window,
+                )]
+            } else {
+                anyhow::bail!("Model provider '{model_provider}' not found in config");
+            }
         } else {
-            anyhow::bail!("Model provider '{model_provider}' not found in config");
-        }
-    } else {
-        // All providers
-        config
-            .providers
-            .models
-            .iter_entries()
-            .map(|(t, a, e)| (format!("{t}.{a}"), e.model.clone().unwrap_or_default(), e.uri.clone(), e.context_window))
-            .collect()
-    };
+            // All providers
+            config
+                .providers
+                .models
+                .iter_entries()
+                .map(|(t, a, e)| {
+                    (
+                        format!("{t}.{a}"),
+                        e.model.clone().unwrap_or_default(),
+                        e.uri.clone(),
+                        e.context_window,
+                    )
+                })
+                .collect()
+        };
 
     for (provider_ref, model, uri, existing_context_window) in targets {
         // Skip if already has context_window set
-        if existing_context_window.is_some() {
-            println!("  {provider_ref}: already has context_window = {}", existing_context_window.unwrap());
+        if let Some(ctx) = existing_context_window {
+            println!("  {provider_ref}: already has context_window = {ctx}");
             continue;
         }
 
@@ -486,11 +499,16 @@ pub async fn update_context_windows(
         let provider_type = provider_ref.split('.').next().unwrap_or("");
 
         // Fetch context window from provider
-        match zeroclaw_providers::fetch_context_window(provider_type, &zeroclaw_config::schema::ModelProviderConfig {
-            model: Some(model.clone()),
-            uri: uri.clone(),
-            ..Default::default()
-        }).await {
+        match zeroclaw_providers::fetch_context_window(
+            provider_type,
+            &zeroclaw_config::schema::ModelProviderConfig {
+                model: Some(model.clone()),
+                uri: uri.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        {
             Some(ctx) => {
                 if dry_run {
                     println!("  {provider_ref}: would set context_window = {ctx} (dry run)");
@@ -498,7 +516,9 @@ pub async fn update_context_windows(
                     // Update the config - need to find and mutate
                     let mut found = false;
                     for entry_mut in config.providers.models.iter_entries_mut() {
-                        if entry_mut.2.model.as_deref() == Some(model.as_str()) && entry_mut.2.uri == uri {
+                        if entry_mut.2.model.as_deref() == Some(model.as_str())
+                            && entry_mut.2.uri == uri
+                        {
                             entry_mut.2.context_window = Some(ctx);
                             updated += 1;
                             println!("  {provider_ref}: set context_window = {ctx}");
@@ -512,7 +532,9 @@ pub async fn update_context_windows(
                 }
             }
             None => {
-                println!("  {provider_ref}: provider does not expose context window or fetch failed");
+                println!(
+                    "  {provider_ref}: provider does not expose context window or fetch failed"
+                );
             }
         }
     }

@@ -4579,7 +4579,12 @@ async fn main() -> Result<()> {
                 model_provider,
                 dry_run,
             }) => {
-                doctor::update_context_windows(&mut config, model_provider.as_deref(), dry_run).await?;
+                Box::pin(doctor::update_context_windows(
+                    &mut config,
+                    model_provider.as_deref(),
+                    dry_run,
+                ))
+                .await?;
                 Ok(())
             }
             None => doctor::run(&config).await,

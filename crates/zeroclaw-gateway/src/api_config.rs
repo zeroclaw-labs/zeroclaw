@@ -1540,13 +1540,19 @@ pub async fn handle_refresh_context_window(
     // Verify the entry exists
     if working.get_prop(&format!("{path}.model")).is_err() {
         return error_response(
-            ConfigApiError::new(ConfigApiCode::PathNotFound, format!("model provider '{provider_type}.{alias}' not found"))
-                .with_path(&path),
+            ConfigApiError::new(
+                ConfigApiCode::PathNotFound,
+                format!("model provider '{provider_type}.{alias}' not found"),
+            )
+            .with_path(&path),
         );
     }
 
     // Build minimal provider config for fetch
-    let model = working.get_prop(&format!("{path}.model")).ok().unwrap_or_default();
+    let model = working
+        .get_prop(&format!("{path}.model"))
+        .ok()
+        .unwrap_or_default();
     let uri = working.get_prop(&format!("{path}.uri")).ok();
 
     let provider_config = zeroclaw_config::schema::ModelProviderConfig {
@@ -1556,7 +1562,12 @@ pub async fn handle_refresh_context_window(
     };
 
     // Fetch context window from provider
-    let context_window = match zeroclaw_providers::fetch_context_window(&provider_type, &provider_config).await {
+    let context_window = match zeroclaw_providers::fetch_context_window(
+        &provider_type,
+        &provider_config,
+    )
+    .await
+    {
         Some(ctx) => ctx,
         None => {
             return error_response(
@@ -1570,10 +1581,16 @@ pub async fn handle_refresh_context_window(
     };
 
     // Update config
-    if let Err(e) = working.set_prop_persistent(&format!("{path}.context_window"), &context_window.to_string()) {
+    if let Err(e) = working.set_prop_persistent(
+        &format!("{path}.context_window"),
+        &context_window.to_string(),
+    ) {
         return error_response(
-            ConfigApiError::new(ConfigApiCode::InternalError, format!("failed to persist context_window: {e}"))
-                .with_path(&path),
+            ConfigApiError::new(
+                ConfigApiCode::InternalError,
+                format!("failed to persist context_window: {e}"),
+            )
+            .with_path(&path),
         );
     }
 

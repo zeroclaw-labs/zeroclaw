@@ -3681,10 +3681,10 @@ impl Config {
     #[must_use]
     pub fn effective_model_context_window(&self, agent_alias: &str) -> usize {
         // 1. Provider config (config.toml) — PRIMARY SOT for model's context window
-        if let Some((_, _, provider_config)) = self.resolved_model_provider_for_agent(agent_alias) {
-            if let Some(ctx) = provider_config.context_window {
-                return ctx;
-            }
+        if let Some((_, _, provider_config)) = self.resolved_model_provider_for_agent(agent_alias)
+            && let Some(ctx) = provider_config.context_window
+        {
+            return ctx;
         }
         // 2. Hard fallback 32,000 (stub)
         32_000
