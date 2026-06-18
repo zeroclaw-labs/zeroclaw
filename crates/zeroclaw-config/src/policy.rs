@@ -229,6 +229,7 @@ pub struct SecurityPolicy {
     pub block_high_risk_commands: bool,
     pub shell_env_passthrough: Vec<String>,
     pub shell_timeout_secs: u64,
+    pub shell_max_memory_mb: u64,
     /// Tool name allowlist. `None` is unrestricted (default for agents
     /// without an explicit `risk_profile.allowed_tools` setting).
     /// `Some(vec![])` denies every tool. `Some(list)` admits only the
@@ -463,6 +464,8 @@ pub enum EscalationViolation {
     /// ceiling. The shell budget is a runaway-process guard; raising
     /// it on the child side defeats the parent's intent.
     ShellTimeoutExceeded { child: u64, parent: u64 },
+    /// Child override raises or disables the parent's shell memory ceiling.
+    ShellMemoryLimitExceeded { child: u64, parent: u64 },
     /// Child flips `block_high_risk_commands` from `true` (parent) to
     /// `false`, opening the high-risk command surface the parent
     /// closed.
@@ -519,6 +522,10 @@ impl std::fmt::Display for EscalationViolation {
                 f,
                 "subagent shell_timeout_secs={child} exceeds parent's {parent}"
             ),
+            Self::ShellMemoryLimitExceeded { child, parent } => write!(
+                f,
+                "subagent shell_max_memory_mb={child} exceeds parent's {parent}"
+            ),
             Self::BlockHighRiskCommandsDisabledByChild => write!(
                 f,
                 "subagent attempts to set block_high_risk_commands=false but the parent enforces it"
@@ -552,6 +559,7 @@ impl Default for SecurityPolicy {
             block_high_risk_commands: true,
             shell_env_passthrough: vec![],
             shell_timeout_secs: 60,
+            shell_max_memory_mb: 512,
             allowed_tools: None,
             excluded_tools: None,
             auto_approve: vec![],
@@ -2285,6 +2293,16 @@ impl SecurityPolicy {
                 parent: parent.shell_timeout_secs,
             });
         }
+        let child_disables_parent_limit =
+            parent.shell_max_memory_mb > 0 && self.shell_max_memory_mb == 0;
+        let child_raises_parent_limit =
+            parent.shell_max_memory_mb > 0 && self.shell_max_memory_mb > parent.shell_max_memory_mb;
+        if child_disables_parent_limit || child_raises_parent_limit {
+            return Err(EscalationViolation::ShellMemoryLimitExceeded {
+                child: self.shell_max_memory_mb,
+                parent: parent.shell_max_memory_mb,
+            });
+        }
         if parent.block_high_risk_commands && !self.block_high_risk_commands {
             return Err(EscalationViolation::BlockHighRiskCommandsDisabledByChild);
         }
@@ -2296,10 +2314,9 @@ impl SecurityPolicy {
     }
 
     /// Legacy entry point: build a `SecurityPolicy` from a risk profile
-    /// without a runtime profile. Budget caps default to zero (interpreted
-    /// as "no enforcement"). Tests and pre-multi-agent callsites use this;
-    /// production code should call `from_profiles` or `for_agent` so the
-    /// runtime profile's budget caps actually take effect.
+    /// without a configured runtime profile. Budget caps use
+    /// `RuntimeProfileConfig::default()` so legacy call sites still get the
+    /// default runtime guardrails.
     pub fn from_risk_profile(
         risk_profile: &crate::schema::RiskProfileConfig,
         workspace_dir: &Path,
@@ -2311,9 +2328,10 @@ impl SecurityPolicy {
     ///
     /// Authorization fields (autonomy level, allowlists, sandbox) come from
     /// the risk profile. Budget caps (`max_actions_per_hour`,
-    /// `max_cost_per_day_cents`, `shell_timeout_secs`) come from the
-    /// runtime profile but are enforced with parent-subset discipline on
-    /// SubAgent spawn (see `ensure_no_escalation_beyond`).
+    /// `max_cost_per_day_cents`, `shell_timeout_secs`,
+    /// `shell_max_memory_mb`) come from the runtime profile but are enforced
+    /// with parent-subset discipline on SubAgent spawn (see
+    /// `ensure_no_escalation_beyond`).
     pub fn from_profiles(
         risk_profile: &crate::schema::RiskProfileConfig,
         runtime_profile: Option<&crate::schema::RuntimeProfileConfig>,
@@ -2370,6 +2388,7 @@ impl SecurityPolicy {
             block_high_risk_commands: risk_profile.block_high_risk_commands,
             shell_env_passthrough: risk_profile.shell_env_passthrough.clone(),
             shell_timeout_secs: runtime.shell_timeout_secs,
+            shell_max_memory_mb: runtime.shell_max_memory_mb,
             allowed_tools: if risk_profile.allowed_tools.is_empty() {
                 None
             } else {
@@ -2393,9 +2412,8 @@ impl SecurityPolicy {
     /// a `SecurityPolicy`. Bails when the agent isn't configured or when its
     /// `risk_profile` field doesn't name a configured profile — there is no
     /// global fallback, every security context is per-agent. Missing
-    /// `runtime_profile` falls back to zero budgets (treated as "inherit /
-    /// no enforcement"), matching the previous default when the budget
-    /// fields lived on the risk profile.
+    /// `runtime_profile` falls back to `RuntimeProfileConfig::default()`,
+    /// matching the default runtime guardrails used by `from_profiles`.
     pub fn for_agent(config: &crate::schema::Config, agent_alias: &str) -> anyhow::Result<Self> {
         let risk_profile = config.risk_profile_for_agent(agent_alias).ok_or_else(|| {
             ::zeroclaw_log::record!(
@@ -2844,6 +2862,7 @@ mod tests {
             max_actions_per_hour: 99,
             max_cost_per_day_cents: 1234,
             shell_timeout_secs: 300,
+            shell_max_memory_mb: 256,
             ..RuntimeProfileConfig::default()
         };
 
@@ -2852,6 +2871,7 @@ mod tests {
         assert_eq!(policy.max_actions_per_hour, 99);
         assert_eq!(policy.max_cost_per_day_cents, 1234);
         assert_eq!(policy.shell_timeout_secs, 300);
+        assert_eq!(policy.shell_max_memory_mb, 256);
     }
 
     #[test]
@@ -2868,6 +2888,7 @@ mod tests {
         assert_eq!(policy.max_actions_per_hour, 20);
         assert_eq!(policy.max_cost_per_day_cents, 500);
         assert_eq!(policy.shell_timeout_secs, 60);
+        assert_eq!(policy.shell_max_memory_mb, 512);
     }
 
     fn unix_forbidden_path_policy() -> SecurityPolicy {
@@ -5253,6 +5274,59 @@ mod tests {
             EscalationViolation::ShellTimeoutExceeded { child, parent }
             if child == 600 && parent == 30
         ));
+    }
+
+    #[test]
+    fn ensure_no_escalation_rejects_higher_shell_memory_limit() {
+        let parent = SecurityPolicy {
+            shell_max_memory_mb: 256,
+            ..parent_policy_for_escalation_tests()
+        };
+        let child = SecurityPolicy {
+            shell_max_memory_mb: 512,
+            ..parent.clone()
+        };
+        let err = child
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("higher shell_max_memory_mb must be rejected");
+        assert!(matches!(
+            err,
+            EscalationViolation::ShellMemoryLimitExceeded { child, parent }
+            if child == 512 && parent == 256
+        ));
+    }
+
+    #[test]
+    fn ensure_no_escalation_rejects_disabled_shell_memory_limit_under_finite_parent() {
+        let parent = SecurityPolicy {
+            shell_max_memory_mb: 256,
+            ..parent_policy_for_escalation_tests()
+        };
+        let child = SecurityPolicy {
+            shell_max_memory_mb: 0,
+            ..parent.clone()
+        };
+        let err = child
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("disabled shell_max_memory_mb must be rejected under finite parent");
+        assert!(matches!(
+            err,
+            EscalationViolation::ShellMemoryLimitExceeded { child, parent }
+            if child == 0 && parent == 256
+        ));
+    }
+
+    #[test]
+    fn ensure_no_escalation_accepts_shell_memory_limit_when_parent_is_unlimited() {
+        let parent = SecurityPolicy {
+            shell_max_memory_mb: 0,
+            ..parent_policy_for_escalation_tests()
+        };
+        let child = SecurityPolicy {
+            shell_max_memory_mb: 512,
+            ..parent.clone()
+        };
+        assert!(child.ensure_no_escalation_beyond(&parent).is_ok());
     }
 
     #[test]

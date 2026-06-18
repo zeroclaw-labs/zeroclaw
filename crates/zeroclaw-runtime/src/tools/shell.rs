@@ -1,6 +1,9 @@
 use crate::platform::RuntimeAdapter;
 use crate::security::SecurityPolicy;
 use crate::security::traits::Sandbox;
+use crate::tools::subprocess_limits::{
+    apply_post_spawn_memory_limit, apply_pre_spawn_memory_limit, memory_limit_exceeded_error,
+};
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -320,6 +323,7 @@ impl Tool for ShellTool {
         // Execute with timeout to prevent hanging commands.
         // Clear the environment to prevent leaking API keys and other secrets
         // (CWE-200), then re-add only safe, functional variables.
+        let max_memory_mb = self.security.shell_max_memory_mb;
         let mut cmd = match self
             .runtime
             .build_shell_command(command, &self.security.workspace_dir)
@@ -390,6 +394,13 @@ impl Tool for ShellTool {
         #[cfg(unix)]
         cmd.process_group(0);
         cmd.kill_on_drop(true);
+        if let Err(e) = apply_pre_spawn_memory_limit(&mut cmd, max_memory_mb) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Failed to configure memory limit: {e}")),
+            });
+        }
         // `output()` pipes stdio implicitly; `spawn()` does not.
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -408,6 +419,17 @@ impl Tool for ShellTool {
 
         #[cfg(unix)]
         let group_guard = ChildGroupGuard::new(child.id());
+        let _memory_limit_guard = match apply_post_spawn_memory_limit(&child, max_memory_mb) {
+            Ok(guard) => guard,
+            Err(e) => {
+                let _ = child.kill().await;
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to configure memory limit: {e}")),
+                });
+            }
+        };
 
         let stdout_handle = child.stdout.take();
         let stderr_handle = child.stderr.take();
@@ -448,14 +470,18 @@ impl Tool for ShellTool {
                         stderr.push_str("\n... [stderr truncated at 1MB]");
                     }
 
+                    let memory_error = memory_limit_exceeded_error(status, &stderr, max_memory_mb);
+
                     ToolResult {
-                        success: status.success(),
+                        success: status.success() && memory_error.is_none(),
                         output: stdout,
-                        error: if stderr.is_empty() {
-                            None
-                        } else {
-                            Some(stderr)
-                        },
+                        error: memory_error.or({
+                            if stderr.is_empty() {
+                                None
+                            } else {
+                                Some(stderr)
+                            }
+                        }),
                     }
                 }
                 Ok(Err(e)) => ToolResult {
@@ -655,6 +681,62 @@ mod tests {
         assert!(result.success);
         assert!(result.output.trim().contains("hello"));
         assert!(result.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn shell_memory_limit_can_be_disabled() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: std::env::temp_dir(),
+            shell_max_memory_mb: 0,
+            ..SecurityPolicy::default()
+        });
+        let tool = ShellTool::new(security, test_runtime());
+        let result = tool
+            .execute(json!({"command": "echo memory-limit-disabled"}))
+            .await
+            .expect("echo command execution should succeed");
+        assert!(result.success);
+        assert!(result.output.contains("memory-limit-disabled"));
+        assert!(result.error.is_none());
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[tokio::test]
+    async fn shell_reports_memory_limit_exceeded() {
+        if tokio::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let command = "python3 -c 'data = bytearray(256 * 1024 * 1024); print(len(data))'";
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            shell_max_memory_mb: 64,
+            ..SecurityPolicy::default()
+        });
+        let tool = ShellTool::new(security, test_runtime()).with_timeout_secs(10);
+        let result = tool
+            .execute(json!({ "command": command, "approved": true }))
+            .await
+            .expect("memory-limited command should return a result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("memory limit exceeded"),
+            "expected structured memory error, got: {result:?}"
+        );
     }
 
     #[tokio::test]
