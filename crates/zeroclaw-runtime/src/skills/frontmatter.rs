@@ -35,6 +35,11 @@ pub struct SkillFrontmatter {
     /// longer silently strips its tags.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// When `true`, this skill's instructions should always be injected into the
+    /// system prompt, even in compact prompt mode. Use sparingly for critical
+    /// skills that must be followed at all times.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub always: bool,
 }
 
 impl SkillFrontmatter {
@@ -92,6 +97,12 @@ impl SkillFrontmatter {
                 tab: zeroclaw_config::config::ConfigTab::None,
                 alias_source: None,
             },
+            field(
+                "always",
+                "bool",
+                false,
+                "When true, always inject this skill's instructions even in compact prompt mode.",
+            ),
         ]
     }
 }
@@ -133,7 +144,7 @@ mod tests {
         let fields = SkillFrontmatter::prop_fields();
         assert_eq!(
             fields.len(),
-            7,
+            8,
             "SkillFrontmatter::prop_fields drifted from struct definition; \
              update both when adding/removing fields"
         );
