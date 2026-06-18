@@ -713,15 +713,17 @@ impl AppSyncStore for RusqliteStore {
     ) -> wacore::store::error::Result<()> {
         let conn = self.conn.lock();
 
+        // Store the MAC bytes raw, not JSON-wrapped: `get_mutation_mac` feeds the
+        // returned value_mac straight into the app-state LTHash, which must see
+        // the original bytes — matches InMemoryStore and the diesel SqliteStore.
+        // JSON-wrapping corrupts the running collection hash (snapshot MAC
+        // mismatch), which fails the critical app-state sync on first pairing.
         for mutation in mutations {
-            let index_mac = to_store_err!(serde_json::to_vec(&mutation.index_mac))?;
-            let value_mac = to_store_err!(serde_json::to_vec(&mutation.value_mac))?;
-
             to_store_err!(execute: conn.execute(
                 "INSERT OR REPLACE INTO app_state_mutation_macs
                  (name, version, index_mac, value_mac, device_id)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![name, i64::try_from(version).unwrap_or(i64::MAX), index_mac, value_mac, self.device_id],
+                params![name, i64::try_from(version).unwrap_or(i64::MAX), mutation.index_mac, mutation.value_mac, self.device_id],
             ))?;
         }
 
@@ -734,12 +736,11 @@ impl AppSyncStore for RusqliteStore {
         index_mac: &[u8],
     ) -> wacore::store::error::Result<Option<Vec<u8>>> {
         let conn = self.conn.lock();
-        let index_mac_json = to_store_err!(serde_json::to_vec(index_mac))?;
 
         let result = conn.query_row(
             "SELECT value_mac FROM app_state_mutation_macs
              WHERE name = ?1 AND index_mac = ?2 AND device_id = ?3",
-            params![name, index_mac_json, self.device_id],
+            params![name, index_mac, self.device_id],
             |row| row.get::<_, Vec<u8>>(0),
         );
 
@@ -758,12 +759,10 @@ impl AppSyncStore for RusqliteStore {
         let conn = self.conn.lock();
 
         for index_mac in index_macs {
-            let index_mac_json = to_store_err!(serde_json::to_vec(index_mac))?;
-
             to_store_err!(execute: conn.execute(
                 "DELETE FROM app_state_mutation_macs
                  WHERE name = ?1 AND index_mac = ?2 AND device_id = ?3",
-                params![name, index_mac_json, self.device_id],
+                params![name, index_mac, self.device_id],
             ))?;
         }
 
@@ -1564,6 +1563,49 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let store = RusqliteStore::new(tmp.path()).unwrap();
         assert_eq!(store.device_id, 1);
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn mutation_macs_round_trip_raw_bytes() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = RusqliteStore::new(tmp.path()).unwrap();
+
+        // Bytes chosen so a JSON re-encoding would differ from the raw value
+        // (NUL + high bytes). Guards against regressing to JSON-wrapped MACs:
+        // `get_mutation_mac`'s result is fed verbatim into the app-state LTHash,
+        // so a non-raw value corrupts the running hash (snapshot MAC mismatch).
+        let index_mac = vec![0x00u8, 0x7f, 0x80, 0xff, 0x10, 0x22];
+        let value_mac = vec![0xdeu8, 0xad, 0xbe, 0xef, 0x00, 0x99];
+        let mac = AppStateMutationMAC {
+            index_mac: index_mac.clone(),
+            value_mac: value_mac.clone(),
+        };
+
+        AppSyncStore::put_mutation_macs(&store, "critical_block", 1, std::slice::from_ref(&mac))
+            .await
+            .unwrap();
+
+        // Must return the raw value_mac verbatim, not a JSON encoding of it.
+        let got = AppSyncStore::get_mutation_mac(&store, "critical_block", &index_mac)
+            .await
+            .unwrap();
+        assert_eq!(got, Some(value_mac));
+
+        // Unknown index → None.
+        let missing = AppSyncStore::get_mutation_mac(&store, "critical_block", &[1, 2, 3])
+            .await
+            .unwrap();
+        assert_eq!(missing, None);
+
+        // Delete removes the entry.
+        AppSyncStore::delete_mutation_macs(&store, "critical_block", std::slice::from_ref(&index_mac))
+            .await
+            .unwrap();
+        let after_delete = AppSyncStore::get_mutation_mac(&store, "critical_block", &index_mac)
+            .await
+            .unwrap();
+        assert_eq!(after_delete, None);
     }
 
     #[cfg(feature = "whatsapp-web")]
