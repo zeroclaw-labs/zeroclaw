@@ -145,6 +145,22 @@ fn fail(msg: impl Into<String>) -> ToolResult {
     }
 }
 
+/// Write single-use outbound-call context to the shared temp dir the channel's
+/// voice handler reads (`realtime::load_call_meta`), returning the token to
+/// append to the call WS URL as `context_token`.
+fn write_call_context(to_number: &str, purpose: Option<&str>, opening: Option<&str>) -> Option<String> {
+    let token = uuid::Uuid::new_v4().to_string();
+    let dir = std::env::temp_dir().join("inkbox_call_contexts");
+    std::fs::create_dir_all(&dir).ok()?;
+    let body = json!({
+        "to_number": to_number,
+        "purpose": purpose.unwrap_or(""),
+        "opening_message": opening.unwrap_or(""),
+    });
+    std::fs::write(dir.join(format!("{token}.json")), body.to_string()).ok()?;
+    Some(token)
+}
+
 // ── tools ────────────────────────────────────────────────────────────────
 
 /// `inkbox_whoami` — report the configured identity's channels.
@@ -372,6 +388,8 @@ impl Tool for InkboxPlaceCall {
             "type": "object",
             "properties": {
                 "to_number": { "type": "string", "description": "Recipient E.164 number." },
+                "purpose": { "type": "string", "description": "Why you're calling — loaded into the live call so the agent opens with the right context." },
+                "opening_message": { "type": "string", "description": "Optional exact opening line to say first when the callee picks up." },
                 "client_websocket_url": { "type": "string", "description": "Optional explicit call-media WS URL; defaults to the agent's tunnel." }
             },
             "required": ["to_number"]
@@ -382,16 +400,30 @@ impl Tool for InkboxPlaceCall {
             return Ok(fail("`to_number` is required"));
         };
         let explicit_ws = str_arg(&args, "client_websocket_url");
+        let purpose = str_arg(&args, "purpose");
+        let opening = str_arg(&args, "opening_message");
         Ok(self
             .ctx
             .run(move |id| {
                 // Default the media leg to this identity's tunnel so the call
                 // bridges through the channel's `/phone/media/ws` handler.
-                let ws = explicit_ws.or_else(|| {
+                let mut ws = explicit_ws.or_else(|| {
                     id.tunnel()
                         .map(|t| t.public_host)
                         .map(|host| format!("wss://{host}/phone/media/ws"))
                 });
+                // Port call context (purpose/opening) to the realtime bridge via
+                // a single-use token file the voice handler reads on connect.
+                if ws.is_some() && (purpose.is_some() || opening.is_some()) {
+                    if let Some(token) =
+                        write_call_context(&to_number, purpose.as_deref(), opening.as_deref())
+                    {
+                        ws = ws.map(|u| {
+                            let sep = if u.contains('?') { '&' } else { '?' };
+                            format!("{u}{sep}context_token={token}")
+                        });
+                    }
+                }
                 let call = id.place_call(&to_number, ws.as_deref())?;
                 Ok(serde_json::to_value(call)?)
             })

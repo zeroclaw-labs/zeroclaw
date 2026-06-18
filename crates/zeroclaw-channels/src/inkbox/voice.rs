@@ -22,7 +22,7 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::header::{HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use futures_util::stream::SplitSink;
@@ -60,13 +60,23 @@ pub(super) fn speak_to_call(conn_id: &str, text: &str) -> bool {
 
 /// Upgrade the call-media connection, asking Inkbox to run STT + TTS, and hand
 /// the socket to the bridge loop.
-pub async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
+pub async fn ws_handler(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    ws: WebSocketUpgrade,
+) -> Response {
     // Realtime mode: ask Inkbox to send RAW audio (no STT/TTS) and bridge it to
     // the OpenAI Realtime API. Falls back to Inkbox STT/TTS when not configured.
     if let Some(rt) = state.realtime.clone() {
-        let meta = super::realtime::CallMeta::default();
+        // Outbound calls carry a `context_token` written by `inkbox_place_call`;
+        // it resolves the purpose/opening to inject. Inbound calls have none.
+        let meta = super::realtime::load_call_meta(params.get("context_token").map(String::as_str));
+        let tx = state.tx.clone();
+        let alias = state.alias.clone();
         let mut resp = ws
-            .on_upgrade(move |socket| super::realtime::run_realtime_bridge(socket, rt, meta))
+            .on_upgrade(move |socket| {
+                super::realtime::run_realtime_bridge(socket, rt, meta, tx, alias)
+            })
             .into_response();
         let headers = resp.headers_mut();
         headers.insert(

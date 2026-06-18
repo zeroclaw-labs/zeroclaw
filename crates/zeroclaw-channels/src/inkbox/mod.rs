@@ -175,11 +175,20 @@ impl Channel for InkboxChannel {
     async fn send(&self, message: &SendMessage) -> Result<()> {
         // Live call replies go to the open WebSocket as TTS, not the REST API,
         // and need no identity round-trip — handle them before the blocking path.
+        // Live-call audio replies (STT/TTS path) go to the open socket; a miss
+        // means the call already ended — drop quietly. Post-call reflection
+        // turns also target `call:<id>` / `noreply` and need no delivery.
+        if message.recipient == "noreply" {
+            return Ok(());
+        }
         if let Some(conn_id) = message.recipient.strip_prefix("call:") {
-            if voice::speak_to_call(conn_id, &message.content) {
-                return Ok(());
-            }
-            anyhow::bail!("Inkbox call {conn_id:?} is no longer connected");
+            voice::speak_to_call(conn_id, &message.content);
+            return Ok(());
+        }
+        // In-call consult: route the agent's answer back to the realtime bridge.
+        if let Some(id) = message.recipient.strip_prefix("consult:") {
+            realtime::deliver_consult(id, &message.content);
+            return Ok(());
         }
 
         // Clone everything needed into the blocking task: the AgentIdentity
