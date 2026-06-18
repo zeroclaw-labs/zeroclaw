@@ -139,71 +139,119 @@ pub(super) fn load_call_meta(context_token: Option<&str>) -> CallMeta {
 
 // ── instructions / greeting / session ──────────────────────────────────────
 
+/// Port of hermes `build_realtime_instructions`, adapted to ZeroClaw identity
+/// and first-person `agent_consult` (it's the same agent, not a handoff).
 fn build_instructions(meta: &CallMeta) -> String {
     let name = if meta.agent_handle.is_empty() {
         "ZeroClaw".to_string()
     } else {
         format!("ZeroClaw (agent handle \"{}\")", meta.agent_handle)
     };
-    let mut s = format!(
-        "You are {name}, an AI assistant, on a live phone call. You ARE the assistant the caller \
-         is talking to — always speak in the first person. Never refer to yourself in the third \
-         person, and never say you'll \"ask the main agent\", \"check with the team\", or \"the \
-         backend\": you do the work yourself.\n"
-    );
-    let mut id_bits = Vec::new();
+    let mut lines: Vec<String> = vec![
+        format!(
+            "You are {name}, speaking on a live Inkbox phone call. You ARE the assistant the \
+             caller is talking to — speak in the first person; never refer to yourself in the \
+             third person and never say you'll ask a 'main agent' or 'the backend'."
+        ),
+        "Use natural, concise spoken replies. Keep most answers to one or two short sentences."
+            .into(),
+        "Do not mention implementation details unless the caller asks.".into(),
+    ];
     if let Some(e) = meta.agent_email.as_deref().filter(|e| !e.is_empty()) {
-        id_bits.push(format!("your email address is {e}"));
+        lines.push(format!("Your email identity: {e}."));
     }
     if let Some(p) = meta.agent_phone.as_deref().filter(|p| !p.is_empty()) {
-        id_bits.push(format!("your phone number is {p}"));
+        lines.push(format!("Your phone number: {p}."));
     }
-    if !id_bits.is_empty() {
-        s.push_str(&format!("Your identity: {}.\n", id_bits.join("; ")));
-    }
-    let who = meta.contact_name.as_deref().unwrap_or("the caller");
-    s.push_str(&format!("You are speaking with {who}.\n"));
-    if meta.direction == "outbound" {
-        s.push_str("You placed this call.\n");
-        if let Some(p) = meta.purpose.as_deref().filter(|p| !p.is_empty()) {
-            s.push_str(&format!("Reason you're calling: {p}\n"));
+    match meta.contact_name.as_deref().filter(|c| !c.is_empty() && *c != "caller") {
+        Some(c) => {
+            lines.push(
+                "You already know who this is — do NOT look them up or ask for details you \
+                 already have below."
+                    .into(),
+            );
+            lines.push(format!("Caller name: {c}."));
         }
+        None => lines.push(
+            "No matching contact record is loaded — you do NOT know who this is. Greet them \
+             neutrally; you may look them up by phone number if needed."
+                .into(),
+        ),
     }
-    s.push_str(
-        "\nSpeak naturally and concisely — one short turn at a time. This is spoken audio: no \
-         markdown, no long monologues.\n\n\
-         When the caller needs current information, something from your memory, or an action — \
-         look up or send an email or text, check or save a contact, take a note — use the \
-         `agent_consult` tool. It briefly pauses the call, does the work with your full toolset, \
-         and returns the result for you to read back. This is YOU doing the work; never describe \
-         it as asking someone else. Don't use it for greetings or small talk.\n\
-         To queue follow-up work for after the call (send an email/text, save a note, update a \
-         contact), use `register_post_call_action` — tell the caller it's queued, not already \
-         done; `edit_post_call_action` / `delete_post_call_action` adjust the queue.\n\
-         To end the call use `hang_up_call`: it is two-step — the first call prompts you to say a \
-         brief goodbye, then call it again to actually hang up. Only when the caller is done.",
-    );
-    s
+    if meta.direction == "outbound" {
+        if let Some(p) = meta.purpose.as_deref().filter(|p| !p.is_empty()) {
+            lines.push(format!("This is an outbound call you placed. Purpose: {p}"));
+        }
+        if let Some(o) = meta.opening.as_deref().filter(|o| !o.is_empty()) {
+            lines.push(format!(
+                "Preferred opening message (say this naturally as your first turn): {o}"
+            ));
+        }
+        lines.push(
+            "For outbound calls, do not open with a generic offer to help. Start by explaining \
+             why you are calling, then ask the next specific question."
+                .into(),
+        );
+    }
+    lines.extend([
+        "Do not perform a lookup before greeting the caller. Do not say you are waiting on a \
+         lookup or checking context."
+            .to_string(),
+        "If the caller asks for work to happen now during the live call and it needs your tools, \
+         call agent_consult. This includes sending SMS/email, reading SMS/email/call history, \
+         creating notes, updating contacts, or checking current data. It is YOU doing the work \
+         with your own tools, not a handoff to anyone else."
+            .to_string(),
+        "If the caller explicitly asks for work to happen after the call, or accepts an after-call \
+         deferral, call register_post_call_action. Tell the caller the action is queued for after \
+         the call; do not claim it has already been completed."
+            .to_string(),
+        "If the caller changes or cancels previously queued after-call work, call \
+         edit_post_call_action or delete_post_call_action using the action index returned when \
+         the work was queued."
+            .to_string(),
+        "If agent_consult completes or queues work that matches a previously registered after-call \
+         action, call delete_post_call_action for that action so it is not executed twice after \
+         hangup."
+            .to_string(),
+        "If the caller asks to hang up, says goodbye, or the conversation is clearly complete, \
+         call hang_up_call. The first call arms hangup and asks you to say goodbye; after the \
+         goodbye, call it once more to end the phone call."
+            .to_string(),
+        "Do not call agent_consult for greetings, caller identity at call start, or generic chat."
+            .to_string(),
+    ]);
+    lines.join("\n")
 }
 
+/// Port of hermes `build_realtime_greeting`, adapted to ZeroClaw.
 fn build_greeting(meta: &CallMeta) -> String {
-    if let Some(open) = meta.opening.as_deref().filter(|o| !o.is_empty()) {
-        return format!("Open the call by saying this naturally as the very first thing, with no greeting before it:\n{open}");
-    }
-    if meta.direction == "outbound" {
-        return meta
-            .purpose
-            .as_deref()
-            .filter(|p| !p.is_empty())
-            .map(|p| format!("Open the call: greet the person and immediately explain why you're calling: {p} One short sentence, then wait."))
-            .unwrap_or_else(|| "Open the call: greet the person and concisely explain why you're calling. One short sentence, then wait.".to_string());
-    }
-    let who = meta
+    let first_name = meta
         .contact_name
         .as_deref()
-        .map(|n| n.split_whitespace().next().unwrap_or(n).to_string())
-        .unwrap_or_else(|| "there".to_string());
-    format!("Greet the caller now: say something like \"Hi {who}, this is ZeroClaw — how can I help?\" One short sentence, then wait.")
+        .filter(|c| !c.is_empty() && *c != "caller")
+        .map(|n| n.split_whitespace().next().unwrap_or(n).to_string());
+
+    if meta.direction == "outbound" {
+        if let Some(o) = meta.opening.as_deref().filter(|o| !o.is_empty()) {
+            return format!(
+                "Open the call by saying this naturally as the very first thing, with no greeting before it:\n{o}"
+            );
+        }
+        if let Some(p) = meta.purpose.as_deref().filter(|p| !p.is_empty()) {
+            return format!(
+                "Open the call by greeting the person and immediately explaining why you are calling: {p}"
+            );
+        }
+        return "Open the call by greeting the person and explaining why you are calling. Be specific and concise.".to_string();
+    }
+
+    let who = first_name.unwrap_or_else(|| "there".to_string());
+    format!(
+        "Greet the caller now as the very first thing you say. Say something like 'Hi {who}, \
+         this is ZeroClaw — how can I help?' Keep it to one short sentence and then wait for \
+         them to respond."
+    )
 }
 
 /// The realtime function tools exposed to the model (ported from hermes).
