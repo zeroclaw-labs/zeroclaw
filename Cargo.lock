@@ -14530,7 +14530,6 @@ dependencies = [
 name = "zeroclaw-runtime"
 version = "0.8.0"
 dependencies = [
- "aardvark-sys",
  "anyhow",
  "async-trait",
  "axum",
@@ -14690,7 +14689,6 @@ dependencies = [
 name = "zeroclawlabs"
 version = "0.8.0"
 dependencies = [
- "aardvark-sys",
  "anyhow",
  "async-imap",
  "async-trait",
