@@ -407,10 +407,10 @@ pub fn parse_code_from_redirect(input: &str, expected_state: Option<&str>) -> Re
             anyhow::bail!("xAI OAuth state mismatch");
         }
     }
-    if let Some(code) = params.get("code") {
-        if !code.trim().is_empty() {
-            return Ok(code.trim().to_string());
-        }
+    if let Some(code) = params.get("code")
+        && !code.trim().is_empty()
+    {
+        return Ok(code.trim().to_string());
     }
     if !trimmed.contains('=') && !trimmed.contains('?') {
         return Ok(trimmed.to_string());

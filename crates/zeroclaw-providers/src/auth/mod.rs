@@ -1665,8 +1665,7 @@ impl AuthProviderFlow for XaiFlow {
         device_code: bool,
         import: Option<&std::path::Path>,
     ) -> Result<()> {
-        if import.is_some() {
-            let import_path = import.expect("checked above");
+        if let Some(import_path) = import {
             crate::auth::xai_oauth::import_grok_auth_profile(
                 ctx.auth_service,
                 profile,
