@@ -82,7 +82,11 @@ impl SandboxPolicy {
     ///
     /// `default_sp` is passed in so callers can reuse an already-constructed default
     /// rather than allocating a second one inside this function.
-    fn resolve(sp: &SandboxPolicyConfig, workspace: &Path, default_sp: &SandboxPolicyConfig) -> Self {
+    fn resolve(
+        sp: &SandboxPolicyConfig,
+        workspace: &Path,
+        default_sp: &SandboxPolicyConfig,
+    ) -> Self {
         let mut deny_write = sp.deny_write.clone();
         if sp.mandatory_deny_write_enabled {
             // Deduplication is string-based (pre-resolution). An operator entry like
@@ -232,7 +236,11 @@ mod tests {
     fn sandbox_policy_default_produces_absolute_paths() {
         let policy = SandboxPolicy::default();
         for p in policy.deny_write.iter().chain(policy.allow_write.iter()) {
-            assert!(p.is_absolute(), "default path not absolute: {}", p.display());
+            assert!(
+                p.is_absolute(),
+                "default path not absolute: {}",
+                p.display()
+            );
         }
     }
 
@@ -240,7 +248,10 @@ mod tests {
     fn default_profile_resolves_without_panic() {
         let policy = SandboxPolicy::from_risk_profile(&RiskProfileConfig::default(), ws());
         assert!(policy.mandatory_deny_write_enabled);
-        assert!(!policy.deny_write.is_empty(), "guardrail list must be present");
+        assert!(
+            !policy.deny_write.is_empty(),
+            "guardrail list must be present"
+        );
     }
 
     #[test]
@@ -259,15 +270,21 @@ mod tests {
         profile.forbidden_paths = vec!["/should_be_ignored".to_string()];
         let policy = SandboxPolicy::from_risk_profile(&profile, ws());
         assert!(policy.deny_read.contains(&PathBuf::from("/explicit")));
-        assert!(!policy.deny_read.contains(&PathBuf::from("/should_be_ignored")));
+        assert!(
+            !policy
+                .deny_read
+                .contains(&PathBuf::from("/should_be_ignored"))
+        );
     }
 
     #[test]
     fn allowed_roots_compat_maps_to_allow_read_and_allow_write_when_at_default() {
-        let mut profile = RiskProfileConfig::default();
-        profile.workspace_only = false;
+        let mut profile = RiskProfileConfig {
+            workspace_only: false,
+            allowed_roots: vec!["/extra".to_string()],
+            ..RiskProfileConfig::default()
+        };
         profile.sandbox_policy.allow_read = vec![];
-        profile.allowed_roots = vec!["/extra".to_string()];
         // allow_write at default — allowed_roots compat applies to both fields
         profile.sandbox_policy.allow_write = SandboxPolicyConfig::default().allow_write;
         let policy = SandboxPolicy::from_risk_profile(&profile, ws());
@@ -277,9 +294,11 @@ mod tests {
 
     #[test]
     fn allowed_roots_does_not_override_explicit_allow_write() {
-        let mut profile = RiskProfileConfig::default();
-        profile.workspace_only = false;
-        profile.allowed_roots = vec!["/extra".to_string()];
+        let mut profile = RiskProfileConfig {
+            workspace_only: false,
+            allowed_roots: vec!["/extra".to_string()],
+            ..RiskProfileConfig::default()
+        };
         profile.sandbox_policy.allow_write = vec!["/custom".to_string()];
         let policy = SandboxPolicy::from_risk_profile(&profile, ws());
         // explicit allow_write wins; allowed_roots is not merged in
@@ -288,8 +307,10 @@ mod tests {
 
     #[test]
     fn workspace_only_always_overrides_allow_write() {
-        let mut profile = RiskProfileConfig::default();
-        profile.workspace_only = true;
+        let mut profile = RiskProfileConfig {
+            workspace_only: true,
+            ..RiskProfileConfig::default()
+        };
         // Set a custom allow_write — workspace_only must still win
         profile.sandbox_policy.allow_write = vec!["/should_be_overridden".to_string()];
         let policy = SandboxPolicy::from_risk_profile(&profile, ws());
@@ -298,8 +319,10 @@ mod tests {
 
     #[test]
     fn workspace_only_false_uses_custom_allow_write() {
-        let mut profile = RiskProfileConfig::default();
-        profile.workspace_only = false;
+        let mut profile = RiskProfileConfig {
+            workspace_only: false,
+            ..RiskProfileConfig::default()
+        };
         profile.sandbox_policy.allow_write = vec!["/custom".to_string()];
         let policy = SandboxPolicy::from_risk_profile(&profile, ws());
         assert_eq!(policy.allow_write, vec![PathBuf::from("/custom")]);
@@ -307,9 +330,11 @@ mod tests {
 
     #[test]
     fn at_default_write_comparison_is_order_independent() {
-        let mut profile = RiskProfileConfig::default();
-        profile.workspace_only = false;
-        profile.allowed_roots = vec!["/via_compat".to_string()];
+        let mut profile = RiskProfileConfig {
+            workspace_only: false,
+            allowed_roots: vec!["/via_compat".to_string()],
+            ..RiskProfileConfig::default()
+        };
         // Same elements as default [".", "/tmp"] but reversed order
         profile.sandbox_policy.allow_write = vec!["/tmp".to_string(), ".".to_string()];
         let policy = SandboxPolicy::from_risk_profile(&profile, ws());
@@ -332,7 +357,12 @@ mod tests {
                 "missing guardrail: {entry}"
             );
         }
-        assert!(policy.deny_write.iter().any(|p| p.ends_with("extra_blocked")));
+        assert!(
+            policy
+                .deny_write
+                .iter()
+                .any(|p| p.ends_with("extra_blocked"))
+        );
     }
 
     #[test]
@@ -363,17 +393,21 @@ mod tests {
     #[test]
     fn old_style_and_new_style_produce_equivalent_policy() {
         // Old-style: forbidden_paths / allowed_roots, sandbox_policy at default.
-        let mut old_style = RiskProfileConfig::default();
-        old_style.forbidden_paths = vec!["/secret".to_string()];
-        old_style.allowed_roots = vec!["/extra".to_string()];
-        old_style.workspace_only = false;
-        old_style.sandbox_policy = SandboxPolicyConfig::default();
+        let old_style = RiskProfileConfig {
+            forbidden_paths: vec!["/secret".to_string()],
+            allowed_roots: vec!["/extra".to_string()],
+            workspace_only: false,
+            sandbox_policy: SandboxPolicyConfig::default(),
+            ..RiskProfileConfig::default()
+        };
 
         // New-style: same semantics via sandbox_policy directly.
-        let mut new_style = RiskProfileConfig::default();
-        new_style.forbidden_paths = vec![];
-        new_style.allowed_roots = vec![];
-        new_style.workspace_only = false;
+        let mut new_style = RiskProfileConfig {
+            forbidden_paths: vec![],
+            allowed_roots: vec![],
+            workspace_only: false,
+            ..RiskProfileConfig::default()
+        };
         new_style.sandbox_policy.deny_read = vec!["/secret".to_string()];
         new_style.sandbox_policy.allow_read = vec!["/extra".to_string()];
         new_style.sandbox_policy.allow_write = vec!["/extra".to_string()];
@@ -385,6 +419,9 @@ mod tests {
         assert_eq!(old_policy.allow_read, new_policy.allow_read);
         assert_eq!(old_policy.allow_write, new_policy.allow_write);
         assert_eq!(old_policy.deny_write, new_policy.deny_write);
-        assert_eq!(old_policy.mandatory_deny_write_enabled, new_policy.mandatory_deny_write_enabled);
+        assert_eq!(
+            old_policy.mandatory_deny_write_enabled,
+            new_policy.mandatory_deny_write_enabled
+        );
     }
 }

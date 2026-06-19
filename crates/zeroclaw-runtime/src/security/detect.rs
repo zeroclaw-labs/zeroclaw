@@ -573,7 +573,7 @@ mod tests {
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
         };
-        let sandbox = create_sandbox(&sandbox_cfg, "native", None);
+        let sandbox = create_sandbox(&sandbox_cfg, &SandboxPolicy::default(), "native", None);
         let posture = sandbox_posture(&sandbox_cfg, "native", None);
 
         assert_eq!(posture.active_backend, sandbox.name());

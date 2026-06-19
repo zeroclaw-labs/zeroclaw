@@ -164,8 +164,8 @@ pub use verifiable_intent::VerifiableIntentTool;
 pub const REENTRANT_AGENT_TOOLS: &[&str] = &[SpawnSubagentTool::NAME, DelegateTool::NAME];
 
 use crate::platform::{NativeRuntime, RuntimeAdapter};
-use crate::security::{SecurityPolicy, create_sandbox};
 use crate::security::policy::SandboxPolicy;
+use crate::security::{SecurityPolicy, create_sandbox};
 use crate::sop::audit::SopAuditLogger;
 use crate::sop::engine::SopEngine;
 use async_trait::async_trait;
@@ -573,7 +573,12 @@ pub fn all_tools_with_runtime(
     let runtime_kind = root_config.runtime.kind.as_wire();
     let sandbox_cfg = risk_profile.sandbox_config();
     let sandbox_policy = SandboxPolicy::from_risk_profile(risk_profile, &security.workspace_dir);
-    let sandbox = create_sandbox(&sandbox_cfg, &sandbox_policy, runtime_kind, Some(&security.workspace_dir));
+    let sandbox = create_sandbox(
+        &sandbox_cfg,
+        &sandbox_policy,
+        runtime_kind,
+        Some(&security.workspace_dir),
+    );
     // Keep a shared runtime adapter available after constructing ShellTool.
     // Independent agentic delegates use it later to build the target-owned tool
     // registry; bounded delegates continue to use the parent `tool_arcs`
