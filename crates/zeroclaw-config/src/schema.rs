@@ -15836,6 +15836,41 @@ impl Config {
         out
     }
 
+    /// Voice-peer usernames for `<channel_type>.<alias>` that should always
+    /// receive TTS voice replies.
+    ///
+    /// A `[peer_groups.<name>]` contributes when its `channel` field matches
+    /// (type-wide or dotted) **and** `output_modality = "voice"`.
+    ///
+    /// This is the live-resolve counterpart of `channel_external_peers`,
+    /// filtered to voice-only peer groups. No cache — single source of truth
+    /// is `self.peer_groups`.
+    pub fn channel_voice_peers(&self, channel_type: &str, alias: &str) -> Vec<String> {
+        use crate::multi_agent::OutputModality;
+
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for group in self.peer_groups.values() {
+            if group.output_modality != OutputModality::Voice {
+                continue;
+            }
+            let group_matches = match group.channel.split_once('.') {
+                Some((ty, al)) => ty == channel_type && al == alias,
+                None => group.channel == channel_type,
+            };
+            if !group_matches {
+                continue;
+            }
+            for peer in &group.external_peers {
+                let username = peer.as_str().to_string();
+                if seen.insert(username.clone()) {
+                    out.push(username);
+                }
+            }
+        }
+        out
+    }
+
     /// Collect the `IntegrationDescriptor` from every nested config that
     /// declares one via `#[integration(...)]`. Adding a new toggleable
     /// integration is one struct-level attribute on the new config + one
