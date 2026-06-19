@@ -419,7 +419,7 @@ impl QQChannel {
 
     /// Fetch an access token from QQ's OAuth2 endpoint.
     async fn fetch_access_token(&self) -> anyhow::Result<(String, u64)> {
-        let body = json!({
+        let mut body = json!({
             "appId": self.app_id,
             "clientSecret": self.app_secret,
         });
@@ -877,20 +877,26 @@ impl QQChannel {
     }
 
     /// Send a media message (msg_type=7) with an already-uploaded file_info.
-    async fn send_media_message(&self, recipient: &str, file_info: &str) -> anyhow::Result<()> {
+    async fn send_media_message(&self, recipient: &str, file_info: &str, reply_to_msg_id: Option<&str>) -> anyhow::Result<()> {
         let token = self.get_token().await?;
         let (scope, id) = Self::resolve_recipient(recipient);
 
         let url = format!("{QQ_API_BASE}/v2/{scope}/{id}/messages");
         ensure_https(&url)?;
 
-        let body = json!({
+        let mut body = json!({
             "msg_type": 7,
             "media": {
                 "file_info": file_info,
             },
             "msg_seq": next_msg_seq(),
         });
+
+        // QQ group passive replies require the original msg_id to prevent
+        // rate-limit / bot-control errors.
+        if scope == "groups" && let Some(msg_id) = reply_to_msg_id.filter(|m| !m.is_empty()) {
+            body["msg_id"] = json!(msg_id);
+        }
 
         let resp = self
             .http_client()
@@ -914,6 +920,7 @@ impl QQChannel {
         &self,
         recipient: &str,
         attachment: &QQMediaAttachment,
+        reply_to_msg_id: Option<&str>,
     ) -> anyhow::Result<()> {
         let target = attachment.target.trim();
 
@@ -934,7 +941,7 @@ impl QQChannel {
                     file_name.as_deref(),
                 )
                 .await?;
-            self.send_media_message(recipient, &file_info).await?;
+            self.send_media_message(recipient, &file_info, reply_to_msg_id).await?;
         } else {
             // Local file upload
             let path = Path::new(target);
@@ -968,7 +975,7 @@ impl QQChannel {
                         .with_attrs(::serde_json::json!({"target": target})),
                     "using cached upload for"
                 );
-                self.send_media_message(recipient, &cached_file_info)
+                self.send_media_message(recipient, &cached_file_info, reply_to_msg_id)
                     .await?;
                 return Ok(());
             }
@@ -990,7 +997,7 @@ impl QQChannel {
                     .await;
             }
 
-            self.send_media_message(recipient, &file_info).await?;
+            self.send_media_message(recipient, &file_info, reply_to_msg_id).await?;
         }
 
         Ok(())
@@ -1228,20 +1235,34 @@ impl QQChannel {
     }
 
     /// Send a markdown text message (msg_type=2).
-    async fn send_text_markdown(&self, recipient: &str, content: &str) -> anyhow::Result<()> {
+    /// Send a markdown text message (msg_type=2).
+    /// When `reply_to_msg_id` is set and the recipient is a group, includes
+    /// `msg_id` for QQ passive-reply API compliance.
+    async fn send_text_markdown(
+        &self,
+        recipient: &str,
+        content: &str,
+        reply_to_msg_id: Option<&str>,
+    ) -> anyhow::Result<()> {
         let token = self.get_token().await?;
         let (scope, id) = Self::resolve_recipient(recipient);
 
         let url = format!("{QQ_API_BASE}/v2/{scope}/{id}/messages");
         ensure_https(&url)?;
 
-        let body = json!({
+        let mut body = json!({
             "markdown": {
                 "content": content,
             },
             "msg_type": 2,
             "msg_seq": next_msg_seq(),
         });
+
+        // QQ group passive replies require the original msg_id to prevent
+        // rate-limit / bot-control errors.
+        if scope == "groups" && let Some(msg_id) = reply_to_msg_id.filter(|m| !m.is_empty()) {
+            body["msg_id"] = json!(msg_id);
+        }
 
         let resp = self
             .http_client()
@@ -1278,23 +1299,24 @@ impl Channel for QQChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let (cleaned_text, attachments) = parse_qq_attachment_markers(&message.content);
+        let reply_msg_id = message.in_reply_to.as_deref();
 
         if attachments.is_empty() {
             // No media markers — send as markdown (original path)
             return self
-                .send_text_markdown(&message.recipient, &message.content)
+                .send_text_markdown(&message.recipient, &message.content, reply_msg_id)
                 .await;
         }
 
         // Send cleaned text first (if non-empty)
         if !cleaned_text.is_empty() {
-            self.send_text_markdown(&message.recipient, &cleaned_text)
+            self.send_text_markdown(&message.recipient, &cleaned_text, reply_msg_id)
                 .await?;
         }
 
         // Send each media attachment
         for attachment in &attachments {
-            if let Err(e) = self.send_attachment(&message.recipient, attachment).await {
+            if let Err(e) = self.send_attachment(&message.recipient, attachment, reply_msg_id).await {
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"target": attachment.target, "error": format!("{}", e)})), "failed to send media attachment; falling back to text");
                 // Degrade to text fallback
                 let fallback = format!(
@@ -1307,7 +1329,7 @@ impl Channel for QQChannel {
                     },
                     attachment.target
                 );
-                self.send_text_markdown(&message.recipient, &fallback)
+                self.send_text_markdown(&message.recipient, &fallback, reply_msg_id)
                     .await?;
             }
         }
@@ -1624,7 +1646,7 @@ impl Channel for QQChannel {
                             }
 
                             let channel_msg = ChannelMessage {
-                                id: Uuid::new_v4().to_string(),
+                                id: msg_id.to_string(),
                                 sender: user_openid.to_string(),
                                 reply_target: chat_id,
                                 content: composed.content,
@@ -1696,7 +1718,7 @@ impl Channel for QQChannel {
                             }
 
                             let channel_msg = ChannelMessage {
-                                id: Uuid::new_v4().to_string(),
+                                id: msg_id.to_string(),
                                 sender: author_id.to_string(),
                                 reply_target: chat_id,
                                 content: composed.content,
@@ -2472,6 +2494,119 @@ allowed_users = ["user1"]
             body.get("content").is_none(),
             "top-level 'content' must not be present"
         );
+    }
+
+    #[test]
+    fn test_send_markdown_includes_msg_id_for_group_passive_reply() {
+        // Simulate the msg_id injection logic from send_text_markdown
+        let scope = "groups";
+        let reply_to_msg_id = Some("original-msg-guid");
+        let content = "reply text";
+
+        let mut body = json!({
+            "markdown": { "content": content },
+            "msg_type": 2,
+            "msg_seq": 1,
+        });
+        if scope == "groups" && let Some(msg_id) = reply_to_msg_id.filter(|m| !m.is_empty()) {
+            body["msg_id"] = json!(msg_id);
+        }
+
+        assert_eq!(body["msg_id"], "original-msg-guid");
+        assert_eq!(body["msg_type"], 2);
+    }
+
+    #[test]
+    fn test_send_markdown_omits_msg_id_for_c2c() {
+        // Private chats do NOT need msg_id
+        let scope = "c2c";
+        let reply_to_msg_id = Some("some-id");
+
+        let mut body = json!({
+            "markdown": { "content": "hi" },
+            "msg_type": 2,
+            "msg_seq": 1,
+        });
+        if scope == "groups" && let Some(msg_id) = reply_to_msg_id.filter(|m| !m.is_empty()) {
+            body["msg_id"] = json!(msg_id);
+        }
+
+        assert!(body.get("msg_id").is_none(), "c2c must not include msg_id");
+    }
+
+    #[test]
+    fn test_send_markdown_omits_msg_id_when_reply_to_msg_id_is_none() {
+        let scope = "groups";
+        let reply_to_msg_id: Option<&str> = None;
+
+        let mut body = json!({
+            "markdown": { "content": "hi" },
+            "msg_type": 2,
+            "msg_seq": 1,
+        });
+        if scope == "groups" && let Some(msg_id) = reply_to_msg_id.filter(|m| !m.is_empty()) {
+            body["msg_id"] = json!(msg_id);
+        }
+
+        assert!(body.get("msg_id").is_none(), "must not include msg_id when reply_to_msg_id is None");
+    }
+
+    #[test]
+    fn test_send_media_includes_msg_id_for_group_passive_reply() {
+        // Simulate the msg_id injection logic from send_media_message
+        let scope = "groups";
+        let reply_to_msg_id = Some("original-msg-guid");
+        let file_info = "some_file_info";
+
+        let mut body = json!({
+            "msg_type": 7,
+            "media": {
+                "file_info": file_info,
+            },
+            "msg_seq": 1,
+        });
+        if scope == "groups" && let Some(msg_id) = reply_to_msg_id.filter(|m| !m.is_empty()) {
+            body["msg_id"] = json!(msg_id);
+        }
+
+        assert_eq!(body["msg_id"], "original-msg-guid");
+        assert_eq!(body["msg_type"], 7);
+        assert_eq!(body["media"]["file_info"], file_info);
+    }
+
+    #[test]
+    fn test_send_media_omits_msg_id_for_c2c() {
+        let scope = "c2c";
+        let reply_to_msg_id = Some("some-id");
+        let file_info = "file_info";
+
+        let mut body = json!({
+            "msg_type": 7,
+            "media": { "file_info": file_info },
+            "msg_seq": 1,
+        });
+        if scope == "groups" && let Some(msg_id) = reply_to_msg_id.filter(|m| !m.is_empty()) {
+            body["msg_id"] = json!(msg_id);
+        }
+
+        assert!(body.get("msg_id").is_none(), "c2c must not include msg_id");
+    }
+
+    #[test]
+    fn test_send_media_omits_msg_id_when_reply_to_msg_id_empty_string() {
+        let scope = "groups";
+        let reply_to_msg_id = Some("");
+
+        let mut body = json!({
+            "msg_type": 7,
+            "media": { "file_info": "info" },
+            "msg_seq": 1,
+        });
+        if scope == "groups" && let Some(msg_id) = reply_to_msg_id.filter(|m| !m.is_empty()) {
+            body["msg_id"] = json!(msg_id);
+        }
+
+        assert!(body.get("msg_id").is_none(), "must not include msg_id when reply_to_msg_id is empty");
     }
 
     // --- Helper function tests ---
