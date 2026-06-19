@@ -1665,6 +1665,10 @@ pub async fn run_gateway(
             "/api/agents/{alias}/workspace/mkdir",
             post(api_browse::handle_agent_workspace_mkdir),
         )
+        .route(
+            "/api/agents/{alias}/skills",
+            get(api_skills::handle_agent_skills),
+        )
         .route("/api/skills/bundles", get(api_skills::handle_list_bundles))
         .route(
             "/api/skills/bundles/{alias}/skills",

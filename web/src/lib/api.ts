@@ -699,6 +699,28 @@ export interface SkillDocument {
   body: string;
 }
 
+/** Where a skill in an agent's effective set was loaded from. */
+export type AgentSkillOrigin = "workspace" | "open-skills" | "plugin" | "bundle";
+
+/**
+ * One skill in an agent's EFFECTIVE skill set, as resolved by the runtime
+ * (not just the configured bundles). Returned by {@link listAgentSkills}.
+ */
+export interface AgentSkillEntry {
+  name: string;
+  description: string;
+  origin: AgentSkillOrigin;
+  /** Present only when `origin === 'plugin'`. */
+  plugin?: string | null;
+  /** Present only when `origin === 'bundle'`. */
+  bundle?: string | null;
+  /** On-disk directory of the skill, when known. */
+  directory?: string | null;
+  /** True only when `origin === 'bundle'` — i.e. the skill is editable via
+   *  the bundle endpoints and can be expanded for detail. */
+  editable: boolean;
+}
+
 export interface SkillCreateRequest {
   name: string;
   frontmatter: SkillFrontmatter;
@@ -714,6 +736,18 @@ export function listSkillsInBundle(
   alias: string,
 ): Promise<{ skills: SkillEntry[] }> {
   return apiFetch(`/api/skills/bundles/${encodeURIComponent(alias)}/skills`);
+}
+
+/**
+ * The agent's EFFECTIVE skill set — every skill the runtime actually loads
+ * for `alias`, across workspace / open-skills / plugin / bundle origins.
+ * Unlike {@link listSkillsInBundle} (which only sees configured bundles),
+ * this reflects what the agent can really use.
+ */
+export function listAgentSkills(
+  alias: string,
+): Promise<{ agent: string; skills: AgentSkillEntry[] }> {
+  return apiFetch(`/api/agents/${encodeURIComponent(alias)}/skills`);
 }
 
 export function readSkill(
