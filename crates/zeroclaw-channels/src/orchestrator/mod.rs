@@ -123,7 +123,7 @@ use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
 use zeroclaw_runtime::agent::loop_::{
-    LoopKnobs, apply_policy_tool_filter, apply_text_tool_prompt_policy,
+    LoopKnobs, ToolLoop, apply_policy_tool_filter, apply_text_tool_prompt_policy,
     build_tool_instructions_for_names, clear_model_switch_request, get_model_switch_state,
     is_model_switch_requested, run_tool_call_loop, scope_session_key, scope_thread_id,
     scrub_credentials,
@@ -4573,57 +4573,60 @@ async fn process_channel_message_body(
                             cost_tracking_context.clone(),
                         zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT.scope(
                             receipt_scope.clone(),
-                        run_tool_call_loop(
-                        active_model_provider.as_ref(),
-                        &mut history,
-                        ctx.tools_registry.as_ref(),
-                        notify_observer.as_ref() as &dyn Observer,
-                        route.model_provider.as_str(),
-                        route.model.as_str(),
-                        runtime_defaults.defaults.temperature,
-                        true,
-                        Some(&*ctx.approval_manager),
-                        msg.channel.as_str(),
-                        Some(msg.reply_target.as_str()),
-                        &ctx.multimodal,
-                        ctx.max_tool_iterations,
-                        Some(cancellation_token.clone()),
-                        delta_tx.clone(),
-                        ctx.hooks.as_deref(),
-                        if msg.channel == "cli"
+                        run_tool_call_loop(ToolLoop {
+                        model_provider: active_model_provider.as_ref(),
+                        history: &mut history,
+                        tools_registry: ctx.tools_registry.as_ref(),
+                        observer: notify_observer.as_ref() as &dyn Observer,
+                        provider_name: route.model_provider.as_str(),
+                        model: route.model.as_str(),
+                        temperature: runtime_defaults.defaults.temperature,
+                        silent: true,
+                        approval: Some(&*ctx.approval_manager),
+                        channel_name: msg.channel.as_str(),
+                        channel_reply_target: Some(msg.reply_target.as_str()),
+                        multimodal_config: &ctx.multimodal,
+                        max_tool_iterations: ctx.max_tool_iterations,
+                        cancellation_token: Some(cancellation_token.clone()),
+                        on_delta: delta_tx.clone(),
+                        hooks: ctx.hooks.as_deref(),
+                        excluded_tools: if msg.channel == "cli"
                             || ctx.autonomy_level == AutonomyLevel::Full
                         {
                             &[]
                         } else {
                             ctx.non_cli_excluded_tools.as_ref()
                         },
-                        ctx.tool_call_dedup_exempt.as_ref(),
-                        ctx.activated_tools.as_ref(),
-                        Some(model_switch_callback.clone()),
-                        &ctx.pacing,
-                        ctx.prompt_config
+                        dedup_exempt_tools: ctx.tool_call_dedup_exempt.as_ref(),
+                        activated_tools: ctx.activated_tools.as_ref(),
+                        model_switch_callback: Some(model_switch_callback.clone()),
+                        pacing: &ctx.pacing,
+                        strict_tool_parsing: ctx
+                            .prompt_config
                             .agent(ctx.agent_alias.as_str())
                             .is_some_and(|agent| agent.resolved.strict_tool_parsing),
-                        ctx.prompt_config
+                        parallel_tools: ctx
+                            .prompt_config
                             .agent(ctx.agent_alias.as_str())
                             .is_some_and(|agent| agent.resolved.parallel_tools),
-                        ctx.max_tool_result_chars,
-                        ctx.context_token_budget,
-                        None, // shared_budget
-                        target_channel.as_deref(),
-                        ctx.receipt_generator.as_ref(),
+                        max_tool_result_chars: ctx.max_tool_result_chars,
+                        context_token_budget: ctx.context_token_budget,
+                        shared_budget: None,
+                        channel: target_channel.as_deref(),
+                        receipt_generator: ctx.receipt_generator.as_ref(),
                         // Collector is meaningful only when the generator is
                         // active. Pass None when receipts are disabled so the
                         // call site reflects that coupling explicitly.
-                        ctx.receipt_generator
+                        collected_receipts: ctx
+                            .receipt_generator
                             .as_ref()
                             .map(|_| tool_receipts_collector.as_ref()),
-                        None, // event_tx
-                        None, // steering
-                        None, // new_messages_out
-                        &loop_knobs,
-                    None,
-),
+                        event_tx: None,
+                        steering: None,
+                        new_messages_out: None,
+                        knobs: &loop_knobs,
+                        image_cache: None,
+}),
                     ),
                     ),
                     ),
