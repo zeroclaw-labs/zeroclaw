@@ -24,6 +24,7 @@ import {
   Brain,
   Search,
   Monitor,
+  ArrowRight,
 } from "lucide-react";
 import type {
   StatusResponse,
@@ -50,8 +51,62 @@ import {
   getTuis,
 } from "@/lib/api";
 import { resolveModelToProviderType } from "@/lib/configuredModels";
+import DoctorFixModal from "@/components/DoctorFixModal";
 
 type CostWindow = "today" | "7d" | "30d" | "month" | "all";
+
+/**
+ * A component's `last_error` is sometimes a config path (e.g.
+ * `agents.cronos.model_provider`) — the field whose misconfiguration is crashing
+ * the supervisor. When we can parse a known config entity out of it, offer the
+ * same inline "fix in place" modal the Doctor page uses (edit the entity, save,
+ * no navigation). Returns null when nothing parseable is present (error shown as
+ * plain text). Mirrors Doctor's `remediationTarget`.
+ */
+function healthFixTarget(
+  err: string | null | undefined,
+): { prefix: string; entity: string; href: string } | null {
+  if (!err) return null;
+  // Anchor at the start (like Doctor's remediationTarget) so a config path is
+  // only matched when the error IS one (e.g. "agents.cronos.model_provider"),
+  // not when prose merely contains the word — "failed to load agents.json"
+  // must NOT yield a bogus Fix target for entity `agents.json`.
+  // agents.<alias>[.<field>] — edit the agent; deep-link the field's tab.
+  const agent = err.match(/^\s*agents\.([a-z0-9_-]+)(?:\.([a-z0-9_.-]+))?/i);
+  if (agent?.[1]) {
+    const alias = agent[1];
+    const field = agent[2] ?? "";
+    const tab = /provider$/i.test(field)
+      ? "?tab=providers"
+      : /^(risk|runtime)_profile/i.test(field)
+        ? "?tab=general"
+        : "";
+    return {
+      prefix: `agents.${alias}`,
+      entity: `agents.${alias}`,
+      href: `/config/agents/${encodeURIComponent(alias)}${tab}`,
+    };
+  }
+  // channels.<type>.<alias>
+  const chan = err.match(/^\s*channels\.([a-z0-9_-]+)\.([a-z0-9_-]+)/i);
+  if (chan?.[1] && chan[2]) {
+    return {
+      prefix: `channels.${chan[1]}.${chan[2]}`,
+      entity: `${chan[1]}.${chan[2]}`,
+      href: `/config/channels/${encodeURIComponent(chan[1])}/${encodeURIComponent(chan[2])}`,
+    };
+  }
+  // providers.models.<type>.<alias>
+  const prov = err.match(/^\s*providers\.models\.([a-z0-9_-]+)\.([a-z0-9_-]+)/i);
+  if (prov?.[1] && prov[2]) {
+    return {
+      prefix: `providers.models.${prov[1]}.${prov[2]}`,
+      entity: `${prov[1]}.${prov[2]}`,
+      href: `/config/providers.models/${encodeURIComponent(prov[1])}/${encodeURIComponent(prov[2])}`,
+    };
+  }
+  return null;
+}
 
 function costWindowBounds(window: CostWindow): { from?: Date; to?: Date } {
   const now = new Date();
@@ -376,6 +431,14 @@ function OverviewTab({
     0.001,
   );
 
+  // Component Health → "fix in place" modal target (set when an error row's
+  // last_error parses to a config entity). Same modal as the Doctor page.
+  const [healthFix, setHealthFix] = useState<{
+    prefix: string;
+    entity: string;
+    href: string;
+  } | null>(null);
+
   return (
     <>
       {/* Status Cards Grid */}
@@ -681,16 +744,33 @@ function OverviewTab({
                         </span>
                       </div>
                       {lastErr ? (
-                        <p
-                          className="text-[11px] mt-1 font-mono break-words"
-                          style={{ color: "var(--color-status-error)" }}
-                          title={lastErr}
-                        >
-                          ⚠{" "}
-                          {lastErr.length > 120
-                            ? lastErr.slice(0, 117) + "…"
-                            : lastErr}
-                        </p>
+                        (() => {
+                          const fix = healthFixTarget(lastErr);
+                          return (
+                            <div className="mt-1 flex items-start gap-2">
+                              <p
+                                className="flex-1 text-[11px] font-mono break-words"
+                                style={{ color: "var(--color-status-error)" }}
+                                title={lastErr}
+                              >
+                                ⚠{" "}
+                                {lastErr.length > 120
+                                  ? lastErr.slice(0, 117) + "…"
+                                  : lastErr}
+                              </p>
+                              {fix && (
+                                <button
+                                  type="button"
+                                  onClick={() => setHealthFix(fix)}
+                                  className="inline-flex h-6 flex-shrink-0 items-center gap-1 rounded-[var(--radius-md)] border border-pc-border bg-transparent px-2 text-[11px] font-medium text-pc-text-secondary transition-colors duration-150 hover:bg-[var(--pc-hover)] hover:text-pc-text hover:border-pc-border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-pc-base cursor-pointer"
+                                >
+                                  {t("dashboard.fix")}
+                                  <ArrowRight className="h-3 w-3" />
+                                </button>
+                              )}
+                            </div>
+                          );
+                        })()
                       ) : null}
                       <div
                         className="flex items-center gap-3 text-[11px] mt-0.5"
@@ -785,6 +865,16 @@ function OverviewTab({
           </div>
         </div>
       )}
+
+      {/* Component Health "fix in place" modal — same editor as the Doctor page.
+          Opens when an error row with a parseable config entity is actioned. */}
+      <DoctorFixModal
+        open={healthFix !== null}
+        prefix={healthFix?.prefix ?? ""}
+        entity={healthFix?.entity ?? ""}
+        href={healthFix?.href ?? ""}
+        onClose={() => setHealthFix(null)}
+      />
     </>
   );
 }

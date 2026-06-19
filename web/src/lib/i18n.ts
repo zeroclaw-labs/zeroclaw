@@ -581,6 +581,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.show_recent_runs': "Show this job's recent runs",
     'cron.timezone_placeholder': "e.g. America/New_York",
     'dashboard.cpu.label': "CPU",
+    'dashboard.fix': "Fix",
     'dashboard.last_ok_title': "last ok:",
     'dashboard.load_agents_error': "Failed to load agents",
     'dashboard.ok_prefix': "ok",

@@ -22,8 +22,8 @@
     "noFallthroughCasesInSwitch": true,
     "noUncheckedIndexedAccess": true,
 
-    /* Aliases */
-    "baseUrl": ".",
+    /* Aliases — `paths` resolves relative to this file; `baseUrl` not needed
+       (TS >=4.1) and Vite resolves `@` via its own resolve.alias. */
     "paths": {
       "@/*": ["./src/*"]
     }

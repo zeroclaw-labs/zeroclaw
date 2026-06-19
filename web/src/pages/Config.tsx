@@ -45,7 +45,7 @@ import SectionTabs, {
 import CostRatesEditor, {
   type CostRatesCategory,
 } from "../components/sections/CostRatesEditor";
-import { Badge, Button, Card, PageHeader } from "@/components/ui";
+import { Badge, Button, Card, ComboBox, PageHeader } from "@/components/ui";
 import { t } from "@/lib/i18n";
 
 // Display order for the curated sidebar groups. Each `SectionInfo.group`
@@ -1079,7 +1079,9 @@ function AgentPeerGroupsTab({
   }, [agentAlias]);
 
   const addToGroup = async () => {
-    if (!pickerValue) return;
+    // The themed ComboBox accepts free text; only act on a real non-member group
+    // (the native <select> this replaced couldn't submit an arbitrary value).
+    if (!pickerValue || !nonMembers.includes(pickerValue)) return;
     setAdding(true);
     setError(null);
     try {
@@ -1158,27 +1160,23 @@ function AgentPeerGroupsTab({
         <span className="text-xs" style={{ color: "var(--pc-text-muted)" }}>
           {t("config.add_agent_to")}
         </span>
-        <select
+        <ComboBox
           value={pickerValue}
-          onChange={(e) => setPickerValue(e.target.value)}
-          disabled={adding || nonMembers.length === 0}
-          className="input-electric text-xs px-2 py-1 appearance-none cursor-pointer"
-        >
-          <option value="">
-            {nonMembers.length === 0
+          onChange={setPickerValue}
+          options={nonMembers}
+          openOnFocus
+          className="w-56"
+          aria-label={t("config.add_agent_to")}
+          placeholder={
+            nonMembers.length === 0
               ? t("config.no_other_groups")
-              : t("config.select_a_group")}
-          </option>
-          {nonMembers.map((g) => (
-            <option key={g} value={g}>
-              {g}
-            </option>
-          ))}
-        </select>
+              : t("config.select_a_group")
+          }
+        />
         <button
           type="button"
           onClick={addToGroup}
-          disabled={!pickerValue || adding}
+          disabled={!pickerValue || adding || !nonMembers.includes(pickerValue)}
           className="btn-electric text-xs px-3 py-1 rounded-lg disabled:opacity-50"
         >
           {adding ? t("config.adding") : t("config.add")}

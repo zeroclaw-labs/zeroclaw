@@ -124,8 +124,17 @@ export default function SectionNavigator({
       if (section.shape === "typed_family_map") {
         // Configured/active provider or channel types under this section.
         const picker = await getSectionPicker(section.key);
+        // A type has children when it has configured instances. The badge for
+        // that is normally "configured" (or "active"), but the Storage section
+        // renames "configured" → "created" backend-side (api_sections.rs), so it
+        // must be accepted too — else configured storages never list in the nav.
         const configuredTypes = picker.items
-          .filter((i) => i.badge === "configured" || i.badge === "active")
+          .filter(
+            (i) =>
+              i.badge === "configured" ||
+              i.badge === "active" ||
+              i.badge === "created",
+          )
           .map((i) => i.key);
         const out: NavEntity[] = [];
         for (const type of configuredTypes) {
