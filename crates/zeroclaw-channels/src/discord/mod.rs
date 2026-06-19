@@ -1978,7 +1978,8 @@ impl Channel for DiscordChannel {
             // continuation chunks. On chunk 0 we build a single envelope carrying
             // content + embeds + components; `to_rest_json` omits whichever are
             // empty, so a plain reply stays byte-identical.
-            let message_id = if i == 0 && (!embeds.is_empty() || !component_action_rows.is_empty()) {
+            let message_id = if i == 0 && (!embeds.is_empty() || !component_action_rows.is_empty())
+            {
                 let payload = DiscordOutgoing {
                     content: Some(chunk.clone()),
                     embeds: embeds.clone(),
@@ -2004,11 +2005,11 @@ impl Channel for DiscordChannel {
                     .await?
                 }
             } else if i == 0 && !local_files.is_empty() {
-                send_discord_message_with_files(
+                send_discord_message_payload_with_files(
                     &client,
                     &self.bot_token,
                     &message.recipient,
-                    chunk,
+                    &DiscordOutgoing::text(chunk.clone()),
                     &local_files,
                 )
                 .await?
@@ -2665,7 +2666,7 @@ impl Channel for DiscordChannel {
                                             let msg = i18n::get_required_cli_string(
                                                 "channel-discord-interaction-unavailable",
                                             );
-                                            if let Err(e) = discord_edit_interaction_response(&client, &app_id, &interaction_token, DISCORD_API_BASE, &msg, &[]).await {
+                                            if let Err(e) = discord_edit_interaction_response(&client, &app_id, &interaction_token, DISCORD_API_BASE, &msg, &[], &[]).await {
                                                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord interaction unavailable-notice failed");
                                             }
                                             pending.lock().remove(&interaction_id);
@@ -4158,9 +4159,17 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        deliver_interaction_answer(&client, "app1", "tok", &server.uri(), "short answer", &[], &[])
-            .await
-            .unwrap();
+        deliver_interaction_answer(
+            &client,
+            "app1",
+            "tok",
+            &server.uri(),
+            "short answer",
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
