@@ -102,7 +102,9 @@ impl ImageGenTool {
             .map(|s| {
                 PathBuf::from(s)
                     .file_name()
-                    .map_or("generated_image".to_string(), |n| n.to_string_lossy().to_string())
+                    .map_or("generated_image".to_string(), |n| {
+                        n.to_string_lossy().to_string()
+                    })
             })
             .unwrap_or_else(|| {
                 let ts = std::time::SystemTime::now()
