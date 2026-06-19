@@ -340,7 +340,7 @@ impl CostTracker {
 // Both the gateway and the channels supervisor share a single CostTracker
 // so that budget enforcement is consistent across all paths.
 
-static GLOBAL_COST_TRACKER: OnceLock<Option<Arc<CostTracker>>> = OnceLock::new();
+static GLOBAL_COST_TRACKER: OnceLock<RwLock<Option<Arc<CostTracker>>>> = OnceLock::new();
 
 impl CostTracker {
     /// Return the process-global `CostTracker`, creating it on first call.
@@ -349,41 +349,55 @@ impl CostTracker {
     /// existing tracker and receive the same `Arc`.  The tracker holds its
     /// config behind a `RwLock`, so reloaded budget limits take effect
     /// without a process restart.  Returns `None` when cost tracking is
-    /// disabled or initialisation fails.
+    /// disabled and no tracker has been constructed yet.
     ///
-    /// Note: if cost tracking was disabled at first init the global stores
-    /// `None` permanently; enabling it later still requires a restart,
-    /// because the `OnceLock` cannot retroactively construct storage.
+    /// When the first boot ran with cost tracking disabled the slot holds
+    /// `None`; a later reload that flips `enabled` to `true` constructs the
+    /// tracker on demand, so enabling cost tracking no longer requires a
+    /// process restart.  Disabling on a later reload leaves the tracker
+    /// resident and relies on `update_config` to neutralise enforcement.
     pub fn get_or_init_global(config: CostConfig, workspace_dir: &Path) -> Option<Arc<Self>> {
-        let tracker = GLOBAL_COST_TRACKER
-            .get_or_init(|| {
-                if !config.enabled {
-                    return None;
-                }
-                match Self::new(config.clone(), workspace_dir) {
-                    Ok(ct) => Some(Arc::new(ct)),
-                    Err(e) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                            "Failed to initialize global cost tracker"
-                        );
-                        None
-                    }
-                }
-            })
-            .clone();
+        let slot = GLOBAL_COST_TRACKER.get_or_init(|| RwLock::new(None));
+        Self::resolve_global(slot, config, workspace_dir)
+    }
 
-        if let Some(ct) = tracker.as_ref() {
+    fn resolve_global(
+        slot: &RwLock<Option<Arc<CostTracker>>>,
+        config: CostConfig,
+        workspace_dir: &Path,
+    ) -> Option<Arc<Self>> {
+        if let Some(ct) = slot.read().as_ref() {
             ct.update_config(config);
+            return Some(ct.clone());
         }
 
-        tracker
+        if !config.enabled {
+            return None;
+        }
+
+        let mut guard = slot.write();
+        if let Some(ct) = guard.as_ref() {
+            ct.update_config(config);
+            return Some(ct.clone());
+        }
+
+        match Self::new(config, workspace_dir) {
+            Ok(ct) => {
+                let ct = Arc::new(ct);
+                *guard = Some(ct.clone());
+                Some(ct)
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "Failed to initialize global cost tracker"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -972,22 +986,23 @@ mod tests {
     #[test]
     fn get_or_init_global_applies_reloaded_config_to_existing_tracker() {
         let tmp = TempDir::new().unwrap();
+        let slot = RwLock::new(None);
 
         let boot = CostConfig {
             enabled: true,
             daily_limit_usd: 10.0,
             ..Default::default()
         };
-        let first =
-            CostTracker::get_or_init_global(boot, tmp.path()).expect("first init yields a tracker");
+        let first = CostTracker::resolve_global(&slot, boot, tmp.path())
+            .expect("first init yields a tracker");
 
         let reloaded = CostConfig {
             enabled: true,
             daily_limit_usd: 14000.0,
             ..Default::default()
         };
-        let after =
-            CostTracker::get_or_init_global(reloaded, tmp.path()).expect("reload yields a tracker");
+        let after = CostTracker::resolve_global(&slot, reloaded, tmp.path())
+            .expect("reload yields a tracker");
 
         assert_eq!(
             after.config().daily_limit_usd,
@@ -997,6 +1012,84 @@ mod tests {
         assert!(
             Arc::ptr_eq(&first, &after),
             "reload must reuse the same global Arc, not construct a second tracker"
+        );
+    }
+
+    #[test]
+    fn get_or_init_global_constructs_tracker_when_enabled_after_disabled_boot() {
+        let tmp = TempDir::new().unwrap();
+        let slot = RwLock::new(None);
+
+        let disabled_boot = CostConfig {
+            enabled: false,
+            daily_limit_usd: 10.0,
+            ..Default::default()
+        };
+        assert!(
+            CostTracker::resolve_global(&slot, disabled_boot, tmp.path()).is_none(),
+            "disabled boot must not construct a tracker"
+        );
+
+        let enable = CostConfig {
+            enabled: true,
+            daily_limit_usd: 14000.0,
+            ..Default::default()
+        };
+        let constructed = CostTracker::resolve_global(&slot, enable, tmp.path())
+            .expect("reload enabling cost tracking must construct the tracker");
+        assert_eq!(
+            constructed.config().daily_limit_usd,
+            14000.0,
+            "the on-demand tracker must adopt the reloaded daily limit"
+        );
+
+        let again = CostTracker::resolve_global(
+            &slot,
+            CostConfig {
+                enabled: true,
+                daily_limit_usd: 14000.0,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .expect("subsequent call yields a tracker");
+        assert!(
+            Arc::ptr_eq(&constructed, &again),
+            "once constructed the tracker must be reused, not rebuilt"
+        );
+    }
+
+    #[test]
+    fn get_or_init_global_leaves_tracker_resident_when_disabled_on_reload() {
+        let tmp = TempDir::new().unwrap();
+        let slot = RwLock::new(None);
+
+        let enabled_boot = CostConfig {
+            enabled: true,
+            daily_limit_usd: 14000.0,
+            ..Default::default()
+        };
+        let tracker = CostTracker::resolve_global(&slot, enabled_boot, tmp.path())
+            .expect("enabled boot yields a tracker");
+
+        let disable = CostConfig {
+            enabled: false,
+            daily_limit_usd: 14000.0,
+            ..Default::default()
+        };
+        let after = CostTracker::resolve_global(&slot, disable, tmp.path())
+            .expect("disable reload leaves the tracker resident");
+        assert!(
+            Arc::ptr_eq(&tracker, &after),
+            "disabling on reload must not tear down the resident tracker"
+        );
+        assert!(
+            !after.config().enabled,
+            "the resident tracker must adopt the disabled config so enforcement is neutralised"
+        );
+        assert!(
+            matches!(after.check_budget(0.0).unwrap(), BudgetCheck::Allowed),
+            "a disabled resident tracker must short-circuit enforcement"
         );
     }
 }
