@@ -4,7 +4,7 @@ use super::types::{
 use crate::schema::CostConfig;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::{Mutex, MutexGuard, RwLock};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -13,7 +13,7 @@ use std::sync::{Arc, OnceLock};
 
 /// Cost tracker for API usage monitoring and budget enforcement.
 pub struct CostTracker {
-    config: CostConfig,
+    config: Arc<RwLock<CostConfig>>,
     storage: Arc<Mutex<CostStorage>>,
     session_id: String,
     /// Per-daemon-lifetime aggregates keyed by `Option<agent_alias>`,
@@ -40,11 +40,29 @@ impl CostTracker {
         })?;
 
         Ok(Self {
-            config,
+            config: Arc::new(RwLock::new(config)),
             storage: Arc::new(Mutex::new(storage)),
             session_id: uuid::Uuid::new_v4().to_string(),
             session_totals: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Snapshot the live cost config. Reads go through the `RwLock` so a
+    /// hot-reload swap is observed without a process restart.
+    fn config_snapshot(&self) -> CostConfig {
+        self.config.read().clone()
+    }
+
+    /// Current live cost config snapshot.
+    pub fn config(&self) -> CostConfig {
+        self.config_snapshot()
+    }
+
+    /// Replace the live cost config. This is what makes budget limits
+    /// reloadable: the process-global tracker stays the same `Arc`, only
+    /// its config is swapped under the `RwLock`.
+    pub fn update_config(&self, config: CostConfig) {
+        *self.config.write() = config;
     }
 
     /// Get the session ID.
@@ -62,7 +80,8 @@ impl CostTracker {
 
     /// Check if a request is within budget.
     pub fn check_budget(&self, estimated_cost_usd: f64) -> Result<BudgetCheck> {
-        if !self.config.enabled {
+        let config = self.config_snapshot();
+        if !config.enabled {
             return Ok(BudgetCheck::Allowed);
         }
 
@@ -82,33 +101,33 @@ impl CostTracker {
 
         // Check daily limit
         let projected_daily = daily_cost + estimated_cost_usd;
-        if projected_daily > self.config.daily_limit_usd {
+        if projected_daily > config.daily_limit_usd {
             return Ok(BudgetCheck::Exceeded {
                 current_usd: daily_cost,
-                limit_usd: self.config.daily_limit_usd,
+                limit_usd: config.daily_limit_usd,
                 period: UsagePeriod::Day,
             });
         }
 
         // Check monthly limit
         let projected_monthly = monthly_cost + estimated_cost_usd;
-        if projected_monthly > self.config.monthly_limit_usd {
+        if projected_monthly > config.monthly_limit_usd {
             return Ok(BudgetCheck::Exceeded {
                 current_usd: monthly_cost,
-                limit_usd: self.config.monthly_limit_usd,
+                limit_usd: config.monthly_limit_usd,
                 period: UsagePeriod::Month,
             });
         }
 
         // Check warning thresholds
-        let warn_threshold = f64::from(self.config.warn_at_percent.min(100)) / 100.0;
-        let daily_warn_threshold = self.config.daily_limit_usd * warn_threshold;
-        let monthly_warn_threshold = self.config.monthly_limit_usd * warn_threshold;
+        let warn_threshold = f64::from(config.warn_at_percent.min(100)) / 100.0;
+        let daily_warn_threshold = config.daily_limit_usd * warn_threshold;
+        let monthly_warn_threshold = config.monthly_limit_usd * warn_threshold;
 
         if projected_daily >= daily_warn_threshold {
             return Ok(BudgetCheck::Warning {
                 current_usd: daily_cost,
-                limit_usd: self.config.daily_limit_usd,
+                limit_usd: config.daily_limit_usd,
                 period: UsagePeriod::Day,
             });
         }
@@ -116,7 +135,7 @@ impl CostTracker {
         if projected_monthly >= monthly_warn_threshold {
             return Ok(BudgetCheck::Warning {
                 current_usd: monthly_cost,
-                limit_usd: self.config.monthly_limit_usd,
+                limit_usd: config.monthly_limit_usd,
                 period: UsagePeriod::Month,
             });
         }
@@ -137,7 +156,7 @@ impl CostTracker {
         usage: TokenUsage,
         agent_alias: Option<&str>,
     ) -> Result<()> {
-        if !self.config.enabled {
+        if !self.config_snapshot().enabled {
             return Ok(());
         }
 
@@ -152,7 +171,7 @@ impl CostTracker {
             anyhow::bail!("Token usage cost must be a finite, non-negative value");
         }
 
-        let effective_alias = if self.config.track_per_agent {
+        let effective_alias = if self.config_snapshot().track_per_agent {
             agent_alias.map(str::to_string)
         } else {
             None
@@ -204,7 +223,7 @@ impl CostTracker {
         let total_tokens: u64 = records.iter().map(|r| r.usage.total_tokens).sum();
         let request_count = records.len();
         let by_model = build_model_stats(records.iter());
-        let by_agent = if self.config.track_per_agent {
+        let by_agent = if self.config_snapshot().track_per_agent {
             build_agent_stats(&records)
         } else {
             HashMap::new()
@@ -286,7 +305,7 @@ impl CostTracker {
                 }
             }
             (daily_total, monthly_total, HashMap::new())
-        } else if self.config.track_per_agent {
+        } else if self.config_snapshot().track_per_agent {
             let by_agent = build_agent_stats(&daily_records);
             (daily_cost, monthly_cost, by_agent)
         } else {
@@ -325,16 +344,23 @@ static GLOBAL_COST_TRACKER: OnceLock<Option<Arc<CostTracker>>> = OnceLock::new()
 
 impl CostTracker {
     /// Return the process-global `CostTracker`, creating it on first call.
-    /// Subsequent calls (from gateway or channels, whichever starts second)
-    /// receive the same `Arc`.  Returns `None` when cost tracking is disabled
-    /// or initialisation fails.
+    /// Subsequent calls (from gateway or channels, whichever starts second,
+    /// or a hot-reload re-invocation) apply the supplied `config` to the
+    /// existing tracker and receive the same `Arc`.  The tracker holds its
+    /// config behind a `RwLock`, so reloaded budget limits take effect
+    /// without a process restart.  Returns `None` when cost tracking is
+    /// disabled or initialisation fails.
+    ///
+    /// Note: if cost tracking was disabled at first init the global stores
+    /// `None` permanently; enabling it later still requires a restart,
+    /// because the `OnceLock` cannot retroactively construct storage.
     pub fn get_or_init_global(config: CostConfig, workspace_dir: &Path) -> Option<Arc<Self>> {
-        GLOBAL_COST_TRACKER
+        let tracker = GLOBAL_COST_TRACKER
             .get_or_init(|| {
                 if !config.enabled {
                     return None;
                 }
-                match Self::new(config, workspace_dir) {
+                match Self::new(config.clone(), workspace_dir) {
                     Ok(ct) => Some(Arc::new(ct)),
                     Err(e) => {
                         ::zeroclaw_log::record!(
@@ -351,7 +377,13 @@ impl CostTracker {
                     }
                 }
             })
-            .clone()
+            .clone();
+
+        if let Some(ct) = tracker.as_ref() {
+            ct.update_config(config);
+        }
+
+        tracker
     }
 }
 
@@ -909,6 +941,62 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("Estimated cost must be a finite, non-negative value")
+        );
+    }
+
+    #[test]
+    fn cost_reload_applies_new_daily_limit() {
+        let tmp = TempDir::new().unwrap();
+
+        let boot = CostConfig {
+            enabled: true,
+            daily_limit_usd: 10.0,
+            ..Default::default()
+        };
+        let tracker = CostTracker::new(boot, tmp.path()).expect("boot tracker");
+        assert_eq!(tracker.config().daily_limit_usd, 10.0);
+
+        tracker.update_config(CostConfig {
+            enabled: true,
+            daily_limit_usd: 14000.0,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            tracker.config().daily_limit_usd,
+            14000.0,
+            "reload must apply the new daily limit through the RwLock"
+        );
+    }
+
+    #[test]
+    fn get_or_init_global_applies_reloaded_config_to_existing_tracker() {
+        let tmp = TempDir::new().unwrap();
+
+        let boot = CostConfig {
+            enabled: true,
+            daily_limit_usd: 10.0,
+            ..Default::default()
+        };
+        let first =
+            CostTracker::get_or_init_global(boot, tmp.path()).expect("first init yields a tracker");
+
+        let reloaded = CostConfig {
+            enabled: true,
+            daily_limit_usd: 14000.0,
+            ..Default::default()
+        };
+        let after =
+            CostTracker::get_or_init_global(reloaded, tmp.path()).expect("reload yields a tracker");
+
+        assert_eq!(
+            after.config().daily_limit_usd,
+            14000.0,
+            "the process-global tracker must adopt the reloaded daily limit"
+        );
+        assert!(
+            Arc::ptr_eq(&first, &after),
+            "reload must reuse the same global Arc, not construct a second tracker"
         );
     }
 }

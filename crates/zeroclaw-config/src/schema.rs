@@ -23869,6 +23869,32 @@ api_token = "tok"
     }
 
     #[test]
+    async fn proxy_reload_applies_new_config_through_rwlock() {
+        set_runtime_proxy_config(ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://boot.example:3128".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            runtime_proxy_config().http_proxy.as_deref(),
+            Some("http://boot.example:3128")
+        );
+
+        set_runtime_proxy_config(ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://reloaded.example:8080".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            runtime_proxy_config().http_proxy.as_deref(),
+            Some("http://reloaded.example:8080"),
+            "RwLock-backed runtime config must reflect the reloaded value"
+        );
+
+        set_runtime_proxy_config(ProxyConfig::default());
+    }
+
+    #[test]
     async fn set_runtime_proxy_config_clears_runtime_proxy_client_cache() {
         let service_key = format!(
             "model_provider.cache_timeout_test.{}",
