@@ -4224,6 +4224,75 @@ mod tests {
     }
 
     #[test]
+    fn provider_runtime_options_cross_family_no_leak() {
+        // Two different provider families (openai and anthropic) each with
+        // distinct max_tokens. Each agent resolves only its own provider's
+        // options — the first provider in config insertion order must NOT
+        // leak its max_tokens to the second provider's agent.
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, AnthropicModelProviderConfig, Config, ModelProviderConfig,
+            OpenAIModelProviderConfig,
+        };
+
+        let mut config = Config::default();
+
+        // First family in insertion order: openai with max_tokens = 16384
+        config.providers.models.openai.insert(
+            "gpt".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    api_key: Some("openai-key".to_string()),
+                    max_tokens: Some(16_384),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+
+        // Second family: anthropic with a different max_tokens
+        config.providers.models.anthropic.insert(
+            "sonnet".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("claude-sonnet-4".to_string()),
+                    api_key: Some("anthropic-key".to_string()),
+                    max_tokens: Some(8_192),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+
+        config.agents.insert(
+            "openai_agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.gpt".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "anthropic_agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "anthropic.sonnet".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let openai_opts = provider_runtime_options_for_agent(&config, "openai_agent");
+        let anthropic_opts = provider_runtime_options_for_agent(&config, "anthropic_agent");
+
+        assert_eq!(
+            openai_opts.provider_max_tokens,
+            Some(16_384),
+            "openai agent must get its own max_tokens, not the anthropic provider's"
+        );
+        assert_eq!(
+            anthropic_opts.provider_max_tokens,
+            Some(8_192),
+            "anthropic agent must get its own max_tokens, not the openai provider's"
+        );
+    }
+
+    #[test]
     fn resilient_alias_deep_acyclic_fallback_does_not_overflow() {
         use zeroclaw_config::schema::{Config, ModelProviderConfig, OpenAIModelProviderConfig};
 
