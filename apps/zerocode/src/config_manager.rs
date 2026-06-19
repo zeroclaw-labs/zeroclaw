@@ -1240,6 +1240,41 @@ impl App {
         Ok(())
     }
 
+    /// Pre-fill a freshly created cost-rate resource from the live provider
+    /// catalog, matching the web Costs editor. Reuses the existing
+    /// `catalog_models` RPC (same payload the gateway serves the dashboard);
+    /// only the `models` category carries token pricing, so other categories
+    /// are left for manual entry. Best-effort: any miss leaves the sheet
+    /// empty rather than surfacing an error.
+    async fn prefill_cost_rates_from_catalog(&self, base_path: &str, resource: &str) {
+        let Some(provider_type) = base_path.strip_prefix("cost.rates.providers.models.") else {
+            return;
+        };
+        let Ok(catalog) = self.rpc.catalog_models(provider_type).await else {
+            return;
+        };
+        let Some(pricing) = catalog.pricing.as_ref().and_then(|p| p.get(resource)) else {
+            return;
+        };
+        // Catalog rates are USD per token; cost sheets store USD per million.
+        let per_mtok = |s: &Option<String>| -> Option<f64> {
+            s.as_ref()
+                .and_then(|v| v.parse::<f64>().ok())
+                .map(|v| v * 1_000_000.0)
+        };
+        let fields = [
+            ("input_per_mtok", per_mtok(&pricing.prompt)),
+            ("output_per_mtok", per_mtok(&pricing.completion)),
+            ("cached_input_per_mtok", per_mtok(&pricing.input_cache_read)),
+        ];
+        for (field, value) in fields {
+            if let Some(v) = value {
+                let prop = format!("{base_path}.{resource}.{field}");
+                let _ = self.rpc.config_set(&prop, serde_json::json!(v)).await;
+            }
+        }
+    }
+
     async fn load_fields(&mut self, prefix: &str) -> Result<()> {
         self.fields = self.rpc.config_list(Some(prefix)).await?;
         self.field_cursor = 0;
@@ -2027,6 +2062,7 @@ impl App {
                 {
                     match self.rpc.config_map_key_create(&map_path, &name).await {
                         Ok(()) => {
+                            self.prefill_cost_rates_from_catalog(&map_path, &name).await;
                             let prefix = format!("{}.{}", map_path, name);
                             let mut bc = breadcrumb;
                             bc.push(name);

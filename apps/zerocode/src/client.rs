@@ -1377,8 +1377,27 @@ pub struct ConfigTemplatesResult {
 #[serde(rename_all = "snake_case")]
 pub struct CatalogModelsResult {
     pub models: Vec<String>,
+    /// Pricing keyed by upstream model id, when the provider's catalog
+    /// returns it. Mirrors the gateway `/api/config/catalog/models` payload
+    /// (same RPC) so the Costs tab can pre-fill rate sheets.
+    #[serde(default)]
+    pub pricing: Option<std::collections::HashMap<String, CatalogModelPricing>>,
     #[serde(default)]
     pub live: bool,
+}
+
+/// Per-token USD pricing strings as emitted by the catalog RPC. Field names
+/// match `zeroclaw_api::model_provider::ModelPricing`; only the rates the
+/// cost-rate sheet consumes are kept.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CatalogModelPricing {
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub completion: Option<String>,
+    #[serde(default)]
+    pub input_cache_read: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
