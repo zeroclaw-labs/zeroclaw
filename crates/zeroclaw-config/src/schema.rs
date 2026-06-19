@@ -10023,7 +10023,6 @@ fn is_valid_env_var_name(name: &str) -> bool {
 
 // ── Profiles & Bundles ───────────────────────────────────────────
 
-
 /// Filesystem and network policy for OS-level sandbox backends
 /// (`[risk_profiles.<alias>.sandbox_policy]`).
 ///
@@ -22102,7 +22101,10 @@ default_temperature = 0.7
     #[test]
     async fn mandatory_deny_write_defaults_flow_through_policy() {
         let deny_write = &SandboxPolicyConfig::default().deny_write;
-        assert!(!deny_write.is_empty(), "default deny_write guardrail list must not be empty");
+        assert!(
+            !deny_write.is_empty(),
+            "default deny_write guardrail list must not be empty"
+        );
         assert!(deny_write.iter().any(|p| p == ".env"), "must block .env");
         assert!(
             deny_write.iter().any(|p| p == ".git/hooks/"),

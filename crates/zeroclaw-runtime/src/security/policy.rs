@@ -82,7 +82,11 @@ impl SandboxPolicy {
     ///
     /// `default_sp` is passed in so callers can reuse an already-constructed default
     /// rather than allocating a second one inside this function.
-    fn resolve(sp: &SandboxPolicyConfig, workspace: &Path, default_sp: &SandboxPolicyConfig) -> Self {
+    fn resolve(
+        sp: &SandboxPolicyConfig,
+        workspace: &Path,
+        default_sp: &SandboxPolicyConfig,
+    ) -> Self {
         let mut deny_write = sp.deny_write.clone();
         if sp.mandatory_deny_write_enabled {
             // Deduplication is string-based (pre-resolution). An operator entry like
@@ -232,7 +236,11 @@ mod tests {
     fn sandbox_policy_default_produces_absolute_paths() {
         let policy = SandboxPolicy::default();
         for p in policy.deny_write.iter().chain(policy.allow_write.iter()) {
-            assert!(p.is_absolute(), "default path not absolute: {}", p.display());
+            assert!(
+                p.is_absolute(),
+                "default path not absolute: {}",
+                p.display()
+            );
         }
     }
 
@@ -240,7 +248,10 @@ mod tests {
     fn default_profile_resolves_without_panic() {
         let policy = SandboxPolicy::from_risk_profile(&RiskProfileConfig::default(), ws());
         assert!(policy.mandatory_deny_write_enabled);
-        assert!(!policy.deny_write.is_empty(), "guardrail list must be present");
+        assert!(
+            !policy.deny_write.is_empty(),
+            "guardrail list must be present"
+        );
     }
 
     #[test]
@@ -259,7 +270,11 @@ mod tests {
         profile.forbidden_paths = vec!["/should_be_ignored".to_string()];
         let policy = SandboxPolicy::from_risk_profile(&profile, ws());
         assert!(policy.deny_read.contains(&PathBuf::from("/explicit")));
-        assert!(!policy.deny_read.contains(&PathBuf::from("/should_be_ignored")));
+        assert!(
+            !policy
+                .deny_read
+                .contains(&PathBuf::from("/should_be_ignored"))
+        );
     }
 
     #[test]
@@ -332,7 +347,12 @@ mod tests {
                 "missing guardrail: {entry}"
             );
         }
-        assert!(policy.deny_write.iter().any(|p| p.ends_with("extra_blocked")));
+        assert!(
+            policy
+                .deny_write
+                .iter()
+                .any(|p| p.ends_with("extra_blocked"))
+        );
     }
 
     #[test]
@@ -385,6 +405,9 @@ mod tests {
         assert_eq!(old_policy.allow_read, new_policy.allow_read);
         assert_eq!(old_policy.allow_write, new_policy.allow_write);
         assert_eq!(old_policy.deny_write, new_policy.deny_write);
-        assert_eq!(old_policy.mandatory_deny_write_enabled, new_policy.mandatory_deny_write_enabled);
+        assert_eq!(
+            old_policy.mandatory_deny_write_enabled,
+            new_policy.mandatory_deny_write_enabled
+        );
     }
 }
