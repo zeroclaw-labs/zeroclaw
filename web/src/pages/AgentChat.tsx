@@ -14,7 +14,7 @@ import {
   parseCommand,
   type CommandSpec,
 } from '@/lib/slashCommands';
-import { Badge, Button } from '@/components/ui';
+import { Button } from '@/components/ui';
 import ChatWorkspace from '@/pages/ChatWorkspace';
 
 import ToolCallCard from '@/components/ToolCallCard';
