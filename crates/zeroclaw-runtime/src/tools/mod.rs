@@ -464,6 +464,11 @@ pub struct AllToolsResult {
     /// Pre-boxed Arcs of every tool (before policy filter). Used by
     /// skill-scoped builtin elevation to resolve targets at registration.
     pub unfiltered_tool_arcs: Vec<Arc<dyn Tool>>,
+    /// Shared slot that PipelineTool reads at execution time to apply the
+    /// per-agent `ToolAccessPolicy` gate. Set by the agent loop after
+    /// constructing the tool registry but before any turn runs.
+    pub pipeline_access_policy:
+        Option<Arc<std::sync::Mutex<Option<zeroclaw_tools::tool_search::ToolAccessPolicy>>>>,
 }
 
 /// Create full tool registry including memory tools and optional Composio
@@ -1292,6 +1297,7 @@ pub fn all_tools_with_runtime(
                     reaction_handle,
                     poll_handle: Some(poll_handle),
                     escalate_handle,
+                    pipeline_access_policy: None,
                 };
             }
 
@@ -1503,13 +1509,23 @@ pub fn all_tools_with_runtime(
     }
 
     // Pipeline tool (execute_pipeline) — multi-step tool chaining.
-    if root_config.pipeline.enabled {
+    // Shared mutable slot so the per-agent ToolAccessPolicy can be injected
+    // after registry construction. PipelineTool validates every step against
+    // both the global [pipeline].allowed_tools AND this per-agent gate.
+    let pipeline_access_policy: Option<
+        Arc<std::sync::Mutex<Option<zeroclaw_tools::tool_search::ToolAccessPolicy>>>,
+    > = if root_config.pipeline.enabled {
+        let policy = Arc::new(std::sync::Mutex::new(None));
         let pipeline_tools: Vec<Arc<dyn Tool>> = tool_arcs.clone();
         tool_arcs.push(Arc::new(PipelineTool::new(
             root_config.pipeline.clone(),
             pipeline_tools,
+            Arc::clone(&policy),
         )));
-    }
+        Some(policy)
+    } else {
+        None
+    };
 
     AllToolsResult {
         unfiltered_tool_arcs: tool_arcs.clone(),
@@ -1520,6 +1536,7 @@ pub fn all_tools_with_runtime(
         reaction_handle,
         poll_handle: Some(poll_handle),
         escalate_handle,
+        pipeline_access_policy,
     }
 }
 
