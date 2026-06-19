@@ -652,6 +652,19 @@ cli-channels-notion = {"  "}{ $status } Notion
 cli-channels-start-hint = Pour démarrer les canaux : zeroclaw channel start
 cli-channels-doctor-hint = Pour vérifier l'état :    zeroclaw channel doctor
 cli-channels-configure-hint = Pour configurer :      zeroclaw config set channels.<name>.<field>=<value>
+
+# ── Context window (doctor update-context-windows, agent interactive) ──
+cli-agent-context-bar = ctx: {used:>7} / {max:>7}  [{bar}]  {pct:.0}%
+cli-agent-context-bar-unknown = ctx: inconnu / {max:>7}
+cli-doctor-ctxwin-already-set = {provider_ref}: a déjà context_window = {ctx}
+cli-doctor-ctxwin-no-model = {provider_ref}: aucun modèle configuré, ignoré
+cli-doctor-ctxwin-would-set = {provider_ref}: définirait context_window = {ctx} (simulation)
+cli-doctor-ctxwin-set = {provider_ref}: context_window défini = {ctx}
+cli-doctor-ctxwin-not-found = {provider_ref}: entrée introuvable pour mise à jour
+cli-doctor-ctxwin-fetch-failed = {provider_ref}: n'expose pas la fenêtre de contexte ou l'obtention a échoué
+cli-doctor-ctxwin-saved = {updated} mise(s) à jour enregistrée(s) dans config.toml
+cli-doctor-ctxwin-dry-run = Simulation terminée — aucun changement. Relancez sans --dry-run pour appliquer.
+cli-doctor-ctxwin-none = Aucune mise à jour nécessaire.
 cli-onboard-about = Initialiser votre espace de travail et votre configuration
 cli-memory-persist-about = Persister les données de l'état de l'agent dans des fichiers locaux ou un stockage distant
 cli-memory-remove-about = Supprimer une entrée de mémoire par clé

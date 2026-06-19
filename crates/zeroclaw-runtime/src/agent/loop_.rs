@@ -944,7 +944,7 @@ pub async fn run(
         let eff_max_history_messages = agent.resolved.max_history_messages;
         let eff_compact_context = agent.resolved.compact_context;
         let eff_max_system_prompt_chars = agent.resolved.max_system_prompt_chars;
-        let eff_max_context_tokens = config.effective_model_context_window(agent_alias);
+        let eff_max_context_tokens = agent.resolved.model_context_window;
         let base_observer = observability::create_observer(&config.observability);
         let observer: Arc<dyn Observer> = Arc::from(base_observer);
         let runtime: Arc<dyn platform::RuntimeAdapter> =
@@ -2395,13 +2395,23 @@ pub async fn run(
                             "\u{2588}".repeat(filled),
                             "\u{2591}".repeat(empty)
                         );
-                        eprintln!(
-                            "\x1b[2mctx: {:>7} / {:>7}  {}  {:.0}%\x1b[0m",
-                            format_tokens(usage.input_tokens),
-                            format_tokens(max_ctx),
-                            bar,
-                            pct
-                        );
+                        let msg = if usage.input_tokens > 0 {
+                            crate::i18n::get_required_cli_string_with_args(
+                                "cli-agent-context-bar",
+                                &[
+                                    ("used", &format_tokens(usage.input_tokens)),
+                                    ("max", &format_tokens(max_ctx)),
+                                    ("bar", &bar),
+                                    ("pct", &format!("{:.0}", pct)),
+                                ],
+                            )
+                        } else {
+                            crate::i18n::get_required_cli_string_with_args(
+                                "cli-agent-context-bar-unknown",
+                                &[("max", &format_tokens(max_ctx))],
+                            )
+                        };
+                        eprintln!("\x1b[2m{}\x1b[0m", msg);
                     }
                 }
 

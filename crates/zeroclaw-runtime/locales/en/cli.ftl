@@ -828,3 +828,16 @@ cli-bundle-warn-archive = warning: bundle directory archive failed: {$error}
 cli-bundle-deleted = deleted skill_bundles.{$alias} (stripped from {$count} agent(s))
 cli-bundle-warn-move = warning: bundle directory move failed: {$error}
 cli-bundle-renamed = renamed skill_bundles.{$from} → skill_bundles.{$to}
+
+# ── Context window (doctor update-context-windows, agent interactive) ──
+cli-agent-context-bar = ctx: {used:>7} / {max:>7}  [{bar}]  {pct:.0}%
+cli-agent-context-bar-unknown = ctx: unknown / {max:>7}
+cli-doctor-ctxwin-already-set = {provider_ref}: already has context_window = {ctx}
+cli-doctor-ctxwin-no-model = {provider_ref}: no model configured, skipping
+cli-doctor-ctxwin-would-set = {provider_ref}: would set context_window = {ctx} (dry run)
+cli-doctor-ctxwin-set = {provider_ref}: set context_window = {ctx}
+cli-doctor-ctxwin-not-found = {provider_ref}: could not find entry to update
+cli-doctor-ctxwin-fetch-failed = {provider_ref}: provider does not expose context window or fetch failed
+cli-doctor-ctxwin-saved = Saved {updated} updates to config.toml
+cli-doctor-ctxwin-dry-run = Dry run complete — no changes written. Run without --dry-run to apply.
+cli-doctor-ctxwin-none = No updates needed.

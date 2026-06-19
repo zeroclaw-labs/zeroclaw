@@ -485,13 +485,21 @@ pub async fn update_context_windows(
     for (provider_ref, model, uri, existing_context_window) in targets {
         // Skip if already has context_window set
         if let Some(ctx) = existing_context_window {
-            println!("  {provider_ref}: already has context_window = {ctx}");
+            let msg = crate::i18n::get_required_cli_string_with_args(
+                "cli-doctor-ctxwin-already-set",
+                &[("provider_ref", &provider_ref), ("ctx", &ctx.to_string())],
+            );
+            println!("{}", msg);
             continue;
         }
 
         // Skip if no model configured
         if model.is_empty() {
-            println!("  {provider_ref}: no model configured, skipping");
+            let msg = crate::i18n::get_required_cli_string_with_args(
+                "cli-doctor-ctxwin-no-model",
+                &[("provider_ref", &provider_ref)],
+            );
+            println!("{}", msg);
             continue;
         }
 
@@ -511,7 +519,11 @@ pub async fn update_context_windows(
         {
             Some(ctx) => {
                 if dry_run {
-                    println!("  {provider_ref}: would set context_window = {ctx} (dry run)");
+                    let msg = crate::i18n::get_required_cli_string_with_args(
+                        "cli-doctor-ctxwin-would-set",
+                        &[("provider_ref", &provider_ref), ("ctx", &ctx.to_string())],
+                    );
+                    println!("{}", msg);
                 } else {
                     // Update the config - need to find and mutate
                     let mut found = false;
@@ -521,31 +533,47 @@ pub async fn update_context_windows(
                         {
                             entry_mut.2.context_window = Some(ctx);
                             updated += 1;
-                            println!("  {provider_ref}: set context_window = {ctx}");
+                            let msg = crate::i18n::get_required_cli_string_with_args(
+                                "cli-doctor-ctxwin-set",
+                                &[("provider_ref", &provider_ref), ("ctx", &ctx.to_string())],
+                            );
+                            println!("{}", msg);
                             found = true;
                             break;
                         }
                     }
                     if !found {
-                        println!("  {provider_ref}: could not find entry to update");
+                        let msg = crate::i18n::get_required_cli_string_with_args(
+                            "cli-doctor-ctxwin-not-found",
+                            &[("provider_ref", &provider_ref)],
+                        );
+                        println!("{}", msg);
                     }
                 }
             }
             None => {
-                println!(
-                    "  {provider_ref}: provider does not expose context window or fetch failed"
+                let msg = crate::i18n::get_required_cli_string_with_args(
+                    "cli-doctor-ctxwin-fetch-failed",
+                    &[("provider_ref", &provider_ref)],
                 );
+                println!("{}", msg);
             }
         }
     }
 
     if !dry_run && updated > 0 {
         config.save().await?;
-        println!("\nSaved {updated} updates to config.toml");
+        let msg = crate::i18n::get_required_cli_string_with_args(
+            "cli-doctor-ctxwin-saved",
+            &[("updated", &updated.to_string())],
+        );
+        println!("\n{}", msg);
     } else if dry_run {
-        println!("\nDry run complete — no changes written. Run without --dry-run to apply.");
+        let msg = crate::i18n::get_required_cli_string("cli-doctor-ctxwin-dry-run");
+        println!("\n{}", msg);
     } else {
-        println!("\nNo updates needed.");
+        let msg = crate::i18n::get_required_cli_string("cli-doctor-ctxwin-none");
+        println!("\n{}", msg);
     }
 
     Ok(updated)

@@ -649,4 +649,17 @@ cli-channels-notion = {"  "}{$status} Notion
 cli-channels-start-hint = チャンネルを開始するには: zeroclaw channel start
 cli-channels-doctor-hint = 状態を確認するには:    zeroclaw channel doctor
 cli-channels-configure-hint = 設定するには:      zeroclaw config set channels.<name>.<field>=<value>
+
+# ── Context window (doctor update-context-windows, agent interactive) ──
+cli-agent-context-bar = ctx: {used:>7} / {max:>7}  [{bar}]  {pct:.0}%
+cli-agent-context-bar-unknown = ctx: 不明 / {max:>7}
+cli-doctor-ctxwin-already-set = {provider_ref}: 既に context_window = {ctx} が設定されています
+cli-doctor-ctxwin-no-model = {provider_ref}: モデルが未設定のためスキップ
+cli-doctor-ctxwin-would-set = {provider_ref}: context_window = {ctx} を設定します (ドライラン)
+cli-doctor-ctxwin-set = {provider_ref}: context_window = {ctx} を設定しました
+cli-doctor-ctxwin-not-found = {provider_ref}: 更新対象のエントリが見つかりません
+cli-doctor-ctxwin-fetch-failed = {provider_ref}: コンテキストウィンドウを公開していないか、取得に失敗しました
+cli-doctor-ctxwin-saved = config.toml に {updated} 件の更新を保存しました
+cli-doctor-ctxwin-dry-run = ドライラン完了 — 変更は書き込まれません。--dry-run なしで実行して適用してください。
+cli-doctor-ctxwin-none = 更新は必要ありません。
 cli-onboard-about = ワークスペースと設定を初期化

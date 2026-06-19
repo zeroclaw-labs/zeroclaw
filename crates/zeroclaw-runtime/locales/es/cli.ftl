@@ -649,3 +649,16 @@ cli-channels-notion = {"  "}{$status} Notion
 cli-channels-start-hint = Para iniciar canales: zeroclaw channel start
 cli-channels-doctor-hint = Para comprobar el estado:    zeroclaw channel doctor
 cli-channels-configure-hint = Para configurar:      zeroclaw config set channels.<name>.<field>=<value>
+
+# ── Context window (doctor update-context-windows, agent interactive) ──
+cli-agent-context-bar = ctx: {used:>7} / {max:>7}  [{bar}]  {pct:.0}%
+cli-agent-context-bar-unknown = ctx: desconocido / {max:>7}
+cli-doctor-ctxwin-already-set = {provider_ref}: ya tiene context_window = {ctx}
+cli-doctor-ctxwin-no-model = {provider_ref}: no hay modelo configurado, omitiendo
+cli-doctor-ctxwin-would-set = {provider_ref}: establecería context_window = {ctx} (simulación)
+cli-doctor-ctxwin-set = {provider_ref}: context_window establecido = {ctx}
+cli-doctor-ctxwin-not-found = {provider_ref}: no se encontró la entrada para actualizar
+cli-doctor-ctxwin-fetch-failed = {provider_ref}: el proveedor no expone ventana de contexto o falló la obtención
+cli-doctor-ctxwin-saved = Guardados {updated} cambios en config.toml
+cli-doctor-ctxwin-dry-run = Simulación completa — sin cambios. Ejecute sin --dry-run para aplicar.
+cli-doctor-ctxwin-none = No se necesitan actualizaciones.

@@ -4315,8 +4315,11 @@ async fn fetch_openai_compatible_context_window(
         return None;
     }
     let url = format!("{}/models", base_url.trim_end_matches('/'));
-    let resp = client
-        .get(&url)
+    let mut req = client.get(&url);
+    if let Some(key) = config.api_key.as_deref() {
+        req = req.bearer_auth(key);
+    }
+    let resp = req
         .send()
         .await
         .ok()?

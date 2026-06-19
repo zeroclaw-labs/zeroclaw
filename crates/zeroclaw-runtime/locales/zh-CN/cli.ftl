@@ -648,3 +648,16 @@ cli-channels-notion = {"  "}{$status} Notion
 cli-channels-start-hint = 启动渠道：zeroclaw channel start
 cli-channels-doctor-hint = 检查健康状况：    zeroclaw channel doctor
 cli-channels-configure-hint = 配置方法：      zeroclaw config set channels.<name>.<field>=<value>
+
+# ── Context window (doctor update-context-windows, agent interactive) ──
+cli-agent-context-bar = ctx: {used:>7} / {max:>7}  [{bar}]  {pct:.0}%
+cli-agent-context-bar-unknown = ctx: 未知 / {max:>7}
+cli-doctor-ctxwin-already-set = {provider_ref}: 已有 context_window = {ctx}
+cli-doctor-ctxwin-no-model = {provider_ref}: 未配置模型，跳过
+cli-doctor-ctxwin-would-set = {provider_ref}: 将设置 context_window = {ctx} (试运行)
+cli-doctor-ctxwin-set = {provider_ref}: 已设置 context_window = {ctx}
+cli-doctor-ctxwin-not-found = {provider_ref}: 找不到要更新的条目
+cli-doctor-ctxwin-fetch-failed = {provider_ref}: 提供商未暴露上下文窗口或获取失败
+cli-doctor-ctxwin-saved = 已保存 {updated} 项更新到 config.toml
+cli-doctor-ctxwin-dry-run = 试运行完成 — 未写入更改。去掉 --dry-run 以应用。
+cli-doctor-ctxwin-none = 无需更新。
