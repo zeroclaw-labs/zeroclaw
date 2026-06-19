@@ -489,6 +489,7 @@ cli-cron-added-oneshot = ✅ Added one-shot cron job {$id}
 cli-cron-added-interval-agent = ✅ Added interval agent cron job {$id}
 cli-cron-added-interval = ✅ Added interval cron job {$id}
 cli-cron-updated = ✅ Updated cron job {$id}
+cli-cron-removed = ✅ Removed cron job {$id}
 cli-cron-paused = ⏸️  Paused cron job {$id}
 cli-cron-resumed = ▶️  Resumed cron job {$id}
 cli-cron-expr = {"  "}Expr  : {$v}
