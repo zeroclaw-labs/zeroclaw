@@ -9,6 +9,7 @@ use super::transport::RpcTransport;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -28,6 +29,36 @@ const HEARTBEAT_IDLE: Duration = Duration::from_secs(20);
 /// How long to wait after a Ping for any frame (a Pong, or anything else)
 /// before declaring the peer dead and tearing the connection down.
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Backoff after a transient `accept()` error so the serve loop does not
+/// hot-spin while the condition (e.g. fd exhaustion) clears.
+const ACCEPT_ERROR_BACKOFF_MS: u64 = 50;
+
+/// File-descriptor exhaustion errno values, stable across the Unix targets
+/// we support (Linux, macOS, BSD).
+#[cfg(unix)]
+const EMFILE: i32 = 24; // too many open files (this process)
+#[cfg(unix)]
+const ENFILE: i32 = 23; // too many open files (system-wide)
+
+/// Returns `true` when an error from a stream listener's `accept()` is
+/// transient and the listener itself remains usable, so the serve loop
+/// should log and keep running rather than terminating the daemon. Covers
+/// file-descriptor exhaustion (`EMFILE`/`ENFILE`, see #7042) and the usual
+/// per-connection hiccups.
+fn is_recoverable_accept_error(e: &std::io::Error) -> bool {
+    if matches!(
+        e.kind(),
+        ErrorKind::ConnectionAborted | ErrorKind::Interrupted | ErrorKind::WouldBlock
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    if matches!(e.raw_os_error(), Some(EMFILE) | Some(ENFILE)) {
+        return true;
+    }
+    false
+}
 
 // ── Transport ────────────────────────────────────────────────────
 
@@ -193,13 +224,21 @@ pub async fn run_wss_listener(
                 let (tcp_stream, remote_addr) = match accept {
                     Ok(v) => v,
                     Err(e) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                            &format!("WSS accept error: {e}")
-                        );
-                        continue;
+                        if is_recoverable_accept_error(&e) {
+                            // Transient (e.g. EMFILE under fd pressure):
+                            // the listener is still valid. Back off briefly
+                            // to avoid hot-spinning, then keep serving
+                            // rather than killing the daemon (#7042).
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                                &format!("WSS accept() transient error: {e}")
+                            );
+                            tokio::time::sleep(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS)).await;
+                            continue;
+                        }
+                        return Err(e).context("WSS accept error");
                     }
                 };
 
@@ -274,4 +313,32 @@ pub async fn run_wss_listener(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod accept_error_tests {
+    use super::is_recoverable_accept_error;
+    use std::io::{Error, ErrorKind};
+
+    #[cfg(unix)]
+    #[test]
+    fn fd_exhaustion_accept_errors_are_recoverable() {
+        // #7042: EMFILE/ENFILE must not terminate the daemon.
+        assert!(is_recoverable_accept_error(&Error::from_raw_os_error(24))); // EMFILE
+        assert!(is_recoverable_accept_error(&Error::from_raw_os_error(23))); // ENFILE
+    }
+
+    #[test]
+    fn transient_kinds_recover_but_fatal_propagates() {
+        assert!(is_recoverable_accept_error(&Error::from(
+            ErrorKind::ConnectionAborted
+        )));
+        assert!(is_recoverable_accept_error(&Error::from(
+            ErrorKind::Interrupted
+        )));
+        // A non-transient error is not swallowed (loop will propagate it).
+        assert!(!is_recoverable_accept_error(&Error::from(
+            ErrorKind::InvalidInput
+        )));
+    }
 }
