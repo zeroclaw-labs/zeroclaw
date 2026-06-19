@@ -6257,7 +6257,7 @@ fn build_channel_by_id(
         "qq" => {
             anyhow::bail!("QQ channel requires the `channel-qq` feature");
         }
-        "lark" => {
+        "lark" | "feishu" => {
             #[cfg(feature = "channel-lark")]
             {
                 let lk = config
@@ -7852,7 +7852,9 @@ fn collect_configured_channels(
 
     #[cfg(feature = "channel-lark")]
     for (alias, lk) in &config.channels.lark {
-        if !active_channel_aliases.contains(&format!("lark.{alias}")) {
+        if !active_channel_aliases.contains(&format!("lark.{alias}"))
+            && !active_channel_aliases.contains(&format!("feishu.{alias}"))
+        {
             continue;
         }
         if !lk.enabled {
