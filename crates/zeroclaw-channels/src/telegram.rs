@@ -569,7 +569,58 @@ pub struct TelegramChannel {
     /// tool approval prompt before auto-denying. Configurable via
     /// `channels.telegram.approval_timeout_secs`. Default: 120.
     approval_timeout_secs: u64,
+    /// Pending Telegram media-group ("album") updates keyed on
+    /// `(chat_id, media_group_id)`. Telegram splits a multi-photo /
+    /// multi-document send into one update per item, each carrying the
+    /// same `media_group_id`. We buffer them so a single album surfaces
+    /// as a single `ChannelMessage` rather than N independent agent
+    /// requests. Resolved on a short debounce window — see
+    /// `MEDIA_GROUP_FLUSH_WINDOW`.
+    ///
+    /// Resolver/canonical-source-of-truth note: this buffer holds *raw
+    /// incoming update JSON* for the brief window before it is
+    /// consumed. It is *not* a cached projection of any configuration
+    /// field. There is nothing to invalidate against a config reload —
+    /// at worst, an in-flight album gets flushed early on the next
+    /// poll. The agent-facing state (sent `ChannelMessage` content,
+    /// attachments) is rebuilt from the raw updates on flush and is
+    /// never stored on this struct.
+    media_group_buffer: Mutex<MediaGroupBuffer>,
 }
+
+/// One pending entry in the Telegram media-group buffer.
+///
+/// `items` are kept in arrival order so that the combined caption /
+/// attachment list preserves the user's intended ordering — Telegram
+/// sends them sorted by `message_id`, which is what users perceive as
+/// "first".
+struct MediaGroupEntry {
+    /// Raw update JSON for each item in this album, in arrival order.
+    items: Vec<serde_json::Value>,
+    /// When the first item for this group arrived. Used for observability.
+    first_seen: std::time::Instant,
+    /// When the most recent item for this group arrived. Drives the
+    /// debounce-window flush.
+    last_seen: std::time::Instant,
+}
+
+/// Buffer of pending media-group updates keyed on `(chat_id, media_group_id)`.
+///
+/// Held on the channel as `Mutex<MediaGroupBuffer>`; mutated only from
+/// the single `listen()` task and from the periodic flush call inside
+/// the same task. A `parking_lot::Mutex` is appropriate because every
+/// critical section is short (insert, lookup, drain) and we never hold
+/// the lock across an `.await`.
+#[derive(Default)]
+struct MediaGroupBuffer {
+    pending: std::collections::HashMap<(i64, String), MediaGroupEntry>,
+}
+
+/// How long to wait after the most recent update for a media group
+/// before flushing it as a single `ChannelMessage`. Telegram typically
+/// delivers all album items within a few hundred milliseconds; this
+/// value gives ample slack while keeping end-to-end agent latency low.
+const MEDIA_GROUP_FLUSH_WINDOW: Duration = Duration::from_millis(700);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditMessageResult {
@@ -628,6 +679,7 @@ impl TelegramChannel {
             tool_command_specs: Vec::new(),
             pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             approval_timeout_secs: 120,
+            media_group_buffer: Mutex::new(MediaGroupBuffer::default()),
         }
     }
 
@@ -1857,6 +1909,219 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             attachments: vec![],
             subject: None,
         })
+    }
+
+    /// Extract a `media_group_id` from an update, if present.
+    ///
+    /// Telegram attaches the same `media_group_id` string to every
+    /// update that belongs to a single media group (album). The
+    /// field is optional; returns `None` for non-grouped updates.
+    fn extract_media_group_id(update: &serde_json::Value) -> Option<String> {
+        let message = update.get("message")?;
+        message
+            .get("media_group_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    }
+
+    /// Find the first message in `updates` whose `media_group_id` equals
+    /// `target_group_id`, if any. Used by the dispatcher to recover
+    /// caption and metadata from any earlier update in the same album
+    /// before the buffer has fully settled.
+    fn find_group_anchor<'a>(
+        updates: &'a [serde_json::Value],
+        target_group_id: &str,
+    ) -> Option<&'a serde_json::Value> {
+        updates.iter().find(|update| {
+            Self::extract_media_group_id(update).as_deref() == Some(target_group_id)
+        })
+    }
+
+    /// Extract the chat id (`i64`) from a raw update, if present.
+    ///
+    /// Media-group buffering keys on `(chat_id, media_group_id)`. The
+    /// chat id is required to disambiguate two chats sending an album
+    /// with coincidentally identical group identifiers (Telegram
+    /// generates the group id server-side and does not guarantee
+    /// uniqueness across chats).
+    fn extract_chat_id(update: &serde_json::Value) -> Option<i64> {
+        update
+            .get("message")
+            .and_then(|m| m.get("chat"))
+            .and_then(|chat| chat.get("id"))
+            .and_then(serde_json::Value::as_i64)
+    }
+
+    /// Insert (or extend) the buffer entry for an update that carries
+    /// a `media_group_id`.
+    ///
+    /// Returns `true` when the update was buffered and the caller
+    /// should skip the per-update dispatch path; `false` when the
+    /// update lacks the required fields and should fall through to
+    /// the normal handler.
+    fn buffer_media_group_update(&self, update: &serde_json::Value) -> bool {
+        let Some(group_id) = Self::extract_media_group_id(update) else {
+            return false;
+        };
+        let Some(chat_id) = Self::extract_chat_id(update) else {
+            return false;
+        };
+
+        let now = std::time::Instant::now();
+        let mut buf = self.media_group_buffer.lock();
+        let entry = buf.pending.entry((chat_id, group_id));
+        match entry {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(MediaGroupEntry {
+                    items: vec![update.clone()],
+                    first_seen: now,
+                    last_seen: now,
+                });
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                slot.get_mut().items.push(update.clone());
+                slot.get_mut().last_seen = now;
+            }
+        }
+        true
+    }
+
+    /// Flush any buffered media-group entries whose `last_seen` is
+    /// older than `MEDIA_GROUP_FLUSH_WINDOW`. Each flushed entry is
+    /// dispatched as a single merged `ChannelMessage` via `tx`.
+    ///
+    /// The buffer lock is held only long enough to drain entries;
+    /// all downstream async work happens after the lock is dropped.
+    /// This keeps the critical section short and avoids any
+    /// lock-across-await hazard with `parking_lot::Mutex`.
+    async fn flush_due_media_groups(
+        &self,
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+    ) {
+        // Drain due entries first; do async parsing afterwards.
+        let due: Vec<((i64, String), MediaGroupEntry)> = {
+            let buf = self.media_group_buffer.lock();
+            let now = std::time::Instant::now();
+            let mut taken = Vec::new();
+            buf.pending.retain(|key, entry| {
+                if now.duration_since(entry.last_seen) >= MEDIA_GROUP_FLUSH_WINDOW {
+                    taken.push((key.clone(), MediaGroupEntry {
+                        items: std::mem::take(&mut entry.items),
+                        first_seen: entry.first_seen,
+                        last_seen: entry.last_seen,
+                    }));
+                    false
+                } else {
+                    true
+                }
+            });
+            taken
+        };
+
+        for (_key, entry) in due {
+            let count = entry.items.len();
+            if count == 0 {
+                continue;
+            }
+
+            // Parse each item through the standard attachment path.
+            // Skip items that don't parse (e.g. unsupported media
+            // kinds) but keep going so one bad item doesn't drop the
+            // whole album.
+            let mut parsed: Vec<ChannelMessage> = Vec::with_capacity(count);
+            for update in &entry.items {
+                let Some(msg) = self.try_parse_attachment_message(update).await else {
+                    continue;
+                };
+                parsed.push(msg);
+            }
+
+            if parsed.is_empty() {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    &format!(
+                        "Media group of {count} items produced no parseable attachments; skipping"
+                    )
+                );
+                continue;
+            }
+
+            // Use the first parsed item as the anchor for sender /
+            // reply_target / thread_ts, but merge all content strings
+            // so the agent sees every file in the album in arrival
+            // order.
+            let anchor = parsed[0].clone();
+            let mut merged_content = String::new();
+            for (i, msg) in parsed.iter().enumerate() {
+                if i > 0 {
+                    merged_content.push_str("\n\n");
+                }
+                merged_content.push_str(&msg.content);
+            }
+
+            // Use a stable, collision-resistant id derived from the
+            // first item's chat_id + message_id. Prefix with
+            // `telegram_album_` so the album's id never collides with
+            // any per-item `telegram_<chat>_<msg>` id.
+            let id_suffix = anchor
+                .id
+                .strip_prefix("telegram_")
+                .unwrap_or(&anchor.id);
+            let album_id = format!("telegram_album_{id_suffix}");
+
+            // Same ack-reaction + typing-indicator treatment as the
+            // per-message path, but applied to the album anchor's
+            // chat_id / message_id.
+            if self.ack_reactions
+                && let Some((reaction_chat_id, reaction_message_id)) =
+                    Self::extract_update_message_target(&entry.items[0])
+            {
+                self.try_add_ack_reaction_nonblocking(
+                    reaction_chat_id,
+                    reaction_message_id,
+                );
+            }
+
+            let typing_body = serde_json::json!({
+                "chat_id": &anchor.reply_target,
+                "action": "typing"
+            });
+            let _ = self
+                .http_client()
+                .post(self.api_url("sendChatAction"))
+                .json(&typing_body)
+                .send()
+                .await; // best-effort, like the per-message path
+
+            let album_msg = ChannelMessage {
+                id: album_id,
+                sender: anchor.sender,
+                reply_target: anchor.reply_target,
+                content: merged_content,
+                channel: anchor.channel.clone(),
+                channel_alias: anchor.channel_alias.clone(),
+                timestamp: anchor.timestamp,
+                thread_ts: anchor.thread_ts.clone(),
+                interruption_scope_id: anchor.interruption_scope_id.clone(),
+                attachments: anchor.attachments.clone(),
+                subject: anchor.subject.clone(),
+            };
+
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!(
+                    "Dispatched Telegram media group as one agent request ({} items)",
+                    parsed.len()
+                )
+            );
+
+            if tx.send(album_msg).await.is_err() {
+                // Receiver is gone; nothing to do but stop flushing.
+                return;
+            }
+        }
     }
 
     /// Attempt to parse a Telegram update as a voice message and transcribe it.
@@ -3764,6 +4029,15 @@ Ensure only one `zeroclaw` process is using this bot token."
                         offset = uid + 1;
                     }
 
+                    // ── Handle media-group ("album") updates ──
+                    // Telegram splits a multi-photo / multi-document send into one
+                    // update per item, each carrying the same `media_group_id`.
+                    // Buffer them so a single album surfaces as one agent request
+                    // rather than N independent ones. See #7873.
+                    if self.buffer_media_group_update(update) {
+                        continue;
+                    }
+
                     // ── Handle callback_query (inline keyboard taps) ──
                     if let Some(cb) = update.get("callback_query") {
                         let cb_id = cb
@@ -3881,6 +4155,15 @@ Ensure only one `zeroclaw` process is using this bot token."
                         return Ok(());
                     }
                 }
+
+                // ── Flush any media groups that have settled ──
+                // After processing every update from this poll batch, drain any
+                // buffered albums whose last item arrived at least
+                // `MEDIA_GROUP_FLUSH_WINDOW` ago and dispatch each one as a
+                // single merged `ChannelMessage`. Done once per poll cycle
+                // (not once per update) so the flush window is measured
+                // across the whole batch.
+                self.flush_due_media_groups(&tx).await;
             }
         }
     }
@@ -7640,5 +7923,139 @@ mod tests {
     fn non_approval_callback_data_is_ignored() {
         let cb_data = "some_other_action:data";
         assert!(cb_data.strip_prefix("approval:").is_none());
+    }
+
+    #[test]
+    fn extract_media_group_id_returns_id_when_present() {
+        let update = serde_json::json!({
+            "update_id": 1,
+            "message": {
+                "message_id": 10,
+                "chat": {"id": 100, "type": "private"},
+                "media_group_id": "abc123",
+            }
+        });
+        assert_eq!(
+            TelegramChannel::extract_media_group_id(&update).as_deref(),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn extract_media_group_id_returns_none_when_absent() {
+        let update = serde_json::json!({
+            "update_id": 1,
+            "message": {
+                "message_id": 10,
+                "chat": {"id": 100, "type": "private"},
+            }
+        });
+        assert!(TelegramChannel::extract_media_group_id(&update).is_none());
+    }
+
+    #[test]
+    fn extract_media_group_id_returns_none_for_callback_only_update() {
+        let update = serde_json::json!({
+            "update_id": 2,
+            "callback_query": {"id": "cb-1", "data": "approval:abc:approve"},
+        });
+        assert!(TelegramChannel::extract_media_group_id(&update).is_none());
+    }
+
+    #[test]
+    fn extract_chat_id_reads_chat_id_from_message() {
+        let update = serde_json::json!({
+            "message": {"chat": {"id": 4242}}
+        });
+        assert_eq!(TelegramChannel::extract_chat_id(&update), Some(4242));
+    }
+
+    #[test]
+    fn extract_chat_id_returns_none_when_chat_missing() {
+        let update = serde_json::json!({
+            "message": {"message_id": 1}
+        });
+        assert!(TelegramChannel::extract_chat_id(&update).is_none());
+    }
+
+    #[test]
+    fn buffer_media_group_update_buffers_when_group_id_present() {
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        let update = serde_json::json!({
+            "update_id": 5,
+            "message": {
+                "message_id": 11,
+                "chat": {"id": 9000},
+                "media_group_id": "group-A",
+            }
+        });
+        assert!(ch.buffer_media_group_update(&update));
+
+        let buf = ch.media_group_buffer.lock();
+        assert!(buf.pending.contains_key(&(9000, "group-A".to_string())));
+        assert_eq!(buf.pending[&(9000, "group-A".to_string())].items.len(), 1);
+    }
+
+    #[test]
+    fn buffer_media_group_update_appends_for_same_group() {
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        for msg_id in 1..=3 {
+            let update = serde_json::json!({
+                "update_id": msg_id,
+                "message": {
+                    "message_id": msg_id,
+                    "chat": {"id": 1},
+                    "media_group_id": "album-1",
+                }
+            });
+            assert!(ch.buffer_media_group_update(&update));
+        }
+        let buf = ch.media_group_buffer.lock();
+        assert_eq!(buf.pending[&(1, "album-1".to_string())].items.len(), 3);
+    }
+
+    #[test]
+    fn buffer_media_group_update_returns_false_without_group_id() {
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        let update = serde_json::json!({
+            "update_id": 1,
+            "message": {
+                "message_id": 1,
+                "chat": {"id": 1},
+            }
+        });
+        assert!(!ch.buffer_media_group_update(&update));
+        let buf = ch.media_group_buffer.lock();
+        assert!(buf.pending.is_empty());
+    }
+
+    #[test]
+    fn buffer_media_group_update_returns_false_without_chat_id() {
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        let update = serde_json::json!({
+            "update_id": 1,
+            "message": {"media_group_id": "g"},
+        });
+        assert!(!ch.buffer_media_group_update(&update));
     }
 }
