@@ -266,8 +266,11 @@ impl Channel for ComponentChannel {
                     .unwrap_or_else(|e| {
                         ::zeroclaw_log::record!(
                             WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
                             &format!(
                                 "health_check call failed for plugin '{}' (channel '{}'): {}",
                                 self.plugin_name, self.alias, e
@@ -353,8 +356,11 @@ impl Channel for ComponentChannel {
                     .unwrap_or_else(|e| {
                         ::zeroclaw_log::record!(
                             WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
                             &format!(
                                 "drop_self_message call failed for plugin '{}' (channel '{}'): {}",
                                 self.plugin_name, self.alias, e
@@ -563,8 +569,11 @@ impl Channel for ComponentChannel {
                     .unwrap_or_else(|e| {
                         ::zeroclaw_log::record!(
                             WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
                             &format!(
                                 "multi_message_delay_ms call failed for plugin '{}' (channel '{}'): {}",
                                 self.plugin_name, self.alias, e
