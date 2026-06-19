@@ -1403,6 +1403,14 @@ impl RpcDispatcher {
         let attribution_agent_alias = agent_alias.clone();
         let attribution_model_provider = model_provider.clone();
         let attribution_model = model.clone();
+        let cost_context = self.ctx.cost_tracker.as_ref().map(|tracker| {
+            let cfg = self.ctx.config.read();
+            crate::agent::cost::tool_loop_cost_tracking_context_from_tracker(
+                &cfg,
+                &agent_alias,
+                Arc::clone(tracker),
+            )
+        });
         let outcome = execute_turn(
             agent,
             prompt.clone(),
@@ -1414,6 +1422,7 @@ impl RpcDispatcher {
                 model,
                 channel: "rpc",
             },
+            cost_context,
             move |event| {
                 let rpc = rpc.clone();
                 let sid = sid_owned.clone();

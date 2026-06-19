@@ -377,7 +377,10 @@ pub async fn run(
             sessions,
             session_backend,
             memory: rpc_memory,
-            cost_tracker: None, // TODO: wire when cost tracker is daemon-scoped
+            cost_tracker: zeroclaw_config::cost::CostTracker::get_or_init_global(
+                config.cost.clone(),
+                &config.data_dir,
+            ),
             event_tx: Some(event_tx.clone()),
             reload_tx: Some(reload_tx.clone()),
             approval_pending: std::sync::Arc::new(

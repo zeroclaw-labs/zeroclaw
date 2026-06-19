@@ -38,6 +38,23 @@ pub fn build_model_provider_pricing(config: &Config) -> ModelProviderPricing {
     pricing
 }
 
+pub fn tool_loop_cost_tracking_context_for_agent(
+    config: &Config,
+    agent_alias: &str,
+) -> Option<ToolLoopCostTrackingContext> {
+    CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)
+        .map(|tracker| tool_loop_cost_tracking_context_from_tracker(config, agent_alias, tracker))
+}
+
+pub fn tool_loop_cost_tracking_context_from_tracker(
+    config: &Config,
+    agent_alias: &str,
+    tracker: Arc<CostTracker>,
+) -> ToolLoopCostTrackingContext {
+    ToolLoopCostTrackingContext::new(tracker, Arc::new(build_model_provider_pricing(config)))
+        .with_agent_alias(agent_alias)
+}
+
 pub fn build_type_level_model_provider_pricing(config: &Config) -> ModelProviderPricing {
     let mut pricing: ModelProviderPricing = HashMap::new();
 

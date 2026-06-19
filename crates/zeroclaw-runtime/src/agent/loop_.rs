@@ -1543,21 +1543,8 @@ pub async fn run(
         });
 
         // ── Cost tracking context (scoped for CLI / cron / web agents) ──
-        let cost_tracking_context: Option<ToolLoopCostTrackingContext> =
-            crate::cost::CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)
-                .map(|tracker| {
-                    let pricing: crate::agent::cost::ModelProviderPricing = config
-                        .providers
-                        .models
-                        .iter_entries()
-                        .map(|(type_k, alias_k, profile)| {
-                            (format!("{type_k}.{alias_k}"), profile.pricing.clone())
-                        })
-                        .filter(|(_, p)| !p.is_empty())
-                        .collect();
-                    ToolLoopCostTrackingContext::new(tracker, Arc::new(pricing))
-                        .with_agent_alias(agent_alias)
-                });
+        let cost_tracking_context =
+            crate::agent::cost::tool_loop_cost_tracking_context_for_agent(&config, agent_alias);
 
         // ── Execute ──────────────────────────────────────────────────
         let start = Instant::now();

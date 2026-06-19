@@ -694,6 +694,16 @@ impl Agent {
         AgentBuilder::new()
     }
 
+    fn tool_loop_cost_tracking_context(&self) -> crate::agent::loop_::ToolLoopCostTrackingContext {
+        if let Ok(Some(context)) =
+            crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.try_with(Clone::clone)
+        {
+            return context;
+        }
+
+        crate::agent::loop_::ToolLoopCostTrackingContext::usage_only()
+    }
+
     fn new_turn_id() -> String {
         uuid::Uuid::new_v4().to_string()
     }
@@ -1949,13 +1959,10 @@ impl Agent {
             ..zeroclaw_config::schema::PacingConfig::default()
         };
 
-        // Usage-only cost context: the loop's per-call recording accumulates
-        // token totals here so AgentEnd keeps reporting them, without
-        // persisting cost records or enforcing budgets (this path never did
-        // either). The loop call below must stay a plain `.await` on this
-        // task — caller-scoped task-locals (thread id, session key, tool
-        // choice / thinking overrides) silently vanish across a spawn.
-        let cost_context = crate::agent::loop_::ToolLoopCostTrackingContext::usage_only();
+        // Keep the loop call as a plain `.await` on this task. Caller-scoped
+        // task-locals (session key, cost tracking, tool choice / thinking
+        // overrides) silently vanish across a spawn.
+        let cost_context = self.tool_loop_cost_tracking_context();
         let loop_result = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
                 Some(cost_context.clone()),
@@ -2300,16 +2307,7 @@ impl Agent {
             ..zeroclaw_config::schema::PacingConfig::default()
         };
 
-        // Reuse any caller-scoped cost context (gateway WS / RPC) so streamed
-        // turns keep the real tracker + pricing wiring instead of shadowing it
-        // with a usage-only fallback. When no outer scope exists, preserve the
-        // legacy Agent behavior by synthesizing a local accumulation-only
-        // context for AgentEnd token reporting.
-        let cost_context = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
-            .try_with(Clone::clone)
-            .ok()
-            .flatten()
-            .unwrap_or_else(crate::agent::loop_::ToolLoopCostTrackingContext::usage_only);
+        let cost_context = self.tool_loop_cost_tracking_context();
 
         // ── Round loop: one tool-call-loop run per steering round ──────────
         for round in 0..self.config.resolved.max_tool_iterations {
@@ -6583,6 +6581,105 @@ mod tests {
         assert!(
             llm_response_idx < end_idx,
             "AgentEnd must follow LlmResponse"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_reuses_outer_cost_tracking_context() {
+        use crate::agent::cost::{
+            TOOL_LOOP_COST_TRACKING_CONTEXT, TOOL_LOOP_TURN_USAGE, ToolLoopCostTrackingContext,
+            TurnUsage,
+        };
+        use crate::cost::CostTracker;
+        use std::collections::HashMap;
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let workspace = tempfile::TempDir::new().expect("temp dir");
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: true,
+                    track_per_agent: true,
+                    ..zeroclaw_config::schema::CostConfig::default()
+                },
+                workspace.path(),
+            )
+            .expect("cost tracker should initialize"),
+        );
+        let pricing = Arc::new(HashMap::from([(
+            "mock-provider".to_string(),
+            HashMap::from([
+                ("test-model.input".to_string(), 3.0),
+                ("test-model.output".to_string(), 15.0),
+            ]),
+        )]));
+        let cost_context = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), pricing)
+            .with_agent_alias("agent-turn");
+        let turn_usage = Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                    text: Some("turn cost".into()),
+                    tool_calls: vec![],
+                    usage: Some(zeroclaw_providers::traits::TokenUsage {
+                        input_tokens: Some(1_000),
+                        cached_input_tokens: None,
+                        output_tokens: Some(200),
+                    }),
+                    reasoning_content: None,
+                }]),
+            }))
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(Arc::from(crate::observability::NoopObserver {}) as Arc<dyn Observer>)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .model_name("test-model".into())
+            .model_provider_name("mock-provider".into())
+            .agent_alias("agent-turn".into())
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let response = TOOL_LOOP_TURN_USAGE
+            .scope(
+                Some(Arc::clone(&turn_usage)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(cost_context), agent.turn("hello")),
+            )
+            .await
+            .expect("turn should succeed");
+
+        assert_eq!(response, "turn cost");
+
+        let recorded = *turn_usage.lock();
+        assert_eq!(recorded.input_tokens, 1_000);
+        assert_eq!(recorded.output_tokens, 200);
+        assert!(
+            recorded.cost_usd > 0.0,
+            "outer turn usage should accumulate non-zero cost from scoped pricing"
+        );
+
+        let summary = tracker.get_summary().expect("cost summary");
+        assert_eq!(summary.request_count, 1);
+        assert_eq!(summary.total_tokens, 1_200);
+        assert!(
+            summary.session_cost_usd > 0.0,
+            "scoped tracker should persist turn usage"
+        );
+        let agent_summary = tracker
+            .get_summary_for_agent("agent-turn")
+            .expect("agent-scoped summary");
+        assert_eq!(agent_summary.request_count, 1);
+        assert!(
+            agent_summary.session_cost_usd > 0.0,
+            "agent alias should flow through persisted turn usage"
         );
     }
 
