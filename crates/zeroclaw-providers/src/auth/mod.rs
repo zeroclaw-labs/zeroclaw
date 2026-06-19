@@ -1,4 +1,5 @@
 pub mod anthropic_token;
+mod cli_i18n;
 pub mod email_oauth2;
 pub mod gemini_oauth;
 pub mod oauth_common;
@@ -24,6 +25,10 @@ const XAI_PROVIDER: &str = "xai";
 const DEFAULT_PROFILE_NAME: &str = "default";
 const OPENAI_REFRESH_SKEW_SECS: u64 = 90;
 const OPENAI_REFRESH_FAILURE_BACKOFF_SECS: u64 = 10;
+
+fn auth_cli_text(config: &Config, key: &str, args: &[(&str, &str)]) -> String {
+    cli_i18n::text(config, key, args)
+}
 const OAUTH_REFRESH_MAX_ATTEMPTS: usize = 3;
 const OAUTH_REFRESH_RETRY_BASE_DELAY_MS: u64 = 350;
 static REFRESH_BACKOFFS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
@@ -1673,10 +1678,21 @@ impl AuthProviderFlow for XaiFlow {
             )
             .await?;
             println!(
-                "Imported xAI auth profile from {}",
-                import_path.display().to_string()
+                "{}",
+                auth_cli_text(
+                    ctx.config,
+                    "cli-auth-xai-imported",
+                    &[("path", &import_path.display().to_string())]
+                )
             );
-            println!("Active profile for xai: {profile}");
+            println!(
+                "{}",
+                auth_cli_text(
+                    ctx.config,
+                    "cli-auth-active-for",
+                    &[("provider", "xai"), ("profile", profile)]
+                )
+            );
             return Ok(());
         }
 
@@ -1687,11 +1703,35 @@ impl AuthProviderFlow for XaiFlow {
                 &discovery.device_authorization_endpoint,
             )
             .await?;
-            println!("xAI device-code login started.");
-            println!("Visit: {}", device.verification_uri);
-            println!("Code:  {}", device.user_code);
+            println!(
+                "{}",
+                auth_cli_text(ctx.config, "cli-auth-xai-device-code-started", &[])
+            );
+            println!(
+                "{}",
+                auth_cli_text(
+                    ctx.config,
+                    "cli-auth-oauth-visit",
+                    &[("uri", &device.verification_uri)]
+                )
+            );
+            println!(
+                "{}",
+                auth_cli_text(
+                    ctx.config,
+                    "cli-auth-oauth-code",
+                    &[("code", &device.user_code)]
+                )
+            );
             if let Some(uri_complete) = &device.verification_uri_complete {
-                println!("Fast link: {uri_complete}");
+                println!(
+                    "{}",
+                    auth_cli_text(
+                        ctx.config,
+                        "cli-auth-oauth-fast-link",
+                        &[("uri", uri_complete)]
+                    )
+                );
             }
             let token_set = crate::auth::xai_oauth::poll_device_code_tokens(
                 ctx.client,
@@ -1707,8 +1747,18 @@ impl AuthProviderFlow for XaiFlow {
             ctx.auth_service
                 .store_xai_tokens(profile, token_set, account_id, true)
                 .await?;
-            println!("Saved profile {profile}");
-            println!("Active profile for xai: {profile}");
+            println!(
+                "{}",
+                auth_cli_text(ctx.config, "cli-auth-saved", &[("profile", profile)])
+            );
+            println!(
+                "{}",
+                auth_cli_text(
+                    ctx.config,
+                    "cli-auth-active-for",
+                    &[("provider", "xai"), ("profile", profile)]
+                )
+            );
             return Ok(());
         }
 
@@ -1726,7 +1776,10 @@ impl AuthProviderFlow for XaiFlow {
         };
         save_pending_oauth_login(ctx.config, &pending)?;
 
-        println!("Open this xAI OAuth URL in your browser and authorize access:");
+        println!(
+            "{}",
+            auth_cli_text(ctx.config, "cli-auth-xai-open-oauth-url", &[])
+        );
         println!("{authorize_url}");
         println!();
 
@@ -1741,9 +1794,21 @@ impl AuthProviderFlow for XaiFlow {
                 code
             }
             Err(e) => {
-                println!("Callback capture failed: {e}");
                 println!(
-                    "Run `zeroclaw auth paste-redirect --model-provider xai --profile {profile}`"
+                    "{}",
+                    auth_cli_text(
+                        ctx.config,
+                        "cli-auth-callback-capture-failed",
+                        &[("error", &e.to_string())]
+                    )
+                );
+                println!(
+                    "{}",
+                    auth_cli_text(
+                        ctx.config,
+                        "cli-auth-run-paste-redirect",
+                        &[("provider", "xai"), ("profile", profile)]
+                    )
                 );
                 return Ok(());
             }
@@ -1764,8 +1829,18 @@ impl AuthProviderFlow for XaiFlow {
         ctx.auth_service
             .store_xai_tokens(profile, token_set, account_id, true)
             .await?;
-        println!("Saved profile {profile}");
-        println!("Active profile for xai: {profile}");
+        println!(
+            "{}",
+            auth_cli_text(ctx.config, "cli-auth-saved", &[("profile", profile)])
+        );
+        println!(
+            "{}",
+            auth_cli_text(
+                ctx.config,
+                "cli-auth-active-for",
+                &[("provider", "xai"), ("profile", profile)]
+            )
+        );
         Ok(())
     }
 
@@ -1776,9 +1851,11 @@ impl AuthProviderFlow for XaiFlow {
         input: Option<&str>,
     ) -> Result<()> {
         let pending = load_pending_oauth_login(ctx.config, "xai")?.ok_or_else(|| {
-            anyhow::Error::msg(
-                "No pending xAI login found. Run `zeroclaw auth login --model-provider xai` first.",
-            )
+            anyhow::Error::msg(auth_cli_text(
+                ctx.config,
+                "cli-auth-xai-no-pending-login",
+                &[],
+            ))
         })?;
         if pending.profile != profile {
             anyhow::bail!(
@@ -1788,7 +1865,11 @@ impl AuthProviderFlow for XaiFlow {
             );
         }
         let redirect_input = input.ok_or_else(|| {
-            anyhow::Error::msg("paste-redirect requires the redirect URL or OAuth code")
+            anyhow::Error::msg(auth_cli_text(
+                ctx.config,
+                "cli-auth-paste-redirect-requires-input",
+                &[],
+            ))
         })?;
         let discovery = crate::auth::xai_oauth::fetch_oauth_discovery(ctx.client).await?;
         let code =
@@ -1814,8 +1895,18 @@ impl AuthProviderFlow for XaiFlow {
             .store_xai_tokens(profile, token_set, account_id, true)
             .await?;
         clear_pending_oauth_login(ctx.config, "xai");
-        println!("Saved profile {profile}");
-        println!("Active profile for xai: {profile}");
+        println!(
+            "{}",
+            auth_cli_text(ctx.config, "cli-auth-saved", &[("profile", profile)])
+        );
+        println!(
+            "{}",
+            auth_cli_text(
+                ctx.config,
+                "cli-auth-active-for",
+                &[("provider", "xai"), ("profile", profile)]
+            )
+        );
         Ok(())
     }
 

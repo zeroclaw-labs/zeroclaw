@@ -17,6 +17,7 @@ base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 directories = "6.0"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+fluent = "0.16"
 chacha20poly1305 = "0.10"
 hex = "0.4"
 hmac = "0.12"
