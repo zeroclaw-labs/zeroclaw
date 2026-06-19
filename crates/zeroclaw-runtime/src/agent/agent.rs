@@ -1167,7 +1167,7 @@ impl Agent {
             &security,
             risk_profile,
             agent_alias,
-            runtime,
+            runtime.clone(),
             memory.clone(),
             composio_key,
             composio_entity_id,
@@ -1410,11 +1410,12 @@ impl Agent {
             .cloned()
             .chain(mcp_elevation_arcs.iter().cloned())
             .collect();
-        tools::register_skill_tools_with_context(
+        tools::register_skill_tools_with_context_and_runtime(
             &mut tools,
             &skills,
             security.clone(),
             &skill_resolution_registry,
+            runtime,
         );
 
         let approval_manager = if approval_backchannel {

@@ -1237,6 +1237,19 @@ impl AcpServer {
         self.register_cancel_token(&session_id, cancel_token.clone())?;
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(100);
 
+        // Cost-tracking inputs, resolved before the spawn while `self.config`
+        // is in scope. `turn_streamed` reuses the outer cost scope set below;
+        // without it the turn falls back to a tracker-less `usage_only` context
+        // and model cost is silently dropped (#5221). Mirrors the gateway WS
+        // path. The process-global tracker is shared with the gateway/daemon.
+        let cost_tracker = zeroclaw_runtime::cost::CostTracker::get_or_init_global(
+            self.config.cost.clone(),
+            &self.config.data_dir,
+        );
+        let cost_pricing = std::sync::Arc::new(
+            zeroclaw_runtime::agent::cost::build_model_provider_pricing(&self.config),
+        );
+
         // Move the Arc into the spawned task and lock inside it.  The inner
         // Mutex stays locked for the duration of the turn, preventing
         // concurrent stop/reap from touching the agent mid-turn. The outer
@@ -1245,6 +1258,15 @@ impl AcpServer {
         let turn_handle = zeroclaw_spawn::spawn!(async move {
             let mut session = session_arc.lock().await;
             let (turn_alias, turn_provider, turn_model) = session.agent.attribution_fields();
+            // Stamp the resolved per-turn alias so `/api/cost?agent=<alias>`
+            // attributes this spend.
+            let cost_context = cost_tracker.map(|tracker| {
+                zeroclaw_runtime::agent::cost::ToolLoopCostTrackingContext::new(
+                    tracker,
+                    cost_pricing,
+                )
+                .with_agent_alias(&turn_alias)
+            });
             let span_session = session_id_for_task.clone();
             let result = {
                 use ::zeroclaw_log::Instrument as _;
@@ -1259,10 +1281,13 @@ impl AcpServer {
                 );
                 zeroclaw_runtime::agent::loop_::scope_session_key(
                     Some(session_id_for_task),
-                    session
-                        .agent
-                        .turn_streamed(&prompt, event_tx, Some(cancel_token))
-                        .instrument(span),
+                    zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                        cost_context,
+                        session
+                            .agent
+                            .turn_streamed(&prompt, event_tx, Some(cancel_token))
+                            .instrument(span),
+                    ),
                 )
                 .await
             };

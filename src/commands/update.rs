@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 
 #[cfg(feature = "agent-runtime")]
-use zeroclaw_runtime::i18n::get_required_cli_string_with_args;
+use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 
 fn update_already_current_message(version: &str) -> String {
     #[cfg(feature = "agent-runtime")]
@@ -28,6 +28,18 @@ fn update_success_message(version: &str) -> String {
     #[cfg(not(feature = "agent-runtime"))]
     {
         format!("Successfully updated to v{version}!")
+    }
+}
+
+fn prebuilt_channel_note_message() -> String {
+    #[cfg(feature = "agent-runtime")]
+    {
+        get_required_cli_string("cli-update-prebuilt-channel-note")
+    }
+
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        "Pre-built updates use the lean default channel bundle. Build from source with `./install.sh --source --preset full`, `--features channels-full`, or a specific `channel-*` feature for Slack, Discord, and other non-default channels.".to_string()
     }
 }
 
@@ -201,6 +213,7 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
             // Cleanup backup on success
             let _ = tokio::fs::remove_file(&backup_path).await;
             println!("{}", update_success_message(&update_info.latest_version));
+            println!("{}", prebuilt_channel_note_message());
             Ok(())
         }
         Err(e) => {
