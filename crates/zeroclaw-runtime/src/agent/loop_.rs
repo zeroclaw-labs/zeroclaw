@@ -274,7 +274,30 @@ pub(crate) fn filter_channel_builtin_tools(
     security: &zeroclaw_config::policy::SecurityPolicy,
 ) {
     let before_filter = tools_registry.len();
-    apply_policy_tool_filter(tools_registry, Some(security), None);
+
+    // At non-Full autonomy, auto-approved tools (web_search_tool,
+    // web_fetch, calculator, etc.) are always accessible on channels
+    // so the bot can fetch real-time information. Write/exec tools
+    // remain gated by the security policy.
+    if security.autonomy != AutonomyLevel::Full && !security.auto_approve.is_empty() {
+        let auto_set: HashSet<&str> =
+            security.auto_approve.iter().map(String::as_str).collect();
+        tools_registry.retain(|t| {
+            let name = t.name();
+            if auto_set.contains(name) {
+                // Auto-approved tool: bypass the allowed_tools allowlist
+                // but still respect the excluded_tools denylist.
+                return security
+                    .excluded_tools
+                    .as_ref()
+                    .is_none_or(|list| !list.iter().any(|ex| ex == name));
+            }
+            security.is_tool_allowed(name)
+        });
+    } else {
+        apply_policy_tool_filter(tools_registry, Some(security), None);
+    }
+
     if tools_registry.len() != before_filter {
         ::zeroclaw_log::record!(
             INFO,
