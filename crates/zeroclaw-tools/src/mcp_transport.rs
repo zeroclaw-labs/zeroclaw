@@ -108,7 +108,7 @@ pub trait McpTransportConn: Send + Sync {
 pub struct StdioTransport {
     _child: Child,
     stdin: tokio::process::ChildStdin,
-    stdout_lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    stdout_lines: Option<tokio::io::Lines<BufReader<tokio::process::ChildStdout>>>,
 }
 
 impl StdioTransport {
@@ -149,7 +149,7 @@ impl StdioTransport {
             );
             anyhow::Error::msg(format!("no stdout on MCP server `{}`", config.name))
         })?;
-        let stdout_lines = BufReader::new(stdout).lines();
+        let stdout_lines = Some(BufReader::new(stdout).lines());
 
         Ok(Self {
             _child: child,
@@ -172,15 +172,21 @@ impl StdioTransport {
     }
 
     async fn recv_raw(&mut self) -> Result<String> {
-        let line = self.stdout_lines.next_line().await?.ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                "mcp_transport: MCP server closed stdout"
-            );
-            anyhow::Error::msg("MCP server closed stdout")
-        })?;
+        let line = self
+            .stdout_lines
+            .as_mut()
+            .context("mcp stdio transport already closed")?
+            .next_line()
+            .await?
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "mcp_transport: MCP server closed stdout"
+                );
+                anyhow::Error::msg("MCP server closed stdout")
+            })?;
         if line.len() > MAX_LINE_BYTES {
             bail!("MCP response too large: {} bytes", line.len());
         }
@@ -233,9 +239,7 @@ impl McpTransportConn for StdioTransport {
         // closes the child's stdout pipe.  Without this the read_loop (if any)
         // hangs forever waiting for EOF and the Child struct is never dropped,
         // so `kill_on_drop` never fires and the stdio child accumulates.
-        self.stdout_lines = tokio::io::Lines::new(tokio::io::BufReader::new(
-            tokio::process::ChildStdout::from_std(std::process::Stdio::null().unwrap())?,
-        ));
+        self.stdout_lines = None;
         Ok(())
     }
 }
