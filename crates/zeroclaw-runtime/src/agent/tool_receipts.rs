@@ -130,6 +130,50 @@ pub struct ReceiptScope {
     pub collector: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
+impl ReceiptScope {
+    /// Single source of truth for turning resolved receipt config into a live
+    /// scope. Returns `None` when receipts are disabled so every turn
+    /// entrypoint (channel orchestrator, ACP, gateway WS) gates identically
+    /// without duplicating the construct-generator-allocate-collector glue.
+    pub fn from_config(config: &zeroclaw_config::schema::ToolReceiptsConfig) -> Option<Self> {
+        config
+            .enabled
+            .then(|| Self::with_generator(ReceiptGenerator::new()))
+    }
+
+    /// Wrap an existing generator with a fresh per-turn collector. Used by the
+    /// channel orchestrator, which holds a long-lived generator on its context
+    /// and assembles one scope per message through this same seam.
+    pub fn with_generator(generator: ReceiptGenerator) -> Self {
+        Self {
+            generator,
+            collector: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// The generator reference for the explicit `ToolLoop.receipt_generator`
+    /// parameter. Threaded so the top-level loop signs each tool result.
+    pub fn generator(&self) -> &ReceiptGenerator {
+        &self.generator
+    }
+
+    /// The collector reference for the explicit `ToolLoop.collected_receipts`
+    /// parameter. Receives signed receipts for the duration of the turn.
+    pub fn collector(&self) -> &std::sync::Mutex<Vec<String>> {
+        &self.collector
+    }
+}
+
+/// Scope `TOOL_LOOP_RECEIPT_CONTEXT` around `fut` for the lifetime of one turn
+/// so delegate sub-loops forward receipts into the same per-turn collector.
+/// One seam shared by every entrypoint; a `None` scope is inert.
+pub async fn scope_receipts<F>(scope: Option<ReceiptScope>, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    TOOL_LOOP_RECEIPT_CONTEXT.scope(scope, fut).await
+}
+
 tokio::task_local! {
     /// Set by the orchestrator when `[agent.tool_receipts] enabled = true`.
     /// `DelegateTool` reads this to forward receipts into sub-agent tool loops

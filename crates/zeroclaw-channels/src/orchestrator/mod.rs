@@ -4548,14 +4548,10 @@ async fn process_channel_message_body(
     // loop returns. Wrapped in `Arc` so the same handle can be shared into
     // `TOOL_LOOP_RECEIPT_CONTEXT` for subagent forwarding. Inert when
     // `receipt_generator` is `None`.
-    let tool_receipts_collector: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let receipt_scope = ctx.receipt_generator.as_ref().map(|generator| {
-        zeroclaw_runtime::agent::tool_receipts::ReceiptScope {
-            generator: generator.clone(),
-            collector: std::sync::Arc::clone(&tool_receipts_collector),
-        }
+        zeroclaw_runtime::agent::tool_receipts::ReceiptScope::with_generator(generator.clone())
     });
+    let tool_receipts_collector = receipt_scope.as_ref().map(|scope| scope.collector.clone());
     let loop_knobs = LoopKnobs::default();
     let (llm_result, fallback_info) = scope_provider_fallback(async {
         let llm_result = loop {
@@ -4571,7 +4567,7 @@ async fn process_channel_message_body(
                         Some(history_key.clone()),
                         zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                             cost_tracking_context.clone(),
-                        zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT.scope(
+                        zeroclaw_runtime::agent::tool_receipts::scope_receipts(
                             receipt_scope.clone(),
                         run_tool_call_loop(ToolLoop {
                         model_provider: active_model_provider.as_ref(),
@@ -4613,14 +4609,12 @@ async fn process_channel_message_body(
                         context_token_budget: ctx.context_token_budget,
                         shared_budget: None,
                         channel: target_channel.as_deref(),
-                        receipt_generator: ctx.receipt_generator.as_ref(),
-                        // Collector is meaningful only when the generator is
-                        // active. Pass None when receipts are disabled so the
-                        // call site reflects that coupling explicitly.
-                        collected_receipts: ctx
-                            .receipt_generator
-                            .as_ref()
-                            .map(|_| tool_receipts_collector.as_ref()),
+                        receipt_generator: receipt_scope.as_ref().map(
+                            zeroclaw_runtime::agent::tool_receipts::ReceiptScope::generator,
+                        ),
+                        collected_receipts: receipt_scope.as_ref().map(
+                            zeroclaw_runtime::agent::tool_receipts::ReceiptScope::collector,
+                        ),
                         event_tx: None,
                         steering: None,
                         new_messages_out: None,
@@ -4992,19 +4986,19 @@ async fn process_channel_message_body(
             // `Arc<Mutex<Vec<String>>>` is forwarded via
             // `TOOL_LOOP_RECEIPT_CONTEXT` into sub-loops.
             let receipts_block = if ctx.show_receipts_in_response {
-                let receipts = tool_receipts_collector
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                if receipts.is_empty() {
-                    None
-                } else {
-                    use std::fmt::Write as _;
-                    let mut block = String::from("---\nTool receipts:");
-                    for r in receipts.iter() {
-                        write!(block, "\n  {r}").ok();
+                tool_receipts_collector.as_ref().and_then(|collector| {
+                    let receipts = collector.lock().unwrap_or_else(|e| e.into_inner());
+                    if receipts.is_empty() {
+                        None
+                    } else {
+                        use std::fmt::Write as _;
+                        let mut block = String::from("---\nTool receipts:");
+                        for r in receipts.iter() {
+                            write!(block, "\n  {r}").ok();
+                        }
+                        Some(block)
                     }
-                    Some(block)
-                }
+                })
             } else {
                 None
             };

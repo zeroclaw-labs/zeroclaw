@@ -1956,45 +1956,55 @@ impl Agent {
         // task — caller-scoped task-locals (thread id, session key, tool
         // choice / thinking overrides) silently vanish across a spawn.
         let cost_context = crate::agent::loop_::ToolLoopCostTrackingContext::usage_only();
+        let receipt_scope = crate::agent::tool_receipts::ReceiptScope::from_config(
+            &self.config.resolved.tool_receipts,
+        );
         let loop_result = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
                 Some(cost_context.clone()),
-                crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
-                    model_provider: self.model_provider.as_ref(),
-                    history: &mut loop_history,
-                    tools_registry: &self.tools,
-                    observer: self.observer.as_ref(),
-                    provider_name: &self.model_provider_name,
-                    model: &effective_model,
-                    temperature: self.temperature,
-                    silent: false,
-                    approval: self.approval_manager.as_deref(),
-                    channel_name: "cli",
-                    channel_reply_target: None,
-                    multimodal_config: &self.multimodal_config,
-                    max_tool_iterations: self.config.resolved.max_tool_iterations,
-                    cancellation_token: None,
-                    on_delta: None,
-                    hooks: self.hook_runner.as_deref(),
-                    excluded_tools: &[],
-                    dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
-                    activated_tools: self.activated_tools.as_ref(),
-                    model_switch_callback: None,
-                    pacing: &pacing,
-                    strict_tool_parsing: self.config.resolved.strict_tool_parsing,
-                    parallel_tools: self.config.resolved.parallel_tools,
-                    max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                    context_token_budget: self.config.resolved.max_context_tokens,
-                    shared_budget: None,
-                    channel: None,
-                    receipt_generator: None,
-                    collected_receipts: None,
-                    event_tx: None,
-                    steering: None,
-                    new_messages_out: Some(&mut loop_new_messages),
-                    knobs: &knobs,
-                    image_cache: Some(&mut self.image_cache),
-                }),
+                crate::agent::tool_receipts::scope_receipts(
+                    receipt_scope.clone(),
+                    crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                        model_provider: self.model_provider.as_ref(),
+                        history: &mut loop_history,
+                        tools_registry: &self.tools,
+                        observer: self.observer.as_ref(),
+                        provider_name: &self.model_provider_name,
+                        model: &effective_model,
+                        temperature: self.temperature,
+                        silent: false,
+                        approval: self.approval_manager.as_deref(),
+                        channel_name: "cli",
+                        channel_reply_target: None,
+                        multimodal_config: &self.multimodal_config,
+                        max_tool_iterations: self.config.resolved.max_tool_iterations,
+                        cancellation_token: None,
+                        on_delta: None,
+                        hooks: self.hook_runner.as_deref(),
+                        excluded_tools: &[],
+                        dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
+                        activated_tools: self.activated_tools.as_ref(),
+                        model_switch_callback: None,
+                        pacing: &pacing,
+                        strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                        parallel_tools: self.config.resolved.parallel_tools,
+                        max_tool_result_chars: self.config.resolved.max_tool_result_chars,
+                        context_token_budget: self.config.resolved.max_context_tokens,
+                        shared_budget: None,
+                        channel: None,
+                        receipt_generator: receipt_scope
+                            .as_ref()
+                            .map(crate::agent::tool_receipts::ReceiptScope::generator),
+                        collected_receipts: receipt_scope
+                            .as_ref()
+                            .map(crate::agent::tool_receipts::ReceiptScope::collector),
+                        event_tx: None,
+                        steering: None,
+                        new_messages_out: Some(&mut loop_new_messages),
+                        knobs: &knobs,
+                        image_cache: Some(&mut self.image_cache),
+                    }),
+                ),
             )
             .await;
 
@@ -2311,6 +2321,13 @@ impl Agent {
             .flatten()
             .unwrap_or_else(crate::agent::loop_::ToolLoopCostTrackingContext::usage_only);
 
+        // Built once per turn so the HMAC key is stable across steering rounds
+        // and the same collector accumulates every round's receipts. `None`
+        // when receipts are disabled, gated by the one shared seam.
+        let receipt_scope = crate::agent::tool_receipts::ReceiptScope::from_config(
+            &self.config.resolved.tool_receipts,
+        );
+
         // ── Round loop: one tool-call-loop run per steering round ──────────
         for round in 0..self.config.resolved.max_tool_iterations {
             // Early exit if the caller cancelled this turn (e.g. user abort)
@@ -2349,42 +2366,49 @@ impl Agent {
             let loop_result = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
                 .scope(
                     Some(cost_context.clone()),
-                    crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
-                        model_provider: self.model_provider.as_ref(),
-                        history: &mut loop_history,
-                        tools_registry: &self.tools,
-                        observer: self.observer.as_ref(),
-                        provider_name: &self.model_provider_name,
-                        model: &effective_model,
-                        temperature: self.temperature,
-                        silent: true,
-                        approval: self.approval_manager.as_deref(),
-                        channel_name: "cli",
-                        channel_reply_target: None,
-                        multimodal_config: &self.multimodal_config,
-                        max_tool_iterations: self.config.resolved.max_tool_iterations,
-                        cancellation_token: cancel_token.clone(),
-                        on_delta: None,
-                        hooks: self.hook_runner.as_deref(),
-                        excluded_tools: &[],
-                        dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
-                        activated_tools: self.activated_tools.as_ref(),
-                        model_switch_callback: None,
-                        pacing: &pacing,
-                        strict_tool_parsing: self.config.resolved.strict_tool_parsing,
-                        parallel_tools: self.config.resolved.parallel_tools,
-                        max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                        context_token_budget: self.config.resolved.max_context_tokens,
-                        shared_budget: None,
-                        channel: approval_bridge.as_deref(),
-                        receipt_generator: None,
-                        collected_receipts: None,
-                        event_tx: Some(event_tx.clone()),
-                        steering: None,
-                        new_messages_out: Some(&mut round_added),
-                        knobs: &knobs,
-                        image_cache: Some(&mut self.image_cache),
-                    }),
+                    crate::agent::tool_receipts::scope_receipts(
+                        receipt_scope.clone(),
+                        crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                            model_provider: self.model_provider.as_ref(),
+                            history: &mut loop_history,
+                            tools_registry: &self.tools,
+                            observer: self.observer.as_ref(),
+                            provider_name: &self.model_provider_name,
+                            model: &effective_model,
+                            temperature: self.temperature,
+                            silent: true,
+                            approval: self.approval_manager.as_deref(),
+                            channel_name: "cli",
+                            channel_reply_target: None,
+                            multimodal_config: &self.multimodal_config,
+                            max_tool_iterations: self.config.resolved.max_tool_iterations,
+                            cancellation_token: cancel_token.clone(),
+                            on_delta: None,
+                            hooks: self.hook_runner.as_deref(),
+                            excluded_tools: &[],
+                            dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
+                            activated_tools: self.activated_tools.as_ref(),
+                            model_switch_callback: None,
+                            pacing: &pacing,
+                            strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                            parallel_tools: self.config.resolved.parallel_tools,
+                            max_tool_result_chars: self.config.resolved.max_tool_result_chars,
+                            context_token_budget: self.config.resolved.max_context_tokens,
+                            shared_budget: None,
+                            channel: approval_bridge.as_deref(),
+                            receipt_generator: receipt_scope
+                                .as_ref()
+                                .map(crate::agent::tool_receipts::ReceiptScope::generator),
+                            collected_receipts: receipt_scope
+                                .as_ref()
+                                .map(crate::agent::tool_receipts::ReceiptScope::collector),
+                            event_tx: Some(event_tx.clone()),
+                            steering: None,
+                            new_messages_out: Some(&mut round_added),
+                            knobs: &knobs,
+                            image_cache: Some(&mut self.image_cache),
+                        }),
+                    ),
                 )
                 .await;
 
@@ -4104,7 +4128,87 @@ mod tests {
         );
     }
 
-    /// Provider that emits TWO native tool calls in a single assistant turn,
+    fn tool_receipts_enabled_config(enabled: bool) -> zeroclaw_config::schema::AliasedAgentConfig {
+        zeroclaw_config::schema::AliasedAgentConfig {
+            resolved: zeroclaw_config::schema::ResolvedRuntime {
+                tool_receipts: zeroclaw_config::schema::ToolReceiptsConfig {
+                    enabled,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..zeroclaw_config::schema::AliasedAgentConfig::default()
+        }
+    }
+
+    fn streamed_agent_with_receipts(enabled: bool) -> Agent {
+        let model_provider = Box::new(StreamToolCaptureModelProvider {
+            tools_received: Arc::new(Mutex::new(Vec::new())),
+            call_count: Arc::new(Mutex::new(0)),
+        });
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        Agent::builder()
+            .model_provider(model_provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .config(tool_receipts_enabled_config(enabled))
+            .build()
+            .expect("agent builder should succeed with valid config")
+    }
+
+    fn history_has_receipt(agent: &Agent) -> bool {
+        agent.history().iter().any(|m| match m {
+            ConversationMessage::ToolResults(results) => results
+                .iter()
+                .any(|r| r.content.contains("[receipt: zc-receipt-")),
+            _ => false,
+        })
+    }
+
+    // RED on upstream/master: the streamed turn path (ACP, gateway WS) hardcoded
+    // `receipt_generator: None`, so an enabled config produced zero receipts.
+    // GREEN once `turn_streamed` derives the scope from its own config through
+    // the shared `ReceiptScope::from_config` seam.
+    #[tokio::test]
+    async fn turn_streamed_signs_tool_results_when_receipts_enabled() {
+        let mut agent = streamed_agent_with_receipts(true);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent
+            .turn_streamed("use the echo tool", event_tx, None)
+            .await
+            .expect("streamed turn should succeed");
+        assert!(
+            history_has_receipt(&agent),
+            "enabled receipts must sign tool results on the streamed path"
+        );
+    }
+
+    // GREEN control: disabled config produces no receipts on the same path.
+    #[tokio::test]
+    async fn turn_streamed_omits_receipts_when_disabled() {
+        let mut agent = streamed_agent_with_receipts(false);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        agent
+            .turn_streamed("use the echo tool", event_tx, None)
+            .await
+            .expect("streamed turn should succeed");
+        assert!(
+            !history_has_receipt(&agent),
+            "disabled receipts must not sign tool results"
+        );
+    }
+
     /// then finishes. Used to verify serial dispatch ordering.
     struct TwoToolCallStreamModelProvider {
         call_count: Arc<Mutex<usize>>,
