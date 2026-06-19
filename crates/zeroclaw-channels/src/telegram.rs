@@ -587,7 +587,6 @@ impl TelegramChannel {
         bot_token: String,
         alias: impl Into<String>,
         peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
-        voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
         mention_only: bool,
     ) -> Self {
         let has_peers = !peer_resolver().is_empty();
@@ -623,13 +622,22 @@ impl TelegramChannel {
             ack_reactions: true,
             tts_manager: None,
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            voice_peer_resolver,
+            voice_peer_resolver: Arc::new(Vec::new) as Arc<dyn Fn() -> Vec<String> + Send + Sync>,
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             proxy_url: None,
             tool_command_specs: Vec::new(),
             pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             approval_timeout_secs: 120,
         }
+    }
+
+    /// Set the resolver used to resolve voice-chat peers live (no cached state).
+    pub fn with_voice_peer_resolver(
+        mut self,
+        voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    ) -> Self {
+        self.voice_peer_resolver = voice_peer_resolver;
+        self
     }
 
     /// Override the approval prompt timeout (default 120s).
@@ -4118,12 +4126,12 @@ mod tests {
             "fake-token".into(),
             "default",
             Arc::new(|| vec!["*".into()]),
-            Arc::new({
-                let cfg = config.clone();
-                move || cfg.channel_voice_peers("telegram", "default")
-            }),
             false,
-        );
+        )
+        .with_voice_peer_resolver(Arc::new({
+            let cfg = config.clone();
+            move || cfg.channel_voice_peers("telegram", "default")
+        }));
 
         // is_voice_chat resolves live via voice_peer_resolver — no cache.
         assert!(
@@ -4167,12 +4175,12 @@ mod tests {
             "fake-token".into(),
             "default",
             Arc::new(|| vec!["*".into()]),
-            Arc::new({
-                let cfg = config.clone();
-                move || cfg.channel_voice_peers("telegram", "default")
-            }),
             false,
-        );
+        )
+        .with_voice_peer_resolver(Arc::new({
+            let cfg = config.clone();
+            move || cfg.channel_voice_peers("telegram", "default")
+        }));
 
         // Simulate a voice-send removing @alice from voice_chats (even though
         // she was never in it — this proves live-resolved peers are separate).

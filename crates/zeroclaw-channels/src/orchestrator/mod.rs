@@ -5739,9 +5739,9 @@ fn build_channel_by_id(
                     tg.bot_token.clone(),
                     alias.clone(),
                     peer_resolver,
-                    voice_peer_resolver,
                     tg.mention_only,
                 )
+                .with_voice_peer_resolver(voice_peer_resolver)
                 .with_persistence(config_arc.clone())
                 .with_api_base(tg.api_base_url.clone())
                 .with_ack_reactions(ack)
@@ -6754,9 +6754,9 @@ fn collect_configured_channels(
                         tg.bot_token.clone(),
                         alias.clone(),
                         peer_resolver,
-                        voice_peer_resolver,
                         tg.mention_only,
                     )
+                    .with_voice_peer_resolver(voice_peer_resolver)
                     .with_persistence(config_arc.clone())
                     .with_api_base(tg.api_base_url.clone())
                     .with_ack_reactions(ack)
