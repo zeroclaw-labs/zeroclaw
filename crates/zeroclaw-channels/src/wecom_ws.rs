@@ -367,10 +367,7 @@ impl WeComWsChannel {
             .await
             .context("media upload response was not JSON")?;
 
-        let errcode = body
-            .get("errcode")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
+        let errcode = body.get("errcode").and_then(Value::as_i64).unwrap_or(0);
         if errcode != 0 {
             let errmsg = body.get("errmsg").and_then(Value::as_str).unwrap_or("");
             anyhow::bail!("WeCom media upload failed: errcode={errcode} errmsg={errmsg}");
@@ -422,10 +419,7 @@ impl WeComWsChannel {
             .await
             .context("media upload response was not JSON")?;
 
-        let errcode = body
-            .get("errcode")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
+        let errcode = body.get("errcode").and_then(Value::as_i64).unwrap_or(0);
         if errcode != 0 {
             let errmsg = body.get("errmsg").and_then(Value::as_str).unwrap_or("");
             anyhow::bail!("WeCom media upload failed: errcode={errcode} errmsg={errmsg}");
@@ -1626,16 +1620,13 @@ impl Channel for WeComWsChannel {
         };
 
         // Upload the file to WeCom to get a media_id.
-        let media_id = self.http_upload_media_with_type(attachment, part_name).await?;
+        let media_id = self
+            .http_upload_media_with_type(attachment, part_name)
+            .await?;
 
         // Send the media to the scope using the WeCom WebSocket API.
-        self.ws_send_media_to_scope(
-            scope,
-            &media_id,
-            msgtype,
-            &attachment.file_name,
-        )
-        .await
+        self.ws_send_media_to_scope(scope, &media_id, msgtype, &attachment.file_name)
+            .await
     }
 
     /// Send media (image/file) to a WeCom scope via aibot_send_msg.
