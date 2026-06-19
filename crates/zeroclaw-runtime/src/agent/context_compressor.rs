@@ -26,6 +26,27 @@ pub struct CompressionResult {
 }
 
 // ---------------------------------------------------------------------------
+// Summary target
+// ---------------------------------------------------------------------------
+
+/// Resolved summarizer destination, computed by the CALLER and passed into the
+/// compressor. The compressor no longer reads `summary_model` itself; the
+/// caller resolves the agent's effective `summary_provider` (cross-provider fix
+/// for #7964) and either points at a distinct summary provider or falls back to
+/// the agent's own provider+model.
+pub struct SummaryTarget<'a> {
+    /// The resolved summary provider (or the agent's own, on fallback).
+    pub provider: &'a dyn ModelProvider,
+    /// The model id to summarize with.
+    pub model: &'a str,
+    /// Whether to keep `[IMAGE:...]`-style media markers in the transcript.
+    /// MUST be `true` only when `provider` is the agent's own provider AND it
+    /// supports vision; a distinct summary provider always gets `false` so a
+    /// local media path is never shipped to a possibly text-only model.
+    pub preserve_media_markers: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Probe tiers for unknown model context windows
 // ---------------------------------------------------------------------------
 
@@ -210,6 +231,7 @@ impl ContextCompressor {
         model_provider: &dyn ModelProvider,
         model: &str,
         temperature: Option<f64>,
+        summary: SummaryTarget<'_>,
     ) -> Result<CompressionResult> {
         if !self.config.enabled {
             let tokens = estimate_tokens(history);
@@ -256,8 +278,13 @@ impl ContextCompressor {
 
         let mut passes_used = 0;
         for _ in 0..self.config.max_passes {
+            let pass_summary = SummaryTarget {
+                provider: summary.provider,
+                model: summary.model,
+                preserve_media_markers: summary.preserve_media_markers,
+            };
             let did_compress = self
-                .compress_once(history, model_provider, model, temperature)
+                .compress_once(history, model_provider, model, temperature, pass_summary)
                 .await?;
             if did_compress {
                 passes_used += 1;
@@ -285,6 +312,7 @@ impl ContextCompressor {
         model: &str,
         temperature: Option<f64>,
         error_msg: &str,
+        summary: SummaryTarget<'_>,
     ) -> Result<bool> {
         // Try to extract actual limit from error message
         if let Some(limit) = parse_context_limit_from_error(error_msg) {
@@ -302,18 +330,25 @@ impl ContextCompressor {
         );
 
         let result = self
-            .compress_if_needed(history, model_provider, model, temperature)
+            .compress_if_needed(history, model_provider, model, temperature, summary)
             .await?;
         Ok(result.compressed)
     }
 
     /// Single compression pass: protect head/tail, summarize middle.
+    ///
+    /// `_model_provider` / `_model` describe the agent's own route and are kept
+    /// for signature parity with the public entry points (and for callers that
+    /// re-pass them as the fallback summary target); the actual summarization
+    /// dispatch now goes through `summary` (the resolved summary provider+model,
+    /// the cross-provider fix for #7964).
     async fn compress_once(
         &self,
         history: &mut Vec<ChatMessage>,
-        model_provider: &dyn ModelProvider,
-        model: &str,
+        _model_provider: &dyn ModelProvider,
+        _model: &str,
         temperature: Option<f64>,
+        summary: SummaryTarget<'_>,
     ) -> Result<bool> {
         let n = history.len();
         let protected_total = self.config.protect_first_n + self.config.protect_last_n;
@@ -332,16 +367,15 @@ impl ContextCompressor {
             return Ok(false);
         }
 
-        let summary_model = self.config.summary_model.as_deref().unwrap_or(model);
-        let preserve_media_markers =
-            self.config.summary_model.is_none() && model_provider.supports_vision();
-
-        // Build transcript from the middle section
+        // Build transcript from the middle section. The caller computed
+        // `preserve_media_markers` (true only when summarizing on the agent's
+        // own vision-capable provider); a distinct summary provider always
+        // strips markers so a local media path never reaches a text-only model.
         let middle = &history[start..end];
         let transcript = build_summarizer_transcript(
             middle,
             self.config.source_max_chars,
-            preserve_media_markers,
+            summary.preserve_media_markers,
         );
 
         if transcript.is_empty() {
@@ -361,15 +395,17 @@ impl ContextCompressor {
              Keep it concise (max 20 bullet points).{identifier_note}\n\n{transcript}"
         );
 
-        // LLM summarization with safety timeout
+        // LLM summarization with safety timeout. Dispatch onto the resolved
+        // summary provider + model (the cross-provider fix for #7964), NOT the
+        // agent's own provider with a bare model id.
         let timeout = Duration::from_secs(self.config.timeout_secs);
-        let dispatcher = ProviderDispatch::from_ref(model_provider);
+        let dispatcher = ProviderDispatch::from_ref(summary.provider);
         let summary_raw = match tokio::time::timeout(
             timeout,
             dispatcher.chat_with_system(
                 Some(SUMMARIZER_SYSTEM),
                 &user_prompt,
-                summary_model,
+                summary.model,
                 temperature,
             ),
         )
@@ -1042,7 +1078,17 @@ mod tests {
         ];
 
         let result = compressor
-            .compress_if_needed(&mut history, &model_provider, "model", None)
+            .compress_if_needed(
+                &mut history,
+                &model_provider,
+                "model",
+                None,
+                SummaryTarget {
+                    provider: &model_provider,
+                    model: "model",
+                    preserve_media_markers: false,
+                },
+            )
             .await
             .expect("compression should succeed");
 
@@ -1053,18 +1099,29 @@ mod tests {
         assert!(!prompt.contains("/tmp/example.png"));
     }
 
+    /// When a DISTINCT summary provider is supplied (the cross-provider fix for
+    /// #7964), the summarization dispatch must land on THAT provider — not the
+    /// agent's own — and `preserve_media_markers: false` must strip
+    /// `[IMAGE:...]` markers so a local path is never shipped to a possibly
+    /// text-only summary model.
     #[tokio::test]
-    async fn compress_if_needed_strips_image_markers_when_summary_model_overrides() {
+    async fn compress_if_needed_dispatches_to_distinct_summary_provider_and_strips_markers() {
         let config = ContextCompressionConfig {
             protect_first_n: 1,
             protect_last_n: 1,
             threshold_ratio: 0.01,
-            summary_model: Some("text-summary-model".to_string()),
             ..Default::default()
         };
         let compressor = ContextCompressor::new(config, 64);
-        let model_provider = CaptureSummarizerModelProvider {
+        // Agent's own provider is vision-capable, but it must NOT receive the
+        // summarization call when a distinct summary provider is resolved.
+        let agent_provider = CaptureSummarizerModelProvider {
             supports_vision: true,
+            seen_messages: Mutex::new(Vec::new()),
+        };
+        // The distinct summary provider — this is where the call must land.
+        let summary_provider = CaptureSummarizerModelProvider {
+            supports_vision: false,
             seen_messages: Mutex::new(Vec::new()),
         };
         let mut history = vec![
@@ -1079,15 +1136,34 @@ mod tests {
         ];
 
         let result = compressor
-            .compress_if_needed(&mut history, &model_provider, "default-vision-model", None)
+            .compress_if_needed(
+                &mut history,
+                &agent_provider,
+                "default-vision-model",
+                None,
+                SummaryTarget {
+                    provider: &summary_provider,
+                    model: "text-summary-model",
+                    // distinct provider ⇒ strip markers regardless of agent vision
+                    preserve_media_markers: false,
+                },
+            )
             .await
             .expect("compression should succeed");
 
         assert!(result.compressed);
-        let seen = model_provider.seen_messages.lock();
-        let prompt = seen.last().expect("summarizer should be invoked");
+        // The distinct summary provider received the call.
+        let summary_seen = summary_provider.seen_messages.lock();
+        let prompt = summary_seen
+            .last()
+            .expect("distinct summary provider should be invoked");
         assert!(!prompt.contains("[IMAGE:"));
         assert!(!prompt.contains("/tmp/summary-override.png"));
+        // The agent's own provider was NOT used for summarization.
+        assert!(
+            agent_provider.seen_messages.lock().is_empty(),
+            "agent provider must not receive the summarization call when a distinct summary provider is set"
+        );
     }
 
     // ── fast_trim_tool_results tests ────────────────────────────────

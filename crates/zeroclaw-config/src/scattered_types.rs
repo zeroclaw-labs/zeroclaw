@@ -301,6 +301,20 @@ pub struct ContextCompressionConfig {
     pub source_max_chars: usize,
     #[serde(default = "default_cc_timeout_secs")]
     pub timeout_secs: u64,
+    /// Summarizer provider as a `providers.models.<type>.<alias>` reference.
+    /// Empty (Default) = inherit the agent's own resolved provider+model.
+    /// Self-contained (provider + model + auth), so a profile shared across
+    /// agents on different providers always summarizes on *this* provider —
+    /// fixes the cross-provider bug the deprecated `summary_model` had. An
+    /// agent-level `summary_provider` overrides this. Validated in
+    /// `Config::validate()`.
+    #[serde(default)]
+    pub summary_provider: crate::providers::ModelProviderRef,
+    /// DEPRECATED bare model id — historically swapped onto the AGENT's own
+    /// provider (the cross-provider footgun, #7964). Still honored as a fallback
+    /// when `summary_provider` is empty, so existing configs keep working
+    /// unchanged. Prefer `summary_provider`. **Slated for removal in schema v4**
+    /// (batched with the next schema bump — not bumped for a single field).
     #[serde(default)]
     pub summary_model: Option<String>,
     #[serde(default = "default_identifier_policy")]
@@ -322,6 +336,7 @@ impl Default for ContextCompressionConfig {
             summary_max_chars: default_summary_max_chars(),
             source_max_chars: default_source_max_chars(),
             timeout_secs: default_cc_timeout_secs(),
+            summary_provider: crate::providers::ModelProviderRef::default(),
             summary_model: None,
             identifier_policy: default_identifier_policy(),
             tool_result_retrim_chars: default_tool_result_retrim_chars(),

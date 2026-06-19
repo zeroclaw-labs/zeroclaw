@@ -2961,6 +2961,106 @@ async fn resolve_classifier_route(
     Some((provider, model, temperature))
 }
 
+/// Resolve the agent's effective context-compression summary provider to a
+/// `(provider, model)` pair for the proactive `compress_if_needed` call
+/// (the cross-provider fix for #7964). Returns `None` when no summary provider
+/// is configured for the agent, or on ANY resolution/build failure; the caller
+/// MUST then fall back to the active `active_model_provider` + `route.model`
+/// (with the deprecated `summary_model` swap still honored).
+///
+/// Sibling of `resolve_classifier_route`: same dotted-ref → `[providers.models]`
+/// lookup, same "every failure → None → caller reuses the main provider"
+/// fail-open contract, just keyed off `effective_summary_provider` and without
+/// a temperature.
+async fn resolve_summary_route(
+    ctx: &ChannelRuntimeContext,
+    defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
+) -> Option<(Arc<dyn ModelProvider>, String)> {
+    let provider_ref = defaults_snapshot
+        .config
+        .effective_summary_provider(ctx.agent_alias.as_str())?;
+    let provider_str = provider_ref.as_str().trim();
+    if provider_str.is_empty() {
+        return None;
+    }
+
+    let (type_key, alias_key) = match provider_str.split_once('.') {
+        Some(parts) => parts,
+        None => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"provider": provider_str})),
+                "summary_provider must be dotted `<type>.<alias>`; falling back to main agent"
+            );
+            return None;
+        }
+    };
+
+    let model_cfg = match defaults_snapshot
+        .config
+        .providers
+        .models
+        .find(type_key, alias_key)
+    {
+        Some(cfg) => cfg,
+        None => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"provider": provider_str})),
+                "summary_provider references an unknown [providers.models.<type>.<alias>] entry; falling back to main agent"
+            );
+            return None;
+        }
+    };
+
+    let model = model_cfg.model.clone().unwrap_or_default();
+    if model.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"provider": provider_str})),
+            "summary_provider points to a [providers.models] entry without a `model` field; falling back to main agent"
+        );
+        return None;
+    }
+
+    let provider = match get_or_create_provider(
+        ctx,
+        provider_str,
+        model_cfg.api_key.as_deref(),
+        defaults_snapshot,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            let safe_err = zeroclaw_providers::sanitize_api_error(&e.to_string());
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"provider": provider_str, "error": safe_err})),
+                "Failed to initialize summary_provider; falling back to main agent provider"
+            );
+            return None;
+        }
+    };
+
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_attrs(::serde_json::json!({"provider": provider_str, "model": model.as_str()})),
+        "summary_provider override active"
+    );
+
+    Some((provider, model))
+}
+
 /// Build the `NoReply` outcome, with a narrow rubric-echo failsafe scoped to
 /// the `Informational` kind only. When the classifier emits `NO_REPLY[INFO]`
 /// with a reason that restates its own rubric (the only failure mode observed
@@ -4187,12 +4287,38 @@ async fn process_channel_message_body(
             ctx.context_token_budget,
         )
         .with_memory(Arc::clone(&ctx.memory));
+        // Resolve the agent's effective summary provider (#7964). On any
+        // failure we fall back to the active provider + route model (with the
+        // deprecated `summary_model` swap), and only that path may preserve
+        // media markers when the active provider supports vision.
+        let resolved_summary = resolve_summary_route(ctx.as_ref(), &runtime_defaults).await;
+        let summary_target = match resolved_summary {
+            Some((ref provider, ref model)) => {
+                zeroclaw_runtime::agent::context_compressor::SummaryTarget {
+                    provider: provider.as_ref(),
+                    model: model.as_str(),
+                    preserve_media_markers: false,
+                }
+            }
+            None => zeroclaw_runtime::agent::context_compressor::SummaryTarget {
+                provider: active_model_provider.as_ref(),
+                model: ctx
+                    .agent_cfg
+                    .resolved
+                    .context_compression
+                    .summary_model
+                    .as_deref()
+                    .unwrap_or(route.model.as_str()),
+                preserve_media_markers: active_model_provider.supports_vision(),
+            },
+        };
         match compressor
             .compress_if_needed(
                 &mut history,
                 active_model_provider.as_ref(),
                 route.model.as_str(),
                 runtime_defaults.defaults.temperature,
+                summary_target,
             )
             .await
         {

@@ -872,6 +872,104 @@ fn api_key_and_uri_for_provider(
     )
 }
 
+/// Resolve the agent's effective context-compression summary provider to a
+/// freshly-built `(provider, model)` pair (the cross-provider fix for #7964).
+///
+/// Mirrors the channel orchestrator's `resolve_classifier_route` fail-open
+/// contract exactly: `effective_summary_provider` is `None`, OR the ref is
+/// unparseable, OR the alias is missing from `[providers.models]`, OR it has no
+/// `.model`, OR the provider build fails ⇒ WARN once and return `None`. The
+/// caller then falls back to the agent's own provider + model (with the
+/// deprecated `summary_model` swap still honored for un-migrated configs), so
+/// compression never becomes a turn-killing hard error.
+fn resolve_summary_provider(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> Option<(Box<dyn ModelProvider>, String)> {
+    let provider_ref = config.effective_summary_provider(agent_alias)?;
+    let provider_str = provider_ref.as_str().trim();
+    if provider_str.is_empty() {
+        return None;
+    }
+
+    let (type_key, alias_key) = match provider_str.split_once('.') {
+        Some(parts) => parts,
+        None => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"provider": provider_str})),
+                "summary_provider must be dotted `<type>.<alias>`; falling back to agent provider"
+            );
+            return None;
+        }
+    };
+
+    let model_cfg = match config.providers.models.find(type_key, alias_key) {
+        Some(cfg) => cfg,
+        None => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"provider": provider_str})),
+                "summary_provider references an unknown [providers.models.<type>.<alias>] entry; falling back to agent provider"
+            );
+            return None;
+        }
+    };
+
+    let model = model_cfg.model.clone().unwrap_or_default();
+    if model.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"provider": provider_str})),
+            "summary_provider points to a [providers.models] entry without a `model` field; falling back to agent provider"
+        );
+        return None;
+    }
+
+    let options = zeroclaw_providers::options_for_provider_ref(
+        config,
+        provider_str,
+        &zeroclaw_providers::provider_runtime_options_for_agent(config, agent_alias),
+    );
+    match zeroclaw_providers::create_resilient_model_provider_from_ref(
+        config,
+        provider_str,
+        model_cfg.api_key.as_deref(),
+        model_cfg.uri.as_deref(),
+        &config.reliability,
+        &options,
+    ) {
+        Ok(provider) => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(
+                        ::serde_json::json!({"provider": provider_str, "model": model.as_str()})
+                    ),
+                "summary_provider override active"
+            );
+            Some((provider, model))
+        }
+        Err(e) => {
+            let safe_err = zeroclaw_providers::sanitize_api_error(&e.to_string());
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"provider": provider_str, "error": safe_err})),
+                "Failed to initialize summary_provider; falling back to agent provider"
+            );
+            None
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn run(
     config: Config,
@@ -2303,6 +2401,32 @@ pub async fn run(
                                     )
                                     .with_memory(mem.clone());
                                 let error_msg = format!("{e}");
+                                // Resolve the agent's effective summary provider
+                                // (#7964). On any failure we fall back to the
+                                // agent's own provider + model (with the
+                                // deprecated `summary_model` swap), and only the
+                                // agent-provider path may preserve media markers.
+                                let resolved_summary =
+                                    resolve_summary_provider(&config, agent_alias);
+                                let summary_target = match resolved_summary {
+                                    Some((ref provider, ref model)) => {
+                                        crate::agent::context_compressor::SummaryTarget {
+                                            provider: provider.as_ref(),
+                                            model: model.as_str(),
+                                            preserve_media_markers: false,
+                                        }
+                                    }
+                                    None => crate::agent::context_compressor::SummaryTarget {
+                                        provider: model_provider.as_ref(),
+                                        model: agent
+                                            .resolved
+                                            .context_compression
+                                            .summary_model
+                                            .as_deref()
+                                            .unwrap_or(&model_name),
+                                        preserve_media_markers: model_provider.supports_vision(),
+                                    },
+                                };
                                 match compressor
                                     .compress_on_error(
                                         &mut history,
@@ -2310,6 +2434,7 @@ pub async fn run(
                                         &model_name,
                                         temperature,
                                         &error_msg,
+                                        summary_target,
                                     )
                                     .await
                                 {
@@ -2372,12 +2497,36 @@ pub async fn run(
                         eff_max_context_tokens,
                     )
                     .with_memory(mem.clone());
+                    // Resolve the agent's effective summary provider (#7964);
+                    // fall back to the agent's own provider + model on any
+                    // failure, preserving media markers only on that path.
+                    let resolved_summary = resolve_summary_provider(&config, agent_alias);
+                    let summary_target = match resolved_summary {
+                        Some((ref provider, ref model)) => {
+                            crate::agent::context_compressor::SummaryTarget {
+                                provider: provider.as_ref(),
+                                model: model.as_str(),
+                                preserve_media_markers: false,
+                            }
+                        }
+                        None => crate::agent::context_compressor::SummaryTarget {
+                            provider: model_provider.as_ref(),
+                            model: agent
+                                .resolved
+                                .context_compression
+                                .summary_model
+                                .as_deref()
+                                .unwrap_or(&model_name),
+                            preserve_media_markers: model_provider.supports_vision(),
+                        },
+                    };
                     match compressor
                         .compress_if_needed(
                             &mut history,
                             model_provider.as_ref(),
                             &model_name,
                             temperature,
+                            summary_target,
                         )
                         .await
                     {

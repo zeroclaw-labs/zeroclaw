@@ -213,7 +213,10 @@ async fn agent_auto_saves_and_recalls_memory() {
 /// Verify ContextCompressor.with_memory saves summary to memory before splice.
 #[tokio::test]
 async fn compressor_with_memory_saves_summary() {
-    use zeroclaw::agent::context_compressor::{ContextCompressionConfig, ContextCompressor};
+    use zeroclaw::agent::context_compressor::{
+        ContextCompressionConfig, ContextCompressor, SummaryTarget,
+    };
+    use zeroclaw::providers::ModelProvider;
     use zeroclaw::providers::traits::ChatMessage;
 
     let tmp = tempfile::TempDir::new().unwrap();
@@ -256,7 +259,20 @@ async fn compressor_with_memory_saves_summary() {
     )]);
 
     let result = compressor
-        .compress_if_needed(&mut history, &mock_model_provider, "test-model", None)
+        .compress_if_needed(
+            &mut history,
+            &mock_model_provider,
+            "test-model",
+            None,
+            // Mirror the production fallback arm (loop_.rs `None`): summarize on
+            // the agent's own provider/model, preserving media markers only when
+            // that provider supports vision.
+            SummaryTarget {
+                provider: &mock_model_provider,
+                model: "test-model",
+                preserve_media_markers: mock_model_provider.supports_vision(),
+            },
+        )
         .await;
 
     // Check if compression happened (it should with threshold_ratio=0.01)
