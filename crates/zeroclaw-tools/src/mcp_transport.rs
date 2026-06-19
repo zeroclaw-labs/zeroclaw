@@ -234,9 +234,7 @@ impl McpTransportConn for StdioTransport {
         // hangs forever waiting for EOF and the Child struct is never dropped,
         // so `kill_on_drop` never fires and the stdio child accumulates.
         self.stdout_lines = tokio::io::Lines::new(tokio::io::BufReader::new(
-            tokio::process::ChildStdout::from_std(
-                std::process::Stdio::null().unwrap(),
-            )?,
+            tokio::process::ChildStdout::from_std(std::process::Stdio::null().unwrap())?,
         ));
         Ok(())
     }
