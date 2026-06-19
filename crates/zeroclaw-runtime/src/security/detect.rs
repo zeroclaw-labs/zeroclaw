@@ -1,5 +1,6 @@
 //! Auto-detection of available security features
 
+use crate::security::policy::SandboxPolicy;
 use crate::security::traits::Sandbox;
 use std::path::Path;
 use std::sync::Arc;
@@ -8,13 +9,19 @@ use zeroclaw_config::schema::{SandboxBackend, SandboxConfig};
 /// Create a sandbox based on auto-detection or explicit config.
 ///
 /// Takes a [`SandboxConfig`] (synthesized from the active risk profile via
-/// `RiskProfileConfig::sandbox_config()`). `runtime_kind` is the
+/// `RiskProfileConfig::sandbox_config()`) and a resolved [`SandboxPolicy`]
+/// (from `SandboxPolicy::from_risk_profile`). `runtime_kind` is the
 /// `runtime.kind` string from the top-level config. When the caller has set
 /// `runtime.kind = "native"`, Docker must never be selected as the sandbox
 /// backend during auto-detection — the user explicitly opted out of container
 /// wrapping.
+///
+/// `policy` is accepted to establish a stable call-site contract but is not
+/// yet forwarded to individual backends; sandbox selection is currently driven
+/// solely by `SandboxConfig` and `runtime_kind`.
 pub fn create_sandbox(
     sandbox: &SandboxConfig,
+    _policy: &SandboxPolicy,
     runtime_kind: &str,
     workspace_dir: Option<&Path>,
 ) -> Arc<dyn Sandbox> {
@@ -266,6 +273,11 @@ pub fn linux_memcg_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::policy::SandboxPolicy;
+
+    fn default_policy() -> SandboxPolicy {
+        SandboxPolicy::default()
+    }
 
     #[test]
     fn detect_best_sandbox_returns_something() {
@@ -281,19 +293,18 @@ mod tests {
             backend: SandboxBackend::None,
             firejail_args: Vec::new(),
         };
-        let sandbox = create_sandbox(&sandbox_cfg, "", None);
+        let sandbox = create_sandbox(&sandbox_cfg, &default_policy(), "", None);
         assert_eq!(sandbox.name(), "none");
     }
 
     #[test]
     fn auto_mode_detects_something() {
         let sandbox_cfg = SandboxConfig {
-            enabled: None, // Auto-detect
+            enabled: None,
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
         };
-        let sandbox = create_sandbox(&sandbox_cfg, "", None);
-        // Should return some sandbox (at least NoopSandbox)
+        let sandbox = create_sandbox(&sandbox_cfg, &default_policy(), "", None);
         assert!(sandbox.is_available());
     }
 
@@ -315,8 +326,7 @@ mod tests {
             backend: SandboxBackend::Docker,
             firejail_args: Vec::new(),
         };
-        let sandbox = create_sandbox(&sandbox_cfg, "native", None);
-        // If Docker is available, it will be selected; if not, NoopSandbox fallback.
+        let sandbox = create_sandbox(&sandbox_cfg, &default_policy(), "native", None);
         assert!(sandbox.is_available());
     }
 

@@ -10023,31 +10023,25 @@ fn is_valid_env_var_name(name: &str) -> bool {
 
 // ── Profiles & Bundles ───────────────────────────────────────────
 
-/// Mandatory write-deny list — always blocked regardless of `allow_write`.
-pub const MANDATORY_DENY_WRITE: &[&str] = &[
-    ".bashrc",
-    ".bash_profile",
-    ".zshrc",
-    ".zprofile",
-    ".profile",
-    ".gitconfig",
-    ".gitmodules",
-    ".git/hooks/",
-    ".git/config",
-    ".env",
-    ".mcp.json",
-    ".claude/agents/",
-    ".vscode/",
-    ".idea/",
-];
 
 /// Filesystem and network policy for OS-level sandbox backends
 /// (`[risk_profiles.<alias>.sandbox_policy]`).
 ///
-/// Intended as the canonical policy model. `forbidden_paths` and `allowed_roots`
-/// on `RiskProfileConfig` will become compatibility aliases that resolve into
-/// this struct (tracked in the sandbox-policy RFC). Until that wiring lands,
-/// both surfaces are independently readable.
+/// **Canonical policy model.** Two distinct compatibility mechanisms exist:
+///
+/// 1. **TOML aliases** — within this `[sandbox_policy]` subtable only, `forbidden_paths`
+///    is an alias for `deny_read` and `allowed_roots` is an alias for `allow_read`.
+///    These are serde parse-time aliases; they do not read the top-level
+///    `RiskProfileConfig.forbidden_paths` / `allowed_roots` fields. Note that the
+///    `allowed_roots` TOML alias populates only `allow_read` — not `allow_write`. The
+///    runtime resolver (mechanism 2) maps the top-level `allowed_roots` to *both* fields.
+///
+/// 2. **Runtime compat mapping** — when the top-level `RiskProfileConfig.forbidden_paths`,
+///    `allowed_roots`, or `workspace_only` fields are set and `sandbox_policy.allow_write`
+///    is still at its schema default, `SandboxPolicy::from_risk_profile` (in
+///    `zeroclaw-runtime`) maps them into this struct at resolution time. Specifically,
+///    `allowed_roots` maps to both `allow_read` and `allow_write`. New configs should use
+///    `sandbox_policy.*` directly.
 ///
 /// Filesystem read semantics: deny-then-allow (`allow_read` overrides `deny_read`).
 /// Filesystem write semantics: allow-only (`deny_write` overrides `allow_write`).
@@ -10057,8 +10051,12 @@ pub const MANDATORY_DENY_WRITE: &[&str] = &[
 #[serde(default)]
 pub struct SandboxPolicyConfig {
     /// Paths denied for read access. `~` is expanded to the user home directory.
+    /// Accepts `forbidden_paths` as a compat alias within the `sandbox_policy` table.
+    #[serde(alias = "forbidden_paths")]
     pub deny_read: Vec<String>,
     /// Paths re-allowed for read within denied regions. Takes precedence over `deny_read`.
+    /// Accepts `allowed_roots` as a compat alias within the `sandbox_policy` table.
+    #[serde(alias = "allowed_roots")]
     pub allow_read: Vec<String>,
     /// Paths allowed for write access. All other paths are denied for writes.
     pub allow_write: Vec<String>,
@@ -10073,9 +10071,10 @@ pub struct SandboxPolicyConfig {
     pub allow_unix_sockets: Vec<String>,
     /// Raw extra bwrap flags appended last (Bubblewrap backend only, escape hatch).
     pub bubblewrap_args: Vec<String>,
-    /// When `true`, `MANDATORY_DENY_WRITE` paths are always blocked regardless of
-    /// `allow_write`. Can be set `false` per profile as an escape hatch; emits a
-    /// WARN log at runtime.
+    /// When `true`, the default `deny_write` guardrail list (shell configs, git hooks,
+    /// `.env`, `.mcp.json`, etc.) is merged into the resolved policy by the runtime
+    /// resolver regardless of any operator-supplied `allow_write`. Set `false` per
+    /// profile as an escape hatch; emits a WARN log at runtime.
     pub mandatory_deny_write_enabled: bool,
 }
 
@@ -10085,7 +10084,22 @@ impl Default for SandboxPolicyConfig {
             deny_read: vec![],
             allow_read: vec![],
             allow_write: vec![".".to_string(), "/tmp".to_string()],
-            deny_write: vec![],
+            deny_write: vec![
+                ".bashrc".to_string(),
+                ".bash_profile".to_string(),
+                ".zshrc".to_string(),
+                ".zprofile".to_string(),
+                ".profile".to_string(),
+                ".gitconfig".to_string(),
+                ".gitmodules".to_string(),
+                ".git/hooks/".to_string(),
+                ".git/config".to_string(),
+                ".env".to_string(),
+                ".mcp.json".to_string(),
+                ".claude/agents/".to_string(),
+                ".vscode/".to_string(),
+                ".idea/".to_string(),
+            ],
             allowed_domains: vec![],
             denied_domains: vec![],
             allow_unix_sockets: vec![],
@@ -10112,10 +10126,16 @@ pub struct RiskProfileConfig {
     /// Autonomy level applied to this profile. Default: `supervised`.
     pub level: AutonomyLevel,
     /// Restrict filesystem access to workspace-relative paths. Default: `false`.
+    /// Compatibility field: the runtime resolver maps `workspace_only = true` into
+    /// `sandbox_policy` by constraining `allow_write` to the workspace root. `workspace_only`
+    /// always takes effect — it overrides any concurrently set `sandbox_policy.allow_write`
+    /// and emits a warning when it does so. Prefer `sandbox_policy.allow_write` for new configs.
     pub workspace_only: bool,
     /// Allowlist of executable names for shell execution.
     pub allowed_commands: Vec<String>,
-    /// Explicit path denylist.
+    /// Explicit path denylist applied at the application layer.
+    /// Compatibility field: the runtime resolver maps this into `sandbox_policy.deny_read`.
+    /// Prefer `sandbox_policy.deny_read` for new configs.
     pub forbidden_paths: Vec<String>,
     /// Require approval for medium-risk operations.
     pub require_approval_for_medium_risk: bool,
@@ -10129,6 +10149,9 @@ pub struct RiskProfileConfig {
     /// Tools that always require approval in this profile.
     pub always_ask: Vec<String>,
     /// Extra directory roots the agent may access.
+    /// Compatibility field: the runtime resolver maps this into `sandbox_policy.allow_read`
+    /// and `sandbox_policy.allow_write`. Prefer `sandbox_policy.allow_read` / `allow_write`
+    /// for new configs.
     #[serde(alias = "allowed_path", alias = "allowed_paths")]
     pub allowed_roots: Vec<String>,
     /// Whether and to which agents this profile may delegate. Defaults to
@@ -10151,9 +10174,9 @@ pub struct RiskProfileConfig {
     pub sandbox_backend: Option<String>,
     /// Extra arguments forwarded to firejail when sandbox_backend = "firejail".
     pub firejail_args: Vec<String>,
-    /// OS-level sandbox filesystem and network policy. Intended as the
-    /// canonical model; `forbidden_paths`/`allowed_roots` alias wiring
-    /// is tracked in the sandbox-policy RFC and lands in a follow-up PR.
+    /// OS-level sandbox filesystem and network policy. Canonical model.
+    /// `forbidden_paths`, `allowed_roots`, and `workspace_only` are compatibility
+    /// inputs translated into this struct by `SandboxPolicy::from_risk_profile`.
     #[serde(default)]
     pub sandbox_policy: SandboxPolicyConfig,
 }
@@ -22077,17 +22100,36 @@ default_temperature = 0.7
     }
 
     #[test]
-    async fn mandatory_deny_write_list_is_nonempty() {
-        assert!(!MANDATORY_DENY_WRITE.is_empty());
-        assert!(MANDATORY_DENY_WRITE.contains(&".env"), "must block .env");
+    async fn mandatory_deny_write_defaults_flow_through_policy() {
+        let deny_write = &SandboxPolicyConfig::default().deny_write;
+        assert!(!deny_write.is_empty(), "default deny_write guardrail list must not be empty");
+        assert!(deny_write.iter().any(|p| p == ".env"), "must block .env");
         assert!(
-            MANDATORY_DENY_WRITE.contains(&".git/hooks/"),
+            deny_write.iter().any(|p| p == ".git/hooks/"),
             "must block .git/hooks/"
         );
         assert!(
-            MANDATORY_DENY_WRITE.contains(&".bashrc"),
+            deny_write.iter().any(|p| p == ".bashrc"),
             "must block .bashrc"
         );
+        assert!(
+            deny_write.iter().any(|p| p == ".mcp.json"),
+            "must block .mcp.json"
+        );
+    }
+
+    #[test]
+    async fn sandbox_policy_config_serde_aliases_deserialize() {
+        // `forbidden_paths` is an alias for `deny_read` inside a `[sandbox_policy]` table.
+        // `allowed_roots` is an alias for `allow_read`.
+        let toml_in = r#"
+            forbidden_paths = ["/sensitive"]
+            allowed_roots = ["/shared"]
+        "#;
+        let p: SandboxPolicyConfig =
+            toml::from_str(toml_in).expect("alias keys must deserialize via serde alias");
+        assert_eq!(p.deny_read, vec!["/sensitive"]);
+        assert_eq!(p.allow_read, vec!["/shared"]);
     }
 
     #[test]
