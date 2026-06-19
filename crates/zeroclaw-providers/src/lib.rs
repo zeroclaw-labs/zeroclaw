@@ -4324,4 +4324,3 @@ mod tests {
             "agent_small must get small provider's max_tokens, NOT the first-configured provider's value"
         );
     }
-}
