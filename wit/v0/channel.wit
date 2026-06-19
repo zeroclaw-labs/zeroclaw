@@ -139,6 +139,12 @@ interface channel {
         supports-free-form-ask,
     }
 
+    // REMOVED: The following three functions could be implemented on the host by
+    // simply looking that the results of get-channel-capabilities:
+    // - supports-draft-updates
+    // - supports-multi-message-streaming
+    // - supports-free-form-ask
+
     // ── Required methods (no Rust default) ────────────────────────────────────
 
     /// Human-readable channel name.
