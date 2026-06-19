@@ -938,12 +938,32 @@ fn tunnel_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
     }];
 
     let providers = [
-        ("cloudflare", "Cloudflare Tunnel", "Zero Trust account + token required."),
-        ("tailscale", "Tailscale Funnel", "Tailnet account required; no separate token."),
+        (
+            "cloudflare",
+            "Cloudflare Tunnel",
+            "Zero Trust account + token required.",
+        ),
+        (
+            "tailscale",
+            "Tailscale Funnel",
+            "Tailnet account required; no separate token.",
+        ),
         ("ngrok", "ngrok", "Auth token required; generous free tier."),
-        ("openvpn", "OpenVPN", "Bring-your-own VPN server and client config."),
-        ("pinggy", "Pinggy", "SSH-based reverse tunnel; no account needed."),
-        ("custom", "Custom command", "Run any tunnel program you define under [tunnel.custom]."),
+        (
+            "openvpn",
+            "OpenVPN",
+            "Bring-your-own VPN server and client config.",
+        ),
+        (
+            "pinggy",
+            "Pinggy",
+            "SSH-based reverse tunnel; no account needed.",
+        ),
+        (
+            "custom",
+            "Custom command",
+            "Run any tunnel program you define under [tunnel.custom].",
+        ),
     ];
 
     for (key, label, description) in providers {
@@ -952,7 +972,8 @@ fn tunnel_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
         } else {
             // Mark as "configured" when the corresponding Option is Some
             // (i.e. the operator has already filled in credentials for it).
-            cfg.tunnel.nested_option_entries()
+            cfg.tunnel
+                .nested_option_entries()
                 .iter()
                 .find(|e| e.field == key)
                 .map(|e| {
