@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc;
+use zeroclaw_api::ingress::IngressContext;
 use zeroclaw_api::model_provider::TokenUsage;
 use zeroclaw_providers::{ChatResponse, ToolCall};
 
@@ -478,6 +479,9 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
         new_messages_out: None,
         knobs: &crate::agent::loop_::LoopKnobs::default(),
         image_cache: None,
+        // Phase 1: stamp Internal/Trusted. Real per-transport
+        // stamping is PR C (RFC #6971 §4).
+        ingress: IngressContext::internal(),
     })
     .await
     .expect("loop should succeed");
@@ -868,6 +872,9 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                 new_messages_out: None,
                 knobs: &crate::agent::loop_::LoopKnobs::default(),
                 image_cache: None,
+                // Phase 1: stamp Internal/Trusted. Real per-transport
+                // stamping is PR C (RFC #6971 §4).
+                ingress: IngressContext::internal(),
             })
             .await
         }),

@@ -4626,6 +4626,9 @@ async fn process_channel_message_body(
                         new_messages_out: None,
                         knobs: &loop_knobs,
                         image_cache: None,
+                        // Phase 1: stamp Internal/Trusted. Real per-transport
+                        // stamping is PR C (RFC #6971 §4).
+                        ingress: zeroclaw_api::ingress::IngressContext::internal(),
 }),
                     ),
                     ),
