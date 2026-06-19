@@ -1,155 +1,176 @@
-# ZeroClaw v0.8.0
+# ZeroClaw v0.8.1
 
-ZeroClaw v0.8.0 is the big one. One daemon now runs many named agents, each with its own workspace, memory, model provider, security policy, channels, and personality, coordinated by a rewritten configuration schema that migrates your existing setup automatically. The release spans 439 commits (not including the squashes) from over 100 contributors since v0.7.5, and also introduces the zerocode terminal UI, a unified logging and attribution pipeline, and a hardened security posture across channels, tools, and the gateway.
+ZeroClaw v0.8.1 is the first patch release on the v0.8.x line, focused on stabilizing the multi-agent runtime, channels, and provider stack that landed in v0.8.0. It spans 205 commits from 45 contributors since v0.8.0 — heavy on bug fixes (121), with substantial new features (46) including a delete/rename-with-cascade configuration story, Discord slash commands derived from installed skills, an OpenAI-compatible cached-input pricing path, and a Phase 0 agent eval harness.
 
-With the big sweeping code changes behind us, expect the v0.8.x series to ship at a more regular pace from here.
+If you upgraded to v0.8.0 and hit rough edges with channel routing, cron delivery, provider replay, or config save round-trips, this is the release that picks those up.
 
 ## Highlights
 
-- **[Multi-agent runtime](https://docs.zeroclawlabs.ai/master/en/agents/overview.html)**: run any number of named agents from one daemon, each with isolated workspace, memory, skills, model provider, and risk profile. Channels, cron jobs, webhooks, and ACP sessions all dispatch to a specific agent.
-- **Schema V3 with automatic migration**: existing configs migrate in place on first load. Provider entries support multiple named aliases per provider, and a single malformed entry no longer wipes its neighbors.
-- **[zerocode](https://docs.zeroclawlabs.ai/master/en/zerocode/overview.html)**: a new terminal UI with dedicated Chat, Code, Dashboard, Config, Quickstart, and Logs panes. **One daemon, many zerocode TUIs:** attach from as many terminals as you want, each with its own identity and sessions. The Code pane speaks ACP with no configuration required.
-- **[Security hardening](https://docs.zeroclawlabs.ai/master/en/security/overview.html)**: per-agent tool allowlists enforced at every dispatch path, bearer-token revocation on device rotation and deletion, secret redaction extended to nested config shapes, private-host allowlists for outbound HTTP tools, and a fix for a Canvas iframe token-theft advisory (GHSA-f385-f6h2-3gqj).
-- **[Observability rework](https://docs.zeroclawlabs.ai/master/en/ops/observability.html)**: a unified structured logging pipeline carries agent, model, and session attribution through every span, streaming to a new Logs page in the dashboard and a gateway logs endpoint.
-- **[Lean default channel bundle](https://docs.zeroclawlabs.ai/master/en/channels/overview.html)**: prebuilt binaries now ship the core channels by default with the rest available as opt-in build features. Check the docs if a channel you use is missing after upgrade.
+- **Cascading config edits**: `delete_with_cascade` and `rename_with_cascade` now ripple through agents, providers, channels, model providers, and skill bundles instead of leaving dangling references (#7837, #7838, #7839, #7830, #7840, #7841, #7842, #7785).
+- **Discord skill-driven slash commands**: dynamic slash commands generated from installed skills, with typed options, chunked interaction followups, edit/delete/bulk-delete archive sync, and configurable reaction recording (#7490, #7489, #7525, #7526, #7844).
+- **[Operator Console redesign](https://docs.zeroclawlabs.ai/master/en/gateway/web-dashboard.html)**: the gateway web UI ships a schema-driven config editor, multi-agent chat, read-only skills browser, and a long list of ported fixes (#7665, #6700).
+- **Cached-input pricing for OpenAI-compatible providers**: cost tracking now captures `cached_input_tokens` for any provider that reports them, including OpenRouter system-prompt caching (#7492, #7634).
+- **Phase 0 agent eval harness**: deterministic replay-driven evaluation lands as the foundation for the eval story going forward (#7067).
+- **Workflow hardening for releases and docs**: a canonical install spec drives every generated installer surface (#7558), gh-pages becomes ephemeral with bounded clone size (#7676), and rustdoc is published once and deduped per locale (#7754).
 
-## Since v0.7.5
+## What's New
 
-### Multi-agent (the star of the show)
+### Multi-agent and config
 
-You can now run a [whole team of agents](https://docs.zeroclawlabs.ai/master/en/agents/overview.html) from a single daemon (#6398): a coding agent with full shell access in one workspace, a locked-down family assistant on Telegram in another, a research agent with its own memory and a cheaper model in a third. Each agent is a first-class identity through the entire stack:
-
-- **Per-agent everything**: [workspace directories](https://docs.zeroclawlabs.ai/master/en/agents/filesystem.html), memory stores with per-agent isolation across the SQLite, Postgres, and Qdrant backends, skill bundles, persona files, and per-agent model-provider resolution in every chat path.
-- **[Channels](https://docs.zeroclawlabs.ai/master/en/channels/overview.html)**: each channel binds to an owning agent, with per-agent runtime contexts, structured session routing, identity injection so an agent knows who it is on each channel, and media uploads routed into the owning agent's workspace.
-- **[Security policy per agent](https://docs.zeroclawlabs.ai/master/en/security/autonomy.html)**: each agent's policy can allow or exclude individual tools, enforced at the dispatch site; every risk-profile setting now propagates into the live policy; SubAgents are depth-capped and gated by the parent agent's risk profile.
-- **Cron**: scheduled jobs are bound to a specific agent with delivery-channel scoping, and the old implicit default-agent fallback is gone.
-- **[ACP](https://docs.zeroclawlabs.ai/master/en/channels/acp.html)**: sessions select an agent explicitly, auto-select when only one is configured, respect configurable session limits, and the bridge accepts a custom config location.
-- **[Dashboard](https://docs.zeroclawlabs.ai/master/en/gateway/web-dashboard.html)**: a multi-agent rework with per-agent status and memory views, RAM and CPU widgets, a Memories tab, and a sandboxed per-agent workspace file explorer.
-- **[Cost tracking](https://docs.zeroclawlabs.ai/master/en/ops/cost-tracking.html)**: rates are organized per provider and model, cached-input tokens are captured, and the dashboard shows per-agent and per-model cost splits with an editable rate sheet.
-
-### zerocode terminal UI
-
-v0.8.0 ships [zerocode](https://docs.zeroclawlabs.ai/master/en/zerocode/overview.html), a full terminal UI for ZeroClaw (#6848). It talks to the daemon over a new RPC transport with [persistent sessions](https://docs.zeroclawlabs.ai/master/en/zerocode/running.html) (#7182) and rides out daemon restarts by reconnecting in place (#7158).
-
-#### Connection: local socket or remote WSS
-
-Locally, zerocode connects over a Unix domain socket (a named pipe on Windows) with no setup at all. For a daemon on another machine, a [TLS WebSocket transport](https://docs.zeroclawlabs.ai/master/en/zerocode/remote.html) connects your workstation to a Raspberry Pi, home server, or VPS with a self-signed certificate and a token. **One daemon serves many zerocode instances at once:** each connecting TUI gets its own signed identity and environment snapshot in the daemon's registry, sessions are tmux-style persistent (#7182) so closing your laptop and reconnecting an hour later from a different network finds your session intact.
-
-#### Shell environment pass-through
-
-A daemon started as a service has a stripped-down environment; your terminal has the real one. On a local socket connection, zerocode [forwards its full shell environment](https://docs.zeroclawlabs.ai/master/en/zerocode/environment.html) to the daemon at handshake, and every shell subprocess your agents spawn gets it overlaid on top of the daemon's safe baseline, with zerocode's values winning on conflict. Your PATH, SSH agent socket, and credential helpers just work, no configuration required.
-
-#### Themes
-
-[Named color themes](https://docs.zeroclawlabs.ai/master/en/zerocode/themes.html) with per-agent overrides in the Code and Chat panes, inline palette previews before you apply, automatic adaptation to your terminal's color depth, and a `terminal` theme that inherits your shell's own colors (#7249).
-
-#### Keybindings
-
-Four built-in presets (default, vim, emacs, arrows-only) plus per-action rebinding through an in-app capture modal. Changes apply live, no restart. **Press `?` on any pane for context-aware help showing the bindings that apply right where you are.**
-
-#### Chat
-
-Conversational sessions with any of your agents: full memory, skills, channel-style context, live model and provider switching mid-conversation (#7209), and an outbound message queue so you can keep typing while a turn is in flight (#7190).
-
-#### Code
-
-A coding workspace built on [ACP](https://docs.zeroclawlabs.ai/master/en/channels/acp.html), the same protocol that powers editor integrations, with zero configuration required: open the pane and it just works. Code sessions are tuned for the job: memory tools are excluded server-side (#7177) so your coding agent stays focused on the tree in front of it instead of consolidating chatter, sessions persist and survive kills cleanly (#7258), and the working directory, branch, and commit are always visible (#7159).
-
-#### Dashboard
-
-Live per-agent status with RAM and CPU for the daemon process, distinguishing loading, error, and live states at a glance.
-
-#### Config
-
-The entire configuration in a split-pane editor with built-in, registry-driven help for every field. Edit agents, providers, channels, and policies without touching a text editor.
-
-#### Quickstart
-
-Guided agent creation end to end: pick a provider, paste a key, choose a model from the live catalog, set a personality, and land directly in Chat with your new agent.
-
-#### Logs
-
-The daemon's structured log stream, filterable and attribution-aware, in the same terminal you work in.
-
-### Observability
-
-- **OTel memory and RAG observability** — every agent turn now produces visible
-  `memory.recall`, `memory.store`, and `rag.retrieve` spans plus five OTel meter
-  instruments (`zeroclaw.memory.recall.{count,duration}`, `zeroclaw.memory.store.count`,
-  `zeroclaw.rag.retrieve.{count,duration}`). The recall/retrieve spans set
-  `gen_ai.operation.name = "retrieval"` and carry a scrubbed/truncated `query_summary`
-  on `input.value`; the store span uses `db.system` / `db.operation = "INSERT"`. These
-  are partial GenAI-compatible attributes: `SpanKind::Internal` is used, and span names
-  are `memory.recall` / `rag.retrieve` / `memory.store` for compatibility with the
-  existing ZeroClaw / Langfuse retrieval views. New spans and instruments live behind
-  the existing `observability-otel` feature gate (#6190).
-
-### Providers
-
-- [New providers](https://docs.zeroclawlabs.ai/master/en/providers/catalog.html): Kilo AI Gateway, GitHub Models (#6445), Morph (#6440), Manifest (#6268), atomic-chat (#6513), a dedicated llama.cpp provider (#6417), seven more OpenAI-compatible providers (#7260), and MiniMax split into Global and China entries (#6758).
-- Native extended thinking for Anthropic and Bedrock (#5652), prompt caching for OpenRouter (#6008), native Responses-protocol tool calls for Codex (#6117), [automatic fallback to a secondary provider on failure](https://docs.zeroclawlabs.ai/master/en/providers/routing.html) (#7178), and the Responses wire protocol honored across custom, OpenAI-compatible, and llama.cpp providers (#7180, #7172, #7418).
+- Typed `delete_with_cascade` and `rename_with_cascade` for aliased entries thread through agents, channels, model providers, and skill bundles, with a `find_all_references` / `plan_delete` foundation under the hood (#7785, #7837, #7838, #7839, #7830, #7840, #7841, #7842).
+- Per-agent delegate roster with cross-profile reach (#7590).
+- Type-driven alias-ref pickers and self-declaring config enums in the Config menu, plus declarative section grouping (#7556, #7594).
+- Agent eval harness — Phase 0 with deterministic replay (#7067).
 
 ### Channels
 
-- [New channels](https://docs.zeroclawlabs.ai/master/en/channels/overview.html): Twitch chat (#7275), WeCom AI Bot (#6680), AMQP with mutual TLS (#7369), and multi-tenant Linq with per-agent routing (#7041).
-- Per-recipient reply pacing across nine channels (#6389), a configurable in-flight message budget (#7391), webhook retry with exponential backoff (#5838), a reply-intent precheck that can route to a cheaper per-agent classifier model (#6068, #6945), and selective channel builds behind the new lean default bundle (#6866, #6904).
-- **Per-alias webhook routing** (#6312): inbound webhooks for WhatsApp, WATI, Nextcloud Talk, and Linq now route by alias — `POST /<type>/<alias>` reaches the matching channel instance instead of always resolving the first one, so multi-instance configs (e.g. `whatsapp.work` + `whatsapp.personal`) each receive their own traffic. The bare `/<type>` path still works as a **deprecated** fallback that resolves to a single deterministic instance (the lexicographically-first alias) and tags the response with an `X-Zeroclaw-Deprecation` header; an unknown alias now returns **404** instead of a 500. Single-instance deployments need no config change.
+- **Discord**: dynamic slash commands derived from installed skills, dispatched over the existing Gateway WebSocket, with typed options and chunked interaction followups (#7489, #7490, #7844). Inbound reactions are recorded behind a scope config (#7526). Archive syncs on message edit, delete, and bulk delete (#7525). Gateway intents are derived from config instead of hardcoded (#7524). The internals were split into a module tree behind a structured outgoing payload (#7832), and Discord is now part of the default-channels bundle (#7825).
+- **Slack**: backfills thread context on first agent encounter (#6428).
+- **Email**: XOAUTH2 auth, observer mode, and read-only IMAP tools (#7021).
+- **WhatsApp**: Web media markers are sent natively (#7811).
+- **Voice pipeline facade** for channels that want to plug into audio I/O (#7394).
 
-### Tools and plugins
+### Providers and runtime
 
-- [New tools](https://docs.zeroclawlabs.ai/master/en/tools/overview.html) for downloading remote files into the workspace (#6957), uploading single files and bundles over HTTP (#6773), sending messages to channels directly from the agent loop (#6665), reading and writing binary files (#7004), and authenticated outbound HTTP requests (#7354). Jina AI joins as a web-search backend (#6833).
-- [WASM plugin interfaces](https://docs.zeroclawlabs.ai/master/en/developing/index.html) are now formally defined for tools, channels, and memory (#7060), with new plugins for Office document extraction (#7454), LanguageTool grammar checking (#7326), and self-hosted Stable Diffusion image generation (#7325).
+- Cached input token pricing surfaces for OpenAI-compatible providers (#7492); OpenRouter system prompts are cached (#7634).
+- NEAR AI Cloud provider added (#6842); Azure OpenAI gains a dedicated `reasoning_effort` wire-up (#7350); `extra_body` is supported on any OpenAI-compatible provider (#7163); custom inference providers can specify `tls_ca_cert_path` (#5797).
+- Provider Manifest is re-added under the schema v3 provider system (#7791).
+- MCP auto-reconnects on stale session or dropped stream (#7351).
+- The three legacy agent turn engines consolidate onto a single `run_tool_call_loop` path (#7540).
 
-### Memory
+### Gateway, web, and CLI
 
-A [pluggable memory strategy](https://docs.zeroclawlabs.ai/master/en/agents/internals.html) now routes agent-turn, gateway, and channel consolidation through one path (#6907, #7053, #7234); time-windowed recall works correctly for markdown-backed memories (#7192); Postgres backend initialization is fixed (#7451).
+- Inbound webhooks route per channel alias (#7367).
+- Web chat input supports slash commands (#7223).
+- Agents/providers/channels CRUD lands in the CLI with skill-bundle cascade (#7842).
+- Gateway: agent owned-state rename/delete cascade and wiring (#7838, #7841).
 
-### Voice, desktop, hardware, docs
+### zerocode and security
 
-- [Voice notes](https://docs.zeroclawlabs.ai/master/en/channels/voice.html) transcode to OGG/Opus for Telegram and WhatsApp (#7050).
-- Desktop onboarding wizards for macOS, Linux, and Windows permissions (#6506, #6710).
-- Smart-room named-device tools and ESP32 simulator harnesses (#7045, #7048, #7363).
-- [Versioned documentation](https://docs.zeroclawlabs.ai/master/en/introduction.html) with a version selector (#7023), a full book rework that derives provider and config reference pages from source (#7365), a [FreeBSD setup guide](https://docs.zeroclawlabs.ai/master/en/setup/freebsd.html) with service files (#7161), [Podman guidance](https://docs.zeroclawlabs.ai/master/en/setup/container.html), a [NixOS module](https://docs.zeroclawlabs.ai/master/en/setup/nixos.html) (#6562), and a fully static container build pipeline (#7176).
+- New doctor pane in zerocode (#7802); session controls and provider diagnostics improvements (#7515).
+- `models list`/`doctor` lists configured models, adds `--check`, and collapses probe rows (#7450).
+- Agent posture status command (#7321).
+- Shell tools see the current session id via the `ZEROCLAW_SESSION_ID` environment variable (#7813).
 
-## Security
+### Skills, plugins, and memory
 
-- **Canvas token theft (GHSA-f385-f6h2-3gqj)**: the dashboard Canvas iframe sandbox is tightened so injected content can no longer exfiltrate the pairing token (#6942).
-- **Bearer-token revocation**: rotating or deleting a paired device now actually invalidates its token at the gateway (#6988).
-- **Secret handling**: redaction now covers every credential-shaped config surface, including nested shapes (#6918, #6982, #7261), and the channel orchestrator no longer falls back to another provider's credentials (#7066).
-- **Outbound request guards**: private-host allowlists for the HTTP request tool (#6981) and for fetches whose DNS resolves to private addresses (#6974).
-- **Tool gating**: per-agent tool allowlists are enforced when channels start (#7064) and on every message (#6960); scheduled agent jobs can no longer modify the scheduler itself by default (#7189); internal telemetry is blocked from the chat WebSocket by default (#7221).
-- **[Sandboxing](https://docs.zeroclawlabs.ai/master/en/security/sandboxing.html)**: tighter library binds in the Linux sandbox (#6902), and interactive subprocesses can no longer hijack the controlling terminal (#7120).
-- **Dependency advisories**: mail library updated for RUSTSEC-2026-0141 (#6662), the web frontend router bumped to clear five advisories (#7198), and Groq API keys added to the leak scanner (#6812).
-- A partially invalid config can no longer silently default security-critical settings during daemon startup (#7160).
+- Background review fork plus the `skill_manage` tool (agentskills.io SKILL.md) (#6667).
+- Frontmatter tags surface in the skill editor with a slash-command toggle (#7734).
+- Skill-directory loads are cached, content-validated, and audit-correct (#7786).
+- Wasmtime dependency and feature flags land for the plugin host (#7429).
+- Memory hygiene extends to pruning daily and core DB rows (#7081).
+- Runtime memory ops are instrumented with OTel GenAI spans (#7570).
 
-## Since v0.8.0-beta-2
+### Build, install, and docs infrastructure
 
-For those tracking the beta line, the 184 commits since beta-2 concentrate on stabilization:
+- Canonical install spec + `cargo generate installers` drives `setup.bat`, AUR PKGBUILD, Scoop manifest, `flake.nix`, Dockerfile/Containerfile feature sets, and `dev/ci/docker-tags.toml`, with an Installer Drift CI gate (#7558).
+- gh-pages becomes ephemeral with bounded clone size (#7676); rustdoc is published once and deduped per locale, with print pages dropped (#7754).
+- macOS and Windows build legs in CI run as `cargo check` to keep the matrix fast (#7669).
 
-- **Config correctness**: the unbounded and yolo quickstart presets actually allow what they advertise (#7371), incremental saves no longer leave a stale schema-version label (#7274), the webhook channel gets a sensible default port (#7193), one malformed provider entry no longer wipes the rest of your providers on load (#7491), config browsing no longer leaks similarly named sibling agents (#7471), and a crash on multi-byte characters in CLI flags is fixed (#7154).
-- **Channel delivery**: only the final assistant turn reaches channels (#7239), internal tool-result markup is stripped from replies (#5796), truncated tool-call fragments are dropped at delivery (#7370), webp images are normalized for vision models (#7135), Telegram preserves code fences across message splits (#6701) and restores forwarded-message attribution (#7251), WhatsApp delivery and reply-mentions work for the new ID format (#7008, #7226), and Matrix keeps separate session state per configured account while repairing key backups (#7388).
-- **Cron**: disabling startup catch-up actually skips overdue jobs (#7348), one-shot reminders can be scheduled relative to now (#7188), schedules set in the past get a clear diagnostic (#7165), and DingTalk is available as a delivery channel (#7091).
-- **Runtime**: history trimming can no longer empty the conversation entirely (#7403), parallel SubAgents and delegates return reliably (#7442), writing files into a container with no mounted workspace fails loudly instead of silently (#7129), and the gateway survives transient connection-accept errors instead of crashing (#7402).
-- **Dashboard**: Integrations category tabs and headings now render human labels such as `Tools & Automation` instead of raw enum keys such as `TOOLSAUTOMATION` (#6488).
+### Improvements (refactor)
 
-## Breaking changes
+- Extract duplicate domain/URL validation into shared helpers in `zeroclaw-tools` (#7340).
+- `before_llm_call` now takes mutable borrows, simplifying provider implementations (#7667).
 
-- **[Schema V3](https://docs.zeroclawlabs.ai/master/en/reference/config.html)** (#6398): configs migrate automatically on first load. Profile settings are split between runtime behavior and risk policy, cost rates are reorganized per provider, and scheduled jobs must name the agent they run as.
-- **[Lean default channel bundle](https://docs.zeroclawlabs.ai/master/en/channels/overview.html)** (#6904): prebuilt binaries ship a core channel set; social channels move to opt-in build features.
-- **[Logging](https://docs.zeroclawlabs.ai/master/en/architecture/logging.html)** (#6398 train): the legacy trace-event path is retired in favor of the unified structured logging pipeline; third-party logging macros are banned workspace-wide.
-- **Observer events** (#6190): `zeroclaw_api::observability::ObserverEvent` is now `#[non_exhaustive]` and adds `MemoryRecall`, `MemoryStore`, and `RagRetrieve`. Out-of-tree observers that exhaustively match events must add a wildcard arm.
-- **Memory observability hook** (#6190): `MemoryStrategy::load_context` now receives an observer reference so the runtime can emit `MemoryRecall` events at the implicit recall boundary. Out-of-tree strategy implementations must update their signature; implementations that do not emit observability can ignore the parameter.
+### Documentation
+
+- First-party extension architecture guide for contributors (#7788).
+- Fluent strings and mdbook translation catalogs refreshed for v0.8.1 (#7939).
+- Discussions stewardship and issue intake forms for governance (#7654, #7652).
+- API events stream semantics for the gateway (#7474); ACP wire shape pinned to v1 spec (#7595); MCP tool control boundaries clarified (#7473).
+- Rootless Debian compose example for the container (#7475); Linux uninstall script in setup docs (#7715); OpenAI Codex over a ChatGPT subscription documented for providers (#7116).
+- README installer options synced (#7708) and the providers routing link fixed (#7185).
+
+### Performance
+
+- Rustdoc published once with per-locale asset dedup (#7754).
+- WeChat markdown regex compilations cached via `LazyLock` (#7494).
+- Skill-directory loads cached with content validation (#7786).
+
+## Bug Fixes
+
+| Area | Fix |
+|---|---|
+| runtime | Route stdout diagnostics through logs (#7934); replay ACP session history in `session/messages` (#7903); credential redaction moved to the rendering layer (#7826); skip response-cache for `[IMAGE:]` multimodal markers (#7779); honor profile tool iteration limits (#7583); forward trimming budgets through the `agent_turn` wrapper (#7780); auto-include discovered MCP tools in `risk_profile.allowed_tools` (#7547); thread shared `CanvasStore` into WS chat and ACP sessions (#7678); resolve runtime profiles for direct turns (#7792); restore native sandbox hardening (#7683); detect no-progress loops across interleaved tool calls (#7681); redact unquoted base64 credentials (#7660); recover poisoned activated-tool lock reads (#7755); keep pruned tool markers out of live context (#7775); condition anti-narration on `show_tool_calls` (#7722); return no heartbeat runs for zero limit (#7721); route native tool narration to stderr (#7773); unify `SopEngine` construction (#7546); honor empty delegate allowed-tools (#7574); expose deferred MCP tools to delegates (#7608); route service commands to named instances (#7579); suppress skill suggestions for installed tools (#7406); clarify peer send targets (#6993); preserve delegate memory namespace (#7465); inherit ACP session cwd into `spawn_subagent` and `delegate` (#7517). |
+| zerocode | Refresh agent picker on Code/Chat tab re-entry (#7834); enforce RPC-only boundary by dropping `zeroclaw-providers` (#7850); grapheme-cluster cursor movement and backspace (#7765); localize config status messages (#7713); avoid hardcoded `vi` editor fallback (#7476); theme markdown body text (#7482); keep Cmd-C separate from quit on macOS (#7477). |
+| providers | Normalize Azure OpenAI credentials (#7703); retry email OAuth refresh failures (#7745); stop `reasoning_content` from leaking into response text (#7725); preserve structured Bedrock tool results (#7712); redact reliable error endpoints consistently (#7682); preserve compatible reasoning field name on multi-turn replay (#7423); cache OpenRouter system prompts (#7634); fail loudly for unusable fallback providers (#7419); resolve Gemini OAuth project from object and current-project shapes (#7560); remove dead pre-normalization image trim (#7782); honor configured OpenAI `timeout_secs` (#7504). |
+| channels | Dedupe QQ voice redeliveries (#7648); add per-channel `ack_reactions` override for Lark/Feishu (#7495); make Slack `bot_token` optional and resolve from env (#7726); persist Matrix thread history after first reply (#7705); require IRC mention boundaries (#7710); add clear-session command (#7671); Telegram base URL validation (#7697); stabilize missing email message ids (#7767); make Slack empty-peer-set rejections self-diagnose (#7567); skip reply-intent classifier on direct messages (#7564); WhatsApp as a cron delivery channel (#7562); select WhatsApp Web backend from personal/pairing config (#7565); WhatsApp Web forward quoted media attachments (#7536); telegram delivery prompt no longer discourages tool use (#7438); route cron email delivery through the no-registry fallback (#7561); AMQP `health_check` actually probes the broker (#7596); render web integration category labels (#7662); persist Discord slash reconcile state and read shared stores from `data_dir` (#7784); inject Lark/Feishu cron delivery defaults from chat context (#7448); render web agent's own model on agent chat page (#7381). |
+| acp | Surface history-pruner and turn-cancel as visible events (#7684). |
+| gateway | Suggest available port on bind conflict (#7801); surface pairing-code recovery when already paired on an alternate port (#7798); fail fast on free-form `ask_user` for the WS approval channel (#7551); route chat workspaces per agent (#7573); point paircode recovery hint at loopback for non-loopback binds (#7207). |
+| config | Align serde defaults with struct `Default` to prevent save round-trip loss (#7532); expose global channel settings in dashboard (#7651); trim legacy typed scalar strings (#7714); gate test-only `EnvValueGuard` on `cfg(unix)` (#7777); warn on extra-nested provider alias tables (#7580); redact bearer tokens in file-transfer header maps (#7566). |
+| memory | Drop postgres client on OS thread to avoid nested runtime panic (#7668); include recall windows in retrieval cache key (#7656); disable hot response cache at zero capacity (#7704); `purge_agent` resolves alias→id before deleting (#7781). |
+| tools | Reject binary/image files in default `file_read` (#7522); fix Claude Code execution on Windows (#7214); reject excessive round precision (#7716); default zero-minute polls (#7707); encode weather location path input (#7717); localize file download tool strings (#7480). |
+| skills | Parse skill review summary from tool history (#7730); distinct error when `skill_manage` patch is disabled (#6684); sanitize skill tool names to satisfy provider name regex (#7399); respect `timeout_secs` from `SKILL.toml` (#7552); update background review loop call (#7653). |
+| cron | Honor `session_target=main` with stable session path (#7731); correct weekday range normalization for Sunday-alias endpoints (#7208). |
+| i18n | Auto-detect system locale when none is configured (#7760); route remaining CLI status output through Fluent (#7499); localize remaining CLI quickstart strings (#7650) and provider selector prompts. |
+| install | Detect musl libc for Linux target triple (#7614); install web dashboard on source installs (#7554); validate agent/provider aliases at input time (#7609); bail with a clear error on non-TTY stdin (#7513). |
+| update | Accept `.zip` release assets on Windows targets (#7530); use `.tar.gz` for Windows assets in gnu-vs-android test (#7528). |
+| security | Create per-agent workspace dir in `for_agent`, plus Android shell support (#7284). |
+| docker | Include `zerocode` binary in release Docker images (#7789); add `g++` to web build layer for cc-rs C++ detection (#7534); add `vim-tiny` to runtime images for editor support (#7503). |
+| doctor | Surface `Config::collect_warnings` in diagnostics (#7727); ensure workspace doctor checks support multi-agents (#7544). |
+| daemon | Allow any configured channel as `heartbeat.target` (#7680). |
+| agent | Emit pending `tool_call` at dispatch so live cards render (#7778). |
+| sop | Wire audit logger into registered SOP tools (#7593). |
+| plugins | Align install/discovery paths and add legacy migration (#7549). |
+| whatsapp | `whatsapp_storage` returns `HashState::default()` when no app-state version row exists (#7806). |
+| cli | Preserve UTF-8 erase handling (#7672). |
+| ci | Centralize Node.js version to `.nvmrc` with LTS 24 (#7550); narrow Kilo provider path label (#7812); unbreak master quality gate (#7696); cover Windows path and shell portability in tests (#7906). |
+| web | Force `js-yaml >=4.2.0` to patch merge-key DoS (#7761); correct chat model switcher resolution and switch timeout (#7191). |
+| docs | Clear rustdoc warnings surfaced by mdbook build (#7751); add `.nojekyll` so Pages serves `_shared/` chrome (#7568). |
+| web/integrations | Tighten Nextcloud Talk draft updates (#7572). |
+
+## Breaking Changes
+
+- **`feat(providers)!`: span attribution — model provider calls now route through the attribution dispatcher** (#7748). The dispatcher centralizes per-provider span attribution and is the only sanctioned path for model provider calls; downstream consumers of the provider call API may need to update if they were bypassing it.
 
 ## Contributors
 
-### Join in
-
-Over 100 people landed work in this release, most of them for the first time. If ZeroClaw does something almost right for you, that gap is a great first PR: a fix, a doc correction, a channel quirk, a provider you wish existed. Start with the [contributing guide](https://docs.zeroclawlabs.ai/master/en/contributing/index.html), open an issue if you want a sanity check first, and we will review it. The review queue moves daily.
-
-### One of us
-
-@0disoft, @abhinavmathur-atlan, @AbubakrSamsodien, @alex-nax, @alexandme, @aliasliao, @Alix-007, @arucil, @ATECHPCS, @Audacity88, @BernardKuo, @bheatwole, @bitscrafts, @casualjim, @chengzhichao-xydt, @ConYel, @DaBlitzStein, @drbparadise, @eastriverlee, @easyteacher, @eldar702, @fanchanghu, @flyin1600, @forsakenyang, @fresh-fx59, @FTDGRT, @g0ne150, @garacio, @guitaripod, @h03-xydt, @hanZeng-08, @IftekharUddin, @ilteoood, @itripn, @jeffjhunter, @joe2643, @johnrspeer83-png, @jokemanfire, @JordanTheJet, @jstar0, @kanmars, @kapelame, @kitswas, @kmsquire, @kristofferkoch, @locnh-ssid, @LuaniiMM, @markuman, @mastwet, @metalmon, @michidk, @mminkus, @mn13, @mov-xound-glitch, @nebullii, @Nillth, @ninenox, @NiuBlibing, @nixosclaw, @ozzyfly, @patrickzzz, @perlowja, @Project516, @puneetdixit200, @r4mmer, @rareba, @Rhoahndur, @rifuki, @roywong10, @RyanHoldren, @sbenedetto, @SebConejo, @sentinel-nnet, @silas-qiao, @SimianAstronaut7, @singlerider, @spacelobster88, @SpectreMercury, @Stealinglight, @Tenith01, @TeoConnexioh, @TheBlindM, @theonlyhennygod, @theredspoon, @thezillo, @tidux, @TJUEZ, @tmigone, @tylerjenningsw, @vernonstinebaker, @vrurg, @WareWolf-MoonWall, @whtiehack, @xianshishan, @XiaoliangWang1991, @xydigit-sj, @xydigitLybnnnn, @yanalialiuk, @yexca, @yijunyu, @Yyukan, @zwffff
+@77382104
+@alanpjohn
+@alexandme
+@Alix-007
+@andybab
+@Audacity88
+@bheatwole
+@chengzhichao-xydt
+@ConYel
+@crh-code
+@danielO99
+@dvgamerr
+@dwc1997
+@fanchanghu
+@IftekharUddin
+@ilteoood
+@itripn
+@JieZeng1993
+@jokemanfire
+@JordanTheJet
+@jstar0
+@metalmon
+@mn13
+@mov-xound-glitch
+@Nillth
+@NiuBlibing
+@perlowja
+@Pick-cat
+@PierreLeGuen
+@rareba
+@rezigned
+@rifuki
+@RyanHoldren
+@sbenedetto
+@SebConejo
+@sentinel-nnet
+@silas-qiao
+@singlerider
+@theonlyhennygod
+@tidux
+@tmigone
+@tw-360vier
+@whiteyzy
+@xianshishan
+@Yyukan
 
 ---
 
-Full diff: https://github.com/zeroclaw-labs/zeroclaw/compare/v0.7.5...v0.8.0
+**Full diff:** [`v0.8.0...v0.8.1`](https://github.com/zeroclaw-labs/zeroclaw/compare/v0.8.0...v0.8.1)
