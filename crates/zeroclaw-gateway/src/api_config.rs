@@ -1555,9 +1555,46 @@ async fn rename_agent_cascade(
     // (custom paths are read off the entry, which is about to move).
     let old_ws = working.agent_workspace_dir(from);
 
-    let report = match alias_refs::rename_with_cascade(&mut working, &AliasKind::Agent, from, to) {
-        Ok(r) => r,
-        Err(e) => return rename_error_response(&body.path, from, e),
+    // RESUME-AFTER-PARTIAL-FAILURE (#7907 review feedback): the prior
+    // persist-first fix left a partial-failure window where config is durably
+    // `to` while workspace / owned stores still lag at `from`. The handler's
+    // own WARN log told the operator to "re-issue the rename to converge" —
+    // but the API rejected that retry with `RenameError::NotFound` before any
+    // side-effect could run (the source alias is gone from the committed
+    // config). Detect that post-persist split-brain HERE, at the API entry,
+    // and short-circuit `rename_with_cascade` so the same request converges
+    // by running ONLY the side-effects. `working` is replaced with the
+    // post-swap config from `state.config` so the rest of the path (which
+    // reads `working.agent_workspace_dir(to)` etc.) sees a consistent view.
+    let mut resumed = false;
+    let report = if !working.agents.contains_key(from) && working.agents.contains_key(to) {
+        // RESUME-AFTER-PARTIAL-FAILURE (#7907 review feedback): the prior
+        // persist-first fix left a partial-failure window where config is
+        // durably `to` while workspace / owned stores still lag at `from`.
+        // The handler's own WARN log told the operator to "re-issue the
+        // rename to converge" — but the API rejected that retry because
+        // `rename_map_key` either NotFound-ed on `from` or InvalidName-ed
+        // on `to already exists`, before any side-effect could run. Detect
+        // that post-persist split-brain HERE, at the API entry, and
+        // short-circuit `rename_with_cascade` so the same request converges
+        // by running ONLY the side-effects. `working` is replaced with the
+        // post-swap config from `state.config` so the rest of the path
+        // (which reads `working.agent_workspace_dir(to)` etc.) sees a
+        // consistent view. `RenameReport` is empty because the in-memory
+        // rewrite already happened on the prior call.
+        working = state.config.read().clone();
+        resumed = true;
+        zeroclaw_config::alias_refs::RenameReport {
+            target_kind: zeroclaw_config::alias_refs::AliasKind::Agent,
+            old_alias: from.to_string(),
+            new_alias: to.to_string(),
+            dirty_paths: Vec::new(),
+        }
+    } else {
+        match alias_refs::rename_with_cascade(&mut working, &AliasKind::Agent, from, to) {
+            Ok(r) => r,
+            Err(e) => return rename_error_response(&body.path, from, e),
+        }
     };
     for path in &report.dirty_paths {
         working.mark_dirty(path);
@@ -1575,6 +1612,11 @@ async fn rename_agent_cascade(
     // fixed. Persisting first means an early failure here leaves config,
     // workspace, and owned state all consistently on `from`: a clean abort
     // (`persist_and_swap` reverts the on-disk file and never swaps `state.config`).
+    //
+    // On the resume path the config is already committed to `to` from the
+    // prior call, so `persist_and_swap` is a no-op write of the same state —
+    // we still call it for symmetry so the success/failure branch below
+    // doesn't need to special-case `resumed`.
     if let Err(e) = persist_and_swap(state, working).await {
         return error_response(e);
     }
@@ -1582,15 +1624,20 @@ async fn rename_agent_cascade(
     // Config is now durably `to` and authoritative in `state.config`. Run the
     // external side-effects against the committed config (read a short-lived
     // clone — never hold the lock guard across an `.await`). Each side-effect is
-    // best-effort and surfaced as a warning; persist-first makes them all
-    // idempotently re-runnable from the corrected config (the workspace move
-    // early-returns once the source is gone; every owned-store op re-points by
-    // `WHERE agent_alias = from`), so re-issuing the same rename converges.
+    // best-effort and surfaced as a warning. Re-issuing the same rename
+    // converges because the resume detection above skips `rename_with_cascade`
+    // and re-runs the side-effects against the corrected config (the workspace
+    // move early-returns once the source is gone; every owned-store op
+    // re-points by `WHERE agent_alias = from`).
     let cfg = state.config.read().clone();
 
     // Move the workspace dir. For the default per-alias location this is
     // `<install>/agents/<from>/workspace` → `…/<to>/workspace`. A custom
     // workspace path is alias-independent, so `old_ws == new_ws` and we skip.
+    // On the resume path `old_ws` was resolved from the original `working`
+    // BEFORE the resume short-circuit replaced it; if the prior call already
+    // moved the workspace, `old_ws.exists()` is false and this is a no-op
+    // (idempotent). Same for the owned-state cascade below.
     let ws_existed = old_ws != new_ws && old_ws.exists();
     let move_warning = move_renamed_workspace(&old_ws, &new_ws).await;
     let workspace_moved = ws_existed && move_warning.is_none();
@@ -1613,16 +1660,20 @@ async fn rename_agent_cascade(
     // The config rename committed. A non-empty `warnings` means a post-persist
     // side-effect did not follow (config is `to`, some follower lags at `from`,
     // re-runnable) — escalate to WARN so that degraded outcome is visible
-    // operationally instead of buried at INFO.
+    // operationally instead of buried at INFO. On the resume path the
+    // side-effects are intentionally re-run; the WARN reflects whether the
+    // resume was fully successful.
     if warnings.is_empty() {
-        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"from": from, "to": to, "memory": owned.memory_rows, "cron": owned.cron_jobs, "acp": owned.acp_sessions, "sessions": owned.sessions_repointed, "workspace_moved": workspace_moved, "dirty_paths": dirty_count})), "agent renamed with owned-state cascade");
+        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"from": from, "to": to, "memory": owned.memory_rows, "cron": owned.cron_jobs, "acp": owned.acp_sessions, "sessions": owned.sessions_repointed, "workspace_moved": workspace_moved, "dirty_paths": dirty_count, "resumed": resumed})), "agent renamed with owned-state cascade");
     } else {
-        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"from": from, "to": to, "memory": owned.memory_rows, "cron": owned.cron_jobs, "acp": owned.acp_sessions, "sessions": owned.sessions_repointed, "workspace_moved": workspace_moved, "dirty_paths": dirty_count, "warnings": warnings})), "agent rename persisted but a post-persist side-effect did not follow; re-issue the rename to converge");
+        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"from": from, "to": to, "memory": owned.memory_rows, "cron": owned.cron_jobs, "acp": owned.acp_sessions, "sessions": owned.sessions_repointed, "workspace_moved": workspace_moved, "dirty_paths": dirty_count, "resumed": resumed, "warnings": warnings})), "agent rename persisted but a post-persist side-effect did not follow; re-issue the rename to converge");
     }
 
     // Persisted rename. `warnings` carries any post-persist side-effect that did
     // not follow, so the split can be remediated rather than reported as a clean
-    // success (207-style partial success).
+    // success (207-style partial success). `renamed: true` reflects the config
+    // commit (which may have happened on a prior call) — `resumed` (logged)
+    // distinguishes the first-call vs resume-call paths.
     axum::Json(RenameMapKeyResponse {
         path: body.path.clone(),
         from: from.clone(),
@@ -2517,6 +2568,121 @@ mod tests {
         assert!(!old_ws.exists(), "old workspace no longer present");
         // (MockMemory.rename_agent is unsupported, so the response `warnings`
         // carries that one known memory line — cron + workspace prove the move.)
+    }
+
+    /// #7907 review feedback (Audacity88 / WareWolf-MoonWall / singlerider):
+    /// the prior persist-first fix left a partial-failure window where the
+    /// config rename was durable but a post-persist side-effect (workspace
+    /// move, owned-DB cascade) had not followed. The handler's own WARN log
+    /// told the operator to "re-issue the rename to converge" — but the API
+    /// rejected the retry with `RenameError::NotFound` because the source
+    /// alias is gone from the committed config. This test forces that exact
+    /// split-brain state (config durably `to`, workspace + cron still at
+    /// `from`) and proves the resume-aware path now converges the side-
+    /// effects on the second call.
+    #[tokio::test]
+    async fn agent_rename_reissue_converges_post_persist_partial_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        // Agent under `from` with a resolvable risk_profile + an allowed cron
+        // command, so cron::add_job accepts a job tied to the agent.
+        let from_agent = zeroclaw_config::schema::AliasedAgentConfig {
+            risk_profile: "default".into(),
+            ..Default::default()
+        };
+        config.agents.insert("from".to_string(), from_agent);
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        config.runtime_profiles.entry("default".into()).or_default();
+        let old_ws = config.agent_workspace_dir("from");
+        std::fs::create_dir_all(&old_ws).unwrap();
+        zeroclaw_runtime::cron::add_job(&config, "from", "* * * * *", "echo hi")
+            .expect("seed cron job");
+
+        let state = crate::api::test_state(config.clone());
+        let body = RenameMapKeyBody {
+            path: "agents".to_string(),
+            from: "from".to_string(),
+            to: "to".to_string(),
+        };
+
+        // ── Simulate the post-persist split-brain: commit the config rename
+        // (so config durably says `to`) but DO NOT move the workspace or
+        // re-point the cron row. This is exactly the state a partially-failed
+        // first call would leave behind.
+        working_simulation_to(&mut config, "from", "to");
+        let persist_cfg = config.clone();
+        let _ = persist_and_swap(&state, persist_cfg).await;
+        // Sanity: config is now durably `to` and the source alias is gone.
+        assert!(state.config.read().agents.contains_key("to"));
+        assert!(!state.config.read().agents.contains_key("from"));
+        // Cron row and workspace are still at `from` (no side-effect ran).
+        assert_eq!(
+            zeroclaw_runtime::cron::list_jobs_by_agent(&config, "from")
+                .unwrap()
+                .len(),
+            1,
+            "precondition: cron row still at `from` (no side-effect ran)"
+        );
+        assert!(
+            old_ws.exists(),
+            "precondition: workspace still at `from` (no side-effect ran)"
+        );
+
+        // ── Re-issue the same rename. Pre-fix the API would 4xx with
+        // `RenameError::NotFound` at `rename_map_key`. The resume-aware
+        // path detects `from`-absent + `to`-present in the entry
+        // `working` and short-circuits straight to the side-effects.
+        let resp = rename_agent_cascade(&state, config.clone(), &body).await;
+        assert!(
+            resp.status().is_success(),
+            "re-issuing the same rename must converge (200 OK), not 4xx"
+        );
+
+        // ── Convergence assertions: workspace + cron now on `to`, nothing on
+        // `from`. The split-brain is healed by the second call.
+        assert!(
+            state.config.read().agent_workspace_dir("to").exists(),
+            "workspace converged to `to` on resume"
+        );
+        assert!(
+            !old_ws.exists(),
+            "old workspace no longer present after resume"
+        );
+        assert_eq!(
+            zeroclaw_runtime::cron::list_jobs_by_agent(&config, "to")
+                .unwrap()
+                .len(),
+            1,
+            "cron converged to `to` on resume"
+        );
+        assert!(
+            zeroclaw_runtime::cron::list_jobs_by_agent(&config, "from")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Helper: simulate the post-persist config-rename shape that
+    /// `rename_with_cascade` would leave on a partially-failed first call.
+    /// Re-runs the same in-memory rewrite + dirty-mark the production code
+    /// would have done, but stops short of moving the workspace or touching
+    /// owned-DB state — i.e. the split-brain we want to recover from.
+    fn working_simulation_to(working: &mut zeroclaw_config::schema::Config, from: &str, to: &str) {
+        use zeroclaw_config::alias_refs::{self, AliasKind};
+        let report = alias_refs::rename_with_cascade(working, &AliasKind::Agent, from, to)
+            .expect("simulation: in-memory rename succeeds");
+        for path in &report.dirty_paths {
+            working.mark_dirty(path);
+        }
     }
 
     #[test]
