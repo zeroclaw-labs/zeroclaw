@@ -143,9 +143,19 @@ impl Tool for ClaudeCodeTool {
         // non-existent paths instead of falling back to the raw value, which
         // could bypass the workspace containment check via symlinks or
         // specially-crafted path components).
+        //
+        // Relative paths are resolved against workspace_dir (not the process
+        // cwd) so that "." or "src" always refers to the configured workspace.
         let work_dir = if let Some(wd) = args.get("working_directory").and_then(|v| v.as_str()) {
-            let wd_path = std::path::PathBuf::from(wd);
             let workspace = &self.security.workspace_dir;
+            // Join with workspace_dir if the path is relative; use it as-is if
+            // already absolute.  This matches the expected behaviour where a
+            // relative working_directory is workspace-relative.
+            let wd_path = if std::path::Path::new(wd).is_absolute() {
+                std::path::PathBuf::from(wd)
+            } else {
+                workspace.join(wd)
+            };
             let canonical_wd = match wd_path.canonicalize() {
                 Ok(p) => p,
                 Err(_) => {
@@ -441,6 +451,55 @@ mod tests {
                 .unwrap_or("")
                 .contains("outside the workspace")
         );
+    }
+
+    #[tokio::test]
+    async fn claude_code_relative_working_directory_resolves_against_workspace() {
+        // Create a real subdirectory inside the test workspace so canonicalize
+        // succeeds.  The fix ensures the path is joined with workspace_dir first,
+        // not resolved from the process cwd.
+        let workspace = std::env::temp_dir();
+        let subdir = workspace.join("claude-code-test-subdir");
+        std::fs::create_dir_all(&subdir).ok();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        });
+        let tool = ClaudeCodeTool::new(security, test_config());
+
+        // "relative" is resolved against workspace, not cwd — so
+        // workspace/relative exists (after we canonicalise it).
+        let result = tool
+            .execute(json!({
+                "prompt": "hello",
+                // subdirectory name that exists inside workspace
+                "working_directory": subdir.file_name().unwrap().to_str().unwrap()
+            }))
+            .await;
+        // We expect either success (tool ran) or an error about the binary
+        // not being found — NOT "does not exist or is not accessible", which
+        // would indicate it looked in the wrong place.
+        match result {
+            Ok(r) if !r.success => {
+                let err = r.error.as_deref().unwrap_or("");
+                // Binary-not-found is acceptable; path-not-found is the bug.
+                assert!(
+                    !err.contains("does not exist or is not accessible"),
+                    "relative working_directory was resolved against cwd instead of workspace: {err}"
+                );
+            }
+            Err(e) => {
+                // Execution error (binary not found) is fine; canonicalize failure
+                // would indicate the wrong base directory.
+                assert!(
+                    !e.to_string().contains("does not exist"),
+                    "relative working_directory was resolved against cwd instead of workspace"
+                );
+            }
+            _ => {}
+        }
     }
 
     #[test]

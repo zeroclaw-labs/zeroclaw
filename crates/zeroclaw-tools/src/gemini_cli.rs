@@ -91,9 +91,19 @@ impl Tool for GeminiCliTool {
         // non-existent paths instead of falling back to the raw value, which
         // could bypass the workspace containment check via symlinks or
         // specially-crafted path components).
+        //
+        // Relative paths are resolved against workspace_dir (not the process
+        // cwd) so that "." or "src" always refers to the configured workspace.
         let work_dir = if let Some(wd) = args.get("working_directory").and_then(|v| v.as_str()) {
-            let wd_path = std::path::PathBuf::from(wd);
             let workspace = &self.security.workspace_dir;
+            // Join with workspace_dir if the path is relative; use it as-is if
+            // already absolute.  This matches the expected behaviour where a
+            // relative working_directory is workspace-relative.
+            let wd_path = if std::path::Path::new(wd).is_absolute() {
+                std::path::PathBuf::from(wd)
+            } else {
+                workspace.join(wd)
+            };
             let canonical_wd = match wd_path.canonicalize() {
                 Ok(p) => p,
                 Err(_) => {
@@ -326,6 +336,46 @@ mod tests {
                 .unwrap_or("")
                 .contains("outside the workspace")
         );
+    }
+
+    #[tokio::test]
+    async fn gemini_cli_relative_working_directory_resolves_against_workspace() {
+        // Verify that a relative path existing inside the workspace is accepted
+        // (i.e. it is resolved against workspace_dir, not cwd).
+        let workspace = std::env::temp_dir();
+        let subdir = workspace.join("gemini-cli-test-subdir");
+        std::fs::create_dir_all(&subdir).ok();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        });
+        let tool = GeminiCliTool::new(security, test_config());
+
+        let result = tool
+            .execute(json!({
+                "prompt": "hello",
+                "working_directory": subdir.file_name().unwrap().to_str().unwrap()
+            }))
+            .await;
+
+        match result {
+            Ok(r) if !r.success => {
+                let err = r.error.as_deref().unwrap_or("");
+                assert!(
+                    !err.contains("does not exist or is not accessible"),
+                    "relative working_directory was resolved against cwd instead of workspace: {err}"
+                );
+            }
+            Err(e) => {
+                assert!(
+                    !e.to_string().contains("does not exist"),
+                    "relative working_directory was resolved against cwd instead of workspace"
+                );
+            }
+            _ => {}
+        }
     }
 
     #[test]
