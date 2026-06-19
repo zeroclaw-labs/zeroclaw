@@ -14,10 +14,12 @@ use axum::{
 };
 use serde::Deserialize;
 use zeroclaw_runtime::rpc::types::{
-    SkillBundleEntry, SkillListEntry, SkillsBundlesResult, SkillsListResult, SkillsReadResult,
+    AgentSkillEntry, AgentSkillsResult, SkillBundleEntry, SkillListEntry, SkillsBundlesResult,
+    SkillsListResult, SkillsReadResult,
 };
 use zeroclaw_runtime::skills::{
-    RemoveMode, ScaffoldOptions, ServiceError, SkillFrontmatter, SkillsService,
+    EffectiveSkill, RemoveMode, ScaffoldOptions, ServiceError, SkillFrontmatter, SkillOrigin,
+    SkillsService,
 };
 
 use super::AppState;
@@ -109,6 +111,53 @@ pub async fn handle_list_skills(
         })
         .into_response(),
         Err(e) => service_error_response(e),
+    }
+}
+
+/// `GET /api/agents/:alias/skills` — the agent's *effective* resolved skill set
+/// (workspace / open-skills / plugin / bundle), with provenance (#7757). Unlike
+/// `/api/skills/bundles/:alias/skills` (bundle-only), this mirrors what the
+/// runtime actually loads for the agent, so the dashboard stops rendering an
+/// empty page when an agent has workspace/open-skills/plugin skills.
+pub async fn handle_agent_skills(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(alias): Path<String>,
+) -> Response {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+    let config = state.config.read().clone();
+    let install_root = config.install_root_dir();
+    let service = SkillsService::new(&config, install_root);
+
+    match service.resolve_effective_skills(&alias) {
+        Ok(skills) => Json(AgentSkillsResult {
+            agent: alias,
+            skills: skills.into_iter().map(agent_skill_entry).collect(),
+        })
+        .into_response(),
+        Err(e) => service_error_response(e),
+    }
+}
+
+/// Map a runtime [`EffectiveSkill`] to its flat wire shape (`origin` string +
+/// optional `plugin`/`bundle` detail). `editable`/`directory` pass through.
+fn agent_skill_entry(s: EffectiveSkill) -> AgentSkillEntry {
+    let (origin, plugin, bundle) = match s.origin {
+        SkillOrigin::Workspace => ("workspace", None, None),
+        SkillOrigin::OpenSkills => ("open-skills", None, None),
+        SkillOrigin::Plugin(p) => ("plugin", Some(p), None),
+        SkillOrigin::Bundle(a) => ("bundle", None, Some(a)),
+    };
+    AgentSkillEntry {
+        name: s.name,
+        description: s.description,
+        origin: origin.to_string(),
+        plugin,
+        bundle,
+        directory: s.directory.map(|d| d.display().to_string()),
+        editable: s.editable,
     }
 }
 

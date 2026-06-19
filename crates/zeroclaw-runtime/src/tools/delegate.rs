@@ -1,4 +1,4 @@
-use crate::agent::loop_::{LoopKnobs, TOOL_LOOP_SESSION_KEY, run_tool_call_loop};
+use crate::agent::loop_::{LoopKnobs, TOOL_LOOP_SESSION_KEY, ToolLoop, run_tool_call_loop};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::security::SecurityPolicy;
@@ -1888,44 +1888,47 @@ impl DelegateTool {
         let collected_receipts = receipt_scope.as_ref().map(|s| s.collector.as_ref());
         let result = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
-            run_tool_call_loop(
+            run_tool_call_loop(ToolLoop {
                 model_provider,
-                &mut history,
-                &sub_tools,
-                &noop_observer,
-                provider_type,
+                history: &mut history,
+                tools_registry: &sub_tools,
+                observer: &noop_observer,
+                provider_name: provider_type,
                 model,
                 temperature,
-                true,
-                None,
-                "delegate",
-                None,
-                &self.multimodal_config,
-                loop_runtime.max_tool_iterations,
-                Some(self.cancellation_token.child_token()),
-                None,
-                None,
-                &[],
-                tool_policy.excluded_tools.as_deref().unwrap_or(&[]),
-                None,
-                None,
-                &zeroclaw_config::schema::PacingConfig::default(),
-                loop_runtime.strict_tool_parsing,
-                loop_runtime.parallel_tools,
-                loop_runtime.max_tool_result_chars,
+                silent: true,
+                approval: None,
+                channel_name: "delegate",
+                channel_reply_target: None,
+                multimodal_config: &self.multimodal_config,
+                max_tool_iterations: loop_runtime.max_tool_iterations,
+                cancellation_token: Some(self.cancellation_token.child_token()),
+                on_delta: None,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: tool_policy.excluded_tools.as_deref().unwrap_or(&[]),
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: loop_runtime.strict_tool_parsing,
+                parallel_tools: loop_runtime.parallel_tools,
+                max_tool_result_chars: loop_runtime.max_tool_result_chars,
                 // Keep delegate subagent context pruning aligned with top-level
                 // agents instead of preserving the old disabled-by-zero path.
-                loop_runtime.max_context_tokens,
-                None, // shared_budget: TODO thread from parent in future
-                None, // channel: delegate subagents don't support approval
+                context_token_budget: loop_runtime.max_context_tokens,
+                shared_budget: None, // TODO thread from parent in future
+                channel: None,       // delegate subagents don't support approval
                 receipt_generator,
                 collected_receipts,
-                None, // event_tx
-                None, // steering
-                None, // new_messages_out
-                &LoopKnobs::default(),
-                None,
-            )
+                event_tx: None,
+                steering: None,
+                new_messages_out: None,
+                knobs: &LoopKnobs::default(),
+                image_cache: None,
+                // Phase 1: stamp Internal/Trusted. Real per-transport
+                // stamping is PR C (RFC #6971 §4).
+                ingress: zeroclaw_api::ingress::IngressContext::internal(),
+            })
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(agent_name)
             )),
