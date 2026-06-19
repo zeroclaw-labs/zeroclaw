@@ -960,6 +960,11 @@ impl RpcDispatcher {
                 .evict_same_mode_sibling(tui_id, &chat_mode, &session_id)
                 .await;
             if !evicted.is_empty() {
+                if let Some(ref hooks) = self.ctx.hooks {
+                    for (sid, _) in &evicted {
+                        hooks.fire_session_end(sid, "rpc").await;
+                    }
+                }
                 let span = ::zeroclaw_log::info_span!(
                     target: "zeroclaw_log_internal_scope",
                     "zeroclaw_scope",
@@ -1012,6 +1017,9 @@ impl RpcDispatcher {
                     Ok(Ok(AcpSessionNewLoad::Restored(data)))
                 } else {
                     let Some(ref store) = self.ctx.acp_session_store else {
+                        if let Some(ref hooks) = self.ctx.hooks {
+                            hooks.fire_session_end(&session_id, "rpc").await;
+                        }
                         self.ctx.sessions.remove(&session_id).await;
                         return Err(rpc_err(
                             INTERNAL_ERROR,
@@ -1049,10 +1057,16 @@ impl RpcDispatcher {
                     }
                     Ok(Ok(AcpSessionNewLoad::Created)) => {}
                     Ok(Ok(AcpSessionNewLoad::Killed)) => {
+                        if let Some(ref hooks) = self.ctx.hooks {
+                            hooks.fire_session_end(&session_id, "rpc").await;
+                        }
                         self.ctx.sessions.remove(&session_id).await;
                         return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
                     }
                     Ok(Err(e)) => {
+                        if let Some(ref hooks) = self.ctx.hooks {
+                            hooks.fire_session_end(&session_id, "rpc").await;
+                        }
                         self.ctx.sessions.remove(&session_id).await;
                         ::zeroclaw_log::record!(
                             WARN,
@@ -1067,6 +1081,9 @@ impl RpcDispatcher {
                         ));
                     }
                     Err(join) => {
+                        if let Some(ref hooks) = self.ctx.hooks {
+                            hooks.fire_session_end(&session_id, "rpc").await;
+                        }
                         self.ctx.sessions.remove(&session_id).await;
                         ::zeroclaw_log::record!(
                             WARN,
@@ -1093,6 +1110,10 @@ impl RpcDispatcher {
                     }
                 }
             }
+        }
+
+        if let Some(ref hooks) = self.ctx.hooks {
+            hooks.fire_session_start(&session_id, "rpc").await;
         }
 
         to_result(SessionNewResult {
@@ -1140,6 +1161,9 @@ impl RpcDispatcher {
             // rather than at end-of-scope, letting the allocator reclaim
             // promptly.
             drop(agent);
+        }
+        if let Some(ref hooks) = self.ctx.hooks {
+            hooks.fire_session_end(&req.session_id, "rpc").await;
         }
         if !self.ctx.sessions.remove(&req.session_id).await {
             return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
@@ -1230,6 +1254,9 @@ impl RpcDispatcher {
 
         let killed = self.ctx.sessions.kill_session(sid).await;
         if killed {
+            if let Some(ref hooks) = self.ctx.hooks {
+                hooks.fire_session_end(sid, "rpc").await;
+            }
             crate::util::release_freed_heap();
             ::zeroclaw_log::record!(
                 INFO,
@@ -2257,6 +2284,9 @@ impl RpcDispatcher {
                 .await
                 .channel_handles()
                 .unregister_channel("rpc");
+        }
+        if let Some(ref hooks) = self.ctx.hooks {
+            hooks.fire_session_end(&req.session_id, "rpc").await;
         }
         self.ctx.sessions.remove(&req.session_id).await;
         // Remove from persistent backend — try raw id, then prefixed variants.
