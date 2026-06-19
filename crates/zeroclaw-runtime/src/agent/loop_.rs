@@ -938,6 +938,7 @@ pub async fn run(
     );
     let __zc_body = async move {
         let agent_alias: &str = __zc_alias.as_str();
+        crate::i18n::init(&crate::i18n::detect_locale());
         // ── Effective per-agent runtime tunables ──────────────────────
         // Profile values (when set) override the agent's inline fields.
         // See `Config::resolved_agent_config` for precedence rules.

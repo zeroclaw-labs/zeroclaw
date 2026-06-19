@@ -745,8 +745,8 @@ cli-bundle-warn-move = 警告：bundle 目录移动失败：{$error}
 cli-bundle-renamed = 已重命名 skill_bundles.{$from} → skill_bundles.{$to}
 
 # ── Context window (doctor update-context-windows, agent interactive) ──
-cli-agent-context-bar = ctx: {used:>7} / {max:>7}  [{bar}]  {pct:.0}%
-cli-agent-context-bar-unknown = ctx: 未知 / {max:>7}
+cli-agent-context-bar = ctx: {used} / {max}  [{bar}]  {pct}%
+cli-agent-context-bar-unknown = ctx: 未知 / {max}
 cli-doctor-ctxwin-already-set = {provider_ref}: 已有 context_window = {ctx}
 cli-doctor-ctxwin-no-model = {provider_ref}: 未配置模型，跳过
 cli-doctor-ctxwin-would-set = {provider_ref}: 将设置 context_window = {ctx} (试运行)

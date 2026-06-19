@@ -449,10 +449,11 @@ pub async fn update_context_windows(
     provider_override: Option<&str>,
     dry_run: bool,
 ) -> anyhow::Result<usize> {
+    crate::i18n::init(&crate::i18n::detect_locale());
     let mut updated = 0usize;
 
     // Collect all the data we need first to avoid borrow conflicts
-    let targets: Vec<(String, String, Option<String>, Option<usize>)> =
+    let targets: Vec<(String, String, Option<String>, Option<String>, Option<usize>)> =
         if let Some(model_provider) = provider_override {
             // Single provider - use find_by_name to look up by "type.alias" format
             if let Some((_, _, entry)) = config.providers.models.find_by_name(model_provider) {
@@ -460,6 +461,7 @@ pub async fn update_context_windows(
                     model_provider.to_string(),
                     entry.model.clone().unwrap_or_default(),
                     entry.uri.clone(),
+                    entry.api_key.clone(),
                     entry.context_window,
                 )]
             } else {
@@ -476,13 +478,14 @@ pub async fn update_context_windows(
                         format!("{t}.{a}"),
                         e.model.clone().unwrap_or_default(),
                         e.uri.clone(),
+                        e.api_key.clone(),
                         e.context_window,
                     )
                 })
                 .collect()
         };
 
-    for (provider_ref, model, uri, existing_context_window) in targets {
+    for (provider_ref, model, uri, api_key, existing_context_window) in targets {
         // Skip if already has context_window set
         if let Some(ctx) = existing_context_window {
             let msg = crate::i18n::get_required_cli_string_with_args(
@@ -512,6 +515,7 @@ pub async fn update_context_windows(
             &zeroclaw_config::schema::ModelProviderConfig {
                 model: Some(model.clone()),
                 uri: uri.clone(),
+                api_key,
                 ..Default::default()
             },
         )

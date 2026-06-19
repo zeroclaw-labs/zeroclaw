@@ -166,6 +166,9 @@ fn load_cli_ftl_sources(locale: &str) -> CliFtlSources {
 
 fn builtin_cli_ftl_source(locale: &str) -> Option<&'static str> {
     match locale {
+        "es" => Some(include_str!("../locales/es/cli.ftl")),
+        "fr" => Some(include_str!("../locales/fr/cli.ftl")),
+        "ja" => Some(include_str!("../locales/ja/cli.ftl")),
         "zh-CN" => Some(include_str!("../locales/zh-CN/cli.ftl")),
         _ => None,
     }

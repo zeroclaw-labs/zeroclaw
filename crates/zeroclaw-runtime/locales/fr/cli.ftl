@@ -749,8 +749,8 @@ cli-bundle-warn-move = avertissement : échec du déplacement du répertoire de 
 cli-bundle-renamed = skill_bundles.{$from} → skill_bundles.{$to} renommé
 
 # ── Context window (doctor update-context-windows, agent interactive) ──
-cli-agent-context-bar = ctx: {used:>7} / {max:>7}  [{bar}]  {pct:.0}%
-cli-agent-context-bar-unknown = ctx: inconnu / {max:>7}
+cli-agent-context-bar = ctx: {used} / {max}  [{bar}]  {pct}%
+cli-agent-context-bar-unknown = ctx: inconnu / {max}
 cli-doctor-ctxwin-already-set = {provider_ref}: a déjà context_window = {ctx}
 cli-doctor-ctxwin-no-model = {provider_ref}: aucun modèle configuré, ignoré
 cli-doctor-ctxwin-would-set = {provider_ref}: définirait context_window = {ctx} (simulation)

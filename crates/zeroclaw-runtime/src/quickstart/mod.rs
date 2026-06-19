@@ -1078,18 +1078,21 @@ fn apply_model_provider(
             }
             // Auto-populate context_window from provider's /models endpoint if supported.
             // Silently ignores failures (falls back to config default).
+            // Only runs when there's a Tokio runtime (i.e., actual CLI, not tests).
             let provider_config = zeroclaw_config::schema::ModelProviderConfig {
                 model: Some(choice.model.clone()),
                 uri: config.get_prop(&format!("{prefix}.uri")).ok(),
                 ..Default::default()
             };
-            if let Some(ctx) = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(
-                    zeroclaw_providers::fetch_context_window(&provider_type, &provider_config),
-                )
-            }) {
-                let _ = config
-                    .set_prop_persistent(&format!("{prefix}.context_window"), &ctx.to_string());
+            if tokio::runtime::Handle::try_current().is_ok() {
+                if let Some(ctx) = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(
+                        zeroclaw_providers::fetch_context_window(&provider_type, &provider_config),
+                    )
+                }) {
+                    let _ = config
+                        .set_prop_persistent(&format!("{prefix}.context_window"), &ctx.to_string());
+                }
             }
             Some(format!("{}.{}", provider_type, choice.alias))
         }
