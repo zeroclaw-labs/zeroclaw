@@ -92,8 +92,20 @@ impl Tool for OpenCodeCliTool {
         // could bypass the workspace containment check via symlinks or
         // specially-crafted path components).
         let work_dir = if let Some(wd) = args.get("working_directory").and_then(|v| v.as_str()) {
-            let wd_path = std::path::PathBuf::from(wd);
+            if wd.trim().is_empty() {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("working_directory must not be empty".into()),
+                });
+            }
+            let mut wd_path = std::path::PathBuf::from(wd);
             let workspace = &self.security.workspace_dir;
+            // Resolve relative working_directory against the workspace
+            // root instead of the daemon's current directory (#7877).
+            if wd_path.is_relative() {
+                wd_path = workspace.join(&wd_path);
+            }
             let canonical_wd = match wd_path.canonicalize() {
                 Ok(p) => p,
                 Err(_) => {

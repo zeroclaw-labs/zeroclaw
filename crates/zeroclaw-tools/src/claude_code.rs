@@ -131,6 +131,13 @@ impl Tool for ClaudeCodeTool {
         // could bypass the workspace containment check via symlinks or
         // specially-crafted path components).
         let work_dir = if let Some(wd) = args.get("working_directory").and_then(|v| v.as_str()) {
+            if wd.trim().is_empty() {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("working_directory must not be empty".into()),
+                });
+            }
             let mut wd_path = std::path::PathBuf::from(wd);
             let workspace = &self.security.workspace_dir;
             // Resolve relative working_directory against the workspace
