@@ -26,7 +26,6 @@ use crate::ModelProviderRuntimeOptions;
 use crate::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
 use crate::traits::ModelProvider;
 use anyhow::Result;
-use std::path::PathBuf;
 
 /// Per-family construction trait. Implemented (directly or via the
 /// `CompatFamilySpec` blanket) by every typed `<Family>ModelProviderConfig`.
@@ -172,13 +171,6 @@ fn has_api_key(key: Option<&str>) -> bool {
 
 fn has_non_empty_value(value: Option<&str>) -> bool {
     value.map(str::trim).is_some_and(|value| !value.is_empty())
-}
-
-fn default_zeroclaw_dir() -> PathBuf {
-    directories::UserDirs::new().map_or_else(
-        || PathBuf::from(".zeroclaw"),
-        |dirs| dirs.home_dir().join(".zeroclaw"),
-    )
 }
 
 /// Apply cross-cutting compat post-processing (timeout, headers, api_path,
@@ -772,7 +764,7 @@ impl FamilyProviderFactory for XaiModelProviderConfig {
             let state_dir = opts
                 .zeroclaw_dir
                 .clone()
-                .unwrap_or_else(default_zeroclaw_dir);
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
             let auth_service = crate::auth::AuthService::new(&state_dir, opts.secrets_encrypt);
             p = p.with_auth_profile("xai", auth_service, opts.auth_profile_override.clone());
         }

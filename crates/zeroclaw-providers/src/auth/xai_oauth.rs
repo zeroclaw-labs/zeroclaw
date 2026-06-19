@@ -348,36 +348,20 @@ async fn parse_token_response(response: reqwest::Response) -> Result<TokenSet> {
 }
 
 pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> Result<String> {
-    let listener = bind_loopback_listener().await?;
-    receive_loopback_code_from_listener(listener, expected_state, timeout).await
-}
-
-pub async fn bind_loopback_listener() -> Result<TcpListener> {
-    TcpListener::bind("127.0.0.1:56121")
-        .await
-        .context("Failed to bind callback listener at 127.0.0.1:56121")
-}
-
-pub async fn receive_loopback_code_from_listener(
-    listener: TcpListener,
-    expected_state: &str,
-    timeout: Duration,
-) -> Result<String> {
     ::zeroclaw_log::scope!(
         model_provider_type: "xai",
         model_provider_alias: "oauth",
         => async move {
-            receive_loopback_code_inner(listener, expected_state, timeout).await
+            receive_loopback_code_inner(expected_state, timeout).await
         }
     )
     .await
 }
 
-async fn receive_loopback_code_inner(
-    listener: TcpListener,
-    expected_state: &str,
-    timeout: Duration,
-) -> Result<String> {
+async fn receive_loopback_code_inner(expected_state: &str, timeout: Duration) -> Result<String> {
+    let listener = TcpListener::bind("127.0.0.1:56121")
+        .await
+        .context("Failed to bind callback listener at 127.0.0.1:56121")?;
     let accepted = tokio::time::timeout(timeout, listener.accept())
         .await
         .context("Timed out waiting for xAI browser callback")?
