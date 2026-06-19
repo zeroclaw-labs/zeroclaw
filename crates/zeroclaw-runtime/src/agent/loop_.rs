@@ -4153,9 +4153,6 @@ mod tests {
             text: String,
             reasoning: String,
         },
-        /// Anthropic shape: narration text deltas streamed live, then a native
-        /// tool_call in the SAME message. Reproduces the duplicate-narration
-        /// regression where the loop re-sent already-streamed narration.
         NarrationThenToolCall {
             narration_chunks: Vec<String>,
             tool_call: ToolCall,
@@ -8993,10 +8990,6 @@ This is an example, not an invocation."#;
 
     #[tokio::test]
     async fn run_tool_call_loop_does_not_duplicate_streamed_narration_before_native_tool_call() {
-        // Anthropic shape: narration streamed live, then a native tool_call in
-        // the SAME message. The stream consumer forwards the narration deltas
-        // live on `on_delta`; the loop must NOT re-send the whole narration
-        // afterward (that doubled it in the channel's accumulated draft).
         let narration = "About to check the count.";
         let model_provider = StreamingNativeToolEventModelProvider::with_turns(vec![
             NativeStreamTurn::NarrationThenToolCall {
@@ -9061,8 +9054,6 @@ This is an example, not an invocation."#;
         .await
         .expect("narration-then-tool streaming should preserve tool loop semantics");
 
-        // Accumulate StreamDelta::Text exactly like the channel orchestrator's
-        // draft updater does — this is the buffer the user actually sees.
         let mut accumulated = String::new();
         let mut text_deltas: Vec<String> = Vec::new();
         while let Some(delta) = rx.recv().await {
@@ -9077,15 +9068,11 @@ This is an example, not an invocation."#;
             result.ends_with("done"),
             "final response should end with 'done', got: {result}"
         );
-        // RED before fix: narration appears twice (live deltas + post-tool
-        // re-send). GREEN after: exactly once.
         assert_eq!(
             accumulated.matches(narration).count(),
             1,
             "narration must appear exactly once in the accumulated draft; deltas={text_deltas:?} accumulated={accumulated:?}"
         );
-        // The final delivered response must NOT be truncated: it still carries
-        // the final assistant turn in full.
         assert!(
             result.contains("done"),
             "final turn must not be truncated; got: {result}"

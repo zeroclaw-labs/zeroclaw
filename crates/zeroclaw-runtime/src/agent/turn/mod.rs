@@ -657,12 +657,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         // can still see it live through `on_delta` below, but the final
         // delivered response must only contain the final assistant turn.
 
-        // Native tool-call model_providers can return assistant text separately from
-        // the structured call payload; relay it to draft-capable channels.
-        // Gate on `!response_streamed_live`: when the stream consumer already
-        // forwarded these deltas live on `on_delta`, re-sending the whole
-        // narration here duplicates it in the channel's accumulated draft
-        // buffer. Mirrors the final-response guard above (§ no double-delivery).
+        // Skip when already streamed live: re-sending duplicates the narration.
         if !display_text.is_empty() {
             if !native_tool_calls.is_empty()
                 && !response_streamed_live
