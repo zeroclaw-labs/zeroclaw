@@ -1340,10 +1340,7 @@ impl Channel for QQChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let (cleaned_text, attachments) = parse_qq_attachment_markers(&message.content);
-        let in_reply_to: Option<&str> = message
-            .in_reply_to
-            .as_deref()
-            .filter(|id| !id.is_empty());
+        let in_reply_to: Option<&str> = message.in_reply_to.as_deref().filter(|id| !id.is_empty());
 
         if attachments.is_empty() {
             // No media markers — send as markdown (original path)
@@ -1360,7 +1357,10 @@ impl Channel for QQChannel {
 
         // Send each media attachment
         for attachment in &attachments {
-            if let Err(e) = self.send_attachment(&message.recipient, attachment, in_reply_to).await {
+            if let Err(e) = self
+                .send_attachment(&message.recipient, attachment, in_reply_to)
+                .await
+            {
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"target": attachment.target, "error": format!("{}", e)})), "failed to send media attachment; falling back to text");
                 // Degrade to text fallback
                 let fallback = format!(
@@ -2648,11 +2648,7 @@ allowed_users = ["user1"]
             "msg_id".to_string(),
             serde_json::Value::String("preexisting".to_string()),
         );
-        let body = QQChannel::build_send_body(
-            "group:G",
-            payload,
-            Some("INBOUND_MSG_ID_42"),
-        );
+        let body = QQChannel::build_send_body("group:G", payload, Some("INBOUND_MSG_ID_42"));
         let count = body
             .as_object()
             .unwrap()
