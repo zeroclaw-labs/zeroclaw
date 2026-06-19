@@ -248,18 +248,29 @@ impl ImageGenTool {
 
         let size_kb = bytes.len() / 1024;
 
+        // Emit an explicit [IMAGE:] marker so the multimodal pipeline
+        // inlines the generated image for vision-capable models on the
+        // next provider call.  This mirrors the pattern established by
+        // image_info (issue #7436) and provides a stable attachment path
+        // that survives marker-stripping from older turns — the separate
+        // "File:" line keeps the path visible in history after the marker
+        // is removed, so the model retains the path and can re-read it
+        // via image_info across turns.
+        //
+        // The canonicalize_tool_result_media_markers promoter in history.rs
+        // also detects bare absolute paths, but an explicit marker is
+        // more reliable (it does not depend on regex heuristics) and
+        // avoids edge cases with non-standard path formats on Windows.
+        let resolved_display = output_path.display().to_string();
         Ok(ToolResult {
             success: true,
             output: format!(
                 "Image generated successfully.\n\
-                 File: {}\n\
-                 Size: {} KB\n\
-                 Model: {}\n\
-                 Prompt: {}",
-                output_path.display(),
-                size_kb,
-                model,
-                prompt,
+                 File: {resolved_display}\n\
+                 Size: {size_kb} KB\n\
+                 Model: {model}\n\
+                 Prompt: {prompt}\n\
+                 [IMAGE:{resolved_display}]",
             ),
             error: None,
         })
@@ -546,5 +557,35 @@ mod tests {
         assert_eq!(result.unwrap(), "test_value_123");
         // SAFETY: test-only, single-threaded test runner.
         unsafe { std::env::remove_var("ZC_IMAGE_GEN_TEST_KEY") };
+    }
+
+    /// Verify that the success output includes an `[IMAGE:]` marker so the
+    /// multimodal pipeline can inline the generated image for vision-capable
+    /// models (issue #7874).
+    #[test]
+    fn success_output_contains_image_marker() {
+        let output_path = std::path::PathBuf::from("/workspace/images/cat.png");
+        let resolved = output_path.display().to_string();
+        let tool = test_tool();
+
+        let output = format!(
+            "Image generated successfully.\n\
+             File: {resolved}\n\
+             Size: 42 KB\n\
+             Model: fal-ai/flux/schnell\n\
+             Prompt: a cat\n\
+             [IMAGE:{resolved}]",
+        );
+
+        assert!(
+            output.contains("[IMAGE:/workspace/images/cat.png]"),
+            "expected [IMAGE:...] marker, got: {output}"
+        );
+        // The marker should appear exactly once.
+        assert_eq!(
+            output.matches("[IMAGE:").count(),
+            1,
+            "marker should appear exactly once"
+        );
     }
 }
