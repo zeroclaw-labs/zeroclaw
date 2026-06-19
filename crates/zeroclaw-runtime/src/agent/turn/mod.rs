@@ -435,6 +435,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             chat_result,
             streamed_live_deltas,
             streamed_protocol_suppressed,
+            streamed_visible_text,
         } = call_provider(
             &ctx,
             active_model_provider,
@@ -657,18 +658,29 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         // can still see it live through `on_delta` below, but the final
         // delivered response must only contain the final assistant turn.
 
-        // Skip when already streamed live: re-sending duplicates the narration.
+        // Relay only the portion of narration the live stream did not already
+        // deliver: re-sending the whole thing duplicates it, sending nothing
+        // truncates the tail the guard withheld before a tool call cut the
+        // stream short.
         if !display_text.is_empty() {
             if !native_tool_calls.is_empty()
-                && !response_streamed_live
                 && !protocol_suppressed
                 && let Some(ref tx) = on_delta
             {
-                let mut narration = display_text.clone();
-                if !narration.ends_with('\n') {
-                    narration.push('\n');
+                let remainder = display_text
+                    .strip_prefix(streamed_visible_text.as_str())
+                    .unwrap_or(if response_streamed_live {
+                        ""
+                    } else {
+                        display_text.as_str()
+                    });
+                if !remainder.is_empty() {
+                    let mut narration = remainder.to_string();
+                    if !narration.ends_with('\n') {
+                        narration.push('\n');
+                    }
+                    let _ = tx.send(StreamDelta::Text(narration)).await;
                 }
-                let _ = tx.send(StreamDelta::Text(narration)).await;
             }
             if !silent {
                 eprint!("{display_text}");
