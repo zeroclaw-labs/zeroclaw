@@ -170,7 +170,7 @@ pub async fn run_local_listener(
                 let stream = match accept {
                     Ok(v) => v,
                     Err(e) => {
-                        if is_recoverable_accept_error(&e) {
+                        if e.downcast_ref::<std::io::Error>().is_some_and(is_recoverable_accept_error) {
                             // Transient (e.g. EMFILE under fd pressure):
                             // the listener is still valid. Back off briefly
                             // to avoid hot-spinning, then keep serving
