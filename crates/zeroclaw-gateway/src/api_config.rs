@@ -1555,38 +1555,51 @@ async fn rename_agent_cascade(
     // (custom paths are read off the entry, which is about to move).
     let old_ws = working.agent_workspace_dir(from);
 
-    let report = match alias_refs::rename_with_cascade(&mut working, &AliasKind::Agent, from, to) {
-        Ok(r) => r,
-        Err(e) => return rename_error_response(&body.path, from, e),
+    // Rewrite the config rename in-memory and persist it FIRST (#7907) before any
+    // external side-effect. Previously the workspace move and owned-state cascade
+    // ran *before* this durable write, so a persist failure after them left config
+    // naming `from` while the workspace + owned stores had moved to `to` - the
+    // inverse split-brain of what #7841 fixed. Persisting first means an early
+    // failure here leaves config, workspace, and owned state all consistently on
+    // `from`: a clean abort (`persist_and_swap` reverts the on-disk file and never
+    // swaps `state.config`).
+    //
+    // Resume-to-converge (#7940): if a *prior* call already persisted the rename
+    // but a post-persist side-effect did not follow, the committed config names
+    // `to` and no longer has `from`. A re-issued `from -> to` must then re-run the
+    // (idempotent) side-effects below rather than fail - `rename_with_cascade`
+    // would otherwise reject it (the `to` key already exists → `InvalidName`
+    // collision; or `from` absent → `NotFound`), so the documented recovery could
+    // never run. Detect that committed state up front and skip the already-done
+    // rewrite + persist, falling through to re-run only the lagging side-effects.
+    let dirty_count = if working.agent(from).is_none() && working.agent(to).is_some() {
+        0
+    } else {
+        match alias_refs::rename_with_cascade(&mut working, &AliasKind::Agent, from, to) {
+            Ok(report) => {
+                for path in &report.dirty_paths {
+                    working.mark_dirty(path);
+                }
+                let dirty_count = report.dirty_paths.len();
+                if let Err(e) = persist_and_swap(state, working).await {
+                    return error_response(e);
+                }
+                dirty_count
+            }
+            Err(e) => return rename_error_response(&body.path, from, e),
+        }
     };
-    for path in &report.dirty_paths {
-        working.mark_dirty(path);
-    }
-    // Compute the NEW workspace path off the rewritten config now, before
-    // `working` is moved into `persist_and_swap` below. Both paths are owned
-    // `PathBuf`s that outlive the move.
-    let new_ws = working.agent_workspace_dir(to);
-    let dirty_count = report.dirty_paths.len();
 
-    // Persist the config rename FIRST (#7907). Previously the workspace move and
-    // owned-state cascade ran *before* this durable write, so a persist failure
-    // after them left config still naming `from` while the workspace + owned
-    // stores had already moved to `to` — the inverse split-brain of what #7841
-    // fixed. Persisting first means an early failure here leaves config,
-    // workspace, and owned state all consistently on `from`: a clean abort
-    // (`persist_and_swap` reverts the on-disk file and never swaps `state.config`).
-    if let Err(e) = persist_and_swap(state, working).await {
-        return error_response(e);
-    }
-
-    // Config is now durably `to` and authoritative in `state.config`. Run the
-    // external side-effects against the committed config (read a short-lived
-    // clone — never hold the lock guard across an `.await`). Each side-effect is
-    // best-effort and surfaced as a warning; persist-first makes them all
-    // idempotently re-runnable from the corrected config (the workspace move
-    // early-returns once the source is gone; every owned-store op re-points by
-    // `WHERE agent_alias = from`), so re-issuing the same rename converges.
+    // Config is now durably `to` and authoritative in `state.config` (committed by
+    // this call or an earlier one). Run the external side-effects against the
+    // committed config (read a short-lived clone - never hold the lock guard
+    // across an `.await`). Each side-effect is best-effort, surfaced as a warning,
+    // and idempotent: the workspace move early-returns once the source is gone,
+    // and every owned-store op re-points by `WHERE agent_alias = from` - so a
+    // re-issued rename converges.
     let cfg = state.config.read().clone();
+    // The NEW workspace path off the committed config (the rewritten `to`).
+    let new_ws = cfg.agent_workspace_dir(to);
 
     // Move the workspace dir. For the default per-alias location this is
     // `<install>/agents/<from>/workspace` → `…/<to>/workspace`. A custom
@@ -1612,7 +1625,7 @@ async fn rename_agent_cascade(
 
     // The config rename committed. A non-empty `warnings` means a post-persist
     // side-effect did not follow (config is `to`, some follower lags at `from`,
-    // re-runnable) — escalate to WARN so that degraded outcome is visible
+    // re-runnable) - escalate to WARN so that degraded outcome is visible
     // operationally instead of buried at INFO.
     if warnings.is_empty() {
         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"from": from, "to": to, "memory": owned.memory_rows, "cron": owned.cron_jobs, "acp": owned.acp_sessions, "sessions": owned.sessions_repointed, "workspace_moved": workspace_moved, "dirty_paths": dirty_count})), "agent renamed with owned-state cascade");
@@ -2387,7 +2400,7 @@ mod tests {
     async fn agent_rename_leaves_owned_state_put_when_persist_fails() {
         let tmp = tempfile::tempdir().unwrap();
         // Force config persistence to FAIL by making `config_path` itself a
-        // directory — save_dirty's atomic write can't replace a dir. Its parent
+        // directory - save_dirty's atomic write can't replace a dir. Its parent
         // (the install root) stays a real dir, so the agent-workspace creation
         // and the cron seed below still work. data_dir is separate + writable.
         let cfg_dir = tmp.path().join("config.toml");
@@ -2412,7 +2425,7 @@ mod tests {
             .allowed_commands = vec!["echo".into()];
         config.runtime_profiles.entry("default".into()).or_default();
 
-        // Seed an owned-state row (a cron job) under `from` — the move-probe.
+        // Seed an owned-state row (a cron job) under `from` - the move-probe.
         zeroclaw_runtime::cron::add_job(&config, "from", "* * * * *", "echo hi")
             .expect("seed cron job");
         assert_eq!(
@@ -2454,7 +2467,7 @@ mod tests {
         assert!(!state.config.read().agents.contains_key("to"));
     }
 
-    /// #7907 happy path: when persist SUCCEEDS, owned state moves to `to` — so
+    /// #7907 happy path: when persist SUCCEEDS, owned state moves to `to` - so
     /// the reorder didn't accidentally skip the side-effects.
     #[tokio::test]
     async fn agent_rename_moves_owned_state_after_successful_persist() {
@@ -2496,7 +2509,7 @@ mod tests {
         // Config swapped to `to`.
         assert!(state.config.read().agents.contains_key("to"));
         assert!(!state.config.read().agents.contains_key("from"));
-        // Cron re-pointed to `to` — the move happened, after a successful persist.
+        // Cron re-pointed to `to` - the move happened, after a successful persist.
         assert_eq!(
             zeroclaw_runtime::cron::list_jobs_by_agent(&config, "to")
                 .unwrap()
@@ -2516,7 +2529,93 @@ mod tests {
         );
         assert!(!old_ws.exists(), "old workspace no longer present");
         // (MockMemory.rename_agent is unsupported, so the response `warnings`
-        // carries that one known memory line — cron + workspace prove the move.)
+        // carries that one known memory line - cron + workspace prove the move.)
+    }
+
+    /// #7940: the documented "re-issue the rename to converge" recovery actually
+    /// converges. Simulates the post-persist partial-failure window - config has
+    /// already committed the rename to `to`, but an owned-state row (cron) and the
+    /// workspace still lag at `from` - then re-issues `from -> to` and proves the
+    /// side-effects re-run rather than 404-ing, so the operator's documented
+    /// recovery command works.
+    #[tokio::test]
+    async fn agent_rename_resume_converges_when_config_already_to() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"), // writable
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let from_agent = zeroclaw_config::schema::AliasedAgentConfig {
+            risk_profile: "default".into(),
+            ..Default::default()
+        };
+        config.agents.insert("from".to_string(), from_agent);
+        config
+            .risk_profiles
+            .entry("default".into())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        config.runtime_profiles.entry("default".into()).or_default();
+
+        // Seed the lagging owned state + workspace under `from` (added while
+        // `from` is still a known agent so cron::add_job validates).
+        zeroclaw_runtime::cron::add_job(&config, "from", "* * * * *", "echo hi")
+            .expect("seed lagged cron job under `from`");
+        let old_ws = config.agent_workspace_dir("from");
+        std::fs::create_dir_all(&old_ws).unwrap();
+
+        // Simulate the post-persist window: config already committed the rename
+        // to `to` (so `from` is gone from config), while the cron row + workspace
+        // above still lag at `from`. The cron DB lives under data_dir and survives
+        // this in-memory config edit.
+        config.agents.remove("from");
+        config.agents.insert(
+            "to".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+
+        let state = crate::api::test_state(config.clone());
+        let body = RenameMapKeyBody {
+            path: "agents".to_string(),
+            from: "from".to_string(),
+            to: "to".to_string(),
+        };
+        // Re-issue the SAME rename. Before #7940 this returned 404 (from absent in
+        // the committed config); now it resumes and re-runs the lagging effects.
+        let resp = rename_agent_cascade(&state, config.clone(), &body).await;
+        assert!(
+            resp.status().is_success(),
+            "re-issuing a rename after a post-persist lag must converge, not 404"
+        );
+
+        // Owned state converged onto `to`.
+        assert_eq!(
+            zeroclaw_runtime::cron::list_jobs_by_agent(&config, "to")
+                .unwrap()
+                .len(),
+            1,
+            "lagged cron re-points to `to` on resume"
+        );
+        assert!(
+            zeroclaw_runtime::cron::list_jobs_by_agent(&config, "from")
+                .unwrap()
+                .is_empty(),
+            "no cron left under `from` after convergence"
+        );
+        // Workspace converged onto `to`.
+        assert!(
+            state.config.read().agent_workspace_dir("to").exists(),
+            "workspace moved to `to` on resume"
+        );
+        assert!(!old_ws.exists(), "old `from` workspace no longer present");
+        // Config still names `to` and never regained `from` (no double-rename).
+        assert!(state.config.read().agents.contains_key("to"));
+        assert!(!state.config.read().agents.contains_key("from"));
     }
 
     #[test]
