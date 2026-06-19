@@ -579,11 +579,17 @@ pub(crate) async fn reconcile_slash_commands(
             vec![global_base],
         ),
     };
+    // The canonical `/ask` we would register, used to prove ownership before
+    // reaping a `/ask` from the inactive scope (#7922): a foreign `/ask` whose
+    // projection differs is left untouched.
+    let expected_ask = desired
+        .iter()
+        .find(|c| c.get("name").and_then(|n| n.as_str()) == Some("ask"));
     // Best-effort cleanup of the now-inactive scope first; a 429 surfaces the
     // cooldown like any active-scope pass would.
     for base in &inactive {
         if let ReconcileOutcome::RateLimited { until } =
-            reap_all_owned_commands(client, &auth, base).await?
+            reap_all_owned_commands(client, &auth, base, expected_ask).await?
         {
             return Ok(ReconcileOutcome::RateLimited { until });
         }
@@ -608,9 +614,14 @@ async fn reap_all_owned_commands(
     client: &reqwest::Client,
     auth: &str,
     base: &str,
+    expected_ask: Option<&serde_json::Value>,
 ) -> anyhow::Result<ReconcileOutcome> {
+    // `with_localizations=true` so the listing echoes the full `*_localizations`
+    // dictionaries; without it Discord returns them null and our `/ask`
+    // ownership check below (a projection match against the command we register,
+    // which carries localizations) would never match our own `/ask`.
     let resp = client
-        .get(base)
+        .get(format!("{base}?with_localizations=true"))
         .header("Authorization", auth)
         .send()
         .await
@@ -632,7 +643,13 @@ async fn reap_all_owned_commands(
     let existing: Vec<serde_json::Value> = resp.json().await?;
     for cmd in &existing {
         let name = cmd.get("name").and_then(|n| n.as_str()).unwrap_or("");
-        if name != "ask" && !is_skill_command_shape(cmd) {
+        // Only reap a `/ask` that is *ours* — one whose projection matches the
+        // `/ask` we register (#7922). Deleting by name alone would reap a `/ask`
+        // registered by other tooling that happens to share the inactive scope.
+        // Skill commands keep their own shape-based ownership marker.
+        let is_owned_ask = name == "ask"
+            && expected_ask.is_some_and(|a| command_projection(cmd) == command_projection(a));
+        if !is_owned_ask && !is_skill_command_shape(cmd) {
             continue;
         }
         let Some(id) = cmd.get("id").and_then(|i| i.as_str()) else {

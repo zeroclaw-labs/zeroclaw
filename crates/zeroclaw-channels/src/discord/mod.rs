@@ -4666,11 +4666,12 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
-        let stale_ask = serde_json::json!({
-            "id": "a1", "name": "ask",
-            "description": "Ask the agent a question", "type": 1,
-            "options": [{ "name": "prompt", "description": "What to ask", "type": 3, "required": true }]
-        });
+        // Derive the stale `/ask` from what we register (incl. its
+        // `description_localizations`, which the reaper's listing requests via
+        // `with_localizations=true`) plus a server-side id — so its projection
+        // matches ours and the ownership check reaps it (#7922).
+        let mut stale_ask = slash_command_registration_body(&[]).as_array().unwrap()[0].clone();
+        stale_ask["id"] = serde_json::json!("a1");
         Mock::given(method("GET"))
             .and(path("/applications/app1/commands"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
@@ -4690,6 +4691,70 @@ mod tests {
             .and(path("/applications/app1/commands/c1"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/guilds/g1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/applications/app1/guilds/g1/commands"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[]);
+        reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Guild,
+            &["g1".to_string()],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn scope_switch_spares_foreign_ask_in_inactive_scope() {
+        // A `/ask` registered by OTHER tooling (different description) on the
+        // now-inactive global scope must NOT be reaped on a scope switch — we
+        // only delete the `/ask` whose projection matches what we register
+        // (#7922). Our own skill command on that scope is still reaped.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let foreign_ask = serde_json::json!({
+            "id": "x1", "name": "ask",
+            "description": "Ask a DIFFERENT bot", "type": 1,
+            "options": [{ "name": "prompt", "description": "What to ask", "type": 3, "required": true }]
+        });
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                foreign_ask,
+                stale_skill_command("c1", "ghost-skill")
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Our owned skill command IS reaped...
+        Mock::given(method("DELETE"))
+            .and(path("/applications/app1/commands/c1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // ...but the foreign `/ask` (x1) must NOT be: expect(0) fails on drop if
+        // a delete is ever issued for it.
+        Mock::given(method("DELETE"))
+            .and(path("/applications/app1/commands/x1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
