@@ -796,8 +796,23 @@ pub fn options_for_provider_ref(
         Some((family, alias)) => provider_runtime_options_for_alias(config, family, alias),
         None => {
             let mut options = fallback.clone();
+            // Bare provider names (no dotted alias) must NOT inherit
+            // per-provider configuration from the fallback — those options
+            // belong to whatever specific provider entry the fallback was
+            // built from. Only global / process-wide settings are safe to
+            // carry over.
             options.provider_kind = None;
             options.provider_api_url = None;
+            options.provider_timeout_secs = None;
+            options.extra_headers = std::collections::HashMap::new();
+            options.provider_max_tokens = None;
+            options.merge_system_into_user = false;
+            options.provider_extra = None;
+            options.native_tools = None;
+            options.wire_api = None;
+            options.think = None;
+            options.chat_template_kwargs = None;
+            options.tls_ca_cert_path = None;
             options
         }
     }
@@ -2606,14 +2621,42 @@ mod tests {
         let inherited = ModelProviderRuntimeOptions {
             provider_kind: Some("openai-compatible".to_string()),
             provider_api_url: Some("http://primary.example/v1".to_string()),
+            provider_timeout_secs: Some(300),
+            extra_headers: {
+                let mut h = std::collections::HashMap::new();
+                h.insert("X-Api-Version".to_string(), "2024-01".to_string());
+                h
+            },
+            provider_max_tokens: Some(4096),
+            merge_system_into_user: true,
+            provider_extra: Some(serde_json::json!({"custom": true})),
+            native_tools: Some(true),
+            wire_api: Some("responses".to_string()),
+            think: Some(true),
+            chat_template_kwargs: Some(serde_json::json!({"template": "custom"})),
+            tls_ca_cert_path: Some("/etc/ssl/certs/custom.pem".to_string()),
             ..Default::default()
         };
         let config = zeroclaw_config::schema::Config::default();
 
         let route_options = options_for_provider_ref(&config, "openrouter", &inherited);
 
+        // Provider-specific fields must be cleared, not leaked
         assert_eq!(route_options.provider_kind, None);
         assert_eq!(route_options.provider_api_url, None);
+        assert_eq!(route_options.provider_timeout_secs, None);
+        assert!(route_options.extra_headers.is_empty());
+        assert_eq!(route_options.provider_max_tokens, None);
+        assert!(!route_options.merge_system_into_user);
+        assert_eq!(route_options.provider_extra, None);
+        assert_eq!(route_options.native_tools, None);
+        assert_eq!(route_options.wire_api, None);
+        assert_eq!(route_options.think, None);
+        assert_eq!(route_options.chat_template_kwargs, None);
+        assert_eq!(route_options.tls_ca_cert_path, None);
+
+        // Global / process-wide fields should survive
+        assert_eq!(route_options.secrets_encrypt, inherited.secrets_encrypt);
     }
 
     #[test]
