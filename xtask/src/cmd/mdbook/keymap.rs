@@ -27,7 +27,7 @@ pub fn run(root: &Path) -> Result<()> {
         dir.join("zerocode-quickstart-pane-keys.md"),
         render_table(quickstart_rows()),
     )?;
-    println!("==> Generated zerocode keybinding snippets from default keymap");
+    eprintln!("==> Generated zerocode keybinding snippets from default keymap");
     Ok(())
 }
 

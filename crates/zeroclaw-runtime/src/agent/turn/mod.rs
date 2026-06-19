@@ -296,17 +296,12 @@ pub async fn run_tool_call_loop(
             .into());
         }
 
-        let iteration_tool_specs = build_iteration_tool_specs(
+        let mut iteration_tool_specs = build_iteration_tool_specs(
             model_provider,
             tools_registry,
             excluded_tools,
             activated_tools,
         )?;
-        let IterationToolSpecs {
-            ref tool_specs,
-            use_native_tools,
-            ..
-        } = iteration_tool_specs;
 
         let (vision_model_provider_box, degrade_strip_images) =
             resolve_vision_provider(model_provider, history, multimodal_config, provider_name)?;
@@ -325,6 +320,12 @@ pub async fn run_tool_call_loop(
         } else {
             (model_provider, provider_name, model)
         };
+        iteration_tool_specs.refresh_native_tool_mode(active_model_provider);
+        let IterationToolSpecs {
+            ref tool_specs,
+            use_native_tools,
+            ..
+        } = iteration_tool_specs;
 
         let prepared_messages = prepare_messages_for_iteration(
             history,
@@ -353,10 +354,34 @@ pub async fn run_tool_call_loop(
         } else {
             None
         };
+        let request_tool_count = request_tools.map_or(0, <[crate::tools::ToolSpec]>::len);
+        let base_provider_supports_native_tools = model_provider.supports_native_tools();
+        let active_provider_supports_native_tools = active_model_provider.supports_native_tools();
+        let active_provider_supports_streaming = active_model_provider.supports_streaming();
+        let active_provider_supports_streaming_tool_events =
+            active_model_provider.supports_streaming_tool_events();
         let should_consume_provider_stream = (on_delta.is_some() || event_tx.is_some())
-            && model_provider.supports_streaming()
-            && (request_tools.is_none() || model_provider.supports_streaming_tool_events());
-        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"has_on_delta": on_delta.is_some(), "has_event_tx": event_tx.is_some(), "supports_streaming": model_provider.supports_streaming(), "should_consume_provider_stream": should_consume_provider_stream})), &format!("Streaming decision for iteration {}", iteration + 1));
+            && active_provider_supports_streaming
+            && (request_tools.is_none() || active_provider_supports_streaming_tool_events);
+        if ::zeroclaw_log::debug_enabled() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "has_on_delta": on_delta.is_some(),
+                        "has_event_tx": event_tx.is_some(),
+                        "base_provider_supports_native_tools": base_provider_supports_native_tools,
+                        "active_provider_supports_native_tools": active_provider_supports_native_tools,
+                        "active_provider_supports_streaming": active_provider_supports_streaming,
+                        "active_provider_supports_streaming_tool_events": active_provider_supports_streaming_tool_events,
+                        "tool_specs_count": tool_specs.len(),
+                        "request_tools_count": request_tool_count,
+                        "use_native_tools": use_native_tools,
+                        "should_consume_provider_stream": should_consume_provider_stream,
+                    })),
+                &format!("native tool delivery decision for iteration {}", iteration + 1)
+            );
+        }
 
         let ProviderCallOutcome {
             chat_result,

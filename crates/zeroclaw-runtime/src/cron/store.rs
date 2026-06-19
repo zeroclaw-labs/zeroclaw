@@ -222,7 +222,14 @@ pub fn remove_job(config: &Config, id: &str) -> Result<()> {
         anyhow::bail!("Cron job '{id}' not found");
     }
 
-    println!("✅ Removed cron job {id}");
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Delete)
+            .with_category(::zeroclaw_log::EventCategory::Cron)
+            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+            .with_attrs(::serde_json::json!({"job_id": id})),
+        "Removed cron job"
+    );
     Ok(())
 }
 
@@ -1410,6 +1417,31 @@ mod tests {
         cron_dir(config).join("jobs.db")
     }
 
+    async fn recv_log_event(
+        rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
+        message: &str,
+    ) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value))
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|candidate| candidate == message) =>
+                {
+                    return value;
+                }
+                Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_elapsed) => {}
+            }
+        }
+        panic!("did not find log event: {message}");
+    }
+
     #[test]
     fn read_only_queries_on_empty_workspace_do_not_initialize_cron_db() {
         let tmp = TempDir::new().unwrap();
@@ -1674,6 +1706,28 @@ mod tests {
 
         remove_job(&config, &job.id).unwrap();
         assert!(list_jobs(&config).unwrap().is_empty());
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn remove_job_emits_structured_cron_delete_event() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "test-agent", "*/10 * * * *", "echo roundtrip").unwrap();
+
+        remove_job(&config, &job.id).unwrap();
+
+        let value = recv_log_event(&mut rx, "Removed cron job").await;
+        assert_eq!(value["event"]["category"], "cron");
+        assert_eq!(value["event"]["action"], "delete");
+        assert_eq!(value["event"]["outcome"], "success");
+        assert_eq!(value["attributes"]["job_id"], job.id);
     }
 
     #[test]
