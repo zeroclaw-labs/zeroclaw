@@ -14478,7 +14478,6 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "directories",
- "fluent",
  "futures-util",
  "hex",
  "hmac 0.12.1",

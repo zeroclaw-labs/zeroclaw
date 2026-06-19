@@ -1,5 +1,4 @@
 pub mod anthropic_token;
-mod cli_i18n;
 pub mod email_oauth2;
 pub mod gemini_oauth;
 pub mod oauth_common;
@@ -25,10 +24,6 @@ const XAI_PROVIDER: &str = "xai";
 const DEFAULT_PROFILE_NAME: &str = "default";
 const OPENAI_REFRESH_SKEW_SECS: u64 = 90;
 const OPENAI_REFRESH_FAILURE_BACKOFF_SECS: u64 = 10;
-
-fn auth_cli_text(config: &Config, key: &str, args: &[(&str, &str)]) -> String {
-    cli_i18n::text(config, key, args)
-}
 const OAUTH_REFRESH_MAX_ATTEMPTS: usize = 3;
 const OAUTH_REFRESH_RETRY_BASE_DELAY_MS: u64 = 350;
 static REFRESH_BACKOFFS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
@@ -1108,10 +1103,19 @@ pub fn clear_pending_oauth_login(config: &Config, model_provider: &str) {
 /// Shared context for auth-flow trait methods. Carries the runtime
 /// dependencies each flow needs (config for OAuth client creds, auth
 /// service for token storage, http client for OAuth round-trips).
+type CliFormatter = dyn Fn(&str, &[(&str, &str)], &str) -> String + Send + Sync;
+
 pub struct AuthFlowContext<'a> {
     pub config: &'a Config,
     pub auth_service: &'a AuthService,
     pub client: &'a reqwest::Client,
+    pub format_cli: &'a CliFormatter,
+}
+
+impl AuthFlowContext<'_> {
+    fn cli_text(&self, key: &str, args: &[(&str, &str)], fallback: &str) -> String {
+        (self.format_cli)(key, args, fallback)
+    }
 }
 
 /// Result of [`AuthProviderFlow::refresh_status`] — caller renders the
@@ -1679,18 +1683,18 @@ impl AuthProviderFlow for XaiFlow {
             .await?;
             println!(
                 "{}",
-                auth_cli_text(
-                    ctx.config,
+                ctx.cli_text(
                     "cli-auth-xai-imported",
-                    &[("path", &import_path.display().to_string())]
+                    &[("path", &import_path.display().to_string())],
+                    "Imported xAI auth profile"
                 )
             );
             println!(
                 "{}",
-                auth_cli_text(
-                    ctx.config,
+                ctx.cli_text(
                     "cli-auth-active-for",
-                    &[("provider", "xai"), ("profile", profile)]
+                    &[("provider", "xai"), ("profile", profile)],
+                    "Active profile"
                 )
             );
             return Ok(());
@@ -1705,31 +1709,35 @@ impl AuthProviderFlow for XaiFlow {
             .await?;
             println!(
                 "{}",
-                auth_cli_text(ctx.config, "cli-auth-xai-device-code-started", &[])
-            );
-            println!(
-                "{}",
-                auth_cli_text(
-                    ctx.config,
-                    "cli-auth-oauth-visit",
-                    &[("uri", &device.verification_uri)]
+                ctx.cli_text(
+                    "cli-auth-xai-device-code-started",
+                    &[],
+                    "xAI device-code login started."
                 )
             );
             println!(
                 "{}",
-                auth_cli_text(
-                    ctx.config,
+                ctx.cli_text(
+                    "cli-auth-oauth-visit",
+                    &[("uri", &device.verification_uri)],
+                    "Visit"
+                )
+            );
+            println!(
+                "{}",
+                ctx.cli_text(
                     "cli-auth-oauth-code",
-                    &[("code", &device.user_code)]
+                    &[("code", &device.user_code)],
+                    "Code"
                 )
             );
             if let Some(uri_complete) = &device.verification_uri_complete {
                 println!(
                     "{}",
-                    auth_cli_text(
-                        ctx.config,
+                    ctx.cli_text(
                         "cli-auth-oauth-fast-link",
-                        &[("uri", uri_complete)]
+                        &[("uri", uri_complete)],
+                        "Fast link"
                     )
                 );
             }
@@ -1749,14 +1757,14 @@ impl AuthProviderFlow for XaiFlow {
                 .await?;
             println!(
                 "{}",
-                auth_cli_text(ctx.config, "cli-auth-saved", &[("profile", profile)])
+                ctx.cli_text("cli-auth-saved", &[("profile", profile)], "Saved profile")
             );
             println!(
                 "{}",
-                auth_cli_text(
-                    ctx.config,
+                ctx.cli_text(
                     "cli-auth-active-for",
-                    &[("provider", "xai"), ("profile", profile)]
+                    &[("provider", "xai"), ("profile", profile)],
+                    "Active profile"
                 )
             );
             return Ok(());
@@ -1778,7 +1786,11 @@ impl AuthProviderFlow for XaiFlow {
 
         println!(
             "{}",
-            auth_cli_text(ctx.config, "cli-auth-xai-open-oauth-url", &[])
+            ctx.cli_text(
+                "cli-auth-xai-open-oauth-url",
+                &[],
+                "Open this xAI OAuth URL in your browser and authorize access:"
+            )
         );
         println!("{authorize_url}");
         println!();
@@ -1796,18 +1808,18 @@ impl AuthProviderFlow for XaiFlow {
             Err(e) => {
                 println!(
                     "{}",
-                    auth_cli_text(
-                        ctx.config,
+                    ctx.cli_text(
                         "cli-auth-callback-capture-failed",
-                        &[("error", &e.to_string())]
+                        &[("error", &e.to_string())],
+                        "Callback capture failed"
                     )
                 );
                 println!(
                     "{}",
-                    auth_cli_text(
-                        ctx.config,
+                    ctx.cli_text(
                         "cli-auth-run-paste-redirect",
-                        &[("provider", "xai"), ("profile", profile)]
+                        &[("provider", "xai"), ("profile", profile)],
+                        "Run paste-redirect"
                     )
                 );
                 return Ok(());
@@ -1831,14 +1843,14 @@ impl AuthProviderFlow for XaiFlow {
             .await?;
         println!(
             "{}",
-            auth_cli_text(ctx.config, "cli-auth-saved", &[("profile", profile)])
+            ctx.cli_text("cli-auth-saved", &[("profile", profile)], "Saved profile")
         );
         println!(
             "{}",
-            auth_cli_text(
-                ctx.config,
+            ctx.cli_text(
                 "cli-auth-active-for",
-                &[("provider", "xai"), ("profile", profile)]
+                &[("provider", "xai"), ("profile", profile)],
+                "Active profile"
             )
         );
         Ok(())
@@ -1851,10 +1863,10 @@ impl AuthProviderFlow for XaiFlow {
         input: Option<&str>,
     ) -> Result<()> {
         let pending = load_pending_oauth_login(ctx.config, "xai")?.ok_or_else(|| {
-            anyhow::Error::msg(auth_cli_text(
-                ctx.config,
+            anyhow::Error::msg(ctx.cli_text(
                 "cli-auth-xai-no-pending-login",
                 &[],
+                "No pending xAI login found. Run `zeroclaw auth login --model-provider xai` first.",
             ))
         })?;
         if pending.profile != profile {
@@ -1865,10 +1877,10 @@ impl AuthProviderFlow for XaiFlow {
             );
         }
         let redirect_input = input.ok_or_else(|| {
-            anyhow::Error::msg(auth_cli_text(
-                ctx.config,
+            anyhow::Error::msg(ctx.cli_text(
                 "cli-auth-paste-redirect-requires-input",
                 &[],
+                "paste-redirect requires the redirect URL or OAuth code",
             ))
         })?;
         let discovery = crate::auth::xai_oauth::fetch_oauth_discovery(ctx.client).await?;
@@ -1897,14 +1909,14 @@ impl AuthProviderFlow for XaiFlow {
         clear_pending_oauth_login(ctx.config, "xai");
         println!(
             "{}",
-            auth_cli_text(ctx.config, "cli-auth-saved", &[("profile", profile)])
+            ctx.cli_text("cli-auth-saved", &[("profile", profile)], "Saved profile")
         );
         println!(
             "{}",
-            auth_cli_text(
-                ctx.config,
+            ctx.cli_text(
                 "cli-auth-active-for",
-                &[("provider", "xai"), ("profile", profile)]
+                &[("provider", "xai"), ("profile", profile)],
+                "Active profile"
             )
         );
         Ok(())

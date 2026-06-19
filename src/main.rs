@@ -6510,6 +6510,8 @@ fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
 #[cfg(feature = "agent-runtime")]
 async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Result<()> {
     let auth_service = auth::AuthService::from_config(config);
+    let auth_cli_formatter =
+        |key: &str, args: &[(&str, &str)], fallback: &str| ta(key, args, fallback);
 
     match auth_command {
         AuthCommands::Login {
@@ -6524,6 +6526,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 config,
                 auth_service: &auth_service,
                 client: &client,
+                format_cli: &auth_cli_formatter,
             };
             provider
                 .flow()
@@ -6542,6 +6545,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 config,
                 auth_service: &auth_service,
                 client: &client,
+                format_cli: &auth_cli_formatter,
             };
             let input_str: Option<String> = match input {
                 Some(value) => Some(value),
@@ -6638,6 +6642,7 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 config,
                 auth_service: &auth_service,
                 client: &client,
+                format_cli: &auth_cli_formatter,
             };
             let status = provider
                 .flow()
