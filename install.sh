@@ -241,7 +241,13 @@ detect_target_triple() {
   arch=$(uname -m)
 
   case "$os" in
-  Darwin) echo "aarch64-apple-darwin" ;; # presume M-series
+  Darwin)
+    case "$arch" in
+    arm64 | aarch64) echo "aarch64-apple-darwin" ;;
+    x86_64) echo "x86_64-apple-darwin" ;;
+    *) echo "" ;;
+    esac
+    ;;
   Linux)
     libc=$(detect_libc)
     case "$arch" in
