@@ -29190,6 +29190,117 @@ model_provider = \"ollama.default\"
     // table (the extreme case of pruning — all fields pruned away)
     // must deserialize to the same value as the struct's `Default`.
 
+    // ── Schema-walked reload round-trip smoke battery ─────────────
+    //
+    // Reload re-reads config.toml and rebuilds the in-memory Config; any
+    // scalar field that does not survive a serialize -> deserialize cycle
+    // is silently lost on reload (the #7498 class). This walks every
+    // scalar prop the derive exposes, mutates it off-default, round-trips
+    // the whole Config through TOML, and asserts the mutated value comes
+    // back. Driven entirely off prop_fields() so it tracks the schema.
+
+    fn values_match(a: &str, b: &str) -> bool {
+        if a == b {
+            return true;
+        }
+        match (a.parse::<f64>(), b.parse::<f64>()) {
+            (Ok(x), Ok(y)) => (x - y).abs() < f64::EPSILON,
+            _ => false,
+        }
+    }
+
+    fn off_default_value_for(
+        field: &crate::traits::PropFieldInfo,
+        current: &str,
+    ) -> Option<String> {
+        match field.kind {
+            PropKind::Bool => Some(if current == "true" { "false" } else { "true" }.to_string()),
+            PropKind::Integer => {
+                let n: i128 = current.parse().unwrap_or(0);
+                Some((n.wrapping_add(7)).to_string())
+            }
+            PropKind::Float => {
+                let n: f64 = current.parse().unwrap_or(0.0);
+                Some(format!("{:.3}", n + 1.5))
+            }
+            PropKind::String => {
+                let probe = "zc_reload_probe";
+                if current == probe {
+                    Some("zc_reload_probe_alt".to_string())
+                } else {
+                    Some(probe.to_string())
+                }
+            }
+            PropKind::Enum => field.enum_variants.and_then(|variants| {
+                variants()
+                    .into_iter()
+                    .find(|v| v != current)
+                    .or_else(|| variants().into_iter().next())
+            }),
+            PropKind::AliasRef
+            | PropKind::StringArray
+            | PropKind::ObjectArray
+            | PropKind::Object => None,
+        }
+    }
+
+    #[test]
+    async fn every_scalar_field_survives_toml_reload_round_trip() {
+        let mut config = Config::default();
+        let fields = config.prop_fields();
+
+        let mut mutated: Vec<(String, String)> = Vec::new();
+        let mut skipped_non_scalar = 0usize;
+        let mut skipped_unsettable = 0usize;
+
+        for field in &fields {
+            if field.is_secret {
+                continue;
+            }
+            let Ok(current) = config.get_prop(&field.name) else {
+                skipped_unsettable += 1;
+                continue;
+            };
+            let Some(target) = off_default_value_for(field, &current) else {
+                skipped_non_scalar += 1;
+                continue;
+            };
+            if config.set_prop(&field.name, &target).is_err() {
+                skipped_unsettable += 1;
+                continue;
+            }
+            mutated.push((field.name.clone(), target));
+        }
+
+        let serialized = toml::to_string(&config).expect("mutated config must serialize");
+        let reloaded: Config =
+            toml::from_str(&serialized).expect("serialized config must deserialize");
+
+        let mut lost: Vec<String> = Vec::new();
+        for (name, expected) in &mutated {
+            match reloaded.get_prop(name) {
+                Ok(got) if values_match(&got, expected) => {}
+                Ok(got) => lost.push(format!("{name}: set {expected:?}, reloaded {got:?}")),
+                Err(e) => lost.push(format!("{name}: set {expected:?}, reload read failed: {e}")),
+            }
+        }
+
+        assert!(
+            lost.is_empty(),
+            "{} scalar field(s) did not survive a TOML reload round-trip ({} mutated, {} non-scalar skipped, {} unsettable skipped):\n{}",
+            lost.len(),
+            mutated.len(),
+            skipped_non_scalar,
+            skipped_unsettable,
+            lost.join("\n")
+        );
+        assert!(
+            mutated.len() > 100,
+            "smoke battery covered only {} scalar fields; schema walk likely regressed",
+            mutated.len()
+        );
+    }
+
     #[test]
     async fn empty_table_round_trips_to_http_request_config_default() {
         let from_empty: HttpRequestConfig = toml::from_str("").unwrap();
