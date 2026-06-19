@@ -9503,12 +9503,26 @@ pub async fn deliver_announcement(
             if !wa.is_web_config() {
                 anyhow::bail!("WhatsApp channel send requires Web mode (session_path must be set)");
             }
-            let peers = config.channel_external_peers("whatsapp", alias);
-            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
-                Arc::new(move || peers.clone());
-            let allowed_groups = wa.allowed_groups.clone();
-            let allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
-                Arc::new(move || allowed_groups.clone());
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.to_string();
+                Arc::new(move || cfg_arc.read().channel_external_peers("whatsapp", &alias))
+            };
+            // Source of truth: `config.channels.whatsapp.<alias>.allowed_groups`.
+            // Resolved at use-time (no cache — see AGENTS.md "ABSOLUTE RULE").
+            let allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.to_string();
+                Arc::new(move || {
+                    cfg_arc
+                        .read()
+                        .channels
+                        .whatsapp
+                        .get(&alias)
+                        .map(|wa| wa.allowed_groups.clone())
+                        .unwrap_or_default()
+                })
+            };
             let ch = WhatsAppWebChannel::new(
                 wa,
                 alias.to_string(),
