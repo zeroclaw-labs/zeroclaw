@@ -1,4 +1,4 @@
-use crate::auth::oauth_common::{parse_query_params, url_encode};
+use crate::auth::oauth_common::{code_challenge_for_verifier, parse_query_params, url_encode};
 use crate::auth::profiles::TokenSet;
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -162,6 +162,15 @@ pub fn build_authorize_url(authorization_endpoint: &str, pkce: &PkceState) -> St
         .map(|(k, v)| format!("{}={}", url_encode(k), url_encode(v)))
         .collect::<Vec<_>>();
     format!("{authorization_endpoint}?{}", encoded.join("&"))
+}
+
+pub fn restore_pkce_state(code_verifier: String, state: String) -> PkceState {
+    let code_challenge = code_challenge_for_verifier(&code_verifier);
+    PkceState {
+        code_verifier,
+        code_challenge,
+        state,
+    }
 }
 
 pub async fn exchange_code_for_tokens(
@@ -339,20 +348,36 @@ async fn parse_token_response(response: reqwest::Response) -> Result<TokenSet> {
 }
 
 pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> Result<String> {
+    let listener = bind_loopback_listener().await?;
+    receive_loopback_code_from_listener(listener, expected_state, timeout).await
+}
+
+pub async fn bind_loopback_listener() -> Result<TcpListener> {
+    TcpListener::bind("127.0.0.1:56121")
+        .await
+        .context("Failed to bind callback listener at 127.0.0.1:56121")
+}
+
+pub async fn receive_loopback_code_from_listener(
+    listener: TcpListener,
+    expected_state: &str,
+    timeout: Duration,
+) -> Result<String> {
     ::zeroclaw_log::scope!(
         model_provider_type: "xai",
         model_provider_alias: "oauth",
         => async move {
-            receive_loopback_code_inner(expected_state, timeout).await
+            receive_loopback_code_inner(listener, expected_state, timeout).await
         }
     )
     .await
 }
 
-async fn receive_loopback_code_inner(expected_state: &str, timeout: Duration) -> Result<String> {
-    let listener = TcpListener::bind("127.0.0.1:56121")
-        .await
-        .context("Failed to bind callback listener at 127.0.0.1:56121")?;
+async fn receive_loopback_code_inner(
+    listener: TcpListener,
+    expected_state: &str,
+    timeout: Duration,
+) -> Result<String> {
     let accepted = tokio::time::timeout(timeout, listener.accept())
         .await
         .context("Timed out waiting for xAI browser callback")?
@@ -580,5 +605,17 @@ mod tests {
             .expect("code should parse");
         assert_eq!(code, "abc");
         assert!(parse_code_from_redirect("/callback?code=abc&state=bad", Some("xyz")).is_err());
+    }
+
+    #[test]
+    fn restore_pkce_state_recomputes_s256_challenge() {
+        let restored = restore_pkce_state("verifier".into(), "state".into());
+        assert_eq!(restored.code_verifier, "verifier");
+        assert_eq!(restored.state, "state");
+        assert_eq!(
+            restored.code_challenge,
+            code_challenge_for_verifier("verifier")
+        );
+        assert!(!restored.code_challenge.is_empty());
     }
 }

@@ -17,14 +17,18 @@ pub struct PkceState {
     pub state: String,
 }
 
+pub fn code_challenge_for_verifier(code_verifier: &str) -> String {
+    let digest = Sha256::digest(code_verifier.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+}
+
 /// Generate a new PKCE state with cryptographically random values.
 ///
 /// Creates a code verifier, derives the S256 code challenge, and generates
 /// a random state parameter for CSRF protection.
 pub fn generate_pkce_state() -> PkceState {
     let code_verifier = random_base64url(64);
-    let digest = Sha256::digest(code_verifier.as_bytes());
-    let code_challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+    let code_challenge = code_challenge_for_verifier(&code_verifier);
 
     PkceState {
         code_verifier,
@@ -124,10 +128,7 @@ mod tests {
     #[test]
     fn pkce_challenge_is_sha256_of_verifier() {
         let pkce = generate_pkce_state();
-        let expected = {
-            let digest = Sha256::digest(pkce.code_verifier.as_bytes());
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
-        };
+        let expected = code_challenge_for_verifier(&pkce.code_verifier);
         assert_eq!(pkce.code_challenge, expected);
     }
 

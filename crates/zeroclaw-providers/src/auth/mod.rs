@@ -403,12 +403,14 @@ impl AuthService {
             anyhow::bail!("xAI auth profile is not OAuth-based: {profile_id}");
         };
 
-        if !token_set.is_expiring_within(Duration::from_secs(OPENAI_REFRESH_SKEW_SECS)) {
+        if !xai_token_needs_refresh(token_set) {
             return Ok(Some(token_set.access_token.clone()));
         }
 
         let Some(refresh_token) = token_set.refresh_token.clone() else {
-            return Ok(Some(token_set.access_token.clone()));
+            anyhow::bail!(
+                "xAI OAuth access token is expired or has unknown expiry and no refresh token is available; run `zeroclaw auth login --model-provider xai` again"
+            );
         };
 
         let refresh_lock = refresh_lock_for_profile(&profile_id);
@@ -421,7 +423,7 @@ impl AuthService {
         let Some(latest_tokens) = latest_profile.token_set.as_ref() else {
             anyhow::bail!("xAI auth profile is missing token set: {profile_id}");
         };
-        if !latest_tokens.is_expiring_within(Duration::from_secs(OPENAI_REFRESH_SKEW_SECS)) {
+        if !xai_token_needs_refresh(latest_tokens) {
             return Ok(Some(latest_tokens.access_token.clone()));
         }
 
@@ -859,21 +861,30 @@ async fn refresh_xai_access_token_with_retries(
     refresh_token: &str,
 ) -> Result<TokenSet> {
     let mut last_err = None;
-    for attempt in 0..OAUTH_REFRESH_MAX_ATTEMPTS {
+    let retry_base_delay_ms = oauth_refresh_retry_base_delay_ms();
+    for attempt in 1..=OAUTH_REFRESH_MAX_ATTEMPTS {
         match crate::auth::xai_oauth::refresh_access_token(client, refresh_token).await {
             Ok(tokens) => return Ok(tokens),
             Err(err) => {
+                let non_retryable = is_non_retryable_oauth_refresh_error(&err);
+                let should_retry = !non_retryable && attempt < OAUTH_REFRESH_MAX_ATTEMPTS;
                 last_err = Some(err);
-                if attempt + 1 < OAUTH_REFRESH_MAX_ATTEMPTS {
-                    tokio::time::sleep(Duration::from_millis(
-                        OAUTH_REFRESH_RETRY_BASE_DELAY_MS * (attempt as u64 + 1),
-                    ))
-                    .await;
+                if should_retry && retry_base_delay_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(retry_base_delay_ms * attempt as u64))
+                        .await;
+                }
+                if !should_retry {
+                    break;
                 }
             }
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow::Error::msg("xAI OAuth refresh failed")))
+}
+
+fn xai_token_needs_refresh(token_set: &TokenSet) -> bool {
+    token_set.expires_at.is_none()
+        || token_set.is_expiring_within(Duration::from_secs(OPENAI_REFRESH_SKEW_SECS))
 }
 
 fn is_non_retryable_oauth_refresh_error(err: &anyhow::Error) -> bool {
@@ -1774,6 +1785,7 @@ impl AuthProviderFlow for XaiFlow {
         let pkce = crate::auth::xai_oauth::generate_pkce_state();
         let authorize_url =
             crate::auth::xai_oauth::build_authorize_url(&discovery.authorization_endpoint, &pkce);
+        let loopback_listener = crate::auth::xai_oauth::bind_loopback_listener().await?;
 
         let pending = PendingOAuthLogin {
             model_provider: "xai".into(),
@@ -1795,16 +1807,14 @@ impl AuthProviderFlow for XaiFlow {
         println!("{authorize_url}");
         println!();
 
-        let code = match crate::auth::xai_oauth::receive_loopback_code(
+        let code = match crate::auth::xai_oauth::receive_loopback_code_from_listener(
+            loopback_listener,
             &pkce.state,
             std::time::Duration::from_secs(300),
         )
         .await
         {
-            Ok(code) => {
-                clear_pending_oauth_login(ctx.config, "xai");
-                code
-            }
+            Ok(code) => code,
             Err(e) => {
                 println!(
                     "{}",
@@ -1841,6 +1851,7 @@ impl AuthProviderFlow for XaiFlow {
         ctx.auth_service
             .store_xai_tokens(profile, token_set, account_id, true)
             .await?;
+        clear_pending_oauth_login(ctx.config, "xai");
         println!(
             "{}",
             ctx.cli_text("cli-auth-saved", &[("profile", profile)], "Saved profile")
@@ -1886,11 +1897,10 @@ impl AuthProviderFlow for XaiFlow {
         let discovery = crate::auth::xai_oauth::fetch_oauth_discovery(ctx.client).await?;
         let code =
             crate::auth::xai_oauth::parse_code_from_redirect(redirect_input, Some(&pending.state))?;
-        let pkce = crate::auth::xai_oauth::PkceState {
-            code_verifier: pending.code_verifier.clone(),
-            code_challenge: String::new(),
-            state: pending.state.clone(),
-        };
+        let pkce = crate::auth::xai_oauth::restore_pkce_state(
+            pending.code_verifier.clone(),
+            pending.state.clone(),
+        );
         let token_set = crate::auth::xai_oauth::exchange_code_for_tokens(
             ctx.client,
             &discovery.token_endpoint,
@@ -2141,6 +2151,23 @@ mod tests {
         assert!(!is_non_retryable_oauth_refresh_error(&anyhow::Error::msg(
             "Failed to refresh email OAuth2 token: connection reset"
         )));
+    }
+
+    #[test]
+    fn xai_tokens_with_unknown_expiry_are_refreshed() {
+        let token_set = TokenSet {
+            access_token: "xai-access-token".to_string(),
+            refresh_token: Some("xai-refresh-token".to_string()),
+            id_token: None,
+            expires_at: None,
+            token_type: Some("Bearer".to_string()),
+            scope: Some("offline_access".to_string()),
+        };
+
+        assert!(
+            xai_token_needs_refresh(&token_set),
+            "xAI imported tokens with unknown expiry should refresh instead of being treated as permanently valid"
+        );
     }
 
     async fn email_oauth_permanent_failure_handler(
