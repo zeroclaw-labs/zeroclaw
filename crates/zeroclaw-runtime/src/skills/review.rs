@@ -94,42 +94,42 @@ pub async fn maybe_run_skill_review(
 
     let result = SKILL_REVIEW_ACTIVE
         .scope((), async {
-            crate::agent::loop_::run_tool_call_loop(
-                provider,
-                &mut review_history,
-                &tools,
+            crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                model_provider: provider,
+                history: &mut review_history,
+                tools_registry: &tools,
                 observer,
                 provider_name,
-                model_name,
-                Some(0.3),      // temperature — low so the fork doesn't ramble
-                true,           // silent
-                None,           // approval: no human in the loop here
-                "skill_review", // channel_name
-                None,           // channel_reply_target
-                multimodal,
-                config.max_review_iterations as usize,
-                cancellation_token.cloned(), // cancellation_token
-                None,                        // on_delta
-                None,                        // hooks
-                &[],                         // excluded_tools
-                &[],                         // dedup_exempt_tools
-                None,                        // activated_tools
-                None,                        // model_switch_callback
+                model: model_name,
+                temperature: Some(0.3), // low so the fork doesn't ramble
+                silent: true,
+                approval: None, // no human in the loop here
+                channel_name: "skill_review",
+                channel_reply_target: None,
+                multimodal_config: multimodal,
+                max_tool_iterations: config.max_review_iterations as usize,
+                cancellation_token: cancellation_token.cloned(),
+                on_delta: None,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
                 pacing,
-                false, // strict_tool_parsing — lenient for the restricted fork
-                false, // parallel_tools — sequential for the mutation-capable fork
+                strict_tool_parsing: false, // lenient for the restricted fork
+                parallel_tools: false,      // sequential for the mutation-capable fork
                 max_tool_result_chars,
-                max_context_tokens,
-                None, // shared_budget
-                None, // channel
-                None, // receipt_generator
-                Some(&receipts),
-                None, // event_tx
-                None, // steering
-                None, // new_messages_out
-                &crate::agent::loop_::LoopKnobs::default(),
-                None, // image_cache
-            )
+                context_token_budget: max_context_tokens,
+                shared_budget: None,
+                channel: None,
+                receipt_generator: None,
+                collected_receipts: Some(&receipts),
+                event_tx: None,
+                steering: None,
+                new_messages_out: None,
+                knobs: &crate::agent::loop_::LoopKnobs::default(),
+                image_cache: None,
+            })
             .await
         })
         .await;

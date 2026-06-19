@@ -150,43 +150,91 @@ pub(crate) const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 /// notes are the one exception (merged into the existing system message;
 /// only reachable when pattern loop detection is enabled, which no
 /// `new_messages_out` consumer turns on).
-#[allow(clippy::too_many_arguments)]
-pub async fn run_tool_call_loop(
-    model_provider: &dyn ModelProvider,
-    history: &mut Vec<ChatMessage>,
-    tools_registry: &[Box<dyn Tool>],
-    observer: &dyn Observer,
-    provider_name: &str,
-    model: &str,
-    temperature: Option<f64>,
-    silent: bool,
-    approval: Option<&ApprovalManager>,
-    channel_name: &str,
-    channel_reply_target: Option<&str>,
-    multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
-    max_tool_iterations: usize,
-    cancellation_token: Option<CancellationToken>,
-    on_delta: Option<tokio::sync::mpsc::Sender<DraftEvent>>,
-    hooks: Option<&crate::hooks::HookRunner>,
-    excluded_tools: &[String],
-    dedup_exempt_tools: &[String],
-    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
-    model_switch_callback: Option<ModelSwitchCallback>,
-    pacing: &zeroclaw_config::schema::PacingConfig,
-    strict_tool_parsing: bool,
-    parallel_tools: bool,
-    max_tool_result_chars: usize,
-    context_token_budget: usize,
-    shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
-    channel: Option<&dyn Channel>,
-    receipt_generator: Option<&crate::agent::tool_receipts::ReceiptGenerator>,
-    collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
-    event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
-    mut steering: Option<&mut tokio::sync::mpsc::Receiver<String>>,
-    mut new_messages_out: Option<&mut Vec<ChatMessage>>,
-    knobs: &LoopKnobs,
-    mut image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
-) -> Result<String> {
+/// All parameters of [`run_tool_call_loop`], bundled into one borrowed struct.
+///
+/// Field names and types mirror the loop's former positional arguments
+/// one-for-one (the loop borrows everything for the duration of the turn,
+/// including the `&mut` working sets `history`, `steering`, `new_messages_out`,
+/// and `image_cache`). [`LoopKnobs`] stays a nested sub-bundle in `knobs`.
+///
+/// Callers build this struct literal and pass it by value; the loop
+/// destructures it once at entry, so the body reads exactly as it did when
+/// these were positional parameters.
+pub struct ToolLoop<'a> {
+    pub model_provider: &'a dyn ModelProvider,
+    pub history: &'a mut Vec<ChatMessage>,
+    pub tools_registry: &'a [Box<dyn Tool>],
+    pub observer: &'a dyn Observer,
+    pub provider_name: &'a str,
+    pub model: &'a str,
+    pub temperature: Option<f64>,
+    pub silent: bool,
+    pub approval: Option<&'a ApprovalManager>,
+    pub channel_name: &'a str,
+    pub channel_reply_target: Option<&'a str>,
+    pub multimodal_config: &'a zeroclaw_config::schema::MultimodalConfig,
+    pub max_tool_iterations: usize,
+    pub cancellation_token: Option<CancellationToken>,
+    pub on_delta: Option<tokio::sync::mpsc::Sender<DraftEvent>>,
+    pub hooks: Option<&'a crate::hooks::HookRunner>,
+    pub excluded_tools: &'a [String],
+    pub dedup_exempt_tools: &'a [String],
+    pub activated_tools:
+        Option<&'a std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    pub model_switch_callback: Option<ModelSwitchCallback>,
+    pub pacing: &'a zeroclaw_config::schema::PacingConfig,
+    pub strict_tool_parsing: bool,
+    pub parallel_tools: bool,
+    pub max_tool_result_chars: usize,
+    pub context_token_budget: usize,
+    pub shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    pub channel: Option<&'a dyn Channel>,
+    pub receipt_generator: Option<&'a crate::agent::tool_receipts::ReceiptGenerator>,
+    pub collected_receipts: Option<&'a std::sync::Mutex<Vec<String>>>,
+    pub event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
+    pub steering: Option<&'a mut tokio::sync::mpsc::Receiver<String>>,
+    pub new_messages_out: Option<&'a mut Vec<ChatMessage>>,
+    pub knobs: &'a LoopKnobs,
+    pub image_cache: Option<&'a mut zeroclaw_providers::multimodal::LocalImageCache>,
+}
+
+pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
+    let ToolLoop {
+        model_provider,
+        history,
+        tools_registry,
+        observer,
+        provider_name,
+        model,
+        temperature,
+        silent,
+        approval,
+        channel_name,
+        channel_reply_target,
+        multimodal_config,
+        max_tool_iterations,
+        cancellation_token,
+        on_delta,
+        hooks,
+        excluded_tools,
+        dedup_exempt_tools,
+        activated_tools,
+        model_switch_callback,
+        pacing,
+        strict_tool_parsing,
+        parallel_tools,
+        max_tool_result_chars,
+        context_token_budget,
+        shared_budget,
+        channel,
+        receipt_generator,
+        collected_receipts,
+        event_tx,
+        mut steering,
+        mut new_messages_out,
+        knobs,
+        mut image_cache,
+    } = p;
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
@@ -296,17 +344,12 @@ pub async fn run_tool_call_loop(
             .into());
         }
 
-        let iteration_tool_specs = build_iteration_tool_specs(
+        let mut iteration_tool_specs = build_iteration_tool_specs(
             model_provider,
             tools_registry,
             excluded_tools,
             activated_tools,
         )?;
-        let IterationToolSpecs {
-            ref tool_specs,
-            use_native_tools,
-            ..
-        } = iteration_tool_specs;
 
         let (vision_model_provider_box, degrade_strip_images) =
             resolve_vision_provider(model_provider, history, multimodal_config, provider_name)?;
@@ -325,6 +368,12 @@ pub async fn run_tool_call_loop(
         } else {
             (model_provider, provider_name, model)
         };
+        iteration_tool_specs.refresh_native_tool_mode(active_model_provider);
+        let IterationToolSpecs {
+            ref tool_specs,
+            use_native_tools,
+            ..
+        } = iteration_tool_specs;
 
         let prepared_messages = prepare_messages_for_iteration(
             history,
@@ -353,10 +402,34 @@ pub async fn run_tool_call_loop(
         } else {
             None
         };
+        let request_tool_count = request_tools.map_or(0, <[crate::tools::ToolSpec]>::len);
+        let base_provider_supports_native_tools = model_provider.supports_native_tools();
+        let active_provider_supports_native_tools = active_model_provider.supports_native_tools();
+        let active_provider_supports_streaming = active_model_provider.supports_streaming();
+        let active_provider_supports_streaming_tool_events =
+            active_model_provider.supports_streaming_tool_events();
         let should_consume_provider_stream = (on_delta.is_some() || event_tx.is_some())
-            && model_provider.supports_streaming()
-            && (request_tools.is_none() || model_provider.supports_streaming_tool_events());
-        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"has_on_delta": on_delta.is_some(), "has_event_tx": event_tx.is_some(), "supports_streaming": model_provider.supports_streaming(), "should_consume_provider_stream": should_consume_provider_stream})), &format!("Streaming decision for iteration {}", iteration + 1));
+            && active_provider_supports_streaming
+            && (request_tools.is_none() || active_provider_supports_streaming_tool_events);
+        if ::zeroclaw_log::debug_enabled() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "has_on_delta": on_delta.is_some(),
+                        "has_event_tx": event_tx.is_some(),
+                        "base_provider_supports_native_tools": base_provider_supports_native_tools,
+                        "active_provider_supports_native_tools": active_provider_supports_native_tools,
+                        "active_provider_supports_streaming": active_provider_supports_streaming,
+                        "active_provider_supports_streaming_tool_events": active_provider_supports_streaming_tool_events,
+                        "tool_specs_count": tool_specs.len(),
+                        "request_tools_count": request_tool_count,
+                        "use_native_tools": use_native_tools,
+                        "should_consume_provider_stream": should_consume_provider_stream,
+                    })),
+                &format!("native tool delivery decision for iteration {}", iteration + 1)
+            );
+        }
 
         let ProviderCallOutcome {
             chat_result,

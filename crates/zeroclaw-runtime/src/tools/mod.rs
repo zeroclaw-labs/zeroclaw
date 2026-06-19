@@ -318,13 +318,33 @@ pub fn register_skill_tools_with_context(
     security: Arc<SecurityPolicy>,
     unfiltered_registry: &[Arc<dyn Tool>],
 ) {
+    register_skill_tools_with_context_and_runtime(
+        tools_registry,
+        skills,
+        security,
+        unfiltered_registry,
+        Arc::new(NativeRuntime::new()),
+    );
+}
+
+pub fn register_skill_tools_with_context_and_runtime(
+    tools_registry: &mut Vec<Box<dyn Tool>>,
+    skills: &[crate::skills::Skill],
+    security: Arc<SecurityPolicy>,
+    unfiltered_registry: &[Arc<dyn Tool>],
+    runtime: Arc<dyn RuntimeAdapter>,
+) {
     if skills.is_empty() {
         return;
     }
 
     let before = tools_registry.len();
-    let skill_tools =
-        crate::skills::skills_to_tools_with_context(skills, security, unfiltered_registry);
+    let skill_tools = crate::skills::skills_to_tools_with_context_and_runtime(
+        skills,
+        security,
+        unfiltered_registry,
+        runtime,
+    );
     let existing_names: std::collections::HashSet<String> = tools_registry
         .iter()
         .map(|t| t.name().to_string())
