@@ -8,9 +8,11 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::PipelineConfig;
+
+use crate::tool_search::ToolAccessPolicy;
 
 /// Errors specific to pipeline execution.
 #[derive(Debug, Clone, Serialize, thiserror::Error)]
@@ -74,16 +76,31 @@ pub struct PipelineTool {
     config: PipelineConfig,
     tools: Vec<Arc<dyn Tool>>,
     allowed_set: HashSet<String>,
+    tool_access_policy: Arc<Mutex<Option<ToolAccessPolicy>>>,
 }
 
 impl PipelineTool {
-    pub fn new(config: PipelineConfig, tools: Vec<Arc<dyn Tool>>) -> Self {
+    pub fn new(
+        config: PipelineConfig,
+        tools: Vec<Arc<dyn Tool>>,
+        tool_access_policy: Arc<Mutex<Option<ToolAccessPolicy>>>,
+    ) -> Self {
         let allowed_set: HashSet<String> = config.allowed_tools.iter().cloned().collect();
         Self {
             config,
             tools,
             allowed_set,
+            tool_access_policy,
         }
+    }
+
+    /// Set the per-agent tool access policy that gates sub-tool execution.
+    ///
+    /// Callers must invoke this after construction and before any pipeline
+    /// execution so that the per-agent `ToolAccessPolicy` is respected in
+    /// addition to the global `[pipeline].allowed_tools` config.
+    pub fn set_access_policy(&self, policy: ToolAccessPolicy) {
+        *self.tool_access_policy.lock().unwrap() = Some(policy);
     }
 
     /// Find a tool by name in the registry.
@@ -100,9 +117,16 @@ impl PipelineTool {
             return Err(PipelineError::TooManySteps(self.config.max_steps));
         }
 
-        // Check all tools are on the allowlist before executing any.
+        // Two-gate check: global pipeline allowlist AND per-agent access policy.
+        // The per-agent gate is a shared mutable slot set externally by loop_.rs
+        // after constructing the tool registry. When unset the gate is open.
+        let policy_guard = self.tool_access_policy.lock().unwrap();
         for step in &request.steps {
-            if !self.allowed_set.contains(&step.tool) {
+            if !self.allowed_set.contains(&step.tool)
+                || policy_guard
+                    .as_ref()
+                    .is_some_and(|p| !p.is_tool_allowed(&step.tool))
+            {
                 return Err(PipelineError::UnknownTool(step.tool.clone()));
             }
         }
@@ -537,7 +561,7 @@ mod tests {
             max_steps: 2,
             allowed_tools: vec!["shell".to_string()],
         };
-        let tool = PipelineTool::new(config, vec![]);
+        let tool = PipelineTool::new(config, vec![], Arc::new(Mutex::new(None)));
 
         let request = PipelineRequest {
             steps: vec![
@@ -569,7 +593,7 @@ mod tests {
             max_steps: 20,
             allowed_tools: vec!["shell".to_string()],
         };
-        let tool = PipelineTool::new(config, vec![]);
+        let tool = PipelineTool::new(config, vec![], Arc::new(Mutex::new(None)));
 
         let request = PipelineRequest {
             steps: vec![PipelineStep {
@@ -591,7 +615,7 @@ mod tests {
             max_steps: 20,
             allowed_tools: vec!["shell".to_string(), "file_read".to_string()],
         };
-        let tool = PipelineTool::new(config, vec![]);
+        let tool = PipelineTool::new(config, vec![], Arc::new(Mutex::new(None)));
 
         let request = PipelineRequest {
             steps: vec![
@@ -618,7 +642,7 @@ mod tests {
             max_steps: 20,
             allowed_tools: vec![],
         };
-        let tool = PipelineTool::new(config, vec![]);
+        let tool = PipelineTool::new(config, vec![], Arc::new(Mutex::new(None)));
 
         let request = PipelineRequest {
             steps: vec![],
@@ -702,7 +726,7 @@ mod tests {
                 output: "final answer".into(),
             }),
         ];
-        PipelineTool::new(config, tools)
+        PipelineTool::new(config, tools, Arc::new(Mutex::new(None)))
     }
 
     #[tokio::test]
