@@ -244,6 +244,16 @@ mod tests {
         })
     }
 
+    #[cfg(target_os = "windows")]
+    fn absolute_path_outside_workspace() -> &'static str {
+        r"C:\Windows\win.ini"
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn absolute_path_outside_workspace() -> &'static str {
+        "/etc/passwd"
+    }
+
     /// A minimal tool that records how many times `execute` was called.
     struct CountingTool {
         calls: Arc<AtomicUsize>,
@@ -346,7 +356,7 @@ mod tests {
         let (inner, counter) = CountingTool::new();
         let tool = PathGuardedTool::new(inner, policy(AutonomyLevel::Full));
         let result = tool
-            .execute(serde_json::json!({"command": "cat /etc/passwd"}))
+            .execute(serde_json::json!({"command": format!("cat {}", absolute_path_outside_workspace())}))
             .await
             .unwrap();
         assert!(!result.success);
@@ -381,7 +391,7 @@ mod tests {
                     .map(String::from)
             });
         let result = tool
-            .execute(serde_json::json!({"target": "/etc/shadow"}))
+            .execute(serde_json::json!({"target": absolute_path_outside_workspace()}))
             .await
             .unwrap();
         assert!(!result.success);
@@ -401,7 +411,7 @@ mod tests {
         let tool = RateLimitedTool::new(PathGuardedTool::new(inner, sec.clone()), sec);
 
         let blocked = tool
-            .execute(serde_json::json!({"path": "/etc/passwd"}))
+            .execute(serde_json::json!({"path": absolute_path_outside_workspace()}))
             .await
             .unwrap();
         assert!(!blocked.success);
@@ -482,7 +492,7 @@ mod tests {
         let tool = RateLimitedTool::new(PathGuardedTool::new(inner, sec.clone()), sec);
 
         let blocked = tool
-            .execute(serde_json::json!({"path": "/etc/passwd"}))
+            .execute(serde_json::json!({"path": absolute_path_outside_workspace()}))
             .await
             .unwrap();
         assert!(!blocked.success);

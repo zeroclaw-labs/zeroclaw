@@ -492,7 +492,14 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             );
             Ok(())
         }
-        crate::CronCommands::Remove { id } => remove_job(config, &id),
+        crate::CronCommands::Remove { id } => {
+            remove_job(config, &id)?;
+            println!(
+                "{}",
+                get_required_cli_string_with_args("cli-cron-removed", &[("id", &id)])
+            );
+            Ok(())
+        }
         crate::CronCommands::Pause { id } => {
             pause_job(config, &id)?;
             println!(
