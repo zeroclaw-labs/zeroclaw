@@ -4265,4 +4265,63 @@ mod tests {
             "a deep acyclic chain must be depth-capped, never overflow or abort the build"
         );
     }
+
+    #[test]
+    fn provider_runtime_options_does_not_leak_max_tokens_across_providers() {
+        // Regression: when two providers have different max_tokens, each agent
+        // must receive only its own provider's options — not the first provider
+        // in config insertion order.
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ModelProviderConfig, OpenAIModelProviderConfig,
+        };
+
+        let mut config = Config::default();
+        // Provider A (inserted first): large max_tokens
+        config.providers.models.openai.insert(
+            "big".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    max_tokens: Some(128_000),
+                    ..Default::default()
+                },
+            },
+        );
+        // Provider B (inserted second): small max_tokens
+        config.providers.models.openai.insert(
+            "small".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    max_tokens: Some(16_384),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let agent_big = AliasedAgentConfig {
+            model_provider: "openai.big".into(),
+            ..AliasedAgentConfig::default()
+        };
+        let agent_small = AliasedAgentConfig {
+            model_provider: "openai.small".into(),
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("agent_big".to_string(), agent_big);
+        config.agents.insert("agent_small".to_string(), agent_small);
+
+        let opts_big = provider_runtime_options_for_agent(&config, "agent_big");
+        let opts_small = provider_runtime_options_for_agent(&config, "agent_small");
+
+        assert_eq!(
+            opts_big.provider_max_tokens,
+            Some(128_000),
+            "agent_big must get big provider's max_tokens"
+        );
+        assert_eq!(
+            opts_small.provider_max_tokens,
+            Some(16_384),
+            "agent_small must get small provider's max_tokens, NOT the first-configured provider's value"
+        );
+    }
 }
