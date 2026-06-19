@@ -482,14 +482,26 @@ impl App {
         }
     }
 
-    /// Highlight style + symbol for the right (detail) pane lists: active while
-    /// focus is in the detail, dimmed "you are here" while the section list holds
-    /// focus and the detail is just a preview.
+    /// Highlight style + symbol for the right (detail) pane lists.
+    ///
+    /// Three visual states are intentionally separated so a *selected* field
+    /// in the field list is no longer mistaken for an *editable* input:
+    ///
+    /// 1. FieldList (selection) — the row is highlighted with the selection
+    ///    background but kept dim and un-bolded. The arrow gutter is a thin
+    ///    ">" instead of the bold "› " reserved for active editing.
+    /// 2. FieldEdit (active editing) — bold + bright foreground on the
+    ///    selection background with the "› " gutter, matching the rest of
+    ///    the editor's active surfaces.
+    /// 3. Other screens / section-list holds focus — dim "you are here"
+    ///    marker, identical to the previous behavior.
     fn detail_highlight(&self) -> (ratatui::style::Style, &'static str) {
-        if self.zeroclaw_pane == ZeroclawPane::Detail {
-            (theme::selected_style(), "› ")
-        } else {
-            (theme::selected_inactive_style(), "  ")
+        match (&self.screen, self.zeroclaw_pane) {
+            (Screen::FieldEdit { .. }, _) => (theme::selected_style(), "\u{203a} "),
+            (Screen::FieldList { .. }, ZeroclawPane::Detail) => {
+                (theme::selected_inactive_style(), ">")
+            }
+            _ => (theme::selected_inactive_style(), "  "),
         }
     }
 
@@ -3272,7 +3284,17 @@ impl App {
                 };
 
                 let env_marker = if f.is_env_overridden { " [env]" } else { "" };
-                let line = format!("{short_name} = {val_display}{env_marker}");
+                // In the field list (selection) screen, the row is only
+                // *selected*; it is not yet editable. Make this explicit so the
+                // affordance no longer mimics an active text input. The press
+                // hint only appears on the row that currently has the cursor
+                // and is omitted once the user enters the edit screen.
+                let press_hint = if i == self.field_cursor {
+                    "  \u{2500}\u{2192} press Enter to edit"
+                } else {
+                    ""
+                };
+                let line = format!("{short_name} = {val_display}{env_marker}{press_hint}");
 
                 let style = if f.populated {
                     theme::body_style()
