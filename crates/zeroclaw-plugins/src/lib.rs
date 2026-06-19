@@ -116,7 +116,10 @@ pub struct PluginInfo {
 ///
 /// When used in TCP/UDP/HTTP permissions the runtime enforces the address at
 /// connect time: IP literals and resolved-domain IPs are matched exactly;
-/// wildcard patterns are matched via a reverse-DNS lookup.
+/// wildcard patterns are matched using string matching for HTTP, but using
+/// reverse-DNS lookup for TCP/UDP. Operators should treat *.example.com TCP/UDP
+/// grants as granting access to any host whose reverse-DNS record matches, not
+/// purely the forward-DNS zone"
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct AddressString(String);
