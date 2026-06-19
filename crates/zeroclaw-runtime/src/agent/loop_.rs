@@ -1368,6 +1368,21 @@ pub async fn run(
             );
         }
 
+        // ── Wire per-agent policy into PipelineTool ────────────────────
+        // PipelineTool carries an unfiltered internal registry (every
+        // built-in tool is available to it at construction). The filter above
+        // gates the top-level Vec<Box<dyn Tool>> but PipelineTool.validate()
+        // must also reject steps that use tools denied by the agent's
+        // SecurityPolicy. The shared Mutex slot lets us inject the per-agent
+        // ToolAccessPolicy after construction without downcasting.
+        if let Some(ref slot) = all_tools_result.pipeline_access_policy {
+            if let Some(policy) =
+                mcp_tool_access_policy(security.as_ref(), allowed_tools.as_deref())
+            {
+                *slot.lock().unwrap() = Some(policy);
+            }
+        }
+
         // ── Wire MCP tools (non-fatal) — CLI path ────────────────────
         // NOTE: MCP tools are injected after built-in tool filtering
         // (filter_primary_agent_tools_or_fail / agent.allowed_tools / agent.denied_tools).
@@ -2997,6 +3012,16 @@ pub async fn process_message(
         // `filter_channel_builtin_tools` so the production path is
         // regression-tested (see process_message_policy_filters_eager_builtins).
         filter_channel_builtin_tools(&mut tools_registry, security.as_ref());
+
+        // ── Wire per-agent policy into PipelineTool (process_message path) ──
+        // Same rationale as the CLI path: PipelineTool's internal registry is
+        // unfiltered, so we inject the per-agent ToolAccessPolicy via the
+        // shared Mutex slot so validate() gates sub-tool steps.
+        if let Some(ref slot) = all_tools_result_pm.pipeline_access_policy {
+            if let Some(policy) = mcp_tool_access_policy(security.as_ref(), None) {
+                *slot.lock().unwrap() = Some(policy);
+            }
+        }
 
         // ── Wire MCP tools (non-fatal) — process_message path ────────
         // NOTE: Same ordering contract as the CLI path above. MCP tools are
