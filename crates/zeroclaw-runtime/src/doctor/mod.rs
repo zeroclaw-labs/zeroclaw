@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use std::io::Write;
 use std::path::Path;
 use zeroclaw_config::schema::Config;
+use zeroclaw_providers::split_v2_colon_url;
 
 const DAEMON_STALE_SECONDS: i64 = 30;
 const SCHEDULER_STALE_SECONDS: i64 = 120;
@@ -681,7 +682,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         for (family, alias, entry) in config.providers.models.iter_entries() {
             found_any = true;
             let label = format!("{family}.{alias}");
-            if let Some(reason) = provider_validation_error(family) {
+            if let Some(reason) = provider_validation_error(config, family, alias) {
                 items.push(DiagItem::error(
                     cat,
                     format!("model_provider \"{label}\" is invalid: {reason}"),
@@ -756,7 +757,9 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         if route.hint.is_empty() {
             items.push(DiagItem::warn(cat, "model route with empty hint"));
         }
-        if let Some(reason) = provider_validation_error(&route.model_provider) {
+        let (family, alias_opt) = split_v2_colon_url(&route.model_provider);
+        let alias: &str = alias_opt.unwrap_or("default");
+        if let Some(reason) = provider_validation_error(config, family, alias) {
             items.push(DiagItem::warn(
                 cat,
                 format!(
@@ -847,18 +850,23 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     agent_names.sort();
     for name in agent_names {
         let agent = config.agents.get(name).unwrap();
-        let provider_type = agent
+        let (family, alias) = agent
             .model_provider
             .split_once('.')
-            .map_or(agent.model_provider.as_str(), |(t, _)| t);
-        if provider_type.is_empty() {
+            .unwrap_or_else(|| (agent.model_provider.as_str(), "default"));
+        if family.is_empty() {
             continue;
         }
-        if let Some(reason) = provider_validation_error(provider_type) {
+        let full_provider = if alias == "default" {
+            family.to_string()
+        } else {
+            format!("{family}.{alias}")
+        };
+        if let Some(reason) = provider_validation_error(config, family, alias) {
             items.push(DiagItem::warn(
                 cat,
                 format!(
-                    "agent \"{name}\" uses invalid model_provider \"{provider_type}\": {reason}",
+                    "agent \"{name}\" uses invalid model_provider \"{full_provider}\": {reason}",
                 ),
             ));
         }
@@ -918,8 +926,31 @@ fn web_dist_dir_expansion_reason_key(value: &str) -> Option<&'static str> {
     }
 }
 
-fn provider_validation_error(name: &str) -> Option<String> {
-    match zeroclaw_providers::create_model_provider(name, None) {
+fn provider_validation_error(config: &Config, family: &str, alias: &str) -> Option<String> {
+    // For custom providers, we need to validate using the URI from config
+    if family == "custom" || family.starts_with("custom:") || family.starts_with("anthropic-custom:") {
+        // Look up the custom provider entry to get the URI
+        if let Some(entry) = config.providers.models.find(family, alias) {
+            if let Some(uri) = entry.uri.as_deref() {
+                // Validate using the URI from config
+                let name_with_uri = format!("{family}:{uri}");
+                match zeroclaw_providers::create_model_provider(&name_with_uri, None) {
+                    Ok(_) => return None,
+                    Err(err) => return Some(
+                        err.to_string()
+                            .lines()
+                            .next()
+                            .unwrap_or("invalid model_provider")
+                            .into(),
+                    ),
+                }
+            }
+        }
+        // Fall back to original validation if we can't get URI from config
+    }
+    
+    // Original validation logic for non-custom providers or as fallback
+    match zeroclaw_providers::create_model_provider(family, None) {
         Ok(_) => None,
         Err(err) => Some(
             err.to_string()
@@ -1393,14 +1424,15 @@ mod tests {
 
     #[test]
     fn provider_validation_checks_custom_url_shape() {
-        assert!(provider_validation_error("openrouter").is_none());
-        assert!(provider_validation_error("custom:https://example.com").is_none());
-        assert!(provider_validation_error("anthropic-custom:https://example.com").is_none());
+        let config = Config::default();
+        assert!(provider_validation_error(&config, "openrouter", "default").is_none());
+        assert!(provider_validation_error(&config, "custom", "https://example.com").is_none());
+        assert!(provider_validation_error(&config, "anthropic-custom", "https://example.com").is_none());
 
-        let invalid_custom = provider_validation_error("custom:").unwrap_or_default();
+        let invalid_custom = provider_validation_error(&config, "custom", "").unwrap_or_default();
         assert!(invalid_custom.contains("requires a URL"));
 
-        let invalid_unknown = provider_validation_error("totally-fake").unwrap_or_default();
+        let invalid_unknown = provider_validation_error(&config, "totally-fake", "default").unwrap_or_default();
         assert!(invalid_unknown.contains("Unknown model_provider"));
     }
 

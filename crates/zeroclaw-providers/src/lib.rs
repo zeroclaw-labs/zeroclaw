@@ -1150,7 +1150,7 @@ pub fn canonicalize_v2_model_provider_name(name: &str) -> &str {
 /// schema stores custom endpoints as `[providers.models.<family>.<alias>]
 /// uri = "..."`; this helper preserves runtime-factory compatibility for
 /// callers that still pass the legacy single-token form.
-fn split_v2_colon_url(name: &str) -> (&str, Option<&str>) {
+pub fn split_v2_colon_url(name: &str) -> (&str, Option<&str>) {
     if let Some(idx) = name.find(':') {
         let (prefix, rest) = name.split_at(idx);
         let url = &rest[1..];
