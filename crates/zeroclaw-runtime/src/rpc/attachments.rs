@@ -149,7 +149,8 @@ pub async fn process_file_entry(
     let canonical = tokio::fs::canonicalize(&dest)
         .await
         .unwrap_or_else(|_| dest.clone());
-    let workspace_path = canonical.to_string_lossy().to_string();
+    let canonical_display = canonical.to_string_lossy();
+    let workspace_path = strip_windows_verbatim_prefix(&canonical_display).into_owned();
 
     // 6. Build marker.
     //
@@ -176,12 +177,9 @@ pub async fn process_file_entry(
     // and emit a WARN. Always use the workspace /uploads/ copy for clipboard.
     let kind = attachment_kind(&mime_type);
     let is_clipboard = matches!(entry.source, FileSource::Clipboard);
-    let display_path = if is_clipboard {
-        &workspace_path
-    } else {
-        original_path.as_deref().unwrap_or(&workspace_path)
-    };
     let marker = if kind == "IMAGE" {
+        let display_path =
+            image_marker_display_path(original_path.as_deref(), &workspace_path, is_clipboard);
         format!("[IMAGE:{display_path}]")
     } else {
         // Non-image: prose format with workspace path so the agent can
@@ -216,6 +214,30 @@ pub async fn process_file_entry(
 /// Sanitize a filename: strip path separators and null bytes.
 fn sanitize_filename(name: &str) -> String {
     name.replace(['/', '\\', '\0'], "_")
+}
+
+/// Strip the Windows verbatim (`\\?\`) prefix that `canonicalize` prepends so
+/// model-visible file markers contain ordinary local paths.
+fn strip_windows_verbatim_prefix(path: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        return std::borrow::Cow::Owned(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = path.strip_prefix(r"\\?\") {
+        return std::borrow::Cow::Borrowed(rest);
+    }
+    std::borrow::Cow::Borrowed(path)
+}
+
+fn image_marker_display_path<'a>(
+    original_path: Option<&'a str>,
+    workspace_path: &'a str,
+    is_clipboard: bool,
+) -> std::borrow::Cow<'a, str> {
+    if is_clipboard {
+        std::borrow::Cow::Borrowed(workspace_path)
+    } else {
+        strip_windows_verbatim_prefix(original_path.unwrap_or(workspace_path))
+    }
 }
 
 /// Derive MIME type from filename extension via `mime_guess`.
@@ -271,6 +293,38 @@ mod tests {
         assert_eq!(sanitize_filename("path/to/file.txt"), "path_to_file.txt");
         assert_eq!(sanitize_filename("back\\slash.txt"), "back_slash.txt");
         assert_eq!(sanitize_filename("null\0byte.txt"), "null_byte.txt");
+    }
+
+    #[test]
+    fn strip_windows_verbatim_prefix_keeps_markers_plain() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\C:\Users\me\file.png"),
+            r"C:\Users\me\file.png"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\UNC\server\share\file.png"),
+            r"\\server\share\file.png"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix("/tmp/file.png"),
+            "/tmp/file.png"
+        );
+    }
+
+    #[test]
+    fn path_mode_image_marker_display_path_strips_original_verbatim_prefix() {
+        let workspace_path = r"C:\Users\me\.zeroclaw\uploads\copy.png";
+        let display_path = image_marker_display_path(
+            Some(r"\\?\C:\Users\me\Pictures\source.png"),
+            workspace_path,
+            false,
+        );
+        let marker = format!("[IMAGE:{display_path}]");
+
+        assert_eq!(display_path, r"C:\Users\me\Pictures\source.png");
+        assert_eq!(marker, r"[IMAGE:C:\Users\me\Pictures\source.png]");
+        assert!(!marker.contains(r"\\?\"));
+        assert!(!workspace_path.contains(r"\\?\"));
     }
 
     #[test]
