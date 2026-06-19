@@ -47,20 +47,15 @@ impl CostTracker {
         })
     }
 
-    /// Snapshot the live cost config. Reads go through the `RwLock` so a
-    /// hot-reload swap is observed without a process restart.
     fn config_snapshot(&self) -> CostConfig {
         self.config.read().clone()
     }
 
-    /// Current live cost config snapshot.
     pub fn config(&self) -> CostConfig {
         self.config_snapshot()
     }
 
-    /// Replace the live cost config. This is what makes budget limits
-    /// reloadable: the process-global tracker stays the same `Arc`, only
-    /// its config is swapped under the `RwLock`.
+    /// Hot-swap config so reloaded budget limits apply without a restart.
     pub fn update_config(&self, config: CostConfig) {
         *self.config.write() = config;
     }
@@ -343,19 +338,10 @@ impl CostTracker {
 static GLOBAL_COST_TRACKER: OnceLock<RwLock<Option<Arc<CostTracker>>>> = OnceLock::new();
 
 impl CostTracker {
-    /// Return the process-global `CostTracker`, creating it on first call.
-    /// Subsequent calls (from gateway or channels, whichever starts second,
-    /// or a hot-reload re-invocation) apply the supplied `config` to the
-    /// existing tracker and receive the same `Arc`.  The tracker holds its
-    /// config behind a `RwLock`, so reloaded budget limits take effect
-    /// without a process restart.  Returns `None` when cost tracking is
-    /// disabled and no tracker has been constructed yet.
-    ///
-    /// When the first boot ran with cost tracking disabled the slot holds
-    /// `None`; a later reload that flips `enabled` to `true` constructs the
-    /// tracker on demand, so enabling cost tracking no longer requires a
-    /// process restart.  Disabling on a later reload leaves the tracker
-    /// resident and relies on `update_config` to neutralise enforcement.
+    /// Return the process-global `CostTracker`, applying `config` to the
+    /// existing tracker on later calls and reusing the same `Arc`. Returns
+    /// `None` while cost tracking is disabled and no tracker exists yet; a
+    /// later reload flipping `enabled` to `true` constructs it on demand.
     pub fn get_or_init_global(config: CostConfig, workspace_dir: &Path) -> Option<Arc<Self>> {
         let slot = GLOBAL_COST_TRACKER.get_or_init(|| RwLock::new(None));
         Self::resolve_global(slot, config, workspace_dir)
