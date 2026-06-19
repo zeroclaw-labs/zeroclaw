@@ -95,10 +95,10 @@ impl MediaGroupBuffer {
         let entry = self.groups.entry(key.clone()).or_insert_with(Vec::new);
         entry.push(item);
         if is_new {
-            self.deadlines
-                .insert(key, tokio::time::Instant::now() + Duration::from_millis(
-                    MEDIA_GROUP_FLUSH_TIMEOUT_MS,
-                ));
+            self.deadlines.insert(
+                key,
+                tokio::time::Instant::now() + Duration::from_millis(MEDIA_GROUP_FLUSH_TIMEOUT_MS),
+            );
         }
     }
 
@@ -4080,8 +4080,8 @@ Ensure only one `zeroclaw` process is using this bot token."
                             let group_key = format!("{chat_id}:{mg_id}");
 
                             // Gate check before downloading
-                            let gated_caption =
-                                self.check_media_mention_gate(message, attachment.caption.as_deref())?;
+                            let gated_caption = self
+                                .check_media_mention_gate(message, attachment.caption.as_deref())?;
 
                             let (username, sender_id, sender_identity) =
                                 Self::extract_sender_info(message);
@@ -4119,8 +4119,7 @@ Ensure only one `zeroclaw` process is using this bot token."
                             let local_filename = match &attachment.file_name {
                                 Some(name) => name.clone(),
                                 None => {
-                                    let ext =
-                                        tg_file_path.rsplit('.').next().unwrap_or("jpg");
+                                    let ext = tg_file_path.rsplit('.').next().unwrap_or("jpg");
                                     format!("photo_{chat_id}_{message_id}.{ext}")
                                 }
                             };
@@ -4143,9 +4142,7 @@ Ensure only one `zeroclaw` process is using this bot token."
                                 sender_identity: sender_identity.clone(),
                                 thread_id: thread_id.clone(),
                             };
-                            self.media_group_buffer
-                                .lock()
-                                .push(group_key, item);
+                            self.media_group_buffer.lock().push(group_key, item);
                             continue; // wait for more items or timeout
                         }
                         // media_group_id with no attachment metadata → pass through to the
