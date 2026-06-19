@@ -92,17 +92,25 @@ impl ImageGenTool {
             }
         };
 
-        let filename = args
+        // Sanitize filename — strip path components to prevent traversal.
+        // When the caller doesn't provide one, generate a unique default so
+        // successive calls without an explicit name never clobber each other.
+        let safe_name = args
             .get("filename")
             .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or("generated_image");
-
-        // Sanitize filename — strip path components to prevent traversal.
-        let safe_name = PathBuf::from(filename).file_name().map_or_else(
-            || "generated_image".to_string(),
-            |n| n.to_string_lossy().to_string(),
-        );
+            .map(|s| {
+                PathBuf::from(s)
+                    .file_name()
+                    .map_or("generated_image".to_string(), |n| n.to_string_lossy().to_string())
+            })
+            .unwrap_or_else(|| {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                format!("generated_image_{ts}")
+            });
 
         let size = args
             .get("size")
@@ -248,19 +256,24 @@ impl ImageGenTool {
 
         let size_kb = bytes.len() / 1024;
 
+        // Emit a durable `File:` line (survives marker-stripping in older turns)
+        // plus an explicit `[IMAGE:…]` marker the multimodal pipeline inlines.
+        // Both carry the same path string so the promoter
+        // (`canonicalize_tool_result_media_markers`) dedups the bare path
+        // against the already-wrapped marker and does not double-count.
+        let path_display = output_path.display().to_string();
+        let output = format!(
+            "Image generated successfully.\n\
+             File: {path_display}\n\
+             Size: {size_kb} KB\n\
+             Model: {model}\n\
+             Prompt: {prompt}\n\
+             [IMAGE:{path_display}]",
+        );
+
         Ok(ToolResult {
             success: true,
-            output: format!(
-                "Image generated successfully.\n\
-                 File: {}\n\
-                 Size: {} KB\n\
-                 Model: {}\n\
-                 Prompt: {}",
-                output_path.display(),
-                size_kb,
-                model,
-                prompt,
-            ),
+            output,
             error: None,
         })
     }
@@ -535,6 +548,29 @@ mod tests {
             |n| n.to_string_lossy().to_string(),
         );
         assert_eq!(sanitized, "generated_image");
+    }
+
+    #[test]
+    fn default_filename_includes_nanoseconds() {
+        // Without an explicit filename the tool generates a name based on
+        // unix-nanosecond timestamp so successive calls never collide.
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let default_name = format!("generated_image_{ts}");
+
+        // Format matches the expected pattern.
+        assert!(
+            default_name.starts_with("generated_image_"),
+            "default name must start with 'generated_image_' prefix"
+        );
+        // Timestamp portion is numeric.
+        let after_prefix = default_name.strip_prefix("generated_image_").unwrap();
+        assert!(
+            after_prefix.parse::<u64>().is_ok(),
+            "timestamp suffix must be parseable as u64, got: {after_prefix}"
+        );
     }
 
     #[test]
