@@ -12,10 +12,6 @@ use super::signature::{self, SignatureMode, VerificationResult};
 use super::{PluginCapability, PluginInfo, PluginManifest};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-
-use crate::FineGrainedPermission;
-#[cfg(feature = "plugins-wasmtime")]
-use crate::component::ComponentEngine;
 #[cfg(feature = "plugins-wasmtime")]
 use std::sync::Arc;
 
@@ -29,7 +25,7 @@ pub struct PluginHost {
     signature_mode: SignatureMode,
     trusted_publisher_keys: Vec<String>,
     #[cfg(feature = "plugins-wasmtime")]
-    component_engine: Arc<ComponentEngine>,
+    component_engine: Arc<crate::component::ComponentEngine>,
 }
 
 struct LoadedPlugin {
@@ -85,7 +81,7 @@ impl PluginHost {
             signature_mode,
             trusted_publisher_keys,
             #[cfg(feature = "plugins-wasmtime")]
-            component_engine: Arc::new(ComponentEngine::new()?),
+            component_engine: Arc::new(crate::component::ComponentEngine::new()?),
         };
 
         host.discover()?;
@@ -304,7 +300,7 @@ impl PluginHost {
         &self,
         name: &str,
         capability: PluginCapability,
-    ) -> Result<(Vec<u8>, &[FineGrainedPermission]), PluginError> {
+    ) -> Result<(Vec<u8>, &[crate::FineGrainedPermission]), PluginError> {
         let plugin = self
             .loaded
             .get(name)
