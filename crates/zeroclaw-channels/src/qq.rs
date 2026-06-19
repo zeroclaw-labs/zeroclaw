@@ -876,21 +876,71 @@ impl QQChannel {
         Ok((upload_resp.file_info, upload_resp.ttl))
     }
 
+    /// Build the JSON body for a QQ send request, optionally attaching
+    /// a passive-reply `msg_id` when the recipient is a group.
+    ///
+    /// QQ Bot v2 API requires the triggering inbound `msg_id` in group
+    /// `/messages` request bodies so the server can classify the send as a
+    /// passive reply. Without it, the request is treated as an "active
+    /// message" and rejected with code `40034102` when the bot only holds
+    /// passive-reply permissions (the default for newly provisioned bots).
+    /// See #7872.
+    ///
+    /// The id MUST be the QQ gateway `msg_id` of the inbound message being
+    /// replied to — never a fabricated, stale, or cross-conversation value.
+    /// Empty strings are dropped to avoid sending `msg_id=""` which the QQ
+    /// API rejects with a different validation code.
+    ///
+    /// Per the task scope (#7872), `msg_id` is only attached for group
+    /// recipients (`group:<openid>`); private (c2c) sends use the same body
+    /// builder but the field is intentionally omitted unless and until
+    /// we have evidence the c2c endpoint requires it.
+    fn build_send_body(
+        recipient: &str,
+        mut payload: serde_json::Value,
+        in_reply_to: Option<&str>,
+    ) -> serde_json::Value {
+        if let Some(reply_id) = in_reply_to {
+            if !reply_id.is_empty() && recipient.starts_with("group:") {
+                let obj = payload
+                    .as_object_mut()
+                    .expect("QQ send body must be a JSON object");
+                // Preserve a caller-supplied msg_id; only insert the
+                // passive-reply id when none is present. This avoids
+                // accidentally clobbering an id a higher layer chose
+                // intentionally and keeps the JSON shape with exactly one
+                // `msg_id` key.
+                obj.entry("msg_id".to_string())
+                    .or_insert_with(|| serde_json::Value::String(reply_id.to_string()));
+            }
+        }
+        payload
+    }
+
     /// Send a media message (msg_type=7) with an already-uploaded file_info.
-    async fn send_media_message(&self, recipient: &str, file_info: &str) -> anyhow::Result<()> {
+    async fn send_media_message(
+        &self,
+        recipient: &str,
+        file_info: &str,
+        in_reply_to: Option<&str>,
+    ) -> anyhow::Result<()> {
         let token = self.get_token().await?;
         let (scope, id) = Self::resolve_recipient(recipient);
 
         let url = format!("{QQ_API_BASE}/v2/{scope}/{id}/messages");
         ensure_https(&url)?;
 
-        let body = json!({
-            "msg_type": 7,
-            "media": {
-                "file_info": file_info,
-            },
-            "msg_seq": next_msg_seq(),
-        });
+        let body = Self::build_send_body(
+            recipient,
+            json!({
+                "msg_type": 7,
+                "media": {
+                    "file_info": file_info,
+                },
+                "msg_seq": next_msg_seq(),
+            }),
+            in_reply_to,
+        );
 
         let resp = self
             .http_client()
@@ -914,6 +964,7 @@ impl QQChannel {
         &self,
         recipient: &str,
         attachment: &QQMediaAttachment,
+        in_reply_to: Option<&str>,
     ) -> anyhow::Result<()> {
         let target = attachment.target.trim();
 
@@ -934,7 +985,8 @@ impl QQChannel {
                     file_name.as_deref(),
                 )
                 .await?;
-            self.send_media_message(recipient, &file_info).await?;
+            self.send_media_message(recipient, &file_info, in_reply_to)
+                .await?;
         } else {
             // Local file upload
             let path = Path::new(target);
@@ -968,7 +1020,7 @@ impl QQChannel {
                         .with_attrs(::serde_json::json!({"target": target})),
                     "using cached upload for"
                 );
-                self.send_media_message(recipient, &cached_file_info)
+                self.send_media_message(recipient, &cached_file_info, in_reply_to)
                     .await?;
                 return Ok(());
             }
@@ -990,7 +1042,8 @@ impl QQChannel {
                     .await;
             }
 
-            self.send_media_message(recipient, &file_info).await?;
+            self.send_media_message(recipient, &file_info, in_reply_to)
+                .await?;
         }
 
         Ok(())
@@ -1228,20 +1281,29 @@ impl QQChannel {
     }
 
     /// Send a markdown text message (msg_type=2).
-    async fn send_text_markdown(&self, recipient: &str, content: &str) -> anyhow::Result<()> {
+    async fn send_text_markdown(
+        &self,
+        recipient: &str,
+        content: &str,
+        in_reply_to: Option<&str>,
+    ) -> anyhow::Result<()> {
         let token = self.get_token().await?;
         let (scope, id) = Self::resolve_recipient(recipient);
 
         let url = format!("{QQ_API_BASE}/v2/{scope}/{id}/messages");
         ensure_https(&url)?;
 
-        let body = json!({
-            "markdown": {
-                "content": content,
-            },
-            "msg_type": 2,
-            "msg_seq": next_msg_seq(),
-        });
+        let body = Self::build_send_body(
+            recipient,
+            json!({
+                "markdown": {
+                    "content": content,
+                },
+                "msg_type": 2,
+                "msg_seq": next_msg_seq(),
+            }),
+            in_reply_to,
+        );
 
         let resp = self
             .http_client()
@@ -1278,23 +1340,27 @@ impl Channel for QQChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let (cleaned_text, attachments) = parse_qq_attachment_markers(&message.content);
+        let in_reply_to: Option<&str> = message
+            .in_reply_to
+            .as_deref()
+            .filter(|id| !id.is_empty());
 
         if attachments.is_empty() {
             // No media markers — send as markdown (original path)
             return self
-                .send_text_markdown(&message.recipient, &message.content)
+                .send_text_markdown(&message.recipient, &message.content, in_reply_to)
                 .await;
         }
 
         // Send cleaned text first (if non-empty)
         if !cleaned_text.is_empty() {
-            self.send_text_markdown(&message.recipient, &cleaned_text)
+            self.send_text_markdown(&message.recipient, &cleaned_text, in_reply_to)
                 .await?;
         }
 
         // Send each media attachment
         for attachment in &attachments {
-            if let Err(e) = self.send_attachment(&message.recipient, attachment).await {
+            if let Err(e) = self.send_attachment(&message.recipient, attachment, in_reply_to).await {
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"target": attachment.target, "error": format!("{}", e)})), "failed to send media attachment; falling back to text");
                 // Degrade to text fallback
                 let fallback = format!(
@@ -1307,7 +1373,7 @@ impl Channel for QQChannel {
                     },
                     attachment.target
                 );
-                self.send_text_markdown(&message.recipient, &fallback)
+                self.send_text_markdown(&message.recipient, &fallback, in_reply_to)
                     .await?;
             }
         }
@@ -1624,7 +1690,12 @@ impl Channel for QQChannel {
                             }
 
                             let channel_msg = ChannelMessage {
-                                id: Uuid::new_v4().to_string(),
+                                // Use the QQ gateway msg_id as the canonical
+                                // ChannelMessage id so passive-reply sends can
+                                // attach it as `msg_id` and avoid the
+                                // active-message permission failure (code
+                                // 40034102). See #7872.
+                                id: msg_id.to_string(),
                                 sender: user_openid.to_string(),
                                 reply_target: chat_id,
                                 content: composed.content,
@@ -1696,7 +1767,15 @@ impl Channel for QQChannel {
                             }
 
                             let channel_msg = ChannelMessage {
-                                id: Uuid::new_v4().to_string(),
+                                // Use the QQ gateway msg_id as the canonical
+                                // ChannelMessage id so passive-reply sends can
+                                // attach it as `msg_id` to the group send
+                                // body, classifying it as a passive reply
+                                // rather than an active message (which would
+                                // require an additional Tencent permission
+                                // grant — QQ API error code 40034102).
+                                // See #7872.
+                                id: msg_id.to_string(),
                                 sender: author_id.to_string(),
                                 reply_target: chat_id,
                                 content: composed.content,
@@ -2471,6 +2550,120 @@ allowed_users = ["user1"]
         assert!(
             body.get("content").is_none(),
             "top-level 'content' must not be present"
+        );
+    }
+
+    // --- build_send_body passive-reply msg_id propagation (#7872) ---
+    //
+    // QQ Bot v2 group sends must carry the triggering inbound `msg_id` so the
+    // server classifies the send as a passive reply. Without it, the API
+    // rejects with `40034102` unless the bot holds active-message
+    // permissions. See zeroclaw-labs/zeroclaw#7872.
+
+    fn minimal_group_body() -> serde_json::Value {
+        json!({
+            "markdown": { "content": "hi" },
+            "msg_type": 2,
+            "msg_seq": 1,
+        })
+    }
+
+    fn minimal_c2c_body() -> serde_json::Value {
+        json!({
+            "markdown": { "content": "hi" },
+            "msg_type": 2,
+            "msg_seq": 1,
+        })
+    }
+
+    #[test]
+    fn test_build_send_body_group_attaches_msg_id_for_passive_reply() {
+        let body = QQChannel::build_send_body(
+            "group:OPENID_G1",
+            minimal_group_body(),
+            Some("INBOUND_MSG_ID_42"),
+        );
+        assert_eq!(
+            body.get("msg_id").and_then(|v| v.as_str()),
+            Some("INBOUND_MSG_ID_42"),
+            "group sends must include the triggering msg_id (#7872)"
+        );
+        // Original fields preserved.
+        assert_eq!(body["msg_type"], 2);
+        assert_eq!(body["markdown"]["content"], "hi");
+    }
+
+    #[test]
+    fn test_build_send_body_group_without_in_reply_to_omits_msg_id() {
+        let body = QQChannel::build_send_body("group:OPENID_G1", minimal_group_body(), None);
+        assert!(
+            body.get("msg_id").is_none(),
+            "no passive-reply id => msg_id must be absent (do not fabricate)"
+        );
+    }
+
+    #[test]
+    fn test_build_send_body_group_with_empty_in_reply_to_omits_msg_id() {
+        // Empty string is treated as "no id" — sending msg_id="" would be a
+        // different QQ API validation failure.
+        let body = QQChannel::build_send_body("group:OPENID_G1", minimal_group_body(), Some(""));
+        assert!(
+            body.get("msg_id").is_none(),
+            "empty msg_id must not be forwarded to the QQ API"
+        );
+    }
+
+    #[test]
+    fn test_build_send_body_private_dm_omits_msg_id() {
+        // Scope per #7872 is intentionally narrow: only group recipients.
+        // Private (user:/c2c) sends must not attach msg_id — that would
+        // either be rejected by the QQ API as an unknown field or silently
+        // mark the send as a passive reply to a non-existent thread.
+        let body = QQChannel::build_send_body(
+            "user:OPENID_U1",
+            minimal_c2c_body(),
+            Some("INBOUND_MSG_ID_42"),
+        );
+        assert!(
+            body.get("msg_id").is_none(),
+            "user-scope sends must not carry msg_id per #7872 scope"
+        );
+    }
+
+    #[test]
+    fn test_build_send_body_msg_id_is_passed_through_verbatim() {
+        // Regression guard against accidental id mangling / re-encoding.
+        let raw = "ROBOT_INBOUND.123.abcdef";
+        let body = QQChannel::build_send_body("group:G", minimal_group_body(), Some(raw));
+        assert_eq!(body.get("msg_id").and_then(|v| v.as_str()), Some(raw));
+    }
+
+    #[test]
+    fn test_build_send_body_does_not_duplicate_msg_id_when_already_present() {
+        // The helper should not stomp on a caller-provided msg_id; it just
+        // inserts when an in_reply_to is supplied. Verify we never silently
+        // overwrite or duplicate the key.
+        let mut payload = minimal_group_body();
+        payload.as_object_mut().unwrap().insert(
+            "msg_id".to_string(),
+            serde_json::Value::String("preexisting".to_string()),
+        );
+        let body = QQChannel::build_send_body(
+            "group:G",
+            payload,
+            Some("INBOUND_MSG_ID_42"),
+        );
+        let count = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|k| *k == "msg_id")
+            .count();
+        assert_eq!(count, 1, "msg_id key must not be duplicated");
+        assert_eq!(
+            body.get("msg_id").and_then(|v| v.as_str()),
+            Some("preexisting"),
+            "pre-existing msg_id must be preserved over a later in_reply_to"
         );
     }
 
