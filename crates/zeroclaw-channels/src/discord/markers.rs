@@ -655,45 +655,63 @@ fn parse_components_body(json: &str) -> Option<Vec<Vec<ComponentSpec>>> {
 /// The marker tag, including the trailing colon — `[COMPONENTS:`.
 const COMPONENTS_TAG: &str = "[COMPONENTS:";
 
-/// Strip a single `[COMPONENTS:{json}]` marker from `message`, returning the
-/// stripped text and the parsed row specs (empty when no valid marker was
-/// present). Unlike the attachment scanner this is JSON-aware: the marker body
-/// is a JSON object that itself contains `[`/`]`, so the close bracket is found
-/// by tracking brace depth and string state rather than the first `]`.
+/// Strip *every* `[COMPONENTS:{json}]` marker from `message`, returning the
+/// fully-stripped text and the merged row specs from all markers (empty when
+/// none were present). JSON-aware: a marker body is a JSON object that itself
+/// contains `[`/`]`, so the close bracket is found by tracking brace depth and
+/// string state rather than the first `]`.
 ///
-/// Tolerance mirrors `parse_attachment_markers`: a malformed or empty-result
-/// marker is dropped from the text (its raw JSON should never leak to chatters)
-/// but never fails the send. Only the first marker is honored; any further
-/// `[COMPONENTS:…]` markers are left untouched in the text.
+/// All recognised markers are consumed and their rows concatenated in emission
+/// order — an agent that emits several `[COMPONENTS:…]` markers (e.g. one per
+/// row while composing a "kitchen sink" reply) gets them merged onto the one
+/// message. The downstream builder caps the merged rows to Discord's 5
+/// action-row limit.
+///
+/// Extent + repair are delegated to [`find_marker_extent`], which is
+/// **prose-safe**: it never consumes user text outside a marker. A `[COMPONENTS:`
+/// that isn't a recognisable marker is left verbatim (its raw tag may show, but
+/// no surrounding words are ever deleted) and scanning resumes *after* the tag,
+/// so one garbled marker neither eats prose nor suppresses a later valid one.
 pub(crate) fn parse_component_markers(message: &str) -> (String, Vec<Vec<ComponentSpec>>) {
-    let Some(tag_start) = message.find(COMPONENTS_TAG) else {
-        return (message.to_string(), Vec::new());
-    };
-    let body_start = tag_start + COMPONENTS_TAG.len();
-
-    // Walk from the start of the JSON body to the marker's closing `]`,
-    // skipping any `]` that sits inside the JSON (in a string or nested array).
-    let Some(close_rel) = find_marker_close(&message[body_start..]) else {
-        // No closing bracket — leave the text untouched (it isn't a marker).
-        return (message.to_string(), Vec::new());
-    };
-    let close = body_start + close_rel;
-    let json = &message[body_start..close];
-
     let mut cleaned = String::with_capacity(message.len());
-    cleaned.push_str(&message[..tag_start]);
-    cleaned.push_str(&message[close + 1..]);
-    let cleaned = cleaned.trim().to_string();
+    let mut rows: Vec<Vec<ComponentSpec>> = Vec::new();
+    let mut rest = message;
 
-    let rows = parse_components_body(json).unwrap_or_default();
-    (cleaned, rows)
+    loop {
+        let Some(tag_rel) = rest.find(COMPONENTS_TAG) else {
+            // No further marker: keep the remaining text verbatim.
+            cleaned.push_str(rest);
+            break;
+        };
+        let body_start = tag_rel + COMPONENTS_TAG.len();
+        match find_marker_extent(&rest[body_start..]) {
+            Some((consumed, marker_rows)) => {
+                // Recognised marker: drop it, keep the text before it.
+                cleaned.push_str(&rest[..tag_rel]);
+                rows.extend(marker_rows);
+                rest = &rest[body_start + consumed..];
+            }
+            None => {
+                // Not a marker I can safely strip (under-closed with prose after,
+                // or a body that doesn't parse). Keep the tag verbatim and resume
+                // scanning AFTER it: never delete surrounding words, never let one
+                // bad `[COMPONENTS:` suppress a later valid marker. `body_start`
+                // is past the ASCII tag, so this also guarantees forward progress.
+                cleaned.push_str(&rest[..body_start]);
+                rest = &rest[body_start..];
+            }
+        }
+    }
+
+    (cleaned.trim().to_string(), rows)
 }
 
-/// Given the text immediately after `[COMPONENTS:`, return the byte offset of
-/// the marker's closing `]` (relative to that slice), tracking JSON string and
-/// brace/bracket nesting so a `]` inside the JSON body doesn't end the marker.
-/// `None` when no balanced close is found.
-fn find_marker_close(after_tag: &str) -> Option<usize> {
+/// Byte offset of the closing `]` of a `[COMPONENTS:{json}]` marker whose body is
+/// bracket-balanced (relative to `after_tag`), or `None` when the body never
+/// returns to depth 0 at a `]` (it is under-closed). String/escape-aware so a
+/// `]` inside a JSON string is ignored. The first depth-0 `]` is the structural
+/// end of a balanced body, so this never crosses into trailing prose.
+fn strict_marker_close(after_tag: &str) -> Option<usize> {
     let mut depth: i64 = 0;
     let mut in_string = false;
     let mut escaped = false;
@@ -713,7 +731,6 @@ fn find_marker_close(after_tag: &str) -> Option<usize> {
             '}' => depth -= 1,
             ']' => {
                 if depth == 0 {
-                    // Top-level `]` closes the marker.
                     return Some(i);
                 }
                 depth -= 1;
@@ -724,6 +741,111 @@ fn find_marker_close(after_tag: &str) -> Option<usize> {
     None
 }
 
+/// Balance the brackets of a JSON body: insert the closer the model dropped (or
+/// mis-ordered) and append closers for anything still open at the end; an extra
+/// closer with nothing open is dropped. String/escape-aware. Only brackets are
+/// touched — a value-level JSON error still fails the later parse (and is
+/// tolerated). Operates ONLY on the supplied body slice, so it can never consume
+/// text outside the marker.
+fn repair_brackets(body: &str) -> String {
+    let mut out = String::with_capacity(body.len() + 4);
+    let mut stack: Vec<char> = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in body.chars() {
+        if in_string {
+            out.push(c);
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '{' | '[' => {
+                stack.push(c);
+                out.push(c);
+            }
+            '}' | ']' => loop {
+                match stack.last().copied() {
+                    // Extra closer with nothing open — drop it.
+                    None => break,
+                    Some(top) => {
+                        let want = if top == '{' { '}' } else { ']' };
+                        if c == want {
+                            stack.pop();
+                            out.push(c);
+                            break;
+                        }
+                        // Dropped/mis-ordered closer: insert the wanted one, pop,
+                        // and retry the current closer against the new top.
+                        out.push(want);
+                        stack.pop();
+                    }
+                }
+            },
+            _ => out.push(c),
+        }
+    }
+    // Close anything still open (a dropped trailing closer).
+    while let Some(top) = stack.pop() {
+        out.push(if top == '{' { '}' } else { ']' });
+    }
+    out
+}
+
+/// Locate a `[COMPONENTS:]` marker's extent + parsed rows, given the text right
+/// after `[COMPONENTS:`. Returns `(consumed, rows)` where `consumed` is the byte
+/// length through the marker's closing `]`. `None` means "not a marker I can
+/// safely strip" — the caller keeps the tag verbatim and keeps scanning.
+///
+/// Prose-safety invariant: a `[COMPONENTS:` is stripped only when the slice up
+/// to its close is one valid JSON value. `serde_json::from_str` requires the
+/// *whole* slice to validate, so a slice contaminated with user prose can never
+/// qualify — prose is never deleted.
+///
+/// A balanced body is closed by [`strict_marker_close`] (the first depth-0 `]`)
+/// and accepted when that slice validates; for an over-/under-opened body strict
+/// can land on a `]` sitting in trailing prose, but the contaminated slice fails
+/// to validate so we fall through. An under-closed body (the model dropped a
+/// closer — observed live: `…}]}]}]` for `…}]}]]}]`) is bracket-repaired ONLY
+/// when the marker is trailing (whitespace only after the last `]`, so there is
+/// no prose to eat), holds no second `[COMPONENTS:`, and the repaired body parses
+/// into rows. Anything else is left verbatim — its raw JSON may show (a
+/// recoverable leak), but no surrounding words are ever lost.
+fn find_marker_extent(after_tag: &str) -> Option<(usize, Vec<Vec<ComponentSpec>>)> {
+    // Case 1 — strip only when the whole slice up to the strict close is one
+    // valid JSON value. serde's `from_str` requires exactly that, so a slice
+    // carrying trailing/embedded prose (an over-/under-opened body whose strict
+    // close landed on a `]` sitting in user text) can never qualify — prose is
+    // never deleted. A valid body that renders no rows (e.g. a modal button
+    // missing its fields, or an empty select) is still a marker: strip it so its
+    // raw JSON doesn't leak, with empty rows.
+    if let Some(close) = strict_marker_close(after_tag) {
+        let body = &after_tag[..close];
+        if serde_json::from_str::<serde_json::Value>(body.trim()).is_ok() {
+            let rows = parse_components_body(body).unwrap_or_default();
+            return Some((close + 1, rows)); // `]` is one ASCII byte
+        }
+    }
+    // Case 2 — under-closed body: repair ONLY a trailing, single, parseable marker.
+    let last_close = after_tag.rfind(']')?;
+    if !after_tag[last_close + 1..].chars().all(char::is_whitespace) {
+        return None; // prose follows the candidate close — refuse to consume it
+    }
+    let candidate = &after_tag[..last_close];
+    if candidate.contains(COMPONENTS_TAG) {
+        return None; // a later marker sits inside — don't repair across markers
+    }
+    let rows = parse_components_body(&repair_brackets(candidate))?; // must parse
+    Some((last_close + 1, rows))
+}
 
 /// Resolved outbound attachment target after sandbox validation.
 #[derive(Debug)]
@@ -1164,6 +1286,103 @@ mod component_marker_tests {
     use crate::discord::components::ButtonStyle;
 
     #[test]
+    fn merges_multiple_markers_and_strips_all() {
+        // Regression: an agent composing a "kitchen sink" reply may emit several
+        // [COMPONENTS:…] markers (e.g. one per row). Previously only the first
+        // was honored and the rest leaked as raw JSON "outside" the rendered
+        // set. Now every marker is consumed, rows merged in order, all stripped.
+        let msg = concat!(
+            "Buttons: [COMPONENTS:{\"rows\":[[{\"label\":\"Primary\",\"style\":\"primary\",\"prompt\":\"p1\"}]]}]\n",
+            "Modal: [COMPONENTS:{\"rows\":[[{\"label\":\"Report\",\"style\":\"danger\",\"prompt\":\"p2\",\"modal\":{\"title\":\"T\",\"fields\":[{\"id\":\"s\",\"label\":\"S\",\"style\":\"short\",\"required\":true}]}}]]}]\n",
+            "Select: [COMPONENTS:{\"rows\":[[{\"select\":\"Pick\",\"options\":[{\"label\":\"A\",\"value\":\"a\",\"prompt\":\"pa\"}]}]]}]",
+        );
+        let (cleaned, rows) = parse_component_markers(msg);
+        assert!(
+            !cleaned.contains("[COMPONENTS:"),
+            "no marker may leak; got: {cleaned:?}"
+        );
+        assert_eq!(rows.len(), 3, "rows from all three markers are merged");
+        assert_eq!(rows[0].len(), 1);
+        assert_eq!(rows[1].len(), 1);
+        assert_eq!(rows[2].len(), 1);
+        assert!(matches!(rows[2][0], ComponentSpec::Select { .. }));
+    }
+
+    #[test]
+    fn repairs_dropped_rows_closing_bracket() {
+        // Regression (live capture): the model dropped the `]` that closes the
+        // "rows" array — it emitted `…}]}]}]` where a balanced body needs
+        // `…}]}]]}]`. Previously the marker had no findable close, leaked raw,
+        // and rendered nothing. The tolerant scanner repairs the single missing
+        // closer and recovers all rows. Note the `}]` (missing rows `]`) after
+        // row 2 instead of `]]`.
+        let msg = concat!(
+            "[COMPONENTS:{\"rows\":[",
+            "[{\"label\":\"A\",\"style\":\"primary\",\"prompt\":\"pa\"}],",
+            "[{\"label\":\"B\",\"style\":\"danger\",\"prompt\":\"pb\"}]",
+            "}]", // <- model dropped the rows-array ']' here
+        );
+        let (cleaned, rows) = parse_component_markers(msg);
+        assert!(
+            !cleaned.contains("[COMPONENTS:"),
+            "marker must not leak raw; got {cleaned:?}"
+        );
+        assert_eq!(rows.len(), 2, "both rows recovered after bracket repair");
+        assert_eq!(rows[0].len(), 1);
+        assert_eq!(rows[1].len(), 1);
+    }
+
+    #[test]
+    fn valid_kitchen_sink_payload_parses_to_three_rows() {
+        // The maintainer-validated kitchen-sink body (buttons+link / modal /
+        // select) must parse cleanly with no repair and strip fully.
+        let msg = "[COMPONENTS:{\"rows\":[[{\"label\":\"Primary\",\"style\":\"primary\",\"prompt\":\"p\"},{\"label\":\"View PR\",\"url\":\"https://example.com\"}],[{\"label\":\"Report Bug\",\"style\":\"danger\",\"prompt\":\"p\",\"modal\":{\"title\":\"Report\",\"fields\":[{\"id\":\"summary\",\"label\":\"Summary\",\"style\":\"short\",\"required\":true}]}}],[{\"select\":\"Pick\",\"options\":[{\"label\":\"All OK\",\"value\":\"all_ok\",\"prompt\":\"o\"}]}]]}]";
+        let (cleaned, rows) = parse_component_markers(msg);
+        assert_eq!(cleaned, "");
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(rows[1][0], ComponentSpec::ModalButton { .. }));
+        assert!(matches!(rows[2][0], ComponentSpec::Select { .. }));
+    }
+
+    #[test]
+    fn mid_message_under_closed_marker_preserves_prose() {
+        // The model dropped a body closer, leaving the marker under-closed, and a
+        // later bare `]` sits in trailing prose. The scanner MUST NOT walk forward
+        // eating the user's words to reach that `]`. All prose is preserved (the
+        // raw tag may show, but no text is deleted) and nothing renders. This is
+        // the data-loss regression the bracket-repair scanner must never cause.
+        let msg = "Status update: [COMPONENTS:{\"rows\":[[{\"label\":\"Ack\",\"prompt\":\"ack\"}]] all good, deploy finished] thanks everyone";
+        let (cleaned, rows) = parse_component_markers(msg);
+        assert!(
+            cleaned.contains("all good, deploy finished"),
+            "user prose must never be deleted; got {cleaned:?}"
+        );
+        assert!(
+            cleaned.contains("thanks everyone"),
+            "trailing prose must be preserved; got {cleaned:?}"
+        );
+        assert!(
+            rows.is_empty(),
+            "an ambiguous under-closed marker renders nothing"
+        );
+    }
+
+    #[test]
+    fn garbled_marker_does_not_poison_a_later_valid_marker() {
+        // A first, unterminated `[COMPONENTS:` (no usable close) must neither
+        // swallow nor suppress a later perfectly valid marker: the bad one is
+        // left verbatim, the good one still renders.
+        let msg = "[COMPONENTS:{\"rows\":[[ oops [COMPONENTS:{\"rows\":[[{\"label\":\"Go\",\"prompt\":\"go\"}]]}]";
+        let (cleaned, rows) = parse_component_markers(msg);
+        assert_eq!(rows.len(), 1, "the valid second marker renders");
+        assert_eq!(rows[0].len(), 1);
+        assert!(
+            !cleaned.contains("\"Go\""),
+            "the valid marker is stripped, not left in text; got {cleaned:?}"
+        );
+    }
+
+    #[test]
     fn parses_button_row_and_strips_marker() {
         let msg = "Choose: [COMPONENTS:{\"rows\":[[{\"label\":\"Approve\",\"style\":\"success\",\"prompt\":\"approve it\"},{\"label\":\"Deny\",\"style\":\"danger\",\"prompt\":\"deny it\"}]]}] thanks";
         let (cleaned, rows) = parse_component_markers(msg);
@@ -1253,11 +1472,55 @@ mod component_marker_tests {
     }
 
     #[test]
-    fn malformed_json_is_tolerated_and_marker_dropped() {
-        // Bad JSON: the marker is stripped (so its raw body never leaks) but no
-        // rows are produced and the send is NOT failed.
+    fn unparseable_body_left_verbatim_no_prose_lost() {
+        // A balanced body that doesn't parse into rows is NOT a renderable marker.
+        // We leave the raw tag verbatim (a recoverable leak) rather than strip a
+        // slice we can't validate — surrounding prose is always preserved.
         let (cleaned, rows) = parse_component_markers("before [COMPONENTS:{not valid json}] after");
-        assert_eq!(cleaned, "before  after");
+        assert!(cleaned.contains("before"), "got {cleaned:?}");
+        assert!(cleaned.contains("after"), "got {cleaned:?}");
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn over_opened_body_does_not_eat_prose() {
+        // The model doubled the opening brace, so strict_marker_close walks past
+        // the marker's own `]` (still at depth 1) onto a `]` in trailing prose.
+        // The over-opened body fails to parse, so Case 1 does NOT strip through it:
+        // all prose is preserved and nothing renders. (Data-loss regression guard.)
+        let msg = "Heads up: [COMPONENTS:{{\"rows\":[[{\"label\":\"A\",\"prompt\":\"p\"}]]}] trailing ] here and more";
+        let (cleaned, rows) = parse_component_markers(msg);
+        assert!(
+            cleaned.contains("trailing"),
+            "prose before the false close kept; got {cleaned:?}"
+        );
+        assert!(
+            cleaned.contains("here and more"),
+            "prose after kept; got {cleaned:?}"
+        );
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn dropped_outer_close_with_prose_does_not_eat_prose() {
+        // The `{…}` body is itself balanced but the marker's own closing `]` is
+        // dropped and a later `]` sits in prose. The contaminated slice (body +
+        // prose) fails to parse, so no words are deleted. (Data-loss regression.)
+        let msg = "Update [COMPONENTS:{\"rows\":[[{\"label\":\"A\",\"prompt\":\"p\"}]]} the value is arr] later";
+        let (cleaned, rows) = parse_component_markers(msg);
+        assert!(cleaned.contains("the value is arr"), "got {cleaned:?}");
+        assert!(cleaned.contains("later"), "got {cleaned:?}");
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn literal_tag_in_prose_does_not_eat_prose() {
+        // A user who literally types the substring `[COMPONENTS:` in normal prose
+        // with a later `]` must not have the text between them deleted.
+        let msg = "see the [COMPONENTS: docs] for the format and more notes here";
+        let (cleaned, rows) = parse_component_markers(msg);
+        assert!(cleaned.contains("docs"), "got {cleaned:?}");
+        assert!(cleaned.contains("more notes here"), "got {cleaned:?}");
         assert!(rows.is_empty());
     }
 

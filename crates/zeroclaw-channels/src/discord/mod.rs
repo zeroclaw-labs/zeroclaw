@@ -1956,10 +1956,12 @@ impl Channel for DiscordChannel {
             &content,
             self.stream_mode,
             DISCORD_MAX_MESSAGE_LENGTH,
-            // Force at least one message even when the text is empty, so an
-            // embeds-only (or files-only) reply still has a first message to
-            // carry them.
-            !local_files.is_empty() || !embeds.is_empty(),
+            // Force a first message even when the text is empty, so an
+            // embeds-only, files-only, or components-only reply still has a
+            // first message to carry them. Without this, empty content + no
+            // files yields zero chunks and the embeds/action-rows are silently
+            // dropped.
+            !local_files.is_empty() || !embeds.is_empty() || !component_action_rows.is_empty(),
         );
         let inter_chunk_delay_ms =
             if self.stream_mode == zeroclaw_config::schema::StreamMode::MultiMessage {
@@ -7417,8 +7419,14 @@ mod tests {
 
     #[test]
     fn malformed_component_marker_does_not_register_anything() {
+        // A balanced-but-invalid-JSON body is left verbatim (a recoverable leak)
+        // rather than stripped — this guarantees no surrounding prose is ever
+        // deleted. Either way it registers nothing and never 400s the send.
         let (cleaned, rows) = parse_component_markers("hi [COMPONENTS:{garbage}] there");
-        assert_eq!(cleaned, "hi  there", "bad marker stripped, not 400");
+        assert!(
+            cleaned.contains("hi") && cleaned.contains("there"),
+            "prose preserved; got {cleaned:?}"
+        );
         let mut reg = pending::PendingComponents::default();
         let action_rows = build_component_rows("n", &rows, &mut reg);
         assert!(action_rows.is_empty(), "no rows from a malformed marker");
