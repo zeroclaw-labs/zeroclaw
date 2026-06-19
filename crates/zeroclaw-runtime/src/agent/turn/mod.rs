@@ -87,7 +87,9 @@ pub use outcome::{
 };
 #[cfg(test)]
 pub(crate) use parse_response::build_native_assistant_history;
-pub(crate) use parse_response::{interpret_chat_response, resolve_display_text};
+pub(crate) use parse_response::{
+    interpret_chat_response, resolve_display_text, unforwarded_narration,
+};
 pub(crate) use post_exec::record_executed_outcomes;
 pub(crate) use provider_call::{
     ProviderCallOutcome, announce_llm_request, call_provider, enforce_tool_loop_budget,
@@ -659,21 +661,13 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         // delivered response must only contain the final assistant turn.
 
         // Relay only the portion of narration the live stream did not already
-        // deliver: re-sending the whole thing duplicates it, sending nothing
-        // truncates the tail the guard withheld before a tool call cut the
-        // stream short.
+        // deliver: re-sending the whole thing duplicates it.
         if !display_text.is_empty() {
             if !native_tool_calls.is_empty()
                 && !protocol_suppressed
                 && let Some(ref tx) = on_delta
             {
-                let remainder = display_text
-                    .strip_prefix(streamed_visible_text.as_str())
-                    .unwrap_or(if response_streamed_live {
-                        ""
-                    } else {
-                        display_text.as_str()
-                    });
+                let remainder = unforwarded_narration(&display_text, &streamed_visible_text);
                 if !remainder.is_empty() {
                     let mut narration = remainder.to_string();
                     if !narration.ends_with('\n') {

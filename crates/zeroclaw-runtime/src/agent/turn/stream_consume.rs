@@ -81,15 +81,14 @@ pub(crate) async fn consume_provider_streaming_response(
     let mut forwarded_text = String::new();
 
     macro_rules! forward_visible {
-        ($text:expr, true) => {{
+        ($text:expr, $count_visible:tt) => {{
             let visible = $text;
             if event_tx.is_some() || delta_sender.is_some() {
                 outcome.forwarded_visible_text.push_str(&visible);
             }
             if let Some(tx) = event_tx {
                 outcome.forwarded_live_deltas = true;
-                visible_event_output = true;
-                forwarded_text.push_str(&visible);
+                forward_visible!(@count $count_visible, visible);
                 let _ = tx
                     .send(TurnEvent::Chunk {
                         delta: visible.clone(),
@@ -103,26 +102,11 @@ pub(crate) async fn consume_provider_streaming_response(
                 }
             }
         }};
-        ($text:expr, false) => {{
-            let visible = $text;
-            if event_tx.is_some() || delta_sender.is_some() {
-                outcome.forwarded_visible_text.push_str(&visible);
-            }
-            if let Some(tx) = event_tx {
-                outcome.forwarded_live_deltas = true;
-                let _ = tx
-                    .send(TurnEvent::Chunk {
-                        delta: visible.clone(),
-                    })
-                    .await;
-            }
-            if let Some(tx) = delta_sender {
-                outcome.forwarded_live_deltas = true;
-                if tx.send(StreamDelta::Text(visible)).await.is_err() {
-                    delta_sender = None;
-                }
-            }
+        (@count true, $visible:ident) => {{
+            visible_event_output = true;
+            forwarded_text.push_str(&$visible);
         }};
+        (@count false, $visible:ident) => {{}};
     }
 
     loop {
@@ -280,22 +264,10 @@ pub(crate) async fn consume_provider_streaming_response(
     }
 
     if let Some(forward_text) = text_guard.finish() {
-        if event_tx.is_some() || delta_sender.is_some() {
-            outcome.forwarded_visible_text.push_str(&forward_text);
-        }
-        if let Some(tx) = event_tx {
-            outcome.forwarded_live_deltas = true;
-            let _ = tx
-                .send(TurnEvent::Chunk {
-                    delta: forward_text.clone(),
-                })
-                .await;
-        }
-        if let Some(tx) = delta_sender {
-            outcome.forwarded_live_deltas = true;
-            let _ = tx.send(StreamDelta::Text(forward_text)).await;
-        }
+        forward_visible!(forward_text, false);
     }
+    // Final forward may null delta_sender on send failure; mark it read.
+    let _ = delta_sender;
     outcome.suppressed_protocol = text_guard.suppressed_protocol;
 
     Ok(outcome)
