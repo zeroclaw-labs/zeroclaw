@@ -659,8 +659,14 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
 
         // Native tool-call model_providers can return assistant text separately from
         // the structured call payload; relay it to draft-capable channels.
+        // Gate on `!response_streamed_live`: when the stream consumer already
+        // forwarded these deltas live on `on_delta`, re-sending the whole
+        // narration here duplicates it in the channel's accumulated draft
+        // buffer. Mirrors the final-response guard above (§ no double-delivery).
         if !display_text.is_empty() {
             if !native_tool_calls.is_empty()
+                && !response_streamed_live
+                && !protocol_suppressed
                 && let Some(ref tx) = on_delta
             {
                 let mut narration = display_text.clone();
