@@ -353,6 +353,11 @@ pub async fn run(
                 Mode::Acp => acp_pane.ctx_tokens(),
                 _ => (None, None),
             };
+            let browse_mode = match mode {
+                Mode::Chat => chat_pane.in_browse_mode(),
+                Mode::Acp => acp_pane.in_browse_mode(),
+                _ => false,
+            };
             draw_status_bar(
                 frame,
                 chunks[status_idx],
@@ -360,6 +365,7 @@ pub async fn run(
                 rpc.tui_id(),
                 CtxBar::new(ctx_input, ctx_max),
                 needs_intervention,
+                browse_mode,
             );
 
             // Help modal overlay (drawn last so it sits on top).
@@ -564,8 +570,19 @@ pub async fn run(
                 }
 
                 if global == Some(GlobalAction::Quit) {
-                    // Close all transient widgets, then arm the confirm modal
-                    // rather than exiting outright.
+                    // First Ctrl+C: clear input bar text, clear transient
+                    // state (browse mode, overlay, …) and arm the confirm modal.
+                    match mode {
+                        Mode::Chat => {
+                            chat_pane.exit_browse_mode();
+                            chat_pane.clear_input();
+                        }
+                        Mode::Acp => {
+                            acp_pane.exit_browse_mode();
+                            acp_pane.clear_input();
+                        }
+                        _ => {}
+                    }
                     show_help = false;
                     reload_confirm = false;
                     reload_status = None;
@@ -816,6 +833,7 @@ fn draw_status_bar(
     tui_id: Option<&str>,
     ctx: CtxBar,
     needs_intervention: bool,
+    browse_mode: bool,
 ) {
     let (dot, label, style) = match state {
         ConnectionState::Connected => (
@@ -866,11 +884,28 @@ fn draw_status_bar(
     spans.push(Span::styled(label, style));
     frame.render_widget(Paragraph::new(Line::from(spans)), right_area);
 
-    // Left: ctx bar, left-aligned in its own column. The bar is held back
-    // until the context-accounting feature is ready to show; there is no
-    // user-facing switch — the gate flips when the work lands.
-    const SHOW_CTX_BAR: bool = false;
-    if SHOW_CTX_BAR && let Some(w) = ctx.widget() {
+    // Left: ctx bar, possibly preceded by a browse-mode badge.
+    // If browse mode is active, split off a fixed-width badge first.
+    let left_area = if browse_mode {
+        let badge_w = "  BROWSE  ".len() as u16 + 1;
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(badge_w), Constraint::Min(0)])
+            .split(left_area);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(
+                " BROWSE ",
+                Style::default()
+                    .fg(HEALTHY_GREEN)
+                    .add_modifier(Modifier::REVERSED),
+            )])),
+            chunks[0],
+        );
+        chunks[1]
+    } else {
+        left_area
+    };
+    if let Some(w) = ctx.widget() {
         frame.render_widget(w, left_area);
     }
 }

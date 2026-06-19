@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use pulldown_cmark::{Event as MdEvent, Options as MdOptions, Parser as MdParser, Tag, TagEnd};
 use ratatui::{
     Frame,
@@ -945,8 +945,78 @@ impl Chat {
             }
         }
 
+        // Any key press clears the mouse-click highlight — the user is done
+        // with visual selection and is interacting via keyboard.
+        state.highlighted_entry = None;
+        state.mouse_down_entry = None;
+
+        // ── Auto-exit browse mode on typing keys ─────────────────
+        // If the user pressed a printable key that isn't a browse-mode
+        // navigation key (j/k/↑/↓/Esc/Enter/Ctrl+C), exit browse mode
+        // so they can type without an extra Esc press.
+        if state.in_browse_mode() {
+            let is_browse_key = match key.code {
+                KeyCode::Up | KeyCode::Down => true,
+                KeyCode::Esc | KeyCode::Enter => true,
+                KeyCode::Home | KeyCode::End => true,
+                // Ctrl+K to move cursor up in browse mode.
+                KeyCode::Char('k')
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(crossterm::event::KeyModifiers::ALT) =>
+                {
+                    true
+                }
+                // In browse mode, 'j' and 'k' are vim-style navigation
+                // (except when combined with Ctrl or Alt).
+                KeyCode::Char(c)
+                    if !key.modifiers.intersects(
+                        crossterm::event::KeyModifiers::CONTROL
+                            | crossterm::event::KeyModifiers::ALT,
+                    ) =>
+                {
+                    matches!(c, 'j' | 'k' | 'J' | 'K' | 'y' | 'Y')
+                }
+                _ => false,
+            };
+            if !is_browse_key {
+                state.exit_browse_mode();
+                // Fall through — input bar handling below will pick up
+                // any remaining non-navigation key now that browse mode
+                // is off.  Note: Ctrl+C (Quit) is intercepted by app.rs
+                // before reaching this handler, so we don't need to
+                // special-case it here.
+            }
+        }
+
         // ── Delegate to input bar first ─────────────────────────
         // The input bar handles: file explorer, Ctrl+A, Ctrl+V,
+        // Enter in browse mode → exit back to input, then let Enter submit.
+        //
+        // NOTE: Ctrl+K (BrowseEnter) must be intercepted here, before the
+        // input bar, because the textarea consumes Ctrl+K as "kill to end of
+        // line" and never passes it through to the action dispatch.
+        if matches!(key.code, KeyCode::Char('k'))
+            && key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL)
+            && !key.modifiers.contains(crossterm::event::KeyModifiers::ALT)
+            && state.pending_approval().is_none()
+            && !state.turn_in_flight
+        {
+            if state.in_browse_mode() {
+                state.browse_move_up(1, false);
+            } else {
+                state.enter_browse_mode();
+            }
+            return false;
+        }
+
+        if state.in_browse_mode() && key.code == KeyCode::Enter {
+            state.exit_browse_mode();
+        }
+
         // Enter (slash commands + submit), text input, cursor, backspace.
         // It does NOT handle approval, selection, session management, etc.
         if state.pending_approval().is_none() && !state.in_browse_mode() {
@@ -1727,26 +1797,54 @@ impl Chat {
                     let ctrl = mouse.modifiers.contains(KM::CONTROL);
                     if let Some(idx) = hit {
                         if ctrl {
-                            if !state.browse_multi.remove(&idx) {
-                                state.browse_multi.insert(idx);
+                            if state.in_browse_mode() {
+                                if !state.browse_multi.remove(&idx) {
+                                    state.browse_multi.insert(idx);
+                                }
+                                state.mark_dirty_full();
+                            } else {
+                                // Ctrl+click outside browse mode: copy silently
+                                state.browse_multi.clear();
+                                state.highlighted_entry = Some(idx);
+                                ChatState::copy_entry_silently(state, idx);
+                                state.mark_dirty_full();
                             }
-                            state.mark_dirty_full();
                         } else if shift {
-                            if state.browse_cursor.is_none() {
+                            if state.in_browse_mode() {
+                                if state.browse_cursor.is_none() {
+                                    state.browse_cursor = Some(idx);
+                                }
+                                state.browse_anchor = state.browse_cursor;
                                 state.browse_cursor = Some(idx);
+                                state.mark_dirty_full();
+                            } else {
+                                // Shift+click outside browse mode: copy silently
+                                state.browse_multi.clear();
+                                state.highlighted_entry = Some(idx);
+                                ChatState::copy_entry_silently(state, idx);
+                                state.mark_dirty_full();
                             }
-                            state.browse_anchor = state.browse_cursor;
-                            state.browse_cursor = Some(idx);
-                            state.mark_dirty_full();
                         } else {
+                            // Plain click
                             state.browse_multi.clear();
-                            state.browse_cursor = Some(idx);
                             state.browse_anchor = None;
                             state.mark_dirty_full();
+
+                            if state.in_browse_mode() {
+                                // In browse mode: move cursor, prepare for drag/up copy
+                                state.browse_cursor = Some(idx);
+                                state.mouse_down_entry = Some(idx);
+                            } else {
+                                // Out of browse mode: copy silently, brief highlight
+                                state.highlighted_entry = Some(idx);
+                                ChatState::copy_entry_silently(state, idx);
+                            }
                         }
                     } else {
                         state.browse_multi.clear();
                         state.browse_cursor = None;
+                        state.highlighted_entry = None;
+                        state.mouse_down_entry = None;
                         state.browse_anchor = None;
                         state.mark_dirty_full();
                     }
@@ -1767,10 +1865,44 @@ impl Chat {
                             (drag.start_scroll as i32 + scroll_delta).clamp(0, max as i32);
                         state.scroll_offset = new_off as u16;
                         state.pinned_to_bottom = state.scroll_offset >= max;
+                    } else if let Some(start) = state.mouse_down_entry {
+                        // Drag extends selection only in browse mode.
+                        if state.in_browse_mode() {
+                            let hit = state
+                                .entry_rects
+                                .iter()
+                                .find(|(_, r)| mouse::in_rect(col, row, *r))
+                                .map(|(idx, _)| *idx);
+                            if let Some(end) = hit {
+                                state.browse_anchor = Some(start);
+                                state.browse_cursor = Some(end);
+                                state.mark_dirty_full();
+                            }
+                        }
                     }
                 }
                 MouseEventKind::Up(MouseButton::Left) => {
                     state.scrollbar_drag = None;
+                    // Auto-copy on mouse-up based on gesture:
+                    //   * Click (no drag) → copy the single entry.
+                    //   * Drag (range set) → copy the selection.
+                    if let Some(idx) = state.mouse_down_entry.take() {
+                        if state.browse_anchor.is_some() {
+                            // Drag → copy the range
+                            let text = state.yank_selection();
+                            if !text.is_empty() {
+                                crate::mouse::copy_osc52(&text);
+                                state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
+                            }
+                        } else {
+                            // Plain click → copy the single entry
+                            let text = state.yank_single_entry(idx);
+                            if !text.is_empty() {
+                                crate::mouse::copy_osc52(&text);
+                                state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
+                            }
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1826,6 +1958,29 @@ impl Chat {
             return s.info_message.as_ref();
         }
         None
+    }
+
+    /// Whether the active chat session is in browse mode.
+    pub(crate) fn in_browse_mode(&self) -> bool {
+        match &self.phase {
+            ChatPhase::Active(s) => s.in_browse_mode(),
+            _ => false,
+        }
+    }
+
+    /// Exit browse / selection mode if active. No-op otherwise.
+    pub(crate) fn exit_browse_mode(&mut self) {
+        if let ChatPhase::Active(s) = &mut self.phase {
+            s.exit_browse_mode();
+        }
+    }
+
+    /// Clear the input bar text (called when Ctrl+C arms the quit modal).
+    pub(crate) fn clear_input(&mut self) {
+        if let ChatPhase::Active(s) = &mut self.phase {
+            s.input_bar.reset();
+            s.mark_dirty_full();
+        }
     }
 
     pub(crate) fn wants_text_input(&self) -> bool {
@@ -1923,7 +2078,10 @@ impl crate::widgets::HelpContext for Chat {
                 }
                 // Idle: compose pane-level bindings + input bar as child.
                 let mut pane_entries = vec![
-                    E::key("Ctrl+↑", crate::i18n::t("zc-chat-help-browse-mode")),
+                    E::new(
+                        vec!["Ctrl+↑", "Ctrl+K"],
+                        crate::i18n::t("zc-chat-help-browse-mode"),
+                    ),
                     E::key(
                         "Shift+↑/↓",
                         crate::i18n::t("zc-chat-help-scroll-conversation"),
@@ -2725,11 +2883,9 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let body_w = inner_width;
     let body_h = inner_height;
     state.entry_rects.clear();
-    for &(entry_idx, lo, hi) in &state.cached_line_ranges {
-        let lo = lo as u16;
-        let hi = hi as u16;
-        let visible_lo = lo.max(scroll);
-        let visible_hi = hi.min(scroll + body_h);
+    for &(entry_idx, screen_lo, screen_hi) in &state.cached_screen_ranges {
+        let visible_lo = screen_lo.max(scroll);
+        let visible_hi = screen_hi.min(scroll + body_h);
         if visible_hi <= visible_lo {
             continue;
         }
@@ -2932,7 +3088,6 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     let mut in_italic = false;
     let mut in_strike = false;
     let mut in_code_block = false;
-    let mut code_block_lang: Option<String> = None;
     let mut code_block_text: String = String::new();
     let mut heading_level: Option<HeadingLevel> = None;
     let mut blockquote_depth: u32 = 0;
@@ -3023,14 +3178,17 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
                 push_line(&mut lines, &mut current_spans);
                 in_code_block = true;
                 code_block_text.clear();
-                let lang = match kind {
+                let code_block_lang = match kind {
                     pulldown_cmark::CodeBlockKind::Fenced(info) => {
                         let s = info.trim();
-                        if s.is_empty() { None } else { Some(s.to_string()) }
+                        if s.is_empty() {
+                            None
+                        } else {
+                            Some(s.to_string())
+                        }
                     }
                     pulldown_cmark::CodeBlockKind::Indented => None,
                 };
-                code_block_lang = lang;
 
                 // Render header bar, exactly `width` columns wide:
                 //   ┌─── lang ───── [Copy] ───────┐
@@ -3053,7 +3211,11 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
                 let right_dots = middle.saturating_sub(left_dots);
                 lines.push(Line::from(vec![
                     Span::styled(
-                        format!("\u{250c}\u{2500}{}{}", hdr_text, "\u{2500}".repeat(left_dots)),
+                        format!(
+                            "\u{250c}\u{2500}{}{}",
+                            hdr_text,
+                            "\u{2500}".repeat(left_dots)
+                        ),
                         theme::dim_style(),
                     ),
                     Span::styled(
@@ -3555,6 +3717,14 @@ pub struct ChatState {
     browse_anchor: Option<usize>,
     /// Ctrl+click multi-select set, independent of cursor/anchor range.
     browse_multi: std::collections::BTreeSet<usize>,
+    /// Click-selected entry for visual feedback without entering browse mode.
+    /// Set by mouse click, cleared on any key press. Separate from
+    /// `browse_cursor` so clicking doesn't steal keyboard input.
+    highlighted_entry: Option<usize>,
+    /// Entry index where mouse went down, reset on up.  Used to distinguish
+    /// a plain click (no Drag events → auto-copy single entry on Up) from a
+    /// drag gesture (Drag events occurred → auto-copy the range on Up).
+    mouse_down_entry: Option<usize>,
     /// Per-entry hit rects from the last draw.
     entry_rects: Vec<(usize, ratatui::layout::Rect)>,
     /// Clickable provider/model title spans from the last draw.
@@ -3573,6 +3743,11 @@ pub struct ChatState {
     /// Per-entry unwrapped-line ranges in `cached_lines` — `(entry_idx,
     /// start, end_exclusive)`. Used by mouse hit-testing.
     cached_line_ranges: Vec<(usize, usize, usize)>,
+    /// Per-entry screen-row ranges: `(entry_idx, screen_start, screen_end)`.
+    /// Unlike `cached_line_ranges` (unwrapped line indices), these account for
+    /// markdown wrapping so mouse hit-testing (`entry_rects`) lands on the
+    /// correct screen rows for agent messages, code blocks, and tables.
+    cached_screen_ranges: Vec<(usize, u16, u16)>,
     /// Fine-grained dirty tracking — see [`LinesDirty`].
     dirty: LinesDirty,
     /// How many entries from `entries[cached_render_start..]` are represented in
@@ -3642,6 +3817,8 @@ impl ChatState {
             browse_cursor: None,
             browse_anchor: None,
             browse_multi: std::collections::BTreeSet::new(),
+            highlighted_entry: None,
+            mouse_down_entry: None,
             entry_rects: Vec::new(),
             title_hit_rects: Vec::new(),
             scrollbar_track_rect: None,
@@ -3653,6 +3830,7 @@ impl ChatState {
             last_inner_height: 0,
             cached_lines: Vec::new(),
             cached_line_ranges: Vec::new(),
+            cached_screen_ranges: Vec::new(),
             dirty: LinesDirty::Full,
             cached_entry_count: 0,
             cached_render_start: 0,
@@ -3698,6 +3876,24 @@ impl ChatState {
         self.browse_cursor.is_some() || !self.browse_multi.is_empty()
     }
 
+    /// Yank a single entry's body text — used by the auto-copy-on-click
+    /// feature when the user clicks a chat entry.
+    fn yank_single_entry(&self, idx: usize) -> String {
+        self.entries
+            .get(idx)
+            .map(clipboard_text)
+            .unwrap_or_default()
+    }
+
+    /// Copy a single entry to clipboard silently (no browse mode, just OSC 52).
+    fn copy_entry_silently(state: &mut ChatState, idx: usize) {
+        let text = state.yank_single_entry(idx);
+        if !text.is_empty() {
+            crate::mouse::copy_osc52(&text);
+            state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
+        }
+    }
+
     /// Build the clipboard string. Single = body. Multi = role-prefixed.
     fn yank_selection(&self) -> String {
         let sel = self.selected_entries();
@@ -3731,6 +3927,8 @@ impl ChatState {
     /// Leave browse mode: clear both cursor and anchor, return to input.
     fn exit_browse_mode(&mut self) {
         self.browse_cursor = None;
+        self.highlighted_entry = None;
+        self.mouse_down_entry = None;
         self.browse_anchor = None;
         self.mark_dirty_full();
     }
@@ -3786,7 +3984,7 @@ impl ChatState {
     }
 
     /// True when `idx` should render highlighted: in range, in multi-select,
-    /// or matches the lone cursor.
+    /// matches the lone cursor, or is the click-highlighted entry.
     fn is_entry_highlighted(&self, idx: usize) -> bool {
         if self.browse_multi.contains(&idx) {
             return true;
@@ -3794,7 +3992,7 @@ impl ChatState {
         if self.is_in_browse_range(idx) {
             return true;
         }
-        self.browse_cursor == Some(idx)
+        self.browse_cursor == Some(idx) || self.highlighted_entry == Some(idx)
     }
 
     /// Total selection: multi-select set ∪ browse range ∪ lone cursor.
@@ -3860,6 +4058,7 @@ impl ChatState {
             self.cached_entry_count = total - start;
             self.dirty = LinesDirty::Clean;
             self.cached_total_rows = self.cached_total_rows.saturating_add(appended_rows);
+            self.rebuild_screen_ranges(width);
             return;
         }
 
@@ -3888,6 +4087,32 @@ impl ChatState {
         self.cached_render_start = start;
         self.dirty = LinesDirty::Clean;
         self.cached_total_rows = self.compute_cached_rows(width);
+        self.rebuild_screen_ranges(width);
+    }
+
+    /// Recompute `cached_screen_ranges` from `cached_line_ranges` by wrapping
+    /// each entry's `Line`s individually, so screen row positions reflect
+    /// markdown wrapping (code blocks, tables, etc.). Called after every
+    /// cache rebuild so mouse hit-testing in `entry_rects` stays accurate.
+    fn rebuild_screen_ranges(&mut self, width: u16) {
+        self.cached_screen_ranges.clear();
+        let mut screen_cursor = 0u16;
+        for &(entry_idx, lo, hi) in &self.cached_line_ranges {
+            let entry_lines = self.cached_lines[lo..hi]
+                .iter()
+                .map(borrow_line)
+                .collect::<Vec<_>>();
+            if entry_lines.is_empty() {
+                continue;
+            }
+            let wrapped = Paragraph::new(entry_lines)
+                .wrap(Wrap { trim: false })
+                .line_count(width) as u16;
+            let screen_lo = screen_cursor;
+            screen_cursor += wrapped;
+            self.cached_screen_ranges
+                .push((entry_idx, screen_lo, screen_cursor));
+        }
     }
 
     fn compute_cached_rows(&self, width: u16) -> u16 {
@@ -4596,6 +4821,8 @@ impl ChatState {
         self.cancel_started_at = None;
         self.browse_cursor = None;
         self.browse_anchor = None;
+        self.highlighted_entry = None;
+        self.mouse_down_entry = None;
         self.browse_multi.clear();
         // Reset branch cache: new session may have a different cwd.
         self.git_branch = None;
@@ -4696,6 +4923,7 @@ pub async fn open_editor_for_content(content: &str) -> String {
             std::io::stdout(),
             crossterm::event::PushKeyboardEnhancementFlags(
                 crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    | crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
             )
         );
     }
@@ -4890,8 +5118,8 @@ mod tests {
             &id,
             Some(serde_json::json!({
                 "agents": [
-                    {"alias": "alpha", "enabled": true, "live_sessions": 0},
-                    {"alias": "beta", "enabled": true, "live_sessions": 0}
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": 0},
+                    {"alias": "beta", "enabled": true, "live_sessions": 0, "persisted_sessions": 0}
                 ]
             })),
             None,
@@ -4933,8 +5161,8 @@ mod tests {
             &id,
             Some(serde_json::json!({
                 "agents": [
-                    {"alias": "alpha", "enabled": true, "live_sessions": 0},
-                    {"alias": "beta", "enabled": true, "live_sessions": 1}
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": 0},
+                    {"alias": "beta", "enabled": true, "live_sessions": 1, "persisted_sessions": 0}
                 ]
             })),
             None,
@@ -5062,8 +5290,8 @@ mod tests {
             &id,
             Some(serde_json::json!({
                 "agents": [
-                    {"alias": "alpha", "enabled": true, "live_sessions": 0},
-                    {"alias": "beta", "enabled": true, "live_sessions": 0}
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0, "persisted_sessions": 0},
+                    {"alias": "beta", "enabled": true, "live_sessions": 0, "persisted_sessions": 0}
                 ]
             })),
             None,

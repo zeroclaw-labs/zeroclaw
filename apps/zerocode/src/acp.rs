@@ -58,6 +58,18 @@ impl Acp {
         self.inner.wants_text_input()
     }
 
+    pub(crate) fn clear_input(&mut self) {
+        self.inner.clear_input();
+    }
+
+    pub(crate) fn in_browse_mode(&self) -> bool {
+        self.inner.in_browse_mode()
+    }
+
+    pub(crate) fn exit_browse_mode(&mut self) {
+        self.inner.exit_browse_mode();
+    }
+
     pub(crate) async fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) {
         self.inner.handle_mouse(mouse, area).await;
     }

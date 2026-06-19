@@ -425,6 +425,7 @@ zc-chat-approval-action-edit = Edit
 
 zc-chat-clipboard-you = You: { $text }
 zc-chat-clipboard-agent = Agent: { $text }
+zc-chat-copied-clipboard = Copied to clipboard
 
 zc-config-breadcrumb-root = Config
 zc-config-section-detail-hint = { $open } or { $into } to open this section

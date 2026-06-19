@@ -598,14 +598,10 @@ impl Dashboard {
                     ),
                     Span::styled(&a.alias, theme::body_style()),
                     Span::styled(
-                        if a.persisted_sessions > 0 {
-                            format!(
-                                "  ({} live, {} saved)",
-                                a.live_sessions, a.persisted_sessions
-                            )
-                        } else {
-                            format!("  ({} live)", a.live_sessions)
-                        },
+                        format!(
+                            "  ({} live, {} persisted)",
+                            a.live_sessions, a.persisted_sessions
+                        ),
                         theme::dim_style(),
                     ),
                 ]))
@@ -892,14 +888,10 @@ impl Dashboard {
                         status_style,
                     ),
                     Span::styled(
-                        if a.persisted_sessions > 0 {
-                            format!(
-                                "  {} live / {} saved",
-                                a.live_sessions, a.persisted_sessions
-                            )
-                        } else {
-                            format!("  {} live", a.live_sessions)
-                        },
+                        format!(
+                            "  live: {}, persisted: {}",
+                            a.live_sessions, a.persisted_sessions
+                        ),
                         theme::dim_style(),
                     ),
                 ]))
@@ -952,8 +944,11 @@ impl Dashboard {
                 },
             ),
             detail_line(
-                &crate::i18n::t("zc-dashboard-detail-live-sessions"),
-                &a.live_sessions.to_string(),
+                &crate::i18n::t("zc-dashboard-detail-sessions"),
+                &format!(
+                    "{} live, {} persisted",
+                    a.live_sessions, a.persisted_sessions
+                ),
             ),
         ];
         if a.persisted_sessions > 0 {

@@ -1,91 +1,12 @@
-//! Platform clipboard image reading and text writing.
+//! Platform clipboard image reading and text reading.
 //!
 //! Shells out to system clipboard tools to read image data from the
-//! clipboard, read text from the clipboard, and write text to the
-//! clipboard. Gracefully degrades — returns `None` if no tool is
-//! available or no image is present.
+//! clipboard and read text from the clipboard. Gracefully degrades —
+//! returns `None` if no tool is available or no image/text is present.
 
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
-
-/// Clipboard text writer, selected per platform.
-#[derive(Debug, Clone)]
-enum WriteTool {
-    /// xclip (X11)
-    Xclip,
-    /// wl-copy (Wayland)
-    WlCopy,
-    /// pbcopy (macOS)
-    PbCopy,
-    /// PowerShell Set-Clipboard (Windows)
-    PowerShell,
-}
-
-/// Write UTF-8 text to the system clipboard.
-///
-/// Returns `true` on success, `false` if no tool is available or the
-/// write failed. Used by the code-block [Copy] action and the
-/// `/copy` slash command.
-pub(crate) fn write_clipboard_text(text: &str) -> bool {
-    let tool = which_write_tool();
-    match tool {
-        Some(t) => run_write_tool(&t, text),
-        None => false,
-    }
-}
-
-fn which_write_tool() -> Option<WriteTool> {
-    if cfg!(windows) {
-        Some(WriteTool::PowerShell)
-    } else if which_exists("wl-copy") {
-        Some(WriteTool::WlCopy)
-    } else if which_exists("xclip") {
-        Some(WriteTool::Xclip)
-    } else if which_exists("pbcopy") {
-        Some(WriteTool::PbCopy)
-    } else {
-        None
-    }
-}
-
-fn run_write_tool(tool: &WriteTool, text: &str) -> bool {
-    let mut cmd = match tool {
-        WriteTool::Xclip => {
-            let mut c = Command::new("xclip");
-            c.args(["-selection", "clipboard"]);
-            c
-        }
-        WriteTool::WlCopy => Command::new("wl-copy"),
-        WriteTool::PbCopy => Command::new("pbcopy"),
-        WriteTool::PowerShell => {
-            let mut c = Command::new("powershell");
-            c.args([
-                "-NoProfile",
-                "-Command",
-                "Set-Clipboard",
-            ]);
-            c
-        }
-    };
-
-    cmd.stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-
-    use std::io::Write as _;
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(text.as_bytes());
-        drop(stdin);
-    }
-
-    child.wait().map(|s| s.success()).unwrap_or(false)
-}
 
 /// Try to read image data from the system clipboard.
 ///
