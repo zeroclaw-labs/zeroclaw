@@ -35,7 +35,7 @@
 //! and re-audit, i.e. the exact pre-cache behavior. This is a runtime off-ramp if
 //! the cache is ever suspected of serving stale results.
 
-use super::Skill;
+use super::{DroppedSkill, Skill};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
@@ -51,9 +51,21 @@ struct CacheKey {
     tag: &'static str,
 }
 
+/// The cached unit of a skill-directory load: the loaded skills *and* the
+/// audit-dropped candidates the loader skipped. Caching both keeps the
+/// skipped-audit record (#7963) alive across cache hits without re-auditing —
+/// the whole point of the cache (see module docs). A side-channel that
+/// recomputed drops would re-walk + re-audit on every hit and defeat both the
+/// cache and the audit-parity guarantee.
+#[derive(Clone)]
+pub(super) struct LoadOutput {
+    pub skills: Vec<Skill>,
+    pub dropped: Vec<DroppedSkill>,
+}
+
 struct CacheEntry {
     signature: u64,
-    skills: Vec<Skill>,
+    output: LoadOutput,
 }
 
 fn cache() -> &'static RwLock<HashMap<CacheKey, CacheEntry>> {
@@ -174,8 +186,8 @@ pub(super) fn cached_load(
     dir: &Path,
     allow_scripts: bool,
     tag: &'static str,
-    load: impl FnOnce() -> Vec<Skill>,
-) -> Vec<Skill> {
+    load: impl FnOnce() -> LoadOutput,
+) -> LoadOutput {
     if !cache_enabled() {
         return load();
     }
@@ -193,7 +205,7 @@ pub(super) fn cached_load(
         if let Some(entry) = guard.get(&key)
             && entry.signature == signature
         {
-            return entry.skills.clone();
+            return entry.output.clone();
         }
     }
 
@@ -201,16 +213,16 @@ pub(super) fn cached_load(
     // relative to lock contention here and we want a single store. If the dir
     // mutates during `load`, its content digest changes, so the *next* call's
     // signature differs from what we store and the entry self-heals.
-    let skills = load();
+    let output = load();
     let mut guard = cache().write().unwrap_or_else(|e| e.into_inner());
     guard.insert(
         key,
         CacheEntry {
             signature,
-            skills: skills.clone(),
+            output: output.clone(),
         },
     );
-    skills
+    output
 }
 
 /// Drop every cached entry. Call after any out-of-band mutation of a skills
@@ -242,23 +254,26 @@ mod tests {
 
         let load = || {
             calls.fetch_add(1, Ordering::SeqCst);
-            vec![Skill {
-                name: "alpha".into(),
-                description: String::new(),
-                version: String::new(),
-                author: None,
-                tags: vec![],
-                tools: vec![],
-                prompts: vec![],
-                slash_options: vec![],
-                location: None,
-            }]
+            LoadOutput {
+                skills: vec![Skill {
+                    name: "alpha".into(),
+                    description: String::new(),
+                    version: String::new(),
+                    author: None,
+                    tags: vec![],
+                    tools: vec![],
+                    prompts: vec![],
+                    slash_options: vec![],
+                    location: None,
+                }],
+                dropped: vec![],
+            }
         };
 
         let a = cached_load(&skills_dir, false, "test", load);
         let b = cached_load(&skills_dir, false, "test", load);
-        assert_eq!(a.len(), 1);
-        assert_eq!(b.len(), 1);
+        assert_eq!(a.skills.len(), 1);
+        assert_eq!(b.skills.len(), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 1, "loader should run once");
     }
 
@@ -271,7 +286,10 @@ mod tests {
         let calls = AtomicUsize::new(0);
         let load = || {
             calls.fetch_add(1, Ordering::SeqCst);
-            Vec::<Skill>::new()
+            LoadOutput {
+                skills: Vec::new(),
+                dropped: vec![],
+            }
         };
 
         cached_load(&skills_dir, false, "test", load);
@@ -294,7 +312,10 @@ mod tests {
         let calls = AtomicUsize::new(0);
         let load = || {
             calls.fetch_add(1, Ordering::SeqCst);
-            Vec::<Skill>::new()
+            LoadOutput {
+                skills: Vec::new(),
+                dropped: vec![],
+            }
         };
 
         cached_load(&skills_dir, false, "test", load);
@@ -331,7 +352,10 @@ mod tests {
         let calls = AtomicUsize::new(0);
         let load = || {
             calls.fetch_add(1, Ordering::SeqCst);
-            Vec::<Skill>::new()
+            LoadOutput {
+                skills: Vec::new(),
+                dropped: vec![],
+            }
         };
 
         cached_load(&skills_dir, false, "test", load);
@@ -380,7 +404,10 @@ mod tests {
         let calls = AtomicUsize::new(0);
         let load = || {
             calls.fetch_add(1, Ordering::SeqCst);
-            Vec::<Skill>::new()
+            LoadOutput {
+                skills: Vec::new(),
+                dropped: vec![],
+            }
         };
 
         // Must return promptly (no hang) and, because the dir can't be signed,
@@ -404,7 +431,10 @@ mod tests {
         let calls = AtomicUsize::new(0);
         let load = || {
             calls.fetch_add(1, Ordering::SeqCst);
-            Vec::<Skill>::new()
+            LoadOutput {
+                skills: Vec::new(),
+                dropped: vec![],
+            }
         };
 
         cached_load(&skills_dir, false, "test", load);
@@ -427,7 +457,10 @@ mod tests {
         let calls = AtomicUsize::new(0);
         let load = || {
             calls.fetch_add(1, Ordering::SeqCst);
-            Vec::<Skill>::new()
+            LoadOutput {
+                skills: Vec::new(),
+                dropped: vec![],
+            }
         };
 
         cached_load(&skills_dir, false, "test", load);
@@ -448,7 +481,10 @@ mod tests {
         let calls = AtomicUsize::new(0);
         let load = || {
             calls.fetch_add(1, Ordering::SeqCst);
-            Vec::<Skill>::new()
+            LoadOutput {
+                skills: Vec::new(),
+                dropped: vec![],
+            }
         };
 
         cached_load(&absent, false, "test", load);
@@ -473,5 +509,54 @@ mod tests {
         for v in ["1", "true", "yes", "on", "", "garbage"] {
             assert!(cache_enabled_from_env(Some(v)), "{v:?} should stay enabled");
         }
+    }
+
+    // #7963: the dropped-skill record must ride the cache, so a cache HIT returns
+    // the same drops as the miss without re-running (re-auditing) the loader.
+    #[test]
+    fn dropped_records_survive_cache_hit() {
+        invalidate();
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        write(&skills_dir, "alpha", "# Alpha\n");
+        let calls = AtomicUsize::new(0);
+
+        let drop = || DroppedSkill {
+            name: "bad".into(),
+            origin_hint: "workspace".into(),
+            reason: super::super::SkillDropReason::AuditError("boom".into()),
+            location: None,
+        };
+        let load = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            LoadOutput {
+                skills: Vec::new(),
+                dropped: vec![drop()],
+            }
+        };
+
+        let first = cached_load(&skills_dir, false, "test", load);
+        // On the hit the loader must NOT run; the closure asserts via call count.
+        let hit_load = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            LoadOutput {
+                skills: Vec::new(),
+                dropped: vec![],
+            }
+        };
+        let second = cached_load(&skills_dir, false, "test", hit_load);
+
+        assert_eq!(first.dropped.len(), 1);
+        assert_eq!(
+            second.dropped.len(),
+            1,
+            "drops must survive the cache hit, not be recomputed"
+        );
+        assert_eq!(second.dropped[0].name, "bad");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the loader must run only on the miss"
+        );
     }
 }
