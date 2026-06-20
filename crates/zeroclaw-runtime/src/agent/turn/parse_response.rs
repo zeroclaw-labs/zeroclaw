@@ -121,6 +121,17 @@ pub(crate) async fn interpret_chat_response(
         turn_id: None,
     });
 
+    // Record cost via the task-local tracker (no-op when not scoped) and keep
+    // the per-call USD so both the Usage event and the llm_response log line
+    // can carry it. `None` = untracked (no cost scope or no usage);
+    // `Some(0.0)` = tracked but unpriced (the missing-pricing WARN fires
+    // inside record_tool_loop_cost_usage in that case).
+    let call_cost_usd = resp
+        .usage
+        .as_ref()
+        .and_then(|usage| record_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage))
+        .map(|(_total_tokens, cost_usd)| cost_usd);
+
     // Per-LLM-call usage event, right after the observer success event
     // (upstream E2 parity, agent.rs Usage emission).
     if let Some(tx) = ctx.event_tx
@@ -131,16 +142,10 @@ pub(crate) async fn interpret_chat_response(
                 input_tokens: usage.input_tokens,
                 cached_input_tokens: usage.cached_input_tokens,
                 output_tokens: usage.output_tokens,
-                cost_usd: None,
+                cost_usd: call_cost_usd,
             })
             .await;
     }
-
-    // Record cost via task-local tracker (no-op when not scoped)
-    let _ = resp
-        .usage
-        .as_ref()
-        .and_then(|usage| record_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage));
 
     let response_text = strip_think_tags(resp.text_or_empty());
     // First try native structured tool calls (OpenAI-format).
@@ -234,6 +239,7 @@ pub(crate) async fn interpret_chat_response(
                 "iteration": iteration + 1,
                 "input_tokens": resp_input_tokens,
                 "output_tokens": resp_output_tokens,
+                "cost_usd": call_cost_usd,
                 "raw_response": scrub_credentials(&response_text),
                 "native_tool_calls": resp.tool_calls.len(),
                 "parsed_tool_calls": calls.len(),
