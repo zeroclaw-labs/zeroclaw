@@ -3128,9 +3128,6 @@ async fn main() -> Result<()> {
         );
     }
 
-    #[cfg(feature = "agent-runtime")]
-    crate::i18n::init(&crate::i18n::detect_locale());
-
     let cmd = apply_i18n_to_command(Cli::command());
 
     if std::env::args_os().len() <= 1 {
@@ -3146,6 +3143,9 @@ async fn main() -> Result<()> {
         // SAFETY: called early in main before any threads are spawned.
         unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", config_dir) };
     }
+
+    #[cfg(feature = "agent-runtime")]
+    crate::i18n::init(&crate::i18n::detect_locale());
 
     // Completions must remain stdout-only and should not load config or initialize logging.
     // This avoids warnings/log lines corrupting sourced completion scripts.

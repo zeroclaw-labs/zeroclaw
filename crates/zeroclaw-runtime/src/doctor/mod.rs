@@ -449,60 +449,71 @@ pub async fn update_context_windows(
     provider_override: Option<&str>,
     dry_run: bool,
 ) -> anyhow::Result<usize> {
-    crate::i18n::init(&crate::i18n::detect_locale());
     let mut updated = 0usize;
 
     // Collect all the data we need first to avoid borrow conflicts
-    let targets: Vec<(String, String, Option<String>, Option<String>, Option<usize>)> =
-        if let Some(model_provider) = provider_override {
-            // Single provider - use find_by_name to look up by "type.alias" format
-            if let Some((_, _, entry)) = config.providers.models.find_by_name(model_provider) {
-                vec![(
-                    model_provider.to_string(),
-                    entry.model.clone().unwrap_or_default(),
-                    entry.uri.clone(),
-                    entry.api_key.clone(),
-                    entry.context_window,
-                )]
-            } else {
-                anyhow::bail!("Model provider '{model_provider}' not found in config");
-            }
+    let targets: Vec<(
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<usize>,
+    )> = if let Some(model_provider) = provider_override {
+        // Single provider - use find_by_name to look up by "type.alias" format
+        if let Some((_, _, entry)) = config.providers.models.find_by_name(model_provider) {
+            vec![(
+                model_provider.to_string(),
+                entry.model.clone().unwrap_or_default(),
+                entry.uri.clone(),
+                entry.api_key.clone(),
+                entry.context_window,
+            )]
         } else {
-            // All providers
-            config
-                .providers
-                .models
-                .iter_entries()
-                .map(|(t, a, e)| {
-                    (
-                        format!("{t}.{a}"),
-                        e.model.clone().unwrap_or_default(),
-                        e.uri.clone(),
-                        e.api_key.clone(),
-                        e.context_window,
-                    )
-                })
-                .collect()
-        };
+            anyhow::bail!("Model provider '{model_provider}' not found in config");
+        }
+    } else {
+        // All providers
+        config
+            .providers
+            .models
+            .iter_entries()
+            .map(|(t, a, e)| {
+                (
+                    format!("{t}.{a}"),
+                    e.model.clone().unwrap_or_default(),
+                    e.uri.clone(),
+                    e.api_key.clone(),
+                    e.context_window,
+                )
+            })
+            .collect()
+    };
 
     for (provider_ref, model, uri, api_key, existing_context_window) in targets {
         // Skip if already has context_window set
         if let Some(ctx) = existing_context_window {
-            let msg = crate::i18n::get_required_cli_string_with_args(
-                "cli-doctor-ctxwin-already-set",
-                &[("provider_ref", &provider_ref), ("ctx", &ctx.to_string())],
+            println!(
+                "{}",
+                crate::i18n::get_required_cli_string_with_args(
+                    "cli-doctor-ctxwin-already-set",
+                    &[
+                        ("provider_ref", &provider_ref.as_str()),
+                        ("ctx", &ctx.to_string())
+                    ],
+                )
             );
-            println!("{}", msg);
             continue;
         }
 
         // Skip if no model configured
         if model.is_empty() {
-            let msg = crate::i18n::get_required_cli_string_with_args(
-                "cli-doctor-ctxwin-no-model",
-                &[("provider_ref", &provider_ref)],
+            println!(
+                "{}",
+                crate::i18n::get_required_cli_string_with_args(
+                    "cli-doctor-ctxwin-no-model",
+                    &[("provider_ref", &provider_ref.as_str())],
+                )
             );
-            println!("{}", msg);
             continue;
         }
 
@@ -523,11 +534,16 @@ pub async fn update_context_windows(
         {
             Some(ctx) => {
                 if dry_run {
-                    let msg = crate::i18n::get_required_cli_string_with_args(
-                        "cli-doctor-ctxwin-would-set",
-                        &[("provider_ref", &provider_ref), ("ctx", &ctx.to_string())],
+                    println!(
+                        "{}",
+                        crate::i18n::get_required_cli_string_with_args(
+                            "cli-doctor-ctxwin-would-set",
+                            &[
+                                ("provider_ref", &provider_ref.as_str()),
+                                ("ctx", &ctx.to_string())
+                            ],
+                        )
                     );
-                    println!("{}", msg);
                 } else {
                     // Update the config - need to find and mutate
                     let mut found = false;
@@ -537,47 +553,62 @@ pub async fn update_context_windows(
                         {
                             entry_mut.2.context_window = Some(ctx);
                             updated += 1;
-                            let msg = crate::i18n::get_required_cli_string_with_args(
-                                "cli-doctor-ctxwin-set",
-                                &[("provider_ref", &provider_ref), ("ctx", &ctx.to_string())],
+                            println!(
+                                "{}",
+                                crate::i18n::get_required_cli_string_with_args(
+                                    "cli-doctor-ctxwin-set",
+                                    &[
+                                        ("provider_ref", provider_ref.as_str()),
+                                        ("ctx", &ctx.to_string())
+                                    ],
+                                )
                             );
-                            println!("{}", msg);
                             found = true;
                             break;
                         }
                     }
                     if !found {
-                        let msg = crate::i18n::get_required_cli_string_with_args(
-                            "cli-doctor-ctxwin-not-found",
-                            &[("provider_ref", &provider_ref)],
+                        println!(
+                            "{}",
+                            crate::i18n::get_required_cli_string_with_args(
+                                "cli-doctor-ctxwin-not-found",
+                                &[("provider_ref", provider_ref.as_str())],
+                            )
                         );
-                        println!("{}", msg);
                     }
                 }
             }
             None => {
-                let msg = crate::i18n::get_required_cli_string_with_args(
-                    "cli-doctor-ctxwin-fetch-failed",
-                    &[("provider_ref", &provider_ref)],
+                println!(
+                    "{}",
+                    crate::i18n::get_required_cli_string_with_args(
+                        "cli-doctor-ctxwin-fetch-failed",
+                        &[("provider_ref", provider_ref.as_str())],
+                    )
                 );
-                println!("{}", msg);
             }
         }
     }
 
     if !dry_run && updated > 0 {
         config.save().await?;
-        let msg = crate::i18n::get_required_cli_string_with_args(
-            "cli-doctor-ctxwin-saved",
-            &[("updated", &updated.to_string())],
+        println!(
+            "\n{}",
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-doctor-ctxwin-saved",
+                &[("updated", &updated.to_string())],
+            )
         );
-        println!("\n{}", msg);
     } else if dry_run {
-        let msg = crate::i18n::get_required_cli_string("cli-doctor-ctxwin-dry-run");
-        println!("\n{}", msg);
+        println!(
+            "\n{}",
+            crate::i18n::get_required_cli_string("cli-doctor-ctxwin-dry-run")
+        );
     } else {
-        let msg = crate::i18n::get_required_cli_string("cli-doctor-ctxwin-none");
-        println!("\n{}", msg);
+        println!(
+            "\n{}",
+            crate::i18n::get_required_cli_string("cli-doctor-ctxwin-none")
+        );
     }
 
     Ok(updated)

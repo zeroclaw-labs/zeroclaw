@@ -938,7 +938,6 @@ pub async fn run(
     );
     let __zc_body = async move {
         let agent_alias: &str = __zc_alias.as_str();
-        crate::i18n::init(&crate::i18n::detect_locale());
         // ── Effective per-agent runtime tunables ──────────────────────
         // Profile values (when set) override the agent's inline fields.
         // See `Config::resolved_agent_config` for precedence rules.
@@ -1350,13 +1349,12 @@ pub async fn run(
             .collect();
 
         // ── Initialize locale-aware tool descriptions ──────────────────
-        let i18n_locale = config
+        let _i18n_locale = config
             .locale
             .as_deref()
             .filter(|s| !s.is_empty())
             .map(ToString::to_string)
             .unwrap_or_else(crate::i18n::detect_locale);
-        crate::i18n::init(&i18n_locale);
 
         // ── Build system prompt from workspace MD files (OpenClaw framework) ──
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
@@ -2401,16 +2399,16 @@ pub async fn run(
                             crate::i18n::get_required_cli_string_with_args(
                                 "cli-agent-context-bar",
                                 &[
-                                    ("used", &format_tokens(usage.input_tokens)),
-                                    ("max", &format_tokens(max_ctx)),
+                                    ("used", &format_tokens(usage.input_tokens).as_str()),
+                                    ("max", &format_tokens(max_ctx).as_str()),
                                     ("bar", &bar),
-                                    ("pct", &format!("{:.0}", pct)),
+                                    ("pct", &format!("{:.0}", pct).as_str()),
                                 ],
                             )
                         } else {
                             crate::i18n::get_required_cli_string_with_args(
                                 "cli-agent-context-bar-unknown",
-                                &[("max", &format_tokens(max_ctx))],
+                                &[("max", &format_tokens(max_ctx).as_str())],
                             )
                         };
                         eprintln!("\x1b[2m{}\x1b[0m", msg);
@@ -2842,13 +2840,12 @@ pub async fn process_message(
             .collect();
 
         // ── Initialize locale-aware tool descriptions ──────────────────
-        let i18n_locale = config
+        let _i18n_locale = config
             .locale
             .as_deref()
             .filter(|s| !s.is_empty())
             .map(ToString::to_string)
             .unwrap_or_else(crate::i18n::detect_locale);
-        crate::i18n::init(&i18n_locale);
 
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
 

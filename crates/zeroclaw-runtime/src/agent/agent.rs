@@ -1959,44 +1959,6 @@ impl Agent {
         let loop_result = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
                 Some(cost_context.clone()),
-<<<<<<< HEAD
-                crate::agent::loop_::run_tool_call_loop(
-                    self.model_provider.as_ref(),
-                    &mut loop_history,
-                    &self.tools,
-                    self.observer.as_ref(),
-                    &self.model_provider_name,
-                    &effective_model,
-                    self.temperature,
-                    false,
-                    self.approval_manager.as_deref(),
-                    "cli",
-                    None,
-                    &self.multimodal_config,
-                    self.config.resolved.max_tool_iterations,
-                    None,
-                    None,
-                    self.hook_runner.as_deref(),
-                    &[],
-                    &self.config.resolved.tool_call_dedup_exempt,
-                    self.activated_tools.as_ref(),
-                    None,
-                    &pacing,
-                    self.config.resolved.strict_tool_parsing,
-                    self.config.resolved.parallel_tools,
-                    self.config.resolved.max_tool_result_chars,
-                    self.config.resolved.model_context_window,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(&mut loop_new_messages),
-                    &knobs,
-                    Some(&mut self.image_cache),
-                ),
-=======
                 crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
                     model_provider: self.model_provider.as_ref(),
                     history: &mut loop_history,
@@ -2033,7 +1995,6 @@ impl Agent {
                     knobs: &knobs,
                     image_cache: Some(&mut self.image_cache),
                 }),
->>>>>>> master
             )
             .await;
 
