@@ -14675,6 +14675,7 @@ dependencies = [
  "wit-bindgen 0.58.0",
  "zeroclaw-api",
  "zeroclaw-plugins",
+ "zeroclaw-spawn",
 ]
 
 [[package]]

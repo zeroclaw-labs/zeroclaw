@@ -229,3 +229,165 @@ macro_rules! export_memory {
         $crate::bindings::memory::export!(__ZeroclawPluginComponent with_types_in $crate::bindings::memory);
     };
 }
+
+/// Wires a [`crate::channel::ChannelPlugin`] implementation into the
+/// generated `export!` for the `channel-plugin` world.
+#[macro_export]
+macro_rules! export_channel {
+    ($ty:ty) => {
+        struct __ZeroclawPluginComponent;
+
+        impl $crate::bindings::channel::exports::zeroclaw::plugin::channel::Guest
+            for __ZeroclawPluginComponent
+        {
+            fn name() -> String {
+                <$ty as $crate::channel::ChannelPlugin>::name()
+            }
+
+            fn send(
+                message: $crate::channel::SendMessage,
+            ) -> Result<(), String> {
+                <$ty as $crate::channel::ChannelPlugin>::send(message)
+            }
+
+            fn poll_message() -> Option<$crate::channel::InboundMessage> {
+                <$ty as $crate::channel::ChannelPlugin>::poll_message()
+            }
+
+            fn get_channel_capabilities() -> $crate::channel::ChannelCapabilities {
+                <$ty as $crate::channel::ChannelPlugin>::get_channel_capabilities()
+            }
+
+            fn health_check() -> bool {
+                <$ty as $crate::channel::ChannelPlugin>::health_check()
+            }
+
+            fn self_handle() -> Option<String> {
+                <$ty as $crate::channel::ChannelPlugin>::self_handle()
+            }
+
+            fn self_addressed_mention() -> Option<String> {
+                <$ty as $crate::channel::ChannelPlugin>::self_addressed_mention()
+            }
+
+            fn drop_self_message(msg: $crate::channel::InboundMessage) -> bool {
+                <$ty as $crate::channel::ChannelPlugin>::drop_self_message(msg)
+            }
+
+            fn start_typing(recipient: String) -> Result<(), String> {
+                <$ty as $crate::channel::ChannelPlugin>::start_typing(recipient)
+            }
+
+            fn stop_typing(recipient: String) -> Result<(), String> {
+                <$ty as $crate::channel::ChannelPlugin>::stop_typing(recipient)
+            }
+
+            fn send_draft(
+                message: $crate::channel::SendMessage,
+            ) -> Result<Option<String>, String> {
+                <$ty as $crate::channel::ChannelPlugin>::send_draft(message)
+            }
+
+            fn update_draft(
+                recipient: String,
+                message_id: String,
+                text: String,
+            ) -> Result<(), String> {
+                <$ty as $crate::channel::ChannelPlugin>::update_draft(recipient, message_id, text)
+            }
+
+            fn update_draft_progress(
+                recipient: String,
+                message_id: String,
+                text: String,
+            ) -> Result<(), String> {
+                <$ty as $crate::channel::ChannelPlugin>::update_draft_progress(
+                    recipient, message_id, text,
+                )
+            }
+
+            fn finalize_draft(
+                recipient: String,
+                message_id: String,
+                text: String,
+            ) -> Result<(), String> {
+                <$ty as $crate::channel::ChannelPlugin>::finalize_draft(recipient, message_id, text)
+            }
+
+            fn cancel_draft(recipient: String, message_id: String) -> Result<(), String> {
+                <$ty as $crate::channel::ChannelPlugin>::cancel_draft(recipient, message_id)
+            }
+
+            fn multi_message_delay_ms() -> u64 {
+                <$ty as $crate::channel::ChannelPlugin>::multi_message_delay_ms()
+            }
+
+            fn add_reaction(
+                channel_id: String,
+                message_id: String,
+                emoji: String,
+            ) -> Result<(), String> {
+                <$ty as $crate::channel::ChannelPlugin>::add_reaction(channel_id, message_id, emoji)
+            }
+
+            fn remove_reaction(
+                channel_id: String,
+                message_id: String,
+                emoji: String,
+            ) -> Result<(), String> {
+                <$ty as $crate::channel::ChannelPlugin>::remove_reaction(
+                    channel_id, message_id, emoji,
+                )
+            }
+
+            fn pin_message(channel_id: String, message_id: String) -> Result<(), String> {
+                <$ty as $crate::channel::ChannelPlugin>::pin_message(channel_id, message_id)
+            }
+
+            fn unpin_message(channel_id: String, message_id: String) -> Result<(), String> {
+                <$ty as $crate::channel::ChannelPlugin>::unpin_message(channel_id, message_id)
+            }
+
+            fn redact_message(
+                channel_id: String,
+                message_id: String,
+                reason: Option<String>,
+            ) -> Result<(), String> {
+                <$ty as $crate::channel::ChannelPlugin>::redact_message(
+                    channel_id, message_id, reason,
+                )
+            }
+
+            fn request_approval(
+                recipient: String,
+                request: $crate::channel::ApprovalRequest,
+            ) -> Result<Option<$crate::channel::ApprovalResponse>, String> {
+                <$ty as $crate::channel::ChannelPlugin>::request_approval(recipient, request)
+            }
+
+            fn request_choice(
+                question: String,
+                choices: Vec<String>,
+                timeout_secs: u64,
+            ) -> Result<Option<String>, String> {
+                <$ty as $crate::channel::ChannelPlugin>::request_choice(
+                    question, choices, timeout_secs,
+                )
+            }
+        }
+
+        impl $crate::bindings::channel::exports::zeroclaw::plugin::plugin_info::Guest
+            for __ZeroclawPluginComponent
+        {
+            fn plugin_name() -> String {
+                <$ty as $crate::channel::ChannelPlugin>::plugin_info().0.to_string()
+            }
+
+            fn plugin_version() -> String {
+                <$ty as $crate::channel::ChannelPlugin>::plugin_info().1.to_string()
+            }
+        }
+
+        $crate::bindings::channel::export!(__ZeroclawPluginComponent with_types_in $crate::bindings::channel);
+    };
+}

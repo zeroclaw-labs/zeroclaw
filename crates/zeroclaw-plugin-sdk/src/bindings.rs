@@ -35,3 +35,13 @@ pub mod memory {
         pub_export_macro: true,
     });
 }
+
+#[cfg(all(feature = "channel", feature = "plugins-wit-v0"))]
+pub mod channel {
+    wit_bindgen::generate!({
+        world: "channel-plugin",
+        path: "../../wit/v0",
+        features: ["plugins-wit-v0"],
+        pub_export_macro: true,
+    });
+}

@@ -11,6 +11,8 @@
 //! not need to reach into it directly.
 
 pub mod bindings;
+#[cfg(feature = "channel")]
+pub mod channel;
 mod macros;
 #[cfg(feature = "memory")]
 pub mod memory;
