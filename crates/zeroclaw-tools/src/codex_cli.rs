@@ -266,6 +266,17 @@ mod tests {
         })
     }
 
+    fn test_security_with_workspace(
+        autonomy: AutonomyLevel,
+        workspace_dir: std::path::PathBuf,
+    ) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy,
+            workspace_dir,
+            ..SecurityPolicy::default()
+        })
+    }
+
     #[test]
     fn codex_cli_tool_name() {
         let tool = CodexCliTool::new(test_security(AutonomyLevel::Supervised), test_config());
@@ -345,6 +356,53 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("outside the workspace")
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_cli_resolves_relative_working_directory_under_workspace() {
+        let workspace = tempfile::TempDir::new().expect("temp workspace");
+        let empty_path = tempfile::TempDir::new().expect("empty PATH dir");
+        let relative_working_directory = "relative-workdir";
+        std::fs::create_dir(workspace.path().join(relative_working_directory))
+            .expect("relative working directory");
+
+        let previous_path = std::env::var_os("PATH");
+        // SAFETY: this test is intended to run with `--test-threads=1` and
+        // restores PATH before returning.
+        unsafe { std::env::set_var("PATH", empty_path.path()) };
+        let _path_guard = scopeguard::guard(previous_path, |previous_path| match previous_path {
+            Some(previous_path) => {
+                // SAFETY: restoring the process PATH captured before this test.
+                unsafe { std::env::set_var("PATH", previous_path) }
+            }
+            None => {
+                // SAFETY: restoring the process PATH captured before this test.
+                unsafe { std::env::remove_var("PATH") }
+            }
+        });
+
+        let tool = CodexCliTool::new(
+            test_security_with_workspace(AutonomyLevel::Full, workspace.path().to_path_buf()),
+            test_config(),
+        );
+        let result = tool
+            .execute(json!({
+                "prompt": "hello",
+                "working_directory": relative_working_directory
+            }))
+            .await
+            .expect("should return a result after path validation");
+        let error = result.error.as_deref().unwrap_or("");
+
+        assert!(!result.success);
+        assert!(
+            !error.contains("outside the workspace"),
+            "relative working_directory should resolve inside workspace; got {error:?}"
+        );
+        assert!(
+            error.contains("Codex CLI ('codex') not found in PATH"),
+            "expected missing Codex CLI after path validation; got {error:?}"
         );
     }
 
