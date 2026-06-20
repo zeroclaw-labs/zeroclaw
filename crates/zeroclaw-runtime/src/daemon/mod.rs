@@ -7,7 +7,7 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN};
 
 mod registry;
-pub use registry::DaemonRegistry;
+pub use registry::{DaemonRegistry, GatewayReloadControls};
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
@@ -207,6 +207,7 @@ pub async fn run(
     // Reload channel: gateway's /admin/reload writes here; our wait loop
     // (below) selects on it alongside OS signals. Cross-platform.
     let (reload_tx, reload_rx) = tokio::sync::watch::channel::<bool>(false);
+    let (gateway_shutdown_tx, _) = tokio::sync::watch::channel::<bool>(false);
 
     // Construct the TUI registry early so both the gateway (for /api/tuis)
     // and the RPC socket (for tui/list) share the same Arc.
@@ -217,7 +218,10 @@ pub async fn run(
         let gateway_cfg = config.clone();
         let gateway_host = host.clone();
         let gateway_event_tx = event_tx.clone();
-        let gateway_reload_tx = reload_tx.clone();
+        let gateway_reload_controls = GatewayReloadControls {
+            shutdown_tx: gateway_shutdown_tx.clone(),
+            reload_tx: reload_tx.clone(),
+        };
         let gateway_tui_registry = tui_registry.clone();
         let gateway_start = std::sync::Arc::new(gateway_start);
         handles.push(spawn_component_supervisor(
@@ -228,10 +232,20 @@ pub async fn run(
                 let cfg = gateway_cfg.clone();
                 let host = gateway_host.clone();
                 let tx = gateway_event_tx.clone();
-                let reload = gateway_reload_tx.clone();
+                let reload_controls = gateway_reload_controls.clone();
                 let tui_reg = gateway_tui_registry.clone();
                 let start = gateway_start.clone();
-                async move { start(host, port, cfg, Some(tx), Some(reload), Some(tui_reg)).await }
+                async move {
+                    start(
+                        host,
+                        port,
+                        cfg,
+                        Some(tx),
+                        Some(reload_controls),
+                        Some(tui_reg),
+                    )
+                    .await
+                }
             },
         ));
     }
@@ -386,6 +400,7 @@ pub async fn run(
             ),
             event_tx: Some(event_tx.clone()),
             reload_tx: Some(reload_tx.clone()),
+            gateway_shutdown_tx: Some(gateway_shutdown_tx.clone()),
             approval_pending: std::sync::Arc::new(
                 crate::rpc::context::ApprovalPendingMap::default(),
             ),
@@ -1972,11 +1987,15 @@ mod tests {
 
         let mut registry = DaemonRegistry::new();
         registry.register_gateway(Box::new(
-            move |host, port, config, event_tx, reload_tx, tui_registry| {
+            move |host, port, config, event_tx, reload_controls, tui_registry| {
                 let seen_tx = seen_tx.clone();
                 Box::pin(async move {
                     let has_event_tx = event_tx.is_some();
-                    let has_reload_tx = reload_tx.is_some();
+                    let has_gateway_shutdown_tx = reload_controls.is_some();
+                    let reload_tx = reload_controls
+                        .map(|controls| controls.reload_tx)
+                        .expect("daemon should pass reload controls to gateway starter");
+                    let has_reload_tx = !reload_tx.is_closed();
                     let has_tui_registry = tui_registry.is_some();
                     seen_tx
                         .send((
@@ -1984,14 +2003,12 @@ mod tests {
                             port,
                             config.data_dir.clone(),
                             has_event_tx,
+                            has_gateway_shutdown_tx,
                             has_reload_tx,
                             has_tui_registry,
                         ))
                         .expect("record gateway starter inputs");
-                    reload_tx
-                        .expect("daemon should pass reload sender to gateway starter")
-                        .send(true)
-                        .expect("send reload signal");
+                    reload_tx.send(true).expect("send reload signal");
                     std::future::pending::<Result<()>>().await
                 })
             },
@@ -2006,13 +2023,22 @@ mod tests {
         .expect("daemon run should succeed");
 
         assert_eq!(exit, DaemonExit::Reload);
-        let (host, port, data_dir, has_event_tx, has_reload_tx, has_tui_registry) = seen_rx
+        let (
+            host,
+            port,
+            data_dir,
+            has_event_tx,
+            has_gateway_shutdown_tx,
+            has_reload_tx,
+            has_tui_registry,
+        ) = seen_rx
             .try_recv()
             .expect("gateway starter should record its daemon inputs");
         assert_eq!(host, "127.0.0.1");
         assert_eq!(port, 4242);
         assert_eq!(data_dir, expected_data_dir);
         assert!(has_event_tx);
+        assert!(has_gateway_shutdown_tx);
         assert!(has_reload_tx);
         assert!(has_tui_registry);
     }

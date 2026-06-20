@@ -3905,7 +3905,7 @@ async fn main() -> Result<()> {
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
-                    move |host, port, config, tx, reload_tx, tui_registry| {
+                    move |host, port, config, tx, reload_controls, tui_registry| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
@@ -3915,7 +3915,7 @@ async fn main() -> Result<()> {
                                 port,
                                 config,
                                 tx,
-                                reload_tx,
+                                reload_controls,
                                 tui_registry,
                                 Some(canvas_store),
                                 sop_engine,

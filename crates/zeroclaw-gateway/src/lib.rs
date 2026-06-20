@@ -557,10 +557,11 @@ pub async fn run_gateway(
     port: u16,
     config: Config,
     external_event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
-    // Reload sender owned by the daemon. /admin/reload writes `true` here;
-    // the daemon's wait loop reacts via `subscribe()` and tears down to
-    // re-init. Cross-platform replacement for the SIGUSR1 hack.
-    reload_tx: Option<tokio::sync::watch::Sender<bool>>,
+    // Reload controls owned by the daemon for supervised runs. RPC reloads
+    // write to `shutdown_tx` before signalling daemon reload so the listener
+    // releases its socket before the replacement gateway binds. /admin/reload
+    // writes to both controls directly. Standalone gateway passes `None`.
+    reload_controls: Option<zeroclaw_runtime::daemon::GatewayReloadControls>,
     // TUI session registry from the daemon for the /api/tuis endpoint.
     tui_registry: Option<Arc<zeroclaw_runtime::rpc::tui_identity::TuiRegistry>>,
     canvas_store: Option<CanvasStore>,
@@ -1452,7 +1453,11 @@ pub async fn run_gateway(
         zeroclaw_runtime::observability::create_observer(&config.observability),
     );
 
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let (owned_shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, reload_tx) = reload_controls
+        .map(|controls| (controls.shutdown_tx, Some(controls.reload_tx)))
+        .unwrap_or((owned_shutdown_tx, None));
+    let mut shutdown_rx = shutdown_tx.subscribe();
 
     // Node registry for dynamic node discovery
     let node_registry = Arc::new(nodes::NodeRegistry::new(config.nodes.max_nodes));
@@ -4916,6 +4921,68 @@ mod tests {
             );
         }
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn run_gateway_uses_external_shutdown_sender() {
+        let port_probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = port_probe.local_addr().unwrap().port();
+        drop(port_probe);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (reload_tx, _) = tokio::sync::watch::channel(false);
+        let reload_controls = zeroclaw_runtime::daemon::GatewayReloadControls {
+            shutdown_tx: shutdown_tx.clone(),
+            reload_tx,
+        };
+
+        let handle = zeroclaw_spawn::spawn!(async move {
+            run_gateway(
+                "127.0.0.1",
+                port,
+                config,
+                None,
+                Some(reload_controls),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        });
+
+        let addr = format!("127.0.0.1:{port}");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("gateway should accept connections before shutdown");
+
+        shutdown_tx
+            .send(true)
+            .expect("external daemon-owned shutdown sender should stay connected");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("gateway should return after external shutdown")
+            .expect("gateway task should not panic")
+            .expect("gateway shutdown should be graceful");
+
+        std::net::TcpListener::bind(("127.0.0.1", port))
+            .expect("gateway should release the listener after external shutdown");
     }
 
     #[tokio::test]

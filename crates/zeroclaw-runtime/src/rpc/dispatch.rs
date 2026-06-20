@@ -8,6 +8,10 @@ use super::context::RpcContext;
 use super::transport::RpcTransport;
 use super::turn::{TurnAttribution, TurnOutcome, execute_turn};
 use super::types::*;
+
+const RPC_RELOAD_REPLY_FLUSH_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+const RPC_RELOAD_GATEWAY_SHUTDOWN_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(200);
 use crate::agent::agent::TurnEvent;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -2571,15 +2575,33 @@ impl RpcDispatcher {
     }
 
     fn handle_config_reload(&self) -> RpcResult {
-        let Some(reload_tx) = self.ctx.reload_tx.clone() else {
+        if !self.schedule_daemon_reload("config") {
             return Err(rpc_err(INTERNAL_ERROR, "Reload not available"));
-        };
-        // Delay so the RPC reply flushes before the daemon tears down.
-        zeroclaw_spawn::spawn!(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            let _ = reload_tx.send(true);
-        });
+        }
         to_result(ConfigReloadResult { reloading: true })
+    }
+
+    fn schedule_daemon_reload(&self, surface: &'static str) -> bool {
+        let Some(reload_tx) = self.ctx.reload_tx.clone() else {
+            return false;
+        };
+        let gateway_shutdown_tx = self.ctx.gateway_shutdown_tx.clone();
+        zeroclaw_spawn::spawn!(async move {
+            tokio::time::sleep(RPC_RELOAD_REPLY_FLUSH_DELAY).await;
+            if let Some(gateway_shutdown_tx) = gateway_shutdown_tx {
+                let _ = gateway_shutdown_tx.send(true);
+                tokio::time::sleep(RPC_RELOAD_GATEWAY_SHUTDOWN_DELAY).await;
+            }
+            let _ = reload_tx.send(true);
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({ "surface": surface })),
+                "daemon reload dispatched"
+            );
+        });
+        true
     }
 
     fn handle_config_list(&self, params: &Value) -> RpcResult {
@@ -3462,7 +3484,7 @@ impl RpcDispatcher {
     /// use. Returns `true` when the supervisor was notified, `false`
     /// when no supervisor is attached (e.g. test harness).
     fn signal_daemon_reload(&self) -> bool {
-        let Some(reload_tx) = self.ctx.reload_tx.clone() else {
+        if self.ctx.reload_tx.is_none() {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -3484,22 +3506,7 @@ impl RpcDispatcher {
             ),
             "quickstart: daemon reload signalled"
         );
-        let started = std::time::Instant::now();
-        zeroclaw_spawn::spawn!(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            let _ = reload_tx.send(true);
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                    .with_attrs(::serde_json::json!({
-                        "elapsed_ms": started.elapsed().as_millis() as u64,
-                        "surface": crate::quickstart::Surface::Tui.as_str(),
-                    })),
-                "quickstart: daemon reload dispatched"
-            );
-        });
-        true
+        self.schedule_daemon_reload(crate::quickstart::Surface::Tui.as_str())
     }
 }
 
@@ -3641,6 +3648,49 @@ mod tests {
     fn doctor_run_method_is_registered() {
         assert_eq!(Method::from_wire("doctor/run"), Some(Method::DoctorRun));
         assert_eq!(Method::DoctorRun.wire_name(), "doctor/run");
+    }
+
+    #[tokio::test]
+    async fn config_reload_shuts_down_gateway_before_daemon_reload() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (gateway_shutdown_tx, mut gateway_shutdown_rx) = tokio::sync::watch::channel(false);
+        let (reload_tx, mut reload_rx) = tokio::sync::watch::channel(false);
+        let ctx = RpcContext::minimal_with_reload_controls(
+            zeroclaw_config::schema::Config::default(),
+            sessions,
+            Some(gateway_shutdown_tx),
+            Some(reload_tx),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-reload:pid=1".into());
+
+        let result = dispatcher.handle_config_reload();
+        assert!(
+            result.is_ok(),
+            "config/reload should accept reload-capable contexts"
+        );
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            gateway_shutdown_rx.changed(),
+        )
+        .await
+        .expect("gateway shutdown must be signalled before daemon reload")
+        .expect("gateway shutdown sender should stay alive");
+        assert!(*gateway_shutdown_rx.borrow_and_update());
+        assert!(
+            !*reload_rx.borrow(),
+            "daemon reload must wait until the gateway listener has been asked to shut down"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), reload_rx.changed())
+            .await
+            .expect("daemon reload should follow gateway shutdown")
+            .expect("reload sender should stay alive");
+        assert!(*reload_rx.borrow_and_update());
     }
 
     #[test]
