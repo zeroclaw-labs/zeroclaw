@@ -3193,14 +3193,12 @@ fn markdown_to_lines(text: &str, width: u16) -> Vec<Line<'static>> {
                 // Render header bar, exactly `width` columns wide:
                 //   ┌─── lang ───── [Copy] ───────┐
                 let lang_display = code_block_lang.clone().unwrap_or_default();
-                let hdr_text = if lang_display.is_empty() {
-                    " code "
+                let header_text_owned = if lang_display.is_empty() {
+                    " code ".to_string()
                 } else {
-                    // " rust "  — space-padded so it reads cleanly
-                    // between the dashes
-                    let t = lang_display.as_str();
-                    Box::leak(format!(" {} ", t).into_boxed_str())
+                    format!(" {} ", lang_display.as_str())
                 };
+                let hdr_text = header_text_owned.as_str();
                 let hdr_visible = hdr_text.len();
                 let copy_lbl = " [Copy] ";
                 let copy_visible = copy_lbl.len();
@@ -3935,6 +3933,9 @@ impl ChatState {
 
     /// Move the cursor up by `n` entries.  Clamps at 0.
     /// If `extend` is true, sets/keeps the anchor for range selection.
+    /// Scrolls up by the height of the entry we leave, so the viewport
+    /// follows the cursor — the cursor entry ends up at the bottom of
+    /// the viewport.
     fn browse_move_up(&mut self, n: usize, extend: bool) {
         let len = self.entries.len();
         if len == 0 {
@@ -3947,11 +3948,27 @@ impl ChatState {
             self.browse_anchor = None;
         }
         self.browse_cursor = Some(cur.saturating_sub(n));
+
+        // Scroll up so the cursor entry stays visible: use the entry height
+        // from the cached screen ranges, or fall back to 1 line if the cache
+        // hasn't been populated yet.
+        let scroll_by = self
+            .cached_screen_ranges
+            .iter()
+            .find(|(idx, _, _)| *idx == cur)
+            .map(|&(_, lo, hi)| hi - lo)
+            .unwrap_or(1);
+        self.scroll_offset = self.scroll_offset.saturating_sub(scroll_by);
+        self.pinned_to_bottom = false;
+
         self.mark_dirty_full();
     }
 
     /// Move the cursor down by `n` entries.  Clamps at last entry.
     /// If `extend` is true, sets/keeps the anchor for range selection.
+    /// Scrolls down by the height of the entry we leave, so the viewport
+    /// follows the cursor — the cursor entry ends up at the top of the
+    /// viewport.
     fn browse_move_down(&mut self, n: usize, extend: bool) {
         let len = self.entries.len();
         if len == 0 {
@@ -3964,6 +3981,18 @@ impl ChatState {
             self.browse_anchor = None;
         }
         self.browse_cursor = Some((cur + n).min(len - 1));
+
+        // Scroll down so the cursor entry stays visible.
+        let scroll_by = self
+            .cached_screen_ranges
+            .iter()
+            .find(|(idx, _, _)| *idx == cur)
+            .map(|&(_, lo, hi)| hi - lo)
+            .unwrap_or(1);
+        let max = self.last_total_rows.saturating_sub(self.last_inner_height);
+        self.scroll_offset = self.scroll_offset.saturating_add(scroll_by).min(max);
+        self.pinned_to_bottom = self.scroll_offset >= max;
+
         self.mark_dirty_full();
     }
 

@@ -885,6 +885,10 @@ fn draw_status_bar(
     frame.render_widget(Paragraph::new(Line::from(spans)), right_area);
 
     // Left: ctx bar, possibly preceded by a browse-mode badge.
+    // The ctx bar is held back until the context-accounting feature is
+    // ready to show; there is no user-facing switch — the gate flips
+    // when the work lands.
+    const SHOW_CTX_BAR: bool = false;
     // If browse mode is active, split off a fixed-width badge first.
     let left_area = if browse_mode {
         let badge_w = "  BROWSE  ".len() as u16 + 1;
@@ -905,7 +909,7 @@ fn draw_status_bar(
     } else {
         left_area
     };
-    if let Some(w) = ctx.widget() {
+    if SHOW_CTX_BAR && let Some(w) = ctx.widget() {
         frame.render_widget(w, left_area);
     }
 }

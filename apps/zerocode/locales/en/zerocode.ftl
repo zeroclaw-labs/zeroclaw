@@ -236,7 +236,7 @@ zc-dashboard-detail-schedule = Schedule
 zc-dashboard-detail-next-run = Next Run
 zc-dashboard-detail-last-run = Last Run
 zc-dashboard-detail-last-status = Last Status
-zc-dashboard-detail-live-sessions = Live Sessions
+zc-dashboard-detail-sessions = Sessions
 zc-dashboard-detail-persisted-sessions = Persisted Sessions
 zc-dashboard-cost-not-available = Cost tracking is not available. Configure a cost backend to see usage data.
 
