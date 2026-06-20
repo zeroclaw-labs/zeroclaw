@@ -131,8 +131,14 @@ struct ModelFetchResult {
     current: Option<String>,
 }
 
+// Whether returning to a chat-style pane (Code/Chat) should re-fetch the agent
+// list. True for the error screen (e.g. a stale "no agents yet" left over from a
+// fresh install) AND for the agent picker, so an agent created elsewhere —
+// Quickstart or manual Config — shows up without a reconnect. `Active` /
+// `PickCwd` are intentionally excluded: a live session or an in-flight
+// directory pick must not be torn down just to refresh a list.
 fn should_retry_on_entry(phase: &ChatPhase) -> bool {
-    matches!(phase, ChatPhase::Error(_))
+    matches!(phase, ChatPhase::Error(_) | ChatPhase::PickAgent { .. })
 }
 
 impl Chat {
@@ -234,8 +240,24 @@ impl Chat {
             return Ok(());
         }
 
+        // Preserve the highlighted alias across a re-entry refresh: init() also
+        // runs when the user returns to the pane (see refresh_if_inactive), and
+        // resetting the cursor to the top every tab switch would be jarring.
+        // Falls back to the first row for a brand-new picker or if the prior
+        // selection was removed.
+        let prior_alias = match &self.phase {
+            ChatPhase::PickAgent {
+                agents: prev,
+                list_state,
+                ..
+            } => list_state.selected().and_then(|i| prev.get(i)).cloned(),
+            _ => None,
+        };
+        let selected = prior_alias
+            .and_then(|alias| agents.iter().position(|a| a == &alias))
+            .unwrap_or(0);
         let mut list_state = ListState::default();
-        list_state.select(Some(0));
+        list_state.select(Some(selected));
         // No carried session matched: a manual pick of a different agent must
         // not bleed a stale resume id into a mismatched agent's session.
         self.resume_session_id = None;
@@ -281,11 +303,15 @@ impl Chat {
         self.pick_or_start_session(agent_alias).await;
     }
 
-    /// Re-check stale setup errors when the user returns to a chat-style pane.
+    /// Re-sync the agent list when the user returns to a chat-style pane.
     ///
-    /// Manual setup can happen in Config while Chat is parked on a stale
-    /// "no agents" error. Quickstart uses `focus_agent()` directly after
-    /// creation, but manual Config setup needs this small refresh hook.
+    /// Two cases this covers, both for agents created while the pane sat
+    /// untouched: a stale "no agents" error from a fresh install, and the
+    /// agent picker missing an agent added via Quickstart or manual Config.
+    /// Quickstart's freshly-created agent is handed straight to Chat via
+    /// `focus_agent()`, but the *other* chat-style pane (and the picker in
+    /// general) only learns about new agents through this hook — the
+    /// Dashboard stays current on its own because it polls `agents/status`.
     pub(crate) async fn refresh_if_inactive(&mut self) {
         if should_retry_on_entry(&self.phase) {
             let _ = self.init().await;
@@ -4981,6 +5007,68 @@ mod tests {
         };
         assert_eq!(agents, vec!["alpha".to_string(), "beta".to_string()]);
         assert!(!loading);
+    }
+
+    #[tokio::test]
+    async fn chat_entry_refresh_reloads_agents_from_pick_phase() {
+        // Re-entering the pane while parked on the picker must re-fetch the
+        // agent list so an agent created elsewhere (Quickstart / Config) shows
+        // up — and the existing highlight must survive the refresh. Regression
+        // for "new agent missing from Code/Chat tab when agents already exist".
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut list_state = ListState::default();
+        list_state.select(Some(1)); // user has "beta" highlighted
+        chat.phase = ChatPhase::PickAgent {
+            agents: vec!["alpha".to_string(), "beta".to_string()],
+            list_state,
+            loading: false,
+        };
+
+        let refresh = tokio::spawn(async move {
+            chat.refresh_if_inactive().await;
+            chat
+        });
+
+        let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("refresh should request the agent list")
+            .unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], method::AGENTS_STATUS);
+
+        let id = request["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(serde_json::json!({
+                "agents": [
+                    {"alias": "alpha", "enabled": true, "live_sessions": 0},
+                    {"alias": "beta", "enabled": true, "live_sessions": 0},
+                    {"alias": "gamma", "enabled": true, "live_sessions": 0}
+                ]
+            })),
+            None,
+        );
+
+        let chat = tokio::time::timeout(Duration::from_secs(2), refresh)
+            .await
+            .expect("refresh should finish after agents/status response")
+            .unwrap();
+        let ChatPhase::PickAgent {
+            agents, list_state, ..
+        } = chat.phase
+        else {
+            panic!("refresh should keep the agent picker");
+        };
+        // The newly-created agent is now present...
+        assert_eq!(
+            agents,
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
+        );
+        // ...and the prior highlight ("beta", row 1) is preserved.
+        assert_eq!(list_state.selected(), Some(1));
     }
 
     #[tokio::test]

@@ -309,6 +309,7 @@ mod tests {
             tags: vec![],
             tools: vec![],
             prompts: vec![],
+            slash_options: Vec::new(),
             location: None,
         }
     }

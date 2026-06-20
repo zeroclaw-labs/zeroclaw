@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use zeroclaw_api::platform::is_android;
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
 
 /// Native runtime — full access, runs on Mac/Linux/Windows/Docker/Raspberry Pi
@@ -47,7 +48,11 @@ impl RuntimeAdapter for NativeRuntime {
     ) -> anyhow::Result<tokio::process::Command> {
         #[cfg(not(target_os = "windows"))]
         {
-            let mut process = tokio::process::Command::new("sh");
+            // Android keeps its shell at /system/bin/sh and it is not always
+            // on PATH for spawned processes; use the absolute path when present
+            // so the shell can launch (and reach platform tools).
+            let shell = if is_android() { "/system/bin/sh" } else { "sh" };
+            let mut process = tokio::process::Command::new(shell);
             process.arg("-c").arg(command).current_dir(workspace_dir);
             Ok(process)
         }

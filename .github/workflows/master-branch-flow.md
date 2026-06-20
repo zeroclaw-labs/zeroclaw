@@ -7,7 +7,9 @@ Use with:
 - [`docs/book/src/maintainers/ci-and-actions.md`](../../docs/book/src/maintainers/ci-and-actions.md)
 - [`docs/book/src/maintainers/release-runbook.md`](../../docs/book/src/maintainers/release-runbook.md)
 
-Last updated: **June 2026** (merge queue enabled on `master`).
+Last updated: **June 2026** (merge queue disabled on `master`; maintainers
+merge directly. The `merge_group` CI plumbing is retained, so the queue can be
+re-enabled from branch protection with no code change).
 
 ---
 
@@ -24,7 +26,7 @@ Maintainers with merge authority: `JordanTheJet`, `singlerider`, `Audacity88`, `
 
 | File | Trigger | Purpose |
 |---|---|---|
-| `ci.yml` | `pull_request` → `master`; `push` → `master`; `merge_group` | Lint + test + build on PRs, merge-queue batches, and trusted post-merge cache-warming runs |
+| `ci.yml` | `pull_request` → `master`; `push` → `master`; `merge_group` (dormant) | Lint + test + build on PRs and trusted post-merge cache-warming runs. The `merge_group` trigger stays wired but never fires while the merge queue is disabled. |
 | `release-stable-manual.yml` | `workflow_dispatch`, tag push `v*` | Stable release (manual, version-gated) |
 | `cross-platform-build-manual.yml` | `workflow_dispatch` | Full platform build matrix (manual smoke check) |
 | `pr-path-labeler.yml` | `pull_request` lifecycle | Automatic path-based PR labeling |
@@ -36,7 +38,7 @@ Maintainers with merge authority: `JordanTheJet`, `singlerider`, `Audacity88`, `
 | Event | What runs |
 |---|---|
 | PR opened or updated against `master` | `ci.yml` (full lint + test + build) |
-| PR added to the merge queue (`merge_group`) | `ci.yml` runs the full gate on a temporary `gh-readonly-queue/master/…` branch that stacks the base + earlier queue entries + this PR |
+| PR added to the merge queue (`merge_group`) | **Inactive** — the merge queue is currently disabled. If re-enabled, `ci.yml` runs the full gate on a temporary `gh-readonly-queue/master/…` branch stacking the base + earlier queue entries + this PR. |
 | Push to `master` | `ci.yml` (post-merge quality signal + trusted Rust cache warming) |
 | Manual dispatch | `cross-platform-build-manual.yml` or `release-stable-manual.yml` |
 | Tag push `vX.Y.Z` | `release-stable-manual.yml` (full release pipeline) |
@@ -66,14 +68,14 @@ tag push.
    - `security` — `cargo deny check`.
    - `CI Required Gate` — composite job; branch protection requires this.
 3. Maintainer reviews. Once the gate is green and review policy is satisfied,
-   they click **Merge when ready** to add the PR to the merge queue rather than
-   merging directly.
-4. The merge queue builds a temporary `gh-readonly-queue/master/…` branch
-   stacking `master` + any earlier queued PRs + this PR, and re-runs `ci.yml`
-   (the `merge_group` event) against it. The PR lands only when
-   `CI Required Gate` is green on that combined branch; if it fails, the PR is
-   ejected from the queue and the author is notified, while PRs ahead of it
-   continue unaffected.
+   the maintainer merges the PR directly (squash).
+
+> **Merge queue (currently disabled).** `master` previously *required* a merge
+> queue, which serialized landings and re-tested each PR against the latest base
+> on a temporary `gh-readonly-queue/master/…` branch before it could land. It is
+> disabled for now — maintainers merge directly. The `merge_group` trigger in
+> `ci.yml` is retained, so re-enabling is a one-click branch-protection toggle
+> ("Require merge queue" on the `master` rule) with no code change.
 
 ### 2) Stable Release (manual)
 
@@ -128,10 +130,7 @@ flowchart TD
   L --> SEC["security\ncargo deny check"]
   T & BLD & CHK & C32 & BCH & SEC --> G["CI Required Gate"]
   G -->|red| D["PR stays open"]
-  G -->|green| Q["Maintainer: Merge when ready → merge queue"]
-  Q --> MG["merge_group: ci.yml on\ngh-readonly-queue/master/…"]
-  MG -->|red| E["PR ejected from queue\nauthor notified"]
-  MG -->|green| R["PR lands on master"]
+  G -->|green| R["Maintainer merges (squash) → master"]
 ```
 
 ### Stable release

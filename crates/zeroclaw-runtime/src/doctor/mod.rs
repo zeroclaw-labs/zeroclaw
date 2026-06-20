@@ -11,7 +11,7 @@ const COMMAND_VERSION_PREVIEW_CHARS: usize = 60;
 
 // ── Diagnostic item ──────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Ok,
@@ -20,7 +20,7 @@ pub enum Severity {
 }
 
 /// Structured diagnostic result for programmatic consumption (web dashboard, API).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DiagResult {
     pub severity: Severity,
     pub category: String,
@@ -143,7 +143,6 @@ fn collapse_model_probes(probes: Vec<(String, ModelProbe)>) -> Vec<DiagResult> {
     out
 }
 
-/// Run diagnostics and print human-readable report to stdout.
 async fn probe_models(config: &Config) -> Vec<DiagResult> {
     let targets = doctor_model_targets(config, None);
     let mut probes = Vec::with_capacity(targets.len());
@@ -166,9 +165,16 @@ async fn probe_models(config: &Config) -> Vec<DiagResult> {
     collapse_model_probes(probes)
 }
 
-pub async fn run(config: &Config) -> Result<()> {
+/// Run the full Doctor suite and return the structured result used by CLI and RPC.
+pub async fn run_structured(config: &Config) -> Vec<DiagResult> {
     let mut results = diagnose(config);
     results.extend(probe_models(config).await);
+    results
+}
+
+/// Run diagnostics and print human-readable report to stdout.
+pub async fn run(config: &Config) -> Result<()> {
+    let results = run_structured(config).await;
 
     println!("🩺 ZeroClaw Doctor (enhanced)");
     println!();
@@ -857,6 +863,16 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
             ));
         }
     }
+
+    // Non-fatal config warnings — dangling fallback refs, wire_api misuse, etc.
+    // Source of truth: `Config::collect_warnings()` (same signal as gateway API
+    // and `Config::validate()` tracing). Do not duplicate checks here.
+    for warning in config.collect_warnings() {
+        items.push(DiagItem::warn(
+            cat,
+            format!("{} (at {})", warning.message, warning.path),
+        ));
+    }
 }
 
 /// Flag `gateway.web_dist_dir` values that rely on shell-style expansion
@@ -1474,6 +1490,31 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn structured_run_includes_model_probe_results() {
+        let mut config = Config::default();
+        let profile = config
+            .providers
+            .models
+            .ensure("custom", "local")
+            .expect("known model_provider type");
+        profile.api_key = Some("redacted-test-key".to_string());
+        profile.uri = Some("http://127.0.0.1:9/v1".to_string());
+
+        let baseline = diagnose(&config);
+        assert!(
+            !baseline
+                .iter()
+                .any(|item| item.category == "providers.models")
+        );
+
+        let full = run_structured(&config).await;
+        assert!(
+            full.iter().any(|item| item.category == "providers.models"),
+            "shared structured runner should include the same model probe rows as the CLI"
+        );
+    }
+
     #[test]
     fn config_validation_catches_unknown_provider() {
         // Typed slots can only hold canonical family names, so an unknown
@@ -1571,6 +1612,40 @@ mod tests {
         });
         assert!(route_item.is_some());
         assert_eq!(route_item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn config_validation_surfaces_dangling_fallback_ref() {
+        use zeroclaw_config::schema::{ModelProviderConfig, NvidiaModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.nvidia.insert(
+            "nvidia".to_string(),
+            NvidiaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("stepfun-ai/step-3.5-flash".into()),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "deepseek-ai/deepseek-v4-flash",
+                    )],
+                    ..Default::default()
+                },
+            },
+        );
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+        let fallback_item = items.iter().find(|item| {
+            item.message
+                .contains("does not resolve to a configured providers.models entry")
+                && item
+                    .message
+                    .contains("providers.models.nvidia.nvidia.fallback[0]")
+        });
+        assert!(
+            fallback_item.is_some(),
+            "doctor should surface dangling fallback refs"
+        );
+        assert_eq!(fallback_item.unwrap().severity, Severity::Warn);
     }
 
     #[test]

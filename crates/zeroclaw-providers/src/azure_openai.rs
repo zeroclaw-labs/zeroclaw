@@ -200,9 +200,13 @@ impl AzureOpenAiModelProvider {
             "https://{}.openai.azure.com/openai/deployments/{}",
             resource_name, deployment_name
         );
+        let credential = credential
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
         Self {
             alias: alias.to_string(),
-            credential: credential.map(ToString::to_string),
+            credential,
             resource_name: resource_name.to_string(),
             deployment_name: deployment_name.to_string(),
             api_version: version.to_string(),
@@ -717,6 +721,32 @@ mod tests {
     fn creates_without_credential() {
         let p = AzureOpenAiModelProvider::new("test", None, "resource", "deployment", None, None);
         assert!(p.credential.is_none());
+    }
+
+    #[test]
+    fn blank_credential_is_treated_as_missing() {
+        let p = AzureOpenAiModelProvider::new(
+            "test",
+            Some("   \t  "),
+            "resource",
+            "deployment",
+            None,
+            None,
+        );
+        assert!(p.credential.is_none());
+    }
+
+    #[test]
+    fn credential_is_trimmed_before_storage() {
+        let p = AzureOpenAiModelProvider::new(
+            "test",
+            Some("  azure-test-credential \n"),
+            "resource",
+            "deployment",
+            None,
+            None,
+        );
+        assert_eq!(p.credential.as_deref(), Some("azure-test-credential"));
     }
 
     #[tokio::test]

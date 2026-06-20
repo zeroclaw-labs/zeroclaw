@@ -111,18 +111,26 @@ export function uiMessagesToPersisted(
     thinking?: string;
     markdown?: boolean;
     local?: boolean;
+    ephemeral?: boolean;
     toolCall?: { name: string; args?: unknown; output?: string };
     timestamp: Date;
   }>,
 ): PersistedChatBubble[] {
-  return messages.map((m) => ({
-    id: m.id,
-    role: m.role,
-    content: m.content,
-    thinking: m.thinking,
-    markdown: m.markdown,
-    local: m.local,
-    toolCall: m.toolCall,
-    timestamp: m.timestamp.toISOString(),
-  }));
+  return messages
+    // Skip messages flagged `ephemeral: true` (web slash-command output like
+    // /help, /model banners, unknown-command notices). They are throwaway UI
+    // feedback and must not be re-hydrated as fake assistant replies on reload. #7137
+    .filter((m) => !m.ephemeral)
+    .map((m) => ({
+      id: m.id,
+      role: m.role,
+      content: m.content,
+      thinking: m.thinking,
+      markdown: m.markdown,
+      // Preserve the verbatim-user-input flag so reloaded bubbles still skip
+      // server-timestamp stripping.
+      local: m.local,
+      toolCall: m.toolCall,
+      timestamp: m.timestamp.toISOString(),
+    }));
 }

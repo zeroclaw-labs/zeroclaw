@@ -119,6 +119,7 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_api::channel::Channel;
+use zeroclaw_api::ingress::IngressContext;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{
     self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory, MemoryCategory, decay,
@@ -636,9 +637,11 @@ pub async fn agent_turn(
     model_switch_callback: Option<ModelSwitchCallback>,
     strict_tool_parsing: bool,
     parallel_tools: bool,
+    max_tool_result_chars: usize,
+    context_token_budget: usize,
     channel: Option<&dyn Channel>,
 ) -> Result<String> {
-    run_tool_call_loop(
+    run_tool_call_loop(ToolLoop {
         model_provider,
         history,
         tools_registry,
@@ -652,28 +655,31 @@ pub async fn agent_turn(
         channel_reply_target,
         multimodal_config,
         max_tool_iterations,
-        None,
-        None,
-        None,
+        cancellation_token: None,
+        on_delta: None,
+        hooks: None,
         excluded_tools,
         dedup_exempt_tools,
         activated_tools,
         model_switch_callback,
-        &zeroclaw_config::schema::PacingConfig::default(),
+        pacing: &zeroclaw_config::schema::PacingConfig::default(),
         strict_tool_parsing,
         parallel_tools,
-        0,    // max_tool_result_chars: 0 = disabled (legacy callers)
-        0,    // context_token_budget: 0 = disabled (legacy callers)
-        None, // shared_budget: no shared budget for legacy callers
+        max_tool_result_chars,
+        context_token_budget,
+        shared_budget: None, // no shared budget for agent_turn callers
         channel,
-        None, // receipt_generator
-        None, // collected_receipts
-        None, // event_tx
-        None, // steering
-        None, // new_messages_out
-        &LoopKnobs::default(),
-        None,
-    )
+        receipt_generator: None,
+        collected_receipts: None,
+        event_tx: None,
+        steering: None,
+        new_messages_out: None,
+        knobs: &LoopKnobs::default(),
+        image_cache: None,
+        // Phase 1: stamp Internal/Trusted. Real per-transport
+        // stamping is PR C (RFC #6971 §4).
+        ingress: IngressContext::internal(),
+    })
     .await
 }
 
@@ -690,7 +696,7 @@ pub(crate) use super::turn::{
 };
 pub use super::turn::{
     DraftEvent, LoopKnobs, MaxIterationBehavior, ModelSwitchCallback, ModelSwitchRequested,
-    PROGRESS_MIN_INTERVAL_MS, StreamDelta, ToolLoopCancelled, drain_steering_messages,
+    PROGRESS_MIN_INTERVAL_MS, StreamDelta, ToolLoop, ToolLoopCancelled, drain_steering_messages,
     is_model_switch_requested, is_tool_loop_cancelled, run_tool_call_loop, scrub_credentials,
 };
 
@@ -823,10 +829,27 @@ fn resolved_agent_for_turn(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
 ) -> Result<zeroclaw_config::schema::AliasedAgentConfig> {
-    config
+    let agent = config
         .resolved_agent_config(agent_alias)
-        .with_context(|| format!("agents.{agent_alias} is not configured"))
+        .with_context(|| format!("agents.{agent_alias} is not configured"))?;
+    #[cfg(test)]
+    if let Some(hook) = RESOLVED_AGENT_FOR_TURN_TEST_HOOK
+        .lock()
+        .expect("resolved-agent test hook lock should not be poisoned")
+        .as_ref()
+        .cloned()
+    {
+        hook(agent_alias, agent.resolved.max_tool_iterations);
+    }
+    Ok(agent)
 }
+
+#[cfg(test)]
+type ResolvedAgentForTurnTestHook = Arc<dyn Fn(&str, usize) + Send + Sync>;
+
+#[cfg(test)]
+static RESOLVED_AGENT_FOR_TURN_TEST_HOOK: LazyLock<Mutex<Option<ResolvedAgentForTurnTestHook>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 /// Resolve (api_key, uri) for `provider_name`, preferring the alias-specific
 /// config when `provider_name` is a dotted `<family>.<alias>` reference.
@@ -991,7 +1014,7 @@ pub async fn run(
             &security,
             &risk_profile,
             agent_alias,
-            runtime,
+            runtime.clone(),
             mem.clone(),
             composio_key,
             composio_entity_id,
@@ -1337,11 +1360,12 @@ pub async fn run(
             .cloned()
             .chain(mcp_elevation_arcs.iter().cloned())
             .collect();
-        tools::register_skill_tools_with_context(
+        tools::register_skill_tools_with_context_and_runtime(
             &mut tools_registry,
             &skills,
             security.clone(),
             &skill_resolution_registry,
+            runtime,
         );
 
         let mut tool_descs: Vec<(&str, &str)> = vec![
@@ -1489,6 +1513,7 @@ pub async fn run(
                 eff_compact_context,
                 eff_max_system_prompt_chars,
                 true,
+                config.channels.show_tool_calls,
             );
 
         // Append structured tool-use instructions with schemas (only for non-native model_providers)
@@ -1685,42 +1710,45 @@ pub async fn run(
                         thinking_params.native_thinking,
                         TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                             cost_tracking_context.clone(),
-                            run_tool_call_loop(
-                                model_provider.as_ref(),
-                                &mut history,
-                                &tools_registry,
-                                observer.as_ref(),
-                                &provider_name,
-                                &model_name,
-                                effective_temperature,
-                                false,
-                                approval_manager.as_ref(),
+                            run_tool_call_loop(ToolLoop {
+                                model_provider: model_provider.as_ref(),
+                                history: &mut history,
+                                tools_registry: &tools_registry,
+                                observer: observer.as_ref(),
+                                provider_name: &provider_name,
+                                model: &model_name,
+                                temperature: effective_temperature,
+                                silent: false,
+                                approval: approval_manager.as_ref(),
                                 channel_name,
-                                None,
-                                &config.multimodal,
-                                agent.resolved.max_tool_iterations,
-                                None,
-                                None,
-                                None,
-                                &excluded_tools,
-                                &agent.resolved.tool_call_dedup_exempt,
-                                activated_handle.as_ref(),
-                                Some(model_switch_callback.clone()),
-                                &config.pacing,
-                                agent.resolved.strict_tool_parsing,
-                                agent.resolved.parallel_tools,
-                                agent.resolved.max_tool_result_chars,
-                                agent.resolved.max_context_tokens,
-                                None, // shared_budget
-                                None, // channel: CLI mode — uses prompt_cli
-                                None, // receipt_generator
-                                None, // collected_receipts
-                                None, // event_tx
-                                None, // steering
-                                None, // new_messages_out
-                                &LoopKnobs::default(),
-                                None,
-                            ),
+                                channel_reply_target: None,
+                                multimodal_config: &config.multimodal,
+                                max_tool_iterations: agent.resolved.max_tool_iterations,
+                                cancellation_token: None,
+                                on_delta: None,
+                                hooks: None,
+                                excluded_tools: &excluded_tools,
+                                dedup_exempt_tools: &agent.resolved.tool_call_dedup_exempt,
+                                activated_tools: activated_handle.as_ref(),
+                                model_switch_callback: Some(model_switch_callback.clone()),
+                                pacing: &config.pacing,
+                                strict_tool_parsing: agent.resolved.strict_tool_parsing,
+                                parallel_tools: agent.resolved.parallel_tools,
+                                max_tool_result_chars: agent.resolved.max_tool_result_chars,
+                                context_token_budget: agent.resolved.max_context_tokens,
+                                shared_budget: None,
+                                channel: None,
+                                receipt_generator: None,
+                                collected_receipts: None,
+                                event_tx: None,
+                                steering: None,
+                                new_messages_out: None,
+                                knobs: &LoopKnobs::default(),
+                                image_cache: None,
+                                // Phase 1: stamp Internal/Trusted. Real per-transport
+                                // stamping is PR C (RFC #6971 §4).
+                                ingress: IngressContext::internal(),
+                            }),
                         ),
                     )
                     .await
@@ -2164,42 +2192,45 @@ pub async fn run(
                             thinking_params.native_thinking,
                             TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                                 cost_tracking_context.clone(),
-                                run_tool_call_loop(
-                                    model_provider.as_ref(),
-                                    &mut history,
-                                    &tools_registry,
-                                    observer.as_ref(),
-                                    &provider_name,
-                                    &model_name,
-                                    turn_temperature,
-                                    true,
-                                    approval_manager.as_ref(),
+                                run_tool_call_loop(ToolLoop {
+                                    model_provider: model_provider.as_ref(),
+                                    history: &mut history,
+                                    tools_registry: &tools_registry,
+                                    observer: observer.as_ref(),
+                                    provider_name: &provider_name,
+                                    model: &model_name,
+                                    temperature: turn_temperature,
+                                    silent: true,
+                                    approval: approval_manager.as_ref(),
                                     channel_name,
-                                    None,
-                                    &config.multimodal,
-                                    agent.resolved.max_tool_iterations,
-                                    Some(cancel_token.clone()),
-                                    Some(delta_tx.clone()),
-                                    None,
-                                    &excluded_tools,
-                                    &agent.resolved.tool_call_dedup_exempt,
-                                    activated_handle.as_ref(),
-                                    Some(model_switch_callback.clone()),
-                                    &config.pacing,
-                                    agent.resolved.strict_tool_parsing,
-                                    agent.resolved.parallel_tools,
-                                    agent.resolved.max_tool_result_chars,
-                                    agent.resolved.max_context_tokens,
-                                    None, // shared_budget
-                                    None, // channel: interactive CLI — uses prompt_cli
-                                    None, // receipt_generator
-                                    None, // collected_receipts
-                                    None, // event_tx
-                                    None, // steering
-                                    None, // new_messages_out
-                                    &LoopKnobs::default(),
-                                    None,
-                                ),
+                                    channel_reply_target: None,
+                                    multimodal_config: &config.multimodal,
+                                    max_tool_iterations: agent.resolved.max_tool_iterations,
+                                    cancellation_token: Some(cancel_token.clone()),
+                                    on_delta: Some(delta_tx.clone()),
+                                    hooks: None,
+                                    excluded_tools: &excluded_tools,
+                                    dedup_exempt_tools: &agent.resolved.tool_call_dedup_exempt,
+                                    activated_tools: activated_handle.as_ref(),
+                                    model_switch_callback: Some(model_switch_callback.clone()),
+                                    pacing: &config.pacing,
+                                    strict_tool_parsing: agent.resolved.strict_tool_parsing,
+                                    parallel_tools: agent.resolved.parallel_tools,
+                                    max_tool_result_chars: agent.resolved.max_tool_result_chars,
+                                    context_token_budget: agent.resolved.max_context_tokens,
+                                    shared_budget: None,
+                                    channel: None,
+                                    receipt_generator: None,
+                                    collected_receipts: None,
+                                    event_tx: None,
+                                    steering: None,
+                                    new_messages_out: None,
+                                    knobs: &LoopKnobs::default(),
+                                    image_cache: None,
+                                    // Phase 1: stamp Internal/Trusted. Real per-transport
+                                    // stamping is PR C (RFC #6971 §4).
+                                    ingress: IngressContext::internal(),
+                                }),
                             ),
                         )
                         .await
@@ -2534,7 +2565,7 @@ pub async fn process_message(
             &security,
             &risk_profile,
             agent_alias,
-            runtime,
+            runtime.clone(),
             mem.clone(),
             composio_key,
             composio_entity_id,
@@ -2786,11 +2817,12 @@ pub async fn process_message(
             .cloned()
             .chain(mcp_elevation_arcs.iter().cloned())
             .collect();
-        tools::register_skill_tools_with_context(
+        tools::register_skill_tools_with_context_and_runtime(
             &mut tools_registry,
             &skills,
             security.clone(),
             &skill_resolution_registry,
+            runtime,
         );
 
         let mut tool_descs: Vec<(&str, &str)> = vec![
@@ -2912,6 +2944,7 @@ pub async fn process_message(
                 eff_compact_context,
                 eff_max_system_prompt_chars,
                 false,
+                config.channels.show_tool_calls,
             );
         if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
@@ -3042,6 +3075,8 @@ pub async fn process_message(
                     None,
                     agent.resolved.strict_tool_parsing,
                     agent.resolved.parallel_tools,
+                    agent.resolved.max_tool_result_chars,
+                    agent.resolved.max_context_tokens,
                     None, // channel: process_message path has no channel ref
                 ),
             )
@@ -3069,11 +3104,15 @@ mod tests {
 
     zeroclaw_api::mock_tool_attribution!(
         CountingTool,
+        CredentialOutputTool,
         EmptySuccessTool,
         RecordingArgsTool,
         DelayTool,
         FailingTool,
         NamedMockTool,
+        CompletesAndSignalsTool,
+        CancelsTurnTool,
+        VerboseTool,
     );
 
     // ── maybe_inject_channel_delivery_defaults tests ──────────────
@@ -3576,6 +3615,7 @@ mod tests {
             &observer,
             None,
             None,
+            None,
         )
         .await;
         assert!(result.is_ok(), "execute_one_tool should not panic or error");
@@ -3608,9 +3648,49 @@ mod tests {
             &observer,
             None,
             None, // receipt_generator
+            None, // event_tx
         )
         .await
         .expect("suffix alias should execute the unique activated tool");
+
+        assert!(outcome.success);
+        assert_eq!(outcome.output, "counted:ok");
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_recovers_poisoned_activated_tool_lock() {
+        let observer = NoopObserver;
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let activated = Arc::new(std::sync::Mutex::new(crate::tools::ActivatedToolSet::new()));
+        let activated_tool: Arc<dyn Tool> = Arc::new(CountingTool::new(
+            "docker-mcp__extract_text",
+            Arc::clone(&invocations),
+        ));
+        activated
+            .lock()
+            .unwrap()
+            .activate("docker-mcp__extract_text".into(), activated_tool);
+        let poisoned = Arc::clone(&activated);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().expect("test mutex should lock");
+            panic!("poison activated-tools lock");
+        })
+        .join();
+
+        let outcome = execute_one_tool(
+            "extract_text",
+            serde_json::json!({ "value": "ok" }),
+            None,
+            &[],
+            Some(&activated),
+            &observer,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("poisoned activated-tools lock should recover for read");
 
         assert!(outcome.success);
         assert_eq!(outcome.output, "counted:ok");
@@ -3631,6 +3711,7 @@ mod tests {
             &observer,
             None,
             None, // receipt_generator
+            None, // event_tx
         )
         .await
         .expect("empty successful tool output should still execute");
@@ -3638,6 +3719,60 @@ mod tests {
         assert!(outcome.success);
         assert_eq!(outcome.output, "(no output)");
         assert!(outcome.error_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_keeps_data_path_raw_and_scrubs_only_observer() {
+        struct CapturingResults {
+            results: std::sync::Mutex<Vec<Option<String>>>,
+        }
+        impl crate::observability::Observer for CapturingResults {
+            fn record_event(&self, event: &crate::observability::ObserverEvent) {
+                if let crate::observability::ObserverEvent::ToolCall { result, .. } = event {
+                    self.results.lock().unwrap().push(result.clone());
+                }
+            }
+            fn record_metric(&self, _metric: &crate::observability::traits::ObserverMetric) {}
+            fn name(&self) -> &str {
+                "capturing-results"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn flush(&self) {}
+        }
+
+        let observer = CapturingResults {
+            results: std::sync::Mutex::new(Vec::new()),
+        };
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(CredentialOutputTool)];
+
+        let outcome = execute_one_tool(
+            "credential_output",
+            serde_json::json!({}),
+            None,
+            &tools,
+            None,
+            &observer,
+            None,
+            None, // receipt_generator
+            None, // event_tx
+        )
+        .await
+        .expect("tool should execute");
+
+        // Data path (fed to the model and HMAC receipts) carries raw bytes.
+        assert_eq!(outcome.output, "api_key = \"sk-live-abcd1234efgh5678\"");
+        assert!(!outcome.output.contains("[REDACTED]"));
+
+        // Observer (human-facing log/dashboard render) is scrubbed.
+        let captured = observer.results.lock().unwrap();
+        let result = captured
+            .first()
+            .and_then(|r| r.as_deref())
+            .expect("observer must receive a tool result");
+        assert!(result.contains("[REDACTED]"));
+        assert!(!result.contains("abcd1234efgh5678"));
     }
     use crate::observability::NoopObserver;
     use tempfile::TempDir;
@@ -4287,6 +4422,37 @@ mod tests {
         }
     }
 
+    struct CredentialOutputTool;
+
+    #[async_trait]
+    impl Tool for CredentialOutputTool {
+        fn name(&self) -> &str {
+            "credential_output"
+        }
+
+        fn description(&self) -> &str {
+            "Returns success with a credential-shaped value in its output"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "api_key = \"sk-live-abcd1234efgh5678\"".to_string(),
+                error: None,
+            })
+        }
+    }
+
     struct EmptySuccessTool;
 
     #[async_trait]
@@ -4500,42 +4666,45 @@ mod tests {
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
         let observer = NoopObserver;
 
-        let err = run_tool_call_loop(
-            &model_provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "cli",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            3,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let err = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 3,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect_err("user image on a non-vision provider should error");
 
@@ -4563,42 +4732,45 @@ mod tests {
             ..Default::default()
         };
 
-        let result = run_tool_call_loop(
-            &model_provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "cli",
-            None,
-            &multimodal,
-            3,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            multimodal_config: &multimodal,
+            max_tool_iterations: 3,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("oversized payload should be skipped and continue as text-only");
 
@@ -4630,42 +4802,45 @@ mod tests {
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
         let observer = NoopObserver;
 
-        let result = run_tool_call_loop(
-            &model_provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "cli",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            3,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 3,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("valid multimodal payload should pass");
 
@@ -4696,42 +4871,45 @@ mod tests {
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
         let observer = NoopObserver;
 
-        let result = run_tool_call_loop(
-            &model_provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "cli",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            3,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 3,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("text-only fallback should succeed, not abort the turn");
 
@@ -4762,42 +4940,45 @@ mod tests {
             ..Default::default()
         };
 
-        let err = run_tool_call_loop(
-            &model_provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "cli",
-            None,
-            &multimodal,
-            3,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let err = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            multimodal_config: &multimodal,
+            max_tool_iterations: 3,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect_err("should fail when vision model_provider cannot be created");
 
@@ -4828,46 +5009,125 @@ mod tests {
 
         // Even though vision_model_provider points to a nonexistent model_provider, this
         // should succeed because there are no image markers to trigger routing.
-        let result = run_tool_call_loop(
-            &model_provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "scripted",
-            "scripted-model",
-            Some(0.0),
-            true,
-            None,
-            "cli",
-            None,
-            &multimodal,
-            3,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "scripted",
+            model: "scripted-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            multimodal_config: &multimodal,
+            max_tool_iterations: 3,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("text-only messages should succeed with default model_provider");
 
         assert_eq!(result, "hello world");
+    }
+
+    /// Behavior-identical guard (RFC #6971 phase 1): the always-on ingress
+    /// policy layer must not change a turn's output. A plain turn with the
+    /// `IngressContext::internal()` envelope, and the same turn with a fully
+    /// external/untrusted channel envelope, both disposition to `Loop` under
+    /// the default policy and must produce the identical final answer the
+    /// engine produced before the layer existed.
+    #[tokio::test]
+    async fn run_tool_call_loop_ingress_default_loop_is_behavior_identical() {
+        async fn run_with(ctx: IngressContext) -> String {
+            let model_provider =
+                ScriptedModelProvider::from_text_responses(vec!["identical answer"]);
+            let mut history = vec![ChatMessage::user("hello".to_string())];
+            let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+            let observer = NoopObserver;
+
+            run_tool_call_loop(ToolLoop {
+                model_provider: &model_provider,
+                history: &mut history,
+                tools_registry: &tools_registry,
+                observer: &observer,
+                provider_name: "scripted",
+                model: "scripted-model",
+                temperature: Some(0.0),
+                silent: true,
+                approval: None,
+                channel_name: "cli",
+                channel_reply_target: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 3,
+                cancellation_token: None,
+                on_delta: None,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                shared_budget: None,
+                channel: None,
+                receipt_generator: None,
+                collected_receipts: None,
+                event_tx: None,
+                steering: None,
+                new_messages_out: None,
+                knobs: &LoopKnobs::default(),
+                image_cache: None,
+                ingress: ctx,
+            })
+            .await
+            .expect("default-Loop ingress must run the turn exactly as today")
+        }
+
+        let internal = run_with(IngressContext::internal()).await;
+        let external = run_with(IngressContext {
+            message_id: Some("ghc_9001".to_string()),
+            source_class: zeroclaw_api::ingress::SourceClass::External,
+            sender: Some("attacker".to_string()),
+            transport: zeroclaw_api::ingress::Transport::Channel {
+                kind: "github".to_string(),
+                alias: "gh".to_string(),
+            },
+            trust: zeroclaw_api::ingress::TrustClass::Untrusted,
+        })
+        .await;
+
+        assert_eq!(internal, "identical answer");
+        assert_eq!(
+            internal, external,
+            "default-Loop policy must produce identical output regardless of envelope"
+        );
     }
 
     /// When `vision_model_provider` is set but `vision_model` is not, the default
@@ -4894,42 +5154,45 @@ mod tests {
             ..Default::default()
         };
 
-        let err = run_tool_call_loop(
-            &model_provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "cli",
-            None,
-            &multimodal,
-            3,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let err = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            multimodal_config: &multimodal,
+            max_tool_iterations: 3,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect_err("should fail due to nonexistent vision model_provider");
 
@@ -4959,42 +5222,45 @@ mod tests {
             ..Default::default()
         };
 
-        let result = run_tool_call_loop(
-            &model_provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "scripted",
-            "scripted-model",
-            Some(0.0),
-            true,
-            None,
-            "cli",
-            None,
-            &multimodal,
-            3,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "scripted",
+            model: "scripted-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            multimodal_config: &multimodal,
+            max_tool_iterations: 3,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("empty image markers should not trigger vision routing");
 
@@ -5023,42 +5289,45 @@ mod tests {
             ..Default::default()
         };
 
-        let err = run_tool_call_loop(
-            &model_provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "cli",
-            None,
-            &multimodal,
-            3,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let err = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            multimodal_config: &multimodal,
+            max_tool_iterations: 3,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect_err("should attempt vision model_provider creation for multiple images");
 
@@ -5171,42 +5440,45 @@ mod tests {
         ];
         let observer = NoopObserver;
 
-        let result = run_tool_call_loop(
-            &model_provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            Some(&approval_mgr),
-            "telegram",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: Some(&approval_mgr),
+            channel_name: "telegram",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("parallel execution should complete");
 
@@ -5286,42 +5558,45 @@ mod tests {
         ];
         let observer = NoopObserver;
 
-        let result = run_tool_call_loop(
-            &model_provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            Some(&approval_mgr),
-            "telegram",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            true, // parallel_tools
-            0,
-            0,
-            None,
-            None,
-            None,
-            None,
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: Some(&approval_mgr),
+            channel_name: "telegram",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: true,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("native parallel execution should complete");
 
@@ -5348,6 +5623,182 @@ mod tests {
         }
     }
 
+    struct CompletesAndSignalsTool {
+        completed_tx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    #[async_trait]
+    impl Tool for CompletesAndSignalsTool {
+        fn name(&self) -> &str {
+            "fast_tool"
+        }
+        fn description(&self) -> &str {
+            "Completes immediately and signals a sibling to cancel the turn"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{}})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            if let Some(tx) = self.completed_tx.lock().await.take() {
+                let _ = tx.send(());
+            }
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "fast-done".to_string(),
+                error: None,
+            })
+        }
+    }
+
+    struct CancelsTurnTool {
+        token: CancellationToken,
+        wait_for: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    impl Tool for CancelsTurnTool {
+        fn name(&self) -> &str {
+            "cancel_tool"
+        }
+        fn description(&self) -> &str {
+            "Waits for a sibling to finish, cancels the turn, then never returns"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{}})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            if let Some(rx) = self.wait_for.lock().await.take() {
+                let _ = rx.await;
+            }
+            self.token.cancel();
+            // The executor's select drops this future once the token fires; the
+            // pending await keeps this call from ever returning Ok.
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    }
+
+    // A parallel sibling that finished before the cancellation already emitted
+    // its real terminal ToolResult; the cancel cleanup must not emit a second,
+    // interrupted result for that same tool_call_id (#7778 regression).
+    #[tokio::test]
+    async fn run_tool_call_loop_parallel_cancel_no_double_terminal_for_completed_call() {
+        let model_provider = ScriptedModelProvider::from_native_tool_calls(
+            vec![
+                ("call_fast", "fast_tool", "{}"),
+                ("call_cancel", "cancel_tool", "{}"),
+            ],
+            "done",
+        );
+
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        let token = CancellationToken::new();
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(CompletesAndSignalsTool {
+                completed_tx: tokio::sync::Mutex::new(Some(completed_tx)),
+            }),
+            Box::new(CancelsTurnTool {
+                token: token.clone(),
+                wait_for: tokio::sync::Mutex::new(Some(completed_rx)),
+            }),
+        ];
+
+        let approval_cfg = zeroclaw_config::schema::RiskProfileConfig {
+            level: crate::security::AutonomyLevel::Full,
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
+        };
+        let approval_mgr = ApprovalManager::from_risk_profile(&approval_cfg);
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run two tool calls"),
+        ];
+        let observer = NoopObserver;
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+
+        let _ = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: Some(&approval_mgr),
+            channel_name: "telegram",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: Some(token.clone()),
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: true,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: Some(event_tx),
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
+        .await;
+
+        drop(tools_registry);
+        let mut results_by_id: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let zeroclaw_api::agent::TurnEvent::ToolResult { id, output, .. } = event {
+                results_by_id.entry(id).or_default().push(output);
+            }
+        }
+
+        let fast_results = results_by_id
+            .get("call_fast")
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        assert_eq!(
+            fast_results.len(),
+            1,
+            "completed parallel call must get exactly one terminal ToolResult, got: {fast_results:?}"
+        );
+        assert_eq!(fast_results[0], "fast-done");
+
+        let cancel_results = results_by_id
+            .get("call_cancel")
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        assert_eq!(
+            cancel_results.len(),
+            1,
+            "cancelled-in-flight call must get exactly one interrupted ToolResult, got: {cancel_results:?}"
+        );
+        assert_eq!(
+            cancel_results[0],
+            crate::i18n::get_required_cli_string("turn-tool-interrupted-before-result")
+        );
+    }
+
     #[tokio::test]
     async fn run_tool_call_loop_injects_channel_delivery_defaults_for_cron_add() {
         let model_provider = ScriptedModelProvider::from_text_responses(vec![
@@ -5369,42 +5820,45 @@ mod tests {
         ];
         let observer = NoopObserver;
 
-        let result = run_tool_call_loop(
-            &model_provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "telegram",
-            Some("chat-42"),
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "telegram",
+            channel_reply_target: Some("chat-42"),
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("cron_add delivery defaults should be injected");
 
@@ -5448,42 +5902,45 @@ mod tests {
         ];
         let observer = NoopObserver;
 
-        let result = run_tool_call_loop(
-            &model_provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "telegram",
-            Some("chat-42"),
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "telegram",
+            channel_reply_target: Some("chat-42"),
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("explicit delivery mode should be preserved");
 
@@ -5519,42 +5976,45 @@ mod tests {
         ];
         let observer = NoopObserver;
 
-        let result = run_tool_call_loop(
-            &model_provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "lark",
-            Some("chat-99"),
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "lark",
+            channel_reply_target: Some("chat-99"),
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("lark cron_add delivery defaults should be injected");
 
@@ -5598,42 +6058,45 @@ mod tests {
         ];
         let observer = NoopObserver;
 
-        let result = run_tool_call_loop(
-            &model_provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "feishu",
-            Some("chat-77"),
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "feishu",
+            channel_reply_target: Some("chat-77"),
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("feishu cron_add delivery defaults should be injected");
 
@@ -5680,42 +6143,45 @@ mod tests {
         ];
         let observer = NoopObserver;
 
-        let result = run_tool_call_loop(
-            &model_provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "cli",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("loop should finish after deduplicating repeated calls");
 
@@ -5767,42 +6233,45 @@ mod tests {
             &zeroclaw_config::schema::RiskProfileConfig::default(),
         );
 
-        let result = run_tool_call_loop(
-            &model_provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            Some(&approval_mgr),
-            "telegram",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: Some(&approval_mgr),
+            channel_name: "telegram",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("non-interactive shell should succeed for low-risk command");
 
@@ -5844,42 +6313,45 @@ mod tests {
         let observer = NoopObserver;
         let exempt = vec!["count_tool".to_string()];
 
-        let result = run_tool_call_loop(
-            &model_provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "cli",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            None,
-            None,
-            &[],
-            &exempt,
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &exempt,
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("loop should finish with exempt tool executing twice");
 
@@ -5930,42 +6402,45 @@ mod tests {
         ];
         let observer = NoopObserver;
 
-        let result = run_tool_call_loop(
-            &model_provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "cli",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            None,
-            None,
-            &[],
-            &[], // no config-provided dedup exemptions
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false,
-            0,
-            0,
-            None,
-            None,
-            None,
-            None,
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("loop should finish running both identical subagent calls");
 
@@ -6015,42 +6490,45 @@ mod tests {
         let observer = NoopObserver;
         let exempt = vec!["count_tool".to_string()];
 
-        let _result = run_tool_call_loop(
-            &model_provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "cli",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            None,
-            None,
-            &[],
-            &exempt,
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let _result = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &exempt,
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("loop should complete");
 
@@ -6086,42 +6564,45 @@ mod tests {
         ];
         let observer = NoopObserver;
 
-        let result = run_tool_call_loop(
-            &model_provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "cli",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("native fallback id flow should complete");
 
@@ -6161,42 +6642,45 @@ mod tests {
         ];
         let observer = NoopObserver;
 
-        let result = run_tool_call_loop(
-            &provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "matrix",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "matrix",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("malformed tool protocol should retry and recover");
 
@@ -6231,42 +6715,45 @@ mod tests {
         ];
         let observer = NoopObserver;
 
-        let result = run_tool_call_loop(
-            &provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "matrix",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "matrix",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("business JSON should be returned as normal text");
 
@@ -6299,42 +6786,45 @@ mod tests {
         ];
         let observer = NoopObserver;
 
-        let result = run_tool_call_loop(
-            &provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "matrix",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "matrix",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("unknown business JSON should be returned as normal text");
 
@@ -6370,42 +6860,45 @@ mod tests {
         ];
         let observer = NoopObserver;
 
-        let result = run_tool_call_loop(
-            &provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "matrix",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            6,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "matrix",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 6,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("malformed tool protocol should return a safe fallback");
 
@@ -6438,42 +6931,45 @@ mod tests {
         let observer = NoopObserver;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
-        let result = run_tool_call_loop(
-            &provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "matrix",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            Some(tx),
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "matrix",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: Some(tx),
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("toolcalls reference JSON should remain visible without tools");
 
@@ -6505,42 +7001,45 @@ mod tests {
         ];
         let observer = NoopObserver;
 
-        let result = run_tool_call_loop(
-            &provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "cli",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("toolcalls reference JSON should remain visible without tools");
 
@@ -6564,42 +7063,45 @@ mod tests {
         ];
         let observer = NoopObserver;
 
-        let result = run_tool_call_loop(
-            &provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "cli",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("schema JSON should remain visible without tools");
 
@@ -6624,42 +7126,45 @@ mod tests {
         ];
         let observer = NoopObserver;
 
-        let result = run_tool_call_loop(
-            &provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "cli",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("audit JSON should remain visible without tools");
 
@@ -6684,42 +7189,45 @@ mod tests {
         ];
         let observer = NoopObserver;
 
-        let result = run_tool_call_loop(
-            &provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "cli",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("reference JSON should remain visible without tools");
 
@@ -6746,42 +7254,45 @@ This is an example, not an invocation."#;
         ];
         let observer = NoopObserver;
 
-        let result = run_tool_call_loop(
-            &provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "cli",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("tool_call tag examples should remain visible without tools");
 
@@ -6813,42 +7324,45 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
-        let result = run_tool_call_loop(
-            &provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "matrix",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            Some(tx),
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "matrix",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: Some(tx),
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("registered tool_call fenced examples should remain visible");
 
@@ -6892,42 +7406,45 @@ This is an example, not an invocation."#;
         ];
         let observer = NoopObserver;
 
-        let result = run_tool_call_loop(
-            &provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "cli",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("registered tool_call tag examples should remain visible");
 
@@ -6954,42 +7471,45 @@ Done."#;
         ];
         let observer = NoopObserver;
 
-        let result = run_tool_call_loop(
-            &provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "cli",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("tagged tool protocol with trailing text should retry and recover");
 
@@ -7019,42 +7539,45 @@ Done."#;
         ];
         let observer = NoopObserver;
 
-        let result = run_tool_call_loop(
-            &provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "matrix",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "matrix",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("embedded fenced tool protocol should retry and recover");
 
@@ -7082,42 +7605,45 @@ Done."#;
         ];
         let observer = NoopObserver;
 
-        let result = run_tool_call_loop(
-            &provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "cli",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "cli",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("standalone tool_call fence should retry and recover without tools");
 
@@ -7146,42 +7672,45 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
-        let result = run_tool_call_loop(
-            &provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "matrix",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            Some(tx),
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "matrix",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: Some(tx),
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("tool_call fenced examples should remain visible without tools");
 
@@ -7267,42 +7796,45 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
-        let result = run_tool_call_loop(
-            &provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "matrix",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            Some(tx),
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "matrix",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: Some(tx),
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("split tool_call fenced examples should remain visible without tools");
 
@@ -7339,42 +7871,45 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
-        let result = run_tool_call_loop(
-            &provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "matrix",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            Some(tx),
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "matrix",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: Some(tx),
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("JSON-fenced tool protocol examples should remain visible without tools");
 
@@ -7415,42 +7950,45 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(16);
 
-        let result = run_tool_call_loop(
-            &provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "matrix",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            Some(tx),
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "matrix",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: Some(tx),
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("streamed fenced tool call should execute and continue");
 
@@ -7514,42 +8052,45 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
 
-        let result = run_tool_call_loop(
-            &model_provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "telegram",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            Some(tx),
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "telegram",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: Some(tx),
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("native tool-call text should be relayed through on_delta");
 
@@ -7618,42 +8159,45 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(32);
 
-        let result = run_tool_call_loop(
-            &model_provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "telegram",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            Some(tx),
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "telegram",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: Some(tx),
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("streaming model_provider should complete");
 
@@ -7696,42 +8240,45 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
-        let result = run_tool_call_loop(
-            &model_provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "telegram",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            5,
-            None,
-            Some(tx),
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "telegram",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 5,
+            cancellation_token: None,
+            on_delta: Some(tx),
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("streaming tool loop should execute tool and finish");
 
@@ -8580,42 +9127,45 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
-        let result = run_tool_call_loop(
-            &model_provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "telegram",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            5,
-            None,
-            Some(tx),
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "telegram",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 5,
+            cancellation_token: None,
+            on_delta: Some(tx),
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("native streaming events should preserve tool loop semantics");
 
@@ -8726,42 +9276,45 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(32);
 
-        let result = run_tool_call_loop(
-            &router,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "router",
-            "hint:fast",
-            Some(0.0),
-            true,
-            None,
-            "telegram",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            Some(tx),
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &router,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "router",
+            model: "hint:fast",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "telegram",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: Some(tx),
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("routed streaming model_provider should complete");
 
@@ -8846,6 +9399,8 @@ This is an example, not an invocation."#;
                 None,
                 false,
                 false, // parallel_tools
+                0,     // max_tool_result_chars: disabled for test
+                0,     // context_token_budget: disabled for test
                 None,  // channel
             )
             .await
@@ -8912,6 +9467,8 @@ This is an example, not an invocation."#;
                 None,
                 true,
                 false, // parallel_tools
+                0,     // max_tool_result_chars: disabled for test
+                0,     // context_token_budget: disabled for test
                 None,  // channel
             )
             .await
@@ -8925,6 +9482,221 @@ This is an example, not an invocation."#;
             assert!(
                 !result.contains("private reasoning"),
                 "strict parser should still strip think tags from final text, got: {result}"
+            );
+        });
+    }
+
+    // ── Regression tests for trimming-budget forwarding through agent_turn ────
+
+    /// A mock tool that produces a configurable-length output string for
+    /// testing that `max_tool_result_chars` is forwarded through
+    /// `agent_turn` to `run_tool_call_loop`.
+    struct VerboseTool {
+        name: String,
+        output_len: usize,
+        invocations: Arc<AtomicUsize>,
+    }
+
+    impl VerboseTool {
+        fn new(name: &str, output_len: usize, invocations: Arc<AtomicUsize>) -> Self {
+            Self {
+                name: name.to_string(),
+                output_len,
+                invocations,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for VerboseTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "Returns a long output for trimming-budget regression tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "value": { "type": "string" }
+                }
+            })
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.invocations.fetch_add(1, Ordering::SeqCst);
+            let output = format!(
+                "verbose-start-{}-{}",
+                self.name,
+                "X".repeat(self.output_len)
+            );
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output,
+                error: None,
+            })
+        }
+    }
+
+    /// When `max_tool_result_chars` is set to a non-zero value, `agent_turn`
+    /// should forward it to `run_tool_call_loop`, which truncates oversized
+    /// tool results. This test verifies the old hardcoded-0 bug (where
+    /// trimming was silently disabled) does not regress.
+    #[test]
+    fn agent_turn_forwards_max_tool_result_chars_to_truncate_tool_result() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should initialize");
+
+        runtime.block_on(async {
+            let model_provider = ScriptedModelProvider::from_text_responses(vec![
+                r#"<tool_call>
+{"name":"verbose_checker","arguments":{"value":"check"}}
+</tool_call>"#,
+                "done",
+            ]);
+
+            let invocations = Arc::new(AtomicUsize::new(0));
+            let verbose_tool: Box<dyn Tool> = Box::new(VerboseTool::new(
+                "verbose_checker",
+                500, // produce 500+ chars of output
+                Arc::clone(&invocations),
+            ));
+            let tools_registry: Vec<Box<dyn Tool>> = vec![verbose_tool];
+            let mut history = vec![
+                ChatMessage::system("test-system"),
+                ChatMessage::user("check"),
+            ];
+            let observer = NoopObserver;
+
+            let _result = agent_turn(
+                &model_provider,
+                &mut history,
+                &tools_registry,
+                &observer,
+                "mock-provider",
+                "mock-model",
+                Some(0.0),
+                true,
+                "daemon",
+                None,
+                &zeroclaw_config::schema::MultimodalConfig::default(),
+                4,
+                None,
+                &[],
+                &[],
+                None,
+                None,
+                false,
+                false,
+                100, // max_tool_result_chars: truncate at 100 chars
+                0,   // context_token_budget: disabled
+                None,
+            )
+            .await
+            .expect("agent_turn should complete");
+
+            assert_eq!(
+                invocations.load(Ordering::SeqCst),
+                1,
+                "tool should be called once"
+            );
+
+            // The tool result in history should be truncated (contain the
+            // truncation marker "...") rather than preserving the full 500+ char output.
+            let all_content: String = history
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<&str>>()
+                .join(" ");
+
+            assert!(
+                !all_content.contains(&"X".repeat(500)),
+                "tool result should not contain 500 consecutive X chars when truncated to 100 chars"
+            );
+        });
+    }
+
+    /// Control test: when `max_tool_result_chars = 0` (disabled), the full
+    /// tool result must be preserved in history without truncation.
+    #[test]
+    fn agent_turn_with_zero_budget_preserves_full_tool_result() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should initialize");
+
+        runtime.block_on(async {
+            let model_provider = ScriptedModelProvider::from_text_responses(vec![
+                r#"<tool_call>
+{"name":"verbose_checker","arguments":{"value":"check"}}
+</tool_call>"#,
+                "done",
+            ]);
+
+            let invocations = Arc::new(AtomicUsize::new(0));
+            let verbose_tool: Box<dyn Tool> = Box::new(VerboseTool::new(
+                "verbose_checker",
+                500,
+                Arc::clone(&invocations),
+            ));
+            let tools_registry: Vec<Box<dyn Tool>> = vec![verbose_tool];
+            let mut history = vec![
+                ChatMessage::system("test-system"),
+                ChatMessage::user("check"),
+            ];
+            let observer = NoopObserver;
+
+            let _result = agent_turn(
+                &model_provider,
+                &mut history,
+                &tools_registry,
+                &observer,
+                "mock-provider",
+                "mock-model",
+                Some(0.0),
+                true,
+                "daemon",
+                None,
+                &zeroclaw_config::schema::MultimodalConfig::default(),
+                4,
+                None,
+                &[],
+                &[],
+                None,
+                None,
+                false,
+                false,
+                0, // max_tool_result_chars: disabled (no truncation)
+                0, // context_token_budget: disabled
+                None,
+            )
+            .await
+            .expect("agent_turn should complete");
+
+            assert_eq!(invocations.load(Ordering::SeqCst), 1);
+
+            // Check that the full output is preserved somewhere in history
+            // (tool results may appear under different roles depending on the
+            // message format used by run_tool_call_loop).
+            let all_content: String = history
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<&str>>()
+                .join(" ");
+
+            assert!(
+                all_content.contains(&"X".repeat(500)),
+                "full tool result should be preserved somewhere in history when max_tool_result_chars=0, \
+                 history roles: {:?}",
+                history.iter().map(|m| m.role.clone()).collect::<Vec<_>>()
             );
         });
     }
@@ -10395,42 +11167,45 @@ Let me check the result."#;
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
-        let result = run_tool_call_loop(
-            &model_provider,
-            &mut history,
-            &tools_registry,
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "telegram",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            4,
-            None,
-            Some(tx),
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "telegram",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 4,
+            cancellation_token: None,
+            on_delta: Some(tx),
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("tool loop should complete");
 
@@ -10521,7 +11296,8 @@ Let me check the result."#;
     #[tokio::test]
     async fn cost_tracking_records_usage_when_scoped() {
         use super::{
-            TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, run_tool_call_loop,
+            TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoop, ToolLoopCostTrackingContext,
+            run_tool_call_loop,
         };
         use crate::cost::CostTracker;
         use crate::observability::noop::NoopObserver;
@@ -10558,42 +11334,45 @@ Let me check the result."#;
         let result = TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
                 Some(ctx),
-                run_tool_call_loop(
-                    &model_provider,
-                    &mut history,
-                    &[],
-                    &observer,
-                    "mock-provider",
-                    "mock-model",
-                    Some(0.0),
-                    true,
-                    None,
-                    "test",
-                    None,
-                    &zeroclaw_config::schema::MultimodalConfig::default(),
-                    2,
-                    None,
-                    None,
-                    None,
-                    &[],
-                    &[],
-                    None,
-                    None,
-                    &zeroclaw_config::schema::PacingConfig::default(),
-                    false,
-                    false, // parallel_tools
-                    0,
-                    0,
-                    None,
-                    None, // channel
-                    None, // receipt_generator
-                    None, // collected_receipts
-                    None, // event_tx
-                    None, // steering
-                    None, // new_messages_out
-                    &LoopKnobs::default(),
-                    None,
-                ),
+                run_tool_call_loop(ToolLoop {
+                    model_provider: &model_provider,
+                    history: &mut history,
+                    tools_registry: &[],
+                    observer: &observer,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                    silent: true,
+                    approval: None,
+                    channel_name: "test",
+                    channel_reply_target: None,
+                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    max_tool_iterations: 2,
+                    cancellation_token: None,
+                    on_delta: None,
+                    hooks: None,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    context_token_budget: 0,
+                    shared_budget: None,
+                    channel: None,
+                    receipt_generator: None,
+                    collected_receipts: None,
+                    event_tx: None,
+                    steering: None,
+                    new_messages_out: None,
+                    knobs: &LoopKnobs::default(),
+                    image_cache: None,
+                    // Phase 1: stamp Internal/Trusted. Real per-transport
+                    // stamping is PR C (RFC #6971 §4).
+                    ingress: IngressContext::internal(),
+                }),
             )
             .await
             .expect("tool loop should succeed");
@@ -10621,42 +11400,45 @@ Let me check the result."#;
             ChatMessage::user("follow-up"),
         ];
 
-        let result = run_tool_call_loop(
-            &provider,
-            &mut history,
-            &[],
-            &observer,
-            "recording-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "test",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            2,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None,
-            None,
-            None,
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &provider,
+            history: &mut history,
+            tools_registry: &[],
+            observer: &observer,
+            provider_name: "recording-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 2,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("tool loop should complete");
 
@@ -10682,7 +11464,8 @@ Let me check the result."#;
     #[tokio::test]
     async fn cost_tracking_enforces_budget() {
         use super::{
-            TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, run_tool_call_loop,
+            TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoop, ToolLoopCostTrackingContext,
+            run_tool_call_loop,
         };
         use crate::cost::CostTracker;
         use crate::observability::noop::NoopObserver;
@@ -10722,42 +11505,45 @@ Let me check the result."#;
         let err = TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
                 Some(ctx),
-                run_tool_call_loop(
-                    &model_provider,
-                    &mut history,
-                    &[],
-                    &observer,
-                    "mock-provider",
-                    "mock-model",
-                    Some(0.0),
-                    true,
-                    None,
-                    "test",
-                    None,
-                    &zeroclaw_config::schema::MultimodalConfig::default(),
-                    2,
-                    None,
-                    None,
-                    None,
-                    &[],
-                    &[],
-                    None,
-                    None,
-                    &zeroclaw_config::schema::PacingConfig::default(),
-                    false,
-                    false, // parallel_tools
-                    0,
-                    0,
-                    None,
-                    None, // channel
-                    None, // receipt_generator
-                    None, // collected_receipts
-                    None, // event_tx
-                    None, // steering
-                    None, // new_messages_out
-                    &LoopKnobs::default(),
-                    None,
-                ),
+                run_tool_call_loop(ToolLoop {
+                    model_provider: &model_provider,
+                    history: &mut history,
+                    tools_registry: &[],
+                    observer: &observer,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                    silent: true,
+                    approval: None,
+                    channel_name: "test",
+                    channel_reply_target: None,
+                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    max_tool_iterations: 2,
+                    cancellation_token: None,
+                    on_delta: None,
+                    hooks: None,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    context_token_budget: 0,
+                    shared_budget: None,
+                    channel: None,
+                    receipt_generator: None,
+                    collected_receipts: None,
+                    event_tx: None,
+                    steering: None,
+                    new_messages_out: None,
+                    knobs: &LoopKnobs::default(),
+                    image_cache: None,
+                    // Phase 1: stamp Internal/Trusted. Real per-transport
+                    // stamping is PR C (RFC #6971 §4).
+                    ingress: IngressContext::internal(),
+                }),
             )
             .await
             .expect_err("should fail with budget exceeded");
@@ -10770,7 +11556,7 @@ Let me check the result."#;
 
     #[tokio::test]
     async fn cost_tracking_is_noop_without_scope() {
-        use super::run_tool_call_loop;
+        use super::{ToolLoop, run_tool_call_loop};
         use crate::observability::noop::NoopObserver;
 
         // No TOOL_LOOP_COST_TRACKING_CONTEXT scoped — should run fine
@@ -10790,42 +11576,45 @@ Let me check the result."#;
         let observer = NoopObserver;
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
 
-        let result = run_tool_call_loop(
-            &model_provider,
-            &mut history,
-            &[],
-            &observer,
-            "mock-provider",
-            "mock-model",
-            Some(0.0),
-            true,
-            None,
-            "test",
-            None,
-            &zeroclaw_config::schema::MultimodalConfig::default(),
-            2,
-            None,
-            None,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            &zeroclaw_config::schema::PacingConfig::default(),
-            false,
-            false, // parallel_tools
-            0,
-            0,
-            None,
-            None, // channel
-            None, // receipt_generator
-            None, // collected_receipts
-            None, // event_tx
-            None, // steering
-            None, // new_messages_out
-            &LoopKnobs::default(),
-            None,
-        )
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &[],
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 2,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
+        })
         .await
         .expect("should succeed without cost scope");
 
@@ -11171,9 +11960,85 @@ Let me check the result."#;
             !super::eager_mcp_tool_allowed("slack__post", access_policy.as_ref()),
             "policy excluded_tools must block eager MCP registration"
         );
+        // `github__search` is in the caller list AND its `__` prefix triggers
+        // the risk-profile MCP auto-admit, so both independent gates pass it.
         assert!(
-            !super::eager_mcp_tool_allowed("github__search", access_policy.as_ref()),
-            "caller allowlist must compose with SecurityPolicy for run() eager MCP"
+            super::eager_mcp_tool_allowed("github__search", access_policy.as_ref()),
+            "name auto-admitted by risk-profile MCP exception and listed by \
+             the caller must be registered eagerly"
+        );
+    }
+
+    /// PR #7547 review (Audacity88 / singlerider) — second-round blocking:
+    /// the MCP `<server>__<tool>` auto-admit exception must apply only to
+    /// the risk-profile gate. A caller-supplied per-run `allowed_tools`
+    /// list (cron job, narrowed delegate invocation, …) must still narrow
+    /// the visible set strictly, even when the risk-profile auto-admit
+    /// would otherwise pass an MCP name.
+    ///
+    /// Concrete scenario from the review: a cron job narrows
+    /// `allowed_tools = ["cron_add"]`. The risk profile is broader and
+    /// includes `cron_add` (so the cron tool itself survives both gates),
+    /// but the risk-profile MCP exception would happily admit
+    /// `filesystem__write_file` — the caller list does not include it,
+    /// so eager MCP registration must reject it.
+    #[test]
+    fn eager_mcp_policy_caller_per_run_list_does_not_leak_mcp_auto_admit() {
+        // Risk profile is permissive enough that the MCP auto-admit
+        // fires on its own gate (a non-empty list activates the `__`
+        // exception). It also covers `cron_add` so the per-run narrowing
+        // can pin that tool through both gates.
+        let policy = TestPolicy {
+            allowed_tools: Some(vec!["cron_add".into(), "fs__read_file".into()]),
+            ..TestPolicy::default()
+        };
+        // Caller-supplied per-run list narrows to a single non-MCP tool.
+        let caller = vec!["cron_add".to_string()];
+        let access_policy = super::mcp_tool_access_policy(&policy, Some(&caller));
+
+        assert!(
+            super::eager_mcp_tool_allowed("cron_add", access_policy.as_ref()),
+            "explicitly-narrowed tool must be admitted by both gates"
+        );
+        assert!(
+            !super::eager_mcp_tool_allowed("filesystem__write_file", access_policy.as_ref()),
+            "MCP wrapper outside the caller-supplied per-run list must be \
+             rejected — the per-run gate does not honor the risk-profile \
+             MCP auto-admit exception (PR #7547 review regression)"
+        );
+        assert!(
+            !super::eager_mcp_tool_allowed("fs__read_file", access_policy.as_ref()),
+            "even risk-profile-listed MCP names are rejected when the \
+             caller-supplied per-run list does not include them"
+        );
+    }
+
+    /// Same scenario as above, but proving the deferred (`tool_search`)
+    /// path also honors the per-run narrowing. `mcp_allowed_tool_count`
+    /// is what guards the `tool_search` registration: if it returns 0
+    /// the deferred-MCP `tool_search` tool is not even added to the
+    /// agent's tool list, so the LLM cannot ask for the MCP wrapper.
+    #[test]
+    fn deferred_mcp_caller_per_run_list_does_not_leak_mcp_auto_admit() {
+        let policy = TestPolicy {
+            allowed_tools: Some(vec!["cron_add".into(), "fs__read_file".into()]),
+            ..TestPolicy::default()
+        };
+        let caller = vec!["cron_add".to_string()];
+        let access_policy = super::mcp_tool_access_policy(&policy, Some(&caller));
+
+        // The two stubs are MCP-shaped wrappers that the risk-profile
+        // auto-admit would otherwise pass, but the caller-supplied
+        // per-run list does not include either of them.
+        assert_eq!(
+            super::mcp_allowed_tool_count(
+                ["filesystem__write_file", "github__search"],
+                access_policy.as_ref()
+            ),
+            0,
+            "deferred MCP `tool_search` must not be registered when the \
+             caller-supplied per-run list admits no MCP stub (PR #7547 \
+             review regression)"
         );
     }
 
@@ -11189,9 +12054,10 @@ Let me check the result."#;
             super::eager_mcp_tool_allowed("fs__read_file", access_policy.as_ref()),
             "process_message eager MCP should use the agent SecurityPolicy allowlist"
         );
+        // github__search contains "__" → auto-admitted even though not in allowed_tools
         assert!(
-            !super::eager_mcp_tool_allowed("github__search", access_policy.as_ref()),
-            "non-allowlisted eager MCP names must not be registered on process_message"
+            super::eager_mcp_tool_allowed("github__search", access_policy.as_ref()),
+            "runtime-discovered MCP tools are auto-admitted (subject only to excluded_tools)"
         );
     }
 
@@ -11231,12 +12097,14 @@ Let me check the result."#;
             Some(&delegate_handle),
             access_policy.as_ref(),
         ));
-        assert!(!super::register_eager_mcp_tool_if_allowed(
+        // github__search contains "__" → auto-admitted
+        assert!(super::register_eager_mcp_tool_if_allowed(
             mock_tool_arc("github__search"),
             &mut tools,
             Some(&delegate_handle),
             access_policy.as_ref(),
         ));
+        // slack__post is explicitly excluded → denied
         assert!(!super::register_eager_mcp_tool_if_allowed(
             mock_tool_arc("slack__post"),
             &mut tools,
@@ -11244,13 +12112,13 @@ Let me check the result."#;
             access_policy.as_ref(),
         ));
 
-        assert_eq!(tool_names(&tools), vec!["fs__read_file"]);
+        assert_eq!(tool_names(&tools), vec!["fs__read_file", "github__search"]);
         let delegate_names: Vec<String> = delegate_handle
             .read()
             .iter()
             .map(|tool| tool.name().to_string())
             .collect();
-        assert_eq!(delegate_names, vec!["fs__read_file"]);
+        assert_eq!(delegate_names, vec!["fs__read_file", "github__search"]);
     }
 
     // ── agent_provider_composite regression ───────────────────────────────
@@ -11328,6 +12196,81 @@ Let me check the result."#;
             agent.resolved.max_tool_iterations, 25,
             "direct agent turns must honor runtime_profiles.*.max_tool_iterations \
              instead of the skipped AliasedAgentConfig::resolved default"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_entrypoints_resolve_runtime_profile_tunables_before_provider_setup() {
+        use zeroclaw_config::providers::RuntimeProfileRef;
+        use zeroclaw_config::schema::{AliasedAgentConfig, RuntimeProfileConfig};
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.runtime_profiles.insert(
+            "entrypoint-profile".to_string(),
+            RuntimeProfileConfig {
+                max_tool_iterations: 3,
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "entrypoint-profile-agent".to_string(),
+            AliasedAgentConfig {
+                runtime_profile: RuntimeProfileRef::new("entrypoint-profile"),
+                ..Default::default()
+            },
+        );
+
+        let seen = Arc::new(Mutex::new(Vec::<(String, usize)>::new()));
+        let seen_for_hook = Arc::clone(&seen);
+        {
+            let mut hook = RESOLVED_AGENT_FOR_TURN_TEST_HOOK
+                .lock()
+                .expect("resolved-agent test hook lock should not be poisoned");
+            *hook = Some(Arc::new(move |alias, max_tool_iterations| {
+                seen_for_hook
+                    .lock()
+                    .expect("seen lock should not be poisoned")
+                    .push((alias.to_string(), max_tool_iterations));
+            }));
+        }
+
+        let _ = super::run(
+            config.clone(),
+            "entrypoint-profile-agent",
+            Some("hello".to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            None,
+            None,
+            super::AgentRunOverrides::default(),
+        )
+        .await;
+        let _ =
+            super::process_message(config, "entrypoint-profile-agent", "hello", Some("session"))
+                .await;
+
+        {
+            let mut hook = RESOLVED_AGENT_FOR_TURN_TEST_HOOK
+                .lock()
+                .expect("resolved-agent test hook lock should not be poisoned");
+            *hook = None;
+        }
+
+        let seen = seen.lock().expect("seen lock should not be poisoned");
+        let matching = seen
+            .iter()
+            .filter(|(alias, max_tool_iterations)| {
+                alias == "entrypoint-profile-agent" && *max_tool_iterations == 3
+            })
+            .count();
+
+        assert_eq!(
+            matching, 2,
+            "run and process_message must both resolve runtime_profiles.*.max_tool_iterations \
+             before provider setup; observed {seen:?}"
         );
     }
 

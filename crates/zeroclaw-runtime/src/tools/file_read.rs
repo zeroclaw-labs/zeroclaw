@@ -78,7 +78,7 @@ impl Tool for FileReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read file contents with line numbers. Supports partial reading via offset and limit. Extracts text from PDF; other binary files are read with lossy UTF-8 conversion. Set encoding=\"base64\" to return raw bytes base64-encoded (for binary files such as .xlsx/.docx); offset/limit are ignored in that mode."
+        "Read file contents with line numbers. Supports partial reading via offset and limit. Extracts text from PDF; binary and image files are rejected (use the image_info tool for images). Set encoding=\"base64\" to return raw bytes base64-encoded (for binary files such as .xlsx/.docx); offset/limit are ignored in that mode."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -328,7 +328,36 @@ impl FileReadTool {
                     });
                 }
 
-                // Lossy fallback — replaces invalid bytes with U+FFFD
+                // Reject confident binary instead of returning lossy garbage.
+                // Known image formats: point the agent at the image_info tool.
+                if let Some(kind) = detect_image_format(&bytes) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Binary image file detected ({kind}): {}. Use the image_info \
+                             tool for images, or encoding=\"base64\" to read the raw bytes.",
+                            resolved_path.display()
+                        )),
+                    });
+                }
+
+                // Other confident binary (NUL byte or a glut of control bytes).
+                if looks_binary(&bytes) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Binary file detected: {}. Use encoding=\"base64\" to read the \
+                             raw bytes.",
+                            resolved_path.display()
+                        )),
+                    });
+                }
+
+                // Not confidently binary — most likely text in a non-UTF-8 encoding
+                // (e.g. Windows-1251, Latin-1). Decode leniently for now; proper
+                // charset detection/transcoding is tracked as a follow-up.
                 let lossy = String::from_utf8_lossy(&bytes).into_owned();
                 Ok(ToolResult {
                     success: true,
@@ -355,6 +384,70 @@ fn try_extract_pdf_text(bytes: &[u8]) -> Option<String> {
 #[cfg(not(feature = "rag-pdf"))]
 fn try_extract_pdf_text(_bytes: &[u8]) -> Option<String> {
     None
+}
+
+/// Detect a common raster-image container by its file-header magic bytes.
+/// Returns the format name when recognized so `file_read` can reject images
+/// with guidance to use the `image_info` tool instead of emitting lossy text.
+/// Only consulted on the non-UTF-8 read path, so an ASCII string that merely
+/// starts with one of these markers (and is therefore valid UTF-8) is unaffected.
+///
+/// PNG/JPEG/GIF magics carry non-ASCII/control bytes and are collision-free, and
+/// WEBP is anchored by the `RIFF…WEBP` container, so the raw magic is enough. The
+/// BMP marker is just the two printable ASCII letters `BM`, which a non-UTF-8
+/// legacy-text file can legitimately start with (a name, "BMW dealer notes", …),
+/// so it is validated against the rest of the BITMAPFILEHEADER instead of trusted
+/// on the magic alone — otherwise the legacy-text carve-out below is defeated.
+fn detect_image_format(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else if is_bmp_header(bytes) {
+        Some("bmp")
+    } else {
+        None
+    }
+}
+
+/// Validate a BMP `BITMAPFILEHEADER` beyond the weak `BM` magic. Real BMPs set
+/// the two reserved words (offset 6..10) to zero and point `bfOffBits`
+/// (offset 10..14, the pixel-array offset) inside the file. Non-UTF-8 text that
+/// merely starts with `BM` carries printable bytes in the reserved field, so it
+/// fails this check and falls through to the lenient lossy read. `bfSize`
+/// (offset 2..6) is deliberately not checked: some encoders write 0 there.
+fn is_bmp_header(bytes: &[u8]) -> bool {
+    if bytes.len() < 14 || !bytes.starts_with(b"BM") {
+        return false;
+    }
+    if bytes[6..10] != [0, 0, 0, 0] {
+        return false;
+    }
+    let off_bits = u32::from_le_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]);
+    (14..=bytes.len() as u32).contains(&off_bits)
+}
+
+/// Heuristic binary classifier for the non-UTF-8 read path. A NUL byte (which
+/// text essentially never contains) or a high density of non-text control
+/// characters marks the content as binary. Legacy single-byte text encodings
+/// (e.g. cp1251, Latin-1) have neither, so they are deliberately NOT classified
+/// as binary here — they fall through to the lenient lossy read.
+fn looks_binary(bytes: &[u8]) -> bool {
+    // Sample a prefix so very large files stay cheap.
+    let sample = &bytes[..bytes.len().min(8192)];
+    if sample.is_empty() {
+        return false;
+    }
+    if sample.contains(&0) {
+        return true;
+    }
+    let is_control = |b: u8| b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r';
+    let controls = sample.iter().filter(|&&b| is_control(b)).count();
+    controls * 100 / sample.len() > 30
 }
 
 #[cfg(test)]
@@ -934,14 +1027,14 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// Non-UTF-8 binary files should be read with lossy conversion.
+    /// Confident binary (NUL byte) is rejected, not returned as lossy text.
     #[tokio::test]
-    async fn file_read_lossy_reads_binary_file() {
-        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_lossy");
+    async fn file_read_rejects_binary_file() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_reject_binary");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        // Write bytes that are not valid UTF-8 and not a PDF
+        // Non-UTF-8 bytes containing a NUL — the classic binary signal.
         let binary_data: Vec<u8> = vec![0x00, 0x80, 0xFF, 0xFE, b'h', b'i', 0x80];
         tokio::fs::write(dir.join("data.bin"), &binary_data)
             .await
@@ -951,19 +1044,174 @@ mod tests {
         let result = tool.execute(json!({"path": "data.bin"})).await.unwrap();
 
         assert!(
-            result.success,
-            "lossy read must succeed, error: {:?}",
+            !result.success,
+            "binary read must fail, got output: {:?}",
+            result.output
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Binary file detected"),
+            "error must indicate binary rejection, got: {:?}",
             result.error
         );
         assert!(
-            result.output.contains('\u{FFFD}'),
-            "lossy output must contain replacement character, got: {:?}",
+            !result.output.contains('\u{FFFD}'),
+            "must not return lossy replacement output, got: {:?}",
             result.output
         );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// PNG images are rejected with guidance toward the image_info tool.
+    #[tokio::test]
+    async fn file_read_rejects_png_image() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_reject_png");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // PNG magic (0x89 makes it invalid UTF-8) + a few header bytes.
+        let png: Vec<u8> = vec![
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+        ];
+        tokio::fs::write(dir.join("pic.png"), &png).await.unwrap();
+
+        let tool = test_tool(dir.clone());
+        let result = tool.execute(json!({"path": "pic.png"})).await.unwrap();
+
         assert!(
-            result.output.contains("hi"),
-            "lossy output must preserve valid ASCII, got: {:?}",
+            !result.success,
+            "image read must fail, got output: {:?}",
             result.output
+        );
+        let err = result.error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("image") && err.contains("image_info"),
+            "error must point at image_info, got: {:?}",
+            result.error
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// JPEG images are rejected too.
+    #[tokio::test]
+    async fn file_read_rejects_jpeg_image() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_reject_jpeg");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let jpeg: Vec<u8> = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
+        tokio::fs::write(dir.join("pic.jpg"), &jpeg).await.unwrap();
+
+        let tool = test_tool(dir.clone());
+        let result = tool.execute(json!({"path": "pic.jpg"})).await.unwrap();
+
+        assert!(!result.success, "jpeg read must fail");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("image"),
+            "error must indicate image rejection, got: {:?}",
+            result.error
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// A real BMP (valid BITMAPFILEHEADER, not just the `BM` magic) is still
+    /// rejected as an image and steered to `image_info`.
+    #[tokio::test]
+    async fn file_read_rejects_bmp_image() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_reject_bmp");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // BMP: "BM", bfSize, reserved=0, bfOffBits=54, a 40-byte DIB header,
+        // then pixel bytes. The 0xFF pixel byte makes the file invalid UTF-8 (a
+        // header of only sub-0x80 bytes would be valid UTF-8 and take the fast
+        // path), so it reaches the non-UTF-8 branch where detect_image_format runs.
+        let mut bmp: Vec<u8> = vec![
+            b'B', b'M', // magic
+            0x3A, 0x00, 0x00, 0x00, // bfSize = 58
+            0x00, 0x00, 0x00, 0x00, // reserved
+            0x36, 0x00, 0x00, 0x00, // bfOffBits = 54
+        ];
+        bmp.resize(54, 0); // DIB header
+        bmp.extend_from_slice(&[0xFF, 0x00, 0xFF, 0x00]); // pixel array
+        tokio::fs::write(dir.join("pic.bmp"), &bmp).await.unwrap();
+
+        let tool = test_tool(dir.clone());
+        let result = tool.execute(json!({"path": "pic.bmp"})).await.unwrap();
+
+        assert!(!result.success, "bmp read must fail");
+        let err = result.error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("image") && err.contains("image_info"),
+            "error must point at image_info, got: {:?}",
+            result.error
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// Non-UTF-8 legacy text that happens to start with the `BM` letters must
+    /// NOT be misread as a BMP image: the reserved-field validation in
+    /// `is_bmp_header` rejects it, so it falls through to the lenient lossy read.
+    /// Regression for the false positive the bare `BM` magic reintroduced.
+    #[tokio::test]
+    async fn file_read_reads_non_utf8_bm_text_lossy() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_bm_text");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // "BM" followed by cp1251 high bytes (a Cyrillic phrase): >14 bytes, the
+        // reserved field (offset 6..10) holds printable text, no NUL / control.
+        let mut data: Vec<u8> = vec![b'B', b'M'];
+        data.extend_from_slice(&[
+            0xCF, 0xF0, 0xE0, 0xE9, 0xF1, 0x20, 0xEA, 0xEE, 0xEC, 0xEF, 0xE0, 0xED, 0xE8, 0xE8,
+        ]);
+        tokio::fs::write(dir.join("note.txt"), &data).await.unwrap();
+
+        let tool = test_tool(dir.clone());
+        let result = tool.execute(json!({"path": "note.txt"})).await.unwrap();
+
+        assert!(
+            result.success,
+            "non-UTF-8 text starting with BM must not be rejected as an image, error: {:?}",
+            result.error
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// Non-UTF-8 *text* (a legacy single-byte encoding) must NOT be classified
+    /// as binary: no NUL, no control glut, no image magic. It still reads
+    /// leniently (lossy) until proper charset decoding lands as a follow-up.
+    #[tokio::test]
+    async fn file_read_reads_non_utf8_text_lossy() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_read_legacy_text");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // "Privet" (Cyrillic) in Windows-1251: all high bytes, but no NUL / control / magic.
+        let cp1251: Vec<u8> = vec![0xCF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2];
+        tokio::fs::write(dir.join("note.txt"), &cp1251)
+            .await
+            .unwrap();
+
+        let tool = test_tool(dir.clone());
+        let result = tool.execute(json!({"path": "note.txt"})).await.unwrap();
+
+        assert!(
+            result.success,
+            "non-UTF-8 text must not be rejected as binary, error: {:?}",
+            result.error
         );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -1156,10 +1404,10 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&workspace).await;
     }
 
-    /// End-to-end test: agent calls `file_read` on a binary file, gets
-    /// lossy UTF-8 output with replacement characters in the tool result.
+    /// End-to-end test: agent calls `file_read` on a binary file and gets a
+    /// binary-rejection error in the tool result (no lossy replacement output).
     #[tokio::test]
-    async fn e2e_agent_file_read_lossy_binary() {
+    async fn e2e_agent_file_read_rejects_binary() {
         use crate::agent::agent::Agent;
         use crate::agent::dispatcher::NativeToolDispatcher;
         use e2e_helpers::*;
@@ -1219,7 +1467,7 @@ mod tests {
             "agent response must mention binary, got: {response}",
         );
 
-        // Verify tool result contains lossy output with replacement chars
+        // Verify the tool result carries the binary-rejection error, not lossy output
         {
             let all_requests = recorded.lock().unwrap();
             assert!(
@@ -1234,13 +1482,13 @@ mod tests {
                 .expect("second request must contain a tool result message");
 
             assert!(
-                tool_result_msg.content.contains("valid"),
-                "tool result must preserve valid ASCII from binary file, got: {}",
+                tool_result_msg.content.contains("Binary file detected"),
+                "tool result must contain the binary-rejection error, got: {}",
                 tool_result_msg.content,
             );
             assert!(
-                tool_result_msg.content.contains('\u{FFFD}'),
-                "tool result must contain replacement character for invalid bytes, got: {}",
+                !tool_result_msg.content.contains('\u{FFFD}'),
+                "tool result must NOT contain lossy replacement characters, got: {}",
                 tool_result_msg.content,
             );
         }
