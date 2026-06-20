@@ -1,0 +1,56 @@
+package zeroclaw:plugin@0.1.0;
+
+/// Proxied, allow-listed WebSocket connectivity for channel plugins.
+///
+/// WASI Preview 2 has no WebSocket primitive, so this is the one genuinely
+/// new networking surface channel plugins need beyond `wasi:http` (which,
+/// after the host's `send_request` hook was made proxy-aware, already
+/// covers unary HTTP for every plugin world). `connect` is implemented
+/// host-side by wrapping the same `ws_connect_with_proxy` function native
+/// channels already use, so a guest gets the same proxy/TLS/allow-list
+/// behavior with no networking code of its own — and, since this is the
+/// *only* networking capability wired into the `channel-plugin` world, a
+/// channel plugin has no way to bypass the proxy or allow-list: it simply
+/// has no raw socket capability to do so.
+@unstable(feature = plugins-wit-v0)
+interface websocket {
+    /// One inbound event surfaced by `poll`.
+    @unstable(feature = plugins-wit-v0)
+    variant ws-message {
+        /// A text frame.
+        text(string),
+        /// A binary frame.
+        binary(list<u8>),
+        /// The connection closed, with the close code if the peer sent one.
+        closed(option<u16>),
+    }
+
+    /// A connected WebSocket. Backed host-side by `ws_connect_with_proxy`'s
+    /// `ProxiedWsStream`; a background task continuously drains inbound
+    /// frames into a queue that `poll` reads from non-blockingly — the same
+    /// host-drives-the-I/O-loop, guest-only-polls model `poll-message`
+    /// already uses for inbound channel messages.
+    @unstable(feature = plugins-wit-v0)
+    resource websocket {
+        /// Open a connection to `url`. The target host must be present in
+        /// this plugin's `fine_grained_permissions` allow-list — the same
+        /// check `wasi:http`'s `send_request` hook applies — and the
+        /// connection is established through this plugin instance's
+        /// resolved proxy (`plugin-config.get-proxy-url`), exactly like a
+        /// native channel's `ws_connect_with_proxy` call.
+        connect: static func(url: string) -> result<websocket, string>;
+
+        /// Send a text frame.
+        send-text: func(text: string) -> result<_, string>;
+
+        /// Send a binary frame.
+        send-binary: func(data: list<u8>) -> result<_, string>;
+
+        /// Non-blocking: returns the next received frame, if any.
+        poll: func() -> option<ws-message>;
+
+        /// Close the connection. `code` is the WebSocket close code to send,
+        /// when given.
+        close: func(code: option<u16>) -> result<_, string>;
+    }
+}

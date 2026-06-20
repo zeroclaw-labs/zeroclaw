@@ -1,0 +1,71 @@
+package zeroclaw:plugin@0.1.0;
+
+/// Optional higher-level driver for WebSocket-gateway-shaped channels
+/// (Discord, Slack Socket Mode, Lark, WeChat Enterprise WS, DingTalk, …).
+///
+/// A WASM guest cannot run its own background timer independent of
+/// host-driven calls, so the heartbeat-timer / stall-detection state
+/// machine that every gateway-style channel needs (and today reimplements
+/// with small protocol-specific variations, e.g. `discord/mod.rs`'s
+/// heartbeat-tick loop) lives here, host-side, once. The guest supplies only
+/// the small protocol-specific pieces: what a heartbeat frame looks like,
+/// how to interpret a raw frame, and what resume state to keep across a
+/// reconnect — all driven by `poll-raw`, mirroring the same
+/// host-ticks/guest-decides model `channel.poll-message` already uses for
+/// inbound messages.
+///
+/// This is layered entirely on `websocket` — a plugin author whose protocol
+/// doesn't need resume/heartbeat semantics can ignore this interface and
+/// drive `websocket` directly.
+@unstable(feature = plugins-wit-v0)
+interface gateway {
+    use types.{json-string};
+    use websocket.{ws-message};
+
+    /// One event surfaced by `poll-raw`.
+    @unstable(feature = plugins-wit-v0)
+    variant gateway-event {
+        /// A raw inbound WebSocket frame.
+        frame(ws-message),
+        /// The host-managed heartbeat timer fired. The guest should build
+        /// and `send` whatever heartbeat frame its protocol requires.
+        heartbeat-tick,
+        /// No frame arrived within the configured stall timeout; the
+        /// connection has already been closed host-side. The guest should
+        /// reconnect, optionally using `saved-session` to resume.
+        stalled,
+    }
+
+    /// A host-managed gateway connection: owns the WebSocket, the heartbeat
+    /// timer, and stall detection.
+    @unstable(feature = plugins-wit-v0)
+    resource gateway-session {
+        /// Open a connection to `url`, subject to the same allow-list
+        /// `websocket.connect` applies. `heartbeat-interval-ms` drives how
+        /// often `heartbeat-tick` is surfaced via `poll-raw`;
+        /// `stall-timeout-secs` is the watchdog threshold (0 disables it).
+        connect: static func(
+            url: string,
+            heartbeat-interval-ms: u32,
+            stall-timeout-secs: u32,
+        ) -> result<gateway-session, string>;
+
+        /// Non-blocking: the next raw frame, heartbeat tick, or stall event.
+        poll-raw: func() -> option<gateway-event>;
+
+        /// Send a frame (e.g. a heartbeat, Identify, or Resume payload).
+        send: func(msg: ws-message) -> result<_, string>;
+
+        /// Persist an opaque resume-state blob (e.g. session id + sequence
+        /// number) scoped to this plugin instance. The host never
+        /// interprets its contents; it outlives any single connection, so
+        /// it survives a `close` followed by a fresh `connect`.
+        save-session: func(state: json-string) -> result<_, string>;
+
+        /// The most recently saved resume-state blob, if any.
+        saved-session: func() -> option<json-string>;
+
+        /// Close the connection.
+        close: func() -> result<_, string>;
+    }
+}

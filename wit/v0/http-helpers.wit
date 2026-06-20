@@ -1,0 +1,59 @@
+package zeroclaw:plugin@0.1.0;
+
+/// Convenience sugar layered on top of the (now proxy-aware) `wasi:http` —
+/// not a parallel security boundary. A guest could hand-roll multipart
+/// encoding and attachment downloads directly over `wasi:http`; these two
+/// functions just save it the trouble, the way Discord's
+/// `reqwest::multipart::Form` helper and Telegram's file-download path do
+/// for native channels today. Both still route through this plugin
+/// instance's resolved proxy client and host-enforced allow-list — the same
+/// checks `send_request` applies.
+@unstable(feature = plugins-wit-v0)
+interface http-helpers {
+    @unstable(feature = plugins-wit-v0)
+    use types.{media-attachment};
+
+    /// One header to send with a request.
+    @unstable(feature = plugins-wit-v0)
+    record http-header {
+        name: string,
+        value: string,
+    }
+
+    /// One field of a `multipart/form-data` request: a plain text field when
+    /// `file-name` is `none`, otherwise a file part.
+    @unstable(feature = plugins-wit-v0)
+    record multipart-field {
+        name: string,
+        file-name: option<string>,
+        content-type: option<string>,
+        data: list<u8>,
+    }
+
+    /// The response to a `send-multipart` call.
+    @unstable(feature = plugins-wit-v0)
+    record http-response {
+        status: u16,
+        headers: list<http-header>,
+        body: list<u8>,
+    }
+
+    /// POST a `multipart/form-data` request — covers Discord/Telegram-style
+    /// file-upload-with-JSON-payload patterns without the guest hand-rolling
+    /// multipart encoding.
+    send-multipart: func(
+        url: string,
+        headers: list<http-header>,
+        fields: list<multipart-field>,
+        timeout-ms: option<u32>,
+    ) -> result<http-response, string>;
+
+    /// Download a URL into a `media-attachment`, enforcing this instance's
+    /// allow-list and a hard `max-bytes` cap (mirroring Telegram's bounded
+    /// attachment download today).
+    download-to-attachment: func(
+        url: string,
+        headers: list<http-header>,
+        max-bytes: u32,
+    ) -> result<media-attachment, string>;
+}

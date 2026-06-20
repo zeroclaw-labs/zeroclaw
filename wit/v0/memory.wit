@@ -288,6 +288,7 @@ interface memory {
 @unstable(feature = plugins-wit-v0)
 world memory-plugin {
     import logging;
+    import plugin-config;
     export plugin-info;
     export memory;
 }

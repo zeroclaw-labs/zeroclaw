@@ -323,22 +323,70 @@ impl PluginHost {
         Ok((bytes, &plugin.manifest.fine_grained_permissions))
     }
 
-    /// Returns a new instance of the specified channel plugin, if it exists and
-    /// can be instantiated.
+    /// Build the per-instance network/secrets config for `name`, filtering
+    /// `secrets` down to the keys the plugin's manifest declared via
+    /// `declared_secrets` — an undeclared key is dropped here, before it
+    /// ever reaches the plugin boundary. `service_key` defaults to
+    /// `plugin.<name>` (matching the existing `"channel.<alias>"` convention
+    /// native channels use with `ProxyConfig`'s `scope = services`
+    /// selector), and can be overridden by the caller (e.g. a channel alias
+    /// wants `"channel.discord"` instead of `"plugin.discord-channel"`).
     #[cfg(feature = "plugins-wasmtime")]
+    fn network_config_for(
+        &self,
+        name: &str,
+        service_key: Option<String>,
+        proxy_url: Option<String>,
+        secrets: std::collections::HashMap<String, String>,
+    ) -> crate::PluginNetworkConfig {
+        let declared: std::collections::HashSet<&str> = self
+            .loaded
+            .get(name)
+            .map(|p| {
+                p.manifest
+                    .declared_secrets
+                    .iter()
+                    .map(String::as_str)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let secrets = secrets
+            .into_iter()
+            .filter(|(k, _)| declared.contains(k.as_str()))
+            .collect();
+
+        crate::PluginNetworkConfig {
+            service_key: service_key.unwrap_or_else(|| format!("plugin.{name}")),
+            proxy_url,
+            secrets,
+        }
+    }
+
+    /// Returns a new instance of the specified channel plugin, if it exists and
+    /// can be instantiated. `service_key`/`proxy_url`/`secrets` resolve the
+    /// per-instance `PluginNetworkConfig` (see [`PluginNetworkConfig`] for the
+    /// secret-sandboxing contract — `secrets` here must already be scoped to
+    /// this one plugin instance, never the global secret store).
+    #[cfg(feature = "plugins-wasmtime")]
+    #[allow(clippy::too_many_arguments)]
     pub async fn instantiate_channel_plugin(
         &self,
         name: &str,
+        service_key: Option<String>,
+        proxy_url: Option<String>,
+        secrets: std::collections::HashMap<String, String>,
     ) -> Result<Arc<dyn Channel>, PluginError> {
         let (bytes, permissions) = self
             .plugin_bytes_and_permissions(name, PluginCapability::Channel)
             .await?;
+        let network_config = self.network_config_for(name, service_key, proxy_url, secrets);
 
         let channel = crate::component::v0::ComponentChannel::from_bytes(
             name,
             &self.component_engine,
             &bytes,
             permissions,
+            network_config,
         )
         .await?;
 
@@ -352,11 +400,14 @@ impl PluginHost {
         let (bytes, permissions) = self
             .plugin_bytes_and_permissions(name, PluginCapability::Tool)
             .await?;
+        let network_config =
+            self.network_config_for(name, None, None, std::collections::HashMap::new());
 
         let tool = crate::component::v0::ComponentTool::from_bytes(
             &self.component_engine,
             &bytes,
             permissions,
+            network_config,
         )
         .await?;
 
@@ -371,12 +422,15 @@ impl PluginHost {
             .plugin_bytes_and_permissions(name, PluginCapability::Memory)
             .await
             .ok()?;
+        let network_config =
+            self.network_config_for(name, None, None, std::collections::HashMap::new());
 
         let memory = crate::component::v0::ComponentMemory::from_bytes(
             name,
             &self.component_engine,
             &bytes,
             permissions,
+            network_config,
         )
         .await
         .ok()?;
@@ -661,6 +715,62 @@ permissions = []
         let plugins = host.list_plugins();
         assert_eq!(plugins.len(), 1);
         assert_eq!(plugins[0].name, "test-plugin");
+    }
+
+    #[cfg(feature = "plugins-wasmtime")]
+    #[test]
+    fn network_config_for_drops_undeclared_secrets() {
+        let dir = tempdir().unwrap();
+        let plugin_dir = dir.path().join("plugins").join("secret-plugin");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            r#"
+name = "secret-plugin"
+version = "0.1.0"
+wasm_path = "plugin.wasm"
+capabilities = ["channel"]
+declared_secrets = ["bot_token"]
+"#,
+        )
+        .unwrap();
+        let host = PluginHost::new(dir.path()).unwrap();
+
+        let mut secrets = std::collections::HashMap::new();
+        secrets.insert("bot_token".to_string(), "shh-its-a-secret".to_string());
+        // An undeclared key — e.g. leaked in from a shared config map by
+        // mistake — must never reach the plugin even though it was passed in.
+        secrets.insert(
+            "unrelated_api_key".to_string(),
+            "should-not-leak".to_string(),
+        );
+
+        let config = host.network_config_for("secret-plugin", None, None, secrets);
+
+        assert_eq!(
+            config.secrets.get("bot_token").map(String::as_str),
+            Some("shh-its-a-secret")
+        );
+        assert!(!config.secrets.contains_key("unrelated_api_key"));
+        assert_eq!(config.service_key, "plugin.secret-plugin");
+    }
+
+    #[cfg(feature = "plugins-wasmtime")]
+    #[test]
+    fn network_config_for_honors_service_key_override() {
+        let dir = tempdir().unwrap();
+        let host = PluginHost::new(dir.path()).unwrap();
+        let config = host.network_config_for(
+            "discord-channel",
+            Some("channel.discord".to_string()),
+            Some("http://proxy.example.com:8080".to_string()),
+            std::collections::HashMap::new(),
+        );
+        assert_eq!(config.service_key, "channel.discord");
+        assert_eq!(
+            config.proxy_url.as_deref(),
+            Some("http://proxy.example.com:8080")
+        );
     }
 
     #[test]

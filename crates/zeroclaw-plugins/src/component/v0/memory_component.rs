@@ -69,6 +69,7 @@ impl ComponentMemory {
         engine: &Arc<ComponentEngine>,
         bytes: &[u8],
         permissions: &[FineGrainedPermission],
+        network_config: crate::PluginNetworkConfig,
     ) -> Result<Self, PluginError> {
         let component = engine.compile(bytes)?;
         let mut linker = wasmtime::component::Linker::<PluginStore>::new(engine.engine());
@@ -76,7 +77,7 @@ impl ComponentMemory {
         wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
             .map_err(PluginError::from)?;
         plugin_store::add_to_linker_memory(&mut linker)?;
-        let host = PluginStore::with_permissions(permissions).await?;
+        let host = PluginStore::with_permissions(permissions, &network_config).await?;
         let mut store = wasmtime::Store::new(engine.engine(), host);
 
         let instance = linker

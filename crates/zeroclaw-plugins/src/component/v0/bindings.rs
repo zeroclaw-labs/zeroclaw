@@ -46,6 +46,14 @@ pub mod channel {
             "zeroclaw:plugin/channel.drop-self-message": trappable,
             "zeroclaw:plugin/channel.multi-message-delay-ms": trappable,
             default: async
+        },
+        with: {
+            // The `websocket`/`gateway-session` resources' representation
+            // types live in their own host modules so the host
+            // implementation can use `ResourceTable`'s typed helpers
+            // directly.
+            "zeroclaw:plugin/websocket.websocket": super::super::websocket_host::HostWebsocketState,
+            "zeroclaw:plugin/gateway.gateway-session": super::super::gateway_host::HostGatewaySessionState,
         }
     });
 }

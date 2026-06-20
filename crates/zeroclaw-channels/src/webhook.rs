@@ -649,10 +649,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         assert_eq!(
-            zeroclaw_infra::retry::parse_retry_after_ms_at(
-                "Sun, 06 Nov 1994 08:49:39 GMT",
-                now
-            ),
+            zeroclaw_infra::retry::parse_retry_after_ms_at("Sun, 06 Nov 1994 08:49:39 GMT", now),
             Some(2_000)
         );
     }
@@ -663,10 +660,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         assert_eq!(
-            zeroclaw_infra::retry::parse_retry_after_ms_at(
-                "Sunday, 06-Nov-94 08:49:39 GMT",
-                now
-            ),
+            zeroclaw_infra::retry::parse_retry_after_ms_at("Sunday, 06-Nov-94 08:49:39 GMT", now),
             Some(2_000)
         );
         assert_eq!(
@@ -681,10 +675,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
         assert_eq!(
-            zeroclaw_infra::retry::parse_retry_after_ms_at(
-                "Sun, 06 Nov 1994 08:49:37 GMT",
-                now
-            ),
+            zeroclaw_infra::retry::parse_retry_after_ms_at("Sun, 06 Nov 1994 08:49:37 GMT", now),
             Some(0)
         );
     }
@@ -701,10 +692,7 @@ mod tests {
 
     #[test]
     fn parse_retry_after_zero() {
-        assert_eq!(
-            zeroclaw_infra::retry::parse_retry_after_ms("0"),
-            Some(0)
-        );
+        assert_eq!(zeroclaw_infra::retry::parse_retry_after_ms("0"), Some(0));
     }
 
     #[test]

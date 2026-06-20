@@ -40,6 +40,8 @@ pub struct ComponentTool {
     plugin_version: String,
     /// Fine-grained sandbox permissions applied to each execute store.
     permissions: Arc<Vec<crate::FineGrainedPermission>>,
+    /// Per-instance proxy/secrets config applied to each execute store.
+    network_config: Arc<crate::PluginNetworkConfig>,
 }
 
 impl ComponentTool {
@@ -56,6 +58,7 @@ impl ComponentTool {
         engine: &Arc<ComponentEngine>,
         bytes: &[u8],
         permissions: &[crate::FineGrainedPermission],
+        network_config: crate::PluginNetworkConfig,
     ) -> Result<Self, PluginError> {
         let component = engine.compile(bytes)?;
         let mut linker = wasmtime::component::Linker::<PluginStore>::new(engine.engine());
@@ -111,6 +114,7 @@ impl ComponentTool {
             plugin_name,
             plugin_version,
             permissions: Arc::new(permissions.to_vec()),
+            network_config: Arc::new(network_config),
         })
     }
 }
@@ -137,8 +141,9 @@ impl Tool for ComponentTool {
         let plugin_version = self.plugin_version.clone();
 
         let permissions = Arc::clone(&self.permissions);
+        let network_config = Arc::clone(&self.network_config);
         wrap_plugin::wrap_plugin_call(&plugin_name, &plugin_version, "execute", async move {
-            let host = PluginStore::with_permissions(&permissions).await?;
+            let host = PluginStore::with_permissions(&permissions, &network_config).await?;
             let mut store = wasmtime::Store::new(engine.engine(), host);
             let bindings = pre.instantiate(&mut store).map_err(PluginError::from)?;
             let exports = bindings.zeroclaw_plugin_tool();

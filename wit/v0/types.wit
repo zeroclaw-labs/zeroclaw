@@ -7,4 +7,20 @@ interface types {
     /// Callers must produce valid JSON; receivers must parse it as JSON.
     @unstable(feature = plugins-wit-v0)
     type json-string = string;
+
+    /// A media file attached to an inbound or outbound message, or fetched
+    /// via `http-helpers.download-to-attachment`.
+    ///
+    /// Note: `data` carries the full raw bytes across the WASM boundary. For
+    /// large attachments (audio, video) this may be several megabytes. A
+    /// resource-handle model can be introduced in a future revision if needed.
+    @unstable(feature = plugins-wit-v0)
+    record media-attachment {
+        /// Original file name (e.g. `voice.ogg`, `photo.jpg`).
+        file-name: string,
+        /// Raw file bytes.
+        data: list<u8>,
+        /// MIME type when known (e.g. `audio/ogg`, `image/jpeg`).
+        mime-type: option<string>,
+    }
 }
