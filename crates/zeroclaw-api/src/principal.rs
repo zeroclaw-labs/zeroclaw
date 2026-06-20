@@ -2,11 +2,11 @@
 //! connection carries once an [`crate`] auth provider has verified a credential.
 //!
 //! This is the shared identity contract for RFC #7141 ("Authentication Provider
-//! support"): each auth provider (`oidc`, `password`, `ssh-key`, `peercred`,
-//! `native`, …) verifies its own credential kind and emits ONE uniform
-//! [`Principal`] carrying identity *and* resolved grants. Everything downstream —
-//! dispatch authorization, audit, per-principal session/memory isolation — reads
-//! this type and is therefore provider-agnostic.
+//! support"): each accepted auth provider (`oidc`, `ssh-key`, `peercred`, `native`)
+//! verifies its own credential kind and emits ONE uniform [`Principal`] carrying
+//! identity plus its asserted grant *claims*. Everything downstream — dispatch
+//! authorization, audit, per-principal session/memory isolation — reads this type
+//! and is therefore provider-agnostic.
 //!
 //! It lives in `zeroclaw-api` (the leaf crate) so it is importable by
 //! `zeroclaw-runtime` (the auth engine + control plane), `zeroclaw-gateway` /
@@ -15,9 +15,14 @@
 //! IdP-claims→`Principal` mapping) lives in `zeroclaw-runtime/src/security/`; only
 //! the data contract lives here.
 //!
-//! Adding a credential kind = add an [`AuthMethod`] arm (every consumer matches it
-//! exhaustively, so a new arm is a compile error to ignore) and a provider impl in
-//! `zeroclaw-runtime/src/security/`; the `Principal` shape does not change.
+//! **This is a foundational seam, deliberately extensible — not frozen.**
+//! [`AuthMethod`] and [`Principal`] are `#[non_exhaustive]`: a new provider adds an
+//! `AuthMethod` arm + a provider impl, and the resolved-grant fields the RFC
+//! requires (allowed-agents, config-write, admin/all — see [`Principal`]) are added
+//! as additive `Principal` fields by the IamPolicy-wiring epic. Consumers match
+//! `AuthMethod` with a `_` arm and construct `Principal` via [`Principal::new`];
+//! both changes are non-breaking. Scoping the seam to the *accepted* #7141 set keeps
+//! this PR from silently widening the security design ahead of the RFC decisions.
 //!
 //! Single source of truth: the legacy `NevisIdentity` (in
 //! `zeroclaw-runtime/src/security/nevis.rs`) carries an overlapping identity+grants
@@ -72,13 +77,15 @@ impl AgentAlias {
 
 /// How a principal proved identity. The provider that authenticated it sets this.
 ///
-/// Additive by design: new providers add arms here, and because the resolver,
-/// audit, and approval code match exhaustively, a forgotten arm is a *compile*
-/// error rather than a silent gap. `Peer` is reserved for the A2A peer-auth path
-/// (cross-effort contract); `Password` is provider-proposed (RFC #7141 comment),
-/// not yet accepted.
+/// Scoped to the **accepted RFC #7141 provider set** (OIDC, ssh-key, peercred,
+/// native) plus the unbound/trusted sentinels. The enum is `#[non_exhaustive]`:
+/// arms for not-yet-accepted providers are added additively by their own scoped
+/// change (e.g. a local `Password` provider once its #7141 scope is accepted; a
+/// `Peer` arm by the A2A effort), so landing them is never a silent widening of
+/// this foundational security seam. Consumers match exhaustively with a `_` arm.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AuthMethod {
     /// No authentication performed (default; an unbound connection).
     #[default]
@@ -87,30 +94,37 @@ pub enum AuthMethod {
     /// shared pairing bearer / trusted-local stdio. Carries the
     /// [`PrincipalId::SHARED_OPERATOR`] sentinel.
     SharedOperator,
-    /// External OpenID Connect IdP (RFC #7141 headline provider; absorbs Nevis).
+    /// External OpenID Connect IdP (RFC #7141 headline provider).
     Oidc,
-    /// Local username/password (RFC #7141 comment — proposed, awaiting buy-in).
-    Password,
     /// Challenge-response against a registered SSH public key.
     SshKey,
     /// Local Unix-socket / named-pipe peer credential (`SO_PEERCRED`).
     Peercred,
     /// The existing `PairingGuard` bearer token (continuity / operator bootstrap).
     Native,
-    /// A cooperating remote agent/runtime (A2A peer-auth).
-    Peer,
 }
 
 /// The single authenticated subject, produced by an auth provider and consumed by
 /// every dispatch/authz/audit/isolation surface.
 ///
-/// Field invariants:
+/// **Extensible, not frozen.** This struct is `#[non_exhaustive]` so later epics
+/// can ADD fields without a breaking change. Construct it via [`Principal::new`]
+/// plus the builder setters (or [`Principal::shared_operator`]), never a struct
+/// literal from another crate.
+///
+/// Field semantics:
 /// - [`Principal::id`] is the canonical join/attribution key (NOT `user_id`).
-/// - `roles` / `scopes` are the resolved grants the provider derived from its
-///   identity source (IdP claims, local `[users.<name>]` profile, …).
+/// - `roles` / `scopes` are the **claims the identity source asserted** — they are
+///   *inputs* to grant resolution, NOT ZeroClaw's resolved grants. The RFC #7141
+///   resolved-grant shape (allowed agents, config-write paths, admin/all), computed
+///   by `IamPolicy` from these claims, is added as additive fields in the
+///   IamPolicy-wiring epic (#7142); `#[non_exhaustive]` keeps that non-breaking.
+/// - `allowed_aliases` is today's coarse per-agent grant (the only resolved grant
+///   carried so far).
 /// - Constructed via a provider's `verify`, or [`Principal::shared_operator`] for
 ///   the trusted-local path. Never half-built.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Principal {
     /// Stable opaque id — the audit/approval/provenance origin and A2A join key.
     pub id: PrincipalId,
@@ -157,6 +171,63 @@ impl Principal {
             expires_at: 0,
             allowed_aliases: Vec::new(),
         }
+    }
+
+    /// Construct an authenticated principal with the given subject id and method.
+    /// Grants default to empty; attach claims via the `with_*` builder setters.
+    /// This is the construction path other crates (the providers) must use because
+    /// the struct is `#[non_exhaustive]`.
+    #[must_use]
+    pub fn new(
+        id: impl Into<PrincipalId>,
+        user_id: impl Into<String>,
+        auth_method: AuthMethod,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            user_id: user_id.into(),
+            roles: Vec::new(),
+            scopes: Vec::new(),
+            auth_method,
+            mfa_verified: false,
+            expires_at: 0,
+            allowed_aliases: Vec::new(),
+        }
+    }
+
+    /// Attach the role claims the identity source asserted.
+    #[must_use]
+    pub fn with_roles(mut self, roles: Vec<String>) -> Self {
+        self.roles = roles;
+        self
+    }
+
+    /// Attach the scope claims granted this session.
+    #[must_use]
+    pub fn with_scopes(mut self, scopes: Vec<String>) -> Self {
+        self.scopes = scopes;
+        self
+    }
+
+    /// Mark MFA as completed.
+    #[must_use]
+    pub fn with_mfa_verified(mut self, mfa_verified: bool) -> Self {
+        self.mfa_verified = mfa_verified;
+        self
+    }
+
+    /// Set the session expiry (UNIX seconds; `0` = none).
+    #[must_use]
+    pub fn with_expires_at(mut self, expires_at: u64) -> Self {
+        self.expires_at = expires_at;
+        self
+    }
+
+    /// Attach the agent aliases this principal may bind.
+    #[must_use]
+    pub fn with_allowed_aliases(mut self, allowed_aliases: Vec<AgentAlias>) -> Self {
+        self.allowed_aliases = allowed_aliases;
+        self
     }
 
     /// `true` once a *distinct* identity source authenticated this principal —

@@ -25,6 +25,11 @@ use zeroclaw_api::principal::{AuthMethod, AuthOutcome, DenyReason};
 /// A credential presented for verification (the input to the #7141 `initialize`
 /// handshake). Secret material is **redacted** in `Debug` — never log it raw.
 ///
+/// Scoped to the accepted RFC #7141 provider set (bearer for native/OIDC, SSH
+/// signature, peer uid). Not-yet-accepted credential kinds (e.g. a local
+/// username/password) are added by their own scoped change, so this seam never
+/// silently carries an unaccepted credential shape.
+///
 /// SECURITY follow-up (#7141): the secret-bearing arms are redacted in `Debug`
 /// and never `Eq`-compared here, but the plaintext is not yet zeroized on drop.
 /// In-memory secret scrubbing is currently absent tree-wide (even the encrypted
@@ -32,13 +37,12 @@ use zeroclaw_api::principal::{AuthMethod, AuthOutcome, DenyReason};
 /// `SecretString` convention is a separate, repo-wide hardening tracked under the
 /// auth-provider work, not bolted onto this one type.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum Credential {
     /// No credential was presented.
     None,
     /// A bearer token (native pairing token, or an OIDC access/ID token).
     Bearer(String),
-    /// A local username + password (the proposed `password` provider).
-    Password { username: String, password: String },
     /// An SSH challenge signature over a server-issued nonce.
     SshSignature {
         username: String,
@@ -54,11 +58,6 @@ impl std::fmt::Debug for Credential {
         match self {
             Self::None => write!(f, "Credential::None"),
             Self::Bearer(_) => write!(f, "Credential::Bearer(<redacted>)"),
-            Self::Password { username, .. } => f
-                .debug_struct("Credential::Password")
-                .field("username", username)
-                .field("password", &"<redacted>")
-                .finish(),
             Self::SshSignature { username, .. } => f
                 .debug_struct("Credential::SshSignature")
                 .field("username", username)
@@ -134,35 +133,44 @@ impl ProviderRegistry {
         self.providers.iter().map(|p| p.name()).collect()
     }
 
-    /// Resolve a presented credential to an [`AuthOutcome`], default-deny. The
-    /// first provider that accepts the credential and authenticates it wins; a
-    /// provider that accepts but rejects does NOT short-circuit a later one, and
-    /// the most-specific [`DenyReason`] from the last accepting provider is
-    /// preserved (so step-up [`DenyReason::MfaRequired`] and operator-facing
-    /// [`DenyReason::Misconfigured`] are not flattened to `BadCredential`).
+    /// Resolve a presented credential to an [`AuthOutcome`], **default-deny and
+    /// authoritative-deny**.
     ///
-    /// Invariant (enforced at provider registration, a later phase): at most one
-    /// provider should `accept` a given credential kind, so registration order
-    /// never decides which provider authoritatively verifies it.
+    /// The first accepting provider that authenticates wins. The key safety rule:
+    /// a provider that *accepts* a credential but rejects it with a **specific**
+    /// [`DenyReason`] (anything other than the generic [`DenyReason::BadCredential`]
+    /// — e.g. [`DenyReason::MfaRequired`], [`DenyReason::TokenExpired`],
+    /// [`DenyReason::Misconfigured`], [`DenyReason::AliasNotEntitled`]) is
+    /// **authoritative**: that outcome is returned immediately so a later,
+    /// more broadly-`accept`ing provider can NOT authenticate the same presented
+    /// credential past it (e.g. an OIDC provider returning `MfaRequired` for a
+    /// bearer token can't be bypassed by a later catch-all bearer provider). Only
+    /// the generic `BadCredential` ("not my credential / wrong secret") lets the
+    /// registry fall through to the next accepting provider. `None` is denied
+    /// before any provider runs. An empty registry denies everything.
     pub async fn resolve(&self, credential: &Credential) -> AuthOutcome {
         if matches!(credential, Credential::None) {
             return AuthOutcome::Denied {
                 reason: DenyReason::NoCredential,
             };
         }
-        let mut deny_reason = DenyReason::BadCredential;
         for provider in &self.providers {
             if provider.accepts(credential) {
                 match provider.verify(credential).await {
                     allowed @ (AuthOutcome::Authenticated(_) | AuthOutcome::Trusted(_)) => {
                         return allowed;
                     }
-                    AuthOutcome::Denied { reason } => deny_reason = reason,
+                    // Specific deny = authoritative; only generic BadCredential
+                    // lets a later accepting provider try the same credential.
+                    AuthOutcome::Denied { reason } if reason != DenyReason::BadCredential => {
+                        return AuthOutcome::Denied { reason };
+                    }
+                    AuthOutcome::Denied { .. } => {}
                 }
             }
         }
         AuthOutcome::Denied {
-            reason: deny_reason,
+            reason: DenyReason::BadCredential,
         }
     }
 }
@@ -283,20 +291,44 @@ mod tests {
         ));
     }
 
+    /// Regression (review #8063): a provider that accepts a credential and rejects
+    /// it with a SPECIFIC reason (MfaRequired) must not be bypassed by a later
+    /// provider that would authenticate the same credential.
+    #[tokio::test]
+    async fn specific_deny_is_not_bypassed_by_a_later_provider() {
+        let mut reg = ProviderRegistry::new();
+        reg.register(Arc::new(AlwaysMfa)); // accepts Bearer → MfaRequired
+        reg.register(Arc::new(FixedBearer("tok"))); // would Trust Bearer("tok")
+        let out = reg.resolve(&Credential::Bearer("tok".into())).await;
+        assert!(
+            matches!(
+                out,
+                AuthOutcome::Denied {
+                    reason: DenyReason::MfaRequired
+                }
+            ),
+            "a later provider must not authenticate past an authoritative MfaRequired"
+        );
+    }
+
     #[test]
     fn debug_redacts_secret_material() {
-        let dbg = format!(
-            "{:?}",
-            Credential::Password {
-                username: "alice".into(),
-                password: "hunter2".into(),
-            }
-        );
-        assert!(dbg.contains("alice"));
-        assert!(!dbg.contains("hunter2"));
+        // Bearer is fully redacted.
         assert_eq!(
             format!("{:?}", Credential::Bearer("tok".into())),
             "Credential::Bearer(<redacted>)"
         );
+        // SshSignature shows the username but never the signature bytes.
+        let dbg = format!(
+            "{:?}",
+            Credential::SshSignature {
+                username: "alice".into(),
+                nonce: vec![1, 2, 3],
+                signature: vec![0xde, 0xad, 0xbe, 0xef],
+            }
+        );
+        assert!(dbg.contains("alice"));
+        assert!(dbg.contains("<redacted>"));
+        assert!(!dbg.contains("222")); // 0xde — raw signature byte must not appear
     }
 }
