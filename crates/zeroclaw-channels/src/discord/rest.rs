@@ -10,16 +10,34 @@ use reqwest::multipart::{Form, Part};
 
 use super::types::DiscordOutgoing;
 
-/// POST a plain-text message and return the new message's ID. Callers
-/// that don't need the ID (e.g. non-first chunks) can discard it.
+/// POST a content-only plain-text message and return the new message's ID.
+/// A thin adapter over [`send_discord_message_payload`] for the many callers
+/// (non-first chunks, streaming replies, approvals) that send no embeds.
 pub(crate) async fn send_discord_message_json(
     client: &reqwest::Client,
     bot_token: &str,
     recipient: &str,
     content: &str,
 ) -> anyhow::Result<String> {
+    send_discord_message_payload(
+        client,
+        bot_token,
+        recipient,
+        &DiscordOutgoing::text(content),
+    )
+    .await
+}
+
+/// POST a full message envelope (content plus any embeds) and return the new
+/// message's ID. Callers that don't need the ID can discard it.
+pub(crate) async fn send_discord_message_payload(
+    client: &reqwest::Client,
+    bot_token: &str,
+    recipient: &str,
+    payload: &DiscordOutgoing,
+) -> anyhow::Result<String> {
     let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
-    let body = DiscordOutgoing::text(content).to_rest_json();
+    let body = payload.to_rest_json();
 
     let resp = client
         .post(&url)
@@ -40,21 +58,18 @@ pub(crate) async fn send_discord_message_json(
     extract_message_id(resp).await
 }
 
-/// POST a message with file attachments via multipart, returning the new
-/// message's ID. Callers that don't need the ID can discard it.
-pub(crate) async fn send_discord_message_with_files(
+/// POST a full message envelope with file attachments via multipart,
+/// returning the new message's ID. Callers that don't need the ID can discard it.
+pub(crate) async fn send_discord_message_payload_with_files(
     client: &reqwest::Client,
     bot_token: &str,
     recipient: &str,
-    content: &str,
+    payload: &DiscordOutgoing,
     files: &[PathBuf],
 ) -> anyhow::Result<String> {
     let url = format!("https://discord.com/api/v10/channels/{recipient}/messages");
 
-    let mut form = Form::new().text(
-        "payload_json",
-        DiscordOutgoing::text(content).payload_json(),
-    );
+    let mut form = Form::new().text("payload_json", payload.payload_json());
 
     for (idx, path) in files.iter().enumerate() {
         let bytes = tokio::fs::read(path).await.map_err(|error| {
@@ -121,10 +136,8 @@ async fn extract_message_id(resp: reqwest::Response) -> anyhow::Result<String> {
         })
 }
 
-/// Edit an existing Discord message via PATCH.
-///
-/// Returns `Ok(())` on success. On HTTP 429 (rate limited), logs at debug
-/// level and returns `Ok(())` since skipping a mid-stream edit is harmless.
+/// Edit an existing Discord message with content only. A thin adapter over
+/// [`edit_discord_message_payload`].
 pub(crate) async fn edit_discord_message(
     client: &reqwest::Client,
     bot_token: &str,
@@ -132,8 +145,30 @@ pub(crate) async fn edit_discord_message(
     message_id: &str,
     content: &str,
 ) -> anyhow::Result<()> {
+    edit_discord_message_payload(
+        client,
+        bot_token,
+        channel_id,
+        message_id,
+        &DiscordOutgoing::text(content),
+    )
+    .await
+}
+
+/// Edit an existing Discord message with a full envelope (content plus embeds)
+/// via PATCH.
+///
+/// Returns `Ok(())` on success. On HTTP 429 (rate limited), logs at debug
+/// level and returns `Ok(())` since skipping a mid-stream edit is harmless.
+pub(crate) async fn edit_discord_message_payload(
+    client: &reqwest::Client,
+    bot_token: &str,
+    channel_id: &str,
+    message_id: &str,
+    payload: &DiscordOutgoing,
+) -> anyhow::Result<()> {
     let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}");
-    let body = DiscordOutgoing::text(content).to_rest_json();
+    let body = payload.to_rest_json();
 
     let resp = client
         .patch(&url)

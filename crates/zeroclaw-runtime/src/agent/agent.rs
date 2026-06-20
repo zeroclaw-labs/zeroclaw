@@ -1994,6 +1994,9 @@ impl Agent {
                     new_messages_out: Some(&mut loop_new_messages),
                     knobs: &knobs,
                     image_cache: Some(&mut self.image_cache),
+                    // Phase 1: stamp Internal/Trusted. Real per-transport
+                    // stamping is PR C (RFC #6971 §4).
+                    ingress: zeroclaw_api::ingress::IngressContext::internal(),
                 }),
             )
             .await;
@@ -2384,6 +2387,9 @@ impl Agent {
                         new_messages_out: Some(&mut round_added),
                         knobs: &knobs,
                         image_cache: Some(&mut self.image_cache),
+                        // Phase 1: stamp Internal/Trusted. Real per-transport
+                        // stamping is PR C (RFC #6971 §4).
+                        ingress: zeroclaw_api::ingress::IngressContext::internal(),
                     }),
                 )
                 .await;

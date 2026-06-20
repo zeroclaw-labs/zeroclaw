@@ -788,6 +788,10 @@ turn-interrupted-by-user = [interrupted by user]
 # on this path, so the wording names the channel, not a user.
 turn-cancelled-client-rpc = [turn cancelled via client]
 turn-stream-interrupted = [stream interrupted]
+# Refusal returned when the ingress policy layer (RFC #6971) drops an inbound
+# turn before it reaches the model. Unreachable under the default `Loop` policy
+# (phase 1); becomes live when non-`Loop` policy is configured (phase 3).
+turn-ingress-dropped = This request was not processed: { $reason }
 turn-tool-interrupted-before-result = [interrupted by user before this tool produced a result]
 # Safe reply delivered when the model repeatedly emits malformed internal
 # tool-call protocol and the turn gives up retrying.

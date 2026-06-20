@@ -6,6 +6,7 @@
 
 use serde_json::json;
 
+use super::embed::DiscordEmbed;
 use super::types::DiscordOutgoing;
 
 /// Credentials needed to answer a deferred interaction later: the followup
@@ -103,21 +104,31 @@ pub(crate) async fn discord_reject_interaction(
 /// Edit the deferred interaction's @original message
 /// (`PATCH {api_base}/webhooks/{app_id}/{token}/messages/@original`). The token
 /// is valid for 15 minutes; no bot auth header is required for the followup
-/// webhook. `content` must be within Discord's 2000-char limit — callers whose
+/// webhook. Renders any `[EMBED:…]` the agent emitted by attaching `embeds`
+/// alongside the content via the same `DiscordOutgoing` envelope the normal send
+/// path uses. `content` must be within Discord's 2000-char limit — callers whose
 /// reply may exceed it chunk first and post the remainder via
-/// [`discord_post_interaction_followup`].
+/// [`discord_post_interaction_followup`]. `api_base` is injectable for tests.
 pub(crate) async fn discord_edit_interaction_response(
     client: &reqwest::Client,
     app_id: &str,
     interaction_token: &str,
     api_base: &str,
     content: &str,
+    embeds: &[DiscordEmbed],
 ) -> anyhow::Result<()> {
     let url = format!("{api_base}/webhooks/{app_id}/{interaction_token}/messages/@original");
+    // No truncation: the caller chunks (deliver_interaction_answer) and this edit
+    // carries the first ≤2000-char chunk plus any embeds.
+    let payload = DiscordOutgoing {
+        content: Some(content.to_string()),
+        embeds: embeds.to_vec(),
+        ..Default::default()
+    };
     // without_url: transport errors embed the token-bearing URL.
     let resp = client
         .patch(&url)
-        .json(&DiscordOutgoing::text(content).to_rest_json())
+        .json(&payload.to_rest_json())
         .send()
         .await
         .map_err(reqwest::Error::without_url)?;
@@ -152,4 +163,58 @@ pub(crate) async fn discord_post_interaction_followup(
         anyhow::bail!("interaction followup post failed ({status}): {err}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod embed_reply_tests {
+    use super::*;
+    use wiremock::matchers::{body_json, body_partial_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn slash_reply_attaches_embeds_to_the_original_edit() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/webhooks/app/tok/messages/@original"))
+            .and(body_partial_json(serde_json::json!({
+                "content": "see below",
+                "embeds": [{ "title": "Report" }]
+            })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let embed = DiscordEmbed {
+            title: Some("Report".to_string()),
+            ..Default::default()
+        };
+        discord_edit_interaction_response(
+            &client,
+            "app",
+            "tok",
+            &server.uri(),
+            "see below",
+            std::slice::from_ref(&embed),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn content_only_slash_reply_omits_the_embeds_key() {
+        // No embeds → the @original edit body stays byte-stable {"content": …}.
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/webhooks/app/tok/messages/@original"))
+            .and(body_json(serde_json::json!({ "content": "hi" })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        discord_edit_interaction_response(&client, "app", "tok", &server.uri(), "hi", &[])
+            .await
+            .unwrap();
+    }
 }
