@@ -64,4 +64,10 @@ capabilities = ["channel"]
         .expect("channel closed without a message");
 
     assert_eq!(received.content, "hello from host");
+
+    // channel-echo declares no optional capabilities, so this exercises
+    // the host's documented fallback for an unset `health-check` flag:
+    // the host composes the trait default (`true`) without calling into
+    // the guest, mirroring the `reindex` assertion in spike_memory.rs.
+    assert!(zeroclaw_api::channel::Channel::health_check(&*channel).await);
 }
