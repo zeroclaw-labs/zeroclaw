@@ -4276,7 +4276,7 @@ pub async fn fetch_context_window(
     match provider_type {
         "openrouter" => fetch_openrouter_context_window(config).await,
         "together" | "groq" | "fireworks" | "deepinfra" | "hyperbolic" | "anyscale" | "novita"
-        | "nebius" | "gemini" | "nvidia" => fetch_openai_compatible_context_window(config).await,
+        | "nebius" => fetch_openai_compatible_context_window(provider_type, config).await,
         _ => None, // anthropic, openai, ollama, bedrock, etc. don't expose it
     }
 }
@@ -4307,10 +4307,12 @@ async fn fetch_openrouter_context_window(
 }
 
 async fn fetch_openai_compatible_context_window(
+    provider_type: &str,
     config: &zeroclaw_config::schema::ModelProviderConfig,
 ) -> Option<usize> {
     let client = reqwest::Client::new();
-    let base_url = config.uri.as_deref().unwrap_or("");
+    let default_uri = crate::factory::get_default_url(provider_type);
+    let base_url = config.uri.as_deref().or(default_uri).unwrap_or("");
     if base_url.is_empty() {
         return None;
     }

@@ -1082,10 +1082,16 @@ fn apply_model_provider(
             let provider_config = zeroclaw_config::schema::ModelProviderConfig {
                 model: Some(choice.model.clone()),
                 uri: config.get_prop(&format!("{prefix}.uri")).ok(),
+                api_key: config.get_prop(&format!("{prefix}.api_key")).ok(),
                 ..Default::default()
             };
             if tokio::runtime::Handle::try_current()
-                .map(|h| matches!(h.runtime_flavor(), tokio::runtime::RuntimeFlavor::MultiThread))
+                .map(|h| {
+                    matches!(
+                        h.runtime_flavor(),
+                        tokio::runtime::RuntimeFlavor::MultiThread
+                    )
+                })
                 .unwrap_or(false)
                 && let Some(ctx) = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(
