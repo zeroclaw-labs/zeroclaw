@@ -12,6 +12,7 @@ use tokio::net::TcpListener;
 
 pub use crate::auth::oauth_common::{PkceState, generate_pkce_state};
 
+// Public OAuth client id used by Grok Build CLI/OpenClaw auth profiles; not a client secret.
 pub const XAI_OAUTH_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 pub const XAI_OAUTH_SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
 pub const XAI_OAUTH_ISSUER: &str = "https://auth.x.ai";
