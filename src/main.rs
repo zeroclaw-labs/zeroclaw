@@ -894,6 +894,11 @@ Examples:
         #[command(subcommand)]
         dream_command: Option<DreamCommands>,
 
+        /// Agent to target (alias). Dream mode is per-agent; omit to use the
+        /// sole configured / dream-enabled agent.
+        #[arg(long)]
+        agent: Option<String>,
+
         /// Preview changes without persisting to memory
         #[arg(long)]
         dry_run: bool,
@@ -4703,12 +4708,13 @@ async fn main() -> Result<()> {
 
         Commands::Dream {
             dream_command,
+            agent,
             dry_run,
             verbose,
         } => match dream_command {
-            Some(DreamCommands::Report) => dream::show_report(&config),
-            Some(DreamCommands::Promote) => dream::promote(&config).await,
-            None => dream::run_dream(&config, dry_run, verbose).await,
+            Some(DreamCommands::Report) => dream::show_report(&config, agent.as_deref()),
+            Some(DreamCommands::Promote) => dream::promote(&config, agent.as_deref()).await,
+            None => dream::run_dream(&config, agent.as_deref(), dry_run, verbose).await,
         },
 
         Commands::Auth { auth_command } => handle_auth_command(auth_command, &config).await,

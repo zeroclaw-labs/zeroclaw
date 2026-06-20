@@ -122,6 +122,45 @@ pub struct AgentMemoryConfig {
     pub backend: MemoryBackendKind,
 }
 
+/// Per-agent dream-mode opt-in and overrides, nested under
+/// `[agents.<alias>.dream_mode]`.
+///
+/// Dream mode (periodic memory consolidation) is **opt-in per agent**: an
+/// agent participates only when its effective `enabled` resolves to `true`.
+/// Both fields are `Option` and layer over the global `[dream_mode]` block —
+/// `None` inherits the global default, `Some(_)` overrides it for this agent.
+///
+/// There is deliberately **no provider field here**: each agent dreams
+/// through its own `model_provider`, so consolidation runs on the same
+/// provider the agent already uses (with the optional `model` override below
+/// for a cheaper background model). This keeps the per-agent surface minimal
+/// and avoids a provider alias that would have to be kept in sync.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "agent_dream_mode"]
+#[serde(default)]
+pub struct AgentDreamModeConfig {
+    /// Opt this agent into dream-mode consolidation. `None` inherits the
+    /// global `[dream_mode].enabled` default (`false`); `Some(true)` opts the
+    /// agent in even when the global default is off; `Some(false)` opts it
+    /// out even when the global default is on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Per-agent model override for the dream reflect phase, applied against
+    /// this agent's own `model_provider`. `None` inherits the global
+    /// `[dream_mode].model`. When the resolved value is unset the cycle is
+    /// local-only (mechanical prune/consolidate, no LLM call, zero tokens).
+    ///
+    /// Known limitation (B1.5): because this is `Option<String>` with
+    /// inherit-on-`None` semantics, an agent cannot force *local-only* dreaming
+    /// via TOML when the global `[dream_mode].model` is set — there is no way to
+    /// express "explicitly override back to none". If you need a mix of
+    /// LLM-assisted and local-only agents, leave the global `model` unset and
+    /// set it per-agent only on the agents that should call an LLM.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
 /// Preferred output modality for a peer group.
 ///
 /// Controls how the agent delivers replies to peers in this group when no

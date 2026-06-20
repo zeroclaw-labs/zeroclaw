@@ -512,7 +512,7 @@ pub async fn run(
         );
     }
 
-    if config.dream_mode.enabled {
+    if !config.agents_with_dream_enabled().is_empty() {
         let dream_cfg = config.clone();
         handles.push(spawn_component_supervisor(
             "dream",
@@ -528,7 +528,7 @@ pub async fn run(
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "Dream mode disabled; dream supervisor not started"
+            "Dream mode disabled; no agents opted in (dream supervisor not started)"
         );
     }
 
@@ -1149,71 +1149,35 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 /// trigger time, and runs a dream cycle. Runs local-only (no network) unless
 /// `dream_mode.model` is configured, in which case LLM reflection is enabled.
 async fn run_dream_worker(config: Config) -> Result<()> {
-    use crate::dream::engine::DreamEngine;
     use anyhow::Context;
     use std::str::FromStr;
 
-    if !config.dream_mode.enabled {
+    // Per-agent cycle wall-clock cap. Generous for one reflect call + memory
+    // I/O; bounds head-of-line blocking so one slow/hung agent can't starve
+    // the others in the same scheduled sweep.
+    const DREAM_AGENT_TIMEOUT: Duration = Duration::from_secs(300);
+
+    // Snapshot the opted-in agents once (config is fixed for this worker's
+    // lifetime; a config change restarts the daemon and respawns the worker).
+    let agents: Vec<String> = config
+        .agents_with_dream_enabled()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+    if agents.is_empty() {
+        crate::health::mark_component_ok("dream");
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "Dream mode disabled"
+            "Dream mode: no agents opted in; worker idle"
         );
         return Ok(());
     }
 
-    let engine = DreamEngine::new(config.dream_mode.clone(), config.data_dir.clone());
-
-    // Resolve the provider only if dream_mode.model is configured (opt-in LLM).
-    let (provider, model): (
-        Option<Box<dyn ::zeroclaw_api::model_provider::ModelProvider>>,
-        Option<String>,
-    ) =
-        if config.dream_mode.model.is_some() {
-            // Resolve the first configured model_provider as the default, using the
-            // same V3 `<family>.<alias>` reference contract as a normal agent turn
-            // (see `agent::build_session_model_provider`).
-            let (family, alias, fallback) =
-                config.providers.models.iter_entries().next().context(
-                    "dream worker: dream_mode.model set but no model_provider configured",
-                )?;
-            let provider_ref = format!("{family}.{alias}");
-            let model_name = config
-                .dream_mode
-                .model
-                .as_deref()
-                .or(fallback.model.as_deref())
-                .unwrap_or("claude-haiku-4-5-20251001")
-                .to_string();
-
-            let provider_runtime_options =
-                zeroclaw_providers::provider_runtime_options_for_alias(&config, family, alias);
-            let p = zeroclaw_providers::create_routed_model_provider_with_options(
-                &config,
-                &provider_ref,
-                fallback.api_key.as_deref(),
-                fallback.uri.as_deref(),
-                &config.reliability,
-                &config.model_routes,
-                &model_name,
-                &provider_runtime_options,
-            )?;
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                &format!("Dream mode: LLM reflection enabled (model='{model_name}')")
-            );
-            (Some(p), Some(model_name))
-        } else {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                "Dream mode: local-only (no dream_mode.model configured)"
-            );
-            (None, None)
-        };
-
-    // Parse the cron schedule for cycle timing.
+    // One shared schedule for the sweep (B1.5: per-agent memory + provider
+    // scoping, single supervisor + single cron). Per-agent schedules are a
+    // future refinement (B2).
     let schedule = cron::Schedule::from_str(&config.dream_mode.schedule).context(format!(
         "dream worker: invalid cron expression '{}'",
         config.dream_mode.schedule
@@ -1224,8 +1188,8 @@ async fn run_dream_worker(config: Config) -> Result<()> {
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
         &format!(
-            "Dream mode started: schedule='{}'",
-            config.dream_mode.schedule
+            "Dream mode started: schedule='{}', agents={:?}",
+            config.dream_mode.schedule, agents
         )
     );
 
@@ -1245,65 +1209,168 @@ async fn run_dream_worker(config: Config) -> Result<()> {
             DEBUG,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             &format!(
-                "Dream mode: sleeping for {}s until next cycle",
+                "Dream mode: sleeping for {}s until next sweep",
                 sleep_duration.as_secs()
             )
         );
         tokio::time::sleep(sleep_duration).await;
 
-        // Create memory backend for this cycle.
-        let memory: Option<Box<dyn zeroclaw_memory::Memory>> = zeroclaw_memory::create_memory(
-            &config.memory,
-            &config.data_dir,
-            config
-                .providers
-                .models
-                .iter_entries()
-                .next()
-                .and_then(|(_, _, e)| e.api_key.as_deref()),
-        )
-        .ok();
-
-        let Some(ref mem) = memory else {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                "Dream mode: memory backend unavailable, skipping cycle"
-            );
-            continue;
-        };
-
-        match engine
-            .run_cycle(
-                mem.as_ref(),
-                provider.as_ref().map(|p| p.as_ref()),
-                model.as_deref(),
+        // Run each opted-in agent's cycle in turn, isolated: a failure or
+        // timeout for one agent is logged and never aborts the others. Track
+        // sweep outcomes so component health reflects whether the sweep made
+        // any successful progress (a wholly-failing dream config must not
+        // report the `dream` component as healthy).
+        let mut succeeded = 0usize;
+        let mut failed = 0usize;
+        for agent_alias in &agents {
+            match tokio::time::timeout(
+                DREAM_AGENT_TIMEOUT,
+                run_agent_dream_cycle(&config, agent_alias),
             )
             .await
-        {
-            Ok(result) => {
-                crate::health::mark_component_ok("dream");
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                    &format!(
-                        "Dream cycle complete: {} insights, {} pruned",
-                        result.consolidated_count, result.pruned_count
-                    )
-                );
-            }
-            Err(e) => {
-                crate::health::mark_component_error("dream", e.to_string());
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                    &format!("Dream cycle failed: {e}")
-                );
+            {
+                Ok(Ok(result)) => {
+                    succeeded += 1;
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        &format!(
+                            "Dream cycle complete for agent '{agent_alias}': {} insights, {} pruned",
+                            result.consolidated_count, result.pruned_count
+                        )
+                    );
+                }
+                Ok(Err(e)) => {
+                    failed += 1;
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!("Dream cycle failed for agent '{agent_alias}': {e}")
+                    );
+                }
+                Err(_) => {
+                    failed += 1;
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!(
+                            "Dream cycle for agent '{agent_alias}' timed out after {}s; skipping",
+                            DREAM_AGENT_TIMEOUT.as_secs()
+                        )
+                    );
+                }
             }
         }
+
+        // Component health reflects real progress: OK if at least one agent
+        // completed (per-agent failures are surfaced in the logs above);
+        // errored if every opted-in agent failed or timed out.
+        record_dream_sweep_health("dream", succeeded, failed);
     }
+}
+
+/// Record `dream`-component health from a sweep's outcome counts. The
+/// component is healthy only if at least one agent cycle succeeded; a wholly
+/// failing/timing-out sweep marks it errored so `health`/gateway status
+/// reflect the broken config rather than reporting OK forever.
+fn record_dream_sweep_health(component: &str, succeeded: usize, failed: usize) {
+    if succeeded > 0 {
+        crate::health::mark_component_ok(component);
+    } else {
+        crate::health::mark_component_error(
+            component,
+            format!("all {failed} opted-in agent dream cycle(s) failed or timed out"),
+        );
+    }
+}
+
+/// Run one dream cycle for a single agent, scoped to that agent's own memory
+/// and provider.
+///
+/// - **Memory** is the agent-scoped backend (`create_memory_for_agent`), so
+///   gather/prune/consolidate touch only this agent's entries — no cross-agent
+///   contamination.
+/// - **Provider** is the agent's own `model_provider`
+///   (`resolved_model_provider_for_agent`), resolved through the same routed
+///   path as a normal agent turn. The LLM reflect phase is opt-in: it runs only
+///   when the effective `dream_mode.model` is set; otherwise the cycle is
+///   local-only (mechanical prune/consolidate, zero tokens).
+/// - **Pending/report state** lives in the agent's own workspace dir, so each
+///   agent has its own `dream_pending.json` / `dream_report.json`.
+async fn run_agent_dream_cycle(
+    config: &Config,
+    agent_alias: &str,
+) -> Result<crate::dream::engine::DreamCycleResult> {
+    use crate::dream::engine::DreamEngine;
+    use anyhow::Context;
+
+    let dream_cfg = config.effective_dream_config(agent_alias);
+    let resolved = config.resolved_model_provider_for_agent(agent_alias);
+
+    // Opt-in LLM: build the agent's own provider only when a model is set.
+    let (provider, model): (
+        Option<Box<dyn ::zeroclaw_api::model_provider::ModelProvider>>,
+        Option<String>,
+    ) = if dream_cfg.model.is_some() {
+        let (family, alias, entry) = resolved.with_context(|| {
+            format!(
+                "dream worker: agent '{agent_alias}' has dream_mode.model set but no resolvable model_provider"
+            )
+        })?;
+        let provider_ref = format!("{family}.{alias}");
+        let model_name = dream_cfg
+            .model
+            .clone()
+            .or_else(|| entry.model.clone())
+            .unwrap_or_else(|| "claude-haiku-4-5-20251001".to_string());
+
+        let provider_runtime_options =
+            zeroclaw_providers::provider_runtime_options_for_agent(config, agent_alias);
+        let p = zeroclaw_providers::create_routed_model_provider_with_options(
+            config,
+            &provider_ref,
+            entry.api_key.as_deref(),
+            entry.uri.as_deref(),
+            &config.reliability,
+            &config.model_routes,
+            &model_name,
+            &provider_runtime_options,
+        )?;
+        (Some(p), Some(model_name))
+    } else {
+        (None, None)
+    };
+
+    // Agent-scoped memory backend — gather/prune/consolidate stay within this
+    // agent's own memory.
+    let api_key = resolved.and_then(|(_, _, e)| e.api_key.as_deref());
+    let memory = zeroclaw_memory::create_memory_for_agent(config, agent_alias, api_key)
+        .await
+        .with_context(|| {
+            format!("dream worker: failed to create scoped memory for agent '{agent_alias}'")
+        })?;
+
+    // Pending/report files live in the agent's own workspace dir.
+    let workspace = config.agent_workspace_dir(agent_alias);
+    if let Err(e) = std::fs::create_dir_all(&workspace) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            &format!("dream worker: could not ensure workspace dir for agent '{agent_alias}': {e}")
+        );
+    }
+
+    let engine = DreamEngine::new(dream_cfg, workspace);
+    engine
+        .run_cycle(
+            memory.as_ref(),
+            provider.as_ref().map(|p| p.as_ref()),
+            model.as_deref(),
+        )
+        .await
 }
 
 /// Resolve delivery target: explicit config > auto-detect first configured channel.
@@ -2274,5 +2341,29 @@ mod tests {
             .expect("task should not panic")
             .expect("signal handler should not error");
         assert_eq!(result, DaemonExit::Shutdown);
+    }
+
+    #[test]
+    fn dream_sweep_health_errors_when_all_agents_fail() {
+        // Unique component names so this never collides with the live "dream"
+        // component or with parallel tests touching the shared health registry.
+        record_dream_sweep_health("dream_test_all_fail", 0, 3);
+        record_dream_sweep_health("dream_test_partial", 1, 2);
+
+        let snap = crate::health::snapshot();
+        assert_eq!(
+            snap.components
+                .get("dream_test_all_fail")
+                .map(|c| c.status.as_str()),
+            Some("error"),
+            "a sweep where every opted-in agent failed must mark the component errored, not OK"
+        );
+        assert_eq!(
+            snap.components
+                .get("dream_test_partial")
+                .map(|c| c.status.as_str()),
+            Some("ok"),
+            "a sweep with at least one successful agent cycle is healthy"
+        );
     }
 }

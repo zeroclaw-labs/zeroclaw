@@ -26,6 +26,7 @@ cli-memory-about = Manage agent memory entries
 cli-config-about = Manage ZeroClaw configuration
 cli-dream-about = Run a dream cycle (periodic memory consolidation)
 cli-dream-report-about = Show the pending dream report
+cli-dream-agent = Agent: {$agent}
 cli-dream-starting = Dream cycle starting...
     { "  " }Provider: {$provider}
     { "  " }Model: {$model}

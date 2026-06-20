@@ -1,4 +1,10 @@
 //! CLI handler for the `zeroclaw dream` command.
+//!
+//! Dream mode is opt-in per agent and scoped per agent: each cycle runs over a
+//! single agent's own memory, through that agent's own `model_provider`, with
+//! pending/report state in that agent's workspace dir. The manual CLI therefore
+//! always targets one agent — selected with `--agent <alias>`, or inferred when
+//! the install has a single (or single dream-enabled) agent.
 
 use anyhow::{Context, Result};
 use zeroclaw_config::schema::Config;
@@ -6,43 +12,83 @@ use zeroclaw_runtime::dream::pending::DreamPending;
 use zeroclaw_runtime::dream::report::DreamReport;
 use zeroclaw_runtime::i18n::{get_cli_string_with_args, get_required_cli_string};
 
-/// Run a manual dream cycle from the CLI.
-pub async fn run_dream(config: &Config, dry_run: bool, verbose: bool) -> Result<()> {
+/// Resolve the single agent a manual `dream` invocation targets.
+///
+/// With `--agent`, use it (manual override — runs even if the agent hasn't
+/// opted in). Otherwise infer: prefer the unique dream-enabled agent, else the
+/// unique configured agent. Ambiguity (multiple candidates) is an error asking
+/// for `--agent`.
+fn resolve_target_agent(config: &Config, agent: Option<&str>) -> Result<String> {
+    if let Some(a) = agent {
+        let cfg = config
+            .agents
+            .get(a)
+            .with_context(|| format!("dream: no agent '{a}' configured"))?;
+        anyhow::ensure!(cfg.enabled, "dream: agent '{a}' is disabled");
+        return Ok(a.to_string());
+    }
+
+    // Inference: prefer the unique dream-enabled agent, else the unique
+    // *enabled* configured agent. Disabled agents are never inferred — this
+    // matches the daemon, which only dreams enabled, opted-in agents.
+    let enabled = config.agents_with_dream_enabled();
+    let candidates: Vec<&str> = if enabled.is_empty() {
+        config
+            .agents
+            .iter()
+            .filter(|(_, a)| a.enabled)
+            .map(|(alias, _)| alias.as_str())
+            .collect()
+    } else {
+        enabled
+    };
+
+    match candidates.as_slice() {
+        [only] => Ok((*only).to_string()),
+        [] => anyhow::bail!("dream: no enabled agents configured"),
+        _ => anyhow::bail!(
+            "dream: multiple agents configured — specify which to run with --agent <alias>"
+        ),
+    }
+}
+
+/// Run a manual dream cycle for one agent from the CLI.
+pub async fn run_dream(
+    config: &Config,
+    agent: Option<&str>,
+    dry_run: bool,
+    verbose: bool,
+) -> Result<()> {
     use zeroclaw_runtime::dream::engine::DreamEngine;
 
-    // Dry-run is enforced via run_cycle_with_options below — audit_mode is left
-    // as-configured so dry-run doesn't silently flip behaviour in the report.
-    let engine = DreamEngine::new(config.dream_mode.clone(), config.data_dir.clone());
+    let agent_alias = resolve_target_agent(config, agent)?;
+    let dream_cfg = config.effective_dream_config(&agent_alias);
+    let resolved = config.resolved_model_provider_for_agent(&agent_alias);
 
-    // Resolve provider only if dream_mode.model is configured (opt-in LLM).
+    // Opt-in LLM: build the agent's own provider only when a model is set.
     let (provider, model): (
         Option<Box<dyn zeroclaw_api::model_provider::ModelProvider>>,
         Option<String>,
-    ) = if config.dream_mode.model.is_some() {
-        // Resolve the first configured model_provider as the default, using the
-        // same V3 `<family>.<alias>` reference contract as a normal agent turn.
-        let (family, alias, fallback) = config
-            .providers
-            .models
-            .iter_entries()
-            .next()
-            .context("dream: dream_mode.model set but no model_provider configured")?;
+    ) = if dream_cfg.model.is_some() {
+        let (family, alias, entry) = resolved.with_context(|| {
+            format!(
+                "dream: agent '{agent_alias}' has dream_mode.model set but no resolvable model_provider"
+            )
+        })?;
         let provider_ref = format!("{family}.{alias}");
-        let model_name = config
-            .dream_mode
+        let model_name = dream_cfg
             .model
-            .as_deref()
-            .or(fallback.model.as_deref())
-            .unwrap_or("claude-haiku-4-5-20251001")
-            .to_string();
+            .clone()
+            .or_else(|| entry.model.clone())
+            .unwrap_or_else(|| "claude-haiku-4-5-20251001".to_string());
 
         let provider_runtime_options =
-            zeroclaw_providers::provider_runtime_options_for_alias(config, family, alias);
+            zeroclaw_providers::provider_runtime_options_for_agent(config, &agent_alias);
         let p = zeroclaw_providers::create_routed_model_provider_with_options(
             config,
             &provider_ref,
-            fallback.api_key.as_deref(),
-            fallback.uri.as_deref(),
+            entry.api_key.as_deref(),
+            entry.uri.as_deref(),
             &config.reliability,
             &config.model_routes,
             &model_name,
@@ -53,18 +99,19 @@ pub async fn run_dream(config: &Config, dry_run: bool, verbose: bool) -> Result<
         (None, None)
     };
 
-    // Create memory backend.
-    let memory = zeroclaw_memory::create_memory(
-        &config.memory,
-        &config.data_dir,
-        config
-            .providers
-            .models
-            .iter_entries()
-            .next()
-            .and_then(|(_, _, e)| e.api_key.as_deref()),
-    )
-    .context("dream: failed to create memory backend")?;
+    // Agent-scoped memory backend — gather/prune/consolidate stay within this
+    // agent's own memory.
+    let api_key = resolved.and_then(|(_, _, e)| e.api_key.as_deref());
+    let memory = zeroclaw_memory::create_memory_for_agent(config, &agent_alias, api_key)
+        .await
+        .context("dream: failed to create scoped memory backend")?;
+
+    // Pending/report files live in this agent's own workspace dir.
+    let workspace = config.agent_workspace_dir(&agent_alias);
+    std::fs::create_dir_all(&workspace).ok();
+
+    let audit_mode = dream_cfg.audit_mode;
+    let engine = DreamEngine::new(dream_cfg, workspace);
 
     if verbose {
         let mode_str = if model.is_some() {
@@ -73,6 +120,11 @@ pub async fn run_dream(config: &Config, dry_run: bool, verbose: bool) -> Result<
             "local-only"
         };
         let model_display = model.as_deref().unwrap_or("(none)");
+        println!(
+            "{}",
+            get_cli_string_with_args("cli-dream-agent", &[("agent", agent_alias.as_str())])
+                .unwrap_or_else(|| format!("Agent: {agent_alias}"))
+        );
         println!(
             "{}",
             get_cli_string_with_args(
@@ -135,19 +187,21 @@ pub async fn run_dream(config: &Config, dry_run: bool, verbose: bool) -> Result<
 
     if dry_run {
         println!("\n{}", get_required_cli_string("cli-dream-dry-run-notice"));
-    } else if config.dream_mode.audit_mode {
+    } else if audit_mode {
         println!("\n{}", get_required_cli_string("cli-dream-staged-notice"));
     }
 
     Ok(())
 }
 
-/// Show the pending dream report, if any.
-pub fn show_report(config: &Config) -> Result<()> {
-    match DreamReport::load_pending(&config.data_dir)? {
+/// Show the pending dream report for an agent, if any.
+pub fn show_report(config: &Config, agent: Option<&str>) -> Result<()> {
+    let agent_alias = resolve_target_agent(config, agent)?;
+    let dir = config.agent_workspace_dir(&agent_alias);
+    match DreamReport::load_pending(&dir)? {
         Some(report) => {
             println!("{}", report.format_message());
-            DreamReport::mark_delivered(&config.data_dir)?;
+            DreamReport::mark_delivered(&dir)?;
         }
         None => {
             println!("{}", get_required_cli_string("cli-dream-no-report"));
@@ -156,16 +210,19 @@ pub fn show_report(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Promote staged dream mutations from `dream_pending.json` into memory.
+/// Promote an agent's staged dream mutations from its `dream_pending.json`.
 ///
 /// Delegates to `zeroclaw_runtime::dream::pending::promote_pending`, which
 /// preserves the pending file on partial backend failures so the user can
 /// retry without losing staged work.
-pub async fn promote(config: &Config) -> Result<()> {
+pub async fn promote(config: &Config, agent: Option<&str>) -> Result<()> {
     use zeroclaw_runtime::dream::pending::promote_pending;
 
+    let agent_alias = resolve_target_agent(config, agent)?;
+    let dir = config.agent_workspace_dir(&agent_alias);
+
     // Snapshot pending counts up front for the "Promoting N insights..." banner.
-    let Some(pending_view) = DreamPending::load(&config.data_dir)? else {
+    let Some(pending_view) = DreamPending::load(&dir)? else {
         println!("{}", get_required_cli_string("cli-dream-no-pending"));
         return Ok(());
     };
@@ -186,25 +243,22 @@ pub async fn promote(config: &Config) -> Result<()> {
         ))
     );
 
-    let memory = zeroclaw_memory::create_memory(
-        &config.memory,
-        &config.data_dir,
-        config
-            .providers
-            .models
-            .iter_entries()
-            .next()
-            .and_then(|(_, _, e)| e.api_key.as_deref()),
-    )
-    .context("dream promote: failed to create memory backend")?;
+    // Apply against the agent's own scoped memory backend.
+    let api_key = config
+        .resolved_model_provider_for_agent(&agent_alias)
+        .and_then(|(_, _, e)| e.api_key.as_deref());
+    let memory = zeroclaw_memory::create_memory_for_agent(config, &agent_alias, api_key)
+        .await
+        .context("dream promote: failed to create scoped memory backend")?;
 
-    let result = promote_pending(
-        &config.data_dir,
-        memory.as_ref(),
-        config.dream_mode.hard_prune,
-    )
-    .await?
-    .expect("pending was just loaded above");
+    let Some(result) = promote_pending(&dir, memory.as_ref(), config.dream_mode.hard_prune).await?
+    else {
+        // The pending file was removed between the snapshot above and now
+        // (e.g. a concurrent promote, or a manual delete). Nothing to apply —
+        // don't panic on the missing file.
+        println!("{}", get_required_cli_string("cli-dream-no-pending"));
+        return Ok(());
+    };
 
     println!(
         "{}",
@@ -237,4 +291,63 @@ pub async fn promote(config: &Config) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zeroclaw_config::schema::AliasedAgentConfig;
+
+    fn cfg_with(agents: &[(&str, bool)]) -> Config {
+        let mut config = Config::default();
+        for (alias, enabled) in agents {
+            config.agents.insert(
+                (*alias).to_string(),
+                AliasedAgentConfig {
+                    enabled: *enabled,
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
+        config
+    }
+
+    #[test]
+    fn explicit_disabled_agent_is_rejected() {
+        let config = cfg_with(&[("alpha", false)]);
+        let err = resolve_target_agent(&config, Some("alpha")).unwrap_err();
+        assert!(err.to_string().contains("disabled"), "{err}");
+    }
+
+    #[test]
+    fn explicit_enabled_agent_resolves() {
+        let config = cfg_with(&[("alpha", true)]);
+        assert_eq!(
+            resolve_target_agent(&config, Some("alpha")).unwrap(),
+            "alpha"
+        );
+    }
+
+    #[test]
+    fn unknown_agent_is_rejected() {
+        let config = cfg_with(&[("alpha", true)]);
+        let err = resolve_target_agent(&config, Some("ghost")).unwrap_err();
+        assert!(err.to_string().contains("no agent 'ghost'"), "{err}");
+    }
+
+    #[test]
+    fn inference_never_picks_a_disabled_agent() {
+        // A sole disabled agent, none dream-enabled → no enabled candidates,
+        // so a no-arg `zeroclaw dream` refuses rather than dreaming a disabled
+        // agent (matches the daemon, which skips disabled agents).
+        let config = cfg_with(&[("alpha", false)]);
+        let err = resolve_target_agent(&config, None).unwrap_err();
+        assert!(err.to_string().contains("no enabled agents"), "{err}");
+    }
+
+    #[test]
+    fn inference_picks_sole_enabled_agent() {
+        let config = cfg_with(&[("alpha", true)]);
+        assert_eq!(resolve_target_agent(&config, None).unwrap(), "alpha");
+    }
 }

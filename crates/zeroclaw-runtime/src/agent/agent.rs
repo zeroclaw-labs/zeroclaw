@@ -2635,14 +2635,15 @@ pub async fn run(
         done: false,
     };
 
-    // Deliver pending dream report on interactive session start.
-    if message.is_none()
-        && effective_config.dream_mode.show_report
-        && let Ok(Some(report)) =
-            crate::dream::report::DreamReport::load_pending(&effective_config.data_dir)
-    {
-        println!("{}\n", report.format_message());
-        let _ = crate::dream::report::DreamReport::mark_delivered(&effective_config.data_dir);
+    // Deliver this agent's pending dream report on interactive session start.
+    // The report lives in the agent's own workspace dir (per-agent dream
+    // state), so each agent surfaces only its own "while you were away" notice.
+    if message.is_none() && effective_config.dream_mode.show_report {
+        let dream_dir = effective_config.agent_workspace_dir(agent_alias);
+        if let Ok(Some(report)) = crate::dream::report::DreamReport::load_pending(&dream_dir) {
+            println!("{}\n", report.format_message());
+            let _ = crate::dream::report::DreamReport::mark_delivered(&dream_dir);
+        }
     }
 
     if let Some(msg) = message {

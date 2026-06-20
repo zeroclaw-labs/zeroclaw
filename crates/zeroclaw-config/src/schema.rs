@@ -3454,6 +3454,16 @@ pub struct AliasedAgentConfig {
     #[serde(default)]
     #[nested]
     pub identity: IdentityConfig,
+
+    /// Per-agent dream-mode opt-in (`[agents.<alias>.dream_mode]`).
+    /// Dream mode (periodic memory consolidation) is opt-in per agent; this
+    /// block enables it for the agent and optionally overrides the model used
+    /// for the reflect phase. The provider is the agent's own `model_provider`.
+    /// See `crate::multi_agent::AgentDreamModeConfig`.
+    #[tab(Memory)]
+    #[serde(default)]
+    #[nested]
+    pub dream_mode: crate::multi_agent::AgentDreamModeConfig,
 }
 
 impl Default for AliasedAgentConfig {
@@ -3477,6 +3487,7 @@ impl Default for AliasedAgentConfig {
             workspace: crate::multi_agent::AgentWorkspaceConfig::default(),
             memory: crate::multi_agent::AgentMemoryConfig::default(),
             identity: IdentityConfig::default(),
+            dream_mode: crate::multi_agent::AgentDreamModeConfig::default(),
         }
     }
 }
@@ -3807,6 +3818,44 @@ impl Config {
             .models
             .iter_entries()
             .find(|(ty, al, _)| *ty == type_key && *al == alias_key)
+    }
+
+    /// Resolve the effective dream-mode config for an agent by overlaying the
+    /// per-agent `[agents.<alias>.dream_mode]` block on the global
+    /// `[dream_mode]` defaults. `enabled` and `model` are inherited from the
+    /// global block when the per-agent override is unset (`None`). The
+    /// provider is intentionally not part of this config — callers resolve it
+    /// from the agent's own `model_provider` (see
+    /// `resolved_model_provider_for_agent`).
+    #[must_use]
+    pub fn effective_dream_config(&self, agent_alias: &str) -> DreamModeConfig {
+        let mut cfg = self.dream_mode.clone();
+        if let Some(agent) = self.agents.get(agent_alias) {
+            if let Some(enabled) = agent.dream_mode.enabled {
+                cfg.enabled = enabled;
+            }
+            if agent.dream_mode.model.is_some() {
+                cfg.model = agent.dream_mode.model.clone();
+            }
+        }
+        cfg
+    }
+
+    /// Aliases of agents that are enabled and have dream mode effectively
+    /// enabled — i.e. the per-agent `[agents.<alias>.dream_mode].enabled`
+    /// override, falling back to the global `[dream_mode].enabled` default
+    /// when unset. Drives whether the daemon spawns the dream supervisor and
+    /// which agents each scheduled cycle consolidates. Dream mode is opt-in:
+    /// with no per-agent override and the default global `enabled = false`,
+    /// this returns empty and no dreaming runs.
+    #[must_use]
+    pub fn agents_with_dream_enabled(&self) -> Vec<&str> {
+        self.agents
+            .iter()
+            .filter(|(_, agent)| agent.enabled)
+            .filter(|(_, agent)| agent.dream_mode.enabled.unwrap_or(self.dream_mode.enabled))
+            .map(|(alias, _)| alias.as_str())
+            .collect()
     }
 
     /// Reverse-lookup the agent alias that owns a configured channel
@@ -28665,6 +28714,90 @@ allowed_users = []
         config.agents.insert("alpha".to_string(), agent);
 
         config
+    }
+
+    // ── Per-agent dream-mode opt-in (B1.5) ──────────────────────────
+
+    fn dream_agent() -> AliasedAgentConfig {
+        AliasedAgentConfig {
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            ..AliasedAgentConfig::default()
+        }
+    }
+
+    #[test]
+    async fn dream_opt_in_off_by_default() {
+        // Global default (`enabled = false`) + no per-agent override → nothing
+        // dreams. Dream mode is opt-in.
+        let mut config = Config::default();
+        config.agents.insert("alpha".into(), dream_agent());
+        config.agents.insert("beta".into(), dream_agent());
+        assert!(config.agents_with_dream_enabled().is_empty());
+    }
+
+    #[test]
+    async fn dream_per_agent_opt_in_includes_only_that_agent() {
+        let mut config = Config::default();
+        config.agents.insert("alpha".into(), dream_agent());
+        config.agents.insert("beta".into(), dream_agent());
+        // Opt alpha in via the per-agent override even though the global
+        // default is off.
+        config.agents.get_mut("alpha").unwrap().dream_mode.enabled = Some(true);
+        assert_eq!(config.agents_with_dream_enabled(), vec!["alpha"]);
+    }
+
+    #[test]
+    async fn dream_per_agent_opt_out_overrides_global_on() {
+        let mut config = Config::default();
+        config.dream_mode.enabled = true; // global on → agents inherit unless overridden
+        config.agents.insert("alpha".into(), dream_agent());
+        config.agents.insert("beta".into(), dream_agent());
+        config.agents.get_mut("beta").unwrap().dream_mode.enabled = Some(false);
+
+        let mut enabled = config.agents_with_dream_enabled();
+        enabled.sort_unstable();
+        assert_eq!(enabled, vec!["alpha"]);
+    }
+
+    #[test]
+    async fn dream_disabled_agent_never_dreams() {
+        let mut config = Config::default();
+        let mut a = dream_agent();
+        a.enabled = false; // the agent itself is disabled
+        a.dream_mode.enabled = Some(true); // even though it opts into dreaming
+        config.agents.insert("alpha".into(), a);
+        assert!(config.agents_with_dream_enabled().is_empty());
+    }
+
+    #[test]
+    async fn effective_dream_config_merges_model_override() {
+        let mut config = Config::default();
+        config.dream_mode.model = Some("global-model".into());
+        let mut a = dream_agent();
+        a.dream_mode.model = Some("agent-model".into());
+        config.agents.insert("alpha".into(), a);
+        config.agents.insert("beta".into(), dream_agent());
+
+        // alpha overrides the model; beta inherits the global model.
+        assert_eq!(
+            config.effective_dream_config("alpha").model.as_deref(),
+            Some("agent-model")
+        );
+        assert_eq!(
+            config.effective_dream_config("beta").model.as_deref(),
+            Some("global-model")
+        );
+    }
+
+    #[test]
+    async fn effective_dream_config_inherits_global_enabled() {
+        let mut config = Config::default();
+        config.dream_mode.enabled = true;
+        config.agents.insert("alpha".into(), dream_agent());
+        // No per-agent override → inherits global enabled.
+        assert!(config.effective_dream_config("alpha").enabled);
+        // Unknown agent → just the global defaults.
+        assert!(config.effective_dream_config("ghost").enabled);
     }
 
     #[test]
