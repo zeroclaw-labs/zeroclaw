@@ -32,7 +32,9 @@ pub use document::{DocumentParseError, SkillDocument};
 pub use frontmatter::SkillFrontmatter;
 pub use reference::{SkillRef, SkillRefError};
 pub use scaffold::{ScaffoldError, ScaffoldOptions};
-pub use service::{RemoveMode, ServiceError, SkillSummary, SkillsService};
+pub use service::{
+    EffectiveSkill, RemoveMode, ServiceError, SkillOrigin, SkillSummary, SkillsService,
+};
 pub(crate) use suggestions::render_missing_skill_install_suggestion;
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
@@ -237,6 +239,11 @@ struct SkillMarkdownMeta {
     version: Option<String>,
     author: Option<String>,
     tags: Vec<String>,
+    /// Typed slash-command options from the nested `slash_options:` frontmatter
+    /// block. Parsed by the shared helper in `document` (not the flat scanner)
+    /// so a SKILL.md skill can drive native Discord slash commands — parity with
+    /// SKILL.toml's `[[skill.slash_options]]`.
+    slash_options: Vec<SkillSlashOption>,
 }
 
 fn default_version() -> String {
@@ -1090,7 +1097,7 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         tags: parsed.meta.tags,
         tools: Vec::new(),
         prompts: vec![parsed.body],
-        slash_options: Vec::new(),
+        slash_options: parsed.meta.slash_options,
         location: Some(path.to_path_buf()),
     })
 }
@@ -1130,7 +1137,7 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
         tags: parsed.meta.tags,
         tools: Vec::new(),
         prompts: vec![parsed.body],
-        slash_options: Vec::new(),
+        slash_options: parsed.meta.slash_options,
         location: Some(path.to_path_buf()),
     }))
 }
@@ -1237,6 +1244,10 @@ fn parse_simple_frontmatter(s: &str) -> SkillMarkdownMeta {
     if let Some(ref key) = collecting_multiline {
         flush_multiline(key, &multiline_parts, &mut meta);
     }
+    // The one nested field. Parsed by the shared helper so the loader and the
+    // service (`SkillDocument`) read `slash_options` identically — no second
+    // nested parser to drift.
+    meta.slash_options = document::parse_slash_options(s);
     meta
 }
 
@@ -2616,6 +2627,57 @@ version = "0.1.0"
 "#,
         );
         let skill = load_skill_toml(&path).unwrap();
+        assert!(skill.slash_options.is_empty());
+    }
+
+    #[test]
+    fn load_skill_md_parses_slash_options_from_frontmatter() {
+        let tmp = TempDir::new().unwrap();
+        let md = r#"---
+name: draft
+description: Draft content to a spec.
+tags: [slash]
+slash_options:
+  - name: format
+    description: Output format.
+    type: string
+    required: true
+    choices: [{name: Email, value: email}, {name: Tweet, value: tweet}]
+  - name: words
+    type: integer
+    min: 10
+    max: 2000
+---
+# Draft
+
+Write it.
+"#;
+        let path = tmp.path().join("SKILL.md");
+        std::fs::write(&path, md).unwrap();
+        let skill = load_skill_md(&path, tmp.path()).unwrap();
+
+        // Parity with SKILL.toml: the runtime Skill carries typed options.
+        assert_eq!(skill.slash_options.len(), 2);
+        assert_eq!(skill.slash_options[0].name, "format");
+        assert!(skill.slash_options[0].required);
+        assert_eq!(skill.slash_options[0].choices.len(), 2);
+        assert_eq!(skill.slash_options[1].kind, "integer");
+        assert_eq!(skill.slash_options[1].min, Some(10.0));
+        assert_eq!(skill.slash_options[1].max, Some(2000.0));
+        assert!(skill.tags.contains(&"slash".to_string()));
+
+        // The options block lives in frontmatter, so the prompt (body) is clean.
+        assert_eq!(skill.prompts.len(), 1);
+        assert!(skill.prompts[0].contains("Write it."));
+        assert!(!skill.prompts[0].contains("slash_options"));
+    }
+
+    #[test]
+    fn load_skill_md_without_slash_options_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("SKILL.md");
+        std::fs::write(&path, "---\nname: plain\ndescription: d\n---\n# Plain\n").unwrap();
+        let skill = load_skill_md(&path, tmp.path()).unwrap();
         assert!(skill.slash_options.is_empty());
     }
 

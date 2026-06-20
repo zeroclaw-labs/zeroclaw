@@ -327,7 +327,8 @@ pub(crate) fn is_skill_command_shape(cmd: &serde_json::Value) -> bool {
 
 /// Comparable projection of a command for change detection: description plus
 /// per-option (name, type, required, description) and, for typed options, the
-/// (choices, min/max value, min/max length) constraints. Discord decorates
+/// (choices, min/max value, min/max length, autocomplete) constraints. Discord
+/// decorates
 /// listed commands with server-side fields (id, version,
 /// default_member_permissions, …) that must not defeat the comparison; the
 /// numeric constraints are normalised (numbers → f64, lengths → u64, choice
@@ -366,6 +367,14 @@ pub(crate) fn command_projection(cmd: &serde_json::Value) -> serde_json::Value {
                             "max_value": o.get("max_value").and_then(serde_json::Value::as_f64),
                             "min_length": o.get("min_length").and_then(serde_json::Value::as_u64),
                             "max_length": o.get("max_length").and_then(serde_json::Value::as_u64),
+                            // Autocomplete options omit static `choices`; project
+                            // the flag (default false) so an autocomplete option
+                            // we registered compares equal to Discord's echo and
+                            // doesn't trigger a spurious re-registration.
+                            "autocomplete": o
+                                .get("autocomplete")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false),
                         })
                     })
                     .collect::<Vec<_>>()
@@ -602,6 +611,70 @@ mod typed_option_tests {
         assert_eq!(opts[1]["type"], json!(4));
         assert_eq!(opts[1]["min_value"], json!(1));
         assert_eq!(opts[1]["max_value"], json!(50));
+    }
+
+    #[test]
+    fn md_skill_frontmatter_options_drive_a_typed_command_end_to_end() {
+        // End-to-end proof that no channel-side change was needed: a SKILL.md
+        // declaring slash_options in its frontmatter loads through the public
+        // runtime loader and registers a typed Discord command (dropdown +
+        // integer range), not the legacy single `input`.
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("draft");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let md = r#"---
+name: draft
+description: Draft content to a spec.
+tags: [slash]
+slash_options:
+  - name: format
+    description: Output format.
+    type: string
+    required: true
+    choices: [{name: Email, value: email}, {name: Tweet, value: tweet}]
+  - name: words
+    type: integer
+    min: 10
+    max: 2000
+---
+# Draft
+
+Write it.
+"#;
+        std::fs::write(skill_dir.join("SKILL.md"), md).unwrap();
+
+        let skills = zeroclaw_runtime::skills::load_skills_from_directory(tmp.path(), false);
+        let specs = discord_slash_specs_from_skills(&skills);
+        assert_eq!(
+            specs.len(),
+            1,
+            "the slash-tagged MD skill yields one command"
+        );
+
+        let body = slash_command_registration_body(&specs);
+        let arr = body.as_array().unwrap();
+        let draft = arr
+            .iter()
+            .find(|c| c["name"] == json!("draft"))
+            .expect("draft command present");
+        let opts = draft["options"].as_array().unwrap();
+
+        // Typed options replaced the legacy single `input`.
+        assert!(opts.iter().all(|o| o["name"] != json!("input")));
+        let format = opts
+            .iter()
+            .find(|o| o["name"] == json!("format"))
+            .expect("format option");
+        assert_eq!(format["type"], json!(3)); // STRING
+        assert_eq!(format["required"], json!(true));
+        assert_eq!(format["choices"].as_array().unwrap().len(), 2);
+        let words = opts
+            .iter()
+            .find(|o| o["name"] == json!("words"))
+            .expect("words option");
+        assert_eq!(words["type"], json!(4)); // INTEGER
+        assert_eq!(words["min_value"], json!(10));
+        assert_eq!(words["max_value"], json!(2000));
     }
 
     #[test]
