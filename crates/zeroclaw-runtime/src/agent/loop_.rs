@@ -970,6 +970,40 @@ fn resolve_summary_provider(
     }
 }
 
+/// Runtime deprecation nudge for the legacy `context_compression.summary_model`
+/// fallback path (#7964). When no `summary_provider` is resolved and the
+/// deprecated bare `summary_model` is dispatched on the agent's OWN provider,
+/// WARN once per agent per process that this can silently mismatch for a
+/// runtime profile shared across providers, and recommend migrating to
+/// `summary_provider`. The config-time `cross_provider_summary_model`
+/// diagnostic carries the precise cross-provider detection; this is the
+/// belt-and-suspenders signal on the hot path, deduped so it does not spam
+/// every turn. Mirrors the warn-once pattern in `agent::cost`.
+fn warn_deprecated_summary_model_fallback(agent_alias: &str, summary_model: &str) {
+    static SEEN: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+    let first = {
+        let mut seen = SEEN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        seen.insert(agent_alias.to_string())
+    };
+    if !first {
+        return;
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(
+                ::serde_json::json!({"agent": agent_alias, "summary_model": summary_model})
+            ),
+        "Deprecated context_compression.summary_model is being dispatched on this agent's own \
+         provider. A bare summary_model shared by a runtime profile across providers can \
+         silently summarize on the wrong provider (#7964). Migrate to summary_provider. \
+         This warning fires once per agent per process."
+    );
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn run(
     config: Config,
@@ -2416,16 +2450,31 @@ pub async fn run(
                                             preserve_media_markers: false,
                                         }
                                     }
-                                    None => crate::agent::context_compressor::SummaryTarget {
-                                        provider: model_provider.as_ref(),
-                                        model: agent
+                                    None => {
+                                        if let Some(legacy) = agent
                                             .resolved
                                             .context_compression
                                             .summary_model
                                             .as_deref()
-                                            .unwrap_or(&model_name),
-                                        preserve_media_markers: model_provider.supports_vision(),
-                                    },
+                                            .filter(|m| !m.trim().is_empty())
+                                        {
+                                            warn_deprecated_summary_model_fallback(
+                                                agent_alias,
+                                                legacy,
+                                            );
+                                        }
+                                        crate::agent::context_compressor::SummaryTarget {
+                                            provider: model_provider.as_ref(),
+                                            model: agent
+                                                .resolved
+                                                .context_compression
+                                                .summary_model
+                                                .as_deref()
+                                                .unwrap_or(&model_name),
+                                            preserve_media_markers: model_provider
+                                                .supports_vision(),
+                                        }
+                                    }
                                 };
                                 match compressor
                                     .compress_on_error(
@@ -2509,16 +2558,27 @@ pub async fn run(
                                 preserve_media_markers: false,
                             }
                         }
-                        None => crate::agent::context_compressor::SummaryTarget {
-                            provider: model_provider.as_ref(),
-                            model: agent
+                        None => {
+                            if let Some(legacy) = agent
                                 .resolved
                                 .context_compression
                                 .summary_model
                                 .as_deref()
-                                .unwrap_or(&model_name),
-                            preserve_media_markers: model_provider.supports_vision(),
-                        },
+                                .filter(|m| !m.trim().is_empty())
+                            {
+                                warn_deprecated_summary_model_fallback(agent_alias, legacy);
+                            }
+                            crate::agent::context_compressor::SummaryTarget {
+                                provider: model_provider.as_ref(),
+                                model: agent
+                                    .resolved
+                                    .context_compression
+                                    .summary_model
+                                    .as_deref()
+                                    .unwrap_or(&model_name),
+                                preserve_media_markers: model_provider.supports_vision(),
+                            }
+                        }
                     };
                     match compressor
                         .compress_if_needed(
