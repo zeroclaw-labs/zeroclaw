@@ -68,16 +68,47 @@ pub(crate) async fn announce_llm_request(
     });
     {
         let _provider_guard = ::zeroclaw_log::attribution_span!(active_model_provider).entered();
+        let mut attrs = ::serde_json::json!({
+            "iteration": iteration + 1,
+            "messages_count": history.len(),
+            "model": active_model,
+            "trace_id": ctx.turn_id,
+        });
+        // Opt-in request payload capture (observability.log_llm_request_payload,
+        // default off). When enabled, attach the scrubbed + truncated message
+        // history; when off (or no writer installed) `attrs` is unchanged.
+        if let Some((policy, truncate_bytes)) = ::zeroclaw_log::llm_request_payload_policy()
+            && policy.captures_payload()
+            && let ::serde_json::Value::Object(map) = &mut attrs
+        {
+            let rendered: Vec<::serde_json::Value> = history
+                .iter()
+                .map(|m| {
+                    ::serde_json::json!({"role": m.role.as_str(), "content": m.content.as_str()})
+                })
+                .collect();
+            let serialized = ::serde_json::to_string(&rendered).unwrap_or_default();
+            let scrubbed = scrub_credentials(&serialized);
+            if let Some(capture) =
+                ::zeroclaw_log::capture_llm_request(policy, truncate_bytes, &scrubbed)
+            {
+                map.insert(
+                    "request_messages".to_string(),
+                    ::serde_json::Value::String(capture.text),
+                );
+                if capture.truncated {
+                    map.insert("request_messages_truncated".to_string(), true.into());
+                    map.insert(
+                        "request_messages_original_bytes".to_string(),
+                        capture.original_bytes.into(),
+                    );
+                }
+            }
+        }
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send).with_attrs(
-                ::serde_json::json!({
-                    "iteration": iteration + 1,
-                    "messages_count": history.len(),
-                    "model": active_model,
-                    "trace_id": ctx.turn_id,
-                })
-            ),
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                .with_attrs(attrs),
             "llm_request"
         );
     }
