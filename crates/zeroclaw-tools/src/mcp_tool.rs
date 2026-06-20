@@ -199,6 +199,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn eager_wrapper_dispatches_while_run_owner_holds_registry() {
+        // Eager-path lifetime contract (#5903 / #8023): the wrapper holds only a
+        // `Weak`, so the agent run must keep one strong `Arc<McpRegistry>` alive
+        // (now stored on `Agent`, dropped in `Agent::drop`). While that owner
+        // lives, the wrapper upgrades and dispatches; once it drops, the wrapper
+        // fails gracefully and the registry (and its kill_on_drop stdio children)
+        // can be reaped. This is the scenario the unknown-tool test does not
+        // cover and that a `Weak`-only wrapper regressed.
+        let run_owner = empty_registry().await; // the strong Arc the agent holds
+        let def = make_def("ghost", Some("Ghost tool"), json!({}));
+        // Built as the eager path does: new() downgrades internally, so the Arc
+        // passed here is consumed and `run_owner` is left as the sole strong
+        // reference — exactly the post-init state.
+        let wrapper =
+            McpToolWrapper::new("nowhere__ghost".to_string(), def, Arc::clone(&run_owner));
+
+        // Owner alive -> upgrade succeeds -> dispatch reaches the registry and
+        // returns the genuine unknown-tool error, NOT "registry dropped".
+        let ok = wrapper.execute(json!({})).await.expect("execute non-fatal");
+        assert!(!ok.success);
+        assert!(
+            ok.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("unknown MCP tool"),
+            "while the run owner lives the wrapper must dispatch; got: {:?}",
+            ok.error
+        );
+
+        // Drop the run owner (mirrors Agent::drop) -> no strong refs remain ->
+        // the Weak can no longer upgrade -> graceful "registry dropped".
+        drop(run_owner);
+        let after = wrapper.execute(json!({})).await.expect("execute non-fatal");
+        assert!(!after.success);
+        assert!(
+            after
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("registry dropped"),
+            "after the run owner drops the wrapper must fail gracefully; got: {:?}",
+            after.error
+        );
+    }
+
+    #[tokio::test]
     async fn execute_success_sets_success_true_and_output() {
         // Verify the ToolResult success-branch struct shape compiles correctly.
         // A real happy-path requires a live MCP server; that is covered by E2E tests.

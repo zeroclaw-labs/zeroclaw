@@ -182,6 +182,13 @@ pub struct Agent {
     /// When MCP deferred loading is enabled, tools are activated via `tool_search`
     /// and stored here for lookup during tool execution.
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    /// Strong owner of the MCP registry for the agent's lifetime. Eager-path
+    /// `McpToolWrapper`s hold only a `Weak`, so without this the registry would
+    /// drop right after init and every MCP call would fail with "registry
+    /// dropped"; holding it here keeps the wrappers upgradable for the whole run
+    /// and drops it in `Agent::drop` — exactly when #5903 wants the stdio
+    /// children reaped via the registry's `kill_on_drop` transport.
+    mcp_registry: Option<Arc<crate::tools::McpRegistry>>,
     /// Hook runner for tool-call auditing and lifecycle side effects.
     /// See issue #5462.
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
@@ -214,6 +221,10 @@ impl Drop for Agent {
                     "model_provider": self.model_provider_name,
                     "model": self.model_name,
                     "history_messages_freed": self.history.len(),
+                    // Dropping the Agent releases the last strong Arc to the MCP
+                    // registry (when one was held), letting it drop and reap its
+                    // stdio children via kill_on_drop (#5903).
+                    "mcp_registry_released": self.mcp_registry.is_some(),
                 })),
             "Agent dropped; conversation history and per-session state freed"
         );
@@ -313,6 +324,7 @@ pub struct AgentBuilder {
     security_summary: Option<String>,
     autonomy_level: Option<crate::security::AutonomyLevel>,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    mcp_registry: Option<Arc<crate::tools::McpRegistry>>,
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
     approval_manager: Option<Arc<ApprovalManager>>,
     agent_alias: Option<String>,
@@ -355,6 +367,7 @@ impl AgentBuilder {
             security_summary: None,
             autonomy_level: None,
             activated_tools: None,
+            mcp_registry: None,
             hook_runner: None,
             approval_manager: None,
             agent_alias: None,
@@ -515,6 +528,11 @@ impl AgentBuilder {
         activated: Option<Arc<std::sync::Mutex<tools::ActivatedToolSet>>>,
     ) -> Self {
         self.activated_tools = activated;
+        self
+    }
+
+    pub fn mcp_registry(mut self, registry: Option<Arc<tools::McpRegistry>>) -> Self {
+        self.mcp_registry = registry;
         self
     }
 
@@ -680,6 +698,7 @@ impl AgentBuilder {
                 .autonomy_level
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
             activated_tools: self.activated_tools,
+            mcp_registry: self.mcp_registry,
             hook_runner: self.hook_runner,
             approval_manager: self.approval_manager,
             agent_alias: self.agent_alias.unwrap_or_default(),
@@ -1225,6 +1244,9 @@ impl Agent {
         // and webhook paths (loop_.rs) so that the WebSocket/daemon UI
         // path also has access to MCP tools.
         let mut activated_tools: Option<Arc<std::sync::Mutex<tools::ActivatedToolSet>>> = None;
+        // Strong owner of the MCP registry, threaded onto the Agent so the
+        // Weak-backed eager wrappers can upgrade for the whole run (see #5903).
+        let mut mcp_registry_keepalive: Option<Arc<tools::McpRegistry>> = None;
         // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
         let mut mcp_elevation_arcs: Vec<Arc<dyn tools::Tool>> = Vec::new();
         // Secure by default: only the MCP servers granted by this agent's
@@ -1246,6 +1268,9 @@ impl Agent {
             match tools::McpRegistry::connect_all(&agent_mcp_servers).await {
                 Ok(registry) => {
                     let registry = std::sync::Arc::new(registry);
+                    // Keep one strong reference alive for the agent run's lifetime;
+                    // eager wrappers below hold only a Weak.
+                    mcp_registry_keepalive = Some(std::sync::Arc::clone(&registry));
                     mcp_elevation_arcs = tools::collect_mcp_elevation_arcs(&registry).await;
                     let mcp_policy =
                         crate::agent::loop_::mcp_tool_access_policy(security.as_ref(), None);
@@ -1469,6 +1494,7 @@ impl Agent {
             .security_summary(Some(security.prompt_summary()))
             .autonomy_level(risk_profile.level)
             .activated_tools(activated_tools)
+            .mcp_registry(mcp_registry_keepalive)
             .hook_runner(if config.hooks.enabled {
                 let mut runner = crate::hooks::HookRunner::new();
                 if config.hooks.builtin.command_logger {
