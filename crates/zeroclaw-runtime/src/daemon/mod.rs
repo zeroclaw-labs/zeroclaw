@@ -377,7 +377,10 @@ pub async fn run(
             sessions,
             session_backend,
             memory: rpc_memory,
-            cost_tracker: zeroclaw_config::cost::CostTracker::get_or_init_global(
+            // Process-global tracker shared with the gateway and channel
+            // supervisor. Without this the RPC/zerocode-TUI turn path has no
+            // tracker to record into and model cost is silently dropped (#5221).
+            cost_tracker: crate::cost::CostTracker::get_or_init_global(
                 config.cost.clone(),
                 &config.data_dir,
             ),

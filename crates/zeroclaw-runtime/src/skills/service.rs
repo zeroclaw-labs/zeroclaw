@@ -15,11 +15,43 @@ use super::scaffold::{self, ScaffoldError, ScaffoldOptions};
 use zeroclaw_config::schema::Config;
 
 /// Per-skill view returned by [`SkillsService::list_skills`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `Eq` dropped: `frontmatter.slash_options` carry `f64` bounds (not `Eq`).
+#[derive(Debug, Clone, PartialEq)]
 pub struct SkillSummary {
     pub r#ref: SkillRef,
     pub directory: PathBuf,
     pub frontmatter: SkillFrontmatter,
+}
+
+/// Where an agent-effective skill came from. The dashboard mirrors the
+/// runtime's four-source union ([`super::load_skills_for_agent_from_config`])
+/// so an operator sees the same skills the agent actually loads — not just
+/// the `[skill_bundles.*]` table. Only [`SkillOrigin::Bundle`] skills are
+/// editable through the bundle write APIs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillOrigin {
+    /// `<install>/agents/<alias>/workspace/skills/`.
+    Workspace,
+    /// The open-skills repo (tagged `open-skills`).
+    OpenSkills,
+    /// A `plugins-wasm` plugin (`plugin:<name>/...`); holds the plugin name.
+    Plugin(String),
+    /// A configured `[skill_bundles.<alias>]`; holds the bundle alias.
+    Bundle(String),
+}
+
+/// One skill in an agent's *effective* set, with provenance — returned by
+/// [`SkillsService::resolve_effective_skills`].
+#[derive(Debug, Clone)]
+pub struct EffectiveSkill {
+    pub name: String,
+    pub description: String,
+    pub origin: SkillOrigin,
+    pub directory: Option<PathBuf>,
+    /// `true` only for [`SkillOrigin::Bundle`] — the only writable source.
+    pub editable: bool,
+    /// `Some(alias)` iff `editable` (routes the bundle editor).
+    pub bundle: Option<String>,
 }
 
 /// Behaviour selector for [`SkillsService::remove_skill`].
@@ -135,6 +167,67 @@ impl<'a> SkillsService<'a> {
             }
         }
         Ok(out)
+    }
+
+    /// An agent's *effective* skill set — the four-source union the runtime
+    /// actually loads (workspace / open-skills / plugin / bundle), each tagged
+    /// with its [`SkillOrigin`]. This fixes the dashboard's "shows zero skills
+    /// when skills exist" gap (#7757): it is sourced from the **audited**
+    /// resolver [`super::load_skills_for_agent_from_config`], NOT from
+    /// [`Self::list_skills`] (which is bundle-only and does a raw, unaudited
+    /// `read_dir`) — so the page reflects exactly what the agent injects, and
+    /// never surfaces un-audited external (open-skills/plugin) frontmatter.
+    pub fn resolve_effective_skills(
+        &self,
+        agent_alias: &str,
+    ) -> Result<Vec<EffectiveSkill>, ServiceError> {
+        // Resolve each configured bundle's directory once, to attribute
+        // bundle-origin skills by `location` prefix.
+        let bundles = self.list_bundles()?;
+        let skills = super::load_skills_for_agent_from_config(self.config, agent_alias);
+        Ok(skills
+            .into_iter()
+            .map(|s| {
+                let origin = Self::derive_origin(&s, &bundles);
+                let (editable, bundle) = match &origin {
+                    SkillOrigin::Bundle(alias) => (true, Some(alias.clone())),
+                    _ => (false, None),
+                };
+                EffectiveSkill {
+                    name: s.name,
+                    description: s.description,
+                    origin,
+                    directory: s.location,
+                    editable,
+                    bundle,
+                }
+            })
+            .collect())
+    }
+
+    /// Attribute a resolved skill to its [`SkillOrigin`], mirroring the
+    /// resolver's own discriminators so dashboard provenance can't drift: the
+    /// `open-skills` tag, the `plugin:` name/tag prefix, then a `location`
+    /// match against a configured bundle directory; otherwise the workspace.
+    fn derive_origin(skill: &super::Skill, bundles: &[BundleSummary]) -> SkillOrigin {
+        if skill.tags.iter().any(|t| t == "open-skills") {
+            return SkillOrigin::OpenSkills;
+        }
+        if let Some(rest) = skill.name.strip_prefix("plugin:") {
+            let plugin = rest.split('/').next().unwrap_or(rest);
+            return SkillOrigin::Plugin(plugin.to_string());
+        }
+        if let Some(plugin) = skill.tags.iter().find_map(|t| t.strip_prefix("plugin:")) {
+            return SkillOrigin::Plugin(plugin.to_string());
+        }
+        if let Some(loc) = &skill.location {
+            for b in bundles {
+                if loc.starts_with(&b.directory) {
+                    return SkillOrigin::Bundle(b.alias.clone());
+                }
+            }
+        }
+        SkillOrigin::Workspace
     }
 
     /// Read the `SKILL.md` for a resolved skill.
@@ -285,6 +378,97 @@ mod tests {
         let alpha_only = svc.list_skills(Some("alpha")).unwrap();
         assert_eq!(alpha_only.len(), 1);
         assert_eq!(alpha_only[0].r#ref.bundle(), "alpha");
+    }
+
+    // #7757: provenance derivation mirrors the resolver's own discriminators.
+    #[test]
+    fn derive_origin_classifies_each_source() {
+        let bundles = vec![BundleSummary {
+            alias: "core".into(),
+            directory: PathBuf::from("/inst/shared/skills/core"),
+            include: vec![],
+            exclude: vec![],
+        }];
+        let mk = |name: &str, tags: &[&str], loc: Option<&str>| crate::skills::Skill {
+            name: name.into(),
+            description: String::new(),
+            version: String::new(),
+            author: None,
+            tags: tags.iter().map(|s| (*s).to_string()).collect(),
+            tools: vec![],
+            prompts: vec![],
+            slash_options: vec![],
+            location: loc.map(PathBuf::from),
+        };
+        assert_eq!(
+            SkillsService::derive_origin(&mk("s", &["open-skills"], None), &bundles),
+            SkillOrigin::OpenSkills
+        );
+        assert_eq!(
+            SkillsService::derive_origin(&mk("plugin:foo/bar", &[], None), &bundles),
+            SkillOrigin::Plugin("foo".into())
+        );
+        assert_eq!(
+            SkillsService::derive_origin(
+                &mk("s", &[], Some("/inst/shared/skills/core/s")),
+                &bundles
+            ),
+            SkillOrigin::Bundle("core".into())
+        );
+        assert_eq!(
+            SkillsService::derive_origin(
+                &mk("s", &[], Some("/inst/agents/default/workspace/skills/s")),
+                &bundles
+            ),
+            SkillOrigin::Workspace
+        );
+    }
+
+    // #7757: the effective set unions non-bundle sources (workspace) with
+    // bundle skills, tagging origin + editability — the gap that made the
+    // dashboard render empty when only workspace skills existed.
+    #[test]
+    fn resolve_effective_skills_unions_workspace_and_bundle() {
+        let (dir, mut cfg) = fixture(&["core"]);
+        // install_root_dir() = config_path.parent(); align it with the service
+        // install_root so the agent's bundle + workspace dirs resolve here.
+        cfg.config_path = dir.path().join("config.toml");
+        cfg.agents.insert(
+            "default".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                skill_bundles: vec!["core".into()],
+                ..Default::default()
+            },
+        );
+        let svc = SkillsService::new(&cfg, dir.path());
+        make_skill(&svc, "core", "bundle-skill");
+        // A workspace skill on disk (the source the dashboard used to miss).
+        let ws = cfg
+            .agent_workspace_dir("default")
+            .join("skills")
+            .join("ws-skill");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(
+            ws.join("SKILL.md"),
+            "---\nname: ws-skill\ndescription: w\n---\n# ws\n",
+        )
+        .unwrap();
+
+        let eff = svc.resolve_effective_skills("default").unwrap();
+        let by = |n: &str| {
+            eff.iter()
+                .find(|e| e.name == n)
+                .unwrap_or_else(|| panic!("missing {n}"))
+        };
+        assert_eq!(
+            by("bundle-skill").origin,
+            SkillOrigin::Bundle("core".into())
+        );
+        assert!(by("bundle-skill").editable);
+        assert_eq!(by("bundle-skill").bundle.as_deref(), Some("core"));
+        assert_eq!(by("ws-skill").origin, SkillOrigin::Workspace);
+        assert!(!by("ws-skill").editable);
+        assert!(by("ws-skill").bundle.is_none());
     }
 
     #[test]

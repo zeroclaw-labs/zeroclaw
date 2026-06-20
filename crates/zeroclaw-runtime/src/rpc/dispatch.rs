@@ -1403,13 +1403,18 @@ impl RpcDispatcher {
         let attribution_agent_alias = agent_alias.clone();
         let attribution_model_provider = model_provider.clone();
         let attribution_model = model.clone();
+        // Cost-tracking context for this turn. Built from the daemon-scoped
+        // tracker + the live pricing map and stamped with the agent alias so
+        // `execute_turn` can persist token usage and attribute spend. `None`
+        // when cost tracking is disabled (no tracker wired). See #5221.
         let cost_context = self.ctx.cost_tracker.as_ref().map(|tracker| {
-            let cfg = self.ctx.config.read();
-            crate::agent::cost::tool_loop_cost_tracking_context_from_tracker(
-                &cfg,
-                &agent_alias,
-                Arc::clone(tracker),
+            let cfg_guard = self.ctx.config.read();
+            let pricing = crate::agent::cost::build_model_provider_pricing(&cfg_guard);
+            crate::agent::cost::ToolLoopCostTrackingContext::new(
+                tracker.clone(),
+                std::sync::Arc::new(pricing),
             )
+            .with_agent_alias(&attribution_agent_alias)
         });
         let outcome = execute_turn(
             agent,

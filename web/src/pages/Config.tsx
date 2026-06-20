@@ -15,16 +15,19 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
-import { ArrowLeft, ChevronRight, MessageSquare, Plus, Sparkles, Trash2 } from "lucide-react";
+import { ArrowLeft, Check, ChevronRight, MessageSquare, Pencil, Plus, Sparkles, Trash2, X } from "lucide-react";
 import {
   ApiError,
   deleteMapKey,
+  getDeletePlan,
   getDrift,
   getMapKeys,
   getSections,
   listProps,
   patchConfig,
+  renameMapKey,
   selectSectionItem,
+  type DeletePlan,
   type DriftEntry,
   type ListResponseEntry,
   type PickerItem,
@@ -857,6 +860,14 @@ function AliasListView({
                 setAliases((prev) => prev.filter((a) => a !== alias));
               }}
               onDeleteError={(msg) => setError(msg)}
+              onRenamed={(to, warnings) => {
+                setAliases((prev) => prev.map((a) => (a === alias ? to : a)));
+                if (warnings.length > 0) {
+                  setError(
+                    `${t("config.rename_warnings_prefix")} ${warnings.join("; ")}`,
+                  );
+                }
+              }}
             />
           ))}
 
@@ -1268,49 +1279,166 @@ function AliasRow({
   onSelect,
   onDeleted,
   onDeleteError,
+  onRenamed,
 }: {
   alias: string;
   mapPath: string;
   onSelect: () => void;
   onDeleted: () => void;
   onDeleteError: (msg: string) => void;
+  onRenamed: (to: string, warnings: string[]) => void;
 }) {
-  // Two-stage confirm avoids accidental deletes without a modal: first
-  // click arms the trash (3-second window), second click commits.
-  const [armed, setArmed] = useState(false);
-  const [deleting, setDeleting] = useState(false);
+  // Pencil renames in place (reference-rewrite cascade); trash opens a delete
+  // cascade preview — what gets scrubbed / what blocks it — before committing.
+  const [mode, setMode] = useState<"idle" | "renaming" | "confirm-delete">("idle");
+  const [renameValue, setRenameValue] = useState(alias);
+  const [plan, setPlan] = useState<DeletePlan | null>(null);
+  const [busy, setBusy] = useState(false);
 
-  useEffect(() => {
-    if (!armed) return;
-    const timer = setTimeout(() => setArmed(false), 3000);
-    return () => clearTimeout(timer);
-  }, [armed]);
+  const toErr = (err: unknown) =>
+    err instanceof ApiError
+      ? `[${err.envelope.code}] ${err.envelope.message}`
+      : err instanceof Error
+        ? err.message
+        : String(err);
 
-  const onTrashClick = (e: React.MouseEvent) => {
+  const startRename = (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (!armed) {
-      setArmed(true);
+    setRenameValue(alias);
+    setMode("renaming");
+  };
+  const commitRename = () => {
+    const to = renameValue.trim();
+    if (!to || to === alias) {
+      setMode("idle");
       return;
     }
-    setDeleting(true);
-    deleteMapKey(mapPath, alias)
-      .then(() => {
-        onDeleted();
-      })
-      .catch((err) => {
-        onDeleteError(
-          err instanceof ApiError
-            ? `[${err.envelope.code}] ${err.envelope.message}`
-            : err instanceof Error
-              ? err.message
-              : String(err),
-        );
-      })
+    setBusy(true);
+    renameMapKey(mapPath, alias, to)
+      .then((res) => onRenamed(to, res.warnings ?? []))
+      .catch((err) => onDeleteError(toErr(err)))
       .finally(() => {
-        setDeleting(false);
-        setArmed(false);
+        setBusy(false);
+        setMode("idle");
       });
   };
+
+  const startDelete = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setPlan(null);
+    setMode("confirm-delete");
+    getDeletePlan(mapPath, alias)
+      .then(setPlan)
+      .catch((err) => {
+        onDeleteError(toErr(err));
+        setMode("idle");
+      });
+  };
+  const commitDelete = () => {
+    setBusy(true);
+    deleteMapKey(mapPath, alias)
+      .then(() => onDeleted())
+      .catch((err) => onDeleteError(toErr(err)))
+      .finally(() => {
+        setBusy(false);
+        setMode("idle");
+      });
+  };
+
+  if (mode === "renaming") {
+    return (
+      <div className="w-full flex items-center gap-2 px-4 py-3">
+        <input
+          autoFocus
+          type="text"
+          value={renameValue}
+          onChange={(e) => setRenameValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commitRename();
+            if (e.key === "Escape") setMode("idle");
+          }}
+          disabled={busy}
+          className="input-electric flex-1 px-3 py-1.5 text-sm"
+        />
+        <button type="button" onClick={commitRename} disabled={busy} title={t("common.save")} className="btn-icon flex-shrink-0">
+          <Check className="h-4 w-4" />
+        </button>
+        <button type="button" onClick={() => setMode("idle")} disabled={busy} title={t("common.cancel")} className="btn-icon flex-shrink-0">
+          <X className="h-4 w-4" />
+        </button>
+      </div>
+    );
+  }
+
+  if (mode === "confirm-delete") {
+    const blocked = plan != null && !plan.allowed;
+    return (
+      <div className="w-full flex flex-col gap-2 px-4 py-3 bg-pc-elevated/40">
+        <div className="flex items-center justify-between gap-3">
+          <span className="font-medium text-pc-text text-sm">{alias}</span>
+          <button type="button" onClick={() => setMode("idle")} title={t("common.cancel")} className="btn-icon flex-shrink-0">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        {plan == null ? (
+          <span className="text-xs text-pc-text-muted">{t("config.delete_checking")}</span>
+        ) : blocked ? (
+          <div className="text-xs text-status-error">
+            {plan.blockers.length > 0 && (
+              <>
+                <div className="font-medium">{t("config.delete_blocked")}</div>
+                <ul className="mt-1 space-y-0.5">
+                  {plan.blockers.map((b) => (
+                    <li key={b.path}>
+                      <code>{b.path}</code>
+                    </li>
+                  ))}
+                </ul>
+              </>
+            )}
+            {plan.live_acp_sessions ? (
+              <div className={plan.blockers.length > 0 ? "mt-1" : ""}>
+                {plan.live_acp_sessions} {t("config.delete_live_acp")}
+              </div>
+            ) : null}
+          </div>
+        ) : (
+          <div className="text-xs text-pc-text-secondary space-y-1">
+            {plan.scrubs.length > 0 ? (
+              <div>
+                <div>{t("config.delete_scrubs")}</div>
+                <ul className="mt-0.5 space-y-0.5">
+                  {plan.scrubs.map((s) => (
+                    <li key={s.path}>
+                      <code className="text-pc-text-faint">{s.path}</code>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : !plan.cascades_owned_state ? (
+              <div className="text-pc-text-muted">{t("config.delete_no_refs")}</div>
+            ) : null}
+            {plan.cascades_owned_state ? <div>{t("config.delete_owned_state")}</div> : null}
+          </div>
+        )}
+        {plan != null && !blocked && (
+          <div className="flex items-center gap-2 pt-1">
+            <button
+              type="button"
+              onClick={commitDelete}
+              disabled={busy}
+              className="text-xs px-2 py-1 rounded border border-status-error/40 text-status-error"
+            >
+              {busy ? t("config.delete_deleting") : t("config.delete_confirm")}
+            </button>
+            <button type="button" onClick={() => setMode("idle")} disabled={busy} className="text-xs px-2 py-1 text-pc-text-muted">
+              {t("common.cancel")}
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="w-full flex items-center justify-between gap-3 px-4 py-3 text-sm transition-colors hover:bg-pc-elevated/50">
@@ -1327,21 +1455,11 @@ function AliasRow({
         </div>
         <ChevronRight className="h-4 w-4 flex-shrink-0 text-pc-text-muted" />
       </button>
-      <button
-        type="button"
-        onClick={onTrashClick}
-        disabled={deleting}
-        title={armed ? t("config.confirm_delete_title") : t("config.delete_alias_title")}
-        className={[
-          "btn-icon flex-shrink-0",
-          armed ? "text-status-error border-status-error/40" : "",
-        ].join(" ")}
-      >
-        {armed ? (
-          <span className="text-xs px-1">{t("common.confirm")}</span>
-        ) : (
-          <Trash2 className="h-4 w-4" />
-        )}
+      <button type="button" onClick={startRename} title={t("config.rename_alias_title")} className="btn-icon flex-shrink-0">
+        <Pencil className="h-4 w-4" />
+      </button>
+      <button type="button" onClick={startDelete} title={t("config.delete_alias_title")} className="btn-icon flex-shrink-0">
+        <Trash2 className="h-4 w-4" />
       </button>
     </div>
   );
