@@ -895,9 +895,10 @@ fn first_alias<'a>(aliases: impl Iterator<Item = &'a String>) -> Option<String> 
 /// full static catalog with the `is_some()` snapshot, so we get the
 /// closed-kind list without depending on configured state.
 fn tunnel_provider_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
-    let active = cfg
-        .get_prop("tunnel.tunnel-provider")
-        .unwrap_or_default();
+    // The canonical prop name uses an underscore (`tunnel_provider`); the
+    // hyphenated form is unknown to get_prop and silently yields "" (no active
+    // provider ever badged).
+    let active = cfg.get_prop("tunnel.tunnel_provider").unwrap_or_default();
     let mut items = vec![PickerItem {
         key: "none".to_string(),
         label: "none".to_string(),
@@ -1615,8 +1616,7 @@ mod tests {
     fn tunnel_picker_surfaces_all_option_backed_providers_on_fresh_config() {
         let cfg = empty_cfg();
         let items = tunnel_provider_picker(&cfg);
-        let keys: std::collections::BTreeSet<&str> =
-            items.iter().map(|i| i.key.as_str()).collect();
+        let keys: std::collections::BTreeSet<&str> = items.iter().map(|i| i.key.as_str()).collect();
         for required in [
             "none",
             "cloudflare",
@@ -1643,8 +1643,9 @@ mod tests {
         // stays None — only `tunnel.tunnel-provider` is what marks
         // "active" in the picker. The provider is statically known from
         // the schema regardless of the Option being Some/None.
-        cfg.set_prop_persistent("tunnel.tunnel-provider", "tailscale")
-            .expect("tunnel.tunnel-provider is a known string prop");
+        // Set the active-provider field directly; the picker reads it via
+        // get_prop. Avoids writing the developer's real config in the test.
+        cfg.tunnel.tunnel_provider = "tailscale".to_string();
         let items = tunnel_provider_picker(&cfg);
         let active: Vec<&str> = items
             .iter()
@@ -1669,14 +1670,10 @@ mod tests {
     #[test]
     fn tunnel_picker_badges_present_option_fields_as_configured() {
         let mut cfg = empty_cfg();
-        cfg.set_prop_persistent("tunnel.tunnel-provider", "cloudflare")
-            .expect("tunnel.tunnel-provider is a known string prop");
-        // Simulate the user entering credentials: setting a property
-        // under `tunnel.cloudflare.*` materializes the nested Option
-        // (the macros turn `set_prop` into `Some(value)` when the
-        // section starts at None and the path is nested).
-        cfg.set_prop_persistent("tunnel.cloudflare.token", "fake-token")
-            .expect("tunnel.cloudflare.token should materialize the cloudflare nested option");
+        cfg.tunnel.tunnel_provider = "cloudflare".to_string();
+        // Materialize the cloudflare nested Option directly so the picker sees
+        // it as present, without writing the developer's real config.
+        cfg.tunnel.cloudflare = Some(zeroclaw_config::schema::CloudflareTunnelConfig::default());
         let items = tunnel_provider_picker(&cfg);
         let cloudflare = items
             .iter()
