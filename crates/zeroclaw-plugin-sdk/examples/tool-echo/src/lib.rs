@@ -1,38 +1,22 @@
-use zeroclaw_plugin_sdk::bindings::tool::exports::zeroclaw::plugin::{plugin_info, tool};
+use zeroclaw_plugin_sdk::tool::{ToolMetadata, ToolPlugin, ToolResult, ToolResultExt};
 
-struct Component;
+struct Echo;
 
-impl tool::Guest for Component {
-    fn name() -> String {
-        "echo".to_string()
+impl ToolPlugin for Echo {
+    fn metadata() -> ToolMetadata {
+        ToolMetadata::new("echo", "Echoes its input argument back as the tool output.")
+            .parameters_schema(
+                r#"{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}"#,
+            )
     }
 
-    fn description() -> String {
-        "Echoes its input argument back as the tool output.".to_string()
+    fn plugin_info() -> (&'static str, &'static str) {
+        ("tool-echo", "0.1.0")
     }
 
-    fn parameters_schema() -> String {
-        r#"{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}"#
-            .to_string()
-    }
-
-    fn execute(args: String) -> Result<tool::ToolResult, String> {
-        Ok(tool::ToolResult {
-            success: true,
-            output: args,
-            error: None,
-        })
+    fn execute(args: String) -> Result<ToolResult, String> {
+        Ok(ToolResult::ok(args))
     }
 }
 
-impl plugin_info::Guest for Component {
-    fn plugin_name() -> String {
-        "tool-echo".to_string()
-    }
-
-    fn plugin_version() -> String {
-        "0.1.0".to_string()
-    }
-}
-
-zeroclaw_plugin_sdk::bindings::tool::export!(Component with_types_in zeroclaw_plugin_sdk::bindings::tool);
+zeroclaw_plugin_sdk::export_tool!(Echo);
