@@ -4242,7 +4242,7 @@ mod tests {
             OpenAIModelProviderConfig {
                 base: ModelProviderConfig {
                     model: Some("gpt-4o".to_string()),
-                    api_key: Some("openai-key".to_string()),
+                    api_key: Some("fake-openai-key-not-real".to_string()),
                     max_tokens: Some(16_384),
                     ..ModelProviderConfig::default()
                 },
@@ -4255,7 +4255,7 @@ mod tests {
             AnthropicModelProviderConfig {
                 base: ModelProviderConfig {
                     model: Some("claude-sonnet-4".to_string()),
-                    api_key: Some("anthropic-key".to_string()),
+                    api_key: Some("fake-anthropic-key-not-real".to_string()),
                     max_tokens: Some(8_192),
                     ..ModelProviderConfig::default()
                 },
