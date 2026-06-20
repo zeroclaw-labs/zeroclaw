@@ -22,6 +22,7 @@
 /docs/superpowers/specs
 .secrets
 firmware/*/target
+crates/zeroclaw-plugin-sdk/examples/*/target
 web/dist/*
 !web/dist/.gitkeep
 
