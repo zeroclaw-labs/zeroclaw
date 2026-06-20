@@ -495,10 +495,22 @@ export function listProps(prefix?: string): Promise<ListResponse> {
   return apiFetch<ListResponse>(`/api/config/list${q}`);
 }
 
-export async function patchConfig(ops: PatchOp[]): Promise<PatchResponse> {
+export async function patchConfig(
+  ops: PatchOp[],
+  opts?: {
+    /** Send `X-ZeroClaw-Override-Drift: true` so the server overwrites the
+     *  on-disk file even when it has drifted from in-memory state on a patched
+     *  path (otherwise that returns 409 `config_changed_externally`). Use only
+     *  after the operator has chosen to overwrite a known drift. */
+    overrideDrift?: boolean;
+  },
+): Promise<PatchResponse> {
   const result = await apiFetch<PatchResponse>("/api/config", {
     method: "PATCH",
     body: JSON.stringify(ops),
+    ...(opts?.overrideDrift
+      ? { headers: { "X-ZeroClaw-Override-Drift": "true" } }
+      : {}),
   });
   // Config structure changed: notify listeners (e.g. the ⌘K search index)
   // so they can invalidate caches. Decoupled via a browser event to avoid a
