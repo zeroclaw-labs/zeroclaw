@@ -1,7 +1,7 @@
 import { SkillCard } from '@/components/SkillCard';
-import { listSkillBundles, listSkillsInBundle, readSkill } from '@/lib/api';
+import { getAgentOptions, listAgentSkills, readSkill } from '@/lib/api';
 import { t } from '@/lib/i18n';
-import type { SkillBundleEntry, SkillDocument, SkillEntry } from '@/lib/api';
+import type { AgentSkillEntry, SkillDocument } from '@/lib/api';
 import {
   BookOpen,
   RefreshCw,
@@ -10,8 +10,9 @@ import {
 import { useCallback, useEffect, useState } from 'react';
 
 export default function Skills() {
-  const [bundles, setBundles] = useState<SkillBundleEntry[]>([]);
-  const [skillsByBundle, setSkillsByBundle] = useState<Record<string, SkillEntry[]>>({});
+  const [agents, setAgents] = useState<string[]>([]);
+  const [selectedAlias, setSelectedAlias] = useState<string>('');
+  const [skills, setSkills] = useState<AgentSkillEntry[]>([]);
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(true);
   const [reloading, setReloading] = useState(false);
@@ -19,45 +20,54 @@ export default function Skills() {
   const [expandedKey, setExpandedKey] = useState<string | null>(null);
   const [detailMap, setDetailMap] = useState<Record<string, SkillDocument>>({});
 
-  const loadBundles = useCallback(() => {
-    return listSkillBundles()
-      .then(({ bundles: bs }) => {
-        setBundles(bs);
-        return Promise.all(
-          bs.map((b) =>
-            listSkillsInBundle(b.alias).then(({ skills }) => ({ alias: b.alias, skills })),
-          ),
-        );
+  // Load the agent list once; default to the first agent.
+  useEffect(() => {
+    let cancelled = false;
+    getAgentOptions()
+      .then(({ agents: as }) => {
+        if (cancelled) return;
+        setAgents(as);
+        setSelectedAlias((prev) => prev || as[0] || '');
+        if (as.length === 0) setLoading(false);
       })
-      .then((results) => {
-        const map: Record<string, SkillEntry[]> = {};
-        for (const { alias, skills } of results) {
-          map[alias] = skills;
-        }
-        setSkillsByBundle(map);
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setError(err instanceof Error ? err.message : String(err));
+        setLoading(false);
       });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  const fetchAll = useCallback(() => {
+  const loadSkills = useCallback((alias: string) => {
+    return listAgentSkills(alias).then(({ skills: ss }) => {
+      setSkills(ss);
+    });
+  }, []);
+
+  // Re-fetch whenever the selected agent changes.
+  useEffect(() => {
+    if (!selectedAlias) return;
     setLoading(true);
     setError(null);
-    loadBundles()
+    setExpandedKey(null);
+    loadSkills(selectedAlias)
       .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)))
       .finally(() => setLoading(false));
-  }, [loadBundles]);
-
-  useEffect(() => {
-    fetchAll();
-  }, [fetchAll]);
+  }, [selectedAlias, loadSkills]);
 
   const handleReload = () => {
+    if (!selectedAlias) return;
     setReloading(true);
-    loadBundles()
+    loadSkills(selectedAlias)
       .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)))
       .finally(() => setReloading(false));
   };
 
-  const handleExpand = (skill: SkillEntry) => {
+  // Only bundle skills can be expanded — detail comes from the bundle endpoint.
+  const handleExpand = (skill: AgentSkillEntry) => {
+    if (!skill.editable || !skill.bundle) return;
     const key = `${skill.bundle}/${skill.name}`;
     if (expandedKey === key) {
       setExpandedKey(null);
@@ -71,15 +81,19 @@ export default function Skills() {
     }
   };
 
-  const allSkills = bundles.flatMap((b) => skillsByBundle[b.alias] ?? []);
+  const skillKey = (skill: AgentSkillEntry): string =>
+    skill.editable && skill.bundle
+      ? `${skill.bundle}/${skill.name}`
+      : `${skill.origin}:${skill.plugin ?? ''}/${skill.name}`;
 
-  const filtered = allSkills.filter((s) => {
+  const filtered = skills.filter((s) => {
     const q = search.toLowerCase();
     return (
       s.name.toLowerCase().includes(q) ||
-      s.frontmatter.description.toLowerCase().includes(q) ||
-      s.bundle.toLowerCase().includes(q) ||
-      (s.frontmatter.category ?? '').toLowerCase().includes(q)
+      s.description.toLowerCase().includes(q) ||
+      s.origin.toLowerCase().includes(q) ||
+      (s.bundle ?? '').toLowerCase().includes(q) ||
+      (s.plugin ?? '').toLowerCase().includes(q)
     );
   });
 
@@ -115,18 +129,34 @@ export default function Skills() {
     <div className="p-6 space-y-6 animate-fade-in">
       {/* Header row */}
       <div className="flex items-center justify-between gap-4 flex-wrap">
-        <div className="relative max-w-md flex-1">
-          <Search
-            className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4"
-            style={{ color: 'var(--pc-text-faint)' }}
-          />
-          <input
-            type="text"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder={t('skills.search')}
-            className="input-electric w-full pl-10 pr-4 py-2.5 text-sm"
-          />
+        <div className="flex items-center gap-3 flex-1 flex-wrap">
+          <select
+            value={selectedAlias}
+            onChange={(e) => setSelectedAlias(e.target.value)}
+            className="input-electric px-3 py-2.5 text-sm"
+            aria-label={t('skills.agent')}
+            title={t('skills.agent')}
+          >
+            {agents.map((a) => (
+              <option key={a} value={a}>
+                {a}
+              </option>
+            ))}
+          </select>
+
+          <div className="relative max-w-md flex-1">
+            <Search
+              className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4"
+              style={{ color: 'var(--pc-text-faint)' }}
+            />
+            <input
+              type="text"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder={t('skills.search')}
+              className="input-electric w-full pl-10 pr-4 py-2.5 text-sm"
+            />
+          </div>
         </div>
 
         <button
@@ -162,7 +192,7 @@ export default function Skills() {
       {/* Skill cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 stagger-children">
         {filtered.map((skill) => {
-          const key = `${skill.bundle}/${skill.name}`;
+          const key = skillKey(skill);
           const isExpanded = expandedKey === key;
           const detail = detailMap[key];
 
@@ -170,7 +200,7 @@ export default function Skills() {
             <SkillCard
               key={key}
               skill={skill}
-              onExpand={handleExpand}
+              onExpand={skill.editable ? handleExpand : undefined}
               isExpanded={isExpanded}
               skillDetail={detail}
             />
