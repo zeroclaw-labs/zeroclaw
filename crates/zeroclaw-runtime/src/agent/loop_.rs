@@ -403,6 +403,25 @@ fn compute_excluded_mcp_tools(
         .collect()
 }
 
+fn native_tool_specs_present_for_turn(
+    model_provider: &dyn ModelProvider,
+    tools_registry: &[Box<dyn Tool>],
+    excluded_tools: &[String],
+    activated_tools: Option<&Arc<Mutex<crate::tools::ActivatedToolSet>>>,
+) -> Result<bool> {
+    if !model_provider.supports_native_tools() {
+        return Ok(false);
+    }
+
+    let iteration_tool_specs = super::turn::build_iteration_tool_specs(
+        model_provider,
+        tools_registry,
+        excluded_tools,
+        activated_tools,
+    )?;
+    Ok(!iteration_tool_specs.tool_specs.is_empty())
+}
+
 /// Build a `query_summary` field for memory observability events from a raw
 /// user query.
 ///
@@ -1492,6 +1511,18 @@ pub async fn run(
             None
         };
         let native_tools = model_provider.supports_native_tools();
+        let prompt_excluded_tools = message
+            .as_deref()
+            .map(|msg| {
+                compute_excluded_mcp_tools(&tools_registry, &agent.resolved.tool_filter_groups, msg)
+            })
+            .unwrap_or_default();
+        let native_tool_specs_present = native_tool_specs_present_for_turn(
+            model_provider.as_ref(),
+            &tools_registry,
+            &prompt_excluded_tools,
+            activated_handle.as_ref(),
+        )?;
         let expose_text_tool_protocol = apply_text_tool_prompt_policy(
             native_tools,
             agent.resolved.strict_tool_parsing,
@@ -1508,7 +1539,7 @@ pub async fn run(
                 Some(&agent.identity),
                 bootstrap_max_chars,
                 Some(&risk_profile),
-                native_tools,
+                native_tool_specs_present,
                 config.skills.prompt_injection_mode,
                 eff_compact_context,
                 eff_max_system_prompt_chars,
@@ -2923,6 +2954,12 @@ pub async fn process_message(
             None
         };
         let native_tools = model_provider.supports_native_tools();
+        let native_tool_specs_present = native_tool_specs_present_for_turn(
+            model_provider.as_ref(),
+            &tools_registry,
+            &excluded_tools,
+            activated_handle_pm.as_ref(),
+        )?;
         let expose_text_tool_protocol = apply_text_tool_prompt_policy(
             native_tools,
             agent.resolved.strict_tool_parsing,
@@ -2939,7 +2976,7 @@ pub async fn process_message(
                 Some(&agent.identity),
                 bootstrap_max_chars,
                 Some(&risk_profile),
-                native_tools,
+                native_tool_specs_present,
                 config.skills.prompt_injection_mode,
                 eff_compact_context,
                 eff_max_system_prompt_chars,
@@ -10583,9 +10620,10 @@ Let me check the result."#;
         assert_eq!(history[1].content, "recent");
     }
 
-    /// When `build_system_prompt_with_mode` is called with `native_tools = true`,
-    /// the output must contain ZERO XML protocol artifacts and must not inject
-    /// the duplicate non-native tools summary.
+    /// When `build_system_prompt_with_mode` is called with
+    /// `native_tool_specs_present = true`, the output must contain ZERO XML
+    /// protocol artifacts and must not inject the duplicate non-native tools
+    /// summary.
     #[test]
     fn native_tools_system_prompt_contains_zero_xml() {
         use crate::agent::system_prompt::build_system_prompt_with_mode;
@@ -10603,7 +10641,7 @@ Let me check the result."#;
             &[],  // no skills
             None, // no identity config
             None, // no bootstrap_max_chars
-            true, // native_tools
+            true, // native_tool_specs_present
             zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             crate::security::AutonomyLevel::default(),
         );
@@ -10638,6 +10676,101 @@ Let me check the result."#;
         assert!(
             system_prompt.contains("## Your Task"),
             "Native prompt should contain task instructions"
+        );
+    }
+
+    #[test]
+    fn native_tool_specs_prompt_allows_actions_without_text_tools() {
+        use crate::agent::system_prompt::build_system_prompt_with_mode;
+
+        let workspace = tempdir().unwrap();
+        let provider =
+            ScriptedModelProvider::from_text_responses(vec!["ok"]).with_native_tool_support();
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn crate::tools::Tool>> =
+            vec![Box::new(CountingTool::new("shell", invocations))];
+
+        let native_tool_specs_present =
+            super::native_tool_specs_present_for_turn(&provider, &tools_registry, &[], None)
+                .expect("native spec availability should be derivable");
+        assert!(native_tool_specs_present);
+
+        let system_prompt = build_system_prompt_with_mode(
+            workspace.path(),
+            "test-model",
+            &[],
+            &[],
+            None,
+            None,
+            native_tool_specs_present,
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            crate::security::AutonomyLevel::default(),
+        );
+
+        assert!(
+            !system_prompt.contains("No tools are available"),
+            "Native prompt with effective native specs must not deny tool availability"
+        );
+        assert!(
+            system_prompt.contains("Use tools when the request requires action"),
+            "Native prompt with effective native specs should authorize action tool use"
+        );
+    }
+
+    #[test]
+    fn native_capable_provider_with_zero_effective_tools_keeps_no_tools_boundary() {
+        use crate::agent::system_prompt::build_system_prompt_with_mode;
+
+        let provider =
+            ScriptedModelProvider::from_text_responses(vec!["ok"]).with_native_tool_support();
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn crate::tools::Tool>> =
+            vec![Box::new(CountingTool::new("shell", invocations))];
+        let excluded_tools = vec!["shell".to_string()];
+
+        let native_tool_specs_present = super::native_tool_specs_present_for_turn(
+            &provider,
+            &tools_registry,
+            &excluded_tools,
+            None,
+        )
+        .expect("native spec availability should be derivable");
+        assert!(!native_tool_specs_present);
+
+        let system_prompt = build_system_prompt_with_mode(
+            std::path::Path::new("/tmp"),
+            "test-model",
+            &[],
+            &[],
+            None,
+            None,
+            native_tool_specs_present,
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            crate::security::AutonomyLevel::default(),
+        );
+
+        assert!(
+            system_prompt.contains("No tools are available for this turn"),
+            "Native-capable providers with zero effective specs must keep the no-tools boundary"
+        );
+    }
+
+    #[test]
+    fn native_tool_specs_present_signal_uses_effective_specs_not_provider_capability() {
+        let provider =
+            ScriptedModelProvider::from_text_responses(vec!["ok"]).with_native_tool_support();
+        assert!(zeroclaw_providers::ModelProvider::supports_native_tools(
+            &provider
+        ));
+
+        let no_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let native_tool_specs_present =
+            super::native_tool_specs_present_for_turn(&provider, &no_tools, &[], None)
+                .expect("native spec availability should be derivable");
+
+        assert!(
+            !native_tool_specs_present,
+            "Provider native-tool capability alone must not imply tools are available"
         );
     }
 
