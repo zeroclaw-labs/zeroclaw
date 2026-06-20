@@ -25,7 +25,7 @@ export default function EntityEnabledToggle({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // The drift guard (409 `config_changed_externally`) fires when the on-disk
-  // config has diverged from the daemon's in-memory state on this path — e.g. a
+  // config has diverged from the daemon's in-memory state on this path, e.g. a
   // hand-edit, or a daemon left running across an external config write. Track
   // it separately from generic errors so the operator gets an explicit
   // "overwrite" affordance instead of a cryptic "save failed" that silently
