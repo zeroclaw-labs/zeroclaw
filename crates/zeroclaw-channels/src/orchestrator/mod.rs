@@ -6897,15 +6897,30 @@ fn channel_ref_matches_message_channel(channel_ref: &str, message_channel: &str)
 /// An empty set means no enabled agent declared channel bindings, so
 /// collection falls back to legacy behavior and accepts all enabled channels.
 struct ActiveChannelAliases {
-    /// Set of `<type>.<alias>` channel references from enabled agents.
-    aliases: HashSet<String>,
+    /// `<type>.<alias>` declared by ENABLED agents. Drives `contains` in
+    /// explicit-binding mode: only enabled owners' bindings count.
+    enabled_bindings: HashSet<String>,
+    /// `<type>.<alias>` declared by ALL agents (enabled or disabled).
+    /// Distinguishes "true legacy fallback" (no bindings anywhere) from
+    /// "bindings exist but every owner is disabled" — the #8013 bug path.
+    /// When non-empty and `enabled_bindings` is empty, legacy mode must
+    /// NOT fire; otherwise disabled owners would still bring their bound
+    /// channels online.
+    all_known_bindings: HashSet<String>,
 }
 
 impl ActiveChannelAliases {
     /// Returns true when `channel_ref` is explicitly bound, or when there are
-    /// no explicit bindings and legacy "accept all enabled channels" mode applies.
+    /// no explicit bindings anywhere and legacy "accept all enabled channels"
+    /// mode applies.
     fn contains(&self, channel_ref: &str) -> bool {
-        self.aliases.is_empty() || self.aliases.contains(channel_ref)
+        self.all_known_bindings.is_empty() || self.enabled_bindings.contains(channel_ref)
+    }
+
+    /// True when bindings exist somewhere in the config but every owner is
+    /// `enabled = false`. The #8013 bug fires when this returns true.
+    fn disabled_owners_exist(&self) -> bool {
+        !self.all_known_bindings.is_empty() && self.enabled_bindings.is_empty()
     }
 }
 
@@ -6990,13 +7005,32 @@ fn collect_configured_channels(
     let config = config_arc.read();
 
     let active_channel_aliases = ActiveChannelAliases {
-        aliases: config
+        enabled_bindings: config
             .agents
             .values()
             .filter(|a| a.enabled)
             .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
             .collect(),
+        all_known_bindings: config
+            .agents
+            .values()
+            .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
+            .collect(),
     };
+
+    if active_channel_aliases.disabled_owners_exist() {
+        let skipped: Vec<&String> = active_channel_aliases.all_known_bindings.iter().collect();
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "skipped_bindings": skipped.len(),
+                    "bindings": skipped,
+                })),
+            "channel binding(s) skipped: all owning agent(s) are disabled (#8013)"
+        );
+    }
 
     #[cfg(feature = "channel-telegram")]
     for (alias, tg) in &config.channels.telegram {
@@ -8455,6 +8489,17 @@ fn collect_configured_channels(
         );
     }
 
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({
+                "activated_bindings": active_channel_aliases.enabled_bindings.len(),
+                "bindings": active_channel_aliases.enabled_bindings.iter().collect::<Vec<_>>(),
+            })),
+        "channel binding(s) activated from enabled agents"
+    );
+
     channels
 }
 
@@ -8594,16 +8639,32 @@ fn build_owner_by_channel_key(
         }
     }
 
-    // Legacy fallback mode: when no enabled agent declares channel bindings,
-    // channel collection accepts all enabled channels. Those channels must
-    // also be routable, so bind collected channel keys to the runtime-active
-    // agent selection (explicit `"default"` alias when present, else
-    // lexicographically-smallest enabled alias).
-    // `owner_by_channel_key.is_empty()` means every enabled agent had an
-    // empty `agents.<alias>.channels` list; this is the same "legacy mode"
-    // signal used by `collect_configured_channels` to accept all enabled
-    // channel blocks.
-    if owner_by_channel_key.is_empty() && !collected_channel_keys.is_empty() {
+    // Distinguish "no enabled agent declared bindings" (true legacy mode)
+    // from "bindings exist but every owner is disabled" (active skip — see
+    // #8013). In the second case, we deliberately leave `owner_by_channel_key`
+    // empty so `AgentRouter::resolve` falls through and the inbound message
+    // is dropped at line 5667, instead of being silently routed to a
+    // now-disabled agent.
+    let any_binding_declared_anywhere = config.agents.values().any(|a| !a.channels.is_empty());
+
+    if any_binding_declared_anywhere {
+        if owner_by_channel_key.is_empty() && !collected_channel_keys.is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "channel bindings exist but no owning agent is enabled; \
+                 affected channels will be unbound and inbound messages dropped (#8013)"
+            );
+        }
+        return owner_by_channel_key;
+    }
+
+    // True legacy mode: no agent anywhere declares a binding. Preserve the
+    // existing deterministic fallback so on-disk session hydration and the
+    // pre-existing `build_owner_by_channel_key_legacy_fallback_*` tests
+    // continue to work.
+    if !collected_channel_keys.is_empty() {
         let fallback_owner = config
             .resolved_runtime_agent_alias()
             .filter(|alias| enabled_agents.iter().any(|enabled| enabled == *alias))
@@ -18434,6 +18495,174 @@ This is an example JSON object for profile settings."#;
                 .iter()
                 .any(|entry| entry.display_name == "Mattermost"),
             "enabled channels should still load when no enabled agent declares channel bindings"
+        );
+    }
+
+    // ----------------------------------------------------------
+    // Pinned regression for issue #8013: disabling an agent must
+    // stop its bound Discord channel from staying online. The
+    // legacy fallback in `ActiveChannelAliases::contains` used to
+    // collapse "no bindings anywhere" with "all explicit owners are
+    // disabled" — these tests pin both states.
+    // ----------------------------------------------------------
+
+    #[cfg(feature = "channel-discord")]
+    #[test]
+    fn collect_configured_channels_skips_channel_when_only_owner_is_disabled() {
+        // T1 — the bug path: an explicit binding exists, but the
+        // owner agent is `enabled = false`. Legacy fallback must NOT
+        // bring the channel online.
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "disco".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: false,
+                channels: vec!["discord.default".into()],
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "test-token".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[]);
+
+        assert!(
+            !channels.iter().any(|entry| entry.display_name == "Discord"),
+            "disabled-owner channel must not be collected (#8013)"
+        );
+    }
+
+    #[cfg(feature = "channel-discord")]
+    #[test]
+    fn collect_configured_channels_legacy_accepts_all_when_no_bindings_declared() {
+        // T2 — the legacy fallback: an enabled agent with no `channels`
+        // list (empty bindings). All enabled channels still load. Pins
+        // the same contract as
+        // `collect_configured_channels_falls_back_when_agent_bindings_missing`
+        // but mirrors it onto Discord so the surface stays obvious.
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "legacy".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![],
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "test-token".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[]);
+
+        assert!(
+            channels.iter().any(|entry| entry.display_name == "Discord"),
+            "no-bindings-anywhere must still trigger the legacy fallback"
+        );
+    }
+
+    #[cfg(feature = "channel-discord")]
+    #[test]
+    fn collect_configured_channels_respects_mixed_enabled_and_disabled_owners() {
+        // T3 — two bound channels, one owner enabled (keeper) and one
+        // owner disabled (loser). Only the enabled owner's channel
+        // comes online.
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "keeper".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["discord.a".into()],
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "loser".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: false,
+                channels: vec!["discord.b".into()],
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "a".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "token-a".to_string(),
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "b".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "token-b".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[]);
+
+        let discord_channels: Vec<_> = channels
+            .iter()
+            .filter(|entry| entry.display_name == "Discord")
+            .collect();
+        assert_eq!(
+            discord_channels.len(),
+            1,
+            "exactly one Discord channel should be active when only one owner is enabled"
+        );
+        assert_eq!(
+            discord_channels[0].alias.as_deref(),
+            Some("a"),
+            "only the enabled owner's channel should be active"
+        );
+    }
+
+    #[test]
+    fn build_owner_by_channel_key_skips_disabled_owners() {
+        // T4 — reload contract: when an admin flips an agent to
+        // `enabled = false` and the daemon re-runs `start_channels`,
+        // the resulting owner map must NOT bind the now-disabled
+        // owner's channel to any agent (legacy fallback must not fire
+        // because at least one binding exists in the config). Pairs
+        // with `build_owner_by_channel_key_legacy_fallback_is_deterministic_without_default`
+        // to pin both branches of the discriminator.
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "loser".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: false,
+                channels: vec!["discord.b".into()],
+                ..Default::default()
+            },
+        );
+
+        // Reload passes an empty enabled_agents slice because the only
+        // owner is disabled.
+        let owners = build_owner_by_channel_key(&config, &[], &["discord.b".to_string()]);
+
+        assert!(
+            owners.is_empty(),
+            "disabled-owner channels must not be rebound to any fallback agent (#8013)"
         );
     }
 
