@@ -2409,16 +2409,16 @@ pub async fn run(
                             crate::i18n::get_required_cli_string_with_args(
                                 "cli-agent-context-bar",
                                 &[
-                                    ("used", &format_tokens(usage.input_tokens).as_str()),
-                                    ("max", &format_tokens(max_ctx).as_str()),
+                                    ("used", format_tokens(usage.input_tokens).as_str()),
+                                    ("max", format_tokens(max_ctx).as_str()),
                                     ("bar", &bar),
-                                    ("pct", &format!("{:.0}", pct).as_str()),
+                                    ("pct", format!("{:.0}", pct).as_str()),
                                 ],
                             )
                         } else {
                             crate::i18n::get_required_cli_string_with_args(
                                 "cli-agent-context-bar-unknown",
-                                &[("max", &format_tokens(max_ctx).as_str())],
+                                &[("max", format_tokens(max_ctx).as_str())],
                             )
                         };
                         eprintln!("\x1b[2m{}\x1b[0m", msg);

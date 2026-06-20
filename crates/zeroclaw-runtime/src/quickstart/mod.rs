@@ -1084,15 +1084,15 @@ fn apply_model_provider(
                 uri: config.get_prop(&format!("{prefix}.uri")).ok(),
                 ..Default::default()
             };
-            if tokio::runtime::Handle::try_current().is_ok() {
-                if let Some(ctx) = tokio::task::block_in_place(|| {
+            if tokio::runtime::Handle::try_current().is_ok()
+                && let Some(ctx) = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(
                         zeroclaw_providers::fetch_context_window(&provider_type, &provider_config),
                     )
-                }) {
-                    let _ = config
-                        .set_prop_persistent(&format!("{prefix}.context_window"), &ctx.to_string());
-                }
+                })
+            {
+                let _ = config
+                    .set_prop_persistent(&format!("{prefix}.context_window"), &ctx.to_string());
             }
             Some(format!("{}.{}", provider_type, choice.alias))
         }

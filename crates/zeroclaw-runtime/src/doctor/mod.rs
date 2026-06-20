@@ -451,14 +451,10 @@ pub async fn update_context_windows(
 ) -> anyhow::Result<usize> {
     let mut updated = 0usize;
 
+    type ProviderTarget = (String, String, Option<String>, Option<String>, Option<usize>);
+
     // Collect all the data we need first to avoid borrow conflicts
-    let targets: Vec<(
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<usize>,
-    )> = if let Some(model_provider) = provider_override {
+    let targets: Vec<ProviderTarget> = if let Some(model_provider) = provider_override {
         // Single provider - use find_by_name to look up by "type.alias" format
         if let Some((_, _, entry)) = config.providers.models.find_by_name(model_provider) {
             vec![(
@@ -497,8 +493,8 @@ pub async fn update_context_windows(
                 crate::i18n::get_required_cli_string_with_args(
                     "cli-doctor-ctxwin-already-set",
                     &[
-                        ("provider_ref", &provider_ref.as_str()),
-                        ("ctx", &ctx.to_string())
+                        ("provider_ref", provider_ref.as_str()),
+                        ("ctx", ctx.to_string().as_str())
                     ],
                 )
             );
@@ -509,10 +505,10 @@ pub async fn update_context_windows(
         if model.is_empty() {
             println!(
                 "{}",
-                crate::i18n::get_required_cli_string_with_args(
-                    "cli-doctor-ctxwin-no-model",
-                    &[("provider_ref", &provider_ref.as_str())],
-                )
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-doctor-ctxwin-no-model",
+                &[("provider_ref", provider_ref.as_str())],
+            )
             );
             continue;
         }
@@ -536,13 +532,13 @@ pub async fn update_context_windows(
                 if dry_run {
                     println!(
                         "{}",
-                        crate::i18n::get_required_cli_string_with_args(
-                            "cli-doctor-ctxwin-would-set",
-                            &[
-                                ("provider_ref", &provider_ref.as_str()),
-                                ("ctx", &ctx.to_string())
-                            ],
-                        )
+                    crate::i18n::get_required_cli_string_with_args(
+                        "cli-doctor-ctxwin-would-set",
+                        &[
+                            ("provider_ref", provider_ref.as_str()),
+                            ("ctx", ctx.to_string().as_str())
+                        ],
+                    )
                     );
                 } else {
                     // Update the config - need to find and mutate
@@ -555,13 +551,13 @@ pub async fn update_context_windows(
                             updated += 1;
                             println!(
                                 "{}",
-                                crate::i18n::get_required_cli_string_with_args(
-                                    "cli-doctor-ctxwin-set",
-                                    &[
-                                        ("provider_ref", provider_ref.as_str()),
-                                        ("ctx", &ctx.to_string())
-                                    ],
-                                )
+                            crate::i18n::get_required_cli_string_with_args(
+                                "cli-doctor-ctxwin-set",
+                                &[
+                                    ("provider_ref", provider_ref.as_str()),
+                                    ("ctx", ctx.to_string().as_str())
+                                ],
+                            )
                             );
                             found = true;
                             break;
