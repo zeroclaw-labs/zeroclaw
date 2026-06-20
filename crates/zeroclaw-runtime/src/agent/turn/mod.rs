@@ -663,6 +663,8 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         // Relay only the portion of narration the live stream did not already
         // deliver: re-sending the whole thing duplicates it.
         if !display_text.is_empty() {
+            // `protocol_suppressed` withholds the whole turn; the empty-remainder
+            // skip below handles the guard-passed case where the live stream already forwarded every byte.
             if !native_tool_calls.is_empty()
                 && !protocol_suppressed
                 && let Some(ref tx) = on_delta
