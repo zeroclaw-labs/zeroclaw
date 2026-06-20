@@ -122,15 +122,19 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tempfile::TempDir;
-    use zeroclaw_config::schema::Config;
+    use zeroclaw_config::schema::{Config, SkillsConfig};
 
     fn config_for_tmp(tmp: &TempDir) -> Config {
-        let mut config = Config::default();
-        config.config_path = tmp.path().join("config.toml");
-        config.data_dir = tmp.path().join("data");
-        config.skills.open_skills_enabled = false;
-        config.skills.allow_scripts = false;
-        config
+        Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            skills: SkillsConfig {
+                open_skills_enabled: false,
+                allow_scripts: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
     }
 
     fn agent_workspace(config: &Config, agent_alias: &str) -> std::path::PathBuf {
