@@ -324,6 +324,35 @@ mod tests {
     }
 
     #[test]
+    fn filter_by_native_trace_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trace.jsonl");
+        let mut a = make_event("a", None);
+        a.trace_id = Some("turn-1".into());
+        let mut b = make_event("b", None);
+        b.trace_id = Some("turn-2".into());
+        let mut c = make_event("c", None);
+        c.trace_id = Some("turn-1".into());
+        write_jsonl(&path, &[a, b, c]);
+
+        // The exact turn matches its two rows...
+        let filter = LogFilter {
+            trace_id: Some("turn-1".into()),
+            ..Default::default()
+        };
+        assert_eq!(load_page(&path, &filter, 10).unwrap().events.len(), 2);
+
+        // ...and an unknown id matches nothing (the bug this fixes: before the
+        // layer promotion the native field was always None, so this returned 0
+        // for EVERY id, including real ones).
+        let filter = LogFilter {
+            trace_id: Some("turn-missing".into()),
+            ..Default::default()
+        };
+        assert_eq!(load_page(&path, &filter, 10).unwrap().events.len(), 0);
+    }
+
+    #[test]
     fn hide_internal_drops_internal_category() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("trace.jsonl");
