@@ -8628,6 +8628,27 @@ fn build_owner_by_channel_key(
     owner_by_channel_key
 }
 
+fn open_channel_session_backend(
+    config: &Config,
+) -> Result<Option<Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>> {
+    if !config.channels.session_persistence {
+        return Ok(None);
+    }
+
+    let backend = zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels)
+        .context("open configured channel session backend")?;
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        &format!(
+            "📂 Session persistence enabled (backend: {})",
+            config.channels.session_backend
+        )
+    );
+
+    Ok(Some(backend))
+}
+
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(
@@ -8706,34 +8727,7 @@ pub async fn start_channels(
     // Single session backend shared across agents — they're scoped by
     // `session_key` (which already encodes `<channel_type>.<alias>`), so
     // multiple agent ctxs reading the same backend never overlap.
-    let shared_session_store: Option<Arc<dyn zeroclaw_infra::session_backend::SessionBackend>> =
-        if config.channels.session_persistence {
-            match zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels) {
-                Ok(backend) => {
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                        &format!(
-                            "📂 Session persistence enabled (backend: {})",
-                            config.channels.session_backend
-                        )
-                    );
-                    Some(backend)
-                }
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "Session persistence disabled"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
+    let shared_session_store = open_channel_session_backend(&config)?;
 
     // Channel infrastructure (listeners, `channels_by_name`, the mpsc bus)
     // is built once inside the loop on the first iteration — the primary
@@ -8844,12 +8838,14 @@ pub async fn start_channels(
             &config.agents,
             provider_api_key.as_deref(),
             &config,
+            config.channels.session_persistence,
             canvas_store.clone(),
             false,
             None,
             sop_engine.clone(),
             sop_audit.clone(),
-        );
+        )
+        .with_context(|| format!("agents.{agent_alias}: build channel tool registry"))?;
         let mut built_tools = all_tools_result_ch.tools;
         let delegate_handle_ch = all_tools_result_ch.delegate_handle;
 
@@ -9967,6 +9963,54 @@ mod tests {
         assert!(
             msg.contains("zeroclaw quickstart"),
             "expected `zeroclaw quickstart` reference, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn channel_session_backend_off_switch_does_not_open_configured_backend() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.channels.session_persistence = false;
+        config.channels.session_backend = "postgres".to_string();
+
+        let backend = open_channel_session_backend(&config)
+            .expect("channel persistence off must not open the configured backend");
+
+        assert!(backend.is_none());
+        assert!(
+            !config.data_dir.join("sessions").exists(),
+            "disabled channel persistence must not create a session backend directory"
+        );
+    }
+
+    #[test]
+    fn channel_session_backend_enabled_missing_feature_fails() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.channels.session_persistence = true;
+        config.channels.session_backend = "postgres".to_string();
+
+        let err = match open_channel_session_backend(&config) {
+            Ok(_) => {
+                panic!("channel persistence on must fail for a known backend missing its feature")
+            }
+            Err(err) => err,
+        };
+        let msg = format!("{err:#}");
+
+        assert!(
+            msg.contains("open configured channel session backend")
+                && msg.contains("backend-postgres")
+                && msg.contains("known backend"),
+            "error must include channel context and missing feature details; got: {msg}"
         );
     }
 

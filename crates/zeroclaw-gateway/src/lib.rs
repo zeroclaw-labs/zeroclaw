@@ -179,6 +179,37 @@ pub fn gateway_long_running_request_timeout_secs(
 ) -> u64 {
     cfg.long_running_request_timeout_secs
 }
+
+fn open_gateway_session_backend(config: &Config) -> Result<Option<Arc<dyn SessionBackend>>> {
+    if !config.gateway.session_persistence {
+        return Ok(None);
+    }
+
+    let backend = zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels)
+        .context("open configured gateway session backend")?;
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+        &format!(
+            "Gateway session persistence enabled (backend={})",
+            config.channels.session_backend
+        )
+    );
+    if config.gateway.session_ttl_hours > 0
+        && let Ok(cleaned) = backend.cleanup_stale(config.gateway.session_ttl_hours)
+        && cleaned > 0
+    {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"cleaned": cleaned})),
+            "Cleaned up stale gateway sessions"
+        );
+    }
+
+    Ok(Some(backend))
+}
+
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 /// Fallback max distinct client keys tracked in gateway rate limiter.
@@ -847,12 +878,14 @@ pub async fn run_gateway(
                     .model_provider_for_agent(agent_alias)
                     .and_then(|e| e.api_key.as_deref()),
                 &config,
+                config.gateway.session_persistence,
                 Some(canvas_store.clone()),
                 false,
                 None,
                 sop_engine.clone(),
                 sop_audit.clone(),
-            );
+            )
+            .context("build gateway tool registry")?;
             // Wire channel-driven tool handles so the dashboard agent can
             // deliver messages to configured channels (same pattern as
             // orchestrator::start_channels).
@@ -1186,44 +1219,7 @@ pub async fn run_gateway(
     // Picking `"jsonl"` would otherwise leave gateway WS sessions writing
     // to SQLite while channel + tool reads went to JSONL — the original
     // #5769 split, just on a different backend pairing.
-    let session_backend: Option<Arc<dyn SessionBackend>> = if config.gateway.session_persistence {
-        match zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels) {
-            Ok(backend) => {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                    &format!(
-                        "Gateway session persistence enabled (backend={})",
-                        config.channels.session_backend
-                    )
-                );
-                if config.gateway.session_ttl_hours > 0
-                    && let Ok(cleaned) = backend.cleanup_stale(config.gateway.session_ttl_hours)
-                    && cleaned > 0
-                {
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({"cleaned": cleaned})),
-                        "Cleaned up stale gateway sessions"
-                    );
-                }
-                Some(backend)
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "Session persistence disabled"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let session_backend = open_gateway_session_backend(&config)?;
 
     // ── Pairing guard ──────────────────────────────────────
     let pairing = Arc::new(PairingGuard::new(
@@ -4185,6 +4181,54 @@ mod tests {
     fn gateway_timeout_uses_typed_config_default() {
         let cfg = zeroclaw_config::schema::GatewayConfig::default();
         assert_eq!(gateway_request_timeout_secs(&cfg), 30);
+    }
+
+    #[test]
+    fn gateway_session_backend_off_switch_does_not_open_configured_backend() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.gateway.session_persistence = false;
+        config.channels.session_backend = "postgres".to_string();
+
+        let backend = open_gateway_session_backend(&config)
+            .expect("gateway persistence off must not open the configured backend");
+
+        assert!(backend.is_none());
+        assert!(
+            !config.data_dir.join("sessions").exists(),
+            "disabled gateway persistence must not create a session backend directory"
+        );
+    }
+
+    #[test]
+    fn gateway_session_backend_enabled_missing_feature_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.gateway.session_persistence = true;
+        config.channels.session_backend = "postgres".to_string();
+
+        let err = match open_gateway_session_backend(&config) {
+            Ok(_) => {
+                panic!("gateway persistence on must fail for a known backend missing its feature")
+            }
+            Err(err) => err,
+        };
+        let msg = format!("{err:#}");
+
+        assert!(
+            msg.contains("open configured gateway session backend")
+                && msg.contains("backend-postgres")
+                && msg.contains("known backend"),
+            "error must include gateway context and missing feature details; got: {msg}"
+        );
     }
 
     #[test]

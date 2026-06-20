@@ -159,6 +159,7 @@ use crate::platform::{NativeRuntime, RuntimeAdapter};
 use crate::security::{SecurityPolicy, create_sandbox};
 use crate::sop::audit::SopAuditLogger;
 use crate::sop::engine::SopEngine;
+use anyhow::Context;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -467,7 +468,7 @@ pub fn all_tools(
     canvas_store: Option<CanvasStore>,
     is_subagent_caller: bool,
     tui_env: Option<HashMap<String, String>>,
-) -> AllToolsResult {
+) -> anyhow::Result<AllToolsResult> {
     all_tools_with_runtime(
         config,
         security,
@@ -484,6 +485,7 @@ pub fn all_tools(
         agents,
         fallback_api_key,
         root_config,
+        root_config.channels.session_persistence,
         canvas_store,
         is_subagent_caller,
         tui_env,
@@ -514,12 +516,13 @@ pub fn all_tools_with_runtime(
     agents: &HashMap<String, AliasedAgentConfig>,
     fallback_api_key: Option<&str>,
     root_config: &zeroclaw_config::schema::Config,
+    session_persistence_enabled: bool,
     canvas_store: Option<CanvasStore>,
     is_subagent_caller: bool,
     tui_env: Option<HashMap<String, String>>,
     sop_engine: Option<Arc<Mutex<SopEngine>>>,
     sop_audit: Option<Arc<SopAuditLogger>>,
-) -> AllToolsResult {
+) -> anyhow::Result<AllToolsResult> {
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
     let runtime_kind = root_config.runtime.kind.as_wire();
@@ -1056,18 +1059,27 @@ pub fn all_tools_with_runtime(
         security.clone(),
     )));
 
-    // Session tools share the channel orchestrator's backend via the
+    // Session tools share the owning surface's backend via the
     // `make_session_backend` factory, keyed off `[channels].session_backend`.
     // Previously the tools opened the JSONL `SessionStore` while the
     // gateway WS path opened `SqliteSessionBackend`, so any session
     // created via /ws/chat was invisible to `sessions_list` /
     // `sessions_history`. Routing both call sites through the factory
     // closes that gap and honors the operator's configured backend.
+    //
+    // Only open the backend when this registry's surface has session
+    // persistence enabled. A disabled surface is the valid off-switch; a
+    // leftover `session_backend = "postgres"` must not be touched there.
+    // When enabled, however, a known-but-uncompiled backend must hard-fail
+    // rather than degrade to no session tools or local SQLite.
+    //
     // Read from the SHARED sessions store (`config.data_dir`) the gateway/daemon
     // write to (they build the backend under `&config.data_dir`), NOT the
     // per-agent `workspace_dir` — otherwise `sessions_list`/`sessions_history`
     // miss real sessions and a stray `sessions/sessions.db` is created per agent.
-    if let Ok(backend) = zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels) {
+    if session_persistence_enabled {
+        let backend = zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels)
+            .context("open configured session backend for session tools")?;
         tool_arcs.push(Arc::new(SessionsCurrentTool::new(backend.clone())));
         tool_arcs.push(Arc::new(SessionsListTool::new(backend.clone())));
         tool_arcs.push(Arc::new(SessionsHistoryTool::new(
@@ -1075,14 +1087,14 @@ pub fn all_tools_with_runtime(
             security.clone(),
         )));
         tool_arcs.push(Arc::new(SessionsSendTool::new(backend, security.clone())));
-        // NOTE: SessionResetTool and SessionDeleteTool are available via
-        // zeroclaw_tools::sessions but NOT registered by default. They are
-        // destructive operations (clear/delete conversation history) and
-        // should only be enabled by callers that explicitly need them
-        // (e.g., orchestration dashboards). Agent-callable registrations must
-        // use SessionOwnershipScope so one agent cannot reset/delete another
-        // agent's sessions. The unscoped constructors are operator/admin only.
     }
+    // NOTE: SessionResetTool and SessionDeleteTool are available via
+    // zeroclaw_tools::sessions but NOT registered by default. They are
+    // destructive operations (clear/delete conversation history) and
+    // should only be enabled by callers that explicitly need them
+    // (e.g., orchestration dashboards). Agent-callable registrations must
+    // use SessionOwnershipScope so one agent cannot reset/delete another
+    // agent's sessions. The unscoped constructors are operator/admin only.
 
     // LinkedIn integration (config-gated)
     if root_config.linkedin.enabled {
@@ -1233,7 +1245,7 @@ pub fn all_tools_with_runtime(
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure),
                     "microsoft365: client_credentials auth_flow requires a non-empty client_secret"
                 );
-                return AllToolsResult {
+                return Ok(AllToolsResult {
                     unfiltered_tool_arcs: tool_arcs.clone(),
                     tools: boxed_registry_from_arcs(tool_arcs),
                     delegate_handle: None,
@@ -1241,7 +1253,7 @@ pub fn all_tools_with_runtime(
                     reaction_handle,
                     poll_handle: Some(poll_handle),
                     escalate_handle,
-                };
+                });
             }
 
             let resolved = zeroclaw_tools::microsoft365::types::Microsoft365ResolvedConfig {
@@ -1437,7 +1449,7 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    AllToolsResult {
+    Ok(AllToolsResult {
         unfiltered_tool_arcs: tool_arcs.clone(),
         tools: boxed_registry_from_arcs(tool_arcs),
         delegate_handle,
@@ -1445,7 +1457,7 @@ pub fn all_tools_with_runtime(
         reaction_handle,
         poll_handle: Some(poll_handle),
         escalate_handle,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1462,11 +1474,92 @@ mod tests {
         }
     }
 
+    fn session_registry_result(
+        tmp: &TempDir,
+        cfg: Config,
+        session_persistence_enabled: bool,
+    ) -> anyhow::Result<AllToolsResult> {
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        all_tools_with_runtime(
+            Arc::new(cfg.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &BrowserConfig::default(),
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            session_persistence_enabled,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+    }
+
     #[test]
     fn default_tools_has_expected_count() {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
         assert_eq!(tools.len(), 6);
+    }
+
+    #[test]
+    fn session_tools_do_not_open_backend_when_surface_persistence_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = test_config(&tmp);
+        cfg.channels.session_persistence = false;
+        cfg.channels.session_backend = "postgres".to_string();
+
+        let tools = session_registry_result(&tmp, cfg, false)
+            .expect("persistence off must not open the configured backend")
+            .tools;
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+
+        assert!(
+            !names.iter().any(|name| name.starts_with("sessions")),
+            "session tools must not register when the surface disabled persistence"
+        );
+        assert!(
+            !tmp.path().join("data").join("sessions").exists(),
+            "disabled persistence must not create a session backend directory"
+        );
+    }
+
+    #[test]
+    fn session_tools_fail_when_enabled_known_backend_feature_is_missing() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = test_config(&tmp);
+        cfg.channels.session_persistence = true;
+        cfg.channels.session_backend = "postgres".to_string();
+
+        let err = match session_registry_result(&tmp, cfg, true) {
+            Ok(_) => panic!("persistence on must fail for a known backend missing its feature"),
+            Err(err) => err,
+        };
+        let msg = format!("{err:#}");
+
+        assert!(
+            msg.contains("open configured session backend for session tools")
+                && msg.contains("backend-postgres")
+                && msg.contains("known backend"),
+            "error must include registry context and missing feature details; got: {msg}"
+        );
     }
 
     /// Regression: SOP tools must NOT appear in the tool registry when the
@@ -1511,6 +1604,7 @@ mod tests {
             false,
             None,
         )
+        .expect("build tool registry")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
 
@@ -1573,12 +1667,14 @@ mod tests {
             &HashMap::new(),
             None,
             &cfg,
+            false,
             None,
             false,
             None,
             Some(engine),
             None,
         )
+        .expect("build tool registry")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
 
@@ -1642,12 +1738,14 @@ mod tests {
             &HashMap::new(),
             None,
             &cfg,
+            false,
             None,
             false,
             None,
             Some(shared_engine.clone()),
             Some(shared_audit.clone()),
-        );
+        )
+        .expect("build session-a tool registry");
         let session_b = all_tools_with_runtime(
             Arc::new(Config::default()),
             &security,
@@ -1664,12 +1762,14 @@ mod tests {
             &HashMap::new(),
             None,
             &cfg,
+            false,
             None,
             false,
             None,
             Some(shared_engine.clone()),
             Some(shared_audit.clone()),
-        );
+        )
+        .expect("build session-b tool registry");
 
         for tools in [&session_a.tools, &session_b.tools] {
             assert!(tools.iter().any(|t| t.name() == "sop_status"));
@@ -1744,12 +1844,14 @@ mod tests {
             &HashMap::new(),
             None,
             &root_config,
+            true,
             None,
             false,
             None,
             None,
             None,
         )
+        .expect("build tool registry")
         .tools;
 
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
@@ -1965,6 +2067,7 @@ mod tests {
             false,
             None,
         )
+        .expect("build tool registry")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
@@ -2013,6 +2116,7 @@ mod tests {
             false,
             None,
         )
+        .expect("build tool registry")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
@@ -2077,12 +2181,14 @@ mod tests {
                 &HashMap::new(),
                 None,
                 &cfg,
+                false,
                 None,
                 false,
                 None,
                 Some(sop_engine),
                 Some(sop_audit),
             )
+            .expect("build tool registry")
             .tools
         };
 
@@ -2244,6 +2350,7 @@ mod tests {
             false,
             None,
         )
+        .expect("build tool registry")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
@@ -2283,6 +2390,7 @@ mod tests {
             false,
             None,
         )
+        .expect("build tool registry")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"delegate"));
@@ -2324,6 +2432,7 @@ mod tests {
             false,
             None,
         )
+        .expect("build tool registry")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"read_skill"));
@@ -2364,6 +2473,7 @@ mod tests {
             false,
             None,
         )
+        .expect("build tool registry")
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"read_skill"));
@@ -2398,6 +2508,7 @@ mod tests {
             is_subagent_caller,
             None,
         )
+        .expect("build tool registry")
         .tools
         .iter()
         .map(|t| t.name().to_string())

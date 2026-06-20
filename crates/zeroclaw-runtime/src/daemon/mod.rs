@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use std::path::PathBuf;
 use tokio::task::JoinHandle;
@@ -320,8 +320,14 @@ pub async fn run(
                 }
             });
         }
-        let session_backend =
-            zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels).ok();
+        let session_backend = if config.channels.session_persistence {
+            Some(
+                zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels)
+                    .context("open configured session backend")?,
+            )
+        } else {
+            None
+        };
 
         // Wire the memory subsystem so `memory/list` and `memory/search`
         // work over RPC transports (same pattern as the gateway).
@@ -2010,6 +2016,83 @@ mod tests {
         assert!(has_event_tx);
         assert!(has_reload_tx);
         assert!(has_tui_registry);
+    }
+
+    #[tokio::test]
+    async fn rpc_context_known_uncompiled_session_backend_fails_startup() {
+        use tokio::time::{Duration, timeout};
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.channels.session_persistence = true;
+        config.channels.session_backend = "postgres".to_string();
+
+        let mut registry = DaemonRegistry::new();
+        registry.register_socket(Box::new(|_, _, _| {
+            Box::pin(async { std::future::pending::<Result<()>>().await })
+        }));
+
+        let result = timeout(
+            Duration::from_secs(2),
+            run(config, "127.0.0.1".to_string(), 4242, registry, false),
+        )
+        .await
+        .expect("daemon startup should fail instead of waiting with no session backend");
+        let err = result.expect_err(
+            "postgres without backend-postgres must fail RPC startup, not disable persistence",
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("open configured session backend")
+                && msg.contains("backend-postgres")
+                && msg.contains("known backend"),
+            "error must include RPC context and missing feature details; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_context_disabled_session_persistence_ignores_unavailable_backend() {
+        use tokio::time::{Duration, timeout};
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.channels.session_persistence = false;
+        config.channels.session_backend = "postgres".to_string();
+
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let seen_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(seen_tx)));
+        let mut registry = DaemonRegistry::new();
+        registry.register_socket(Box::new(move |ctx, _, _| {
+            let seen_tx = seen_tx.clone();
+            Box::pin(async move {
+                if let Some(tx) = seen_tx.lock().unwrap().take() {
+                    tx.send(ctx.session_backend.is_none())
+                        .expect("send observed session backend state");
+                    ctx.reload_tx
+                        .as_ref()
+                        .expect("daemon should pass reload sender to RPC context")
+                        .send(true)
+                        .expect("send reload signal");
+                }
+                std::future::pending::<Result<()>>().await
+            })
+        }));
+
+        let exit = timeout(
+            Duration::from_secs(2),
+            run(config, "127.0.0.1".to_string(), 4242, registry, false),
+        )
+        .await
+        .expect("daemon should return after socket-triggered reload")
+        .expect("disabled persistence should not require configured backend");
+
+        assert_eq!(exit, DaemonExit::Reload);
+        assert!(
+            seen_rx
+                .await
+                .expect("socket starter should observe RPC context"),
+            "RPC context must not open a session backend when persistence is disabled"
+        );
     }
 
     #[tokio::test]

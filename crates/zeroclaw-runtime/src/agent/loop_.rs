@@ -1025,12 +1025,13 @@ pub async fn run(
             &config.agents,
             agent_model_provider.and_then(|e| e.api_key.as_deref()),
             &config,
+            config.channels.session_persistence,
             None,
             is_subagent_caller,
             None,
             sop_engine,
             sop_audit,
-        );
+        )?;
         let mut tools_registry = all_tools_result.tools;
         let delegate_handle = all_tools_result.delegate_handle;
         let unfiltered_tool_arcs = all_tools_result.unfiltered_tool_arcs;
@@ -2578,12 +2579,13 @@ pub async fn process_message(
                 .as_ref()
                 .and_then(|e| e.api_key.as_deref()),
             &config,
+            config.channels.session_persistence,
             None,
             false,
             None,
             sop_engine,
             sop_audit,
-        );
+        )?;
         let mut tools_registry = all_tools_result_pm.tools;
         let delegate_handle_pm = all_tools_result_pm.delegate_handle;
         let unfiltered_tool_arcs_pm = all_tools_result_pm.unfiltered_tool_arcs;
@@ -12315,6 +12317,7 @@ Let me check the result."#;
             false,
             None,
         )
+        .expect("build tool registry")
         .tools;
 
         // Sanity: the unrestricted channel registry exposes the dangerous
@@ -12375,6 +12378,7 @@ Let me check the result."#;
             false,
             None,
         )
+        .expect("build tool registry")
         .tools;
         let deny = TestPolicy {
             excluded_tools: Some(vec!["shell".into()]),

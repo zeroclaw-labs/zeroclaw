@@ -1178,12 +1178,13 @@ impl Agent {
             &config.agents,
             agent_model_provider.and_then(|e| e.api_key.as_deref()),
             config,
+            config.channels.session_persistence,
             canvas_store,
             false,
             tui_env,
             sop_engine,
             sop_audit,
-        );
+        )?;
         let mut tools = all_tools_result.tools;
         let delegate_handle = all_tools_result.delegate_handle;
         let ask_user_handle = all_tools_result.ask_user_handle;
