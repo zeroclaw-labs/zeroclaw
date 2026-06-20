@@ -614,6 +614,70 @@ mod typed_option_tests {
     }
 
     #[test]
+    fn md_skill_frontmatter_options_drive_a_typed_command_end_to_end() {
+        // End-to-end proof that no channel-side change was needed: a SKILL.md
+        // declaring slash_options in its frontmatter loads through the public
+        // runtime loader and registers a typed Discord command (dropdown +
+        // integer range), not the legacy single `input`.
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("draft");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let md = r#"---
+name: draft
+description: Draft content to a spec.
+tags: [slash]
+slash_options:
+  - name: format
+    description: Output format.
+    type: string
+    required: true
+    choices: [{name: Email, value: email}, {name: Tweet, value: tweet}]
+  - name: words
+    type: integer
+    min: 10
+    max: 2000
+---
+# Draft
+
+Write it.
+"#;
+        std::fs::write(skill_dir.join("SKILL.md"), md).unwrap();
+
+        let skills = zeroclaw_runtime::skills::load_skills_from_directory(tmp.path(), false);
+        let specs = discord_slash_specs_from_skills(&skills);
+        assert_eq!(
+            specs.len(),
+            1,
+            "the slash-tagged MD skill yields one command"
+        );
+
+        let body = slash_command_registration_body(&specs);
+        let arr = body.as_array().unwrap();
+        let draft = arr
+            .iter()
+            .find(|c| c["name"] == json!("draft"))
+            .expect("draft command present");
+        let opts = draft["options"].as_array().unwrap();
+
+        // Typed options replaced the legacy single `input`.
+        assert!(opts.iter().all(|o| o["name"] != json!("input")));
+        let format = opts
+            .iter()
+            .find(|o| o["name"] == json!("format"))
+            .expect("format option");
+        assert_eq!(format["type"], json!(3)); // STRING
+        assert_eq!(format["required"], json!(true));
+        assert_eq!(format["choices"].as_array().unwrap().len(), 2);
+        let words = opts
+            .iter()
+            .find(|o| o["name"] == json!("words"))
+            .expect("words option");
+        assert_eq!(words["type"], json!(4)); // INTEGER
+        assert_eq!(words["min_value"], json!(10));
+        assert_eq!(words["max_value"], json!(2000));
+    }
+
+    #[test]
     fn projection_is_stable_across_int_vs_float_bounds() {
         // What we send (integer min/max) vs what Discord might echo back (float),
         // plus Discord's server-side decorations — must project equal.
