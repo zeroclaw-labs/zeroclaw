@@ -130,7 +130,6 @@ pub struct Config {
     /// Model-routing rules — route `hint:<name>` to specific
     /// model_provider + model combos.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[credential_class = "requires_follow_up"]
     #[nested]
     #[natural_key = "hint"]
     #[group = "Foundation"]
@@ -139,7 +138,6 @@ pub struct Config {
     /// Embedding-routing rules — route `hint:<name>` to specific
     /// model_provider + model combos for embedding requests.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[credential_class = "requires_follow_up"]
     #[nested]
     #[natural_key = "hint"]
     #[group = "Foundation"]
@@ -10672,6 +10670,7 @@ pub struct ModelRouteConfig {
     #[serde(default)]
     #[secret]
     #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: Option<String>,
 }
 
@@ -10709,6 +10708,7 @@ pub struct EmbeddingRouteConfig {
     #[serde(default)]
     #[secret]
     #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub api_key: Option<String>,
 }
 
