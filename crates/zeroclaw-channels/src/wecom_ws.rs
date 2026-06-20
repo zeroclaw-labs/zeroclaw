@@ -31,6 +31,8 @@ const WECOM_HTTP_TIMEOUT_SECS: u64 = 60;
 const WECOM_CONNECT_TIMEOUT_SECS: u64 = 15;
 const WECOM_WS_READY_WAIT_SECS: u64 = 10;
 const WECOM_WS_READY_POLL_MILLIS: u64 = 100;
+const WECOM_ACCESS_TOKEN_REFRESH_SKEW_SECS: u64 = 300;
+const WECOM_ACCESS_TOKEN_DEFAULT_EXPIRES_SECS: u64 = 7200;
 const WECOM_STREAM_CONFLICT_MAX_RETRIES: usize = 3;
 const WECOM_STREAM_CONFLICT_RETRY_BASE_MILLIS: u64 = 150;
 const WECOM_IDEMPOTENCY_MAX_KEYS: usize = 4096;
@@ -189,6 +191,20 @@ struct WeComRuntimeConfig {
     proxy_url: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct CachedAccessToken {
+    token: String,
+    expires_at: Instant,
+}
+
+impl CachedAccessToken {
+    fn is_fresh(&self, now: Instant) -> bool {
+        self.expires_at
+            .checked_duration_since(now)
+            .is_some_and(|ttl| ttl > Duration::from_secs(WECOM_ACCESS_TOKEN_REFRESH_SKEW_SECS))
+    }
+}
+
 // ── MediaDecryptor (per-attachment AES key) ──────────────────────────
 
 struct MediaDecryptor;
@@ -244,6 +260,7 @@ pub struct WeComWsChannel {
     last_cleanup: Arc<Mutex<Instant>>,
     idempotency: Arc<SimpleIdempotencyStore>,
     req_id_map: Arc<Mutex<HashMap<String, String>>>, // stream_id → req_id
+    access_token_cache: Arc<Mutex<Option<CachedAccessToken>>>,
 }
 
 // ── Construction + WS helpers ────────────────────────────────────────
@@ -299,6 +316,7 @@ impl WeComWsChannel {
             last_cleanup: Arc::new(Mutex::new(Instant::now())),
             idempotency: Arc::new(SimpleIdempotencyStore::new()),
             req_id_map: Arc::new(Mutex::new(HashMap::new())),
+            access_token_cache: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1437,6 +1455,11 @@ impl WeComWsChannel {
     /// WeCom `msgtype` (`image` or `file`).
     async fn send_attachment(&self, scope: &str, attachment: &MediaAttachment) -> Result<()> {
         let (chat_type, chatid) = parse_scope(scope)?;
+        if chat_type == 3 {
+            anyhow::bail!(
+                "WeCom external-scope attachments are not supported by the current HTTP external message path: {scope}"
+            );
+        }
 
         // Upload via WeCom media/upload CGI
         let upload_url = format!(
@@ -1474,9 +1497,21 @@ impl WeComWsChannel {
             #[serde(rename = "media_id")]
             media_id: Option<String>,
             errmsg: Option<String>,
+            errcode: Option<i64>,
         }
 
-        let upload: UploadResp = resp.json().await?;
+        let upload: UploadResp = parse_wecom_json_response(resp, "media upload").await?;
+        let errcode = upload
+            .errcode
+            .unwrap_or_else(|| if upload.media_id.is_some() { 0 } else { -1 });
+        if errcode != 0 {
+            anyhow::bail!(
+                "WeCom media upload API error (errcode={}): {:?}",
+                errcode,
+                upload.errmsg
+            );
+        }
+
         let media_id = upload.media_id.with_context(|| {
             format!(
                 "WeCom upload response missing media_id: {:?}",
@@ -1492,22 +1527,9 @@ impl WeComWsChannel {
             zeroclaw_api::media::MediaKind::Unknown => "file",
         };
 
-        // serde_json::json! only accepts literal keys; the payload nests the
-        // media object under a key named after the msgtype, so build the body
-        // first and insert that dynamic key separately.
-        let mut body = serde_json::json!({
-            "chatid": chatid,
-            "chat_type": chat_type,
-            "msgtype": msgtype,
-        });
-        body[msgtype] = serde_json::json!({ "media_id": media_id });
-        let frame = serde_json::json!({
-            "cmd": "aibot_send_msg",
-            "headers": { "req_id": random_ascii_token(16) },
-            "body": body
-        });
+        let (frame, req_id) = build_attachment_send_command(chat_type, chatid, msgtype, &media_id);
 
-        self.ws_send_frame_and_wait_for_response(frame, "unused", "aibot_send_msg")
+        self.ws_send_frame_and_wait_for_response(frame, &req_id, "aibot_send_msg")
             .await?;
 
         wecom_log_info!(
@@ -1522,12 +1544,41 @@ impl WeComWsChannel {
 
     /// Resolve the current access token for the bot's credentials.
     async fn resolve_access_token(&self) -> Result<String> {
-        // Fetch a fresh access token from WeCom's gettoken endpoint using the
-        // bot's bot_id (agentid) and secret from the channel config.
+        if let Some(token) = self.fresh_cached_access_token(Instant::now()) {
+            return Ok(token);
+        }
+
+        let cached = match self.fetch_access_token().await {
+            Ok(cached) => cached,
+            Err(err) => return self.access_token_after_refresh_error(err),
+        };
+        let access_token = cached.token.clone();
+        *self.access_token_cache.lock() = Some(cached);
+
+        Ok(access_token)
+    }
+
+    fn fresh_cached_access_token(&self, now: Instant) -> Option<String> {
+        self.access_token_cache
+            .lock()
+            .as_ref()
+            .filter(|cached| cached.is_fresh(now))
+            .map(|cached| cached.token.clone())
+    }
+
+    fn access_token_after_refresh_error(&self, err: anyhow::Error) -> Result<String> {
+        self.fresh_cached_access_token(Instant::now()).ok_or(err)
+    }
+
+    async fn fetch_access_token(&self) -> Result<CachedAccessToken> {
+        // TODO(review): Confirm that channel bot_id/secret are the qyapi
+        // corpid/corpsecret values for gettoken before changing credential wiring.
         #[derive(serde::Deserialize)]
         struct TokenResp {
             #[serde(rename = "access_token")]
             access_token: Option<String>,
+            expires_in: Option<u64>,
+            errcode: Option<i64>,
             errmsg: Option<String>,
         }
 
@@ -1543,14 +1594,31 @@ impl WeComWsChannel {
             .await
             .with_context(|| "failed to fetch WeCom access token")?;
 
-        let token: TokenResp = resp
-            .json()
-            .await
-            .with_context(|| "failed to parse WeCom token response")?;
+        let token: TokenResp = parse_wecom_json_response(resp, "gettoken").await?;
+        let errcode = token
+            .errcode
+            .unwrap_or_else(|| if token.access_token.is_some() { 0 } else { -1 });
+        if errcode != 0 {
+            anyhow::bail!(
+                "WeCom gettoken API error (errcode={}): {:?}",
+                errcode,
+                token.errmsg
+            );
+        }
 
-        token
-            .access_token
-            .with_context(|| format!("WeCom gettoken failed: {:?}", token.errmsg))
+        let access_token = token.access_token.with_context(|| {
+            format!(
+                "WeCom gettoken response missing access_token: {:?}",
+                token.errmsg
+            )
+        })?;
+        let expires_in = token
+            .expires_in
+            .unwrap_or(WECOM_ACCESS_TOKEN_DEFAULT_EXPIRES_SECS);
+        Ok(CachedAccessToken {
+            token: access_token,
+            expires_at: Instant::now() + Duration::from_secs(expires_in),
+        })
     }
 }
 
@@ -1622,7 +1690,7 @@ impl WeComWsChannel {
             errmsg: Option<String>,
         }
 
-        let result: ApiResp = resp.json().await?;
+        let result: ApiResp = parse_wecom_json_response(resp, "external message send").await?;
         let errcode = result.errcode.unwrap_or(-1);
         if errcode != 0 {
             anyhow::bail!(
@@ -1649,6 +1717,12 @@ impl Channel for WeComWsChannel {
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
         if message.recipient.starts_with("external--") {
+            if !message.attachments.is_empty() {
+                anyhow::bail!(
+                    "WeCom external-scope attachments are not supported by the current HTTP external message path: {}",
+                    message.recipient
+                );
+            }
             return self
                 .send_external_user_message(&message.recipient, &message.content)
                 .await;
@@ -2284,6 +2358,24 @@ fn image_file_extension(bytes: &[u8]) -> &'static str {
     }
 }
 
+async fn parse_wecom_json_response<T>(resp: reqwest::Response, api_name: &str) -> Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|err| format!("<failed to read response body: {err}>"));
+        anyhow::bail!("WeCom {api_name} HTTP error (status={status}): {body}");
+    }
+
+    resp.json()
+        .await
+        .with_context(|| format!("failed to parse WeCom {api_name} response"))
+}
+
 /// Parse scope string into (chat_type, chatid) for aibot_send_msg.
 /// `user--{userid}` → (1, userid), `group--{chatid}` → (2, chatid)
 fn parse_scope(scope: &str) -> Result<(u32, &str)> {
@@ -2299,6 +2391,43 @@ fn parse_scope(scope: &str) -> Result<(u32, &str)> {
     } else {
         anyhow::bail!("WeCom: invalid scope format: {scope}")
     }
+}
+
+fn build_attachment_send_command(
+    chat_type: u32,
+    chatid: &str,
+    msgtype: &str,
+    media_id: &str,
+) -> (Value, String) {
+    let req_id = random_ascii_token(16);
+    (
+        build_attachment_send_frame(chat_type, chatid, msgtype, media_id, &req_id),
+        req_id,
+    )
+}
+
+fn build_attachment_send_frame(
+    chat_type: u32,
+    chatid: &str,
+    msgtype: &str,
+    media_id: &str,
+    req_id: &str,
+) -> Value {
+    // serde_json::json! only accepts literal keys; the payload nests the media
+    // object under a key named after the msgtype, so build the body first and
+    // insert that dynamic key separately.
+    let mut body = serde_json::json!({
+        "chatid": chatid,
+        "chat_type": chat_type,
+        "msgtype": msgtype,
+    });
+    body[msgtype] = serde_json::json!({ "media_id": media_id });
+
+    serde_json::json!({
+        "cmd": "aibot_send_msg",
+        "headers": { "req_id": req_id },
+        "body": body
+    })
 }
 
 fn summarize_attachment_url_for_log(url: &str) -> String {
@@ -3187,6 +3316,111 @@ mod tests {
         assert!(parse_scope("invalid_scope").is_err());
     }
 
+    #[test]
+    fn attachment_send_command_threads_req_id_into_frame() {
+        let (frame, waiter_req_id) =
+            build_attachment_send_command(1, "zeroclaw_user", "file", "media-123");
+        let frame_req_id = frame
+            .pointer("/headers/req_id")
+            .and_then(Value::as_str)
+            .expect("attachment send frame should include req_id");
+
+        assert_eq!(frame_req_id, waiter_req_id);
+        assert_eq!(frame_req_id.len(), 16);
+    }
+
+    #[tokio::test]
+    async fn send_attachment_rejects_external_scope_before_upload() {
+        let channel = WeComWsChannel::new(&test_wecom_ws_config(), Path::new("/tmp")).unwrap();
+
+        let err = channel
+            .send_attachment("external--zhangsan@example.com", &test_media_attachment())
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("external-scope attachments"));
+        assert!(err.contains("not supported"));
+    }
+
+    #[tokio::test]
+    async fn send_external_message_with_attachment_returns_clear_error() {
+        let channel = WeComWsChannel::new(&test_wecom_ws_config(), Path::new("/tmp")).unwrap();
+        let message = SendMessage::new("hello", "external--zhangsan@example.com")
+            .with_attachments(vec![test_media_attachment()]);
+
+        let err = channel.send(&message).await.unwrap_err().to_string();
+
+        assert!(err.contains("external-scope attachments"));
+        assert!(err.contains("not supported"));
+    }
+
+    #[tokio::test]
+    async fn wecom_json_response_reports_http_status_and_body() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/gettoken"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .set_body_string(r#"{"errcode":45009,"errmsg":"api freq out of limit"}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let resp = reqwest::Client::new()
+            .get(format!("{}/gettoken", server.uri()))
+            .send()
+            .await
+            .unwrap();
+
+        let err = parse_wecom_json_response::<serde_json::Value>(resp, "gettoken")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("WeCom gettoken HTTP error"));
+        assert!(err.contains("429"));
+        assert!(err.contains("api freq out of limit"));
+    }
+
+    #[test]
+    fn access_token_refresh_failure_uses_concurrently_populated_cache() {
+        let channel = WeComWsChannel::new(&test_wecom_ws_config(), Path::new("/tmp")).unwrap();
+        assert!(channel.fresh_cached_access_token(Instant::now()).is_none());
+
+        *channel.access_token_cache.lock() = Some(CachedAccessToken {
+            token: "cached-token".to_string(),
+            expires_at: Instant::now()
+                + Duration::from_secs(WECOM_ACCESS_TOKEN_REFRESH_SKEW_SECS + 60),
+        });
+
+        let token = channel
+            .access_token_after_refresh_error(anyhow::Error::msg("rate limited"))
+            .unwrap();
+
+        assert_eq!(token, "cached-token");
+    }
+
+    #[test]
+    fn access_token_refresh_failure_propagates_when_cache_is_expired() {
+        let channel = WeComWsChannel::new(&test_wecom_ws_config(), Path::new("/tmp")).unwrap();
+        *channel.access_token_cache.lock() = Some(CachedAccessToken {
+            token: "expired-token".to_string(),
+            expires_at: Instant::now()
+                + Duration::from_secs(WECOM_ACCESS_TOKEN_REFRESH_SKEW_SECS - 1),
+        });
+
+        let err = channel
+            .access_token_after_refresh_error(anyhow::Error::msg("rate limited"))
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(err, "rate limited");
+    }
+
     fn test_inbound(chat_type: &str, chat_id: Option<&str>, sender_userid: &str) -> ParsedInbound {
         ParsedInbound {
             msg_id: "msg-1".to_string(),
@@ -3203,6 +3437,14 @@ mod tests {
                 "from": { "userid": sender_userid },
                 "text": { "content": "@bot hello" }
             }),
+        }
+    }
+
+    fn test_media_attachment() -> MediaAttachment {
+        MediaAttachment {
+            file_name: "attachment.txt".to_string(),
+            data: b"hello".to_vec(),
+            mime_type: Some("text/plain".to_string()),
         }
     }
 
