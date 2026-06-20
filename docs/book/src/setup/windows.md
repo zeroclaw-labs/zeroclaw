@@ -4,7 +4,7 @@ Install, update, run as a Windows scheduled task, and uninstall on Windows 10 / 
 
 If you're running WSL2, you can follow the [Linux setup](./linux.md) instead; `install.sh` runs unchanged under WSL.
 
-> **Note on `setup.bat`.** The release `setup.bat` wrapper has known bugs that prevent it from completing when the disk-space pre-flight check reads more free bytes than cmd's 32-bit signed arithmetic can hold (`set /a` overflows above 2^31 bytes = 2.147 GB, affecting Windows 10/11 volumes with more than ~2 GB free) and on shells that strictly parse `if/else` blocks (unescaped parens in an echo). Until those land in a release, the **manual prebuilt** path (Option 1 below) is the recommended install. Building from source (Option 3) also works.
+> **Note on `setup.bat`.** The `#6118` hard-stop failures (the 32-bit `set /a` disk-space overflow and the unescaped-parens `if/else` parse error) were fixed in [#6137](https://github.com/zeroclaw-labs/zeroclaw/pull/6137) and ship in **v0.7.4 and later**. Current releases complete normally. One caveat remains: `setup.bat --prebuilt` still checks for `cargo` before reaching the prebuilt branch, so the **manual prebuilt** path (Option 1 below) is the true no-Rust install. Building from source (Option 3) also works.
 
 ## Install
 
@@ -67,12 +67,9 @@ Flags:
 | `--standard` | Build with common channels (Telegram, Discord, Slack, Matrix) |
 | `--full`     | Build everything |
 
-> ⚠️ **Known issues.** `setup.bat` has two hard-stop failures, one `--prebuilt` mode mismatch, and one onboarding-command naming inconsistency reported in [#6118](https://github.com/zeroclaw-labs/zeroclaw/issues/6118). Fall back to **Option 1** above if you hit any installer blocker.
+> ⚠️ **Known issue (current).** `setup.bat --prebuilt` still checks for `cargo` before it reaches the prebuilt branch, so Option 2 does not honor a no-Rust promise. If you don't have a Rust toolchain, use **Option 1** above.
 >
-> - `Invalid number. Numbers are limited to 32-bits of precision.`: the disk-space pre-flight check uses `set /a`, so free-space byte counts above 2^31 bytes (2.147 GB) overflow cmd's 32-bit signed arithmetic on Windows 10/11 volumes with more than ~2 GB free.
-> - `.[0m was unexpected at this time.`: an echo inside an `if/else` block contains unescaped parens that some shells parse as control-flow syntax.
-> - `setup.bat --prebuilt` still checks for `cargo` before it reaches the prebuilt branch, so the current script does not honor a no-Rust promise for Option 2.
-> - After a successful run, `setup.bat` tells users to run `zeroclaw init`; the current onboarding command used elsewhere in this chapter is `zeroclaw quickstart`. This does not block setup, but it creates UX confusion.
+> _Historical (pre-`v0.7.4`)._ Earlier releases had two hard-stop failures and an onboarding-command mismatch reported in [#6118](https://github.com/zeroclaw-labs/zeroclaw/issues/6118): a 32-bit `set /a` disk-space overflow (`Invalid number. Numbers are limited to 32-bits of precision.`), an unescaped-parens `if/else` parse error (`.[0m was unexpected at this time.`), and a final `zeroclaw init` prompt. All were fixed in [#6137](https://github.com/zeroclaw-labs/zeroclaw/pull/6137) (v0.7.4 / 0.7.5 / 0.8.0); current releases print `zeroclaw quickstart` and complete normally.
 
 ### Option 3: From source
 
