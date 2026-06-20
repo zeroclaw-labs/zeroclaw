@@ -1924,19 +1924,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .map(str::to_owned)
     }
 
-    /// Find the first message in `updates` whose `media_group_id` equals
-    /// `target_group_id`, if any. Used by the dispatcher to recover
-    /// caption and metadata from any earlier update in the same album
-    /// before the buffer has fully settled.
-    fn find_group_anchor<'a>(
-        updates: &'a [serde_json::Value],
-        target_group_id: &str,
-    ) -> Option<&'a serde_json::Value> {
-        updates.iter().find(|update| {
-            Self::extract_media_group_id(update).as_deref() == Some(target_group_id)
-        })
-    }
-
     /// Extract the chat id (`i64`) from a raw update, if present.
     ///
     /// Media-group buffering keys on `(chat_id, media_group_id)`. The
@@ -1994,22 +1981,22 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// all downstream async work happens after the lock is dropped.
     /// This keeps the critical section short and avoids any
     /// lock-across-await hazard with `parking_lot::Mutex`.
-    async fn flush_due_media_groups(
-        &self,
-        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
-    ) {
+    async fn flush_due_media_groups(&self, tx: &tokio::sync::mpsc::Sender<ChannelMessage>) {
         // Drain due entries first; do async parsing afterwards.
         let due: Vec<((i64, String), MediaGroupEntry)> = {
-            let buf = self.media_group_buffer.lock();
+            let mut buf = self.media_group_buffer.lock();
             let now = std::time::Instant::now();
             let mut taken = Vec::new();
             buf.pending.retain(|key, entry| {
                 if now.duration_since(entry.last_seen) >= MEDIA_GROUP_FLUSH_WINDOW {
-                    taken.push((key.clone(), MediaGroupEntry {
-                        items: std::mem::take(&mut entry.items),
-                        first_seen: entry.first_seen,
-                        last_seen: entry.last_seen,
-                    }));
+                    taken.push((
+                        key.clone(),
+                        MediaGroupEntry {
+                            items: std::mem::take(&mut entry.items),
+                            first_seen: entry.first_seen,
+                            last_seen: entry.last_seen,
+                        },
+                    ));
                     false
                 } else {
                     true
@@ -2064,10 +2051,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             // first item's chat_id + message_id. Prefix with
             // `telegram_album_` so the album's id never collides with
             // any per-item `telegram_<chat>_<msg>` id.
-            let id_suffix = anchor
-                .id
-                .strip_prefix("telegram_")
-                .unwrap_or(&anchor.id);
+            let id_suffix = anchor.id.strip_prefix("telegram_").unwrap_or(&anchor.id);
             let album_id = format!("telegram_album_{id_suffix}");
 
             // Same ack-reaction + typing-indicator treatment as the
@@ -2077,10 +2061,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 && let Some((reaction_chat_id, reaction_message_id)) =
                     Self::extract_update_message_target(&entry.items[0])
             {
-                self.try_add_ack_reaction_nonblocking(
-                    reaction_chat_id,
-                    reaction_message_id,
-                );
+                self.try_add_ack_reaction_nonblocking(reaction_chat_id, reaction_message_id);
             }
 
             let typing_body = serde_json::json!({
