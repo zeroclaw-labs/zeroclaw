@@ -6473,6 +6473,7 @@ mod tests {
             .workspace_dir(ws_dir.clone())
             .model_name("test-model".into())
             .temperature(Some(0.0))
+            .prompt_builder(SystemPromptBuilder::default())
             .build()
             .expect("agent builder should succeed with valid config");
 
@@ -6497,6 +6498,7 @@ mod tests {
             .workspace_dir(ws_dir)
             .model_name("test-model".into())
             .temperature(Some(0.0))
+            .prompt_builder(SystemPromptBuilder::default())
             .build()
             .expect("agent builder should succeed with valid config");
 
