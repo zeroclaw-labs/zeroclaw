@@ -22,3 +22,18 @@ zeroclaw-api.workspace = true
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["macros", "rt-multi-thread"] }
+
+# Each world's round-trip test is its own [[test]] target gated by
+# required-features: a single plugin component implements exactly one
+# world, and wit_bindgen::generate! cannot have two worlds that share an
+# identical exported interface (e.g. plugin-info) compiled into the same
+# crate at once — the generated #[macro_export] cabi shims collide
+# regardless of module nesting. `cargo test --features tool` (etc.) builds
+# and runs only the matching target; the others are silently skipped.
+[[test]]
+name = "spike_tool"
+required-features = ["tool"]
+
+[[test]]
+name = "spike_memory"
+required-features = ["memory"]

@@ -1,4 +1,4 @@
-//! Spike: proves the SDK's raw `tool-plugin` guest bindings (sync exports,
+//! Spike: proves the SDK's `tool-plugin` guest bindings (sync exports,
 //! generated via `wit_bindgen::generate!`) actually round-trip through the
 //! real, unmodified host (`zeroclaw_plugins::PluginHost`, which wires the
 //! same world via `wasmtime::component::bindgen!` with
@@ -9,44 +9,19 @@
 //! Skips (rather than fails) if the `wasm32-wasip2` target isn't installed,
 //! since that's a local toolchain dependency, not a code correctness issue.
 
-use std::path::Path;
-use std::process::Command;
+mod common;
 
-fn wasm32_wasip2_installed() -> bool {
-    Command::new("rustup")
-        .args(["target", "list", "--installed"])
-        .output()
-        .map(|out| {
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .any(|line| line.trim() == "wasm32-wasip2")
-        })
-        .unwrap_or(false)
-}
+use std::path::Path;
 
 #[tokio::test]
 async fn tool_echo_round_trips_through_plugin_host() {
-    if !wasm32_wasip2_installed() {
+    if !common::wasm32_wasip2_installed() {
         eprintln!("skipping: wasm32-wasip2 target not installed");
         return;
     }
 
     let example_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/tool-echo");
-
-    let status = Command::new("cargo")
-        .args(["build", "--target", "wasm32-wasip2"])
-        .current_dir(&example_dir)
-        .status()
-        .expect("failed to invoke cargo build for tool-echo example");
-    assert!(
-        status.success(),
-        "tool-echo failed to build for wasm32-wasip2"
-    );
-
-    let wasm_path = example_dir
-        .join("target/wasm32-wasip2/debug/tool_echo.wasm")
-        .canonicalize()
-        .expect("tool-echo.wasm artifact not found after build");
+    let wasm_path = common::build_example(&example_dir, "tool_echo");
 
     let workdir = tempfile::tempdir().expect("tempdir");
     let plugin_dir = workdir.path().join("plugins/echo");

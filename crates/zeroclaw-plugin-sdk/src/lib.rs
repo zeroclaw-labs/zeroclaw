@@ -12,5 +12,7 @@
 
 pub mod bindings;
 mod macros;
+#[cfg(feature = "memory")]
+pub mod memory;
 #[cfg(feature = "tool")]
 pub mod tool;
