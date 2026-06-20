@@ -13,6 +13,12 @@ pub mod tool {
         exports: { default: async }
     });
 }
+// `trappable` (sync) export overrides were tried here for the handful of
+// metadata-only functions (plugin-info, get-*-capabilities, etc.) but
+// wasmtime's `validate_sync_call` rejects any sync export call once a
+// store has async-required imports wired in (which `imports: { default:
+// async }` always does) — every export must go through the `_async` call
+// path on this host, with no sync-call exception.
 pub mod memory {
     wasmtime::component::bindgen!({
         world: "memory-plugin",
@@ -21,10 +27,6 @@ pub mod memory {
             default: async,
         },
         exports: {
-            // Most exports are async, but these need to be sync.
-            "zeroclaw:plugin/plugin-info.plugin-name": trappable,
-            "zeroclaw:plugin/plugin-info.plugin-version": trappable,
-            "zeroclaw:plugin/memory.get-memory-capabilities": trappable,
             default: async
         }
     });
@@ -37,10 +39,15 @@ pub mod channel {
             default: async,
         },
         exports: {
-            // Most exports are async, but these need to be sync.
-            "zeroclaw:plugin/plugin-info.plugin-name": trappable,
-            "zeroclaw:plugin/plugin-info.plugin-version": trappable,
-            "zeroclaw:plugin/channel.get-channel-capabilities": trappable,
+            // These four are called at runtime from synchronous
+            // `zeroclaw_api::channel::Channel` trait methods (via
+            // `call_plugin_sync!`/`blocking_lock`), unlike plugin-info and
+            // get-channel-capabilities above which are only probed once
+            // inside an async constructor. Left `trappable` pending the
+            // channel-plugin SDK feature work, which will need to prove
+            // (or fix) whether sync export calls actually survive
+            // `validate_sync_call` at runtime once exercised by a real
+            // component — untested today.
             "zeroclaw:plugin/channel.self-handle": trappable,
             "zeroclaw:plugin/channel.self-addressed-mention": trappable,
             "zeroclaw:plugin/channel.drop-self-message": trappable,

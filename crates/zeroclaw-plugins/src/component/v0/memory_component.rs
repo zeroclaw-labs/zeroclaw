@@ -90,14 +90,17 @@ impl ComponentMemory {
         let plugin_info = bindings.zeroclaw_plugin_plugin_info();
         let plugin_name = plugin_info
             .call_plugin_name(&mut store)
+            .await
             .map_err(PluginError::from)?;
         let plugin_version = plugin_info
             .call_plugin_version(&mut store)
+            .await
             .map_err(PluginError::from)?;
 
         let capabilities = bindings
             .zeroclaw_plugin_memory()
             .call_get_memory_capabilities(&mut store)
+            .await
             .map_err(PluginError::from)?;
 
         Ok(Self {
