@@ -1,0 +1,18 @@
+[package]
+name = "zeroclaw-plugin-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Guest-side SDK for authoring ZeroClaw WASI Preview 2 / Component Model plugins."
+publish = false
+
+[features]
+default = ["plugins-wit-v0"]
+plugins-wit-v0 = []
+tool = []
+memory = []
+channel = []
+
+[dependencies]
+
+[dev-dependencies]
