@@ -5,7 +5,7 @@ tool-browser-open = 承認されたHTTPS URLをシステムブラウザで開く
 tool-cloud-ops = クラウド変換アドバイザリーツール。IaCプランを分析し、マイグレーションパスを評価し、コストをレビューし、Well-Architected Frameworkの柱に対してアーキテクチャをチェックします。読み取り専用：クラウドリソースを作成または変更しません。
 tool-cloud-patterns = クラウドパターンライブラリ。ワークロード説明を指定すると、適用可能なクラウドネイティブアーキテクチャパターン（コンテナ化、サーバーレス、データベース現代化など）を提案します。
 tool-composio = Composio経由で1000以上のアプリ（Gmail、Notion、GitHub、Slack等）でアクションを実行します。action='list'で利用可能なアクション（パラメータ名を含む）を確認します。action='execute'でaction_name/tool_slugとparamsを指定して実行します。正確なparamsが不確実な場合は、'text'に自然言語の説明を記述してください（Composioが正しいパラメータをNLPで解決します）。action='list_accounts'またはaction='connected_accounts'でOAuth接続アカウントを一覧表示します。action='connect'でapp/auth_config_idを指定するとOAuth URLが取得できます。connected_account_idは省略すると自動解決されます。
-tool-content-search = ワークスペース内のregexパターンでファイルコンテンツを検索します。ripgrep（rg）をサポート、フォールバックとしてgrepを使用。出力モード：'content'（マッチ行とコンテキスト）、'files_with_matches'（ファイルパスのみ）、'count'（ファイルごとのマッチ数）。例：pattern='fn main'、include='*.rs'、output_mode='content'。
+tool-content-search = ワークスペース内のregexパターンでファイルコンテンツを検索します。ripgrep（rg）をサポートし、grepまたは内部検索をフォールバックとして使用。出力モード：'content'（マッチ行とコンテキスト）、'files_with_matches'（ファイルパスのみ）、'count'（ファイルごとのマッチ数）。例：pattern='fn main'、include='*.rs'、output_mode='content'。
 tool-cron-add = cron/at/everyスケジュール付きのスケジュール済みcronジョブ（シェルまたはエージェント）を作成します。job_type='agent'でPromptを使用してAIエージェントをスケジュール実行します。出力をチャネル（Discord、Telegram、Slack、Mattermost、Matrix）に配信するには、delivery={"{"}"mode":"announce","channel":"discord","to":"<channel_id_or_chat_id>"{"}"}を設定します。これは、チャネル経由でユーザーにスケジュール/遅延メッセージを送信するための推奨ツールです。
 tool-cron-list = すべてのスケジュール済みcronジョブを一覧表示
 tool-cron-remove = IDでcronジョブを削除
