@@ -9,3 +9,8 @@ dedicated PR when `zeroclaw-plugins` ships the first 0.1.0 stable release with
 the Component Model path enabled. After that point only additive changes via
 `@since(version = 0.x.0)` are accepted in this directory. See `wit/VERSIONING.md`
 for how to create a stabilizing PR.
+
+**Writing a plugin?** Depend on `crates/zeroclaw-plugin-sdk` (feature
+`tool`, `memory`, or `channel`) rather than hand-rolling
+`wit_bindgen::generate!` against these files directly — it generates the
+same bindings plus an ergonomic trait and `export_*!` macro per world.
