@@ -750,7 +750,7 @@ impl OpenAiCompatibleModelProvider {
         (is_openai_reasoning_model || is_likely_codex_supported).then(|| effort.clone())
     }
 
-    async fn effective_credential(&self) -> anyhow::Result<Option<String>> {
+    async fn resolve_credential(&self) -> anyhow::Result<Option<String>> {
         if self
             .credential
             .as_deref()
@@ -2343,7 +2343,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         // When a credential is present, hit the model_provider's native /models endpoint
         // (OpenAI-compatible: GET {base_url}/models). Local OpenAI-compatible
         // servers with a public catalog use the same path without an Authorization header.
-        let list_credential = self.effective_credential().await?;
+        let list_credential = self.resolve_credential().await?;
         if list_credential.is_some() || self.public_model_listing {
             let url = format!("{}/models", self.base_url);
             let response = self
@@ -2415,7 +2415,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
     ) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ModelInfo>> {
         // When a credential is present, hit the provider's native /models
         // endpoint — this returns pricing data that we can capture.
-        let list_credential = self.effective_credential().await?;
+        let list_credential = self.resolve_credential().await?;
         if list_credential.is_some() || self.public_model_listing {
             let url = format!("{}/models", self.base_url);
             let response = self
@@ -2492,7 +2492,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let credential = self.effective_credential().await?;
+        let credential = self.resolve_credential().await?;
 
         // Normalize image markers (e.g. local file paths from channel
         // attachments) into base64 data URIs before this message reaches the
@@ -2607,7 +2607,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let credential = self.effective_credential().await?;
+        let credential = self.resolve_credential().await?;
 
         let normalized = Self::normalize_messages_for_upstream(messages).await?;
         let merge = self.effective_merge_system(model);
@@ -2691,7 +2691,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.effective_credential().await?;
+        let credential = self.resolve_credential().await?;
 
         let normalized = Self::normalize_messages_for_upstream(messages).await?;
         let merge = self.effective_merge_system(model);
@@ -2797,7 +2797,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.effective_credential().await?;
+        let credential = self.resolve_credential().await?;
 
         let normalized = Self::normalize_messages_for_upstream(request.messages).await?;
         let merge = self.effective_merge_system(model);
@@ -3025,7 +3025,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let url = provider.chat_completions_url();
             let client = provider.streaming_http_client();
             let auth_header = provider.auth_header.clone();
-            let credential = match provider.effective_credential().await {
+            let credential = match provider.resolve_credential().await {
                 Ok(credential) => credential,
                 Err(error) => {
                     let _ = tx
@@ -3167,7 +3167,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let url = provider.chat_completions_url();
             let client = provider.streaming_http_client();
             let auth_header = provider.auth_header.clone();
-            let credential = match provider.effective_credential().await {
+            let credential = match provider.resolve_credential().await {
                 Ok(credential) => credential,
                 Err(error) => {
                     let _ = tx
@@ -3285,7 +3285,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let url = provider.chat_completions_url();
             let client = provider.streaming_http_client();
             let auth_header = provider.auth_header.clone();
-            let credential = match provider.effective_credential().await {
+            let credential = match provider.resolve_credential().await {
                 Ok(credential) => credential,
                 Err(error) => {
                     let _ = tx
@@ -3343,7 +3343,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         // Hit the appropriate URL with a GET to prime the connection pool.
         // The server will likely return 405 Method Not Allowed, which is fine.
         let url = self.chat_completions_url();
-        let credential = self.effective_credential().await?;
+        let credential = self.resolve_credential().await?;
         let _ = self
             .apply_auth_header(self.http_client().get(&url), credential.as_deref())
             .send()
