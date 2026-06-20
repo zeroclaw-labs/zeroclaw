@@ -10195,8 +10195,37 @@ pub struct RiskProfileConfig {
     /// authorization constraint. Authorization decision: which tools is
     /// the agent permitted to invoke at all. See `excluded_tools` for
     /// the inverse denylist scoped to non-CLI channels.
+    ///
+    /// The TOML config does not distinguish an omitted field from
+    /// `allowed_tools = []`; both deserialize to `Vec::new()` and
+    /// `SecurityPolicy::from_profiles` maps that to "no authorization
+    /// constraint" at this layer. If you need an explicit deny-all gate,
+    /// apply it on the caller-supplied per-run `allowed_tools` (cron
+    /// jobs and other narrowers pass that list in directly to
+    /// `ToolAccessPolicy`, which honors `Some(vec![])` as deny-all) or
+    /// via `excluded_tools` covering the specific tools you want blocked.
+    ///
+    /// MCP exception: when the list is non-empty, runtime-discovered MCP
+    /// tools (any name containing `__`, which is the `<server>__<tool>`
+    /// convention used by the MCP wrapper) are auto-admitted into the
+    /// effective allow-list without needing to be listed here individually.
+    /// This keeps the post-#7464 eager-MCP default usable for agents with an
+    /// explicit allow-list. Block individual MCP tools via `excluded_tools`.
+    ///
+    /// Scope of the exception: the `__` auto-admit applies only to this
+    /// risk-profile allow-list, **not** to caller-supplied per-run
+    /// `allowed_tools` (cron job `allowed_tools`, narrowed delegate
+    /// invocations, etc.). Per-run lists are still strict explicit-list
+    /// intersections, so a job that narrows `allowed_tools = ["cron_add"]`
+    /// will not see runtime-discovered MCP tools unless it names them.
+    /// See PR #7547 review for the rationale.
     pub allowed_tools: Vec<String>,
     /// Tools excluded from non-CLI channels under this profile.
+    ///
+    /// Also subtracts from the agentic-delegate allow-list resolved at
+    /// runtime, which is the only way to block individual
+    /// `<server>__<tool>` MCP names that would otherwise be auto-admitted
+    /// by the `allowed_tools` MCP exception described above.
     pub excluded_tools: Vec<String>,
     // ── Sandbox (from security.sandbox) ─────────────────────────────
     /// Whether the sandbox is enabled for this profile. `None` inherits global.

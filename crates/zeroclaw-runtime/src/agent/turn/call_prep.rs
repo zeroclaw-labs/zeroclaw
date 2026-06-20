@@ -78,7 +78,7 @@ pub(crate) async fn prepare_tool_calls(
                     let outcome = ToolExecutionOutcome {
                         output: cancelled,
                         success: false,
-                        error_reason: Some(scrub_credentials(&reason)),
+                        error_reason: Some(reason),
                         duration: Duration::ZERO,
                         receipt: None,
                     };
