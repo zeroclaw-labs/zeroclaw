@@ -278,8 +278,6 @@ rmdir /s /q "%USERPROFILE%\.zeroclaw"
   - "Stop if the computer switches to battery power": unchecked
   - "Start the task only if the computer is idle for…": unchecked
 
-- **`set /a` overflow on free-space byte counts** *(setup.bat only)*. The disk-space pre-flight check in `setup.bat` uses 32-bit cmd arithmetic and overflows when the free-space reading exceeds 2^31 bytes (2.147 GB). This can affect Windows 10/11 volumes with more than ~2 GB free. Use Option 1 (manual prebuilt) until this is fixed in a release.
-
 - **OpenSSH password auth.** If you're driving Windows over SSH and pubkey isn't accepted, drop your key into `C:\Users\<user>\.ssh\authorized_keys` (regular user) or `C:\ProgramData\ssh\administrators_authorized_keys` (when logged in as a member of `Administrators`).
 
 ## Next
