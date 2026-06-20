@@ -254,7 +254,25 @@ pub fn fast_trim_tool_results(
     history: &mut [zeroclaw_providers::ChatMessage],
     protect_last_n: usize,
 ) -> usize {
-    let trim_to = 2000;
+    trim_tool_results_to(history, protect_last_n, 2000)
+}
+
+/// Shrink old `tool`-role results to a bounded head-extract of `trim_to`
+/// characters, in place, keeping the messages (and their tool-call pairing)
+/// intact. Unlike collapse, the result stays a real tool message carrying a
+/// truncated-but-present payload, so the model still sees what each tool
+/// returned and every provider (including Anthropic, which drops synthetic
+/// collapse summaries) receives the content. The last `protect_last_n`
+/// messages are left untouched. Returns total characters saved.
+///
+/// Used by the preemptive over-budget escalation ladder (see
+/// [`super::turn::history_window`]) which calls this with progressively
+/// smaller floors before resorting to dropping whole turns.
+pub fn trim_tool_results_to(
+    history: &mut [zeroclaw_providers::ChatMessage],
+    protect_last_n: usize,
+    trim_to: usize,
+) -> usize {
     let mut saved = 0;
     let cutoff = history.len().saturating_sub(protect_last_n);
     for msg in &mut history[..cutoff] {

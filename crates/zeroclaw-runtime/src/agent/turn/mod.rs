@@ -388,7 +388,12 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             budget.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        preflight_history_maintenance(history, context_token_budget, iteration);
+        preflight_history_maintenance(
+            history,
+            context_token_budget,
+            iteration,
+            &knobs.history_pruning,
+        );
 
         // Check if model switch was requested via model_switch tool
         if let Some(ref callback) = model_switch_callback

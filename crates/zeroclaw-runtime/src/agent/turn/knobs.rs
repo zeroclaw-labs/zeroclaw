@@ -26,6 +26,17 @@ pub struct LoopKnobs {
     /// contract is to return the model text verbatim and let the embedder
     /// do its own post-processing.
     pub detect_protocol_without_tools: bool,
+    /// The agent's resolved history-pruning policy, consulted by the
+    /// preemptive over-budget trim in [`super::history_window`]. Only
+    /// `collapse_tool_results` and `keep_recent` are honored there;
+    /// `enabled`/`max_tokens` are not — an over-budget request MUST be
+    /// trimmed regardless (otherwise the provider returns
+    /// `context_length_exceeded`), but when the user set `enabled = false`
+    /// the override is logged rather than performed silently. `Default`
+    /// (`HistoryPrunerConfig::default()`, i.e. `collapse_tool_results = true`,
+    /// `keep_recent = 4`) reproduces the historical hardcoded trim behaviour
+    /// for callers that build `LoopKnobs::default()`.
+    pub history_pruning: crate::agent::history_pruner::HistoryPrunerConfig,
 }
 
 impl Default for LoopKnobs {
@@ -34,6 +45,7 @@ impl Default for LoopKnobs {
             dedup_enabled: true,
             max_iteration_behavior: MaxIterationBehavior::GracefulSummary,
             detect_protocol_without_tools: true,
+            history_pruning: crate::agent::history_pruner::HistoryPrunerConfig::default(),
         }
     }
 }

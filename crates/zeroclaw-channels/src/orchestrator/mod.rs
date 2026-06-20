@@ -4799,7 +4799,12 @@ async fn process_channel_message_body(
             collector: std::sync::Arc::clone(&tool_receipts_collector),
         }
     });
-    let loop_knobs = LoopKnobs::default();
+    let loop_knobs = LoopKnobs {
+        // Honor the channel agent's resolved history-pruning policy in the
+        // preemptive over-budget trim (collapse_tool_results / keep_recent).
+        history_pruning: ctx.agent_cfg.resolved.history_pruning.clone(),
+        ..LoopKnobs::default()
+    };
     let (llm_result, fallback_info) = scope_provider_fallback(async {
         let llm_result = loop {
             let loop_result = tokio::select! {
