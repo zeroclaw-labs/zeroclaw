@@ -582,4 +582,63 @@ mod tests {
             "recovered activated tool should have been invoked exactly once"
         );
     }
+
+    // Pinned regression for the `tool_search` branch of
+    // `should_execute_tools_in_parallel` (issue #7686, parent tracker #7685).
+    //
+    // `tool_search` activates deferred MCP tools into `ActivatedToolSet`. The
+    // production comment on lines 345–348 explains why this branch exists:
+    // running `tool_search` in parallel with the tools it activates can race
+    // the lookup before activation completes. This branch forces serial
+    // execution.
+    //
+    // Pre-existing tests in `loop_.rs` cover the single-call,
+    // approval-required, and parallel control paths but leave the `tool_search`
+    // branch untested. A future refactor that removes the branch as "seems
+    // redundant because we hold a mutex" would silently regress this
+    // contract — these two tests pin it.
+    use super::should_execute_tools_in_parallel;
+    use crate::agent::loop_::ParsedToolCall;
+    use crate::approval::ApprovalManager;
+
+    fn parsed_tool_call(name: &str) -> ParsedToolCall {
+        ParsedToolCall {
+            name: name.to_string(),
+            arguments: serde_json::json!({}),
+            tool_call_id: None,
+        }
+    }
+
+    #[test]
+    fn tool_search_in_batch_forces_serial() {
+        // Two non-approval-gated tools in a batch where one is `tool_search`
+        // must run sequentially. Without the `tool_search` branch the default
+        // path would return `true` and the runtime would dispatch them in
+        // parallel, racing the lookup against the activation.
+        let calls = vec![
+            parsed_tool_call("tool_search"),
+            parsed_tool_call("file_read"),
+        ];
+
+        assert!(
+            !should_execute_tools_in_parallel(&calls, None),
+            "batch containing tool_search must force sequential execution (line 349-351)"
+        );
+    }
+
+    #[test]
+    fn tool_search_with_approval_required_in_batch_still_forces_serial() {
+        // When both branches would trigger, the test only needs to confirm
+        // the call still returns `false` — the ordering between the
+        // `tool_search` branch and the approval branch is an implementation
+        // detail. The important invariant is: `tool_search` present ⇒ serial.
+        let calls = vec![parsed_tool_call("tool_search"), parsed_tool_call("shell")];
+        let approval_cfg = zeroclaw_config::schema::RiskProfileConfig::default();
+        let approval_mgr = ApprovalManager::from_risk_profile(&approval_cfg);
+
+        assert!(
+            !should_execute_tools_in_parallel(&calls, Some(&approval_mgr)),
+            "tool_search in a mixed approval batch must still force sequential execution"
+        );
+    }
 }
