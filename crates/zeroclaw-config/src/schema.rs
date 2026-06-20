@@ -133,6 +133,7 @@ pub struct Config {
     #[credential_class = "requires_follow_up"]
     #[nested]
     #[natural_key = "hint"]
+    #[group = "Foundation"]
     pub model_routes: Vec<ModelRouteConfig>,
 
     /// Embedding-routing rules — route `hint:<name>` to specific
@@ -141,6 +142,7 @@ pub struct Config {
     #[credential_class = "requires_follow_up"]
     #[nested]
     #[natural_key = "hint"]
+    #[group = "Foundation"]
     pub embedding_routes: Vec<EmbeddingRouteConfig>,
 
     /// Observability backend configuration (`[observability]`).
@@ -24648,6 +24650,44 @@ group_policy = "disabled"
             );
         assert_eq!(anthropic.kind, crate::traits::MapKeyKind::Map);
         assert_eq!(anthropic.natural_key, None);
+    }
+
+    /// `model_routes` and `embedding_routes` are `#[nested]` Vec fields
+    /// with `#[natural_key = "hint"]` — they must surface in
+    /// `map_key_sections()` as `List` entries so the dashboard and the
+    /// incremental TOML writer can address individual route entries.
+    #[tokio::test]
+    async fn map_key_sections_exposes_natural_key_for_model_routes() {
+        let sections = Config::map_key_sections();
+        let entry = sections
+            .iter()
+            .find(|s| s.path == "model_routes")
+            .expect("model_routes must be discoverable in map_key_sections()");
+        assert_eq!(entry.kind, crate::traits::MapKeyKind::List);
+        assert_eq!(
+            entry.natural_key,
+            Some("hint"),
+            "natural_key must mirror the `#[natural_key = \"hint\"]` attribute \
+             on Config::model_routes; the dirty-path writer keys off this to take \
+             the array-of-tables branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn map_key_sections_exposes_natural_key_for_embedding_routes() {
+        let sections = Config::map_key_sections();
+        let entry = sections
+            .iter()
+            .find(|s| s.path == "embedding_routes")
+            .expect("embedding_routes must be discoverable in map_key_sections()");
+        assert_eq!(entry.kind, crate::traits::MapKeyKind::List);
+        assert_eq!(
+            entry.natural_key,
+            Some("hint"),
+            "natural_key must mirror the `#[natural_key = \"hint\"]` attribute \
+             on Config::embedding_routes; the dirty-path writer keys off this to take \
+             the array-of-tables branch"
+        );
     }
 
     /// A dirty path with a kebab-shaped inner field (e.g.
