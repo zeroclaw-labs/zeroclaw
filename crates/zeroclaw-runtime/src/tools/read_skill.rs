@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use serde_json::json;
-use std::path::PathBuf;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::schema::Config;
@@ -9,15 +8,13 @@ use zeroclaw_config::schema::Config;
 /// Supports workspace skills, open-skills, agent-bound skill bundles, and plugin skills.
 pub struct ReadSkillTool {
     config: Arc<Config>,
-    workspace_dir: PathBuf,
     agent_alias: String,
 }
 
 impl ReadSkillTool {
-    pub fn new(config: Arc<Config>, workspace_dir: PathBuf, agent_alias: String) -> Self {
+    pub fn new(config: Arc<Config>, agent_alias: String) -> Self {
         Self {
             config,
-            workspace_dir,
             agent_alias,
         }
     }
@@ -64,12 +61,10 @@ impl Tool for ReadSkillTool {
                 anyhow::Error::msg("Missing 'name' parameter")
             })?;
 
-        // Load all skills for this agent (workspace + open-skills + bundles + plugins)
-        let skills = crate::skills::load_skills_for_agent(
-            &self.workspace_dir,
-            &self.config,
-            &self.agent_alias,
-        );
+        // Resolve from config on each call so the prompt and read path cannot
+        // drift through caller-supplied workspace snapshots.
+        let skills =
+            crate::skills::load_skills_for_agent_from_config(&self.config, &self.agent_alias);
 
         let Some(skill) = skills
             .iter()
@@ -129,21 +124,28 @@ mod tests {
     use tempfile::TempDir;
     use zeroclaw_config::schema::Config;
 
-    fn make_tool(tmp: &TempDir) -> ReadSkillTool {
+    fn config_for_tmp(tmp: &TempDir) -> Config {
         let mut config = Config::default();
+        config.config_path = tmp.path().join("config.toml");
+        config.data_dir = tmp.path().join("data");
         config.skills.open_skills_enabled = false;
         config.skills.allow_scripts = false;
-        ReadSkillTool::new(
-            Arc::new(config),
-            tmp.path().join("workspace"),
-            "default".to_string(),
-        )
+        config
+    }
+
+    fn agent_workspace(config: &Config, agent_alias: &str) -> std::path::PathBuf {
+        config.agent_workspace_dir(agent_alias)
+    }
+
+    fn make_tool(config: Config) -> ReadSkillTool {
+        ReadSkillTool::new(Arc::new(config), "default".to_string())
     }
 
     #[tokio::test]
     async fn reads_markdown_skill_by_name() {
         let tmp = TempDir::new().unwrap();
-        let skill_dir = tmp.path().join("workspace/skills/weather");
+        let config = config_for_tmp(&tmp);
+        let skill_dir = agent_workspace(&config, "default").join("skills/weather");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
             skill_dir.join("SKILL.md"),
@@ -151,7 +153,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = make_tool(&tmp)
+        let result = make_tool(config)
             .execute(json!({ "name": "weather" }))
             .await
             .unwrap();
@@ -164,7 +166,8 @@ mod tests {
     #[tokio::test]
     async fn reads_toml_skill_manifest_by_name() {
         let tmp = TempDir::new().unwrap();
-        let skill_dir = tmp.path().join("workspace/skills/deploy");
+        let config = config_for_tmp(&tmp);
+        let skill_dir = agent_workspace(&config, "default").join("skills/deploy");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
             skill_dir.join("SKILL.toml"),
@@ -175,7 +178,7 @@ description = "Ship safely"
         )
         .unwrap();
 
-        let result = make_tool(&tmp)
+        let result = make_tool(config)
             .execute(json!({ "name": "deploy" }))
             .await
             .unwrap();
@@ -188,14 +191,13 @@ description = "Ship safely"
     #[tokio::test]
     async fn unknown_skill_lists_available_names() {
         let tmp = TempDir::new().unwrap();
-        let skill_dir = tmp.path().join("workspace/skills/weather");
+        let config = config_for_tmp(&tmp);
+        let skill_dir = agent_workspace(&config, "default").join("skills/weather");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(skill_dir.join("SKILL.md"), "# Weather\n").unwrap();
 
-        let result = make_tool(&tmp)
-            .execute(json!({ "name": "calendar" }))
-            .await
-            .unwrap();
+        let tool = make_tool(config);
+        let result = tool.execute(json!({ "name": "calendar" })).await.unwrap();
 
         assert!(!result.success);
         assert_eq!(
@@ -213,7 +215,9 @@ description = "Ship safely"
         // load_skills_with_open_skills_settings, which unwrap_or(false)
         // resolved to false, silently blocking the skill.
         let tmp = TempDir::new().unwrap();
-        let skill_dir = tmp.path().join("workspace/skills/setup");
+        let mut config = config_for_tmp(&tmp);
+        config.skills.allow_scripts = true;
+        let skill_dir = agent_workspace(&config, "default").join("skills/setup");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
             skill_dir.join("SKILL.md"),
@@ -224,13 +228,7 @@ description = "Ship safely"
 
         // Construct with allow_scripts=true. Pre-fix this resolved to false
         // inside the loader and the skill was skipped.
-        let mut config = Config::default();
-        config.skills.allow_scripts = true;
-        let tool = ReadSkillTool::new(
-            Arc::new(config),
-            tmp.path().join("workspace"),
-            "default".to_string(),
-        );
+        let tool = make_tool(config);
         let result = tool.execute(json!({ "name": "setup" })).await.unwrap();
 
         assert!(
@@ -249,7 +247,7 @@ description = "Ship safely"
         let tmp = TempDir::new().unwrap();
 
         // Setup config with skill bundle and agent
-        let mut config = Config::default();
+        let mut config = config_for_tmp(&tmp);
         config.skill_bundles.insert(
             "default".to_string(),
             SkillBundleConfig {
@@ -275,11 +273,7 @@ description = "Ship safely"
         )
         .unwrap();
 
-        let tool = ReadSkillTool::new(
-            Arc::new(config),
-            tmp.path().join("workspace"),
-            "default".to_string(),
-        );
+        let tool = make_tool(config);
 
         let result = tool
             .execute(json!({ "name": "my-bundle-skill" }))
@@ -302,7 +296,7 @@ description = "Ship safely"
         let tmp = TempDir::new().unwrap();
 
         // Setup config with skill bundle and agent
-        let mut config = Config::default();
+        let mut config = config_for_tmp(&tmp);
         config.skill_bundles.insert(
             "default".to_string(),
             SkillBundleConfig {
@@ -319,7 +313,7 @@ description = "Ship safely"
             });
 
         // Create workspace skill
-        let workspace_skill_dir = tmp.path().join("workspace/skills/weather");
+        let workspace_skill_dir = config.agent_workspace_dir("default").join("skills/weather");
         std::fs::create_dir_all(&workspace_skill_dir).unwrap();
         std::fs::write(
             workspace_skill_dir.join("SKILL.md"),
@@ -336,11 +330,7 @@ description = "Ship safely"
         )
         .unwrap();
 
-        let tool = ReadSkillTool::new(
-            Arc::new(config),
-            tmp.path().join("workspace"),
-            "default".to_string(),
-        );
+        let tool = make_tool(config);
 
         let result = tool.execute(json!({ "name": "weather" })).await.unwrap();
 
@@ -348,5 +338,42 @@ description = "Ship safely"
         // Workspace skill takes precedence
         assert!(result.output.contains("Workspace version"));
         assert!(!result.output.contains("Bundle version"));
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[tokio::test]
+    async fn reads_plugin_bundled_skill_by_namespaced_name() {
+        let tmp = TempDir::new().unwrap();
+        let plugins_dir = tmp.path().join("plugins");
+        let plugin_dir = plugins_dir.join("weatherkit");
+        let skill_dir = plugin_dir.join("skills/forecast");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            "name = \"weatherkit\"\nversion = \"0.1.0\"\ncapabilities = [\"skill\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: forecast\ndescription: Return a weather forecast for a place.\n---\n\n# Forecast\n",
+        )
+        .unwrap();
+
+        let mut config = config_for_tmp(&tmp);
+        config.plugins.enabled = true;
+        config.plugins.plugins_dir = plugins_dir.to_string_lossy().into_owned();
+        let tool = make_tool(config);
+
+        let result = tool
+            .execute(json!({ "name": "plugin:weatherkit/forecast" }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "advertised plugin skill must be readable; got {:?}",
+            result.error
+        );
+        assert!(result.output.contains("# Forecast"));
     }
 }

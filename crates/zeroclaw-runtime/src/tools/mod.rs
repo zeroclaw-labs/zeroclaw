@@ -689,7 +689,6 @@ pub fn all_tools_with_runtime(
         // workspace skills, open-skills, agent-bound bundles, and plugin skills.
         tool_arcs.push(Arc::new(ReadSkillTool::new(
             config.clone(),
-            workspace_dir.to_path_buf(),
             agent_alias.to_string(),
         )));
     }
