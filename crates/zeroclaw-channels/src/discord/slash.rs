@@ -327,7 +327,8 @@ pub(crate) fn is_skill_command_shape(cmd: &serde_json::Value) -> bool {
 
 /// Comparable projection of a command for change detection: description plus
 /// per-option (name, type, required, description) and, for typed options, the
-/// (choices, min/max value, min/max length) constraints. Discord decorates
+/// (choices, min/max value, min/max length, autocomplete) constraints. Discord
+/// decorates
 /// listed commands with server-side fields (id, version,
 /// default_member_permissions, …) that must not defeat the comparison; the
 /// numeric constraints are normalised (numbers → f64, lengths → u64, choice
@@ -366,6 +367,14 @@ pub(crate) fn command_projection(cmd: &serde_json::Value) -> serde_json::Value {
                             "max_value": o.get("max_value").and_then(serde_json::Value::as_f64),
                             "min_length": o.get("min_length").and_then(serde_json::Value::as_u64),
                             "max_length": o.get("max_length").and_then(serde_json::Value::as_u64),
+                            // Autocomplete options omit static `choices`; project
+                            // the flag (default false) so an autocomplete option
+                            // we registered compares equal to Discord's echo and
+                            // doesn't trigger a spurious re-registration.
+                            "autocomplete": o
+                                .get("autocomplete")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false),
                         })
                     })
                     .collect::<Vec<_>>()

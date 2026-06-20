@@ -1925,6 +1925,9 @@ impl DelegateTool {
                 new_messages_out: None,
                 knobs: &LoopKnobs::default(),
                 image_cache: None,
+                // Phase 1: stamp Internal/Trusted. Real per-transport
+                // stamping is PR C (RFC #6971 §4).
+                ingress: zeroclaw_api::ingress::IngressContext::internal(),
             })
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(agent_name)

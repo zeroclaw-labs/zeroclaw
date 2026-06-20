@@ -6,6 +6,8 @@
 
 use std::sync::Arc;
 
+use super::components::DiscordActionRow;
+use super::embed::DiscordEmbed;
 use super::slash_options::OptionSpec;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -14,38 +16,22 @@ use super::slash_options::OptionSpec;
 // The single payload the channel-message REST builders collapse onto. The
 // builders already route through `text()`/`to_rest_json()` (EPIC A Phase 2), so
 // the struct and its methods are live; `to_rest_json` is byte-identical to the
-// historical `json!({ "content": content })` (proven by the tests below and by
-// the existing wiremock send tests) because only `content` is populated today.
-// EPIC C fills `embeds`, EPIC B fills `components`/`flags` — until then those
-// three fields stay unread, so the `#[allow(dead_code)]` is scoped to just them.
+// historical `json!({ "content": content })` when only `content` is populated
+// (proven by the tests below). EPIC C fills `embeds` and EPIC B fills
+// `components`/`flags`; all three are now serialized here, so none is a dead
+// placeholder.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct DiscordOutgoing {
     pub(crate) content: Option<String>,
-    // Unread until EPIC C/B wire these into `to_rest_json`; the allow is on the
-    // placeholder fields only, leaving the struct itself under dead-code analysis.
-    #[allow(dead_code)]
     pub(crate) embeds: Vec<DiscordEmbed>,
-    #[allow(dead_code)]
     pub(crate) components: Vec<DiscordActionRow>,
-    #[allow(dead_code)]
     pub(crate) flags: DiscordMessageFlags,
 }
 
-/// Placeholder — filled by EPIC C (rich content / embeds).
-#[allow(dead_code)]
-#[derive(Debug, Default, Clone)]
-pub(crate) struct DiscordEmbed;
-
-/// Placeholder — filled by EPIC B (components).
-#[allow(dead_code)]
-#[derive(Debug, Default, Clone)]
-pub(crate) struct DiscordActionRow;
-
-/// Message flags (e.g. ephemeral); zero by default and omitted from the payload
-/// when zero. Filled by EPIC B.
-#[allow(dead_code)]
+/// Message flags (e.g. ephemeral, components-v2). Zero by default and omitted
+/// from the payload when zero.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct DiscordMessageFlags(pub(crate) u64);
 
@@ -56,6 +42,20 @@ impl DiscordOutgoing {
     pub(crate) fn text(content: impl Into<String>) -> Self {
         Self {
             content: Some(content.into()),
+            ..Default::default()
+        }
+    }
+
+    /// A payload carrying text plus one or more component action rows — the
+    /// shape the buttoned approval prompt sends. Rows are capped to Discord's
+    /// per-message limit at serialization time via `to_rest_json`.
+    pub(crate) fn with_components(
+        content: impl Into<String>,
+        components: Vec<DiscordActionRow>,
+    ) -> Self {
+        Self {
+            content: Some(content.into()),
+            components,
             ..Default::default()
         }
     }
@@ -71,7 +71,32 @@ impl DiscordOutgoing {
                 serde_json::Value::String(content.clone()),
             );
         }
-        // EPIC B/C add `embeds`/`components`/`flags` here; empty → omitted.
+        if !self.embeds.is_empty() {
+            let embeds: Vec<serde_json::Value> =
+                self.embeds.iter().map(DiscordEmbed::to_api).collect();
+            obj.insert("embeds".to_string(), serde_json::Value::Array(embeds));
+        }
+        // Components: emit each action row that renders to a non-empty object; an
+        // empty `components` vec omits the key (preserving the content-only
+        // byte-identity invariant).
+        let components: Vec<serde_json::Value> = self
+            .components
+            .iter()
+            .filter_map(DiscordActionRow::to_api)
+            .collect();
+        if !components.is_empty() {
+            obj.insert(
+                "components".to_string(),
+                serde_json::Value::Array(components),
+            );
+        }
+        // Flags: omitted when zero, so a default payload stays byte-identical.
+        if self.flags.0 != 0 {
+            obj.insert(
+                "flags".to_string(),
+                serde_json::Value::Number(self.flags.0.into()),
+            );
+        }
         serde_json::Value::Object(obj)
     }
 
@@ -210,6 +235,37 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(out.to_rest_json(), serde_json::json!({ "content": "" }));
+    }
+
+    #[test]
+    fn populated_embeds_serialize_through_the_chokepoint() {
+        let out = DiscordOutgoing {
+            content: Some("see below".to_string()),
+            embeds: vec![DiscordEmbed {
+                title: Some("Report".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            out.to_rest_json(),
+            serde_json::json!({
+                "content": "see below",
+                "embeds": [{ "title": "Report" }]
+            })
+        );
+    }
+
+    #[test]
+    fn empty_embeds_vec_omits_the_key_preserving_byte_identity() {
+        // An explicitly-empty embeds vec must not grow an `"embeds"` key, or the
+        // EPIC A content-only byte-identity invariant breaks.
+        let out = DiscordOutgoing {
+            content: Some("hi".to_string()),
+            embeds: Vec::new(),
+            ..Default::default()
+        };
+        assert_eq!(out.to_rest_json(), serde_json::json!({ "content": "hi" }));
     }
 
     #[test]

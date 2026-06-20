@@ -2003,6 +2003,7 @@ impl Agent {
                         new_messages_out: Some(&mut loop_new_messages),
                         knobs: &knobs,
                         image_cache: Some(&mut self.image_cache),
+                        ingress: zeroclaw_api::ingress::IngressContext::internal(),
                     }),
                 ),
             )
@@ -2407,6 +2408,7 @@ impl Agent {
                             new_messages_out: Some(&mut round_added),
                             knobs: &knobs,
                             image_cache: Some(&mut self.image_cache),
+                            ingress: zeroclaw_api::ingress::IngressContext::internal(),
                         }),
                     ),
                 )

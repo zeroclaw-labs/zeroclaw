@@ -3502,6 +3502,101 @@ mod tests {
         h
     }
 
+    /// The backfill inserts a placeholder row for every paired-token hash that
+    /// has no device entry, skips hashes that already have one (without
+    /// clobbering their metadata), and is idempotent across restarts.
+    #[tokio::test]
+    async fn reconcile_backfills_orphan_token_hashes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let registry = DeviceRegistry::new(tmp.path());
+
+        // A real, already-registered device with a name.
+        let known_hash = "a".repeat(64);
+        registry.register(
+            known_hash.clone(),
+            DeviceInfo {
+                id: "known".into(),
+                name: Some("My Laptop".into()),
+                device_type: Some("desktop".into()),
+                paired_at: Utc::now(),
+                last_seen: Utc::now(),
+                ip_address: None,
+                capabilities: None,
+            },
+        );
+
+        let orphan_a = "b".repeat(64);
+        let orphan_b = "c".repeat(64);
+        let inserted = registry
+            .reconcile_from_token_hashes(&[known_hash.clone(), orphan_a.clone(), orphan_b.clone()])
+            .unwrap();
+        assert_eq!(inserted, 2, "only the two orphan hashes should be inserted");
+        assert_eq!(registry.device_count(), 3);
+
+        // Existing metadata is preserved, not clobbered.
+        let known = registry
+            .list()
+            .into_iter()
+            .find(|d| d.id == "known")
+            .expect("known device still present");
+        assert_eq!(known.name.as_deref(), Some("My Laptop"));
+
+        // Re-running is a no-op (idempotent).
+        let again = registry
+            .reconcile_from_token_hashes(&[known_hash, orphan_a, orphan_b])
+            .unwrap();
+        assert_eq!(again, 0);
+        assert_eq!(registry.device_count(), 3);
+    }
+
+    /// Security-management contract: a token paired through the legacy `/pair`
+    /// route is an orphan (authenticates, but absent from the registry). After
+    /// backfill it is keyed by the SAME `token_hash` the auth gate uses, so the
+    /// revoke-by-device path (`revoke` → `PairingGuard::revoke_token_hash`)
+    /// invalidates exactly that bearer token.
+    #[tokio::test]
+    async fn backfilled_orphan_is_revocable_by_its_real_hash() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let pairing = PairingGuard::new(true, &[]);
+        let code = pairing.pairing_code().unwrap();
+        let token = pairing
+            .try_pair(&code, "legacy-client")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(pairing.is_authenticated(&token));
+
+        // Simulate the `/pair` orphan: token is paired but never registered.
+        let registry = DeviceRegistry::new(&data_dir);
+        assert_eq!(registry.device_count(), 0);
+
+        let inserted = registry
+            .reconcile_from_token_hashes(&pairing.tokens())
+            .unwrap();
+        assert_eq!(inserted, 1);
+
+        // The backfilled row is keyed by the auth hash, so revoke returns it and
+        // revoking that hash from the guard actually de-authenticates the token.
+        let device = registry
+            .list()
+            .into_iter()
+            .next()
+            .expect("one backfilled device");
+        let revoked_hash = registry
+            .revoke(&device.id)
+            .unwrap()
+            .expect("device existed");
+        assert_eq!(revoked_hash, PairingGuard::token_hash(&token));
+        assert!(pairing.revoke_token_hash(&revoked_hash));
+        assert!(
+            !pairing.is_authenticated(&token),
+            "token must not authenticate after revoke"
+        );
+    }
+
     /// Regression: `POST /api/devices/{id}/token/rotate` MUST invalidate the
     /// old bearer token. The pre-fix handler only issued a new pairing code
     /// and left the leaked token authenticating (GHSA-f385-f6h2-3gqj
