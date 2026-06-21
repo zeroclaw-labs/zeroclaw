@@ -8,6 +8,14 @@
 
 use serde_json::{Map, Value, json};
 
+/// Discord caps a registered option's static `choices` array — and an
+/// autocomplete answer's `choices` — at 25. A scalar option whose predefined
+/// list exceeds this can't be registered as static choices (Discord 400s); it
+/// is instead flagged `autocomplete: true` and its choices are served (filtered
+/// by the user's partial input) through the type-4 dispatch arm. The same cap
+/// truncates the answered set.
+pub(crate) const DISCORD_MAX_STATIC_CHOICES: usize = 25;
+
 /// A Discord application-command option type this channel supports. The wire
 /// integer is Discord's `ApplicationCommandOptionType`. (Sub-commands/groups —
 /// types 1/2 — are intentionally out of scope here; flat options only.)
@@ -74,6 +82,10 @@ pub struct Choice {
 pub struct OptionSpec {
     pub name: String,
     pub description: String,
+    /// Discord-locale-keyed translations of `description` (from the skill
+    /// manifest, filtered to supported locale codes). Empty → no
+    /// `description_localizations` key is registered for this option.
+    pub description_localizations: std::collections::BTreeMap<String, String>,
     pub kind: OptKind,
     pub required: bool,
     pub choices: Vec<Choice>,
@@ -84,16 +96,62 @@ pub struct OptionSpec {
 }
 
 impl OptionSpec {
+    /// Whether this option is served via autocomplete (type-4) rather than a
+    /// static `choices` array. Discord forbids both on one option and rejects a
+    /// static list over [`DISCORD_MAX_STATIC_CHOICES`]; so a scalar option whose
+    /// predefined list exceeds that cap is registered `autocomplete: true` and
+    /// its choices are filtered + answered through the type-4 dispatch arm. A
+    /// small list (≤ cap) stays static — Discord renders it natively without
+    /// firing autocomplete, so marking it would only lose that native rendering.
+    pub(crate) fn serves_autocomplete(&self) -> bool {
+        self.kind.is_scalar() && self.choices.len() > DISCORD_MAX_STATIC_CHOICES
+    }
+
+    /// The predefined choices matching a user's partial input, as
+    /// `(name, value)` pairs, capped at [`DISCORD_MAX_STATIC_CHOICES`]. The
+    /// filter is a case-insensitive substring match on the choice name (and,
+    /// for a non-empty partial, the value too), so a few keystrokes narrow a
+    /// large list. An empty partial returns the first `cap` choices. A
+    /// non-autocomplete option (no choices, or a small static list) returns
+    /// empty — only options flagged autocomplete receive type-4 events.
+    pub(crate) fn matching_choices(&self, partial: &str) -> Vec<(String, String)> {
+        if !self.serves_autocomplete() {
+            return Vec::new();
+        }
+        let needle = partial.trim().to_ascii_lowercase();
+        self.choices
+            .iter()
+            .filter(|c| {
+                needle.is_empty()
+                    || c.name.to_ascii_lowercase().contains(&needle)
+                    || c.value.to_ascii_lowercase().contains(&needle)
+            })
+            .take(DISCORD_MAX_STATIC_CHOICES)
+            .map(|c| (c.name.clone(), c.value.clone()))
+            .collect()
+    }
+
     /// Serialize to a Discord application-command option object. Choices and
     /// bounds are emitted only for the kinds Discord accepts them on.
     pub fn to_registration_json(&self) -> Value {
         let mut obj = Map::new();
         obj.insert("name".to_string(), json!(self.name));
         obj.insert("description".to_string(), json!(self.description));
+        if !self.description_localizations.is_empty() {
+            obj.insert(
+                "description_localizations".to_string(),
+                json!(self.description_localizations),
+            );
+        }
         obj.insert("type".to_string(), json!(self.kind.wire_type()));
         obj.insert("required".to_string(), json!(self.required));
 
-        if self.kind.is_scalar() && !self.choices.is_empty() {
+        if self.serves_autocomplete() {
+            // Over Discord's static-choice cap: flag autocomplete and serve the
+            // choices through the type-4 arm. Discord rejects a static `choices`
+            // array alongside `autocomplete: true`, so it is intentionally omitted.
+            obj.insert("autocomplete".to_string(), json!(true));
+        } else if self.kind.is_scalar() && !self.choices.is_empty() {
             let choices: Vec<Value> = self
                 .choices
                 .iter()
@@ -173,6 +231,28 @@ pub fn extract_submitted_options(data: &Value) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// The focused option of an APPLICATION_COMMAND_AUTOCOMPLETE (type-4) payload,
+/// as `(command_name, option_name, partial_input)`. Discord marks exactly one
+/// `data.options[]` entry `"focused": true` and carries the user's partial text
+/// in its `value`. Returns `None` when no option is focused or the command name
+/// is absent (a malformed payload we simply can't complete). The partial is
+/// stringified (a focused integer/number option carries a numeric `value`).
+pub(crate) fn extract_focused_option(data: &Value) -> Option<(String, String, String)> {
+    let d = data.get("data")?;
+    let command = d.get("name")?.as_str()?.to_string();
+    let focused = d
+        .get("options")
+        .and_then(|o| o.as_array())?
+        .iter()
+        .find(|o| o.get("focused").and_then(Value::as_bool).unwrap_or(false))?;
+    let option_name = focused.get("name")?.as_str()?.to_string();
+    let partial = focused
+        .get("value")
+        .map(stringify_value)
+        .unwrap_or_default();
+    Some((command, option_name, partial))
+}
+
 fn stringify_value(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
@@ -190,6 +270,7 @@ mod tests {
         OptionSpec {
             name: name.to_string(),
             description: format!("{name} option"),
+            description_localizations: Default::default(),
             kind,
             required,
             choices: Vec::new(),
@@ -305,5 +386,131 @@ mod tests {
     fn extract_submitted_is_empty_when_no_options() {
         assert!(extract_submitted_options(&json!({ "data": { "name": "x" } })).is_empty());
         assert!(extract_submitted_options(&json!({})).is_empty());
+    }
+
+    fn opt_with_choices(name: &str, kind: OptKind, n: usize) -> OptionSpec {
+        let mut o = opt(name, kind, false);
+        o.choices = (0..n)
+            .map(|i| Choice {
+                name: format!("choice-{i:02}"),
+                value: format!("v{i:02}"),
+            })
+            .collect();
+        o
+    }
+
+    #[test]
+    fn serves_autocomplete_only_for_scalars_over_the_static_cap() {
+        // ≤ 25 stays static (Discord renders it natively).
+        assert!(
+            !opt_with_choices("a", OptKind::String, DISCORD_MAX_STATIC_CHOICES)
+                .serves_autocomplete()
+        );
+        // > 25 must be autocomplete (a static list that big would 400).
+        assert!(
+            opt_with_choices("a", OptKind::String, DISCORD_MAX_STATIC_CHOICES + 1)
+                .serves_autocomplete()
+        );
+        assert!(opt_with_choices("a", OptKind::Integer, 30).serves_autocomplete());
+        // Non-scalar kinds never carry choices / autocomplete.
+        assert!(!opt_with_choices("a", OptKind::User, 30).serves_autocomplete());
+        // No choices → nothing to serve.
+        assert!(!opt("a", OptKind::String, false).serves_autocomplete());
+    }
+
+    #[test]
+    fn registration_flags_autocomplete_and_omits_static_choices_over_cap() {
+        let big = opt_with_choices("sort", OptKind::String, 40);
+        let j = big.to_registration_json();
+        assert_eq!(j["autocomplete"], json!(true));
+        assert!(
+            j.get("choices").is_none(),
+            "static choices omitted when autocomplete"
+        );
+
+        // A small list keeps the static `choices` array and no autocomplete flag.
+        let small = opt_with_choices("sort", OptKind::String, 5);
+        let j = small.to_registration_json();
+        assert!(j.get("autocomplete").is_none());
+        assert_eq!(j["choices"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn matching_choices_filters_by_partial_substring_case_insensitively() {
+        let o = opt_with_choices("sort", OptKind::String, 40);
+        // "choice-07" matches name; "v07" matches value — substring, any case.
+        let m = o.matching_choices("CHOICE-07");
+        assert_eq!(m, vec![("choice-07".to_string(), "v07".to_string())]);
+        let m = o.matching_choices("v07");
+        assert_eq!(m, vec![("choice-07".to_string(), "v07".to_string())]);
+    }
+
+    #[test]
+    fn matching_choices_caps_at_25_and_empty_partial_returns_first_cap() {
+        let o = opt_with_choices("sort", OptKind::String, 40);
+        let m = o.matching_choices("");
+        assert_eq!(
+            m.len(),
+            DISCORD_MAX_STATIC_CHOICES,
+            "empty partial → first cap"
+        );
+        // "choice-" matches all 40 but the answer is capped to 25.
+        let m = o.matching_choices("choice-");
+        assert_eq!(m.len(), DISCORD_MAX_STATIC_CHOICES);
+    }
+
+    #[test]
+    fn matching_choices_is_empty_for_no_match_and_for_non_autocomplete_options() {
+        let big = opt_with_choices("sort", OptKind::String, 40);
+        assert!(
+            big.matching_choices("zzz-nope").is_empty(),
+            "no substring match → empty"
+        );
+        // A small static list is not served via autocomplete at all.
+        let small = opt_with_choices("sort", OptKind::String, 5);
+        assert!(small.matching_choices("choice").is_empty());
+        // No choices.
+        assert!(
+            opt("q", OptKind::String, false)
+                .matching_choices("a")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn extract_focused_option_reads_command_option_and_partial() {
+        let payload = json!({
+            "type": 4,
+            "data": {
+                "name": "search",
+                "options": [
+                    { "name": "scope", "type": 3, "value": "repo" },
+                    { "name": "query", "type": 3, "value": "rus", "focused": true }
+                ]
+            }
+        });
+        assert_eq!(
+            extract_focused_option(&payload),
+            Some(("search".to_string(), "query".to_string(), "rus".to_string()))
+        );
+    }
+
+    #[test]
+    fn extract_focused_option_handles_numeric_partial_and_none() {
+        // A focused integer option carries a numeric value → stringified.
+        let numeric = json!({
+            "data": { "name": "c", "options": [ { "name": "limit", "type": 4, "value": 12, "focused": true } ] }
+        });
+        assert_eq!(
+            extract_focused_option(&numeric),
+            Some(("c".to_string(), "limit".to_string(), "12".to_string()))
+        );
+        // No option marked focused → None.
+        let unfocused = json!({
+            "data": { "name": "c", "options": [ { "name": "limit", "type": 4, "value": 12 } ] }
+        });
+        assert!(extract_focused_option(&unfocused).is_none());
+        // Missing command name → None.
+        assert!(extract_focused_option(&json!({ "data": {} })).is_none());
     }
 }

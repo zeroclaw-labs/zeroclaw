@@ -107,6 +107,7 @@ use crate::agent::tool_execution::{
 };
 use crate::approval::ApprovalManager;
 use crate::observability::Observer;
+use crate::security::ingress::{IngressPolicy, ingress_policy};
 use crate::tools::Tool;
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
@@ -118,6 +119,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::channel::Channel;
+use zeroclaw_api::ingress::{IngressContext, IngressDecision};
 use zeroclaw_providers::{ChatMessage, ModelProvider};
 
 /// Maximum malformed internal tool-protocol retries before returning a safe fallback.
@@ -196,6 +198,13 @@ pub struct ToolLoop<'a> {
     pub new_messages_out: Option<&'a mut Vec<ChatMessage>>,
     pub knobs: &'a LoopKnobs,
     pub image_cache: Option<&'a mut zeroclaw_providers::multimodal::LocalImageCache>,
+    /// The ingress envelope stamped by the entry layer (RFC #6971). Travels
+    /// with the turn into the engine, where the universal SOP policy layer
+    /// dispositions it at P1 (turn entry) and P2 (each steering injection).
+    /// Phase-1 callers stamp [`IngressContext::internal`]; real per-transport
+    /// stamping is phase 2. Owned (not borrowed) — the envelope is small and
+    /// consumed by the policy front door for the turn's lifetime.
+    pub ingress: IngressContext,
 }
 
 pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
@@ -234,7 +243,43 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         mut new_messages_out,
         knobs,
         mut image_cache,
+        ingress,
     } = p;
+
+    // ── Ingress policy · P1 (turn entry) ────────────────────────────────────
+    // RFC #6971: every inbound turn passes the universal SOP policy layer before
+    // a model sees it. The default policy dispositions to `Loop` (run the agent,
+    // today's behavior); the layer is always on, never skipped. `ingress` is
+    // consumed here (passed to `ingress_policy`) so it is never dead code under
+    // `-D warnings`. The text dispositioned at P1 is the trailing user turn —
+    // the most recently appended `user` history message, when present.
+    let ingress_policy_cfg = IngressPolicy::default();
+    let p1_text = history
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map_or("", |m| m.content.as_str());
+    match ingress_policy(p1_text, &ingress, &ingress_policy_cfg) {
+        // DEFAULT — the only arm reachable under the default policy. Proceed
+        // into the loop exactly as today.
+        IngressDecision::Loop => {}
+        // Phase 3: wrap the message as untrusted data before it enters history.
+        // Until framing exists, proceed as Loop (behavior-identical).
+        IngressDecision::Annotate { .. } => {}
+        // Phase 2: divert the turn into a managed SOP run instead of the loop.
+        // Not reachable under the default policy; proceed-as-loop for now.
+        IngressDecision::Gate { .. } => {
+            // TODO(PR C): hand this turn to the SOP run the gate names.
+        }
+        // Not reachable under the default policy; refuse the turn when it is.
+        IngressDecision::Drop { ref reason } => {
+            return Ok(crate::i18n::get_required_cli_string_with_args(
+                "turn-ingress-dropped",
+                &[("reason", reason.as_str())],
+            ));
+        }
+    }
+
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
@@ -288,7 +333,29 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
     for iteration in 0..max_iterations {
         // Steering: fold caller-pushed mid-turn messages into history before
         // this iteration's provider request.
+        //
+        // ── Ingress policy · P2 (steering drain) ────────────────────────────
+        // RFC #6971: each mid-turn injection passes the same universal policy
+        // layer as P1. The default policy dispositions to `Loop` → append as
+        // today. The envelope (`ingress`) carries the turn's provenance to the
+        // policy for each drained message.
         for steering_message in drain_steering_messages(&mut steering) {
+            match ingress_policy(&steering_message, &ingress, &ingress_policy_cfg) {
+                // DEFAULT — append the injection to history exactly as today.
+                IngressDecision::Loop => {}
+                // Phase 3: frame as untrusted data; proceed as Loop until
+                // framing exists (behavior-identical).
+                IngressDecision::Annotate { .. } => {}
+                // Phase 2: divert this injection into the SOP run rather than
+                // history. Not reachable under the default policy.
+                IngressDecision::Gate { .. } => {
+                    // TODO(PR C): route this steering message into the gated
+                    // SOP run instead of appending it to history.
+                }
+                // Not reachable under the default policy; drop the injection
+                // (do not append it) when it is.
+                IngressDecision::Drop { .. } => continue,
+            }
             let msg = ChatMessage::user(steering_message);
             if let Some(out) = new_messages_out.as_deref_mut() {
                 out.push(msg.clone());
