@@ -4,6 +4,7 @@ use std::path::Path;
 use std::time::Duration;
 
 const SOURCE: &str = "dev/ci/container-base-images.toml";
+const NODE_VERSION_SOURCE: &str = ".nvmrc";
 const NODE_SUITE: &str = "bookworm-slim";
 const INDEX_ACCEPT: &str = "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json";
 
@@ -76,44 +77,34 @@ struct Token {
     token: String,
 }
 
-#[derive(Deserialize)]
-struct TagPage {
-    results: Vec<TagEntry>,
-    next: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct TagEntry {
-    name: String,
-}
-
-fn discover_node_tag(client: &reqwest::blocking::Client, repo: &str) -> anyhow::Result<String> {
-    let mut best: Option<u32> = None;
-    let mut url = Some(format!(
-        "https://hub.docker.com/v2/repositories/{repo}/tags?page_size=100&name={NODE_SUITE}"
-    ));
-    while let Some(next) = url.take() {
-        let page: TagPage = client
-            .get(&next)
-            .send()
-            .context("node tag list request")?
-            .error_for_status()
-            .context("node tag list status")?
-            .json()
-            .context("parse node tag list")?;
-        for t in &page.results {
-            if let Some(major) = node_major_for_suite(&t.name) {
-                best = Some(best.map_or(major, |b| b.max(major)));
-            }
-        }
-        url = page.next;
-    }
-    let major = best.context("registry returned no <major>-bookworm-slim node tag")?;
+fn node_tag_from_policy(root: &Path, zone: &str) -> anyhow::Result<String> {
+    let major =
+        node_major_policy(root).with_context(|| format!("{zone}: resolve Node major policy"))?;
     Ok(format!("{major}-{NODE_SUITE}"))
 }
 
+fn node_major_policy(root: &Path) -> anyhow::Result<u32> {
+    let raw = std::fs::read_to_string(root.join(NODE_VERSION_SOURCE))
+        .with_context(|| format!("read {NODE_VERSION_SOURCE}"))?;
+    parse_node_major_policy(&raw)
+        .with_context(|| format!("{NODE_VERSION_SOURCE}: expected a non-zero Node major version"))
+}
+
+fn parse_node_major_policy(raw: &str) -> Option<u32> {
+    let version = raw.trim();
+    let version = version.strip_prefix('v').unwrap_or(version);
+    let major = version.split('.').next()?;
+    major
+        .chars()
+        .all(|c| c.is_ascii_digit())
+        .then(|| major.parse::<u32>().ok())
+        .flatten()
+        .filter(|major| *major > 0)
+}
+
 fn node_major_for_suite(tag: &str) -> Option<u32> {
-    tag.strip_suffix(&format!("-{NODE_SUITE}"))
+    tag.strip_suffix(NODE_SUITE)
+        .and_then(|tag| tag.strip_suffix('-'))
         .filter(|m| !m.is_empty() && m.chars().all(|c| c.is_ascii_digit()))
         .and_then(|m| m.parse::<u32>().ok())
 }
@@ -207,7 +198,7 @@ pub fn refresh_source(root: &Path) -> anyhow::Result<()> {
     let mut src = load(root)?;
     for img in &mut src.image {
         let tag = if img.discover {
-            discover_node_tag(&client, &img.repo)?
+            node_tag_from_policy(root, &img.zone)?
         } else {
             img.tag
                 .clone()
@@ -225,8 +216,8 @@ pub fn refresh_source(root: &Path) -> anyhow::Result<()> {
 const SOURCE_HEADER: &str = "# Canonical container base-image pins for the generated container surfaces\n\
 # (Dockerfile, Dockerfile.debian). Edit registry/repo/image_ref/tag here; `tag`\n\
 # and `digest` are rewritten live by `cargo generate installers`. A row with\n\
-# discover=true resolves its tag live from the registry (node: highest\n\
-# <major>-bookworm-slim on Docker Hub). StageX pins in the Containerfile are\n\
+# discover=true derives its tag from the repo root .nvmrc, then refreshes its\n\
+# digest live from the registry. StageX pins in the Containerfile are\n\
 # excluded on purpose: digest-only, reproducible-build intent, no tag to follow.\n\n";
 
 fn render_source(src: &Source) -> anyhow::Result<String> {
@@ -243,19 +234,20 @@ pub fn splice_zones(root: &Path, current: &str) -> anyhow::Result<String> {
         if !current.contains(&begin(&img.zone)) {
             continue;
         }
-        let (tag, digest) = resolved(img)?;
+        let (tag, digest) = resolved(root, img)?;
         out = splice(&out, &img.zone, &arg_line(img, tag, digest))?;
     }
     Ok(out)
 }
 
-fn resolved(img: &BaseImage) -> anyhow::Result<(&str, &str)> {
+fn resolved<'a>(root: &Path, img: &'a BaseImage) -> anyhow::Result<(&'a str, &'a str)> {
     let tag = img.tag.as_deref().with_context(|| {
         format!(
             "{}: TOML missing resolved tag; run `cargo generate installers`",
             img.zone
         )
     })?;
+    validate_node_tag_policy(root, img, tag)?;
     let digest = img.digest.as_deref().with_context(|| {
         format!(
             "{}: TOML missing resolved digest; run `cargo generate installers`",
@@ -263,6 +255,22 @@ fn resolved(img: &BaseImage) -> anyhow::Result<(&str, &str)> {
         )
     })?;
     Ok((tag, digest))
+}
+
+fn validate_node_tag_policy(root: &Path, img: &BaseImage, tag: &str) -> anyhow::Result<()> {
+    if !img.discover {
+        return Ok(());
+    }
+    let expected = node_major_policy(root)?;
+    let actual = node_major_for_suite(tag)
+        .with_context(|| format!("{}: node tag {tag} is not <major>-{NODE_SUITE}", img.zone))?;
+    if actual != expected {
+        anyhow::bail!(
+            "{}: {NODE_VERSION_SOURCE} declares Node major {expected} but tag {tag} resolves to Node major {actual}",
+            img.zone
+        );
+    }
+    Ok(())
 }
 
 /// Network-free drift check: every declared ARG zone must match what the TOML
@@ -284,19 +292,13 @@ pub fn check(root: &Path, current: &str) -> anyhow::Result<Vec<String>> {
         if !declares {
             continue;
         }
-        let (tag, digest) = match resolved(img) {
+        let (tag, digest) = match resolved(root, img) {
             Ok(v) => v,
             Err(e) => {
                 drift.push(e.to_string());
                 continue;
             }
         };
-        if img.discover && node_major_for_suite(tag).is_none() {
-            drift.push(format!(
-                "{}: node tag {tag} is not <major>-{NODE_SUITE}",
-                img.zone
-            ));
-        }
         if !valid_digest(digest) {
             drift.push(format!("{}: malformed digest {digest}", img.zone));
         }
@@ -318,6 +320,32 @@ mod tests {
             .parent()
             .unwrap()
             .to_path_buf()
+    }
+
+    fn source_with_node_tag(tag: &str) -> String {
+        format!(
+            r#"[[image]]
+zone = "base-arg-node"
+arg = "ZEROCLAW_BASE_NODE"
+registry = "dockerhub"
+repo = "library/node"
+image_ref = "node"
+discover = true
+tag = "{tag}"
+digest = "sha256:{}"
+"#,
+            "a".repeat(64)
+        )
+    }
+
+    fn write_source(root: &Path, source: &str) {
+        let dir = root.join("dev/ci");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("container-base-images.toml"), source).unwrap();
+    }
+
+    fn write_nvmrc(root: &Path, major: u32) {
+        std::fs::write(root.join(".nvmrc"), major.to_string()).unwrap();
     }
 
     fn fixed(zone: &str) -> BaseImage {
@@ -369,7 +397,7 @@ mod tests {
     #[test]
     fn arg_line_round_trips_through_zone_body() {
         let img = fixed("base-arg-test");
-        let (tag, digest) = resolved(&img).unwrap();
+        let (tag, digest) = resolved(&root(), &img).unwrap();
         let line = arg_line(&img, tag, digest);
         let content = format!("{}\n{line}\n{}\n", begin(&img.zone), end(&img.zone));
         assert_eq!(zone_body(&content, &img.zone).unwrap(), line);
@@ -380,5 +408,25 @@ mod tests {
         let content = "FROM ${ZEROCLAW_BASE_RUST_SLIM} AS x\n";
         let drift = check(&root(), content).unwrap();
         assert!(drift.iter().any(|d| d.contains("base-arg-rust-slim")));
+    }
+
+    #[test]
+    fn splice_zones_rejects_node_tag_that_differs_from_nvmrc() {
+        let temp = tempfile::tempdir().unwrap();
+        write_nvmrc(temp.path(), 24);
+        write_source(temp.path(), &source_with_node_tag("27-bookworm-slim"));
+        let content = format!(
+            "{}\nARG ZEROCLAW_BASE_NODE=node:27-bookworm-slim@sha256:{}\n{}\n",
+            begin("base-arg-node"),
+            "a".repeat(64),
+            end("base-arg-node")
+        );
+
+        let err = splice_zones(temp.path(), &content).unwrap_err();
+
+        assert!(
+            err.to_string().contains(".nvmrc declares Node major 24"),
+            "expected .nvmrc mismatch error, got {err:#}"
+        );
     }
 }
