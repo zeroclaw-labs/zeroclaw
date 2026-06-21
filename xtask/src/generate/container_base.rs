@@ -222,8 +222,16 @@ pub fn refresh_source(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+const SOURCE_HEADER: &str = "# Canonical container base-image pins for the generated container surfaces\n\
+# (Dockerfile, Dockerfile.debian). Edit registry/repo/image_ref/tag here; `tag`\n\
+# and `digest` are rewritten live by `cargo generate installers`. A row with\n\
+# discover=true resolves its tag live from the registry (node: highest\n\
+# <major>-bookworm-slim on Docker Hub). StageX pins in the Containerfile are\n\
+# excluded on purpose: digest-only, reproducible-build intent, no tag to follow.\n\n";
+
 fn render_source(src: &Source) -> anyhow::Result<String> {
-    toml::to_string_pretty(src).context("serialize source")
+    let body = toml::to_string_pretty(src).context("serialize source")?;
+    Ok(format!("{SOURCE_HEADER}{body}"))
 }
 
 /// Splice the ARG zones each surface declares, sourced from the canonical TOML.
