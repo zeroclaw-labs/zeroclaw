@@ -101,6 +101,17 @@ fn secret_prompt(prompt_text: &str, allow_empty: bool) -> Result<String> {
 
     enable_raw_mode()?;
 
+    // RAII guard ensures raw mode is disabled even if the closure panics.
+    // Without this, a panic would leave the terminal in raw mode (no echo),
+    // requiring the user to manually run `stty sane` or `reset`.
+    struct RawModeGuard;
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            let _ = disable_raw_mode();
+        }
+    }
+    let _raw_guard = RawModeGuard;
+
     let mut buffer = String::new();
     let mut feedback_shown = false;
 
@@ -127,14 +138,17 @@ fn secret_prompt(prompt_text: &str, allow_empty: bool) -> Result<String> {
                             // Clear the feedback line before submitting so it doesn't
                             // linger in the terminal scrollback.
                             if feedback_shown {
-                                // Move cursor up one line, clear it, then move back down.
+                                // Move cursor up one line, clear it, then move back down
+                                // so the cursor ends up on the correct line for any
+                                // subsequent output from the caller.
                                 execute!(
                                     io::stderr(),
                                     crossterm::cursor::MoveUp(1),
                                     crossterm::terminal::Clear(
                                         crossterm::terminal::ClearType::CurrentLine
                                     ),
-                                    crossterm::cursor::MoveToColumn(0)
+                                    crossterm::cursor::MoveToColumn(0),
+                                    crossterm::cursor::MoveDown(1)
                                 )?;
                             }
                             break;
@@ -213,11 +227,7 @@ fn secret_prompt(prompt_text: &str, allow_empty: bool) -> Result<String> {
         Ok(buffer.trim().to_string())
     })();
 
-    disable_raw_mode()?;
-
-    // After leaving raw mode, print the post-submit confirmation without length.
-    // This line is unconditional (non-empty guard is in the caller) and serves
-    // as a final visual signal that the secret was accepted.
+    // RawModeGuard's Drop impl calls disable_raw_mode() here (or on panic).
     result
 }
 
@@ -5227,6 +5237,10 @@ async fn main() -> Result<()> {
                     if !secret_value.is_empty() {
                         eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
                     }
+                    // Safety net for the `not(agent-runtime)` dialoguer fallback path,
+                    // which does not enforce non-empty input at the prompt level.
+                    // Under agent-runtime, secret_prompt(_, false) already bails on
+                    // empty input, making this check unreachable for that path.
                     if secret_value.is_empty() {
                         anyhow::bail!("Value cannot be empty.");
                     }
@@ -6013,7 +6027,9 @@ fn handle_estop_command(
                         .with_prompt("Enter OTP code")
                         .allow_empty_password(false)
                         .interact()?;
-                    eprintln!("{}", ta("cli-otp-received", &[], "  ✓ OTP received"));
+                    if !entered.is_empty() {
+                        eprintln!("{}", ta("cli-otp-received", &[], "  ✓ OTP received"));
+                    }
                     otp_code = Some(entered);
                 }
 
@@ -6600,7 +6616,9 @@ fn indent_paircode_lines(lines: Vec<String>) -> String {
 #[cfg(feature = "agent-runtime")]
 fn read_auth_input(prompt: &str) -> Result<String> {
     let trimmed = secret_prompt(prompt, false)?;
-    eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
+    if !trimmed.is_empty() {
+        eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
+    }
     Ok(trimmed)
 }
 
