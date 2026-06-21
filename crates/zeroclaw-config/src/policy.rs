@@ -2753,6 +2753,7 @@ mod tests {
             always_ask: vec!["shell".into()],
             allowed_roots: vec!["/tmp/extra".into()],
             delegation_policy: crate::autonomy::DelegationPolicy::default(),
+            approval_route: None,
             allowed_tools: vec!["shell".into(), "memory_recall".into()],
             excluded_tools: vec!["spawn_subagent".into()],
             sandbox_enabled: Some(true),

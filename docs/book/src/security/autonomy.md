@@ -44,6 +44,25 @@ This is appropriate for trusted local dev, CI, or SOPs that need to run end-to-e
 
 `auto_approve`, `always_ask`, and `excluded_tools` live as flat lists of tool names on the risk profile (not nested tables). `excluded_tools` is also available per-channel (`channels.<type>.<alias>.excluded_tools`) to hide tools from specific surfaces without changing the profile.
 
+## Cross-channel approval routing
+
+By default an approval prompt is delivered through whichever channel initiated the conversation. To send a profile's tool approvals to a **distinct** approver channel instead (for example, an agent driven from a public channel whose risky actions must be approved by a separate ops channel, or by a different principal), set `approval_route` on the risk profile:
+
+```toml
+[risk_profiles.frontline.approval_route]
+approver_channel = "ops"            # a registered channel name, NOT the originator
+on_no_approver   = "deny"           # default; or "inherit-originator"
+timeout_secs     = 120              # default; bounds the approver's response window
+```
+
+- `approver_channel` is the registered channel that receives the approval request. When the route is set, the gate asks **only** that channel, not the originating one.
+- `on_no_approver` decides what happens when the approver does not answer decisively, is unreachable, is not a registered channel, or times out:
+  - `deny` (the default) fails closed and denies the tool call.
+  - `inherit-originator` falls back to the originating-channel prompt (today's behavior).
+- `timeout_secs` (default 120) bounds how long the gate waits for the approver before applying `on_no_approver`, so a hung approver channel cannot stall a turn.
+
+When `approval_route` is absent (the default), approvals behave exactly as described above: delivered through whichever channel initiated the conversation. The fail-closed default means a misconfigured or unreachable approver denies rather than silently self-approving.
+
 ## Command allow list
 
 For the shell tool specifically: if `allowed_commands` is non-empty, it's strict: any command not listed is blocked. The shell-policy validator handles destructive-pattern detection on top of the allowlist.

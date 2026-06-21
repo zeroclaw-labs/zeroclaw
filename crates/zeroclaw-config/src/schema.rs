@@ -10376,6 +10376,11 @@ pub struct RiskProfileConfig {
     #[serde(default)]
     #[nested]
     pub delegation_policy: DelegationPolicy,
+    /// Route this profile's tool approvals to a DISTINCT approver channel instead of the
+    /// channel that triggered the run (closes the cross-channel-HITL gap). Absent ⇒ the
+    /// originating channel approves (today's behavior). See [`crate::autonomy::ApprovalRoute`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_route: Option<crate::autonomy::ApprovalRoute>,
     /// Tools the agent may call in agentic mode. Empty = inherit / no
     /// authorization constraint. Authorization decision: which tools is
     /// the agent permitted to invoke at all. See `excluded_tools` for
@@ -10435,6 +10440,7 @@ impl Default for RiskProfileConfig {
             always_ask: default_always_ask(),
             allowed_roots: Vec::new(),
             delegation_policy: DelegationPolicy::default(),
+            approval_route: None,
             allowed_tools: Vec::new(),
             excluded_tools: Vec::new(),
             sandbox_enabled: None,
