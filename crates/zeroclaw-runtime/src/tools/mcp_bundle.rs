@@ -277,7 +277,7 @@ mod tests {
                     "-n",
                     "--fixed-strings",
                     "connect_all(&config.mcp.servers)",
-                    &fpath,
+                    fpath,
                 ])
                 .output()
                 .expect("grep command failed");
