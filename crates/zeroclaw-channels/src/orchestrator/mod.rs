@@ -4800,7 +4800,7 @@ async fn process_channel_message_body(
         let llm_result = loop {
             let loop_result = tokio::select! {
                 () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
-                result = tokio::time::timeout(
+                result = Box::pin(tokio::time::timeout(
                     Duration::from_secs(timeout_budget_secs),
                     scope_thread_id(
                         msg.interruption_scope_id.clone()
@@ -4871,7 +4871,7 @@ async fn process_channel_message_body(
                     ),
                     ),
                     ),
-                ) => LlmExecutionResult::Completed(result),
+                )) => LlmExecutionResult::Completed(result),
             };
 
             // Handle model switch: re-create the model_provider and retry
