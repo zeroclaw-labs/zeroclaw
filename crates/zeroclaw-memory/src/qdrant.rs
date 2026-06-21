@@ -839,6 +839,16 @@ impl Memory for QdrantMemory {
         Ok(matches)
     }
 
+    async fn count_agent(&self, agent_alias: &str) -> Result<usize> {
+        // Qdrant keys memory points by the alias in the `agent_id` payload field,
+        // so `rename_agent` re-points exactly the points `list_for_agents` returns;
+        // residue is that match count.
+        Ok(self
+            .list_for_agents(&[agent_alias], None, None)
+            .await?
+            .len())
+    }
+
     async fn count(&self) -> Result<usize> {
         self.ensure_initialized().await?;
 

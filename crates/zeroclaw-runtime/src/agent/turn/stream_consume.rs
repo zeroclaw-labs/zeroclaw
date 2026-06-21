@@ -137,6 +137,7 @@ pub(crate) async fn consume_provider_streaming_response(
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_category(::zeroclaw_log::EventCategory::Provider)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
                     "model_provider stream emitted an error event"

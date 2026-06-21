@@ -83,6 +83,7 @@ pub async fn execute_one_tool(
                                 module_path!(),
                                 ::zeroclaw_log::Action::Note
                             )
+                            .with_category(::zeroclaw_log::EventCategory::Tool)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(::serde_json::json!({
                                 "tool": call_name,

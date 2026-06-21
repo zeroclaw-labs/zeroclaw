@@ -380,10 +380,11 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             if remaining == 0 {
                 ::zeroclaw_log::record!(
                     WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({"iteration": iteration})),
-                    "Shared iteration budget exhausted at iteration "
+                    "Shared iteration budget exhausted at iteration"
                 );
                 break;
             }
@@ -400,7 +401,8 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         {
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Migrate)
+                    .with_category(::zeroclaw_log::EventCategory::Provider),
                 &format!(
                     "Model switch detected: {} {} -> {} {}",
                     provider_name, model, new_model_provider, new_model
@@ -484,6 +486,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
                     .with_attrs(::serde_json::json!({
                         "has_on_delta": on_delta.is_some(),
                         "has_event_tx": event_tx.is_some(),
@@ -612,6 +615,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Provider)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(serde_json::json!({
                         "channel": channel_name,
@@ -625,6 +629,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Provider)
                     .with_attrs(serde_json::json!({
                     "iteration": iteration + 1,
                     "retry": malformed_tool_protocol_retries,
@@ -685,6 +690,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_attrs(::serde_json::json!({
                         "model": model,
