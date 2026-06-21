@@ -151,7 +151,8 @@ impl CostTracker {
         usage: TokenUsage,
         agent_alias: Option<&str>,
     ) -> Result<()> {
-        if !self.config_snapshot().enabled {
+        let config = self.config_snapshot();
+        if !config.enabled {
             return Ok(());
         }
 
@@ -166,7 +167,7 @@ impl CostTracker {
             anyhow::bail!("Token usage cost must be a finite, non-negative value");
         }
 
-        let effective_alias = if self.config_snapshot().track_per_agent {
+        let effective_alias = if config.track_per_agent {
             agent_alias.map(str::to_string)
         } else {
             None
@@ -941,6 +942,34 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("Estimated cost must be a finite, non-negative value")
+        );
+    }
+
+    #[test]
+    fn record_usage_reads_one_config_generation() {
+        let tmp = TempDir::new().unwrap();
+
+        let tracker = CostTracker::new(
+            CostConfig {
+                enabled: true,
+                track_per_agent: true,
+                ..Default::default()
+            },
+            tmp.path(),
+        )
+        .expect("boot tracker");
+
+        tracker
+            .record_usage_with_agent(
+                TokenUsage::new("test/model", 1_000, 1_000, 0, 1.0, 1.0, 0.0),
+                Some("agent-a"),
+            )
+            .expect("record under enabled+track_per_agent");
+
+        let summary = tracker.get_summary().expect("summary");
+        assert!(
+            summary.by_agent.contains_key("agent-a"),
+            "with enabled+track_per_agent both read from one snapshot, the alias must be attributed"
         );
     }
 
