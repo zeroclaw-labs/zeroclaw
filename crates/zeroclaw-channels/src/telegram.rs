@@ -5721,6 +5721,160 @@ mod tests {
     }
 
     #[test]
+    fn parse_update_reply_to_bot_bypasses_mention_only_gate() {
+        let mention_only = true;
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        {
+            let mut cache = ch.bot_id.lock();
+            *cache = Some(42);
+        }
+
+        // Reply to the bot's own message — no mention needed.
+        let update = serde_json::json!({
+            "update_id": 20,
+            "message": {
+                "message_id": 55,
+                "text": "do this",
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "group" },
+                "reply_to_message": {
+                    "message_id": 50,
+                    "from": { "id": 42, "username": "mybot", "is_bot": true },
+                    "text": "original"
+                }
+            }
+        });
+
+        let parsed = ch
+            .parse_update_message(&update)
+            .expect("reply-to-bot should bypass mention_only gate");
+        assert_eq!(parsed.content, "do this");
+    }
+
+    #[test]
+    fn parse_update_reply_to_non_bot_still_dropped_in_mention_only() {
+        let mention_only = true;
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        {
+            let mut cache = ch.bot_id.lock();
+            *cache = Some(42);
+        }
+
+        // Reply to another user (not the bot) — still needs a mention.
+        let update = serde_json::json!({
+            "update_id": 21,
+            "message": {
+                "message_id": 56,
+                "text": "hello",
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "group" },
+                "reply_to_message": {
+                    "message_id": 51,
+                    "from": { "id": 99, "username": "charlie" },
+                    "text": "some message"
+                }
+            }
+        });
+
+        assert!(ch.parse_update_message(&update).is_none());
+    }
+
+    #[test]
+    fn parse_update_reply_bot_id_unresolved_falls_through_in_mention_only() {
+        let mention_only = true;
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        // bot_id stays None — unresolved.
+
+        // Reply to the bot's message, but bot_id is unresolved — falls through.
+        let update = serde_json::json!({
+            "update_id": 22,
+            "message": {
+                "message_id": 57,
+                "text": "hello",
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "group" },
+                "reply_to_message": {
+                    "message_id": 52,
+                    "from": { "id": 42, "username": "mybot", "is_bot": true },
+                    "text": "original"
+                }
+            }
+        });
+
+        assert!(ch.parse_update_message(&update).is_none());
+    }
+
+    #[test]
+    fn parse_update_reply_to_bot_bypasses_mention_only_gate_caption_path() {
+        let mention_only = true;
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+        {
+            let mut cache = ch.bot_id.lock();
+            *cache = Some(42);
+        }
+
+        // Photo with a caption, replying to the bot — caption should pass.
+        let update = serde_json::json!({
+            "update_id": 23,
+            "message": {
+                "message_id": 58,
+                "caption": "enhance this",
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "group" },
+                "photo": [
+                    { "file_id": "abc", "width": 100, "height": 100 }
+                ],
+                "reply_to_message": {
+                    "message_id": 53,
+                    "from": { "id": 42, "username": "mybot", "is_bot": true },
+                    "text": "original photo"
+                }
+            }
+        });
+
+        let parsed = ch
+            .parse_update_message(&update)
+            .expect("reply-to-bot caption should bypass mention_only gate");
+        assert_eq!(parsed.content, "enhance this");
+    }
+
+    #[test]
     fn telegram_is_group_message_detects_groups() {
         let group_msg = serde_json::json!({
             "chat": { "type": "group" }
