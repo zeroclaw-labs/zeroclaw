@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use zeroclaw_api::model_provider::{ChatMessage, ModelProvider};
 use zeroclaw_memory::traits::Memory;
+use zeroclaw_providers::ProviderDispatch;
 use zeroclaw_providers::multimodal;
 
 use crate::observability::{Observer, ObserverEvent};
@@ -238,7 +239,8 @@ impl ContextCompressor {
         if chars_saved > 0 {
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Delete)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
                     .with_attrs(::serde_json::json!({"chars_saved": chars_saved})),
                 "Fast-trim saved chars from old tool results"
             );
@@ -295,7 +297,8 @@ impl ContextCompressor {
 
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Retry)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
                 .with_attrs(::serde_json::json!({"context_window": self.context_window})),
             "Context limit adjusted, re-compressing"
         );
@@ -362,9 +365,10 @@ impl ContextCompressor {
 
         // LLM summarization with safety timeout
         let timeout = Duration::from_secs(self.config.timeout_secs);
+        let dispatcher = ProviderDispatch::from_ref(model_provider);
         let summary_raw = match tokio::time::timeout(
             timeout,
-            model_provider.chat_with_system(
+            dispatcher.chat_with_system(
                 Some(SUMMARIZER_SYSTEM),
                 &user_prompt,
                 summary_model,
@@ -377,8 +381,9 @@ impl ContextCompressor {
             Ok(Err(e)) => {
                 ::zeroclaw_log::record!(
                     WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                     "Summarization LLM call failed, using transcript truncation"
                 );
@@ -387,8 +392,9 @@ impl ContextCompressor {
             Err(_) => {
                 ::zeroclaw_log::record!(
                     WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Timeout)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
                     &format!(
                         "Summarization timed out after {}s, using transcript truncation",
                         self.config.timeout_secs
@@ -415,7 +421,8 @@ impl ContextCompressor {
                 Ok(_) => {
                     ::zeroclaw_log::record!(
                         DEBUG,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Save)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
                             .with_attrs(::serde_json::json!({"message_count": message_count})),
                         "Saved compression summary to memory before discarding messages"
                     );
@@ -423,7 +430,9 @@ impl ContextCompressor {
                 Err(e) => {
                     ::zeroclaw_log::record!(
                         DEBUG,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                         "Failed to save compression summary to memory"
                     );
@@ -448,8 +457,9 @@ impl ContextCompressor {
 
         ::zeroclaw_log::record!(
             WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
                 .with_attrs(::serde_json::json!({
                     "messages_summarized": message_count,
                     "summary_chars": summary.len(),

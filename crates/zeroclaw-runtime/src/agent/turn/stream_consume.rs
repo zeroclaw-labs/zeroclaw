@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::model_provider::StreamEvent;
-use zeroclaw_providers::{ChatMessage, ChatRequest, ModelProvider, ToolCall};
+use zeroclaw_providers::{ChatMessage, ChatRequest, ModelProvider, ProviderDispatch, ToolCall};
 
 #[derive(Debug, Default)]
 pub(crate) struct StreamedChatOutcome {
@@ -25,6 +25,10 @@ pub(crate) struct StreamedChatOutcome {
     pub(crate) reasoning_content: String,
     pub(crate) tool_calls: Vec<ToolCall>,
     pub(crate) forwarded_live_deltas: bool,
+    /// Visible text already delivered live on the draft/event sinks. The loop
+    /// re-sends only `display_text` beyond this prefix, so narration is neither
+    /// duplicated nor truncated when a tool call cuts the live stream short.
+    pub(crate) forwarded_visible_text: String,
     pub(crate) suppressed_protocol: bool,
     pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
 }
@@ -40,7 +44,7 @@ pub(crate) async fn consume_provider_streaming_response(
     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
     strict_tool_parsing: bool,
 ) -> Result<StreamedChatOutcome> {
-    let mut provider_stream = model_provider.stream_chat(
+    let mut provider_stream = ProviderDispatch::from_ref(model_provider).stream_chat(
         ChatRequest {
             messages,
             tools: request_tools,
@@ -76,6 +80,35 @@ pub(crate) async fn consume_provider_streaming_response(
     // already-delivered output.
     let mut forwarded_text = String::new();
 
+    macro_rules! forward_visible {
+        ($text:expr, $count_visible:tt) => {{
+            let visible = $text;
+            if event_tx.is_some() || delta_sender.is_some() {
+                outcome.forwarded_visible_text.push_str(&visible);
+            }
+            if let Some(tx) = event_tx {
+                outcome.forwarded_live_deltas = true;
+                forward_visible!(@count $count_visible, visible);
+                let _ = tx
+                    .send(TurnEvent::Chunk {
+                        delta: visible.clone(),
+                    })
+                    .await;
+            }
+            if let Some(tx) = delta_sender {
+                outcome.forwarded_live_deltas = true;
+                if tx.send(StreamDelta::Text(visible)).await.is_err() {
+                    delta_sender = None;
+                }
+            }
+        }};
+        (@count true, $visible:ident) => {{
+            visible_event_output = true;
+            forwarded_text.push_str(&$visible);
+        }};
+        (@count false, $visible:ident) => {{}};
+    }
+
     loop {
         let next_chunk = if let Some(token) = cancellation_token {
             tokio::select! {
@@ -104,6 +137,7 @@ pub(crate) async fn consume_provider_streaming_response(
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_category(::zeroclaw_log::EventCategory::Provider)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
                     "model_provider stream emitted an error event"
@@ -205,25 +239,7 @@ pub(crate) async fn consume_provider_streaming_response(
                 }
 
                 if strict_tool_parsing {
-                    // Every event_tx send is gated on event_tx ALONE — never
-                    // nested under on_delta. Nesting doubles chunks when both
-                    // are Some and drops them when on_delta is None.
-                    if let Some(tx) = event_tx {
-                        outcome.forwarded_live_deltas = true;
-                        visible_event_output = true;
-                        forwarded_text.push_str(&sanitized_delta);
-                        let _ = tx
-                            .send(TurnEvent::Chunk {
-                                delta: sanitized_delta.clone(),
-                            })
-                            .await;
-                    }
-                    if let Some(tx) = delta_sender {
-                        outcome.forwarded_live_deltas = true;
-                        if tx.send(StreamDelta::Text(sanitized_delta)).await.is_err() {
-                            delta_sender = None;
-                        }
-                    }
+                    forward_visible!(sanitized_delta, true);
                     continue;
                 }
 
@@ -231,22 +247,7 @@ pub(crate) async fn consume_provider_streaming_response(
                     continue;
                 };
 
-                if let Some(tx) = event_tx {
-                    outcome.forwarded_live_deltas = true;
-                    visible_event_output = true;
-                    forwarded_text.push_str(&forward_text);
-                    let _ = tx
-                        .send(TurnEvent::Chunk {
-                            delta: forward_text.clone(),
-                        })
-                        .await;
-                }
-                if let Some(tx) = delta_sender {
-                    outcome.forwarded_live_deltas = true;
-                    if tx.send(StreamDelta::Text(forward_text)).await.is_err() {
-                        delta_sender = None;
-                    }
-                }
+                forward_visible!(forward_text, true);
             }
         }
     }
@@ -256,53 +257,18 @@ pub(crate) async fn consume_provider_streaming_response(
         outcome.response_text.push_str(&trailing_delta);
         if !suppress_forwarding {
             if strict_tool_parsing {
-                if let Some(tx) = event_tx {
-                    outcome.forwarded_live_deltas = true;
-                    let _ = tx
-                        .send(TurnEvent::Chunk {
-                            delta: trailing_delta.clone(),
-                        })
-                        .await;
-                }
-                if let Some(tx) = delta_sender {
-                    outcome.forwarded_live_deltas = true;
-                    if tx.send(StreamDelta::Text(trailing_delta)).await.is_err() {
-                        delta_sender = None;
-                    }
-                }
+                forward_visible!(trailing_delta, false);
             } else if let Some(forward_text) = text_guard.push(&trailing_delta) {
-                if let Some(tx) = event_tx {
-                    outcome.forwarded_live_deltas = true;
-                    let _ = tx
-                        .send(TurnEvent::Chunk {
-                            delta: forward_text.clone(),
-                        })
-                        .await;
-                }
-                if let Some(tx) = delta_sender {
-                    outcome.forwarded_live_deltas = true;
-                    if tx.send(StreamDelta::Text(forward_text)).await.is_err() {
-                        delta_sender = None;
-                    }
-                }
+                forward_visible!(forward_text, false);
             }
         }
     }
 
     if let Some(forward_text) = text_guard.finish() {
-        if let Some(tx) = event_tx {
-            outcome.forwarded_live_deltas = true;
-            let _ = tx
-                .send(TurnEvent::Chunk {
-                    delta: forward_text.clone(),
-                })
-                .await;
-        }
-        if let Some(tx) = delta_sender {
-            outcome.forwarded_live_deltas = true;
-            let _ = tx.send(StreamDelta::Text(forward_text)).await;
-        }
+        forward_visible!(forward_text, false);
     }
+    // Final forward may null delta_sender on send failure; mark it read.
+    let _ = delta_sender;
     outcome.suppressed_protocol = text_guard.suppressed_protocol;
 
     Ok(outcome)

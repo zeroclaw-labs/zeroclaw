@@ -186,19 +186,16 @@ impl HookRunner {
 
     pub async fn run_before_llm_call(
         &self,
-        mut messages: Vec<ChatMessage>,
-        mut model: String,
-    ) -> HookResult<(Vec<ChatMessage>, String)> {
+        messages: &mut Vec<ChatMessage>,
+        model: &mut String,
+    ) -> HookResult<()> {
         for h in &self.handlers {
             let hook_name = h.name();
-            match AssertUnwindSafe(h.before_llm_call(messages.clone(), model.clone()))
+            match AssertUnwindSafe(h.before_llm_call(messages, model))
                 .catch_unwind()
                 .await
             {
-                Ok(HookResult::Continue((m, mdl))) => {
-                    messages = m;
-                    model = mdl;
-                }
+                Ok(HookResult::Continue(())) => {}
                 Ok(HookResult::Cancel(reason)) => {
                     ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hook": hook_name, "reason": reason.to_string()})), "before_llm_call cancelled by hook");
                     return HookResult::Cancel(reason);
@@ -214,7 +211,7 @@ impl HookRunner {
                 }
             }
         }
-        HookResult::Continue((messages, model))
+        HookResult::Continue(())
     }
 
     pub async fn run_before_tool_call(

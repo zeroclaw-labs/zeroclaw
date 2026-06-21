@@ -149,7 +149,7 @@ pub enum ObserverEvent {
     /// Emitted after vector + keyword retrieval against the hardware
     /// datasheet index. Reports cardinalities only; carries an optional
     /// scrubbed-and-truncated query summary on the same terms as
-    /// [`MemoryRecall`]. Has no `success` field because the underlying
+    /// [`Self::MemoryRecall`]. Has no `success` field because the underlying
     /// `rag.retrieve` call is synchronous and infallible.
     RagRetrieve {
         query_summary: Option<String>,

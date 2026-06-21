@@ -7,6 +7,7 @@ use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::{ClassificationRule, Config, ModelRouteConfig};
+use zeroclaw_providers::ProviderDispatch;
 
 const DEFAULT_AGENT_MAX_DEPTH: u32 = 3;
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 10;
@@ -630,7 +631,7 @@ impl ModelRoutingConfigTool {
 
         // Greedy sampling: the ping is a liveness check, not a generation task.
         const PING_TEMPERATURE: f64 = 0.0;
-        model_provider
+        ProviderDispatch::from_ref(&*model_provider)
             .chat_with_system(
                 Some("Respond with OK."),
                 "ping",

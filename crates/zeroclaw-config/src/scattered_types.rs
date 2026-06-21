@@ -219,6 +219,37 @@ impl Default for EvalConfig {
     }
 }
 
+fn default_eval_suite_dir() -> String {
+    "evals".to_string()
+}
+fn default_eval_mode() -> String {
+    "replay".to_string()
+}
+
+/// Configuration for the agent evaluation harness (`[eval]`), surfaced via the
+/// `zeroclaw eval` command. Distinct from `[agent.eval]`, which is the in-loop
+/// response-quality scorer.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "eval"]
+pub struct EvalHarnessConfig {
+    /// Default directory of `*.json` trace fixtures used when `--suite` is omitted.
+    #[serde(default = "default_eval_suite_dir")]
+    pub suite_dir: String,
+    /// Default execution mode (`replay` or `live`) used when `--mode` is omitted.
+    #[serde(default = "default_eval_mode")]
+    pub mode: String,
+}
+
+impl Default for EvalHarnessConfig {
+    fn default() -> Self {
+        Self {
+            suite_dir: default_eval_suite_dir(),
+            mode: default_eval_mode(),
+        }
+    }
+}
+
 fn default_cc_enabled() -> bool {
     true
 }

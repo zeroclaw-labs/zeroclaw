@@ -86,7 +86,7 @@ impl RpcApprovalChannel {
     ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
         let request_id = Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel::<ChannelApprovalResponse>();
-        self.pending.insert(request_id.clone(), tx);
+        let mut pending_request = self.pending.register(request_id.clone(), tx);
 
         self.rpc
             .notify(
@@ -103,7 +103,10 @@ impl RpcApprovalChannel {
             .await;
 
         match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(response)) => Ok(Some(response)),
+            Ok(Ok(response)) => {
+                pending_request.disarm();
+                Ok(Some(response))
+            }
             Ok(Err(_)) | Err(_) => Ok(Some(ChannelApprovalResponse::Deny)),
         }
     }
@@ -157,7 +160,7 @@ mod tests {
 
     #[tokio::test]
     async fn times_out_and_auto_denies() {
-        let (rpc, _write_rx) = make_rpc();
+        let (rpc, mut write_rx) = make_rpc();
         let pending = make_pending();
         let ch = RpcApprovalChannel::new("rpc", "sess-1", Arc::clone(&rpc), Arc::clone(&pending));
         let request = ChannelApprovalRequest {
@@ -165,10 +168,53 @@ mod tests {
             arguments_summary: "rm -rf /".to_string(),
             raw_arguments: None,
         };
-        let result = ch
-            .request_approval_with_timeout("", &request, std::time::Duration::from_millis(50))
-            .await
-            .unwrap();
+        let task = zeroclaw_spawn::spawn!(async move {
+            ch.request_approval_with_timeout("", &request, std::time::Duration::from_millis(50))
+                .await
+        });
+
+        let line = write_rx.recv().await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let request_id = v["params"]["request_id"].as_str().unwrap().to_string();
+        assert!(pending.contains(&request_id));
+
+        let result = task.await.unwrap().unwrap();
         assert_eq!(result, Some(ChannelApprovalResponse::Deny));
+        assert!(
+            !pending.contains(&request_id),
+            "timed-out approval request must be removed from the pending map"
+        );
+        assert!(
+            !pending.resolve(&request_id, ChannelApprovalResponse::Approve),
+            "late approval after timeout must be a no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_request_future_removes_pending_request() {
+        let (rpc, mut write_rx) = make_rpc();
+        let pending = make_pending();
+        let ch = RpcApprovalChannel::new("rpc", "sess-1", Arc::clone(&rpc), Arc::clone(&pending));
+        let request = ChannelApprovalRequest {
+            tool_name: "shell".to_string(),
+            arguments_summary: "sleep 60".to_string(),
+            raw_arguments: None,
+        };
+        let task = zeroclaw_spawn::spawn!(async move {
+            ch.request_approval_with_timeout("", &request, std::time::Duration::from_secs(60))
+                .await
+        });
+
+        let line = write_rx.recv().await.unwrap();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let request_id = v["params"]["request_id"].as_str().unwrap().to_string();
+        assert!(pending.contains(&request_id));
+
+        task.abort();
+        let _ = task.await;
+        assert!(
+            !pending.contains(&request_id),
+            "dropping the approval future must remove the pending request"
+        );
     }
 }
