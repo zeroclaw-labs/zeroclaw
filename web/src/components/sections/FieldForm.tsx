@@ -477,6 +477,20 @@ function isRequiredField(typeHint: string): boolean {
 // follow the chosen transport instead of the type. Returns null for any field
 // that isn't one of these two transport-gated leaves (transport itself, args,
 // headers, ...), leaving the generic `Option<...>` rule in charge.
+// Which leaf each transport makes mandatory, keyed explicitly per transport so
+// the decision mirrors the server-side `validate_mcp_config` match (Stdio vs
+// Http | Sse) rather than collapsing the enum into a single `=== "stdio"`
+// boolean. A transport the backend adds to the enum but that has no rule here is
+// left UNCLASSIFIED (see below) instead of being silently assumed url-required,
+// which the old `!isStdio` form did to every unknown variant. The fully
+// registry-driven fix is backend-emitted required-leaf-per-transport metadata
+// on the entry; tracked as a follow-up.
+const MCP_REQUIRED_LEAF: Record<string, "command" | "url"> = {
+  stdio: "command",
+  http: "url",
+  sse: "url",
+};
+
 function mcpFieldRequired(
   path: string,
   transport: string | null | undefined,
@@ -484,9 +498,12 @@ function mcpFieldRequired(
   const leaf = path.match(/^mcp\.servers\.[^.]+\.([^.]+)$/)?.[1];
   if (leaf !== "command" && leaf !== "url") return null;
   // Empty / unset transport defaults to stdio (the schema default).
-  const isStdio =
-    ((transport ?? "").trim().toLowerCase() || "stdio") === "stdio";
-  return leaf === "command" ? isStdio : !isStdio;
+  const t = (transport ?? "").trim().toLowerCase() || "stdio";
+  const requiredLeaf = MCP_REQUIRED_LEAF[t];
+  // Unknown transport (a variant added backend-side without a rule here): do not
+  // assert required-ness, so a new variant cannot be silently misclassified.
+  if (!requiredLeaf) return null;
+  return leaf === requiredLeaf;
 }
 
 // Resolve the live transport draft value for the `mcp.servers.<name>` group a
