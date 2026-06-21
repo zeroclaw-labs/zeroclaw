@@ -145,6 +145,11 @@ Each channel gets a `channel:<name>` label in addition to the base `channel` lab
 
 ### Per-provider labels
 
+Provider-specific labels match dedicated provider source files. Shared registry
+or factory files should receive the base `provider` label only; maintainers can
+add a provider-specific label manually when a shared-file change is truly scoped
+to one provider.
+
 | Label | Matches |
 |---|---|
 | `provider:anthropic` | `anthropic.rs` |
