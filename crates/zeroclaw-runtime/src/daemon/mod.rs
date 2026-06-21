@@ -377,7 +377,13 @@ pub async fn run(
             sessions,
             session_backend,
             memory: rpc_memory,
-            cost_tracker: None, // TODO: wire when cost tracker is daemon-scoped
+            // Process-global tracker shared with the gateway and channel
+            // supervisor. Without this the RPC/zerocode-TUI turn path has no
+            // tracker to record into and model cost is silently dropped (#5221).
+            cost_tracker: crate::cost::CostTracker::get_or_init_global(
+                config.cost.clone(),
+                &config.data_dir,
+            ),
             event_tx: Some(event_tx.clone()),
             reload_tx: Some(reload_tx.clone()),
             approval_pending: std::sync::Arc::new(
@@ -506,17 +512,7 @@ pub async fn run(
         );
     }
 
-    println!("🧠 ZeroClaw daemon started");
-    println!("   Gateway:  http://{host}:{port}");
-    println!(
-        "   Socket:   {}",
-        crate::rpc::local::socket_path(&config).display()
-    );
-    println!("   Components: gateway, channels, heartbeat, scheduler");
-    if config.gateway.require_pairing {
-        println!("   Pairing:    enabled (code appears in gateway output above)");
-    }
-    println!("   Ctrl+C or SIGTERM to stop");
+    record_daemon_started(&config, &host, port);
 
     // Wait for shutdown (SIGINT/SIGTERM/Ctrl+C) or reload (in-process channel).
     let exit = wait_for_exit_signal(reload_rx, ephemeral, socket_client_count).await?;
@@ -554,6 +550,22 @@ pub fn state_file_path(config: &Config) -> PathBuf {
         .map_or_else(|| PathBuf::from("."), PathBuf::from)
         .join("state")
         .join("daemon_state.json")
+}
+
+fn record_daemon_started(config: &Config, host: &str, port: u16) {
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
+            .with_category(::zeroclaw_log::EventCategory::System)
+            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+            .with_attrs(::serde_json::json!({
+                "requested_gateway": format!("http://{host}:{port}"),
+                "socket": crate::rpc::local::socket_path(config).display().to_string(),
+                "pairing_enabled": config.gateway.require_pairing,
+                "stop_signal": "Ctrl+C or SIGTERM",
+            })),
+        "ZeroClaw daemon started"
+    );
 }
 
 fn spawn_state_writer(config: Config) -> JoinHandle<()> {
@@ -1410,6 +1422,31 @@ mod tests {
         config
     }
 
+    async fn recv_log_event(
+        rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
+        message: &str,
+    ) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value))
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|candidate| candidate == message) =>
+                {
+                    return value;
+                }
+                Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_elapsed) => {}
+            }
+        }
+        panic!("did not find log event: {message}");
+    }
+
     #[test]
     fn state_file_path_uses_config_state_directory() {
         let tmp = TempDir::new().unwrap();
@@ -1417,6 +1454,39 @@ mod tests {
 
         let path = state_file_path(&config);
         assert_eq!(path, tmp.path().join("state").join("daemon_state.json"));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn daemon_startup_diagnostics_are_logged_as_structured_event() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.gateway.require_pairing = true;
+
+        record_daemon_started(&config, "127.0.0.1", 0);
+
+        let value = recv_log_event(&mut rx, "ZeroClaw daemon started").await;
+        assert_eq!(value["event"]["category"], "system");
+        assert_eq!(value["event"]["action"], "start");
+        assert_eq!(value["event"]["outcome"], "success");
+        assert_eq!(
+            value["attributes"]["requested_gateway"],
+            "http://127.0.0.1:0"
+        );
+        assert_eq!(value["attributes"]["pairing_enabled"].as_bool(), Some(true));
+        assert_eq!(value["attributes"]["stop_signal"], "Ctrl+C or SIGTERM");
+        assert_eq!(
+            value["attributes"]["socket"],
+            crate::rpc::local::socket_path(&config)
+                .display()
+                .to_string()
+        );
     }
 
     #[tokio::test]
@@ -1489,6 +1559,7 @@ mod tests {
                 multi_message_delay_ms: 0,
                 stall_timeout_secs: 0,
                 slash_commands: false,
+                slash_command_scope: zeroclaw_config::schema::SlashCommandScope::default(),
                 intents_mask: None,
                 reaction_notifications: zeroclaw_config::schema::DiscordReactionScope::Off,
                 interrupt_on_new_message: false,
@@ -1514,6 +1585,7 @@ mod tests {
                 multi_message_delay_ms: 0,
                 stall_timeout_secs: 0,
                 slash_commands: false,
+                slash_command_scope: zeroclaw_config::schema::SlashCommandScope::default(),
                 intents_mask: None,
                 reaction_notifications: zeroclaw_config::schema::DiscordReactionScope::Off,
                 interrupt_on_new_message: false,

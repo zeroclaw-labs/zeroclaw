@@ -219,6 +219,18 @@ fn check_tool_registry(config: &crate::config::Config) -> CheckResult {
 fn check_channel_config(config: &crate::config::Config) -> CheckResult {
     let channels = zeroclaw_channels::listing::compiled_channels(&config.channels);
     let configured = channels.iter().filter(|e| e.configured).count();
+    let uncompiled = zeroclaw_channels::listing::configured_uncompiled_channels(&config.channels);
+    if !uncompiled.is_empty() {
+        let names = uncompiled
+            .iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return CheckResult::fail(
+            "channels",
+            channel_config_uncompiled_detail(channels.len(), configured, &names),
+        );
+    }
     CheckResult::pass(
         "channels",
         format!(
@@ -226,6 +238,23 @@ fn check_channel_config(config: &crate::config::Config) -> CheckResult {
             channels.len(),
             configured
         ),
+    )
+}
+
+fn channel_config_uncompiled_detail(
+    compiled: usize,
+    compiled_configured: usize,
+    names: &str,
+) -> String {
+    let compiled = compiled.to_string();
+    let configured = compiled_configured.to_string();
+    get_required_cli_string_with_args(
+        "cli-selftest-channel-config-uncompiled",
+        &[
+            ("compiled", compiled.as_str()),
+            ("configured", configured.as_str()),
+            ("names", names),
+        ],
     )
 }
 

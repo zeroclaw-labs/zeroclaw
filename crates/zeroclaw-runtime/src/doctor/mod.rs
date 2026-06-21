@@ -11,7 +11,7 @@ const COMMAND_VERSION_PREVIEW_CHARS: usize = 60;
 
 // ── Diagnostic item ──────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Ok,
@@ -20,7 +20,7 @@ pub enum Severity {
 }
 
 /// Structured diagnostic result for programmatic consumption (web dashboard, API).
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DiagResult {
     pub severity: Severity,
     pub category: String,
@@ -143,7 +143,6 @@ fn collapse_model_probes(probes: Vec<(String, ModelProbe)>) -> Vec<DiagResult> {
     out
 }
 
-/// Run diagnostics and print human-readable report to stdout.
 async fn probe_models(config: &Config) -> Vec<DiagResult> {
     let targets = doctor_model_targets(config, None);
     let mut probes = Vec::with_capacity(targets.len());
@@ -166,9 +165,16 @@ async fn probe_models(config: &Config) -> Vec<DiagResult> {
     collapse_model_probes(probes)
 }
 
-pub async fn run(config: &Config) -> Result<()> {
+/// Run the full Doctor suite and return the structured result used by CLI and RPC.
+pub async fn run_structured(config: &Config) -> Vec<DiagResult> {
     let mut results = diagnose(config);
     results.extend(probe_models(config).await);
+    results
+}
+
+/// Run diagnostics and print human-readable report to stdout.
+pub async fn run(config: &Config) -> Result<()> {
+    let results = run_structured(config).await;
 
     println!("🩺 ZeroClaw Doctor (enhanced)");
     println!();
@@ -441,7 +447,8 @@ pub async fn run_models(
 /// --check` (configured-model verification) and future interactive flows (the
 /// `quickstart` model picker, which also wants pricing) share one fetch path.
 pub async fn fetch_provider_catalog(config: &Config, provider_ref: &str) -> Result<Vec<String>> {
-    create_doctor_model_provider(config, provider_ref)?
+    let provider = create_doctor_model_provider(config, provider_ref)?;
+    zeroclaw_providers::ProviderDispatch::from_ref(&*provider)
         .list_models()
         .await
 }
@@ -1482,6 +1489,31 @@ mod tests {
         if let Err(error) = create_doctor_model_provider(&config, "custom.local") {
             panic!("doctor model probe should build custom providers from alias config: {error}");
         }
+    }
+
+    #[tokio::test]
+    async fn structured_run_includes_model_probe_results() {
+        let mut config = Config::default();
+        let profile = config
+            .providers
+            .models
+            .ensure("custom", "local")
+            .expect("known model_provider type");
+        profile.api_key = Some("redacted-test-key".to_string());
+        profile.uri = Some("http://127.0.0.1:9/v1".to_string());
+
+        let baseline = diagnose(&config);
+        assert!(
+            !baseline
+                .iter()
+                .any(|item| item.category == "providers.models")
+        );
+
+        let full = run_structured(&config).await;
+        assert!(
+            full.iter().any(|item| item.category == "providers.models"),
+            "shared structured runner should include the same model probe rows as the CLI"
+        );
     }
 
     #[test]

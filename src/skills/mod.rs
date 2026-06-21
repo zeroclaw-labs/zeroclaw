@@ -5,6 +5,35 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 use zeroclaw_runtime::skills::{ScaffoldOptions, SkillFrontmatter, SkillsService};
+
+/// Resolve a `cli-*` Fluent key for skill-bundle CLI output. Under `agent-runtime`
+/// (default + what CI/release build) this routes through Fluent; without it the
+/// runtime i18n crate is absent, so the English `fallback` is used.
+#[allow(unused_variables)]
+fn mt(key: &str, fallback: &str) -> String {
+    #[cfg(feature = "agent-runtime")]
+    {
+        zeroclaw_runtime::i18n::get_required_cli_string(key)
+    }
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        fallback.to_string() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+    }
+}
+
+/// `mt` with `{$name}` arguments.
+#[allow(unused_variables)]
+fn mta(key: &str, args: &[(&str, &str)], fallback: &str) -> String {
+    #[cfg(feature = "agent-runtime")]
+    {
+        zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
+    }
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        fallback.to_string() // i18n-exempt: English fallback when Fluent (agent-runtime) is disabled
+    }
+}
+
 pub mod creator {
     #[allow(unused_imports)]
     pub use zeroclaw_runtime::skills::creator::*;
@@ -242,9 +271,14 @@ pub async fn handle_command(
         crate::SkillCommands::Bundle { bundle_command } => match bundle_command {
             crate::SkillBundleCommands::List => handle_bundle_list(config),
             crate::SkillBundleCommands::Add { alias, directory } => {
-                handle_bundle_add(alias, directory)
+                Box::pin(handle_bundle_add(config, alias, directory)).await
             }
-            crate::SkillBundleCommands::Remove { alias } => handle_bundle_remove(alias),
+            crate::SkillBundleCommands::Remove { alias, yes } => {
+                Box::pin(handle_bundle_remove(config, alias, yes)).await
+            }
+            crate::SkillBundleCommands::Rename { from, to } => {
+                Box::pin(handle_bundle_rename(config, from, to)).await
+            }
             crate::SkillBundleCommands::Show { alias } => handle_bundle_show(config, alias),
         },
         crate::SkillCommands::Test { name, verbose } => {
@@ -318,6 +352,8 @@ fn handle_add(
         // Scaffold creates a tagless skill; tags (including the `slash` opt-in
         // for #7490 slash commands) are managed in the dashboard skills editor.
         tags: Vec::new(),
+        // Slash options are authored in the dashboard editor, not at scaffold time.
+        slash_options: Vec::new(),
     };
 
     let skill_dir = service.scaffold_skill(
@@ -385,27 +421,258 @@ fn handle_edit(
     open_in_editor(&path)
 }
 
-fn handle_bundle_add(alias: String, directory: Option<String>) -> Result<()> {
-    // Bundle CRUD is config CRUD. Suggest the `zeroclaw config` invocations
-    // so the config writer stays single-sourced through api_config /
-    // handle_map_key rather than reaching it from here.
-    let directory_path = directory.unwrap_or_else(|| format!("shared/skills/{alias}"));
+/// Create a skill bundle: insert the config entry, set a custom directory if
+/// given, materialize the resolved directory, and persist.
+async fn handle_bundle_add(
+    config: &crate::config::Config,
+    alias: String,
+    directory: Option<String>,
+) -> Result<()> {
+    let mut working = config.clone();
+    if !working
+        .create_map_key("skill_bundles", &alias)
+        .map_err(anyhow::Error::msg)?
+    {
+        println!(
+            "{}",
+            mta(
+                "cli-bundle-exists",
+                &[("alias", alias.as_str())],
+                "skill bundle '{$alias}' already exists (no change)"
+            )
+        );
+        return Ok(());
+    }
+    if let Some(dir) = directory.as_ref()
+        && let Some(b) = working.skill_bundles.get_mut(&alias)
+    {
+        b.directory = Some(dir.clone());
+    }
+    working.mark_dirty(&format!("skill_bundles.{alias}"));
+    let install_root = working.install_root_dir();
+    match zeroclaw_config::skill_bundles::resolve_directory(&working, &install_root, &alias) {
+        Ok(dir) => {
+            tokio::fs::create_dir_all(&dir).await.ok();
+            let d = dir.display().to_string();
+            println!(
+                "{}",
+                mta(
+                    "cli-bundle-created",
+                    &[("alias", alias.as_str()), ("dir", d.as_str())],
+                    "created skill_bundles.{$alias} (dir: {$dir})"
+                )
+            );
+        }
+        Err(e) => {
+            let es = e.to_string();
+            println!(
+                "{}",
+                mta(
+                    "cli-bundle-created-warn",
+                    &[("alias", alias.as_str()), ("error", es.as_str())],
+                    "created skill_bundles.{$alias} (warning: dir resolve failed: {$error})"
+                )
+            );
+        }
+    }
+    Box::pin(working.save_dirty())
+        .await
+        .context("failed to persist config")
+}
+
+/// Delete a skill bundle: archive its directory, strip it from every agent's
+/// `skill_bundles` list, remove the config entry, and persist. Safe-by-default:
+/// without `--yes` it prints the impact and makes no change.
+async fn handle_bundle_remove(
+    config: &crate::config::Config,
+    alias: String,
+    yes: bool,
+) -> Result<()> {
+    let exists = config
+        .get_map_keys("skill_bundles")
+        .is_some_and(|k| k.contains(&alias));
+    if !exists {
+        anyhow::bail!(
+            "{}",
+            mta(
+                "cli-bundle-not-configured",
+                &[("alias", alias.as_str())],
+                "skill bundle '{$alias}' is not configured"
+            )
+        );
+    }
+    let refs = zeroclaw_config::alias_refs::find_bundle_refs(config, &alias);
+    if !yes {
+        let count = refs.len().to_string();
+        println!(
+            "{}",
+            mta(
+                "cli-bundle-impact-header",
+                &[("alias", alias.as_str()), ("count", count.as_str())],
+                "deleting skill_bundles.{$alias} would strip it from {$count} agent reference(s):"
+            )
+        );
+        for r in &refs {
+            println!("  • {}", r.path);
+        }
+        println!(
+            "\n{}",
+            mt(
+                "cli-bundle-no-changes",
+                "No changes made. Re-run with --yes to apply."
+            )
+        );
+        return Ok(());
+    }
+    let mut working = config.clone();
+    let install_root = working.install_root_dir();
+    // Resolve the bundle directory while the entry still exists, so it can be
+    // archived AFTER the config change is durable.
+    let bundle_dir =
+        zeroclaw_config::skill_bundles::resolve_directory(&working, &install_root, &alias)
+            .ok()
+            .filter(|d| d.exists());
+
+    // Mutate + PERSIST the config first, so a later archive failure can't leave
+    // the config pointing at a directory already moved to _deleted/.
+    let mut dirty = zeroclaw_config::alias_refs::scrub_bundle_refs(&mut working, &alias);
+    working
+        .delete_map_key("skill_bundles", &alias)
+        .map_err(anyhow::Error::msg)?;
+    dirty.push(format!("skill_bundles.{alias}"));
+    for p in &dirty {
+        working.mark_dirty(p);
+    }
+    Box::pin(working.save_dirty())
+        .await
+        .context("failed to persist config")?;
+
+    // Archive the bundle directory under shared/skills/_deleted/ (the runtime
+    // skips that path, so it isn't re-scanned as live skills) now that the
+    // config change is on disk.
+    if let Some(dir) = bundle_dir {
+        let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
+        let archive = install_root
+            .join("shared")
+            .join("skills")
+            .join("_deleted")
+            .join(format!("{alias}-{ts}"));
+        if let Some(p) = archive.parent() {
+            tokio::fs::create_dir_all(p).await.ok();
+        }
+        match tokio::fs::rename(&dir, &archive).await {
+            Ok(()) => {
+                let p = archive.display().to_string();
+                println!(
+                    "{}",
+                    mta(
+                        "cli-bundle-archived",
+                        &[("path", p.as_str())],
+                        "archived bundle directory → {$path}"
+                    )
+                );
+            }
+            Err(e) => {
+                let es = e.to_string();
+                eprintln!(
+                    "{}",
+                    mta(
+                        "cli-bundle-warn-archive",
+                        &[("error", es.as_str())],
+                        "warning: bundle directory archive failed: {$error}"
+                    )
+                );
+            }
+        }
+    }
+    let count = refs.len().to_string();
     println!(
         "{}",
-        zeroclaw_runtime::i18n::get_required_cli_string_with_args(
-            "cli-skills-bundle-add-prompt",
-            &[("alias", &alias), ("dir", &directory_path)],
+        mta(
+            "cli-bundle-deleted",
+            &[("alias", alias.as_str()), ("count", count.as_str())],
+            "deleted skill_bundles.{$alias} (stripped from {$count} agent(s))"
         )
     );
     Ok(())
 }
 
-fn handle_bundle_remove(alias: String) -> Result<()> {
+/// Rename a skill bundle: rename the config entry, rewrite every agent's
+/// `skill_bundles` reference, move its directory, and persist.
+async fn handle_bundle_rename(
+    config: &crate::config::Config,
+    from: String,
+    to: String,
+) -> Result<()> {
+    let mut working = config.clone();
+    let install_root = working.install_root_dir();
+    // Resolve the OLD directory while the `from` entry still exists.
+    let old_dir =
+        zeroclaw_config::skill_bundles::resolve_directory(&working, &install_root, &from).ok();
+    match working.rename_map_key("skill_bundles", &from, &to) {
+        Ok(true) => {}
+        Ok(false) => anyhow::bail!(
+            "{}",
+            mta(
+                "cli-bundle-not-configured",
+                &[("alias", from.as_str())],
+                "skill bundle '{$alias}' is not configured"
+            )
+        ),
+        Err(e) => {
+            let es = e.to_string();
+            anyhow::bail!(
+                "{}",
+                mta(
+                    "cli-bundle-rename-failed",
+                    &[("error", es.as_str())],
+                    "rename failed: {$error}"
+                )
+            )
+        }
+    }
+    let mut dirty = zeroclaw_config::alias_refs::rewrite_bundle_refs(&mut working, &from, &to);
+    dirty.push(format!("skill_bundles.{from}"));
+    dirty.push(format!("skill_bundles.{to}"));
+    // Resolve the NEW directory (the entry now lives under `to`) for the move.
+    let new_dir =
+        zeroclaw_config::skill_bundles::resolve_directory(&working, &install_root, &to).ok();
+    for p in &dirty {
+        working.mark_dirty(p);
+    }
+    // PERSIST the config rename before moving the directory, so a later move
+    // failure can't leave the config naming `to` while the dir sits at `from`.
+    Box::pin(working.save_dirty())
+        .await
+        .context("failed to persist config")?;
+
+    // Move the directory (default per-alias path only; a custom path is
+    // alias-independent → old == new → skip).
+    if let (Some(old), Some(new)) = (old_dir, new_dir)
+        && old != new
+        && old.exists()
+    {
+        if let Some(p) = new.parent() {
+            tokio::fs::create_dir_all(p).await.ok();
+        }
+        if let Err(e) = tokio::fs::rename(&old, &new).await {
+            let es = e.to_string();
+            eprintln!(
+                "{}",
+                mta(
+                    "cli-bundle-warn-move",
+                    &[("error", es.as_str())],
+                    "warning: bundle directory move failed: {$error}"
+                )
+            );
+        }
+    }
     println!(
         "{}",
-        zeroclaw_runtime::i18n::get_required_cli_string_with_args(
-            "cli-skills-bundle-remove-prompt",
-            &[("alias", &alias)],
+        mta(
+            "cli-bundle-renamed",
+            &[("from", from.as_str()), ("to", to.as_str())],
+            "renamed skill_bundles.{$from} → skill_bundles.{$to}"
         )
     );
     Ok(())
