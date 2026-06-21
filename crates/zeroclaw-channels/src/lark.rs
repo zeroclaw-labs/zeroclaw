@@ -655,11 +655,14 @@ fn validate_lark_marker_target(
                 .with_attrs(::serde_json::json!({"reason": "no_workspace_dir"})),
             "lark: local marker target has no workspace_dir"
         );
-        anyhow::anyhow!("Lark/Feishu channel was started without a workspace_dir")
+        anyhow::Error::msg("Lark/Feishu channel was started without a workspace_dir")
     })?;
 
-    let workspace = std::fs::canonicalize(workspace)
-        .map_err(|err| anyhow::anyhow!("canonicalize Lark/Feishu workspace_dir failed: {}", err))?;
+    let workspace = std::fs::canonicalize(workspace).map_err(|err| {
+        anyhow::Error::msg(format!(
+            "canonicalize Lark/Feishu workspace_dir failed: {err}"
+        ))
+    })?;
     let candidate = Path::new(trimmed);
     let candidate = if candidate.is_absolute() {
         candidate.to_path_buf()
@@ -675,9 +678,11 @@ fn validate_lark_marker_target(
                     .with_attrs(::serde_json::json!({"reason": "not_found"})),
                 "lark: marker target not found on disk"
             );
-            anyhow::anyhow!("Lark/Feishu marker target not found on disk")
+            anyhow::Error::msg("Lark/Feishu marker target not found on disk")
         } else {
-            anyhow::anyhow!("canonicalize Lark/Feishu marker target failed: {}", err)
+            anyhow::Error::msg(format!(
+                "canonicalize Lark/Feishu marker target failed: {err}"
+            ))
         }
     })?;
 
@@ -700,7 +705,9 @@ fn resolve_lark_media_marker(
 ) -> anyhow::Result<LarkResolvedMediaMarker> {
     let path = validate_lark_marker_target(&marker.target, workspace_dir)?;
     let metadata = std::fs::metadata(&path).map_err(|err| {
-        anyhow::anyhow!("read Lark/Feishu marker target metadata failed: {}", err)
+        anyhow::Error::msg(format!(
+            "read Lark/Feishu marker target metadata failed: {err}"
+        ))
     })?;
     if !metadata.is_file() {
         anyhow::bail!("Lark/Feishu marker target is not a file");
@@ -722,9 +729,11 @@ fn resolve_lark_media_marker(
 }
 
 async fn build_lark_image_upload_form(marker: &LarkResolvedMediaMarker) -> anyhow::Result<Form> {
-    let bytes = fs::read(&marker.path)
-        .await
-        .map_err(|err| anyhow::anyhow!("read Lark/Feishu image marker target failed: {}", err))?;
+    let bytes = fs::read(&marker.path).await.map_err(|err| {
+        anyhow::Error::msg(format!(
+            "read Lark/Feishu image marker target failed: {err}"
+        ))
+    })?;
     Ok(Form::new().text("image_type", "message").part(
         "image",
         Part::bytes(bytes).file_name(marker.file_name.clone()),
@@ -735,9 +744,9 @@ async fn build_lark_file_upload_form(
     marker: &LarkResolvedMediaMarker,
     file_type: &'static str,
 ) -> anyhow::Result<Form> {
-    let bytes = fs::read(&marker.path)
-        .await
-        .map_err(|err| anyhow::anyhow!("read Lark/Feishu file marker target failed: {}", err))?;
+    let bytes = fs::read(&marker.path).await.map_err(|err| {
+        anyhow::Error::msg(format!("read Lark/Feishu file marker target failed: {err}"))
+    })?;
     Ok(Form::new()
         .text("file_type", file_type)
         .text("file_name", marker.file_name.clone())
@@ -2364,7 +2373,7 @@ impl LarkChannel {
             .or_else(|| response.get("image_key"))
             .and_then(|v| v.as_str())
             .map(str::to_string)
-            .ok_or_else(|| anyhow::anyhow!("Lark/Feishu image upload returned no image_key"))
+            .ok_or_else(|| anyhow::Error::msg("Lark/Feishu image upload returned no image_key"))
     }
 
     async fn upload_lark_file(
@@ -2399,7 +2408,7 @@ impl LarkChannel {
             .or_else(|| response.get("file_key"))
             .and_then(|v| v.as_str())
             .map(str::to_string)
-            .ok_or_else(|| anyhow::anyhow!("Lark/Feishu file upload returned no file_key"))
+            .ok_or_else(|| anyhow::Error::msg("Lark/Feishu file upload returned no file_key"))
     }
 
     async fn prepare_lark_media_marker(
