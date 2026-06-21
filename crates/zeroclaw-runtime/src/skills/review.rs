@@ -129,6 +129,9 @@ pub async fn maybe_run_skill_review(
                 new_messages_out: None,
                 knobs: &crate::agent::loop_::LoopKnobs::default(),
                 image_cache: None,
+                // Phase 1: stamp Internal/Trusted. Real per-transport
+                // stamping is PR C (RFC #6971 §4).
+                ingress: zeroclaw_api::ingress::IngressContext::internal(),
             })
             .await
         })

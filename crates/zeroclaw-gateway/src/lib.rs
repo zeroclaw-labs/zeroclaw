@@ -1459,7 +1459,28 @@ pub async fn run_gateway(
 
     // Device registry and pairing store (only when pairing is required)
     let device_registry = if config.gateway.require_pairing {
-        Some(Arc::new(api_pairing::DeviceRegistry::new(&config.data_dir)))
+        let registry = Arc::new(api_pairing::DeviceRegistry::new(&config.data_dir));
+        // Reconcile the registry against the canonical paired-token set so that
+        // tokens paired via the legacy `/pair` route (and any other historical
+        // orphans) become visible and revocable in the management UI. The token
+        // set itself stays owned by `PairingGuard`/`gateway.paired_tokens`.
+        match registry.reconcile_from_token_hashes(&pairing.tokens()) {
+            Ok(0) => {}
+            Ok(n) => ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({ "backfilled": n })),
+                "backfilled legacy paired token(s) into the device registry"
+            ),
+            Err(e) => ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "error": format!("{e}") })),
+                "device registry backfill from paired_tokens failed"
+            ),
+        }
+        Some(registry)
     } else {
         None
     };
@@ -1594,6 +1615,7 @@ pub async fn run_gateway(
             post(api_config::handle_map_key).delete(api_config::handle_delete_map_key),
         )
         .route("/api/config/rename-map-key", post(api_config::handle_rename_map_key))
+        .route("/api/config/delete-plan", get(api_config::handle_delete_plan))
         .route("/api/config/catalog", get(api_sections::handle_catalog))
         .route(
             "/api/config/catalog/models",
@@ -1664,6 +1686,10 @@ pub async fn run_gateway(
         .route(
             "/api/agents/{alias}/workspace/mkdir",
             post(api_browse::handle_agent_workspace_mkdir),
+        )
+        .route(
+            "/api/agents/{alias}/skills",
+            get(api_skills::handle_agent_skills),
         )
         .route("/api/skills/bundles", get(api_skills::handle_list_bundles))
         .route(
@@ -2107,6 +2133,26 @@ async fn handle_pair(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 "new client paired successfully"
             );
+            // Register the device so a token paired via the legacy `/pair`
+            // route is listable and revocable from the management UI, exactly
+            // like `/api/pair` (`submit_pairing_enhanced`). Without this the
+            // token authenticates but has no device row, so the UI can neither
+            // see nor revoke it. The token itself is owned by `PairingGuard`
+            // and persisted below; this row is metadata keyed by its hash.
+            if let Some(ref registry) = state.device_registry {
+                registry.register(
+                    PairingGuard::token_hash(&token),
+                    api_pairing::DeviceInfo {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        name: None,
+                        device_type: None,
+                        paired_at: chrono::Utc::now(),
+                        last_seen: chrono::Utc::now(),
+                        ip_address: Some(rate_key.clone()),
+                        capabilities: None,
+                    },
+                );
+            }
             if let Err(err) =
                 Box::pin(persist_pairing_tokens(state.config.clone(), &state.pairing)).await
             {

@@ -119,6 +119,7 @@ use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_api::channel::Channel;
+use zeroclaw_api::ingress::IngressContext;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{
     self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory, MemoryCategory, decay,
@@ -675,6 +676,9 @@ pub async fn agent_turn(
         new_messages_out: None,
         knobs: &LoopKnobs::default(),
         image_cache: None,
+        // Phase 1: stamp Internal/Trusted. Real per-transport
+        // stamping is PR C (RFC #6971 §4).
+        ingress: IngressContext::internal(),
     })
     .await
 }
@@ -1741,6 +1745,9 @@ pub async fn run(
                                 new_messages_out: None,
                                 knobs: &LoopKnobs::default(),
                                 image_cache: None,
+                                // Phase 1: stamp Internal/Trusted. Real per-transport
+                                // stamping is PR C (RFC #6971 §4).
+                                ingress: IngressContext::internal(),
                             }),
                         ),
                     )
@@ -2220,6 +2227,9 @@ pub async fn run(
                                     new_messages_out: None,
                                     knobs: &LoopKnobs::default(),
                                     image_cache: None,
+                                    // Phase 1: stamp Internal/Trusted. Real per-transport
+                                    // stamping is PR C (RFC #6971 §4).
+                                    ingress: IngressContext::internal(),
                                 }),
                             ),
                         )
@@ -4707,6 +4717,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect_err("user image on a non-vision provider should error");
@@ -4770,6 +4783,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("oversized payload should be skipped and continue as text-only");
@@ -4837,6 +4853,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("valid multimodal payload should pass");
@@ -4903,6 +4922,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("text-only fallback should succeed, not abort the turn");
@@ -4969,6 +4991,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect_err("should fail when vision model_provider cannot be created");
@@ -5035,11 +5060,90 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("text-only messages should succeed with default model_provider");
 
         assert_eq!(result, "hello world");
+    }
+
+    /// Behavior-identical guard (RFC #6971 phase 1): the always-on ingress
+    /// policy layer must not change a turn's output. A plain turn with the
+    /// `IngressContext::internal()` envelope, and the same turn with a fully
+    /// external/untrusted channel envelope, both disposition to `Loop` under
+    /// the default policy and must produce the identical final answer the
+    /// engine produced before the layer existed.
+    #[tokio::test]
+    async fn run_tool_call_loop_ingress_default_loop_is_behavior_identical() {
+        async fn run_with(ctx: IngressContext) -> String {
+            let model_provider =
+                ScriptedModelProvider::from_text_responses(vec!["identical answer"]);
+            let mut history = vec![ChatMessage::user("hello".to_string())];
+            let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+            let observer = NoopObserver;
+
+            run_tool_call_loop(ToolLoop {
+                model_provider: &model_provider,
+                history: &mut history,
+                tools_registry: &tools_registry,
+                observer: &observer,
+                provider_name: "scripted",
+                model: "scripted-model",
+                temperature: Some(0.0),
+                silent: true,
+                approval: None,
+                channel_name: "cli",
+                channel_reply_target: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 3,
+                cancellation_token: None,
+                on_delta: None,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                shared_budget: None,
+                channel: None,
+                receipt_generator: None,
+                collected_receipts: None,
+                event_tx: None,
+                steering: None,
+                new_messages_out: None,
+                knobs: &LoopKnobs::default(),
+                image_cache: None,
+                ingress: ctx,
+            })
+            .await
+            .expect("default-Loop ingress must run the turn exactly as today")
+        }
+
+        let internal = run_with(IngressContext::internal()).await;
+        let external = run_with(IngressContext {
+            message_id: Some("ghc_9001".to_string()),
+            source_class: zeroclaw_api::ingress::SourceClass::External,
+            sender: Some("attacker".to_string()),
+            transport: zeroclaw_api::ingress::Transport::Channel {
+                kind: "github".to_string(),
+                alias: "gh".to_string(),
+            },
+            trust: zeroclaw_api::ingress::TrustClass::Untrusted,
+        })
+        .await;
+
+        assert_eq!(internal, "identical answer");
+        assert_eq!(
+            internal, external,
+            "default-Loop policy must produce identical output regardless of envelope"
+        );
     }
 
     /// When `vision_model_provider` is set but `vision_model` is not, the default
@@ -5101,6 +5205,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect_err("should fail due to nonexistent vision model_provider");
@@ -5166,6 +5273,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("empty image markers should not trigger vision routing");
@@ -5230,6 +5340,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect_err("should attempt vision model_provider creation for multiple images");
@@ -5378,6 +5491,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("parallel execution should complete");
@@ -5493,6 +5609,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("native parallel execution should complete");
@@ -5655,6 +5774,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await;
 
@@ -5749,6 +5871,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("cron_add delivery defaults should be injected");
@@ -5828,6 +5953,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("explicit delivery mode should be preserved");
@@ -5899,6 +6027,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("lark cron_add delivery defaults should be injected");
@@ -5978,6 +6109,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("feishu cron_add delivery defaults should be injected");
@@ -6060,6 +6194,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -6147,6 +6284,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("non-interactive shell should succeed for low-risk command");
@@ -6224,6 +6364,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -6310,6 +6453,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("loop should finish running both identical subagent calls");
@@ -6395,6 +6541,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("loop should complete");
@@ -6466,6 +6615,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("native fallback id flow should complete");
@@ -6541,6 +6693,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("malformed tool protocol should retry and recover");
@@ -6611,6 +6766,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("business JSON should be returned as normal text");
@@ -6679,6 +6837,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("unknown business JSON should be returned as normal text");
@@ -6750,6 +6911,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("malformed tool protocol should return a safe fallback");
@@ -6818,6 +6982,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("toolcalls reference JSON should remain visible without tools");
@@ -6885,6 +7052,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("toolcalls reference JSON should remain visible without tools");
@@ -6944,6 +7114,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("schema JSON should remain visible without tools");
@@ -7004,6 +7177,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("audit JSON should remain visible without tools");
@@ -7064,6 +7240,9 @@ mod tests {
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("reference JSON should remain visible without tools");
@@ -7126,6 +7305,9 @@ This is an example, not an invocation."#;
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("tool_call tag examples should remain visible without tools");
@@ -7193,6 +7375,9 @@ This is an example, not an invocation."#;
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("registered tool_call fenced examples should remain visible");
@@ -7272,6 +7457,9 @@ This is an example, not an invocation."#;
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("registered tool_call tag examples should remain visible");
@@ -7334,6 +7522,9 @@ Done."#;
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("tagged tool protocol with trailing text should retry and recover");
@@ -7399,6 +7590,9 @@ Done."#;
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("embedded fenced tool protocol should retry and recover");
@@ -7462,6 +7656,9 @@ Done."#;
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("standalone tool_call fence should retry and recover without tools");
@@ -7526,6 +7723,9 @@ This is an example, not an invocation."#;
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("tool_call fenced examples should remain visible without tools");
@@ -7647,6 +7847,9 @@ This is an example, not an invocation."#;
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("split tool_call fenced examples should remain visible without tools");
@@ -7719,6 +7922,9 @@ This is an example, not an invocation."#;
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("JSON-fenced tool protocol examples should remain visible without tools");
@@ -7795,6 +8001,9 @@ This is an example, not an invocation."#;
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("streamed fenced tool call should execute and continue");
@@ -7894,6 +8103,9 @@ This is an example, not an invocation."#;
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("native tool-call text should be relayed through on_delta");
@@ -7998,6 +8210,9 @@ This is an example, not an invocation."#;
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("streaming model_provider should complete");
@@ -8076,6 +8291,9 @@ This is an example, not an invocation."#;
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("streaming tool loop should execute tool and finish");
@@ -8960,6 +9178,9 @@ This is an example, not an invocation."#;
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("native streaming events should preserve tool loop semantics");
@@ -9288,6 +9509,9 @@ This is an example, not an invocation."#;
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("routed streaming model_provider should complete");
@@ -11176,6 +11400,9 @@ Let me check the result."#;
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("tool loop should complete");
@@ -11340,6 +11567,9 @@ Let me check the result."#;
                     new_messages_out: None,
                     knobs: &LoopKnobs::default(),
                     image_cache: None,
+                    // Phase 1: stamp Internal/Trusted. Real per-transport
+                    // stamping is PR C (RFC #6971 §4).
+                    ingress: IngressContext::internal(),
                 }),
             )
             .await
@@ -11403,6 +11633,9 @@ Let me check the result."#;
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("tool loop should complete");
@@ -11505,6 +11738,9 @@ Let me check the result."#;
                     new_messages_out: None,
                     knobs: &LoopKnobs::default(),
                     image_cache: None,
+                    // Phase 1: stamp Internal/Trusted. Real per-transport
+                    // stamping is PR C (RFC #6971 §4).
+                    ingress: IngressContext::internal(),
                 }),
             )
             .await
@@ -11573,6 +11809,9 @@ Let me check the result."#;
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            // Phase 1: stamp Internal/Trusted. Real per-transport
+            // stamping is PR C (RFC #6971 §4).
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("should succeed without cost scope");

@@ -55,6 +55,27 @@ Supported frontmatter fields are `name`, `description`, `version`, `author`, and
 
 A skill can also be a structured TOML manifest (`SKILL.toml`). The `[skill]` table requires `name` and `description`; `version` defaults to `0.1.0` when omitted; `author`, `tags`, and `prompts` are optional. Tool entries may use `kind = "shell"`, `kind = "http"`, or `kind = "script"`. Keep tool descriptions narrow and concrete so the model knows when to use them.
 
+### Slash command options and localizations
+
+A skill tagged `slash` is surfaced as a chat-channel slash command (e.g. Discord `/search`). It may declare typed `[[skill.slash_options]]`; a skill that declares none falls back to a single required free-text input. Both the command description and each option description accept an optional `description_localizations` map keyed by locale code. Unknown or unsupported locale codes are dropped with a warning rather than failing registration, so a typo never wedges command registration.
+
+```toml
+[skill]
+name = "search"
+description = "Search the web"
+tags = ["slash"]
+# Localized command descriptions, keyed by locale code.
+description_localizations = { fr = "Rechercher sur le web", ja = "ウェブを検索" }
+
+[[skill.slash_options]]
+name = "query"
+description = "The search query"
+type = "string"
+required = true
+# Localized option descriptions, same form.
+description_localizations = { fr = "La requête de recherche" }
+```
+
 ## Manage installed skills
 
 List installed skills:
