@@ -387,6 +387,8 @@ channel-wecom-ws-dm-access-denied =
 channel-discord-interaction-unauthorized = You're not authorized to use this command here.
 channel-discord-interaction-malformed = Unknown or malformed command.
 channel-discord-interaction-unavailable = That command is no longer available, or its input was empty.
+channel-discord-component-expired = This button or menu has expired or was already used.
+channel-discord-approval-recorded = Your decision has been recorded.
 channel-discord-delivery-failure-note-one = (note: I couldn't deliver {$count} file.)
 channel-discord-delivery-failure-note-many = (note: I couldn't deliver {$count} files.)
 channel-whatsapp-web-delivery-failure-note-one = (note: I could not deliver {$count} WhatsApp media attachment.)
@@ -489,6 +491,7 @@ cli-cron-added-oneshot = ✅ Added one-shot cron job {$id}
 cli-cron-added-interval-agent = ✅ Added interval agent cron job {$id}
 cli-cron-added-interval = ✅ Added interval cron job {$id}
 cli-cron-updated = ✅ Updated cron job {$id}
+cli-cron-removed = ✅ Removed cron job {$id}
 cli-cron-paused = ⏸️  Paused cron job {$id}
 cli-cron-resumed = ▶️  Resumed cron job {$id}
 cli-cron-expr = {"  "}Expr  : {$v}
@@ -689,6 +692,7 @@ cli-status-word-off = off
 cli-status-word-none = (none)
 cli-status-word-configured = configured
 cli-status-word-not-configured = not configured
+cli-status-channel-not-compiled = 🚫 configured, not compiled
 
 # ── desktop / config / plugins / estop / auth ──
 cli-desktop-not-installed = ZeroClaw companion app is not installed.
@@ -759,15 +763,20 @@ cli-hardware-supported-platforms = Supported platforms: Linux, macOS, Windows.
 # ── update (zeroclaw update) ──
 cli-update-already-current = Already up to date (v{$version}).
 cli-update-success = Successfully updated to v{$version}!
+cli-update-prebuilt-channel-note = Pre-built updates use the lean default channel bundle. Build from source with `./install.sh --source --preset full`, `--features channels-full`, or a specific `channel-*` feature for Slack, Discord, and other non-default channels.
 
 # ── self-test (zeroclaw self-test) ──
 cli-selftest-all-passed = All {$total} checks passed.
 cli-selftest-some-failed = {$failed}/{$total} checks failed.
+cli-selftest-channel-config-uncompiled = {$compiled} compiled channel types, {$configured} compiled/configured; configured but not compiled: {$names}. Build from source with `./install.sh --source --preset full`, `--features channels-full`, or the specific `channel-*` feature.
 
 # ── channels (zeroclaw channel list) ──
 cli-channels-header = Channels:
 cli-channels-cli-always = {"  "}✅ CLI (always available)
 cli-channels-notion = {"  "}{$status} Notion
+cli-channels-not-compiled-header = {"  "}Configured but not compiled in this binary:
+cli-channels-not-compiled-entry = {"  "}🚫 {$name} (configured, not compiled)
+cli-channels-build-hint = {"  "}Build from source with `./install.sh --source --preset full`, `--features channels-full`, or the specific `channel-*` feature.
 cli-channels-start-hint = To start channels: zeroclaw channel start
 cli-channels-doctor-hint = To check health:    zeroclaw channel doctor
 cli-channels-configure-hint = To configure:      zeroclaw config set channels.<name>.<field>=<value>
@@ -781,6 +790,10 @@ turn-interrupted-by-user = [interrupted by user]
 # on this path, so the wording names the channel, not a user.
 turn-cancelled-client-rpc = [turn cancelled via client]
 turn-stream-interrupted = [stream interrupted]
+# Refusal returned when the ingress policy layer (RFC #6971) drops an inbound
+# turn before it reaches the model. Unreachable under the default `Loop` policy
+# (phase 1); becomes live when non-`Loop` policy is configured (phase 3).
+turn-ingress-dropped = This request was not processed: { $reason }
 turn-tool-interrupted-before-result = [interrupted by user before this tool produced a result]
 # Safe reply delivered when the model repeatedly emits malformed internal
 # tool-call protocol and the turn gives up retrying.

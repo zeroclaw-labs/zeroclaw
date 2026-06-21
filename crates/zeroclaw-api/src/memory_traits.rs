@@ -276,6 +276,21 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         anyhow::bail!("rename_agent not supported by this memory backend")
     }
 
+    /// Read-only residue probe for the agent-rename cascade (#7940): the count
+    /// of state [`Self::rename_agent`] WOULD re-point for `agent_alias`, without
+    /// mutating anything. Used by the gateway to tell a genuine post-persist
+    /// partial failure (state still lagging at the old alias) apart from an
+    /// unrelated request, so a resume only fires on real residue.
+    ///
+    /// MUST mirror exactly what `rename_agent` moves: for the SQL backends that
+    /// is the `agents` row (alias presence), NOT the memory-row count - an agent
+    /// with an `agents` row but zero memory rows still gets re-pointed, so a
+    /// memory-row probe would be a false negative. Default 0 (markdown/none have
+    /// no DB rows and their `rename_agent` is a no-op).
+    async fn count_agent(&self, _agent_alias: &str) -> anyhow::Result<usize> {
+        Ok(0)
+    }
+
     /// Count total memories
     async fn count(&self) -> anyhow::Result<usize>;
 

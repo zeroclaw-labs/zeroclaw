@@ -1284,6 +1284,27 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn count_agent(&self, agent_alias: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.clone();
+        let agent_alias = agent_alias.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = conn.lock();
+            // Mirror `rename_agent`: it moves the `agents` row (alias -> id), not
+            // the memory rows, so residue is the presence of that alias row (0 or
+            // 1). A memory-row count would miss an agent with an `agents` row but
+            // no memories - a real lag `rename_agent` would still re-point.
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM agents WHERE alias = ?1",
+                params![agent_alias],
+                |row| row.get(0),
+            )?;
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            Ok(count as usize)
+        })
+        .await?
+    }
+
     async fn count(&self) -> anyhow::Result<usize> {
         let conn = self.conn.clone();
 
