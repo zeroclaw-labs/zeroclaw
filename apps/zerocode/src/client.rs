@@ -1365,6 +1365,8 @@ pub struct ConfigSectionEntry {
     pub group: String,
     #[serde(default)]
     pub shape: Option<SectionShape>,
+    #[serde(default)]
+    pub cost_category: String,
 }
 
 #[derive(Debug, serde::Deserialize)]

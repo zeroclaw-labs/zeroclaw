@@ -410,6 +410,9 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
                 group: section_group(&key).to_string(),
                 is_quickstart: wizard.is_some(),
                 shape: wizard.map(zeroclaw_config::sections::Section::shape),
+                cost_category: zeroclaw_config::schema::cost_category_for_provider_section(&key)
+                    .unwrap_or_default()
+                    .to_string(),
                 key,
             }
         })

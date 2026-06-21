@@ -1184,23 +1184,7 @@ impl App {
         Ok(())
     }
 
-    /// Maps a TypedFamilyMap provider section key to its cost-rates
-    /// category, mirroring the web `costCategoryForSection`. Returns `None`
-    /// for sections that carry no rate sheets (channels, etc.).
-    fn cost_category_for_section_key(section_key: &str) -> Option<&'static str> {
-        match section_key {
-            "providers.models" => Some("models"),
-            "providers.tts" => Some("tts"),
-            "providers.transcription" => Some("transcription"),
-            _ => None,
-        }
-    }
-
-    /// When the active AliasList is a cost-bearing provider type (a
-    /// `providers.<category>.<type>` family with the type selected), returns
-    /// `(category, provider_type)`. The web surfaces an Aliases/Costs tab pair
-    /// on exactly these screens; the TUI matches that here.
-    fn alias_list_cost_target(&self) -> Option<(&'static str, String)> {
+    fn alias_list_cost_target(&self) -> Option<(String, String)> {
         if let Screen::AliasList {
             section_idx,
             breadcrumb,
@@ -1208,9 +1192,9 @@ impl App {
         } = &self.screen
             && breadcrumb.len() >= 2
         {
-            let key = &self.sections[*section_idx].key;
-            if let Some(category) = Self::cost_category_for_section_key(key) {
-                return Some((category, breadcrumb[1].clone()));
+            let category = &self.sections[*section_idx].cost_category;
+            if !category.is_empty() {
+                return Some((category.clone(), breadcrumb[1].clone()));
             }
         }
         None
@@ -3569,7 +3553,10 @@ impl App {
         let (dstyle, dsym) = self.detail_highlight();
         frame.render_stateful_widget(
             List::new(items)
-                .block(theme::panel_block(" Costs "))
+                .block(theme::panel_block(&format!(
+                    " {} ",
+                    ConfigTab::Costs.label()
+                )))
                 .highlight_style(dstyle)
                 .highlight_symbol(dsym),
             r.main,
