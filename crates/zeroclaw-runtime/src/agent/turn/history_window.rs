@@ -270,6 +270,35 @@ mod tests {
         assert!(estimate_history_tokens(&history) <= budget);
     }
 
+    #[test]
+    fn pipeline_output_has_no_orphaned_tool_messages_across_configs() {
+        for keep_recent in [0usize, 1, 2, 3, 5] {
+            for collapse_tool_results in [true, false] {
+                let mut history = over_budget_history(8);
+                preflight_history_maintenance(
+                    &mut history,
+                    200,
+                    0,
+                    &HistoryPrunerConfig {
+                        enabled: false,
+                        max_tokens: 8192,
+                        keep_recent,
+                        collapse_tool_results,
+                    },
+                );
+                let mut clone = history.clone();
+                let pruned =
+                    crate::agent::history_pruner::remove_orphaned_tool_messages(&mut clone);
+                assert_eq!(
+                    pruned.removed, 0,
+                    "orphaned tool messages survived preflight trim \
+                     (keep_recent={keep_recent}, collapse={collapse_tool_results}): {:?}",
+                    pruned.orphan_tool_call_ids
+                );
+            }
+        }
+    }
+
     // With collapse enabled, the emergency trim collapses old exchanges into
     // synthetic summaries (the historical default behaviour, now config-driven).
     #[test]
