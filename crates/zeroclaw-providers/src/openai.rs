@@ -490,8 +490,10 @@ impl ModelProvider for OpenAiModelProvider {
             temperature: adjusted_temperature,
             // Omit tool_choice when the tool list is empty — vLLM 0.19+ and
             // spec-compliant validators reject tool_choice without a non-empty
-            // tools field (HTTP 400). `convert_tools` returns None for an empty
-            // slice, so guard on the resulting Option being non-empty.
+            // tools field (HTTP 400). `Self::convert_tools` is a plain
+            // `tools.map(...)`, so an empty input slice yields `Some(vec![])`
+            // (not `None`) — guard on `tools` being `Some` *and* the resulting
+            // list being non-empty, not merely on `is_some()`.
             tool_choice: tools
                 .as_ref()
                 .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),

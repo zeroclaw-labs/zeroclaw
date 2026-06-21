@@ -3253,21 +3253,26 @@ mod tests {
         let p = make_model_provider("vllm", "http://localhost:8000/v1", None);
         let messages = vec![ChatMessage::user("hello")];
 
-        // None tools → no tool_choice, no tools.
+        // Assert on the structured value rather than substring-matching the
+        // serialized string: a JSON-shape or escaping change could otherwise
+        // flip these assertions silently. Inspect the `tool_choice` key
+        // directly.
+
+        // None tools → no tool_choice key.
         let req = p.build_native_tool_chat_request(&messages, None, "test-model", None, false);
-        let json = serde_json::to_string(&req).unwrap();
+        let value = serde_json::to_value(&req).unwrap();
         assert!(
-            !json.contains("tool_choice"),
-            "tool_choice must be omitted when tools is None; got: {json}"
+            value.get("tool_choice").is_none(),
+            "tool_choice must be omitted when tools is None; got: {value}"
         );
 
-        // Empty tools vec → still no tool_choice.
+        // Empty tools vec → still no tool_choice key.
         let req_empty =
             p.build_native_tool_chat_request(&messages, Some(vec![]), "test-model", None, false);
-        let json_empty = serde_json::to_string(&req_empty).unwrap();
+        let value_empty = serde_json::to_value(&req_empty).unwrap();
         assert!(
-            !json_empty.contains("tool_choice"),
-            "tool_choice must be omitted when tools is empty; got: {json_empty}"
+            value_empty.get("tool_choice").is_none(),
+            "tool_choice must be omitted when tools is empty; got: {value_empty}"
         );
     }
 
@@ -3281,10 +3286,11 @@ mod tests {
         })];
         let req =
             p.build_native_tool_chat_request(&messages, Some(tools), "test-model", None, false);
-        let json = serde_json::to_string(&req).unwrap();
-        assert!(
-            json.contains("\"tool_choice\":\"auto\""),
-            "tool_choice must be 'auto' when tools are present; got: {json}"
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            value.get("tool_choice").and_then(serde_json::Value::as_str),
+            Some("auto"),
+            "tool_choice must be 'auto' when tools are present; got: {value}"
         );
     }
 
