@@ -14,6 +14,7 @@ import type {
   SessionMessagesResponse,
   TuiEntry,
 } from "../types/api";
+import type { components } from "./api-generated";
 import { clearToken, getToken, setToken } from "./auth";
 import { apiOrigin, basePath } from "./basePath";
 
@@ -49,6 +50,17 @@ export class ApiError extends Error {
     this.name = "ApiError";
   }
 }
+
+/**
+ * Stable config-API error codes, sourced from the generated OpenAPI schema
+ * (`ConfigApiCode`). Branch on these constants, never a bare string literal, so
+ * a backend rename or a typo fails `tsc` here instead of silently regressing
+ * the behaviour that depends on the code.
+ */
+export type ConfigApiCode = components["schemas"]["ConfigApiCode"];
+export const ConfigApiCodes = {
+  configChangedExternally: "config_changed_externally",
+} as const satisfies Record<string, ConfigApiCode>;
 
 // A response reduced to the plain data the downstream logic needs, so it can be
 // shared between coalesced callers (a Response body can only be read once).

@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Power } from 'lucide-react';
-import { ApiError, patchConfig } from '@/lib/api';
+import { ApiError, ConfigApiCodes, patchConfig } from '@/lib/api';
 import { t } from '@/lib/i18n';
 
 export interface EntityEnabledToggleProps {
@@ -47,7 +47,7 @@ export default function EntityEnabledToggle({
     } catch (e) {
       if (
         e instanceof ApiError &&
-        e.envelope.code === 'config_changed_externally'
+        e.envelope.code === ConfigApiCodes.configChangedExternally
       ) {
         setDriftConflict(true);
       } else {
