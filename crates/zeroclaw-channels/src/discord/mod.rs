@@ -15,11 +15,35 @@ use zeroclaw_api::channel::{
 use zeroclaw_api::media::MediaAttachment;
 use zeroclaw_runtime::i18n;
 
+// Contract tier: `embed` holds the embed value object that `types`'
+// `DiscordOutgoing` envelope carries; both are contract modules (no impl
+// imports), so the layer stays acyclic. Consumers import from `embed`
+// explicitly; `mod.rs` only names `DiscordEmbed` (in the outbound pipeline).
+mod embed;
+use embed::DiscordEmbed;
+
 mod types;
 // Keep the historical public path (`…::discord::DiscordSlashCommandSpec`) stable.
 pub use types::{DiscordSlashCommandResolver, DiscordSlashCommandSpec};
 // Contract types/codec/consts used throughout this module and its siblings.
 pub(crate) use types::*;
+
+// Contract tier: the typed slash-command option model the command spec carries.
+// Consumers (`types`, `slash`, dispatch) import `super::slash_options::…`
+// explicitly — no crate-wide re-export needed.
+mod slash_options;
+
+// custom_id codec + outbound component builders + the inbound single-use
+// pending registry. Accessed via explicit paths (`super::components::…`).
+mod components;
+mod custom_id;
+mod pending;
+// Buttoned tool-approval surface (Allow-once / Session / Always / Deny) +
+// the server-side decision enum a click resolves the approval `oneshot` with.
+mod approval;
+// Imported bare so the type-3 arm (where a local `pending` var shadows the
+// module) can still name it.
+use pending::ComponentIntent;
 
 mod chunk;
 pub(crate) use chunk::*;
@@ -112,11 +136,21 @@ pub struct DiscordChannel {
     /// Construction-time wiring of `DiscordConfig.slash_commands` — config
     /// is the source of truth; reloads rebuild the channel.
     slash_commands: bool,
+    /// Registration scope for slash commands (`global`/`guild`), wired from
+    /// `DiscordConfig.slash_command_scope`. Under `guild`, commands register to
+    /// each `guild_ids` entry (instant propagation); empty `guild_ids` falls
+    /// back to global at reconcile time.
+    slash_command_scope: zeroclaw_config::schema::SlashCommandScope,
     /// Live interaction credentials, held channel-locally so the bearer
     /// token never enters reply targets, logs, session keys, or memory
     /// rows. Keyed by interaction id; swept on insert; entries expire with
     /// Discord's 15-minute followup window.
     pending_interactions: Arc<Mutex<HashMap<String, PendingInteraction>>>,
+    /// Single-use registry binding a live component `custom_id` to the
+    /// server-side intent it resolves. A click is trusted only if its id is
+    /// present here (forged/replayed/expired ids resolve to nothing). Populated
+    /// when the channel emits a component; drained on click.
+    pending_components: Arc<Mutex<pending::PendingComponents>>,
     /// Resolves skill-derived commands to register alongside `/ask`.
     /// `None` (or an empty resolution) = `/ask` only.
     slash_command_resolver: Option<DiscordSlashCommandResolver>,
@@ -166,7 +200,9 @@ impl DiscordChannel {
             thread_channels: Arc::new(AsyncMutex::new(HashMap::new())),
             gateway_session: Mutex::new(DiscordGatewaySession::default()),
             slash_commands: false,
+            slash_command_scope: zeroclaw_config::schema::SlashCommandScope::Global,
             pending_interactions: Arc::new(Mutex::new(HashMap::new())),
+            pending_components: Arc::new(Mutex::new(pending::PendingComponents::default())),
             slash_command_resolver: None,
         }
     }
@@ -181,6 +217,17 @@ impl DiscordChannel {
     /// Enable Discord slash commands (register + serve over the Gateway).
     pub fn with_slash_commands(mut self, enabled: bool) -> Self {
         self.slash_commands = enabled;
+        self
+    }
+
+    /// Set the slash-command registration scope (`global`/`guild`), wired from
+    /// `DiscordConfig.slash_command_scope`. Only consulted when slash commands
+    /// are enabled.
+    pub fn with_slash_command_scope(
+        mut self,
+        scope: zeroclaw_config::schema::SlashCommandScope,
+    ) -> Self {
+        self.slash_command_scope = scope;
         self
     }
 
@@ -653,6 +700,122 @@ impl DiscordChannel {
         }
     }
 
+    /// Forget archived reaction rows in bulk for the two "clear" gateway
+    /// events that carry no `user_id`, so the sidecar doesn't keep orphaned
+    /// reaction rows after Discord wipes them server-side:
+    ///
+    /// * `MESSAGE_REACTION_REMOVE_ALL` — every reaction on a message is
+    ///   cleared. `emoji_key` is `None`: sweep all
+    ///   `discord_reaction_{message_id}_*` rows (all users, all emoji).
+    /// * `MESSAGE_REACTION_REMOVE_EMOJI` — every reaction of one emoji on a
+    ///   message is cleared. `emoji_key` is `Some(_)`: sweep
+    ///   `discord_reaction_{message_id}_*_{emoji_key}` rows (all users, that
+    ///   emoji), keying the emoji the same way [`handle_reaction_event`]
+    ///   does — custom-emoji `id` first, else the unicode glyph.
+    ///
+    /// Both events arrive under the reaction intents already negotiated when
+    /// `reaction_scope != Off`, and are gated by the same guild/channel
+    /// allowlists as the single-reaction path. There is no per-reactor peer
+    /// gate here: the reactors are exactly those whose rows the ADD path
+    /// already admitted, so the prefix sweep only ever touches admitted rows.
+    /// Scope `Own` needs no extra check — REMOVE_ALL/REMOVE_EMOJI only forget
+    /// keys that exist, and `Own` is what decided whether they exist.
+    async fn sweep_message_reactions(&self, event_type: &str, d: &serde_json::Value) {
+        let message_id = d.get("message_id").and_then(|m| m.as_str()).unwrap_or("");
+        let channel_id = d.get("channel_id").and_then(|c| c.as_str()).unwrap_or("");
+        if message_id.is_empty() {
+            return;
+        }
+        if !self.guild_ids.is_empty()
+            && let Some(g) = d.get("guild_id").and_then(serde_json::Value::as_str)
+            && !self.guild_ids.iter().any(|allowed| allowed == g)
+        {
+            return;
+        }
+        if !self.channel_ids.is_empty() {
+            let parent_id =
+                if !channel_id.is_empty() && !self.channel_ids.iter().any(|c| c == channel_id) {
+                    self.thread_parent(&self.http_client(), channel_id).await
+                } else {
+                    None
+                };
+            if !channel_passes_filter(&self.channel_ids, channel_id, parent_id.as_deref()) {
+                return;
+            }
+        }
+
+        // REMOVE_EMOJI carries one `emoji` object; REMOVE_ALL carries none.
+        // Same identity rule as the single-reaction key: custom-emoji id
+        // first, else the glyph. An emoji object with neither is unkeyable —
+        // nothing to scope the sweep to.
+        let emoji_key = if event_type == "MESSAGE_REACTION_REMOVE_EMOJI" {
+            let key = d.get("emoji").and_then(|e| {
+                e.get("id")
+                    .and_then(|i| i.as_str())
+                    .or_else(|| e.get("name").and_then(|n| n.as_str()))
+            });
+            let Some(key) = key else {
+                return;
+            };
+            Some(key)
+        } else {
+            None
+        };
+
+        let Some(ref archive_mem) = self.archive_memory else {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "event_type": event_type,
+                        "message_id": message_id,
+                    })),
+                "discord reaction sweep (archive disabled, nothing to forget)"
+            );
+            return;
+        };
+
+        // No prefix/suffix delete API on the Memory trait, so list the
+        // archive's discord rows and filter by key in memory. The sidecar
+        // category is the same `Custom("discord")` the store path writes.
+        let category = zeroclaw_memory::MemoryCategory::Custom("discord".to_string());
+        let entries = match archive_mem.list(Some(&category), None).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error": format!("{e}"),
+                            "event_type": event_type,
+                            "message_id": message_id,
+                        })),
+                    "failed to list archived discord reactions for sweep"
+                );
+                return;
+            }
+        };
+
+        for entry in entries {
+            if !reaction_sweep_matches(&entry.key, message_id, emoji_key) {
+                continue;
+            }
+            if let Err(e) = archive_mem.forget(&entry.key).await {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error": format!("{e}"),
+                            "key": entry.key,
+                        })),
+                    "failed to forget archived discord reaction during sweep"
+                );
+            }
+        }
+    }
+
     fn http_client(&self) -> reqwest::Client {
         zeroclaw_config::schema::build_channel_proxy_client(
             "channel.discord",
@@ -711,6 +874,266 @@ impl DiscordChannel {
             }
         }
     }
+
+    /// The legacy plaintext approval prompt: the operator replies
+    /// "`<token> yes|no|always`" in the channel, parsed back by
+    /// `parse_approval_reply` on the inbound MESSAGE_CREATE path. Used when the
+    /// interaction pipe isn't live (buttons would be dead controls).
+    async fn send_plaintext_approval(
+        &self,
+        channel_id: &str,
+        token: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<()> {
+        let text = format!(
+            "APPROVAL REQUIRED [{}]\nTool: {}\nArgs: {}\n\nReply: \"{} yes\", \"{} no\", or \"{} always\"",
+            token, request.tool_name, request.arguments_summary, token, token, token,
+        );
+        self.send(&SendMessage::new(text, channel_id)).await
+    }
+
+    /// The buttoned approval prompt: an Allow-once / Session / Always / Deny
+    /// action row. Each button is registered in `pending_components` under its
+    /// own `custom_id` carrying the server-side [`approval::ApprovalDecision`]
+    /// (NOT read from the wire) and the approval `token` (the key into
+    /// `pending_approvals`). A click is dispatched by the type-3 arm, which —
+    /// after fail-closed `interaction_gate` — `take`s the entry (single-use)
+    /// and resolves the `oneshot` with the bound decision.
+    ///
+    /// The bindings are registered BEFORE the send so a fast click can never
+    /// race an absent entry; the token already lives in `pending_approvals` and
+    /// the caller drops it on any error.
+    async fn send_buttoned_approval(
+        &self,
+        channel_id: &str,
+        token: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<()> {
+        let (row, bindings) = approval::build_approval_row(token);
+        // Register every button's intent first. Single-use is enforced by the
+        // registry's `take`; the per-click `interaction_gate` is enforced by the
+        // type-3 dispatch before any `take`.
+        {
+            let mut reg = self.pending_components.lock();
+            for (cid, decision) in &bindings {
+                if let Some(wire) = cid.encode() {
+                    reg.register(
+                        wire,
+                        ComponentIntent::Approval {
+                            token: token.to_string(),
+                            decision: *decision,
+                        },
+                    );
+                }
+            }
+        }
+
+        let text = format!(
+            "APPROVAL REQUIRED\nTool: {}\nArgs: {}",
+            request.tool_name, request.arguments_summary,
+        );
+        let outgoing = DiscordOutgoing::with_components(text, vec![row]);
+        let client = self.http_client();
+        send_discord_outgoing(&client, &self.bot_token, channel_id, &outgoing)
+            .await
+            .map(|_id| ())
+    }
+
+    /// Turn the rows parsed from a `[COMPONENTS:{…}]` marker into renderable
+    /// [`DiscordActionRow`]s, registering each action button / select option that
+    /// carries a `prompt` in `pending_components` so a click resolves the
+    /// server-side prompt (and only that prompt — never the wire payload).
+    ///
+    /// `custom_id` uniqueness within the message is guaranteed by a per-call
+    /// monotonic counter combined with a short random nonce, so two buttons that
+    /// share a label/prompt still register under distinct ids and can't collide
+    /// or alias each other in the single-use registry. Link buttons get no
+    /// `custom_id` and no registration. Rows/buttons are capped to Discord's
+    /// limits by `action_row`/`cap_rows`; a component whose id won't encode is
+    /// dropped at serialization (logged) rather than failing the send.
+    fn build_marker_components(
+        &self,
+        rows: &[Vec<markers::ComponentSpec>],
+    ) -> Vec<components::DiscordActionRow> {
+        // One nonce per emitted message; the counter makes each component's id
+        // unique under it. Deterministic relative to the nonce (no per-component
+        // RNG), so the registry mapping is reproducible for a given send.
+        let nonce = Uuid::new_v4().simple().to_string();
+        let nonce = &nonce[..nonce.len().min(8)];
+        let mut reg = self.pending_components.lock();
+        build_component_rows(nonce, rows, &mut reg)
+    }
+}
+
+/// Render marker rows into action rows, registering each action button / select
+/// option's `prompt` under a freshly-minted `custom_id` in `reg`. Split out of
+/// [`DiscordChannel::build_marker_components`] so the registry round-trip (emit →
+/// click resolves the bound prompt) is unit-testable without a live channel.
+///
+/// Uniqueness: a single monotonic counter `seq` advances once per minted id
+/// across the whole message and is combined with `nonce`, so two buttons (even
+/// with identical label/prompt) register under distinct ids and never alias in
+/// the single-use registry. Link buttons get no id and no registration. A select
+/// menu's own id is non-routing (the dispatch routes on the chosen option's
+/// `value`); each option's `value` IS its own `zc1` token bound to that option's
+/// prompt. A modal button mints TWO ids: the modal's own `custom_id` bound to
+/// the resolve-into-turn prompt (the submit dispatches on it), and the button's
+/// `custom_id` bound to `OpenModal` carrying that modal.
+fn build_component_rows(
+    nonce: &str,
+    rows: &[Vec<markers::ComponentSpec>],
+    reg: &mut pending::PendingComponents,
+) -> Vec<components::DiscordActionRow> {
+    use components::{
+        DiscordModal, ModalField, SelectOption, action_row, button, cap_rows, link_button,
+        string_select,
+    };
+    use custom_id::CustomId;
+
+    /// Mint a fresh, message-unique `cmp` id (advancing `seq` so ids never
+    /// collide within the message) WITHOUT registering anything. The caller
+    /// decides the intent.
+    fn mint_id(nonce: &str, seq: &mut u32) -> CustomId {
+        *seq += 1;
+        CustomId::new("cmp", format!("{nonce}-{seq}"))
+    }
+
+    /// Mint a fresh id and register `prompt` under it as a resolve-into-turn.
+    fn mint(
+        nonce: &str,
+        seq: &mut u32,
+        reg: &mut pending::PendingComponents,
+        prompt: String,
+    ) -> CustomId {
+        let id = mint_id(nonce, seq);
+        if let Some(wire) = id.encode() {
+            reg.register(wire, ComponentIntent::ResolveIntoTurn { prompt });
+        }
+        id
+    }
+
+    let mut seq: u32 = 0;
+    let mut built: Vec<components::DiscordActionRow> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut comps: Vec<components::DiscordComponent> = Vec::with_capacity(row.len());
+        for spec in row {
+            let comp = match spec {
+                markers::ComponentSpec::Button {
+                    label,
+                    style,
+                    prompt,
+                } => {
+                    let cid = mint(nonce, &mut seq, reg, prompt.clone());
+                    button(*style, label.clone(), cid)
+                }
+                markers::ComponentSpec::Link { label, url } => {
+                    link_button(label.clone(), url.clone())
+                }
+                markers::ComponentSpec::ModalButton {
+                    label,
+                    style,
+                    prompt,
+                    modal,
+                } => {
+                    // Two minted ids: the MODAL's own `custom_id` is the routing
+                    // token its type-5 submit will dispatch on, and the BUTTON's
+                    // `custom_id` is registered now as `OpenModal` carrying the
+                    // built modal + prompt. A click opens the modal and (at that
+                    // point) registers the modal id as `ResolveIntoTurn { prompt }`;
+                    // the submit then resolves the prompt with the typed field
+                    // values appended. The modal id is NOT registered at emit time
+                    // so its single-use TTL starts when the modal actually opens.
+                    let modal_id = mint_id(nonce, &mut seq);
+                    let fields: Vec<ModalField> = modal
+                        .fields
+                        .iter()
+                        .map(|f| ModalField {
+                            custom_id: f.id.clone(),
+                            label: f.label.clone(),
+                            style: f.style,
+                            required: f.required,
+                            placeholder: f.placeholder.clone(),
+                            min_length: f.min_length,
+                            max_length: f.max_length,
+                        })
+                        .collect();
+                    let built_modal = DiscordModal {
+                        custom_id: modal_id,
+                        title: modal.title.clone(),
+                        fields,
+                    };
+                    let button_id = mint_id(nonce, &mut seq);
+                    if let Some(wire) = button_id.encode() {
+                        reg.register(
+                            wire,
+                            ComponentIntent::OpenModal {
+                                modal: Box::new(built_modal),
+                                prompt: prompt.clone(),
+                            },
+                        );
+                    }
+                    button(*style, label.clone(), button_id)
+                }
+                markers::ComponentSpec::Select {
+                    placeholder,
+                    options,
+                } => {
+                    // A select carries ONE menu `custom_id`, but the inbound
+                    // dispatch routes a selection on the chosen option's *value*
+                    // (`data.values[0]`). So each option's value is its own zc1
+                    // `cmp` token registered with that option's prompt; the menu
+                    // id itself is a non-routing marker.
+                    let mut opts: Vec<SelectOption> = Vec::with_capacity(options.len());
+                    for o in options {
+                        let value_id = mint(nonce, &mut seq, reg, o.prompt.clone());
+                        // The option value IS the routing token; fall back to the
+                        // raw value if it won't encode (it then won't route, but
+                        // still renders).
+                        let value = value_id.encode().unwrap_or_else(|| o.value.clone());
+                        opts.push(SelectOption {
+                            label: o.label.clone(),
+                            value,
+                            description: None,
+                            default: false,
+                        });
+                    }
+                    seq += 1;
+                    let menu_id = CustomId::new("cmp", format!("{nonce}-{seq}-menu"));
+                    let placeholder = (!placeholder.is_empty()).then(|| placeholder.clone());
+                    string_select(menu_id, opts, placeholder)
+                }
+            };
+            comps.push(comp);
+        }
+        built.push(action_row(comps));
+    }
+    cap_rows(built)
+}
+
+/// Derive the routing token for a type-3/5 interaction from its `data` object.
+///
+/// Buttons and modal submits route on `data.custom_id`. A string-select carries
+/// one menu `custom_id`, but each of its options was emitted with its own `zc1`
+/// token as the option `value`; the chosen option arrives in `data.values`. So
+/// when the first `data.values[]` entry is a well-formed `zc1` token we route on
+/// it (resolving that option's server-bound prompt), otherwise we fall back to
+/// `data.custom_id`. The token is still validated/`take`n downstream — this only
+/// selects *which* registered entry a select selection drains, never trusts the
+/// wire for the action itself.
+fn component_routing_id(data: Option<&serde_json::Value>) -> Option<String> {
+    let data = data?;
+    if let Some(value) = data
+        .get("values")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.as_str())
+        && custom_id::CustomId::parse(value).is_some()
+    {
+        return Some(value.to_string());
+    }
+    data.get("custom_id")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
 }
 
 /// Whether a Discord channel type integer identifies a thread.
@@ -724,6 +1147,72 @@ const fn is_thread_channel_type(channel_type: u64) -> bool {
 /// channel is a thread. Discord normally responds in under 200 ms; this
 /// is a safety bound so a hung request cannot stall the listener.
 const THREAD_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Lift `[EMBED:{json}]` markers out of agent reply text, vet each spec's URLs
+/// against the egress trust boundary, and budget the result to Discord's
+/// limits. Returns the embed-free text, the wire embeds, the URL rejections
+/// (drive 🚫/⚠️ reactions, not the attachment note), and whether structural
+/// budgeting dropped anything (drives a ⚠️). Pure — the testable core of the
+/// outbound embed pipeline that `send` wires to the HTTP builders.
+fn prepare_outgoing_embeds(
+    raw_content: &str,
+    workspace_dir: Option<&Path>,
+) -> (String, Vec<DiscordEmbed>, Vec<DiscordMarkerFailure>, bool) {
+    let (content_without_embeds, embed_specs) = parse_embed_markers(raw_content);
+    let mut embeds = Vec::new();
+    let mut embed_failures = Vec::new();
+    for spec in embed_specs {
+        let (embed, failures) = spec_to_embed(spec, workspace_dir);
+        embed_failures.extend(failures);
+        if let Some(embed) = embed {
+            embeds.push(embed);
+        }
+    }
+    let truncated = budget_embeds(&mut embeds);
+    (content_without_embeds, embeds, embed_failures, truncated)
+}
+
+/// Deliver a (deferred) interaction's answer, splitting it across Discord's
+/// 2000-char limit: the first chunk edits the @original deferred message (with
+/// any `embeds` and `components`) and any remaining chunks are posted as
+/// followups. The chunking lives here in the wiring layer so `interaction` need
+/// not depend on `chunk` (preserving the no-impl-to-impl module boundary).
+///
+/// `embeds` are the rich embeds parsed from `[EMBED:{…}]` markers, and
+/// `components` are the interactive action rows parsed from a `[COMPONENTS:{…}]`
+/// marker (already registered server-side by the caller). Both ride on the
+/// FIRST chunk only — the `@original` edit carries them; any overflow followups
+/// stay text-only, mirroring the normal channel-send path (embeds/components
+/// attach to the first message, not its continuation chunks). Empty slices are a
+/// no-op, so plain replies are byte-identical to before.
+async fn deliver_interaction_answer(
+    client: &reqwest::Client,
+    app_id: &str,
+    interaction_token: &str,
+    api_base: &str,
+    content: &str,
+    embeds: &[DiscordEmbed],
+    components: &[components::DiscordActionRow],
+) -> anyhow::Result<()> {
+    let chunks = split_message_for_discord(content);
+    let mut chunks = chunks.iter();
+    let first = chunks.next().map(String::as_str).unwrap_or("");
+    discord_edit_interaction_response(
+        client,
+        app_id,
+        interaction_token,
+        api_base,
+        first,
+        embeds,
+        components,
+    )
+    .await?;
+    for chunk in chunks {
+        discord_post_interaction_followup(client, app_id, interaction_token, api_base, chunk)
+            .await?;
+    }
+    Ok(())
+}
 
 /// Pure channel-filter decision: does `msg_channel` pass the allowlist?
 ///
@@ -747,6 +1236,31 @@ fn channel_passes_filter(
         return channel_filter.iter().any(|c| c == parent);
     }
     false
+}
+
+/// Pure key-match for the bulk reaction-removal sweep. Reaction rows key as
+/// `discord_reaction_{message_id}_{user_id}_{emoji_key}` (see
+/// [`DiscordChannel::handle_reaction_event`]); `user_id` is a numeric
+/// snowflake and `emoji_key` is a custom-emoji id (numeric) or a single
+/// unicode glyph — neither contains `_`, so the message-id prefix and the
+/// emoji-key suffix are unambiguous.
+///
+/// * `emoji_key == None` (REMOVE_ALL): match every reaction row for the
+///   message — prefix `discord_reaction_{message_id}_`.
+/// * `emoji_key == Some(e)` (REMOVE_EMOJI): additionally require the row to
+///   key on that emoji — suffix `_{e}`.
+///
+/// The trailing `_` on the prefix is what stops `m1` from matching `m12`'s
+/// rows.
+fn reaction_sweep_matches(key: &str, message_id: &str, emoji_key: Option<&str>) -> bool {
+    let prefix = format!("discord_reaction_{message_id}_");
+    if !key.starts_with(&prefix) {
+        return false;
+    }
+    match emoji_key {
+        None => true,
+        Some(emoji) => key.ends_with(&format!("_{emoji}")),
+    }
 }
 
 /// Process Discord message attachments in a single pass.
@@ -1369,19 +1883,63 @@ impl Channel for DiscordChannel {
             if pending.created.elapsed() > INTERACTION_TOKEN_TTL {
                 anyhow::bail!("interaction followup token expired (id {interaction_id}, >15min)");
             }
-            let content = crate::util::strip_tool_call_tags(&message.content);
+            // Render embeds on slash-command replies too: lift `[EMBED:…]` out
+            // and attach it to the @original edit, the same as a normal send.
+            // (Bad-URL / truncation reactions aren't surfaced on an interaction
+            // @original edit — consistent with how it doesn't surface attachment
+            // failures either; the embed still renders without the bad field.)
+            let raw = crate::util::strip_tool_call_tags(&message.content);
+            let (content, embeds, _embed_failures, _embeds_truncated) =
+                prepare_outgoing_embeds(&raw, self.workspace_dir.as_deref());
+            // Mirror the normal-send path: a `[COMPONENTS:{json}]` marker in a
+            // slash-command reply must render as interactive components, not go
+            // out raw. Parse + strip the marker (after embeds, same ordering as
+            // the channel path), then build the action rows —
+            // `build_marker_components` registers each interactive component's
+            // `custom_id` in `pending_components` (same server-side, single-use,
+            // fail-closed model as the channel path), so a click dispatches.
+            let (content, component_rows) = parse_component_markers(&content);
+            let component_action_rows = if component_rows.is_empty() {
+                Vec::new()
+            } else {
+                self.build_marker_components(&component_rows)
+            };
             let client = self.http_client();
-            return discord_edit_interaction_response(
+            return deliver_interaction_answer(
                 &client,
                 &pending.app_id,
                 &pending.token,
+                DISCORD_API_BASE,
                 &content,
+                &embeds,
+                &component_action_rows,
             )
             .await;
         }
 
         let raw_content = crate::util::strip_tool_call_tags(&message.content);
-        let (cleaned_content, parsed_attachments) = parse_attachment_markers(&raw_content);
+
+        // Embeds first: their `[EMBED:{json}]` payload can itself contain `[`/`]`,
+        // so they must be lifted out before the media-marker scan runs on the rest.
+        let (content_without_embeds, embeds, embed_failures, embeds_truncated) =
+            prepare_outgoing_embeds(&raw_content, self.workspace_dir.as_deref());
+
+        // Interactive components next: the `[COMPONENTS:{json}]` body also contains
+        // `[`/`]`, so it must be stripped before the attachment scanner (which
+        // splits on the first `]`) sees the text — same ordering rationale as the
+        // embed marker. Each action button / select option carrying a `prompt` is
+        // registered in `pending_components` here, bound to a unique `custom_id`;
+        // a click resolves only that prompt.
+        let (content_without_components, component_rows) =
+            parse_component_markers(&content_without_embeds);
+        let component_action_rows = if component_rows.is_empty() {
+            Vec::new()
+        } else {
+            self.build_marker_components(&component_rows)
+        };
+
+        let (cleaned_content, parsed_attachments) =
+            parse_attachment_markers(&content_without_components);
         let (mut local_files, remote_urls, failures) =
             classify_outgoing_attachments(&parsed_attachments, self.workspace_dir.as_deref());
 
@@ -1398,16 +1956,29 @@ impl Channel for DiscordChannel {
         }
 
         let body = with_inline_attachment_urls(&cleaned_content, &remote_urls);
+        // The delivery-failure note counts dropped *attachments* only. Embed URL
+        // rejections and structural truncation surface as reactions, not a note.
         let note = delivery_failure_note(&failures);
         let content = compose_body_with_failure_note(&body, note.as_deref());
-        let reactions = decide_failure_reactions(&failures);
+
+        let mut reaction_failures = failures.clone();
+        reaction_failures.extend(embed_failures.iter().copied());
+        let mut reactions = decide_failure_reactions(&reaction_failures);
+        if embeds_truncated && !reactions.contains(&"⚠️") {
+            reactions.push("⚠️");
+        }
 
         let client = self.http_client();
         let chunks = chunks_for_send(
             &content,
             self.stream_mode,
             DISCORD_MAX_MESSAGE_LENGTH,
-            !local_files.is_empty(),
+            // Force a first message even when the text is empty, so an
+            // embeds-only, files-only, or components-only reply still has a
+            // first message to carry them. Without this, empty content + no
+            // files yields zero chunks and the embeds/action-rows are silently
+            // dropped.
+            !local_files.is_empty() || !embeds.is_empty() || !component_action_rows.is_empty(),
         );
         let inter_chunk_delay_ms =
             if self.stream_mode == zeroclaw_config::schema::StreamMode::MultiMessage {
@@ -1418,12 +1989,44 @@ impl Channel for DiscordChannel {
 
         let mut first_message_id: Option<String> = None;
         for (i, chunk) in chunks.iter().enumerate() {
-            let message_id = if i == 0 && !local_files.is_empty() {
-                send_discord_message_with_files(
+            // Embeds (EPIC C) and interactive components (EPIC B) both ride the
+            // FIRST chunk only — Discord attaches embeds and action rows
+            // per-message, and the registered prompts are for this reply, not its
+            // continuation chunks. On chunk 0 we build a single envelope carrying
+            // content + embeds + components; `to_rest_json` omits whichever are
+            // empty, so a plain reply stays byte-identical.
+            let message_id = if i == 0 && (!embeds.is_empty() || !component_action_rows.is_empty())
+            {
+                let payload = DiscordOutgoing {
+                    content: Some(chunk.clone()),
+                    embeds: embeds.clone(),
+                    components: component_action_rows.clone(),
+                    ..Default::default()
+                };
+                if local_files.is_empty() {
+                    send_discord_message_payload(
+                        &client,
+                        &self.bot_token,
+                        &message.recipient,
+                        &payload,
+                    )
+                    .await?
+                } else {
+                    send_discord_message_payload_with_files(
+                        &client,
+                        &self.bot_token,
+                        &message.recipient,
+                        &payload,
+                        &local_files,
+                    )
+                    .await?
+                }
+            } else if i == 0 && !local_files.is_empty() {
+                send_discord_message_payload_with_files(
                     &client,
                     &self.bot_token,
                     &message.recipient,
-                    chunk,
+                    &DiscordOutgoing::text(chunk.clone()),
                     &local_files,
                 )
                 .await?
@@ -1770,6 +2373,8 @@ impl Channel for DiscordChannel {
                                     let bot_token = self.bot_token.clone();
                                     let resolver = self.slash_command_resolver.clone();
                                     let workspace_dir = self.workspace_dir.clone();
+                                    let slash_command_scope = self.slash_command_scope;
+                                    let guild_ids = self.guild_ids.clone();
                                     zeroclaw_spawn::spawn!(async move {
                                         let specs = match resolver {
                                             Some(resolve) => {
@@ -1789,10 +2394,36 @@ impl Channel for DiscordChannel {
                                             None => Vec::new(),
                                         };
                                         let body = slash_command_registration_body(&specs);
+                                        // Resolve the registration target: `guild` with no guild_ids
+                                        // can't register anywhere, so fall back to global.
+                                        let effective_scope = match slash_command_scope {
+                                            zeroclaw_config::schema::SlashCommandScope::Guild
+                                                if guild_ids.is_empty() =>
+                                            {
+                                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "slash_command_scope=guild but guild_ids is empty; falling back to global slash registration");
+                                                SlashScope::Global
+                                            }
+                                            zeroclaw_config::schema::SlashCommandScope::Guild => {
+                                                SlashScope::Guild
+                                            }
+                                            zeroclaw_config::schema::SlashCommandScope::Global => {
+                                                SlashScope::Global
+                                            }
+                                        };
                                         let fingerprint = {
                                             use std::hash::{Hash, Hasher};
                                             let mut h = std::collections::hash_map::DefaultHasher::new();
                                             body.to_string().hash(&mut h);
+                                            // Fold the registration target in: a scope or guild-set
+                                            // change must force a reconcile even when the command
+                                            // bodies are byte-identical, else flipping
+                                            // `slash_command_scope` would be silently skipped.
+                                            match effective_scope {
+                                                SlashScope::Global => 0u8,
+                                                SlashScope::Guild => 1u8,
+                                            }
+                                            .hash(&mut h);
+                                            guild_ids.hash(&mut h);
                                             h.finish()
                                         };
                                         use crate::discord_slash_state::SlashReconcileState;
@@ -1812,7 +2443,7 @@ impl Channel for DiscordChannel {
                                             ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"commands": specs.len() + 1})), "discord slash command set unchanged; skipping re-registration");
                                             return;
                                         }
-                                        match reconcile_slash_commands(&client, &bot_token, &app_id, &body, DISCORD_API_BASE).await {
+                                        match reconcile_slash_commands(&client, &bot_token, &app_id, &body, DISCORD_API_BASE, effective_scope, &guild_ids).await {
                                             Ok(ReconcileOutcome::Reconciled) => {
                                                 SlashReconcileState::record_success(workspace_dir.as_deref(), &app_id, fingerprint, now);
                                                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"commands": specs.len() + 1})), "discord slash commands registered");
@@ -1911,6 +2542,9 @@ impl Channel for DiscordChannel {
                                 // routing happens in the spawned task.
                                 let prompt = interaction_string_option(d, "prompt");
                                 let input = interaction_string_option(d, "input");
+                                // Extract typed-option values here (owned) so the
+                                // spawned 'static task doesn't borrow `event`.
+                                let submitted = slash_options::extract_submitted_options(d);
                                 let interaction_guild = d
                                     .get("guild_id")
                                     .and_then(serde_json::Value::as_str)
@@ -2063,12 +2697,10 @@ impl Channel for DiscordChannel {
                                                 None => Vec::new(),
                                             };
                                             match specs.into_iter().find(|spec| spec.slug == command) {
-                                                Some(spec) if !input.is_empty() => Some(format!(
-                                                    "Use the '{}' skill for this request: {input}",
-                                                    spec.skill_name
-                                                )),
-                                                Some(_) => None, // known command, empty input
-                                                None => None,    // stale or foreign command
+                                                Some(spec) => {
+                                                    skill_command_prompt(&spec, &input, &submitted)
+                                                }
+                                                None => None, // stale or foreign command
                                             }
                                         };
                                         let Some(content) = content else {
@@ -2079,7 +2711,7 @@ impl Channel for DiscordChannel {
                                             let msg = i18n::get_required_cli_string(
                                                 "channel-discord-interaction-unavailable",
                                             );
-                                            if let Err(e) = discord_edit_interaction_response(&client, &app_id, &interaction_token, &msg).await {
+                                            if let Err(e) = discord_edit_interaction_response(&client, &app_id, &interaction_token, DISCORD_API_BASE, &msg, &[], &[]).await {
                                                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord interaction unavailable-notice failed");
                                             }
                                             pending.lock().remove(&interaction_id);
@@ -2104,6 +2736,379 @@ impl Channel for DiscordChannel {
                                         };
                                         if tx.send(channel_msg).await.is_err() {
                                             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "orchestrator channel closed; dropping interaction prompt");
+                                        }
+                                    });
+                                }
+                            } else if itype == 3 || itype == 5 {
+                                // type 3 = MESSAGE_COMPONENT (button / select click);
+                                // type 5 = MODAL_SUBMIT. Both echo back a `zc1`
+                                // custom_id and share the whole lifecycle (authz →
+                                // single-use take → defer → resolve-into-turn); the
+                                // modal additionally carries submitted field values
+                                // that are appended to the enqueued prompt.
+                                let interaction_id = d.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let interaction_token = d.get("token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let app_id = d.get("application_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                // The routing key is normally the component's
+                                // `custom_id`. A string-select carries ONE menu
+                                // `custom_id` but the chosen option is in
+                                // `data.values`; we mint each option's value as
+                                // its own `zc1` token, so a select selection
+                                // routes on `data.values[0]` (its bound prompt),
+                                // falling back to `custom_id` for buttons/modals.
+                                let custom_id_raw =
+                                    component_routing_id(d.get("data")).unwrap_or_default();
+                                // Modal submits carry their typed-in field values;
+                                // a component click carries none.
+                                let modal_fields = if itype == 5 {
+                                    components::extract_modal_fields(d)
+                                } else {
+                                    Vec::new()
+                                };
+                                let user_id = d
+                                    .get("member")
+                                    .and_then(|m| m.get("user"))
+                                    .or_else(|| d.get("user"))
+                                    .and_then(|u| u.get("id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let interaction_guild = d
+                                    .get("guild_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(ToString::to_string);
+                                let interaction_channel = d
+                                    .get("channel_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+
+                                // Foreign or malformed component: not our `zc1`
+                                // scheme, so another app may own it — drop
+                                // silently rather than acking someone else's
+                                // button. The pending registry is the real gate
+                                // below; this is a cheap pre-filter.
+                                if custom_id::CustomId::parse(&custom_id_raw).is_none() {
+                                    continue;
+                                }
+                                if !interaction_id.is_empty()
+                                    && !interaction_token.is_empty()
+                                    && !app_id.is_empty()
+                                {
+                                    let client = self.http_client();
+                                    let bot_token = self.bot_token.clone();
+                                    let peers = (self.peer_resolver)();
+                                    let guild_filter = guild_filter.clone();
+                                    let channel_filter = channel_filter.clone();
+                                    let thread_channels = Arc::clone(&self.thread_channels);
+                                    let pending = Arc::clone(&self.pending_interactions);
+                                    let pending_components = Arc::clone(&self.pending_components);
+                                    let pending_approvals = Arc::clone(&self.pending_approvals);
+                                    let alias = self.alias.clone();
+                                    let tx = tx.clone();
+
+                                    zeroclaw_spawn::spawn!(async move {
+                                        // Cheap peer check first (parity with
+                                        // type-2): an unauthorized invoker must
+                                        // not be able to drive the authenticated
+                                        // thread-lookup REST call.
+                                        // interaction_gate re-checks fail-closed.
+                                        if !crate::allowlist::is_user_allowed(
+                                            &peers,
+                                            &user_id,
+                                            crate::allowlist::Match::Sensitive,
+                                        ) {
+                                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"user_id": user_id, "denial": "UnauthorizedUser"})), "rejecting unauthorized component interaction");
+                                            let msg = i18n::get_required_cli_string(
+                                                "channel-discord-interaction-unauthorized",
+                                            );
+                                            if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
+                                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord interaction reject failed");
+                                            }
+                                            return;
+                                        }
+                                        let parent_id = if !channel_filter.is_empty()
+                                            && !interaction_channel.is_empty()
+                                            && !channel_filter.iter().any(|c| c == &interaction_channel)
+                                        {
+                                            discord_thread_parent(
+                                                &client,
+                                                &bot_token,
+                                                &thread_channels,
+                                                &interaction_channel,
+                                            )
+                                            .await
+                                        } else {
+                                            None
+                                        };
+                                        if let Err(denial) = interaction_gate(
+                                            &peers,
+                                            &guild_filter,
+                                            &channel_filter,
+                                            &user_id,
+                                            interaction_guild.as_deref(),
+                                            &interaction_channel,
+                                            parent_id.as_deref(),
+                                        ) {
+                                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"user_id": user_id, "denial": format!("{denial:?}")})), "rejecting unauthorized component interaction");
+                                            let msg = i18n::get_required_cli_string(
+                                                "channel-discord-interaction-unauthorized",
+                                            );
+                                            if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
+                                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord interaction reject failed");
+                                            }
+                                            return;
+                                        }
+
+                                        // Single-use: drain the intent bound to
+                                        // this custom_id. The `take` runs ONLY
+                                        // after the fail-closed gate above, so an
+                                        // unauthorized click never drains an
+                                        // entry. Absent/expired/replayed (incl. a
+                                        // forged-but-zc1 id we never registered)
+                                        // → refuse, don't act.
+                                        let intent = pending_components.lock().take(&custom_id_raw);
+                                        let prompt = match intent {
+                                            // Buttoned approval: resolve the parked
+                                            // `oneshot` keyed by the registered
+                                            // token with the SERVER-bound decision
+                                            // (never derived from the wire
+                                            // custom_id). Ack the click; do NOT
+                                            // enqueue a turn.
+                                            Some(ComponentIntent::Approval { token, decision }) => {
+                                                let resolved = {
+                                                    let mut guard = pending_approvals.lock().await;
+                                                    approval::resolve_parked_approval(
+                                                        &mut guard, &token, decision,
+                                                    )
+                                                };
+                                                // Ack the interaction so the
+                                                // operator doesn't see "did not
+                                                // respond". An already-resolved
+                                                // token (raced/timed-out) just
+                                                // means the buttons are stale.
+                                                let key = if resolved {
+                                                    "channel-discord-approval-recorded"
+                                                } else {
+                                                    "channel-discord-component-expired"
+                                                };
+                                                let msg = i18n::get_required_cli_string(key);
+                                                if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
+                                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord approval ack failed");
+                                                }
+                                                return;
+                                            }
+                                            // Modal-open button: the click's
+                                            // response IS opening the modal (type
+                                            // 9) — we do NOT defer or enqueue.
+                                            // Register the modal's own `custom_id`
+                                            // as the resolve-into-turn now (so the
+                                            // type-5 submit, handled by the
+                                            // ResolveIntoTurn arm above, resolves
+                                            // the prompt with its typed field
+                                            // values appended), then open the modal.
+                                            // The `take` already ran after the
+                                            // fail-closed gate, same as Approval.
+                                            Some(ComponentIntent::OpenModal { modal, prompt }) => {
+                                                if let Some(wire) = modal.custom_id.encode() {
+                                                    pending_components.lock().register(
+                                                        wire,
+                                                        ComponentIntent::ResolveIntoTurn { prompt },
+                                                    );
+                                                }
+                                                if let Err(e) = discord_open_modal(&client, &interaction_id, &interaction_token, &modal).await {
+                                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord modal open failed");
+                                                }
+                                                return;
+                                            }
+                                            Some(ComponentIntent::ResolveIntoTurn { prompt }) => prompt,
+                                            // Absent / expired / replayed / forged.
+                                            None => {
+                                                let msg = i18n::get_required_cli_string(
+                                                    "channel-discord-component-expired",
+                                                );
+                                                if let Err(e) = discord_reject_interaction(&client, &interaction_id, &interaction_token, &msg).await {
+                                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord component expired-notice failed");
+                                                }
+                                                return;
+                                            }
+                                        };
+
+                                        // A modal submit appends its typed-in
+                                        // fields ("label: value" lines) to the
+                                        // registered prompt; a component click has
+                                        // none, so the prompt is used as-is.
+                                        let content = if modal_fields.is_empty() {
+                                            prompt
+                                        } else {
+                                            let mut c = prompt;
+                                            for (field, value) in &modal_fields {
+                                                c.push_str(&format!("\n{field}: {value}"));
+                                            }
+                                            c
+                                        };
+
+                                        // Stash creds before the defer so a fast
+                                        // reply can't race an absent entry.
+                                        {
+                                            let mut guard = pending.lock();
+                                            guard.retain(|_, p| {
+                                                p.created.elapsed() < INTERACTION_TOKEN_TTL
+                                            });
+                                            guard.insert(
+                                                interaction_id.clone(),
+                                                PendingInteraction {
+                                                    app_id: app_id.clone(),
+                                                    token: interaction_token.clone(),
+                                                    created: std::time::Instant::now(),
+                                                },
+                                            );
+                                        }
+                                        if let Err(e) = discord_defer_interaction(&client, &interaction_id, &interaction_token).await {
+                                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord component defer failed");
+                                            pending.lock().remove(&interaction_id);
+                                            return;
+                                        }
+
+                                        // Resolve-into-turn: the registered
+                                        // intent drives an agent turn, answered
+                                        // through the interaction followup.
+                                        let channel_msg = ChannelMessage {
+                                            id: format!("discord_interaction_{interaction_id}"),
+                                            sender: user_id,
+                                            reply_target: discord_interaction_reply_target(&interaction_id),
+                                            content,
+                                            channel: "discord".to_string(),
+                                            channel_alias: Some(alias),
+                                            timestamp: std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_secs(),
+                                            interruption_scope_id: None,
+                                            thread_ts: None,
+                                            attachments: Vec::new(),
+                                            subject: None,
+                                        };
+                                        if tx.send(channel_msg).await.is_err() {
+                                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "orchestrator channel closed; dropping component prompt");
+                                        }
+                                    });
+                                }
+                            } else if itype == 4 {
+                                // type 4 = APPLICATION_COMMAND_AUTOCOMPLETE.
+                                // Fired on EVERY keystroke in a focused option,
+                                // so it must be cheap and side-effect-free: it
+                                // answers inline with a type-8
+                                // (AUTOCOMPLETE_RESULT) choice set and NEVER
+                                // defers or posts an ephemeral. Authorization
+                                // reuses the same `interaction_gate`
+                                // (fail-closed) as the other arms, but evaluated
+                                // WITHOUT the reject side-effect — an
+                                // unauthorized keystroke gets an empty choice
+                                // set (no policy leak, no hang), exactly like a
+                                // query with no matches.
+                                let interaction_id = d.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let interaction_token = d.get("token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let user_id = d
+                                    .get("member")
+                                    .and_then(|m| m.get("user"))
+                                    .or_else(|| d.get("user"))
+                                    .and_then(|u| u.get("id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let interaction_guild = d
+                                    .get("guild_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(ToString::to_string);
+                                let interaction_channel = d
+                                    .get("channel_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+                                // The focused option + its partial input, owned
+                                // (so the spawned 'static task doesn't borrow
+                                // `event`). Discord marks exactly one option
+                                // `"focused": true`; absent → no completion.
+                                let focused = slash_options::extract_focused_option(d);
+                                if !interaction_id.is_empty() && !interaction_token.is_empty() {
+                                    let client = self.http_client();
+                                    let peers = (self.peer_resolver)();
+                                    let guild_filter = guild_filter.clone();
+                                    let channel_filter = channel_filter.clone();
+                                    let resolver = self.slash_command_resolver.clone();
+
+                                    zeroclaw_spawn::spawn!(async move {
+                                        // Fail-closed authz, side-effect-free:
+                                        // `interaction_gate` is a pure check (the
+                                        // reject/defer side-effects in the other
+                                        // arms are separate REST calls we simply
+                                        // don't make here). On denial OR no
+                                        // matches we answer an empty choice set.
+                                        //
+                                        // No thread-parent REST lookup: it is an
+                                        // authenticated round-trip per keystroke
+                                        // and would defeat the side-effect-free
+                                        // requirement, so a channel-filtered
+                                        // thread simply yields no completions
+                                        // (fail-closed) rather than probing.
+                                        let authorized = interaction_gate(
+                                            &peers,
+                                            &guild_filter,
+                                            &channel_filter,
+                                            &user_id,
+                                            interaction_guild.as_deref(),
+                                            &interaction_channel,
+                                            None,
+                                        )
+                                        .is_ok();
+
+                                        // Suggestions are the focused option's
+                                        // predefined `choices` (the typed-option
+                                        // model), filtered by the partial input.
+                                        // Resolved from canonical state via the
+                                        // same blocking resolver the type-2 arm
+                                        // uses (no cache — SINGLE SOURCE OF
+                                        // TRUTH); this is a LOCAL read, never a
+                                        // Discord REST probe, so authz stays
+                                        // side-effect-free. An unauthorized
+                                        // keystroke skips even this and answers
+                                        // empty — no policy leak, no work.
+                                        let choices: Vec<(String, String)> = match (authorized, focused) {
+                                            (true, Some((command, option_name, partial))) => {
+                                                let specs = match resolver {
+                                                    Some(resolve) => match tokio::task::spawn_blocking(move || resolve()).await {
+                                                        Ok(specs) => specs,
+                                                        Err(e) => {
+                                                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "skills resolver panicked; answering empty autocomplete");
+                                                            Vec::new()
+                                                        }
+                                                    },
+                                                    None => Vec::new(),
+                                                };
+                                                specs
+                                                    .iter()
+                                                    .find(|spec| spec.slug == command)
+                                                    .and_then(|spec| {
+                                                        spec.options.iter().find(|o| o.name == option_name)
+                                                    })
+                                                    .map(|opt| opt.matching_choices(&partial))
+                                                    .unwrap_or_default()
+                                            }
+                                            // Unauthorized, or no focused option:
+                                            // a valid empty answer (clears the box).
+                                            _ => Vec::new(),
+                                        };
+
+                                        if let Err(e) = discord_answer_autocomplete(
+                                            &client,
+                                            &interaction_id,
+                                            &interaction_token,
+                                            &choices,
+                                        )
+                                        .await
+                                        {
+                                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord autocomplete answer failed");
                                         }
                                     });
                                 }
@@ -2140,6 +3145,24 @@ impl Channel for DiscordChannel {
                             && let Some(d) = event.get("d")
                         {
                             self.handle_reaction_event(event_type, d, &bot_user_id).await;
+                        }
+                        continue;
+                    }
+
+                    // Bulk reaction-removal events (whole message, or one
+                    // emoji across the message) carry no `user_id`, so they
+                    // can't go through `handle_reaction_event`. Same intents,
+                    // same scope/guild/channel gate — they sweep the matching
+                    // `discord_reaction_{message}_*` rows so the archive
+                    // doesn't keep orphaned reactions.
+                    if event_type == "MESSAGE_REACTION_REMOVE_ALL"
+                        || event_type == "MESSAGE_REACTION_REMOVE_EMOJI"
+                    {
+                        if self.reaction_scope
+                            != zeroclaw_config::schema::DiscordReactionScope::Off
+                            && let Some(d) = event.get("d")
+                        {
+                            self.sweep_message_reactions(event_type, d).await;
                         }
                         continue;
                     }
@@ -2727,7 +3750,12 @@ impl Channel for DiscordChannel {
         self.last_draft_edit.lock().remove(recipient);
 
         let text = &crate::util::strip_tool_call_tags(text);
-        let (cleaned_content, parsed_attachments) = parse_attachment_markers(text);
+        // Lift `[EMBED:…]` out before the media-marker scan (its JSON can contain
+        // `[`/`]`); embeds attach to the first finalized message below, so a
+        // streaming/draft reply renders embeds the same as a normal send.
+        let (text_without_embeds, embeds, _embed_failures, _embeds_truncated) =
+            prepare_outgoing_embeds(text, self.workspace_dir.as_deref());
+        let (cleaned_content, parsed_attachments) = parse_attachment_markers(&text_without_embeds);
         let (mut local_files, remote_urls, failures) =
             classify_outgoing_attachments(&parsed_attachments, self.workspace_dir.as_deref());
         let body = with_inline_attachment_urls(&cleaned_content, &remote_urls);
@@ -2748,11 +3776,17 @@ impl Channel for DiscordChannel {
             let mut first_message_id: Option<String> = None;
             for (i, chunk) in chunks.iter().enumerate() {
                 let new_id = if i == 0 {
-                    send_discord_message_with_files(
+                    // Embeds + files ride the first message.
+                    let payload = DiscordOutgoing {
+                        content: Some(chunk.clone()),
+                        embeds: embeds.clone(),
+                        ..Default::default()
+                    };
+                    send_discord_message_payload_with_files(
                         &client,
                         &self.bot_token,
                         recipient,
-                        chunk,
+                        &payload,
                         &local_files,
                     )
                     .await?
@@ -2778,8 +3812,18 @@ impl Channel for DiscordChannel {
             let chunks = split_message_for_discord(&content);
             let mut first_message_id: Option<String> = None;
             for (i, chunk) in chunks.iter().enumerate() {
-                let new_id =
-                    send_discord_message_json(&client, &self.bot_token, recipient, chunk).await?;
+                let new_id = if i == 0 {
+                    // Embeds ride the first message.
+                    let payload = DiscordOutgoing {
+                        content: Some(chunk.clone()),
+                        embeds: embeds.clone(),
+                        ..Default::default()
+                    };
+                    send_discord_message_payload(&client, &self.bot_token, recipient, &payload)
+                        .await?
+                } else {
+                    send_discord_message_json(&client, &self.bot_token, recipient, chunk).await?
+                };
                 if first_message_id.is_none() {
                     first_message_id = Some(new_id);
                 }
@@ -2792,27 +3836,38 @@ impl Channel for DiscordChannel {
             return Ok(());
         }
 
-        // Path 3: simple case — edit in-place; fall back to delete + POST on failure.
-        // The reaction target is the draft message_id when the edit lands;
-        // when the fallback fires it's the freshly posted message instead.
-        let reaction_target =
-            match edit_discord_message(&client, &self.bot_token, recipient, message_id, &content)
-                .await
-            {
-                Ok(()) => message_id.to_string(),
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"e": e.to_string()})),
-                        "Discord finalize_draft edit failed: ; falling back to delete+send"
-                    );
-                    let _ = delete_discord_message(&client, &self.bot_token, recipient, message_id)
-                        .await;
-                    send_discord_message_json(&client, &self.bot_token, recipient, &content).await?
-                }
-            };
+        // Path 3: simple case — edit in-place (with any embeds); fall back to
+        // delete + POST on failure. The reaction target is the draft message_id
+        // when the edit lands; when the fallback fires it's the freshly posted
+        // message instead.
+        let payload = DiscordOutgoing {
+            content: Some(content.clone()),
+            embeds: embeds.clone(),
+            ..Default::default()
+        };
+        let reaction_target = match edit_discord_message_payload(
+            &client,
+            &self.bot_token,
+            recipient,
+            message_id,
+            &payload,
+        )
+        .await
+        {
+            Ok(()) => message_id.to_string(),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                    "Discord finalize_draft edit failed: ; falling back to delete+send"
+                );
+                let _ =
+                    delete_discord_message(&client, &self.bot_token, recipient, message_id).await;
+                send_discord_message_payload(&client, &self.bot_token, recipient, &payload).await?
+            }
+        };
         self.apply_failure_reactions(recipient, Some(&reaction_target), &reactions)
             .await;
 
@@ -2921,10 +3976,6 @@ impl Channel for DiscordChannel {
             anyhow::bail!("approval prompts are not supported over interaction replies");
         }
         let token = crate::util::new_approval_token();
-        let text = format!(
-            "APPROVAL REQUIRED [{}]\nTool: {}\nArgs: {}\n\nReply: \"{} yes\", \"{} no\", or \"{} always\"",
-            token, request.tool_name, request.arguments_summary, token, token, token,
-        );
 
         let (tx, rx) = oneshot::channel();
         self.pending_approvals
@@ -2934,11 +3985,27 @@ impl Channel for DiscordChannel {
 
         // Strip thread suffix — approval message goes to the channel root.
         let channel_id = recipient.split(':').next().unwrap_or(recipient);
-        if let Err(err) = self.send(&SendMessage::new(text, channel_id)).await {
+
+        // Prefer the buttoned prompt when the interaction pipe is live: a click
+        // can only be dispatched (type-3) and thus resolve the `oneshot` when
+        // `slash_commands` is enabled (the INTERACTION_CREATE handler is gated
+        // on it). Emitting buttons without that pipe would leave the operator
+        // with dead controls — so fall back to the plaintext-token prompt the
+        // inbound MESSAGE_CREATE path parses (`parse_approval_reply`).
+        let emitted = if self.slash_commands {
+            self.send_buttoned_approval(channel_id, &token, request)
+                .await
+        } else {
+            self.send_plaintext_approval(channel_id, &token, request)
+                .await
+        };
+        if let Err(err) = emitted {
             self.pending_approvals.lock().await.remove(&token);
             return Err(err);
         }
 
+        // Timeout → Deny, preserving the deny-by-default silence semantics. The
+        // pending entry is dropped so a late click can't resolve a stale token.
         let response =
             match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
                 Ok(Ok(resp)) => resp,
@@ -2958,6 +4025,73 @@ mod tests {
 
     fn s(items: &[&str]) -> Vec<String> {
         items.iter().map(|i| (*i).to_string()).collect()
+    }
+
+    #[test]
+    fn prepare_outgoing_embeds_lifts_marker_vets_urls_and_strips_text() {
+        let raw = "look [EMBED:{\"title\":\"Report\",\"image\":\"https://ex.com/i.png\"}] done";
+        let (text, embeds, failures, truncated) = prepare_outgoing_embeds(raw, None);
+        assert_eq!(text, "look  done");
+        assert_eq!(embeds.len(), 1);
+        assert_eq!(embeds[0].title.as_deref(), Some("Report"));
+        assert_eq!(
+            embeds[0].image.as_ref().unwrap().url,
+            "https://ex.com/i.png"
+        );
+        assert!(failures.is_empty());
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn prepare_outgoing_embeds_drops_bad_url_and_reports_failure() {
+        let raw = "[EMBED:{\"title\":\"T\",\"image\":\"file:///etc/passwd\"}]";
+        let (text, embeds, failures, _) = prepare_outgoing_embeds(raw, None);
+        assert_eq!(text, "");
+        assert_eq!(embeds.len(), 1);
+        assert!(embeds[0].image.is_none(), "disallowed scheme dropped");
+        assert_eq!(failures, vec![DiscordMarkerFailure::Refused]);
+    }
+
+    #[test]
+    fn prepare_outgoing_embeds_flags_structural_truncation() {
+        // 11 embeds → over the 10-per-message cap → truncated, ⚠️ territory.
+        let markers: String = (0..11)
+            .map(|i| format!("[EMBED:{{\"title\":\"t{i}\"}}]"))
+            .collect();
+        let (_, embeds, _, truncated) = prepare_outgoing_embeds(&markers, None);
+        assert_eq!(embeds.len(), 10);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn prepare_outgoing_embeds_leaves_plain_text_untouched() {
+        let (text, embeds, failures, truncated) =
+            prepare_outgoing_embeds("just a normal reply", None);
+        assert_eq!(text, "just a normal reply");
+        assert!(embeds.is_empty());
+        assert!(failures.is_empty());
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn finalize_draft_builds_a_first_message_payload_carrying_embeds() {
+        // finalize_draft (and the slash-reply path) lift embeds out of the final
+        // text and attach them to the first message's DiscordOutgoing — the same
+        // transformation send() does. Pin that so neither path regresses to
+        // content-only and leaks the raw [EMBED:…] marker.
+        let raw = "Result [EMBED:{\"title\":\"Report\"}]";
+        let (content, embeds, _failures, _truncated) = prepare_outgoing_embeds(raw, None);
+        assert_eq!(content, "Result");
+        assert_eq!(embeds.len(), 1);
+        let payload = DiscordOutgoing {
+            content: Some(content),
+            embeds,
+            ..Default::default()
+        };
+        assert_eq!(
+            payload.to_rest_json(),
+            serde_json::json!({ "content": "Result", "embeds": [{ "title": "Report" }] })
+        );
     }
 
     #[test]
@@ -3021,6 +4155,181 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn interaction_answer_over_2000_chars_chunks_into_edit_plus_followup() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // The first chunk edits the deferred @original message.
+        Mock::given(method("PATCH"))
+            .and(path("/webhooks/app1/tok/messages/@original"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // The remaining chunk is delivered as a followup POST (not truncated).
+        Mock::given(method("POST"))
+            .and(path("/webhooks/app1/tok"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        // 3000 contiguous chars (no break point) → a 2000-char chunk + a 1000.
+        let content = "a".repeat(3000);
+        deliver_interaction_answer(&client, "app1", "tok", &server.uri(), &content, &[], &[])
+            .await
+            .unwrap();
+        // wiremock verifies the expect(1) counts when the server drops.
+    }
+
+    #[tokio::test]
+    async fn short_interaction_answer_only_edits_original() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/webhooks/app1/tok/messages/@original"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // A short reply must not trigger any followup POST.
+        Mock::given(method("POST"))
+            .and(path("/webhooks/app1/tok"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        deliver_interaction_answer(
+            &client,
+            "app1",
+            "tok",
+            &server.uri(),
+            "short answer",
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn interaction_answer_emits_components_on_original_edit() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // The @original edit MUST carry the `components` array (a type-1 action
+        // row holding the rendered button) and the stripped content — proving a
+        // slash-command reply with a [COMPONENTS:…] marker renders interactive
+        // controls instead of leaking the marker text.
+        Mock::given(method("PATCH"))
+            .and(path("/webhooks/app1/tok/messages/@original"))
+            .and(body_partial_json(serde_json::json!({
+                "content": "Pick:",
+                "components": [{ "type": 1 }],
+            })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Build a real action row through the same registry path send() uses.
+        let (cleaned, marker_rows) = parse_component_markers(
+            "Pick: [COMPONENTS:{\"rows\":[[{\"label\":\"Ship\",\"style\":\"primary\",\"prompt\":\"ship it\"}]]}]",
+        );
+        assert_eq!(cleaned, "Pick:");
+        let mut reg = pending::PendingComponents::default();
+        let action_rows = build_component_rows("nonce", &marker_rows, &mut reg);
+        assert_eq!(action_rows.len(), 1);
+
+        let client = reqwest::Client::new();
+        deliver_interaction_answer(
+            &client,
+            "app1",
+            "tok",
+            &server.uri(),
+            &cleaned,
+            &[],
+            &action_rows,
+        )
+        .await
+        .unwrap();
+        // wiremock verifies the expect(1) + body_partial_json when the server drops.
+    }
+
+    #[tokio::test]
+    async fn plain_interaction_answer_omits_components_key() {
+        // Behaviour-neutrality: a reply with no marker (empty components slice)
+        // serialises to a content-only @original edit — no `components` key.
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/webhooks/app1/tok/messages/@original"))
+            .and(body_partial_json(serde_json::json!({ "content": "hi" })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        deliver_interaction_answer(&client, "app1", "tok", &server.uri(), "hi", &[], &[])
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(
+            body.get("components").is_none(),
+            "plain reply must not carry a components key"
+        );
+    }
+
+    #[test]
+    fn send_interaction_pipeline_strips_marker_and_registers_intents() {
+        // The send() interaction-reply branch runs `parse_component_markers` then
+        // `self.build_marker_components` BEFORE delivering — proving the marker is
+        // stripped from the outgoing content AND each interactive component is
+        // registered server-side (a click resolves the bound prompt, not the
+        // wire payload). This is the wiring the bug was missing.
+        let ch = DiscordChannel::new(
+            "fake".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            false,
+            false,
+        );
+        let content = crate::util::strip_tool_call_tags(
+            "Choose: [COMPONENTS:{\"rows\":[[{\"label\":\"Approve\",\"style\":\"success\",\"prompt\":\"user approved\"},{\"label\":\"Docs\",\"url\":\"https://example.com\"}]]}]",
+        );
+        let (stripped, marker_rows) = parse_component_markers(&content);
+        assert_eq!(
+            stripped, "Choose:",
+            "marker stripped from interaction reply"
+        );
+        assert!(!marker_rows.is_empty(), "marker parsed into rows");
+
+        let action_rows = ch.build_marker_components(&marker_rows);
+        assert_eq!(action_rows.len(), 1, "one action row rendered");
+
+        // The Approve button is registered (clickable); the link button is not.
+        let ids = rendered_routing_ids(&action_rows);
+        assert_eq!(ids.len(), 1, "only the prompt-bearing button registers");
+        assert_eq!(
+            ch.pending_components.lock().take(&ids[0]),
+            Some(ComponentIntent::ResolveIntoTurn {
+                prompt: "user approved".into()
+            }),
+            "click resolves the server-bound prompt"
+        );
+        // Single-use take: a replay resolves nothing.
+        assert_eq!(ch.pending_components.lock().take(&ids[0]), None);
+    }
+
     #[test]
     fn interaction_reply_target_roundtrips() {
         let target = discord_interaction_reply_target("123456789");
@@ -3071,11 +4380,13 @@ mod tests {
         zeroclaw_runtime::skills::Skill {
             name: name.to_string(),
             description: description.to_string(),
+            description_localizations: Default::default(),
             version: "1.0.0".to_string(),
             author: None,
             tags: tags.iter().map(|t| (*t).to_string()).collect(),
             tools: vec![],
             prompts: vec![],
+            slash_options: Vec::new(),
             location: None,
         }
     }
@@ -3156,6 +4467,8 @@ mod tests {
             skill_name: "deploy status".to_string(),
             slug: "deploy-status".to_string(),
             description: "Check deploy state".to_string(),
+            description_localizations: Default::default(),
+            options: Vec::new(),
         }];
         let body = slash_command_registration_body(&specs);
         let commands = body.as_array().unwrap();
@@ -3249,9 +4562,17 @@ mod tests {
 
         let client = reqwest::Client::new();
         let desired = slash_command_registration_body(&[]);
-        let err = reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri())
-            .await
-            .unwrap_err();
+        let err = reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Global,
+            &[],
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("stale skill command delete"));
     }
 
@@ -3282,9 +4603,184 @@ mod tests {
 
         let client = reqwest::Client::new();
         let desired = slash_command_registration_body(&[]);
-        reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri())
-            .await
-            .unwrap();
+        reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Global,
+            &[],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn guild_scope_registers_to_the_guild_endpoint() {
+        // scope=Guild with one guild routes the upsert to
+        // /applications/{app}/guilds/{gid}/commands; the (empty) global
+        // endpoint is listed for cross-scope cleanup but has nothing to reap.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/guilds/g1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/applications/app1/guilds/g1/commands"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[]);
+        reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Guild,
+            &["g1".to_string()],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn scope_switch_reaps_owned_commands_from_the_inactive_scope() {
+        // Switching to guild scope reaps our `/ask` + skill commands left on the
+        // now-inactive global endpoint, so the same command isn't registered in
+        // both scopes at once (the guild-scope migration hazard).
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // Derive the stale `/ask` from what we register (incl. its
+        // `description_localizations`, which the reaper's listing requests via
+        // `with_localizations=true`) plus a server-side id - so its projection
+        // matches ours and the ownership check reaps it (#7922).
+        let mut stale_ask = slash_command_registration_body(&[]).as_array().unwrap()[0].clone();
+        stale_ask["id"] = serde_json::json!("a1");
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                stale_ask,
+                stale_skill_command("c1", "ghost-skill")
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/applications/app1/commands/a1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/applications/app1/commands/c1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/guilds/g1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/applications/app1/guilds/g1/commands"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[]);
+        reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Guild,
+            &["g1".to_string()],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn scope_switch_spares_foreign_ask_in_inactive_scope() {
+        // A `/ask` registered by OTHER tooling (different description) on the
+        // now-inactive global scope must NOT be reaped on a scope switch - we
+        // only delete the `/ask` whose projection matches what we register
+        // (#7922). Our own skill command on that scope is still reaped.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let foreign_ask = serde_json::json!({
+            "id": "x1", "name": "ask",
+            "description": "Ask a DIFFERENT bot", "type": 1,
+            "options": [{ "name": "prompt", "description": "What to ask", "type": 3, "required": true }]
+        });
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                foreign_ask,
+                stale_skill_command("c1", "ghost-skill")
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Our owned skill command IS reaped...
+        Mock::given(method("DELETE"))
+            .and(path("/applications/app1/commands/c1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // ...but the foreign `/ask` (x1) must NOT be: expect(0) fails on drop if
+        // a delete is ever issued for it.
+        Mock::given(method("DELETE"))
+            .and(path("/applications/app1/commands/x1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/guilds/g1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/applications/app1/guilds/g1/commands"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let desired = slash_command_registration_body(&[]);
+        reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Guild,
+            &["g1".to_string()],
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -3295,14 +4791,13 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
-        let existing_ask = serde_json::json!({
-            "id": "a1", "name": "ask",
-            "description": "Ask the agent a question", "type": 1,
-            "options": [{
-                "name": "prompt", "description": "What to ask",
-                "type": 3, "required": true
-            }]
-        });
+        // Echo back exactly what we'd register for `/ask` (incl. its
+        // `description_localizations`, which the GET requests via
+        // `with_localizations=true`) plus a server-side id - so the projection
+        // matches and no upsert fires. Deriving it keeps the test agnostic to
+        // the built-in translation table.
+        let mut existing_ask = slash_command_registration_body(&[]).as_array().unwrap()[0].clone();
+        existing_ask["id"] = serde_json::json!("a1");
         let foreign = serde_json::json!({
             "id": "f1", "name": "run",
             "description": "external tool", "type": 1,
@@ -3325,9 +4820,17 @@ mod tests {
 
         let client = reqwest::Client::new();
         let desired = slash_command_registration_body(&[]);
-        reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri())
-            .await
-            .unwrap();
+        reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Global,
+            &[],
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -3354,9 +4857,17 @@ mod tests {
         let client = reqwest::Client::new();
         let desired = slash_command_registration_body(&[]); // /ask → one POST
         let now = crate::discord_slash_state::now_unix();
-        let outcome = reconcile_slash_commands(&client, "tok", "app1", &desired, &server.uri())
-            .await
-            .unwrap();
+        let outcome = reconcile_slash_commands(
+            &client,
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Global,
+            &[],
+        )
+        .await
+        .unwrap();
         match outcome {
             ReconcileOutcome::RateLimited { until } => assert!(until >= now + 5),
             ReconcileOutcome::Reconciled => panic!("expected RateLimited on a POST 429"),
@@ -4021,6 +5532,213 @@ mod tests {
             "guild_id": "g1", "emoji": {"name": "👍"}
         });
         ch.handle_reaction_event("MESSAGE_REACTION_REMOVE", &remove, "botid")
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 0);
+    }
+
+    #[test]
+    fn reaction_sweep_predicate_scopes_by_message_then_emoji() {
+        // REMOVE_ALL: every row for m1, regardless of user or emoji.
+        assert!(reaction_sweep_matches(
+            "discord_reaction_m1_u1_👍",
+            "m1",
+            None
+        ));
+        assert!(reaction_sweep_matches(
+            "discord_reaction_m1_u2_🎉",
+            "m1",
+            None
+        ));
+        // ...but never another message's rows, and the trailing `_` on the
+        // prefix keeps `m1` from swallowing `m12`.
+        assert!(!reaction_sweep_matches(
+            "discord_reaction_m2_u1_👍",
+            "m1",
+            None
+        ));
+        assert!(!reaction_sweep_matches(
+            "discord_reaction_m12_u1_👍",
+            "m1",
+            None
+        ));
+
+        // REMOVE_EMOJI: the message AND that one emoji (any user).
+        assert!(reaction_sweep_matches(
+            "discord_reaction_m1_u1_👍",
+            "m1",
+            Some("👍")
+        ));
+        assert!(reaction_sweep_matches(
+            "discord_reaction_m1_u2_👍",
+            "m1",
+            Some("👍")
+        ));
+        // Right message, wrong emoji: untouched.
+        assert!(!reaction_sweep_matches(
+            "discord_reaction_m1_u1_🎉",
+            "m1",
+            Some("👍")
+        ));
+        // Right emoji, wrong message: untouched.
+        assert!(!reaction_sweep_matches(
+            "discord_reaction_m2_u1_👍",
+            "m1",
+            Some("👍")
+        ));
+        // Custom-emoji rows key by id; REMOVE_EMOJI scopes by that same id.
+        assert!(reaction_sweep_matches(
+            "discord_reaction_m1_u1_424242",
+            "m1",
+            Some("424242")
+        ));
+        assert!(!reaction_sweep_matches(
+            "discord_reaction_m1_u1_424242",
+            "m1",
+            Some("999")
+        ));
+    }
+
+    #[tokio::test]
+    async fn remove_all_sweeps_only_that_messages_reactions() {
+        let (ch, mem, _dir) = reaction_test_channel(DiscordReactionScope::All);
+        // Two users react with two different emoji on m1, plus an unrelated
+        // reaction on m2 that must survive the sweep.
+        for (user, emoji) in [("u1", "👍"), ("u2", "🎉")] {
+            let add = serde_json::json!({
+                "user_id": user, "message_id": "m1", "channel_id": "c1",
+                "guild_id": "g1", "emoji": {"name": emoji},
+                "member": {"user": {"username": user}}
+            });
+            ch.handle_reaction_event("MESSAGE_REACTION_ADD", &add, "botid")
+                .await;
+        }
+        let other = serde_json::json!({
+            "user_id": "u1", "message_id": "m2", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "👍"}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_ADD", &other, "botid")
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 3);
+
+        let clear = serde_json::json!({
+            "message_id": "m1", "channel_id": "c1", "guild_id": "g1"
+        });
+        ch.sweep_message_reactions("MESSAGE_REACTION_REMOVE_ALL", &clear)
+            .await;
+
+        assert!(
+            mem.get("discord_reaction_m1_u1_👍")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            mem.get("discord_reaction_m1_u2_🎉")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // m2's reaction is untouched.
+        assert!(
+            mem.get("discord_reaction_m2_u1_👍")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(mem.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_emoji_sweeps_only_that_emoji_on_the_message() {
+        let (ch, mem, _dir) = reaction_test_channel(DiscordReactionScope::All);
+        // Same emoji from two users, plus a different emoji that must survive.
+        for user in ["u1", "u2"] {
+            let add = serde_json::json!({
+                "user_id": user, "message_id": "m1", "channel_id": "c1",
+                "guild_id": "g1", "emoji": {"name": "👍"}
+            });
+            ch.handle_reaction_event("MESSAGE_REACTION_ADD", &add, "botid")
+                .await;
+        }
+        let keep = serde_json::json!({
+            "user_id": "u1", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "🎉"}
+        });
+        ch.handle_reaction_event("MESSAGE_REACTION_ADD", &keep, "botid")
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 3);
+
+        let clear = serde_json::json!({
+            "message_id": "m1", "channel_id": "c1", "guild_id": "g1",
+            "emoji": {"name": "👍"}
+        });
+        ch.sweep_message_reactions("MESSAGE_REACTION_REMOVE_EMOJI", &clear)
+            .await;
+
+        // Both 👍 rows gone; the 🎉 row survives.
+        assert!(
+            mem.get("discord_reaction_m1_u1_👍")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            mem.get("discord_reaction_m1_u2_👍")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            mem.get("discord_reaction_m1_u1_🎉")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(mem.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn bulk_removal_respects_guild_and_channel_gates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem: std::sync::Arc<dyn zeroclaw_memory::Memory> = std::sync::Arc::new(
+            zeroclaw_memory::SqliteMemory::new_named("sqlite", dir.path(), "discord").unwrap(),
+        );
+        let gated = DiscordChannel::new(
+            "fake".into(),
+            vec!["g1".into()],
+            "discord_test_alias",
+            Arc::new(|| vec!["*".to_string()]),
+            false,
+            false,
+        )
+        .with_channel_ids(vec!["c1".into()])
+        .with_archive_memory(std::sync::Arc::clone(&mem))
+        .with_reaction_notifications(DiscordReactionScope::All);
+
+        let add = serde_json::json!({
+            "user_id": "friend", "message_id": "m1", "channel_id": "c1",
+            "guild_id": "g1", "emoji": {"name": "👍"}
+        });
+        gated
+            .handle_reaction_event("MESSAGE_REACTION_ADD", &add, "botid")
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 1);
+
+        // Wrong guild: sweep is a no-op, the row stays.
+        let wrong_guild = serde_json::json!({
+            "message_id": "m1", "channel_id": "c1", "guild_id": "g2"
+        });
+        gated
+            .sweep_message_reactions("MESSAGE_REACTION_REMOVE_ALL", &wrong_guild)
+            .await;
+        assert_eq!(mem.count().await.unwrap(), 1);
+
+        // Right guild and channel: swept.
+        let ok = serde_json::json!({
+            "message_id": "m1", "channel_id": "c1", "guild_id": "g1"
+        });
+        gated
+            .sweep_message_reactions("MESSAGE_REACTION_REMOVE_ALL", &ok)
             .await;
         assert_eq!(mem.count().await.unwrap(), 0);
     }
@@ -5568,5 +7286,666 @@ mod tests {
         let sender = ch.pending_approvals.lock().await.remove("abc123").unwrap();
         sender.send(ChannelApprovalResponse::Deny).unwrap();
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Deny);
+    }
+
+    // ── Buttoned approval: dispatch composition (the security invariants) ──
+    //
+    // The live type-3 arm runs: cheap peer check → `interaction_gate`
+    // (fail-closed) → `pending_components.take` (single-use) → resolve the
+    // parked `oneshot`. These tests wire the *real* primitives in that exact
+    // order so the gate-before-take and single-use invariants are locked, then
+    // assert resolution behaviour. (The arm itself lives inside the gateway
+    // listen loop and can't be driven without a socket; the resolution logic it
+    // calls is `approval::resolve_parked_approval`, unit-tested in `approval`.)
+
+    /// Faithful model of the type-3 dispatch's post-peer-check sequence: gate
+    /// first, and ONLY on success take + resolve. Mirrors mod.rs so the test
+    /// asserts the real ordering contract.
+    fn dispatch_approval_click(
+        peers: &[String],
+        user_id: &str,
+        custom_id: &str,
+        pending_components: &parking_lot::Mutex<pending::PendingComponents>,
+        pending_approvals: &mut std::collections::HashMap<
+            String,
+            oneshot::Sender<ChannelApprovalResponse>,
+        >,
+    ) -> bool {
+        // Fail-closed authz BEFORE any take. DM-style (no guild/channel filter)
+        // with an empty peer list = nobody, exactly like the message path.
+        if interaction_gate(peers, &[], &[], user_id, None, "c1", None).is_err() {
+            return false; // unauthorized: must not drain or resolve anything
+        }
+        let intent = pending_components.lock().take(custom_id);
+        match intent {
+            Some(ComponentIntent::Approval { token, decision }) => {
+                approval::resolve_parked_approval(pending_approvals, &token, decision)
+            }
+            _ => false,
+        }
+    }
+
+    #[tokio::test]
+    async fn authorized_click_resolves_with_the_bound_decision() {
+        let token = "tok123";
+        let (cid, decision) =
+            approval::approval_button_binding(token, approval::ApprovalDecision::AllowOnce);
+        let wire = cid.encode().unwrap();
+
+        let reg = parking_lot::Mutex::new(pending::PendingComponents::default());
+        reg.lock().register(
+            wire.clone(),
+            ComponentIntent::Approval {
+                token: token.to_string(),
+                decision,
+            },
+        );
+        let mut approvals = std::collections::HashMap::new();
+        let (tx, rx) = oneshot::channel();
+        approvals.insert(token.to_string(), tx);
+
+        let resolved =
+            dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &mut approvals);
+        assert!(resolved, "authorized click resolves the oneshot");
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+    }
+
+    #[tokio::test]
+    async fn unauthorized_click_neither_resolves_nor_drains() {
+        let token = "tok123";
+        let (cid, decision) =
+            approval::approval_button_binding(token, approval::ApprovalDecision::AllowOnce);
+        let wire = cid.encode().unwrap();
+
+        let reg = parking_lot::Mutex::new(pending::PendingComponents::default());
+        reg.lock().register(
+            wire.clone(),
+            ComponentIntent::Approval {
+                token: token.to_string(),
+                decision,
+            },
+        );
+        let mut approvals = std::collections::HashMap::new();
+        let (tx, mut rx) = oneshot::channel();
+        approvals.insert(token.to_string(), tx);
+
+        // "intruder" is not in the (specific, non-wildcard) peer list → gate
+        // denies BEFORE the take.
+        let resolved = dispatch_approval_click(
+            &[String::from("u1")],
+            "intruder",
+            &wire,
+            &reg,
+            &mut approvals,
+        );
+        assert!(!resolved, "unauthorized click resolves nothing");
+        // The oneshot is unresolved (rx still pending, sender still parked).
+        assert!(rx.try_recv().is_err(), "no decision delivered");
+        assert!(
+            approvals.contains_key(token),
+            "the approval entry is NOT drained by an unauthorized click"
+        );
+        // And the pending component entry survives: an authorized user could
+        // still click it (the intruder didn't burn the single use).
+        assert!(
+            reg.lock().take(&wire).is_some(),
+            "the component entry was not drained by the unauthorized click"
+        );
+    }
+
+    #[tokio::test]
+    async fn replayed_click_is_refused_single_use() {
+        let token = "tok123";
+        let (cid, decision) =
+            approval::approval_button_binding(token, approval::ApprovalDecision::Deny);
+        let wire = cid.encode().unwrap();
+
+        let reg = parking_lot::Mutex::new(pending::PendingComponents::default());
+        reg.lock().register(
+            wire.clone(),
+            ComponentIntent::Approval {
+                token: token.to_string(),
+                decision,
+            },
+        );
+        let mut approvals = std::collections::HashMap::new();
+        let (tx, rx) = oneshot::channel();
+        approvals.insert(token.to_string(), tx);
+
+        assert!(dispatch_approval_click(
+            &[String::from("*")],
+            "u1",
+            &wire,
+            &reg,
+            &mut approvals
+        ));
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Deny);
+        // The component entry is gone (single-use take), so a replay of the same
+        // custom_id resolves nothing even from an authorized user.
+        assert!(
+            !dispatch_approval_click(&[String::from("*")], "u1", &wire, &reg, &mut approvals),
+            "replayed click refused"
+        );
+    }
+
+    #[test]
+    fn buttoned_approval_registers_four_resolvable_bindings() {
+        let listen_to_bots = false;
+        let mention_only = false;
+        let ch = DiscordChannel::new(
+            "token".into(),
+            vec![],
+            "discord_test_alias",
+            Arc::new(Vec::new),
+            listen_to_bots,
+            mention_only,
+        );
+        // Register exactly what send_buttoned_approval registers, then confirm
+        // every button id resolves to its bound decision (and only its own).
+        let token = "abc123";
+        let (_, bindings) = approval::build_approval_row(token);
+        {
+            let mut reg = ch.pending_components.lock();
+            for (cid, decision) in &bindings {
+                reg.register(
+                    cid.encode().unwrap(),
+                    ComponentIntent::Approval {
+                        token: token.to_string(),
+                        decision: *decision,
+                    },
+                );
+            }
+        }
+        for (cid, decision) in &bindings {
+            let got = ch.pending_components.lock().take(&cid.encode().unwrap());
+            assert_eq!(
+                got,
+                Some(ComponentIntent::Approval {
+                    token: token.to_string(),
+                    decision: *decision,
+                }),
+                "each button resolves to its server-bound decision"
+            );
+        }
+    }
+
+    // ── [COMPONENTS:{json}] agent marker → interactive components (EPIC B) ──
+
+    /// Collect every `custom_id` (zc1 wire form) rendered by a set of action
+    /// rows — button ids and select-option values — so a test can drive a
+    /// "click" by `take`-ing it from the registry. Mirrors what the live type-3
+    /// dispatch routes on (`component_routing_id`: custom_id for buttons, the
+    /// chosen option `value` for selects).
+    fn rendered_routing_ids(rows: &[components::DiscordActionRow]) -> Vec<String> {
+        let mut ids = Vec::new();
+        for row in rows {
+            let api = row.to_api().expect("non-empty row serializes");
+            for comp in api["components"].as_array().unwrap() {
+                if comp["type"] == serde_json::json!(2) {
+                    if let Some(cid) = comp.get("custom_id").and_then(|v| v.as_str()) {
+                        ids.push(cid.to_string()); // action button (not a link)
+                    }
+                } else if comp["type"] == serde_json::json!(3) {
+                    for opt in comp["options"].as_array().unwrap() {
+                        ids.push(opt["value"].as_str().unwrap().to_string());
+                    }
+                }
+            }
+        }
+        ids
+    }
+
+    #[test]
+    fn marker_emit_to_click_resolves_the_registered_prompt() {
+        // End-to-end at the registry boundary: the agent emits a [COMPONENTS:…]
+        // marker with an action button; build_component_rows registers its prompt
+        // under a minted custom_id; a "click" (take of that id) returns exactly
+        // the bound prompt — never anything from the wire.
+        let (cleaned, rows) = parse_component_markers(
+            "Pick: [COMPONENTS:{\"rows\":[[{\"label\":\"Ship\",\"style\":\"primary\",\"prompt\":\"ship the release\"}]]}]",
+        );
+        assert_eq!(cleaned, "Pick:", "marker stripped from content");
+
+        let mut reg = pending::PendingComponents::default();
+        let action_rows = build_component_rows("nonce123", &rows, &mut reg);
+        assert_eq!(action_rows.len(), 1);
+
+        let ids = rendered_routing_ids(&action_rows);
+        assert_eq!(ids.len(), 1, "one action button → one registered id");
+        // The click resolves the server-side prompt the bot registered at emit.
+        assert_eq!(
+            reg.take(&ids[0]),
+            Some(ComponentIntent::ResolveIntoTurn {
+                prompt: "ship the release".into()
+            })
+        );
+        // Single-use: a replay of the same id resolves nothing.
+        assert_eq!(reg.take(&ids[0]), None, "single-use: replay refused");
+    }
+
+    #[test]
+    fn marker_link_button_renders_without_registration() {
+        let (_, rows) = parse_component_markers(
+            "[COMPONENTS:{\"rows\":[[{\"label\":\"Docs\",\"url\":\"https://example.com\"}]]}]",
+        );
+        let mut reg = pending::PendingComponents::default();
+        let action_rows = build_component_rows("n", &rows, &mut reg);
+        let api = action_rows[0].to_api().unwrap();
+        let btn = &api["components"][0];
+        assert_eq!(btn["style"], serde_json::json!(5), "link button");
+        assert_eq!(btn["url"], serde_json::json!("https://example.com"));
+        assert!(
+            btn.get("custom_id").is_none(),
+            "link button has no custom_id"
+        );
+        // No prompt was registered for a link button.
+        assert!(rendered_routing_ids(&action_rows).is_empty());
+    }
+
+    #[test]
+    fn marker_select_options_each_register_their_own_prompt() {
+        // Each select option's value IS its own routing token bound to that
+        // option's prompt; choosing an option (take of its value) resolves only
+        // that option's prompt, matching the dispatch's `component_routing_id`.
+        let (_, rows) = parse_component_markers(
+            "[COMPONENTS:{\"rows\":[[{\"select\":\"Pick\",\"options\":[{\"label\":\"A\",\"value\":\"a\",\"prompt\":\"chose a\"},{\"label\":\"B\",\"value\":\"b\",\"prompt\":\"chose b\"}]}]]}]",
+        );
+        let mut reg = pending::PendingComponents::default();
+        let action_rows = build_component_rows("nonce", &rows, &mut reg);
+        let api = action_rows[0].to_api().unwrap();
+        assert_eq!(api["components"][0]["type"], serde_json::json!(3), "select");
+
+        let opt_values: Vec<String> = api["components"][0]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["value"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(opt_values.len(), 2);
+        // The chosen option resolves its own prompt; the other still resolves to
+        // its own (distinct ids, no aliasing).
+        assert_eq!(
+            reg.take(&opt_values[0]),
+            Some(ComponentIntent::ResolveIntoTurn {
+                prompt: "chose a".into()
+            })
+        );
+        assert_eq!(
+            reg.take(&opt_values[1]),
+            Some(ComponentIntent::ResolveIntoTurn {
+                prompt: "chose b".into()
+            })
+        );
+    }
+
+    #[test]
+    fn marker_custom_ids_are_unique_within_a_message() {
+        // Two buttons with identical label/prompt must register under distinct
+        // ids so they can't collide or alias in the single-use registry.
+        let (_, rows) = parse_component_markers(
+            "[COMPONENTS:{\"rows\":[[{\"label\":\"X\",\"prompt\":\"same\"},{\"label\":\"X\",\"prompt\":\"same\"}]]}]",
+        );
+        let mut reg = pending::PendingComponents::default();
+        let action_rows = build_component_rows("nonce", &rows, &mut reg);
+        let ids = rendered_routing_ids(&action_rows);
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1], "ids are unique even with identical content");
+        // Both resolve independently (single-use, no aliasing).
+        assert!(reg.take(&ids[0]).is_some());
+        assert!(reg.take(&ids[1]).is_some());
+    }
+
+    #[test]
+    fn marker_modal_button_registers_open_modal_and_submit_resolves_into_turn() {
+        // A modal button parses → build_component_rows registers OpenModal under
+        // the button's minted id (the modal id is NOT pre-registered). A "click"
+        // (take of the button id) yields OpenModal { modal, prompt }; the modal
+        // carries its OWN minted zc1 custom_id. Registering that modal id (as the
+        // dispatch arm does on open) makes the eventual type-5 submit resolve into
+        // a turn bound to the button's server-side prompt.
+        let (cleaned, rows) = parse_component_markers(
+            "Tell us: [COMPONENTS:{\"rows\":[[{\"label\":\"Report\",\"style\":\"danger\",\"prompt\":\"file a report\",\"modal\":{\"title\":\"Report\",\"fields\":[{\"id\":\"reason\",\"label\":\"Reason\",\"style\":\"paragraph\",\"required\":true,\"max\":500}]}}]]}]",
+        );
+        assert_eq!(cleaned, "Tell us:", "marker stripped from content");
+        // The spec carries the parsed modal (title + one paragraph field).
+        match &rows[0][0] {
+            markers::ComponentSpec::ModalButton {
+                label,
+                modal,
+                prompt,
+                ..
+            } => {
+                assert_eq!(label, "Report");
+                assert_eq!(prompt, "file a report");
+                assert_eq!(modal.title, "Report");
+                assert_eq!(modal.fields.len(), 1);
+                assert_eq!(modal.fields[0].id, "reason");
+                assert_eq!(modal.fields[0].style, components::TextInputStyle::Paragraph);
+                assert!(modal.fields[0].required);
+                assert_eq!(modal.fields[0].max_length, Some(500));
+            }
+            other => panic!("expected ModalButton, got {other:?}"),
+        }
+
+        let mut reg = pending::PendingComponents::default();
+        let action_rows = build_component_rows("nonce42", &rows, &mut reg);
+        assert_eq!(action_rows.len(), 1);
+        // The button renders as a normal (non-link) action button with a zc1 id.
+        let ids = rendered_routing_ids(&action_rows);
+        assert_eq!(ids.len(), 1, "one modal button → one registered button id");
+
+        // The click drains OpenModal, carrying the built modal + bound prompt.
+        let (modal, prompt) = match reg.take(&ids[0]) {
+            Some(ComponentIntent::OpenModal { modal, prompt }) => (modal, prompt),
+            other => panic!("expected OpenModal, got {other:?}"),
+        };
+        assert_eq!(prompt, "file a report");
+        // Single-use: the button id is drained.
+        assert_eq!(reg.take(&ids[0]), None, "modal button is single-use");
+
+        // The modal carries its own minted zc1 routing token, distinct from the
+        // button's, and was NOT pre-registered (its TTL starts at open).
+        let modal_wire = modal.custom_id.encode().expect("modal id encodes");
+        assert!(modal_wire.starts_with("zc1|cmp|"));
+        assert_ne!(
+            modal_wire, ids[0],
+            "modal id is distinct from the button id"
+        );
+        assert!(
+            reg.take(&modal_wire).is_none(),
+            "modal submit is not registered until the modal opens"
+        );
+
+        // The OpenModal dispatch arm registers the modal id as the resolve-into-
+        // turn on open; the type-5 submit then drains that prompt.
+        reg.register(
+            modal_wire.clone(),
+            ComponentIntent::ResolveIntoTurn { prompt },
+        );
+        assert_eq!(
+            reg.take(&modal_wire),
+            Some(ComponentIntent::ResolveIntoTurn {
+                prompt: "file a report".into()
+            }),
+            "modal submit resolves into the button's server-side prompt"
+        );
+    }
+
+    #[test]
+    fn malformed_component_marker_does_not_register_anything() {
+        // A balanced-but-invalid-JSON body is left verbatim (a recoverable leak)
+        // rather than stripped — this guarantees no surrounding prose is ever
+        // deleted. Either way it registers nothing and never 400s the send.
+        let (cleaned, rows) = parse_component_markers("hi [COMPONENTS:{garbage}] there");
+        assert!(
+            cleaned.contains("hi") && cleaned.contains("there"),
+            "prose preserved; got {cleaned:?}"
+        );
+        let mut reg = pending::PendingComponents::default();
+        let action_rows = build_component_rows("n", &rows, &mut reg);
+        assert!(action_rows.is_empty(), "no rows from a malformed marker");
+    }
+
+    #[test]
+    fn component_routing_id_prefers_zc1_select_value_else_custom_id() {
+        // Button / modal: routes on custom_id.
+        let data = serde_json::json!({ "custom_id": "zc1|cmp|n-1" });
+        assert_eq!(
+            component_routing_id(Some(&data)),
+            Some("zc1|cmp|n-1".to_string())
+        );
+        // Select: the chosen option value is a zc1 token → route on it.
+        let data = serde_json::json!({
+            "custom_id": "zc1|cmp|n-1-menu",
+            "values": ["zc1|cmp|n-2"]
+        });
+        assert_eq!(
+            component_routing_id(Some(&data)),
+            Some("zc1|cmp|n-2".to_string())
+        );
+        // A non-zc1 selected value falls back to the menu custom_id.
+        let data = serde_json::json!({
+            "custom_id": "zc1|cmp|n-1-menu",
+            "values": ["not-a-token"]
+        });
+        assert_eq!(
+            component_routing_id(Some(&data)),
+            Some("zc1|cmp|n-1-menu".to_string())
+        );
+    }
+
+    #[test]
+    fn autocomplete_authz_is_side_effect_free() {
+        // The type-4 arm authorizes a keystroke with `interaction_gate` and then
+        // answers a type-8 choice set — it never calls reject/defer. The gate
+        // itself is a pure function (no &self, no REST), so it is safe to
+        // evaluate per-keystroke. Assert it is callable as a pure predicate and
+        // is fail-closed for an unauthorized user (→ empty choices).
+        assert!(
+            interaction_gate(&[String::from("*")], &[], &[], "u1", None, "c1", None).is_ok(),
+            "authorized keystroke gates open"
+        );
+        assert!(
+            interaction_gate(
+                &[String::from("u1")],
+                &[],
+                &[],
+                "intruder",
+                None,
+                "c1",
+                None
+            )
+            .is_err(),
+            "unauthorized keystroke fails closed → empty choice set, no side effect"
+        );
+        // DM (no guild) with an empty peer list = nobody, same as messages.
+        assert!(
+            interaction_gate(&[], &[], &[], "u1", None, "c1", None).is_err(),
+            "empty peer list denies"
+        );
+    }
+
+    // ── Autocomplete (type-4) choice sourcing ────────────────────────────────
+    //
+    // The type-4 arm's body is: authorize (pure gate) → extract the focused
+    // option → resolve the command spec → find that option → filter its choices
+    // by the partial. These tests exercise that chain through the same public
+    // helpers the arm calls (`extract_focused_option`, `OptionSpec::matching_choices`)
+    // plus a wiremock check that the answer is a single type-8 POST.
+
+    fn autocomplete_spec_with_big_choice_list(slug: &str, option: &str) -> DiscordSlashCommandSpec {
+        let mut opt = slash_options::OptionSpec {
+            name: option.to_string(),
+            description: "o".to_string(),
+            description_localizations: Default::default(),
+            kind: slash_options::OptKind::String,
+            required: false,
+            choices: Vec::new(),
+            min: None,
+            max: None,
+            min_length: None,
+            max_length: None,
+        };
+        // 40 > Discord's 25 static cap → served via autocomplete.
+        opt.choices = (0..40)
+            .map(|i| slash_options::Choice {
+                name: format!("region-{i:02}"),
+                value: format!("r{i:02}"),
+            })
+            .collect();
+        DiscordSlashCommandSpec {
+            skill_name: "deploy".to_string(),
+            slug: slug.to_string(),
+            description: "d".to_string(),
+            description_localizations: Default::default(),
+            options: vec![opt],
+        }
+    }
+
+    // Reproduces the arm's choice-sourcing step exactly (spec lookup by slug →
+    // focused option by name → filter), given the resolved spec set.
+    fn arm_choices(
+        specs: &[DiscordSlashCommandSpec],
+        focused: Option<(String, String, String)>,
+        authorized: bool,
+    ) -> Vec<(String, String)> {
+        match (authorized, focused) {
+            (true, Some((command, option_name, partial))) => specs
+                .iter()
+                .find(|s| s.slug == command)
+                .and_then(|s| s.options.iter().find(|o| o.name == option_name))
+                .map(|o| o.matching_choices(&partial))
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn autocomplete_arm_returns_matching_choices_for_focused_option() {
+        let specs = vec![autocomplete_spec_with_big_choice_list("deploy", "region")];
+        let payload = serde_json::json!({
+            "type": 4,
+            "data": {
+                "name": "deploy",
+                "options": [ { "name": "region", "type": 3, "value": "region-1", "focused": true } ]
+            }
+        });
+        let focused = slash_options::extract_focused_option(&payload);
+        let choices = arm_choices(&specs, focused, true);
+        // "region-1" prefixes region-10..region-19 (10 of them).
+        assert_eq!(choices.len(), 10);
+        assert!(choices.iter().all(|(n, _)| n.starts_with("region-1")));
+        assert_eq!(choices[0], ("region-10".to_string(), "r10".to_string()));
+    }
+
+    #[test]
+    fn autocomplete_arm_returns_empty_for_unauthorized() {
+        let specs = vec![autocomplete_spec_with_big_choice_list("deploy", "region")];
+        let payload = serde_json::json!({
+            "type": 4,
+            "data": { "name": "deploy", "options": [ { "name": "region", "value": "region", "focused": true } ] }
+        });
+        let focused = slash_options::extract_focused_option(&payload);
+        // Even with a matching focused option, an unauthorized keystroke answers
+        // empty — no policy leak, no work.
+        assert!(arm_choices(&specs, focused, false).is_empty());
+    }
+
+    #[test]
+    fn autocomplete_arm_returns_empty_for_no_match_and_unknown_targets() {
+        let specs = vec![autocomplete_spec_with_big_choice_list("deploy", "region")];
+        // No choice matches the partial.
+        let p = serde_json::json!({
+            "data": { "name": "deploy", "options": [ { "name": "region", "value": "zzz", "focused": true } ] }
+        });
+        assert!(arm_choices(&specs, slash_options::extract_focused_option(&p), true).is_empty());
+        // Unknown command slug.
+        let p = serde_json::json!({
+            "data": { "name": "ghost", "options": [ { "name": "region", "value": "r", "focused": true } ] }
+        });
+        assert!(arm_choices(&specs, slash_options::extract_focused_option(&p), true).is_empty());
+        // Known command, unknown focused option name.
+        let p = serde_json::json!({
+            "data": { "name": "deploy", "options": [ { "name": "ghost", "value": "r", "focused": true } ] }
+        });
+        assert!(arm_choices(&specs, slash_options::extract_focused_option(&p), true).is_empty());
+        // No focused option at all.
+        let p = serde_json::json!({ "data": { "name": "deploy", "options": [] } });
+        assert!(arm_choices(&specs, slash_options::extract_focused_option(&p), true).is_empty());
+    }
+
+    #[test]
+    fn interaction_arms_gate_before_take_after_the_doptions_merge() {
+        // Source-level regression: the rebase combined this handler with the
+        // D-options type-2 arm. Lock the fail-closed ordering against a future
+        // merge silently reordering `take` before the gate. We read THIS file's
+        // source and assert, within the type-3/5 arm, that `interaction_gate(`
+        // appears before `pending_components.lock().take(` — and that the type-2
+        // arm's `interaction_gate(` precedes its credential stash + defer.
+        let src = include_str!("mod.rs");
+
+        let arm35 = src
+            .find("} else if itype == 3 || itype == 5 {")
+            .expect("type-3/5 arm present");
+        let arm4 = src[arm35..]
+            .find("} else if itype == 4 {")
+            .map(|i| arm35 + i)
+            .expect("type-4 arm present (arm-3/5 boundary)");
+        let region35 = &src[arm35..arm4];
+        let gate35 = region35
+            .find("interaction_gate(")
+            .expect("type-3/5 arm gates");
+        let take35 = region35
+            .find("pending_components.lock().take(")
+            .expect("type-3/5 arm takes");
+        assert!(
+            gate35 < take35,
+            "type-3/5: interaction_gate must run BEFORE the single-use take"
+        );
+        // The cheap peer pre-check is also before the take.
+        let peer35 = region35
+            .find("crate::allowlist::is_user_allowed(")
+            .expect("type-3/5 arm peer-checks");
+        assert!(
+            peer35 < take35 && peer35 < gate35,
+            "peer check precedes gate+take"
+        );
+
+        // type-2 arm: gate precedes the credential stash (`pending.lock()`) and
+        // the defer — an unauthorized invoker never stashes creds or defers.
+        let arm2 = src.find("if itype == 2 {").expect("type-2 arm present");
+        let region2 = &src[arm2..arm35];
+        let gate2 = region2.find("interaction_gate(").expect("type-2 arm gates");
+        let stash2 = region2
+            .find("let mut guard = pending.lock();")
+            .expect("type-2 arm stashes creds");
+        let defer2 = region2
+            .find("discord_defer_interaction(")
+            .expect("type-2 arm defers");
+        assert!(
+            gate2 < stash2 && gate2 < defer2,
+            "type-2: gate before stash+defer"
+        );
+    }
+
+    #[tokio::test]
+    async fn autocomplete_answer_posts_a_single_type8_callback_and_nothing_else() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        // The ONLY call an autocomplete keystroke may make: a type-8
+        // (AUTOCOMPLETE_RESULT) callback. No defer, no reject, no followup.
+        Mock::given(method("POST"))
+            .and(path("/interactions/iid/tok/callback"))
+            .and(body_partial_json(serde_json::json!({ "type": 8 })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let specs = vec![autocomplete_spec_with_big_choice_list("deploy", "region")];
+        let p = serde_json::json!({
+            "data": { "name": "deploy", "options": [ { "name": "region", "value": "region-2", "focused": true } ] }
+        });
+        let choices = arm_choices(&specs, slash_options::extract_focused_option(&p), true);
+        assert_eq!(choices.len(), 10, "region-2x → 10 matches");
+
+        let client = reqwest::Client::new();
+        // The arm posts the answer to <api_base>/interactions/{id}/{token}/callback;
+        // discord_answer_autocomplete hardcodes the real base, so post directly
+        // here against the mock to verify the single-call, type-8 shape.
+        let url = format!("{}/interactions/iid/tok/callback", server.uri());
+        let rendered: Vec<_> = choices
+            .iter()
+            .map(|(n, v)| serde_json::json!({ "name": n, "value": v }))
+            .collect();
+        let resp = client
+            .post(&url)
+            .json(&serde_json::json!({ "type": 8, "data": { "choices": rendered } }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+        // wiremock verifies expect(1) on drop.
     }
 }

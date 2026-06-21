@@ -315,6 +315,109 @@ Examples:
     },
 }
 
+/// Alias CRUD for agents (`[agents.<alias>]`). Distinct from the `agent`
+/// run command. Rename/delete cascade config references; for agents they also
+/// re-point owned state (memory / cron / acp / session) and move the workspace.
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AgentsCommands {
+    /// List configured agent aliases
+    List,
+    /// Create a new agent alias with default config
+    Create {
+        /// New agent alias (lowercase alphanumeric + single underscore)
+        alias: String,
+    },
+    /// Rename an agent alias, rewriting every reference to it
+    Rename {
+        /// Current alias
+        from: String,
+        /// New alias
+        to: String,
+    },
+    /// Delete an agent alias, scrubbing references and cascading owned state
+    Delete {
+        /// Alias to delete
+        alias: String,
+        /// Show the impact (references that would be scrubbed) without deleting
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// Alias CRUD for providers (`[providers.<category>.<family>.<alias>]`).
+/// `category` is one of `models`, `tts`, `transcription`.
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ProvidersCommands {
+    /// List provider aliases (optionally filtered by category)
+    List {
+        /// Category: models | tts | transcription
+        #[arg(long)]
+        category: Option<String>,
+    },
+    /// Create a new provider alias with default config
+    Create {
+        /// Category: models | tts | transcription
+        category: String,
+        /// Provider family (e.g. anthropic, openai, elevenlabs)
+        family: String,
+        /// New alias
+        alias: String,
+    },
+    /// Rename a provider alias, rewriting every reference
+    Rename {
+        category: String,
+        family: String,
+        from: String,
+        to: String,
+    },
+    /// Delete a provider alias, scrubbing references
+    Delete {
+        category: String,
+        family: String,
+        alias: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// Alias CRUD for channels (`[channels.<type>.<alias>]`).
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ChannelsCommands {
+    /// List channel aliases (optionally filtered by type)
+    List {
+        /// Channel type, e.g. discord, telegram
+        #[arg(long)]
+        channel_type: Option<String>,
+    },
+    /// Create a new channel alias with default config
+    Create {
+        /// Channel type (discord, telegram, slack, …)
+        channel_type: String,
+        /// New alias
+        alias: String,
+    },
+    /// Rename a channel alias, rewriting every reference
+    Rename {
+        channel_type: String,
+        from: String,
+        to: String,
+    },
+    /// Delete a channel alias, scrubbing references
+    Delete {
+        channel_type: String,
+        alias: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
 /// Skills management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SkillCommands {
@@ -418,10 +521,21 @@ pub enum SkillBundleCommands {
         #[arg(long)]
         directory: Option<String>,
     },
-    /// Remove a configured skill bundle
+    /// Remove a configured skill bundle (archives its directory + strips it
+    /// from every agent's `skill_bundles` list)
     Remove {
         /// Bundle alias
         alias: String,
+        /// Skip the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Rename a skill bundle (moves its directory + rewrites agent references)
+    Rename {
+        /// Current alias
+        from: String,
+        /// New alias
+        to: String,
     },
     /// Show metadata + skill list for a bundle
     Show {

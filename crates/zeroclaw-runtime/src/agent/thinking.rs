@@ -130,6 +130,7 @@ pub fn apply_thinking_level_with_config(
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
                     .with_attrs(::serde_json::json!({
                         "requested": budget,
                         "clamped": clamped,
@@ -188,6 +189,7 @@ pub fn resolve_thinking_from_message(
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
                     .with_attrs(::serde_json::json!({"thinking_level": format!("{level:?}")})),
                 "Thinking directive parsed from message"
             );

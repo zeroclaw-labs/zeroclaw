@@ -28,6 +28,7 @@ mod config;
 mod config_manager;
 mod dashboard;
 mod diff;
+mod doctor;
 mod editor;
 mod file_explorer;
 mod i18n;
