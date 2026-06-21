@@ -622,6 +622,16 @@ struct MediaGroupBuffer {
 /// value gives ample slack while keeping end-to-end agent latency low.
 const MEDIA_GROUP_FLUSH_WINDOW: Duration = Duration::from_millis(700);
 
+/// `getUpdates` long-poll timeout (seconds) when no media group is buffered.
+const TELEGRAM_LONG_POLL_TIMEOUT_SECS: u64 = 30;
+
+/// `getUpdates` long-poll timeout (seconds) while a media group is buffered.
+/// Shortened so the loop re-enters and runs `flush_due_media_groups` within
+/// ~1s of the album settling, instead of letting a quiet-chat album wait up to
+/// the full long-poll timeout even though its `MEDIA_GROUP_FLUSH_WINDOW` has
+/// already elapsed.
+const MEDIA_GROUP_PENDING_POLL_TIMEOUT_SECS: u64 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditMessageResult {
     Success,
@@ -2006,6 +2016,20 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// all downstream async work happens after the lock is dropped.
     /// This keeps the critical section short and avoids any
     /// lock-across-await hazard with `parking_lot::Mutex`.
+    /// Long-poll timeout (seconds) for the next `getUpdates`. Drops to
+    /// [`MEDIA_GROUP_PENDING_POLL_TIMEOUT_SECS`] while any media group is
+    /// buffered so a settled album is flushed promptly (within ~1s of its
+    /// [`MEDIA_GROUP_FLUSH_WINDOW`]) instead of waiting for the next long-poll
+    /// return — which, in a quiet chat with no further updates, could be up to
+    /// [`TELEGRAM_LONG_POLL_TIMEOUT_SECS`] later.
+    fn poll_timeout_secs(&self) -> u64 {
+        if self.media_group_buffer.lock().pending.is_empty() {
+            TELEGRAM_LONG_POLL_TIMEOUT_SECS
+        } else {
+            MEDIA_GROUP_PENDING_POLL_TIMEOUT_SECS
+        }
+    }
+
     async fn flush_due_media_groups(&self, tx: &tokio::sync::mpsc::Sender<ChannelMessage>) {
         // Drain due entries first; do async parsing afterwards.
         let due: Vec<((i64, String), MediaGroupEntry)> = {
@@ -3939,7 +3963,7 @@ impl Channel for TelegramChannel {
             let url = self.api_url("getUpdates");
             let body = serde_json::json!({
                 "offset": offset,
-                "timeout": 30,
+                "timeout": self.poll_timeout_secs(),
                 "allowed_updates": ["message", "callback_query"]
             });
 
@@ -8041,6 +8065,40 @@ mod tests {
         let buf = ch.media_group_buffer.lock();
         assert!(buf.pending.contains_key(&(9000, "group-A".to_string())));
         assert_eq!(buf.pending[&(9000, "group-A".to_string())].items.len(), 1);
+    }
+
+    #[test]
+    fn poll_timeout_is_short_while_media_group_pending() {
+        // Regression for #8024: a buffered album must not wait for the next
+        // long-poll return to flush. With no media group buffered the loop
+        // uses the full long-poll timeout; once an album item is buffered the
+        // timeout drops to 1s so the loop re-enters and runs
+        // flush_due_media_groups within ~1s of MEDIA_GROUP_FLUSH_WINDOW.
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "default",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        assert_eq!(ch.poll_timeout_secs(), TELEGRAM_LONG_POLL_TIMEOUT_SECS);
+
+        let update = serde_json::json!({
+            "update_id": 7,
+            "message": {
+                "message_id": 21,
+                "chat": {"id": 4242},
+                "media_group_id": "album-z",
+            }
+        });
+        assert!(ch.buffer_media_group_update(&update));
+        assert_eq!(
+            ch.poll_timeout_secs(),
+            MEDIA_GROUP_PENDING_POLL_TIMEOUT_SECS
+        );
+
+        // After the album is drained, the timeout returns to the long-poll value.
+        ch.media_group_buffer.lock().pending.clear();
+        assert_eq!(ch.poll_timeout_secs(), TELEGRAM_LONG_POLL_TIMEOUT_SECS);
     }
 
     #[test]
