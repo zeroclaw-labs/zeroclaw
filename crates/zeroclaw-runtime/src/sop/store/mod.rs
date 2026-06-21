@@ -30,10 +30,15 @@ pub use model::{
 /// listener, and the gateway approve surface.
 pub trait SopRunStore: Send + Sync {
     // ── run state (persistence-resume, state-machine) ──
-    /// Persist-before-mutate. Monotonic-revision-guarded; idempotent on revision.
+    /// Persist-before-mutate. Revision-guarded: a strictly-older revision is
+    /// rejected as `StaleRevision`; an equal revision is accepted only as a
+    /// byte-identical idempotent retry, else `RevisionConflict`; a newer
+    /// revision wins.
     fn save_run(&self, run: &PersistedRun) -> Result<(), StoreError>;
     /// Move a run to terminal state (kept as a terminal record, not deleted) and
-    /// release any live claim.
+    /// release any live claim. Revision-guarded exactly like `save_run`, so a
+    /// stale or divergent terminal write cannot clobber newer state or release a
+    /// live claim.
     fn finish_run(&self, run_id: &str, terminal: &PersistedRun) -> Result<(), StoreError>;
     /// Boot-rehydrate source: every non-terminal run (latest revision per id).
     fn load_active_runs(&self) -> Result<Vec<PersistedRun>, StoreError>;
@@ -41,13 +46,18 @@ pub trait SopRunStore: Send + Sync {
     fn load_run(&self, run_id: &str) -> Result<Option<PersistedRun>, StoreError>;
 
     // ── CAS claim primitive (concurrency-control) ──
-    /// Atomic single-winner admission. Returns `Some(token)` to exactly one
-    /// caller iff under `cap` and no live claim exists for `run_id`, else `None`.
+    /// Atomic single-winner admission honoring BOTH concurrency limits. Returns
+    /// `Some(token)` to exactly one caller iff no live claim exists for `run_id`,
+    /// the run is not terminal, the live claims for `sop_name` stay below
+    /// `per_sop_cap`, AND total live claims stay below `global_cap`. Both caps
+    /// are inclusive maxima counted under one lock (mirrors the engine
+    /// `can_start`); a cap of 0 admits nothing. Otherwise `None`.
     fn try_claim_run(
         &self,
         run_id: &str,
         sop_name: &str,
-        cap: usize,
+        per_sop_cap: usize,
+        global_cap: usize,
     ) -> Result<Option<ClaimToken>, StoreError>;
     /// Renew a claim's lease (tick liveness). No-op if the claim is gone.
     fn heartbeat_claim(&self, token: &ClaimToken) -> Result<(), StoreError>;
@@ -90,6 +100,13 @@ pub enum StoreError {
         have: u64,
         found: u64,
     },
+    /// A same-revision write whose content diverges from the stored run. The
+    /// caller must bump `revision` to record new state; only a byte-identical
+    /// retry at the same revision is accepted (idempotent).
+    RevisionConflict {
+        run_id: String,
+        revision: u64,
+    },
     /// A claim was lost to a concurrent winner (over-cap or already claimed).
     ClaimLost,
 }
@@ -107,6 +124,10 @@ impl std::fmt::Display for StoreError {
             } => write!(
                 f,
                 "sop store stale revision for run {run_id}: have {have}, found {found}"
+            ),
+            Self::RevisionConflict { run_id, revision } => write!(
+                f,
+                "sop store revision conflict for run {run_id}: divergent write at revision {revision}"
             ),
             Self::ClaimLost => write!(f, "sop store claim lost to a concurrent winner"),
         }
@@ -174,25 +195,47 @@ impl InMemoryRunStore {
     }
 }
 
+/// Revision guard shared by every write path: returns `Ok(())` only when
+/// `incoming` is safe to persist over `existing` (a first write, a strictly
+/// newer revision, or a byte-identical same-revision retry). A strictly older
+/// revision is `StaleRevision`; a divergent same-revision payload is
+/// `RevisionConflict`. Durable backends apply the same rule transactionally.
+fn revision_guard(
+    existing: Option<&PersistedRun>,
+    incoming: &PersistedRun,
+) -> Result<(), StoreError> {
+    let Some(existing) = existing else {
+        return Ok(());
+    };
+    if incoming.revision < existing.revision {
+        return Err(StoreError::StaleRevision {
+            run_id: incoming.run_id().to_string(),
+            have: incoming.revision,
+            found: existing.revision,
+        });
+    }
+    if incoming.revision == existing.revision
+        && serde_json::to_vec(existing)? != serde_json::to_vec(incoming)?
+    {
+        return Err(StoreError::RevisionConflict {
+            run_id: incoming.run_id().to_string(),
+            revision: incoming.revision,
+        });
+    }
+    Ok(())
+}
+
 impl SopRunStore for InMemoryRunStore {
     fn save_run(&self, run: &PersistedRun) -> Result<(), StoreError> {
         let mut g = self.lock()?;
-        let id = run.run_id().to_string();
-        if let Some(existing) = g.runs.get(&id)
-            && existing.revision > run.revision
-        {
-            return Err(StoreError::StaleRevision {
-                run_id: id,
-                have: run.revision,
-                found: existing.revision,
-            });
-        }
-        g.runs.insert(id, run.clone());
+        revision_guard(g.runs.get(run.run_id()), run)?;
+        g.runs.insert(run.run_id().to_string(), run.clone());
         Ok(())
     }
 
     fn finish_run(&self, run_id: &str, terminal: &PersistedRun) -> Result<(), StoreError> {
         let mut g = self.lock()?;
+        revision_guard(g.runs.get(run_id), terminal)?;
         g.runs.insert(run_id.to_string(), terminal.clone());
         g.terminal.insert(run_id.to_string());
         g.claims.remove(run_id);
@@ -216,7 +259,8 @@ impl SopRunStore for InMemoryRunStore {
         &self,
         run_id: &str,
         sop_name: &str,
-        cap: usize,
+        per_sop_cap: usize,
+        global_cap: usize,
     ) -> Result<Option<ClaimToken>, StoreError> {
         let mut g = self.lock()?;
         if g.claims.contains_key(run_id) {
@@ -226,7 +270,15 @@ impl SopRunStore for InMemoryRunStore {
         if g.terminal.contains(run_id) {
             return Ok(None);
         }
-        if cap != 0 && g.claims.len() >= cap {
+        // Both caps are enforced atomically under one lock, so neither limit can
+        // be crossed by a concurrent winner. Counts are over LIVE claims, which
+        // track admitted (active) runs 1:1 (mirrors the engine `can_start`).
+        // A cap of 0 admits nothing (matches the engine `>= max_concurrent`).
+        let active_for_sop = g.claims.values().filter(|c| c.sop_name == sop_name).count();
+        if active_for_sop >= per_sop_cap {
+            return Ok(None);
+        }
+        if g.claims.len() >= global_cap {
             return Ok(None);
         }
         // Timestamps are stamped by durable backends; the in-memory backend
@@ -409,13 +461,13 @@ mod tests {
     fn claim_is_single_winner_and_cap_bounded() {
         let s = build_run_store();
         // First claim wins.
-        assert!(s.try_claim_run("r1", "deploy", 2).unwrap().is_some());
+        assert!(s.try_claim_run("r1", "deploy", 2, 2).unwrap().is_some());
         // Duplicate claim on the same run is refused.
-        assert!(s.try_claim_run("r1", "deploy", 2).unwrap().is_none());
+        assert!(s.try_claim_run("r1", "deploy", 2, 2).unwrap().is_none());
         // Second distinct run claims (under cap).
-        assert!(s.try_claim_run("r2", "deploy", 2).unwrap().is_some());
+        assert!(s.try_claim_run("r2", "deploy", 2, 2).unwrap().is_some());
         // Third exceeds cap=2.
-        assert!(s.try_claim_run("r3", "deploy", 2).unwrap().is_none());
+        assert!(s.try_claim_run("r3", "deploy", 2, 2).unwrap().is_none());
         // Releasing frees a slot.
         let tok = ClaimToken {
             run_id: "r1".to_string(),
@@ -425,7 +477,23 @@ mod tests {
             holder: "in-memory".to_string(),
         };
         s.release_claim(&tok).unwrap();
-        assert!(s.try_claim_run("r3", "deploy", 2).unwrap().is_some());
+        assert!(s.try_claim_run("r3", "deploy", 2, 2).unwrap().is_some());
+    }
+
+    #[test]
+    fn claim_caps_isolate_per_sop_yet_share_global() {
+        let s = build_run_store();
+        // per_sop_cap = 1, global_cap = 3.
+        // SOP "a" fills its single per-SOP slot.
+        assert!(s.try_claim_run("a1", "a", 1, 3).unwrap().is_some());
+        // A second "a" run is blocked by the per-SOP cap...
+        assert!(s.try_claim_run("a2", "a", 1, 3).unwrap().is_none());
+        // ...but a DIFFERENT SOP is not blocked by "a" being at its cap.
+        assert!(s.try_claim_run("b1", "b", 1, 3).unwrap().is_some());
+        assert!(s.try_claim_run("c1", "c", 1, 3).unwrap().is_some());
+        // Global cap = 3 is now reached across all SOPs; a fourth distinct SOP
+        // is refused even though its own per-SOP slot is free.
+        assert!(s.try_claim_run("d1", "d", 1, 3).unwrap().is_none());
     }
 
     #[test]
@@ -478,8 +546,25 @@ mod tests {
         ));
         // The stored revision is unchanged after the rejected write.
         assert_eq!(s.load_run("r1").unwrap().unwrap().revision, 5);
-        // Same revision is idempotent (last-writer guard allows ==).
+        // A byte-identical same-revision write is an idempotent retry.
         s.save_run(&run("r1", 5, None)).unwrap();
+        // A DIVERGENT same-revision write is refused, not silently applied.
+        let err = s
+            .save_run(&run("r1", 5, Some("2020-06-06T00:00:00Z")))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::RevisionConflict { revision: 5, .. }
+        ));
+        // The divergent payload did not land: completed_at is still None.
+        assert!(
+            s.load_run("r1")
+                .unwrap()
+                .unwrap()
+                .run
+                .completed_at
+                .is_none()
+        );
         // A newer revision wins.
         s.save_run(&run("r1", 6, None)).unwrap();
         assert_eq!(s.load_run("r1").unwrap().unwrap().revision, 6);
@@ -489,7 +574,7 @@ mod tests {
     fn finish_run_marks_terminal_and_releases_claim() {
         let s = build_run_store();
         s.save_run(&run("r1", 0, None)).unwrap();
-        let tok = s.try_claim_run("r1", "deploy", 4).unwrap().unwrap();
+        let tok = s.try_claim_run("r1", "deploy", 4, 4).unwrap().unwrap();
         assert!(
             s.load_active_runs()
                 .unwrap()
@@ -505,11 +590,47 @@ mod tests {
         // ...but still loadable as a terminal record.
         assert_eq!(s.load_run("r1").unwrap().unwrap().revision, 1);
         // ...and its claim slot was freed.
-        assert!(s.try_claim_run("r1b", "deploy", 1).unwrap().is_some());
+        assert!(s.try_claim_run("r1b", "deploy", 1, 4).unwrap().is_some());
         // A terminal run is not re-claimable even after its claim was released.
-        assert!(s.try_claim_run("r1", "deploy", 4).unwrap().is_none());
+        assert!(s.try_claim_run("r1", "deploy", 4, 4).unwrap().is_none());
         // release_claim on the old token is a no-op (slot already freed).
         s.release_claim(&tok).unwrap();
+    }
+
+    #[test]
+    fn finish_run_revision_guard_protects_live_state_and_claim() {
+        let s = build_run_store();
+        s.save_run(&run("r1", 5, None)).unwrap();
+        let _tok = s.try_claim_run("r1", "deploy", 4, 4).unwrap().unwrap();
+
+        // A stale terminal write (older revision) is refused: it must not
+        // clobber newer state nor release the live claim.
+        let err = s
+            .finish_run("r1", &run("r1", 4, Some("2020-01-02T00:00:00Z")))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::StaleRevision { .. }));
+        // A divergent same-revision terminal write is refused too.
+        let err = s
+            .finish_run("r1", &run("r1", 5, Some("2020-01-02T00:00:00Z")))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::RevisionConflict { .. }));
+
+        // State survived: still active, still revision 5, claim still held
+        // (a fresh claim on the same run is refused because the slot is taken).
+        assert!(
+            s.load_active_runs()
+                .unwrap()
+                .iter()
+                .any(|r| r.run_id() == "r1")
+        );
+        assert_eq!(s.load_run("r1").unwrap().unwrap().revision, 5);
+        assert!(s.try_claim_run("r1", "deploy", 4, 4).unwrap().is_none());
+
+        // A proper terminal write at a newer revision succeeds and releases.
+        s.finish_run("r1", &run("r1", 6, Some("2020-01-02T00:00:00Z")))
+            .unwrap();
+        assert!(s.load_active_runs().unwrap().is_empty());
+        assert_eq!(s.load_run("r1").unwrap().unwrap().revision, 6);
     }
 
     #[test]
@@ -549,7 +670,7 @@ mod tests {
     fn expired_claims_skips_empty_leases_and_matches_past_due() {
         let s = build_run_store();
         // The in-memory backend stamps empty leases — those are never expired.
-        s.try_claim_run("r1", "deploy", 4).unwrap().unwrap();
+        s.try_claim_run("r1", "deploy", 4, 4).unwrap().unwrap();
         assert!(s.expired_claims("2999-01-01T00:00:00Z").unwrap().is_empty());
     }
 }
