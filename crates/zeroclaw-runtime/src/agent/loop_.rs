@@ -9271,6 +9271,7 @@ This is an example, not an invocation."#;
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("narration-then-tool streaming should preserve tool loop semantics");
@@ -9362,6 +9363,7 @@ This is an example, not an invocation."#;
             new_messages_out: None,
             knobs: &LoopKnobs::default(),
             image_cache: None,
+            ingress: IngressContext::internal(),
         })
         .await
         .expect("guard-withheld narration tail should not break the tool loop");
