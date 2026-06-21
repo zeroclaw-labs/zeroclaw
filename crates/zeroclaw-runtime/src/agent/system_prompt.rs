@@ -9,6 +9,8 @@ use crate::skills::Skill;
 
 /// Maximum characters per injected workspace file (matches `OpenClaw` default).
 pub const BOOTSTRAP_MAX_CHARS: usize = 20_000;
+pub(crate) const NO_TOOLS_TASK_FRAMING: &str = "No tools are available for this turn";
+pub(crate) const NATIVE_TOOLS_TASK_FRAMING: &str = "Use tools when the request requires action";
 
 fn load_openclaw_bootstrap_files(
     prompt: &mut String,
@@ -231,13 +233,21 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         prompt.push_str(
             "## Your Task\n\n\
              When the user sends a message, respond naturally and answer directly from conversation context.\n\
-             No tools are available for this turn, so do not emit tool calls or describe unavailable actions.\n\
+             ",
+        );
+        prompt.push_str(NO_TOOLS_TASK_FRAMING);
+        prompt.push_str(
+            ", so do not emit tool calls or describe unavailable actions.\n\
              Do NOT: summarize this configuration, describe your capabilities, or output step-by-step meta-commentary.\n\n",
         );
     } else if native_tool_specs_present {
         prompt.push_str(
             "## Your Task\n\n\
-             When the user sends a message, respond naturally. Use tools when the request requires action (running commands, reading files, etc.).\n\
+             When the user sends a message, respond naturally. ",
+        );
+        prompt.push_str(NATIVE_TOOLS_TASK_FRAMING);
+        prompt.push_str(
+            " (running commands, reading files, etc.).\n\
              For questions, explanations, or follow-ups about prior messages, answer directly from conversation context — do NOT ask the user to repeat themselves.\n\
              Do NOT: summarize this configuration, describe your capabilities, or output step-by-step meta-commentary.\n\n",
         );
