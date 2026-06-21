@@ -2028,16 +2028,6 @@ pub fn is_registry_source(source: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// A single bare registry/skill identifier: non-empty and restricted to the
-/// same charset as bare-name registry installs (ascii-alphanumeric, `-`, `_`).
-/// The charset alone rejects `/`, `\`, `:`, `.`, `~`, `..`, and whitespace.
-fn is_registry_ident(segment: &str) -> bool {
-    !segment.is_empty()
-        && segment
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-}
-
 /// True when `source` is an extra-registry spec `registry:<name>/<skill>`
 /// with both segments being bare registry-safe identifiers.
 pub fn is_extra_registry_source(source: &str) -> bool {
@@ -2046,11 +2036,12 @@ pub fn is_extra_registry_source(source: &str) -> bool {
 
 /// Parse `registry:<name>/<skill>` into `(registry_name, skill_name)`.
 /// Returns `None` unless it is exactly one registry name and one skill name,
-/// both matching [`is_registry_ident`].
+/// both matching their install-spec identifiers.
 pub fn parse_extra_registry_source(source: &str) -> Option<(String, String)> {
     let rest = source.strip_prefix("registry:")?;
     let (name, skill) = rest.split_once('/')?;
-    if !is_registry_ident(name) || !is_registry_ident(skill) {
+    if !zeroclaw_config::schema::ExternalRegistry::is_valid_name(name) || !is_registry_source(skill)
+    {
         return None;
     }
     Some((name.to_string(), skill.to_string()))

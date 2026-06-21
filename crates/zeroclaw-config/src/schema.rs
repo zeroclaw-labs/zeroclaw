@@ -5289,6 +5289,20 @@ pub struct ExternalRegistry {
     pub enabled: bool,
 }
 
+impl ExternalRegistry {
+    /// Returns true when `name` can be addressed by `registry:<name>/<skill>`.
+    ///
+    /// Keep this as the single registry-alias rule used by both config
+    /// validation and runtime install-spec parsing. Lowercase aliases also
+    /// avoid clone-directory collisions on case-insensitive filesystems.
+    pub fn is_valid_name(name: &str) -> bool {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    }
+}
+
 fn default_extra_registry_kind() -> String {
     "git".to_string()
 }
@@ -17167,6 +17181,12 @@ impl Config {
                 if reg.name.trim().is_empty() {
                     anyhow::bail!("skills.extra_registries[{i}].name must not be empty");
                 }
+                if !ExternalRegistry::is_valid_name(&reg.name) {
+                    anyhow::bail!(
+                        "skills.extra_registries[{i}].name '{}' is invalid; use only lowercase ASCII letters, numbers, '-' or '_' so it can be addressed as registry:<name>/<skill>",
+                        reg.name
+                    );
+                }
                 if !seen.insert(reg.name.as_str()) {
                     anyhow::bail!("skills.extra_registries has duplicate name '{}'", reg.name);
                 }
@@ -19382,6 +19402,31 @@ enabled = true
             err.to_string().contains("duplicate name 'team'"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    async fn validate_rejects_extra_registry_unaddressable_names() {
+        for name in [
+            "team.prod",
+            "team prod",
+            "team/prod",
+            "..",
+            " team",
+            "team ",
+            "Team",
+            "teamProd",
+        ] {
+            let mut config = Config::default();
+            config.skills.extra_registries =
+                vec![ext_reg(name, "https://github.com/acme/skills", "git")];
+            let err = config
+                .validate()
+                .expect_err("unaddressable extra-registry name must be rejected");
+            assert!(
+                err.to_string().contains("registry:<name>/<skill>"),
+                "name {name:?} produced unexpected error: {err}"
+            );
+        }
     }
 
     #[test]
