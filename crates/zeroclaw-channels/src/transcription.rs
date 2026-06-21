@@ -201,7 +201,21 @@ impl OpenAiWhisperProvider {
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .map(ToOwned::to_owned)
-            .context("Missing OpenAI STT API key: set [transcription.openai].api_key")?;
+            .or_else(|| {
+                std::env::var("TRANSCRIPTION_API_KEY")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+            })
+            .or_else(|| {
+                std::env::var("OPENAI_API_KEY")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+            })
+            .context(
+                "Missing OpenAI STT API key: set `[transcription.openai].api_key` (or via the \
+                 schema-mirror grammar `ZEROCLAW_transcription__openai__api_key=...`), or set \
+                 the `TRANSCRIPTION_API_KEY` / `OPENAI_API_KEY` environment variable.",
+            )?;
 
         Ok(Self {
             alias: alias.to_string(),
