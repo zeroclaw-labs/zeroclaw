@@ -223,10 +223,13 @@ mod tests {
     // `agent_alias` directly to `resolve_mcp_servers_for_agent` — we can't call
     // `from_config` in unit tests (requires a live model provider), so we verify
     // the resolver contract directly using the same config shape that path would
-    // supply.  A revert of the agent.rs wiring makes this test vacuously pass
+    // supply.
+    //
+    // A revert of the agent.rs wiring makes this test vacuously pass
     // (the site would call connect_all with all servers, not the filtered slice),
-    // but the protective comment above names agent.rs explicitly so reviewers and
-    // grep catch any revert.
+    // so the grep-based guard below runs alongside this unit test to catch that
+    // regression. The protective comment above names agent.rs explicitly so
+    // reviewers and grep also catch any revert.
     #[test]
     fn from_config_path_agent_with_bundle_excludes_sensitive_server() {
         // config.mcp.servers has two entries: "public" and "sensitive"
@@ -240,5 +243,64 @@ mod tests {
         let names: Vec<_> = result.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["public"]);
         assert!(!names.contains(&"sensitive"));
+    }
+
+    /// Regression guard: verify all three production call sites route through
+    /// `resolve_mcp_servers_for_agent` and never pass `&config.mcp.servers`
+    /// directly to `McpRegistry::connect_all`.
+    ///
+    /// The unit tests above exercise the resolver logic but can't catch a revert
+    /// of the production wiring — if a site goes back to `connect_all(&config.mcp.servers)`
+    /// the resolver tests still pass. This grep-based guard catches that by
+    /// searching the source files that hold the three call sites (agent.rs,
+    /// loop_.rs) for the bad pattern in non-comment lines.
+    ///
+    /// Call-site anchors (all MUST use `resolve_mcp_servers_for_agent`):
+    ///   1. crates/zeroclaw-runtime/src/agent/loop_.rs:1131 — main agent turn loop (run)
+    ///   2. crates/zeroclaw-runtime/src/agent/loop_.rs:2671 — persistent-message loop (process_message)
+    ///   3. crates/zeroclaw-runtime/src/agent/agent.rs:1240 — from_config_with_session_cwd_and_mcp_approval_mode
+    ///
+    /// If any site is reverted to `&config.mcp.servers`, mcp_bundles scoping will
+    /// silently stop working — the unit tests below will not catch that regression.
+    #[test]
+    fn all_call_sites_route_through_resolver_no_direct_config_mcp_servers() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let loop_path = format!("{}/src/agent/loop_.rs", root);
+        let agent_path = format!("{}/src/agent/agent.rs", root);
+
+        for (label, fpath) in [
+            ("loop_.rs", loop_path.as_str()),
+            ("agent.rs", agent_path.as_str()),
+        ] {
+            let output = std::process::Command::new("grep")
+                .args([
+                    "-n",
+                    "--fixed-strings",
+                    "connect_all(&config.mcp.servers)",
+                    &fpath,
+                ])
+                .output()
+                .expect("grep command failed");
+
+            // Filter out comment lines (grep -v for lines starting with // or /*)
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let non_comment: Vec<&str> = stdout
+                .lines()
+                .filter(|line| {
+                    let trimmed = line.trim_start();
+                    !trimmed.starts_with("//")
+                        && !trimmed.starts_with("/*")
+                        && !trimmed.starts_with("*")
+                })
+                .collect();
+
+            if !non_comment.is_empty() {
+                let msg = non_comment.join("\n");
+                panic!(
+                    "call-site regression in {}: `connect_all(&config.mcp.servers)` found in non-comment lines.\nAll three production call sites must route through resolve_mcp_servers_for_agent.\nMatches:\n{}",
+                    label, msg
+                );
+            }
+        }
     }
 }
