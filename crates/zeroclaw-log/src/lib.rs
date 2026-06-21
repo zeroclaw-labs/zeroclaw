@@ -81,6 +81,15 @@ pub use writer::{init_from_config, record_event, runtime_trace_path};
 
 mod r#macro;
 
+/// Returns whether ZeroClaw DEBUG log events are enabled for the current
+/// subscriber. Use this before building expensive structured DEBUG attrs.
+pub fn debug_enabled() -> bool {
+    ::tracing::enabled!(
+        target: "zeroclaw_log_event",
+        ::tracing::Level::DEBUG
+    )
+}
+
 /// Test-only re-export of the writer-test mutex. Returns an opaque RAII
 /// guard so peer crates need not name `parking_lot`. Workspace crates
 /// that exercise the `record!` → `LogCaptureLayer` → broadcast hook

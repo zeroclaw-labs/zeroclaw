@@ -190,6 +190,54 @@ pub struct CascadeReport {
     pub deleted_entry: Option<String>,
 }
 
+impl CascadeReport {
+    /// Every entry/section config path the delete mutated — the removed entry
+    /// plus the entry of each scrubbed soft reference. A persisting surface marks
+    /// **each** of these dirty before saving: `Config::save_dirty` writes only
+    /// marked paths, so a referrer scrubbed in another entry that isn't listed
+    /// here would be dropped in memory but left stale on disk (reappearing as a
+    /// dangling reference on the next reload). Symmetric with
+    /// [`RenameReport::dirty_paths`]; paths are at entry granularity (e.g.
+    /// `agents.lead`, `peer_groups.crew`, `heartbeat.agent`) so a marked path
+    /// re-serialises the whole changed subtree. Sorted + deduplicated.
+    #[must_use]
+    pub fn dirty_paths(&self) -> Vec<String> {
+        let mut paths: Vec<String> = self
+            .applied
+            .iter()
+            .map(|site| dirty_entry_for(&site.path))
+            .collect();
+        if let Some(entry) = &self.deleted_entry {
+            paths.push(entry.clone());
+        }
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+}
+
+/// Truncate a [`RefSite`] dotted path to the entry/section path that an
+/// incremental save (`apply_dirty_path`) re-serialises wholesale, so a nested
+/// change (a dropped vec element or a removed/renamed map key) persists with the
+/// whole entry rather than needing a leaf-precise dirty path.
+#[must_use]
+pub fn dirty_entry_for(refsite_path: &str) -> String {
+    let segs: Vec<&str> = refsite_path.split('.').collect();
+    match segs.first().copied() {
+        // agents.<name>.* and peer_groups.<g>.* → the entry root.
+        Some("agents" | "peer_groups") if segs.len() >= 2 => format!("{}.{}", segs[0], segs[1]),
+        // providers.<cat>.<fam>.<alias>.* → the provider entry.
+        Some("providers") if segs.len() >= 4 => segs[..4].join("."),
+        // Scalars / whole-vector fields (heartbeat.agent, acp.default_agent,
+        // escalation.alert_channels[i], model_routes[i]…) → strip any index.
+        _ => refsite_path
+            .split('[')
+            .next()
+            .unwrap_or(refsite_path)
+            .to_string(),
+    }
+}
+
 /// Why a [`delete_with_cascade`] did not complete. `Refused` is an expected,
 /// renderable outcome (a hard reference blocks the delete), not a bug.
 #[derive(Debug)]
@@ -902,6 +950,65 @@ fn rewrite_channel_refs(cfg: &mut Config, channel_type: &str, old: &str, new: &s
     }
     if alert_touched {
         dirty.push("escalation.alert_channels".to_string());
+    }
+    dirty
+}
+
+// ── skill bundles (#7468/#7175) ─────────────────────────────────────────────
+// A skill bundle (`[skill_bundles.<alias>]`) has a single SOFT referrer
+// container: each agent's `skill_bundles: Vec<String>` list (validate() trims,
+// schema.rs ~17272). There is no HARD ref (an agent runs fine with an empty
+// bundle list), so bundles don't warrant an `AliasKind` variant — these three
+// standalone fns mirror the channel arm, flattened to the one container.
+
+/// Enumerate every agent that references skill bundle `alias` (TRIM-matched, as
+/// `Config::validate()` does). All refs are SOFT (droppable from the list).
+#[must_use]
+pub fn find_bundle_refs(cfg: &Config, alias: &str) -> Vec<RefSite> {
+    let mut sites = Vec::new();
+    for (name, agent) in sorted_agents(cfg) {
+        for (i, b) in agent.skill_bundles.iter().enumerate() {
+            if b.trim() == alias {
+                sites.push(RefSite::soft(
+                    format!("agents.{name}.skill_bundles[{i}]"),
+                    ScrubAction::DropFromVec { index: i },
+                    b.as_str(),
+                ));
+            }
+        }
+    }
+    sites
+}
+
+/// Mutating mirror of [`find_bundle_refs`] for delete: drop `alias` from every
+/// agent's `skill_bundles` list. Returns the touched `agents.<name>` dirty paths.
+pub fn scrub_bundle_refs(cfg: &mut Config, alias: &str) -> Vec<String> {
+    let mut dirty = Vec::new();
+    for (name, agent) in cfg.agents.iter_mut() {
+        let before = agent.skill_bundles.len();
+        agent.skill_bundles.retain(|b| b.trim() != alias);
+        if agent.skill_bundles.len() != before {
+            dirty.push(format!("agents.{name}"));
+        }
+    }
+    dirty
+}
+
+/// Mutating mirror for rename: rewrite every agent's `skill_bundles` entry
+/// naming `old` to name `new`. Returns the touched `agents.<name>` dirty paths.
+pub fn rewrite_bundle_refs(cfg: &mut Config, old: &str, new: &str) -> Vec<String> {
+    let mut dirty = Vec::new();
+    for (name, agent) in cfg.agents.iter_mut() {
+        let mut touched = false;
+        for b in agent.skill_bundles.iter_mut() {
+            if b.trim() == old {
+                *b = new.to_string();
+                touched = true;
+            }
+        }
+        if touched {
+            dirty.push(format!("agents.{name}"));
+        }
     }
     dirty
 }
@@ -2635,5 +2742,114 @@ mod tests {
             "elevenlabs.studio"
         );
         assert!(find_all_references(&cfg, &kind, "default").is_empty());
+    }
+
+    #[test]
+    fn dirty_entry_for_truncates_ref_paths_to_persistable_entries() {
+        // agent / peer-group referrer sites → the entry root (whole subtree).
+        assert_eq!(dirty_entry_for("agents.lead.delegates[0]"), "agents.lead");
+        assert_eq!(
+            dirty_entry_for("agents.lead.workspace.access.bot"),
+            "agents.lead"
+        );
+        assert_eq!(
+            dirty_entry_for("peer_groups.crew.agents[1]"),
+            "peer_groups.crew"
+        );
+        // scalars / whole-vector fields → the field/section, index stripped.
+        assert_eq!(dirty_entry_for("heartbeat.agent"), "heartbeat.agent");
+        assert_eq!(dirty_entry_for("acp.default_agent"), "acp.default_agent");
+        assert_eq!(
+            dirty_entry_for("escalation.alert_channels[3]"),
+            "escalation.alert_channels"
+        );
+        assert_eq!(
+            dirty_entry_for("model_routes[0].model_provider"),
+            "model_routes"
+        );
+        // provider entry → the 4-segment entry path.
+        assert_eq!(
+            dirty_entry_for("providers.models.anthropic.default.fallback[0]"),
+            "providers.models.anthropic.default"
+        );
+    }
+
+    #[test]
+    fn cascade_report_dirty_paths_covers_scrubs_and_deleted_entry() {
+        // A delete that scrubbed two referrers in different entries + removed the
+        // entry must report all three dirty paths (deduped, sorted).
+        let mut cfg = empty_config();
+        cfg.heartbeat.enabled = false;
+        cfg.heartbeat.agent = "bot".to_string();
+        cfg.agents
+            .insert("bot".to_string(), AliasedAgentConfig::default());
+        cfg.agents.insert(
+            "lead".to_string(),
+            AliasedAgentConfig {
+                delegates: vec!["bot".to_string()],
+                ..Default::default()
+            },
+        );
+        let report = delete_with_cascade(
+            &mut cfg,
+            &AliasKind::Agent,
+            "bot",
+            CascadePolicy::RefuseOnHard,
+        )
+        .expect("delete succeeds");
+        let dirty = report.dirty_paths();
+        assert!(
+            dirty.contains(&"agents.bot".to_string()),
+            "removed entry: {dirty:?}"
+        );
+        assert!(
+            dirty.contains(&"agents.lead".to_string()),
+            "scrubbed delegate: {dirty:?}"
+        );
+        assert!(
+            dirty.contains(&"heartbeat.agent".to_string()),
+            "cleared heartbeat: {dirty:?}"
+        );
+    }
+
+    #[test]
+    fn bundle_refs_find_scrub_rewrite() {
+        let mut cfg = empty_config();
+        cfg.agents.insert(
+            "a".to_string(),
+            AliasedAgentConfig {
+                skill_bundles: vec!["util".to_string(), "web".to_string()],
+                ..Default::default()
+            },
+        );
+        cfg.agents.insert(
+            "b".to_string(),
+            AliasedAgentConfig {
+                skill_bundles: vec![" util ".to_string()], // padded — validate trims
+                ..Default::default()
+            },
+        );
+
+        // find (trim-matched across both agents)
+        let sites = find_bundle_refs(&cfg, "util");
+        assert_eq!(sites.len(), 2, "{sites:?}");
+        assert!(sites.iter().all(|s| s.strength == RefStrength::Soft));
+
+        // rewrite util -> tools
+        let dirty = rewrite_bundle_refs(&mut cfg, "util", "tools");
+        assert_eq!(dirty.len(), 2);
+        assert_eq!(
+            cfg.agents["a"].skill_bundles,
+            vec!["tools".to_string(), "web".to_string()]
+        );
+        assert_eq!(cfg.agents["b"].skill_bundles, vec!["tools".to_string()]);
+        assert!(find_bundle_refs(&cfg, "util").is_empty());
+
+        // scrub tools from all agents
+        let dirty = scrub_bundle_refs(&mut cfg, "tools");
+        assert_eq!(dirty.len(), 2);
+        assert_eq!(cfg.agents["a"].skill_bundles, vec!["web".to_string()]);
+        assert!(cfg.agents["b"].skill_bundles.is_empty());
+        assert!(find_bundle_refs(&cfg, "tools").is_empty());
     }
 }

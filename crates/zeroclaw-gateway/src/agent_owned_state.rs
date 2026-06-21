@@ -196,3 +196,93 @@ pub async fn cascade_owned_state(
 
     report
 }
+
+/// What the agent-rename owned-state cascade re-pointed (#7468).
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct RenameStateReport {
+    pub memory_rows: usize,
+    pub cron_jobs: usize,
+    pub acp_sessions: usize,
+    pub sessions_repointed: usize,
+    /// Surfaced failures. Non-empty means part of the cascade did NOT complete —
+    /// those rows were not silently treated as re-pointed.
+    pub warnings: Vec<String>,
+}
+
+/// Re-point the agent's owned non-config **DB** state from `from` to `to`:
+/// memory rows (`agents.alias`), cron jobs, ACP sessions, and session-metadata
+/// attribution. The workspace directory is moved by the caller (mirroring how
+/// the delete handler archives the workspace, not `cascade_owned_state`).
+///
+/// Unlike delete this is **in-place** — no export/archive — and there is **no
+/// live-session refusal**: a live ACP session simply follows the rename.
+/// Best-effort + reported: a single store failing does not abort the others; the
+/// surface persists the renamed config last.
+pub async fn cascade_rename_agent(
+    config: &Config,
+    mem: &Arc<dyn Memory>,
+    session_backend: Option<&Arc<dyn SessionBackend>>,
+    from: &str,
+    to: &str,
+) -> RenameStateReport {
+    let mut warnings: Vec<String> = Vec::new();
+
+    let memory_rows = match mem.rename_agent(from, to).await {
+        Ok(n) => n,
+        Err(e) => {
+            warnings.push(format!("memory rename: {e}"));
+            0
+        }
+    };
+
+    let cron_jobs = match zeroclaw_runtime::cron::rename_jobs_by_agent(config, from, to) {
+        Ok(n) => n,
+        Err(e) => {
+            warnings.push(format!("cron rename: {e}"));
+            0
+        }
+    };
+
+    let acp_sessions = match AcpSessionStore::new(&config.data_dir) {
+        Ok(store) => match store.rename_sessions_by_agent(from, to) {
+            Ok(n) => n,
+            Err(e) => {
+                warnings.push(format!("acp rename: {e}"));
+                0
+            }
+        },
+        Err(e) => {
+            warnings.push(format!("acp store open: {e}"));
+            0
+        }
+    };
+
+    let sessions_repointed = match session_backend {
+        Some(b) => match b.rename_agent_attribution(from, to) {
+            Ok(n) => n,
+            Err(e) => {
+                warnings.push(format!("session attribution rename: {e}"));
+                0
+            }
+        },
+        None => 0,
+    };
+
+    if !warnings.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"from": from, "to": to, "warnings": warnings})),
+            "rename owned-state cascade completed with warnings (some state may not have been re-pointed)"
+        );
+    }
+
+    RenameStateReport {
+        memory_rows,
+        cron_jobs,
+        acp_sessions,
+        sessions_repointed,
+        warnings,
+    }
+}

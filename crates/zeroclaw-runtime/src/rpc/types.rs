@@ -822,6 +822,34 @@ rpc_type! {
 }
 
 rpc_type! {
+    /// One skill in an agent's *effective* set (the runtime's four-source
+    /// union), with provenance — for `GET /api/agents/{alias}/skills` (#7757).
+    /// Distinct from [`SkillListEntry`] (bundle-editor wire type); the two must
+    /// not be conflated. `origin` is the discriminant; `plugin`/`bundle` carry
+    /// the source detail; `editable` is `true` only for `origin == "bundle"`.
+    pub struct AgentSkillEntry {
+        pub name: String,
+        pub description: String,
+        /// `"workspace"` | `"open-skills"` | `"plugin"` | `"bundle"`.
+        pub origin: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub plugin: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub bundle: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub directory: Option<String>,
+        pub editable: bool,
+    }
+}
+
+rpc_type! {
+    pub struct AgentSkillsResult {
+        pub agent: String,
+        pub skills: Vec<AgentSkillEntry>,
+    }
+}
+
+rpc_type! {
     pub struct SkillsReadParams {
         pub bundle: String,
         pub name: String,
