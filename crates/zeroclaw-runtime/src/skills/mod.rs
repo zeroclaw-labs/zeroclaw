@@ -60,6 +60,12 @@ const SKILLS_REGISTRY_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24;
 pub struct Skill {
     pub name: String,
     pub description: String,
+    /// Per-locale translations of `description`, keyed by Discord locale code
+    /// (e.g. `fr`, `es-ES`, `ja`). Consumed by slash-capable channels to
+    /// localize the command description; empty for unlocalized skills. Declared
+    /// in SKILL.toml under `[skill]` as `description_localizations`.
+    #[serde(default)]
+    pub description_localizations: BTreeMap<String, String>,
     pub version: String,
     #[serde(default)]
     pub author: Option<String>,
@@ -86,6 +92,11 @@ pub struct Skill {
 pub struct SkillSlashOption {
     pub name: String,
     pub description: String,
+    /// Per-locale translations of `description`, keyed by Discord locale code.
+    /// Empty for unlocalized options. Declared under
+    /// `[[skill.slash_options]]` as `description_localizations`.
+    #[serde(default)]
+    pub description_localizations: BTreeMap<String, String>,
     /// `string` | `integer` | `number` | `boolean` | `user` | `channel` |
     /// `role` | `mentionable`. Unknown values are dropped by the channel.
     #[serde(rename = "type")]
@@ -179,6 +190,8 @@ struct SkillManifest {
 struct SkillMeta {
     name: String,
     description: String,
+    #[serde(default)]
+    description_localizations: BTreeMap<String, String>,
     #[serde(default = "default_version")]
     version: String,
     #[serde(default)]
@@ -239,6 +252,11 @@ struct SkillMarkdownMeta {
     version: Option<String>,
     author: Option<String>,
     tags: Vec<String>,
+    /// Typed slash-command options from the nested `slash_options:` frontmatter
+    /// block. Parsed by the shared helper in `document` (not the flat scanner)
+    /// so a SKILL.md skill can drive native Discord slash commands — parity with
+    /// SKILL.toml's `[[skill.slash_options]]`.
+    slash_options: Vec<SkillSlashOption>,
 }
 
 fn default_version() -> String {
@@ -1060,6 +1078,7 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
     Ok(Skill {
         name: manifest.skill.name,
         description: manifest.skill.description,
+        description_localizations: manifest.skill.description_localizations,
         version: manifest.skill.version,
         author: manifest.skill.author,
         tags: manifest.skill.tags,
@@ -1087,12 +1106,14 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
             .description
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| extract_description(&parsed.body)),
+        // SKILL.md frontmatter carries no localizations.
+        description_localizations: Default::default(),
         version: parsed.meta.version.unwrap_or_else(default_version),
         author: parsed.meta.author,
         tags: parsed.meta.tags,
         tools: Vec::new(),
         prompts: vec![parsed.body],
-        slash_options: Vec::new(),
+        slash_options: parsed.meta.slash_options,
         location: Some(path.to_path_buf()),
     })
 }
@@ -1121,6 +1142,8 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
             .description
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| extract_description(&parsed.body)),
+        // SKILL.md frontmatter carries no localizations.
+        description_localizations: Default::default(),
         version: parsed
             .meta
             .version
@@ -1132,7 +1155,7 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
         tags: parsed.meta.tags,
         tools: Vec::new(),
         prompts: vec![parsed.body],
-        slash_options: Vec::new(),
+        slash_options: parsed.meta.slash_options,
         location: Some(path.to_path_buf()),
     }))
 }
@@ -1239,6 +1262,10 @@ fn parse_simple_frontmatter(s: &str) -> SkillMarkdownMeta {
     if let Some(ref key) = collecting_multiline {
         flush_multiline(key, &multiline_parts, &mut meta);
     }
+    // The one nested field. Parsed by the shared helper so the loader and the
+    // service (`SkillDocument`) read `slash_options` identically — no second
+    // nested parser to drift.
+    meta.slash_options = document::parse_slash_options(s);
     meta
 }
 
@@ -2606,6 +2633,50 @@ choices = [
     }
 
     #[test]
+    fn description_localizations_parse_at_command_and_option_level() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_manifest(
+            tmp.path(),
+            r#"
+[skill]
+name = "search"
+description = "Search the web"
+version = "0.1.0"
+tags = ["slash"]
+description_localizations = { fr = "Rechercher sur le web", ja = "ウェブを検索" }
+
+[[skill.slash_options]]
+name = "query"
+description = "The search query"
+type = "string"
+description_localizations = { fr = "La requête de recherche" }
+"#,
+        );
+        let skill = load_skill_toml(&path).unwrap();
+        assert_eq!(
+            skill
+                .description_localizations
+                .get("fr")
+                .map(String::as_str),
+            Some("Rechercher sur le web")
+        );
+        assert_eq!(
+            skill
+                .description_localizations
+                .get("ja")
+                .map(String::as_str),
+            Some("ウェブを検索")
+        );
+        assert_eq!(
+            skill.slash_options[0]
+                .description_localizations
+                .get("fr")
+                .map(String::as_str),
+            Some("La requête de recherche")
+        );
+    }
+
+    #[test]
     fn skills_without_slash_options_default_to_empty() {
         let tmp = TempDir::new().unwrap();
         let path = write_manifest(
@@ -2618,6 +2689,57 @@ version = "0.1.0"
 "#,
         );
         let skill = load_skill_toml(&path).unwrap();
+        assert!(skill.slash_options.is_empty());
+    }
+
+    #[test]
+    fn load_skill_md_parses_slash_options_from_frontmatter() {
+        let tmp = TempDir::new().unwrap();
+        let md = r#"---
+name: draft
+description: Draft content to a spec.
+tags: [slash]
+slash_options:
+  - name: format
+    description: Output format.
+    type: string
+    required: true
+    choices: [{name: Email, value: email}, {name: Tweet, value: tweet}]
+  - name: words
+    type: integer
+    min: 10
+    max: 2000
+---
+# Draft
+
+Write it.
+"#;
+        let path = tmp.path().join("SKILL.md");
+        std::fs::write(&path, md).unwrap();
+        let skill = load_skill_md(&path, tmp.path()).unwrap();
+
+        // Parity with SKILL.toml: the runtime Skill carries typed options.
+        assert_eq!(skill.slash_options.len(), 2);
+        assert_eq!(skill.slash_options[0].name, "format");
+        assert!(skill.slash_options[0].required);
+        assert_eq!(skill.slash_options[0].choices.len(), 2);
+        assert_eq!(skill.slash_options[1].kind, "integer");
+        assert_eq!(skill.slash_options[1].min, Some(10.0));
+        assert_eq!(skill.slash_options[1].max, Some(2000.0));
+        assert!(skill.tags.contains(&"slash".to_string()));
+
+        // The options block lives in frontmatter, so the prompt (body) is clean.
+        assert_eq!(skill.prompts.len(), 1);
+        assert!(skill.prompts[0].contains("Write it."));
+        assert!(!skill.prompts[0].contains("slash_options"));
+    }
+
+    #[test]
+    fn load_skill_md_without_slash_options_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("SKILL.md");
+        std::fs::write(&path, "---\nname: plain\ndescription: d\n---\n# Plain\n").unwrap();
+        let skill = load_skill_md(&path, tmp.path()).unwrap();
         assert!(skill.slash_options.is_empty());
     }
 
@@ -3002,6 +3124,7 @@ mod prompt_callable_name_tests {
         let skill = Skill {
             name: "pr-review-toolkit:code-reviewer".to_string(),
             description: "review".to_string(),
+            description_localizations: Default::default(),
             version: "1.0.0".to_string(),
             author: None,
             tags: Vec::new(),

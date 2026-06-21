@@ -352,6 +352,8 @@ fn handle_add(
         // Scaffold creates a tagless skill; tags (including the `slash` opt-in
         // for #7490 slash commands) are managed in the dashboard skills editor.
         tags: Vec::new(),
+        // Slash options are authored in the dashboard editor, not at scaffold time.
+        slash_options: Vec::new(),
     };
 
     let skill_dir = service.scaffold_skill(

@@ -4163,6 +4163,10 @@ mod tests {
             text: String,
             reasoning: String,
         },
+        NarrationThenToolCall {
+            narration_chunks: Vec<String>,
+            tool_call: ToolCall,
+        },
     }
 
     struct StreamingNativeToolEventModelProvider {
@@ -4273,6 +4277,18 @@ mod tests {
                         Ok(StreamEvent::TextDelta(StreamChunk::delta(text))),
                         Ok(StreamEvent::Final),
                     ]))
+                }
+                NativeStreamTurn::NarrationThenToolCall {
+                    narration_chunks,
+                    tool_call,
+                } => {
+                    let mut events: Vec<_> = narration_chunks
+                        .into_iter()
+                        .map(|text| Ok(StreamEvent::TextDelta(StreamChunk::delta(text))))
+                        .collect();
+                    events.push(Ok(StreamEvent::ToolCall(tool_call)));
+                    events.push(Ok(StreamEvent::Final));
+                    Box::pin(futures_util::stream::iter(events))
                 }
             }
         }
@@ -9191,6 +9207,190 @@ This is an example, not an invocation."#;
         );
         assert_eq!(model_provider.chat_calls.load(Ordering::SeqCst), 0);
         assert_eq!(visible_deltas, "done");
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_does_not_duplicate_streamed_narration_before_native_tool_call() {
+        let narration = "About to check the count.";
+        let model_provider = StreamingNativeToolEventModelProvider::with_turns(vec![
+            NativeStreamTurn::NarrationThenToolCall {
+                narration_chunks: vec!["About to ".to_string(), "check the count.".to_string()],
+                tool_call: ToolCall {
+                    id: "call_narrate_1".to_string(),
+                    name: "count_tool".to_string(),
+                    arguments: r#"{"value":"A"}"#.to_string(),
+                    extra_content: None,
+                },
+            },
+            NativeStreamTurn::Text("done".to_string()),
+        ]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("narrate then run native tool"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
+
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "telegram",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 5,
+            cancellation_token: None,
+            on_delta: Some(tx),
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            ingress: IngressContext::internal(),
+        })
+        .await
+        .expect("narration-then-tool streaming should preserve tool loop semantics");
+
+        let mut accumulated = String::new();
+        let mut text_deltas: Vec<String> = Vec::new();
+        while let Some(delta) = rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                accumulated.push_str(&text);
+                text_deltas.push(text);
+            }
+        }
+
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert!(
+            result.ends_with("done"),
+            "final response should end with 'done', got: {result}"
+        );
+        assert_eq!(
+            accumulated.matches(narration).count(),
+            1,
+            "narration must appear exactly once in the accumulated draft; deltas={text_deltas:?} accumulated={accumulated:?}"
+        );
+        assert!(
+            result.contains("done"),
+            "final turn must not be truncated; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_preserves_guard_withheld_narration_tail_before_tool_call() {
+        let narration_full = "Checking <tool";
+        let model_provider = StreamingNativeToolEventModelProvider::with_turns(vec![
+            NativeStreamTurn::NarrationThenToolCall {
+                narration_chunks: vec!["Checking ".to_string(), "<tool".to_string()],
+                tool_call: ToolCall {
+                    id: "call_tail_1".to_string(),
+                    name: "count_tool".to_string(),
+                    arguments: r#"{"value":"A"}"#.to_string(),
+                    extra_content: None,
+                },
+            },
+            NativeStreamTurn::Text("done".to_string()),
+        ]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("narrate with a guard-buffered tail then run a native tool"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
+
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "telegram",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 5,
+            cancellation_token: None,
+            on_delta: Some(tx),
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            ingress: IngressContext::internal(),
+        })
+        .await
+        .expect("guard-withheld narration tail should not break the tool loop");
+
+        let mut accumulated = String::new();
+        let mut text_deltas: Vec<String> = Vec::new();
+        while let Some(delta) = rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                accumulated.push_str(&text);
+                text_deltas.push(text);
+            }
+        }
+
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert!(
+            accumulated.contains(narration_full),
+            "guard-withheld tail must still reach the draft exactly once; deltas={text_deltas:?} accumulated={accumulated:?}"
+        );
+        assert_eq!(
+            accumulated.matches("<tool").count(),
+            1,
+            "narration tail must not be duplicated; deltas={text_deltas:?} accumulated={accumulated:?}"
+        );
+        assert!(
+            result.ends_with("done"),
+            "final turn must not be truncated; got: {result}"
+        );
     }
 
     #[tokio::test]
