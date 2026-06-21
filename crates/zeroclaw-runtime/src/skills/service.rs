@@ -15,7 +15,8 @@ use super::scaffold::{self, ScaffoldError, ScaffoldOptions};
 use zeroclaw_config::schema::Config;
 
 /// Per-skill view returned by [`SkillsService::list_skills`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `Eq` dropped: `frontmatter.slash_options` carry `f64` bounds (not `Eq`).
+#[derive(Debug, Clone, PartialEq)]
 pub struct SkillSummary {
     pub r#ref: SkillRef,
     pub directory: PathBuf,
@@ -398,6 +399,7 @@ mod tests {
             prompts: vec![],
             slash_options: vec![],
             location: loc.map(PathBuf::from),
+            description_localizations: Default::default(),
         };
         assert_eq!(
             SkillsService::derive_origin(&mk("s", &["open-skills"], None), &bundles),
