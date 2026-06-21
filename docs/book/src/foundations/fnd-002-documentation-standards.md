@@ -302,7 +302,7 @@ The following key decisions should be documented retroactively. They represent t
 |---|---|
 | ADR-001 | Rust as the implementation language (replacing TypeScript/OpenClaw) |
 | ADR-002 | Trait-driven extensibility as the primary architectural pattern |
-| ADR-003 | WASM + Extism as the plugin execution model |
+| ADR-003 | WASM plugin model and the Extism-to-WIT transition |
 | ADR-004 | Tool shared state ownership contract *(already exists)* |
 | ADR-005 | SQLite + Markdown as the two memory backends |
 | ADR-006 | CLI as the only built-in channel; all others as plugins |

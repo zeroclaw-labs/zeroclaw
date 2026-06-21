@@ -734,6 +734,21 @@ impl AcpSessionStore {
         Ok(rows)
     }
 
+    /// Re-point every ACP session (live or killed) from `from` to `to`,
+    /// returning the row count. The agent-rename cascade (#7468) keeps the
+    /// session and its transcript; only the owning alias moves. Unlike delete,
+    /// a live session (`killed_at IS NULL`) is no obstacle to rename.
+    pub fn rename_sessions_by_agent(&self, from: &str, to: &str) -> Result<usize> {
+        let conn = self.conn.lock();
+        let rows = conn
+            .execute(
+                "UPDATE acp_sessions SET agent_alias = ?2 WHERE agent_alias = ?1",
+                params![from, to],
+            )
+            .context("Failed to rename ACP session owner")?;
+        Ok(rows)
+    }
+
     /// Persist that an admin intentionally killed this ACP session. The
     /// transcript stays durable, but runtime rehydration must not revive it.
     pub fn mark_session_killed(&self, session_uuid: &str) -> Result<bool> {
@@ -1270,5 +1285,26 @@ mod tests {
         assert_eq!(store.delete_sessions_by_agent("alpha").unwrap(), 2);
         assert!(store.list_sessions_by_agent("alpha").unwrap().is_empty());
         assert_eq!(store.list_sessions_by_agent("beta").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rename_sessions_by_agent_repoints_live_and_killed() {
+        let (_tmp, store) = open_store();
+        store.create_session("a-live", "alpha", "/ws/a1").unwrap();
+        store.create_session("a-killed", "alpha", "/ws/a2").unwrap();
+        store.mark_session_killed("a-killed").unwrap();
+        store.create_session("b-live", "beta", "/ws/b1").unwrap();
+
+        // Rename re-points BOTH live and killed sessions; unlike delete, a live
+        // session is no obstacle.
+        assert_eq!(store.rename_sessions_by_agent("alpha", "gamma").unwrap(), 2);
+        assert!(store.list_sessions_by_agent("alpha").unwrap().is_empty());
+        assert_eq!(store.list_sessions_by_agent("gamma").unwrap().len(), 2);
+        // the live session followed the rename
+        assert_eq!(store.count_live_sessions_by_agent("gamma").unwrap(), 1);
+        // beta untouched
+        assert_eq!(store.list_sessions_by_agent("beta").unwrap().len(), 1);
+        // unknown source → 0
+        assert_eq!(store.rename_sessions_by_agent("ghost", "x").unwrap(), 0);
     }
 }
