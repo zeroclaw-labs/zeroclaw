@@ -1921,7 +1921,8 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
 fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
     // Serialize per-sender persistence to prevent interleaving across concurrent
     // workers that share the same conversation_history_key (#7753).
-    let _lock = acquire_persist_lock(ctx, sender_key).lock().unwrap_or_else(|e| e.into_inner());
+    let persist_lock = acquire_persist_lock(ctx, sender_key);
+    let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
 
     // Persist to JSONL before adding to in-memory history.
     if let Some(ref store) = ctx.session_store
@@ -1994,7 +1995,8 @@ fn rollback_orphan_user_turn(
 ) -> bool {
     // Serialize per-sender persistence to prevent interleaving across concurrent
     // workers that share the same conversation_history_key (#7753).
-    let _lock = acquire_persist_lock(ctx, sender_key).lock().unwrap_or_else(|e| e.into_inner());
+    let persist_lock = acquire_persist_lock(ctx, sender_key);
+    let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
 
     let mut histories = ctx
         .conversation_histories
@@ -2665,7 +2667,8 @@ async fn handle_runtime_command_if_needed(
         }
         ChannelRuntimeCommand::NewSession => {
             // Serialize per-sender persistence to prevent interleaving (#7753).
-            let _lock = acquire_persist_lock(ctx, &sender_key)
+            let persist_lock = acquire_persist_lock(ctx, &sender_key);
+            let _lock = persist_lock
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             clear_sender_history(ctx, &sender_key);
@@ -4317,7 +4320,8 @@ async fn process_channel_message_body(
         // `/new` should make the next user turn completely fresh even if
         // older cached turns reappear before this message starts.
         // Serialize per-sender persistence to prevent interleaving (#7753).
-        let _lock = acquire_persist_lock(ctx.as_ref(), &history_key)
+        let persist_lock = acquire_persist_lock(ctx.as_ref(), &history_key);
+        let _lock = persist_lock
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         clear_sender_history(ctx.as_ref(), &history_key);
