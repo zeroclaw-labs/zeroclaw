@@ -4300,17 +4300,29 @@ async fn process_channel_message_body(
                     preserve_media_markers: false,
                 }
             }
-            None => zeroclaw_runtime::agent::context_compressor::SummaryTarget {
-                provider: active_model_provider.as_ref(),
-                model: ctx
+            None => {
+                // Deprecated `summary_model` fallback: dispatched on the agent's
+                // OWN provider. Warn-once (shared process-global set with the
+                // loop_ call sites) that a profile-shared bare model id can
+                // silently mismatch across providers (#7964).
+                let deprecated = ctx
                     .agent_cfg
                     .resolved
                     .context_compression
                     .summary_model
-                    .as_deref()
-                    .unwrap_or(route.model.as_str()),
-                preserve_media_markers: active_model_provider.supports_vision(),
-            },
+                    .as_deref();
+                if let Some(sm) = deprecated.filter(|s| !s.trim().is_empty()) {
+                    zeroclaw_runtime::agent::loop_::warn_deprecated_summary_model_fallback(
+                        ctx.agent_alias.as_str(),
+                        sm,
+                    );
+                }
+                zeroclaw_runtime::agent::context_compressor::SummaryTarget {
+                    provider: active_model_provider.as_ref(),
+                    model: deprecated.unwrap_or(route.model.as_str()),
+                    preserve_media_markers: active_model_provider.supports_vision(),
+                }
+            }
         };
         match compressor
             .compress_if_needed(

@@ -979,7 +979,11 @@ fn resolve_summary_provider(
 /// diagnostic carries the precise cross-provider detection; this is the
 /// belt-and-suspenders signal on the hot path, deduped so it does not spam
 /// every turn. Mirrors the warn-once pattern in `agent::cost`.
-fn warn_deprecated_summary_model_fallback(agent_alias: &str, summary_model: &str) {
+///
+/// `pub` so the channel orchestrator's proactive-compression fallback (the third
+/// dispatch site, in `zeroclaw-channels`) shares this same process-global
+/// warn-once set, keeping the signal one-per-agent across every fallback path.
+pub fn warn_deprecated_summary_model_fallback(agent_alias: &str, summary_model: &str) {
     static SEEN: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
     let first = {
         let mut seen = SEEN
