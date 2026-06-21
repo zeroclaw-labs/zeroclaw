@@ -19125,14 +19125,23 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn cost_category_resolves_only_rate_bearing_sections() {
-        assert_eq!(super::cost_category_for_provider_section("providers.models"), Some("models"));
-        assert_eq!(super::cost_category_for_provider_section("providers.tts"), Some("tts"));
+        assert_eq!(
+            super::cost_category_for_provider_section("providers.models"),
+            Some("models")
+        );
+        assert_eq!(
+            super::cost_category_for_provider_section("providers.tts"),
+            Some("tts")
+        );
         assert_eq!(
             super::cost_category_for_provider_section("providers.transcription"),
             Some("transcription")
         );
         assert_eq!(super::cost_category_for_provider_section("channels"), None);
-        assert_eq!(super::cost_category_for_provider_section("providers.unknown"), None);
+        assert_eq!(
+            super::cost_category_for_provider_section("providers.unknown"),
+            None
+        );
         assert_eq!(super::cost_category_for_provider_section("models"), None);
     }
 
