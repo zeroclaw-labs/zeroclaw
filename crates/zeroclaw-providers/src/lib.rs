@@ -4288,7 +4288,9 @@ async fn fetch_openrouter_context_window(
     let url = config
         .uri
         .as_deref()
+        .filter(|s| !s.is_empty() && *s != "<unset>")
         .unwrap_or("https://openrouter.ai/api/v1/models");
+    eprintln!("[FETCH DEBUG] OpenRouter: base_url={}", url);
     let resp = client
         .get(url)
         .send()
@@ -4312,10 +4314,13 @@ async fn fetch_openai_compatible_context_window(
 ) -> Option<usize> {
     let client = reqwest::Client::new();
     let default_uri = crate::factory::get_default_url(provider_type);
-    let base_url = config.uri.as_deref().or(default_uri).unwrap_or("");
-    if base_url.is_empty() {
-        return None;
-    }
+    let base_url = config
+        .uri
+        .as_deref()
+        .filter(|s| !s.is_empty() && *s != "<unset>")
+        .or(default_uri)
+        .unwrap_or("");
+    eprintln!("[FETCH DEBUG] {}: base_url={}", provider_type, base_url);
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let mut req = client.get(&url);
     if let Some(key) = config.api_key.as_deref() {
