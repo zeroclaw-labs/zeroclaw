@@ -10658,12 +10658,19 @@ impl Default for SchedulerConfig {
 #[prefix = "model_routes"]
 pub struct ModelRouteConfig {
     /// Task hint name (e.g. "reasoning", "fast", "code", "summarize")
+    /// `#[serde(default)]` lets the `create_map_key` macro default-construct
+    /// from `{}` before the hint gets injected via `set_prop`. Empty strings
+    /// are rejected by `Config::validate()`.
     #[serde(default)]
     pub hint: String,
     /// Dotted provider profile ref to route to (must resolve to `providers.models.<type>.<alias>`)
+    /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
+    /// Empty strings are rejected by `Config::validate()`.
     #[serde(default)]
     pub model_provider: String,
     /// Provider-local model identifier to use with that provider profile
+    /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
+    /// Empty strings are rejected by `Config::validate()`.
     #[serde(default)]
     pub model: String,
     /// Optional API key override for this route's model provider
@@ -10693,12 +10700,19 @@ pub struct ModelRouteConfig {
 #[prefix = "embedding_routes"]
 pub struct EmbeddingRouteConfig {
     /// Route hint name (e.g. "semantic", "archive", "faq")
+    /// `#[serde(default)]` lets the `create_map_key` macro default-construct
+    /// from `{}` before the hint gets injected via `set_prop`. Empty strings
+    /// are rejected by `Config::validate()`.
     #[serde(default)]
     pub hint: String,
     /// Dotted embedding-capable provider profile ref
+    /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
+    /// Empty strings are rejected by `Config::validate()`.
     #[serde(default)]
     pub model_provider: String,
     /// Provider-local embedding model identifier to use with that provider profile
+    /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
+    /// Empty strings are rejected by `Config::validate()`.
     #[serde(default)]
     pub model: String,
     /// Optional embedding dimension override for this route
