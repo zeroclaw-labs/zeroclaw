@@ -761,10 +761,12 @@ impl FamilyProviderFactory for XaiModelProviderConfig {
         .with_models_dev_key("xai");
 
         if !has_api_key(key) {
-            let state_dir = opts
-                .zeroclaw_dir
-                .clone()
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let state_dir = opts.zeroclaw_dir.clone().unwrap_or_else(|| {
+                directories::UserDirs::new().map_or_else(
+                    || std::path::PathBuf::from(".zeroclaw"),
+                    |dirs| dirs.home_dir().join(".zeroclaw"),
+                )
+            });
             let auth_service = crate::auth::AuthService::new(&state_dir, opts.secrets_encrypt);
             p = p.with_auth_profile("xai", auth_service, opts.auth_profile_override.clone());
         }
