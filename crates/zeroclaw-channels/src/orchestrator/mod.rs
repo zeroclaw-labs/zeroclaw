@@ -256,8 +256,8 @@ const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn ModelProvider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
 /// Session-only model overrides scoped above the per-sender [`RouteSelectionMap`].
-/// Keyed by a `scope_override_key` (prefixed `user::`/`guild::`/`agent::`), so all
-/// three tiers share one in-memory map. Never persisted — lost on restart by design.
+/// Keyed by a `scope_override_key` (prefixed `user::`/`agent::`), so both
+/// tiers share one in-memory map. Never persisted — lost on restart by design.
 type ScopedRouteMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
 
 fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
@@ -466,7 +466,7 @@ struct ChannelRuntimeContext {
     pending_new_sessions: PendingNewSessionSet,
     provider_cache: ProviderCacheMap,
     route_overrides: RouteSelectionMap,
-    /// Session-only `/model` overrides scoped by user/guild/agent (see
+    /// Session-only `/model` overrides scoped by user/agent (see
     /// [`ScopedRouteMap`]). Consulted above `route_overrides` in
     /// [`get_route_selection`]; never persisted.
     scope_overrides: ScopedRouteMap,
