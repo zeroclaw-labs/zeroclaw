@@ -422,7 +422,7 @@ pub fn parse_code_from_redirect(input: &str, expected_state: Option<&str>) -> Re
     {
         return Ok(code.trim().to_string());
     }
-    if !trimmed.contains('=') && !trimmed.contains('?') {
+    if expected_state.is_none() && !trimmed.contains('=') && !trimmed.contains('?') {
         return Ok(trimmed.to_string());
     }
     anyhow::bail!("xAI OAuth callback missing code parameter")
@@ -590,6 +590,15 @@ mod tests {
             .expect("code should parse");
         assert_eq!(code, "abc");
         assert!(parse_code_from_redirect("/callback?code=abc&state=bad", Some("xyz")).is_err());
+    }
+
+    #[test]
+    fn parse_redirect_accepts_raw_code_only_without_expected_state() {
+        assert_eq!(
+            parse_code_from_redirect("abc123", None).expect("raw code should parse"),
+            "abc123"
+        );
+        assert!(parse_code_from_redirect("abc123", Some("xyz")).is_err());
     }
 
     #[test]

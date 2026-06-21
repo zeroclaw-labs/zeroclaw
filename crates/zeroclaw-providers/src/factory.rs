@@ -751,6 +751,16 @@ impl FamilyProviderFactory for XaiModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
+        if let Some(p) = build_responses_provider_if_requested(
+            self.base.wire_api,
+            alias,
+            api_url.or(Some("https://api.x.ai/v1")),
+            key,
+            opts,
+        ) {
+            return Ok(p);
+        }
+
         let mut p = OpenAiCompatibleModelProvider::new(
             alias,
             "xAI",
