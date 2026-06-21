@@ -304,11 +304,13 @@ mod tests {
         Skill {
             name: name.to_string(),
             description: "Installed capability".to_string(),
+            description_localizations: Default::default(),
             version: "0.1.0".to_string(),
             author: None,
             tags: vec![],
             tools: vec![],
             prompts: vec![],
+            slash_options: Vec::new(),
             location: None,
         }
     }

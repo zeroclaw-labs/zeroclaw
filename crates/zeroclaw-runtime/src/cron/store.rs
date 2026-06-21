@@ -222,8 +222,67 @@ pub fn remove_job(config: &Config, id: &str) -> Result<()> {
         anyhow::bail!("Cron job '{id}' not found");
     }
 
-    println!("✅ Removed cron job {id}");
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Delete)
+            .with_category(::zeroclaw_log::EventCategory::Cron)
+            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+            .with_attrs(::serde_json::json!({"job_id": id})),
+        "Removed cron job"
+    );
     Ok(())
+}
+
+/// Cron jobs owned by `agent_alias`, for the agent-deletion export-then-delete
+/// archive (#7175).
+pub fn list_jobs_by_agent(config: &Config, agent_alias: &str) -> Result<Vec<CronJob>> {
+    let Some(jobs) = with_read_connection(config, |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
+                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                    allowed_tools, source, uses_memory, agent_alias
+             FROM cron_jobs WHERE agent_alias = ?1 ORDER BY next_run ASC",
+        )?;
+        let rows = stmt.query_map(params![agent_alias], map_cron_job_row)?;
+        let mut jobs = Vec::new();
+        for row in rows {
+            jobs.push(row?);
+        }
+        Ok(jobs)
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+    Ok(jobs)
+}
+
+/// Delete every cron job owned by `agent_alias`, returning the row count
+/// (`cron_runs` cascade via their `job_id` FK). A job whose owning agent is gone
+/// can never run, so the agent-deletion cascade removes it (#7175).
+pub fn remove_jobs_by_agent(config: &Config, agent_alias: &str) -> Result<usize> {
+    let changed = with_initialized_connection(config, |conn| {
+        conn.execute(
+            "DELETE FROM cron_jobs WHERE agent_alias = ?1",
+            params![agent_alias],
+        )
+        .context("Failed to delete cron jobs for agent")
+    })?;
+    Ok(changed)
+}
+
+/// Re-point every cron job owned by `from` to `to`, returning the row count.
+/// Called by the agent-rename cascade (#7468): the job keeps running, just
+/// under the renamed owner. `agent_alias` is plain TEXT (not a UUID), so this
+/// is a direct column update.
+pub fn rename_jobs_by_agent(config: &Config, from: &str, to: &str) -> Result<usize> {
+    let changed = with_initialized_connection(config, |conn| {
+        conn.execute(
+            "UPDATE cron_jobs SET agent_alias = ?2 WHERE agent_alias = ?1",
+            params![from, to],
+        )
+        .context("Failed to rename cron job owner")
+    })?;
+    Ok(changed)
 }
 
 pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
@@ -1358,6 +1417,31 @@ mod tests {
         cron_dir(config).join("jobs.db")
     }
 
+    async fn recv_log_event(
+        rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
+        message: &str,
+    ) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value))
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|candidate| candidate == message) =>
+                {
+                    return value;
+                }
+                Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_elapsed) => {}
+            }
+        }
+        panic!("did not find log event: {message}");
+    }
+
     #[test]
     fn read_only_queries_on_empty_workspace_do_not_initialize_cron_db() {
         let tmp = TempDir::new().unwrap();
@@ -1622,6 +1706,28 @@ mod tests {
 
         remove_job(&config, &job.id).unwrap();
         assert!(list_jobs(&config).unwrap().is_empty());
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn remove_job_emits_structured_cron_delete_event() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "test-agent", "*/10 * * * *", "echo roundtrip").unwrap();
+
+        remove_job(&config, &job.id).unwrap();
+
+        let value = recv_log_event(&mut rx, "Removed cron job").await;
+        assert_eq!(value["event"]["category"], "cron");
+        assert_eq!(value["event"]["action"], "delete");
+        assert_eq!(value["event"]["outcome"], "success");
+        assert_eq!(value["attributes"]["job_id"], job.id);
     }
 
     #[test]
