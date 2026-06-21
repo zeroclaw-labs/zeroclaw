@@ -258,6 +258,7 @@ mod tests {
                 skills: vec![Skill {
                     name: "alpha".into(),
                     description: String::new(),
+                    description_localizations: Default::default(),
                     version: String::new(),
                     author: None,
                     tags: vec![],

@@ -11848,6 +11848,25 @@ pub enum StreamMode {
     MultiMessage,
 }
 
+/// Where a channel registers its skill slash commands. `global` (default)
+/// registers application-wide - the commands work everywhere the bot is, but
+/// Discord takes up to ~1h to propagate changes. `guild` registers to each
+/// guild in `guild_ids`, which propagates instantly (the right choice for fast
+/// iteration and single-server bots). When `guild` is set with an empty
+/// `guild_ids`, the channel logs a warning and falls back to global.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum SlashCommandScope {
+    /// Application-wide commands (propagate in up to ~1h). Default.
+    #[default]
+    Global,
+    /// Commands registered to each guild in `guild_ids` (instant propagation).
+    Guild,
+}
+
 fn default_draft_update_interval_ms() -> u64 {
     1000
 }
@@ -12057,6 +12076,16 @@ pub struct DiscordConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub slash_commands: bool,
+    /// Scope for registered slash commands: `global` (default, application-wide,
+    /// ~1h propagation) or `guild` (registered to each `guild_ids` entry,
+    /// instant). Only meaningful when `slash_commands = true`; `guild` with an
+    /// empty `guild_ids` warns and falls back to global. Switching scope reaps
+    /// owned commands from the now-inactive scope; note that *removing* a guild
+    /// from `guild_ids` (without switching scope) does not reap that guild's
+    /// commands - remove the bot from the guild, or switch scope, to clear them.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub slash_command_scope: SlashCommandScope,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
@@ -21464,6 +21493,7 @@ default_temperature = 0.7
             interrupt_on_new_message: false,
             mention_only: false,
             slash_commands: false,
+            slash_command_scope: SlashCommandScope::default(),
             proxy_url: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
@@ -21494,6 +21524,7 @@ default_temperature = 0.7
             interrupt_on_new_message: false,
             mention_only: false,
             slash_commands: false,
+            slash_command_scope: SlashCommandScope::default(),
             proxy_url: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
