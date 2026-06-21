@@ -1,6 +1,6 @@
 use super::web_search_provider_routing::{WebSearchProviderRoute, resolve_web_search_provider};
 use async_trait::async_trait;
-use regex::Regex;
+use duckduckgo::browser::Browser;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -170,93 +170,113 @@ impl WebSearchTool {
     }
 
     async fn search_duckduckgo(&self, query: &str) -> anyhow::Result<String> {
-        self.search_duckduckgo_at("https://html.duckduckgo.com/html/", query)
-            .await
+        let user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+        let limit = self.max_results;
+
+        // Build through the builder so proxy and user-agent are wired.
+        // Browser::new() creates its own reqwest client and ignores proxy.
+        let mut builder = Browser::builder().cookie_store(true).user_agent(user_agent);
+
+        // Apply the process-global runtime proxy when configured and
+        // scoped to this service.  BrowserBuilder::proxy() takes a URL
+        // string (uses Proxy::all internally), so we resolve the best
+        // single URL from the proxy config: prefer https_proxy for
+        // HTTPS traffic, fall back to all_proxy, then http_proxy.
+        let proxy_config = zeroclaw_config::schema::runtime_proxy_config();
+        if proxy_config.should_apply_to_service("tool.web_search") {
+            let proxy_url = proxy_config
+                .https_proxy
+                .as_deref()
+                .filter(|u| !u.trim().is_empty())
+                .or_else(|| {
+                    proxy_config
+                        .all_proxy
+                        .as_deref()
+                        .filter(|u| !u.trim().is_empty())
+                })
+                .or_else(|| {
+                    proxy_config
+                        .http_proxy
+                        .as_deref()
+                        .filter(|u| !u.trim().is_empty())
+                });
+            if let Some(url) = proxy_url {
+                builder = builder.proxy(url);
+            }
+        }
+
+        let browser = builder.build().map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"search_provider": "duckduckgo", "error": format!("{}", e)})),
+                "web_search: failed to build DuckDuckGo browser"
+            );
+            anyhow::Error::msg(format!("Failed to build DuckDuckGo browser: {e}"))
+        })?;
+
+        // NOTE: BrowserBuilder does not expose a reqwest timeout option.
+        // The tokio::time::timeout wrapper below cancels the future, but
+        // the underlying TCP socket may linger until the OS TCP timeout.
+        let results = tokio::time::timeout(
+            Duration::from_secs(self.timeout_secs),
+            browser.lite_search(query, "wt-wt", Some(limit), user_agent),
+        )
+        .await
+        .map_err(|_| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"search_provider": "duckduckgo"})),
+                "web_search: DuckDuckGo search timed out"
+            );
+            anyhow::Error::msg(format!(
+                "DuckDuckGo search timed out after {} seconds. Try configuring SearXNG, Brave, or Tavily as the web search provider.",
+                self.timeout_secs
+            ))
+        })?
+        .map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"search_provider": "duckduckgo", "error": format!("{}", e)})),
+                "web_search: DuckDuckGo search failed"
+            );
+            anyhow::Error::msg(format!(
+                "DuckDuckGo search failed: {e}. Try configuring SearXNG, Brave, or Tavily as the web search provider."
+            ))
+        })?;
+
+        self.format_ddg_results(&results, query)
     }
 
-    /// Inner DuckDuckGo request implementation, parameterized on the endpoint URL
-    /// so request-flow tests can target a local mock server. Production calls
-    /// always go through [`Self::search_duckduckgo`].
-    async fn search_duckduckgo_at(
+    fn format_ddg_results(
         &self,
-        endpoint_url: &str,
+        results: &[duckduckgo::response::LiteSearchResult],
         query: &str,
     ) -> anyhow::Result<String> {
-        let encoded_query = urlencoding::encode(query);
-        let search_url = format!("{}?q={}", endpoint_url, encoded_query);
-
-        let builder = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-        let builder =
-            zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.web_search");
-        let client = builder.build()?;
-
-        let response = client.get(&search_url).send().await?;
-        let status = response.status();
-        let final_url_is_block =
-            contains_ascii_case_insensitive(response.url().as_str(), "/wr.do?");
-
-        if !status.is_success() {
-            if let Some(message) = duckduckgo_block_message(status, final_url_is_block, false) {
-                anyhow::bail!(message);
-            }
-            anyhow::bail!("DuckDuckGo search failed with status: {}", status);
-        }
-
-        let html = response.text().await?;
-        let html_contains_block = contains_ascii_case_insensitive(&html, "/wr.do?")
-            || contains_ascii_case_insensitive(&html, "anomaly-modal");
-        if let Some(message) =
-            duckduckgo_block_message(status, final_url_is_block, html_contains_block)
-        {
-            anyhow::bail!(message);
-        }
-        self.parse_duckduckgo_results(&html, query)
-    }
-
-    fn parse_duckduckgo_results(&self, html: &str, query: &str) -> anyhow::Result<String> {
-        // Extract result links: <a class="result__a" href="...">Title</a>
-        let link_regex = Regex::new(
-            r#"<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>"#,
-        )?;
-
-        // Extract snippets: <a class="result__snippet">...</a>
-        let snippet_regex = Regex::new(r#"<a class="result__snippet[^"]*"[^>]*>([\s\S]*?)</a>"#)?;
-
-        let link_matches: Vec<_> = link_regex
-            .captures_iter(html)
-            .take(self.max_results + 2)
-            .collect();
-
-        let snippet_matches: Vec<_> = snippet_regex
-            .captures_iter(html)
-            .take(self.max_results + 2)
-            .collect();
-
-        if link_matches.is_empty() {
+        if results.is_empty() {
             return Ok(format!("No results found for: {}", query));
         }
 
         let mut lines = vec![format!("Search results for: {} (via DuckDuckGo)", query)];
 
-        let count = link_matches.len().min(self.max_results);
+        for (i, result) in results.iter().take(self.max_results).enumerate() {
+            let title = if result.title.is_empty() {
+                "No title"
+            } else {
+                &result.title
+            };
+            let url = &result.url;
+            let snippet = &result.snippet;
 
-        for i in 0..count {
-            let caps = &link_matches[i];
-            let url_str = decode_ddg_redirect_url(&caps[1]);
-            let title = strip_tags(&caps[2]);
-
-            lines.push(format!("{}. {}", i + 1, title.trim()));
-            lines.push(format!("   {}", url_str.trim()));
-
-            // Add snippet if available
-            if i < snippet_matches.len() {
-                let snippet = strip_tags(&snippet_matches[i][1]);
-                let snippet = snippet.trim();
-                if !snippet.is_empty() {
-                    lines.push(format!("   {}", snippet));
-                }
+            lines.push(format!("{}. {}", i + 1, title));
+            lines.push(format!("   {}", url));
+            if !snippet.is_empty() {
+                lines.push(format!("   {}", snippet));
             }
         }
 
@@ -810,44 +830,6 @@ impl WebSearchTool {
     }
 }
 
-fn decode_ddg_redirect_url(raw_url: &str) -> String {
-    if let Some(index) = raw_url.find("uddg=") {
-        let encoded = &raw_url[index + 5..];
-        let encoded = encoded.split('&').next().unwrap_or(encoded);
-        if let Ok(decoded) = urlencoding::decode(encoded) {
-            return decoded.into_owned();
-        }
-    }
-
-    raw_url.to_string()
-}
-
-const DUCKDUCKGO_BLOCK_MESSAGE: &str = "DuckDuckGo blocked the automated search request. Try configuring SearXNG, Brave, or Tavily as the web search provider.";
-
-fn duckduckgo_block_message(
-    status: reqwest::StatusCode,
-    final_url_is_block: bool,
-    html_contains_block: bool,
-) -> Option<&'static str> {
-    if status == reqwest::StatusCode::FORBIDDEN || final_url_is_block || html_contains_block {
-        Some(DUCKDUCKGO_BLOCK_MESSAGE)
-    } else {
-        None
-    }
-}
-
-fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
-    haystack
-        .as_bytes()
-        .windows(needle.len())
-        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
-}
-
-fn strip_tags(content: &str) -> String {
-    let re = Regex::new(r"<[^>]+>").unwrap();
-    re.replace_all(content, "").to_string()
-}
-
 #[async_trait]
 impl Tool for WebSearchTool {
     fn name(&self) -> &str {
@@ -947,226 +929,51 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_tags() {
-        let html = "<b>Hello</b> <i>World</i>";
-        assert_eq!(strip_tags(html), "Hello World");
-    }
-
-    #[test]
-    fn test_parse_duckduckgo_results_empty() {
+    fn test_format_ddg_results_empty() {
         let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
-        let result = tool
-            .parse_duckduckgo_results("<html>No results here</html>", "test")
-            .unwrap();
+        let result = tool.format_ddg_results(&[], "test").unwrap();
         assert!(result.contains("No results found"));
     }
 
     #[test]
-    fn test_parse_duckduckgo_results_with_data() {
+    fn test_format_ddg_results_with_data() {
+        use duckduckgo::response::LiteSearchResult;
         let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
-        let html = r#"
-            <a class="result__a" href="https://example.com">Example Title</a>
-            <a class="result__snippet">This is a description</a>
-        "#;
-        let result = tool.parse_duckduckgo_results(html, "test").unwrap();
+        let results = vec![LiteSearchResult {
+            title: "Example Title".to_string(),
+            url: "https://example.com".to_string(),
+            snippet: "This is a description".to_string(),
+        }];
+        let result = tool.format_ddg_results(&results, "test").unwrap();
         assert!(result.contains("Example Title"));
         assert!(result.contains("https://example.com"));
+        assert!(result.contains("This is a description"));
+        assert!(result.contains("via DuckDuckGo"));
     }
 
     #[test]
-    fn test_parse_duckduckgo_results_decodes_redirect_url() {
+    fn test_format_ddg_results_empty_title_fallback() {
+        use duckduckgo::response::LiteSearchResult;
         let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
-        let html = r#"
-            <a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpath%3Fa%3D1&amp;rut=test">Example Title</a>
-            <a class="result__snippet">This is a description</a>
-        "#;
-        let result = tool.parse_duckduckgo_results(html, "test").unwrap();
-        assert!(result.contains("https://example.com/path?a=1"));
-        assert!(!result.contains("rut=test"));
-    }
-
-    #[test]
-    fn test_duckduckgo_block_detection_reports_forbidden_status() {
-        let message = duckduckgo_block_message(reqwest::StatusCode::FORBIDDEN, false, false)
-            .expect("403 responses should be classified as a DuckDuckGo block");
-
-        assert!(message.contains("DuckDuckGo blocked"));
-        assert!(message.contains("SearXNG"));
-    }
-
-    #[test]
-    fn test_duckduckgo_block_detection_reports_verification_redirect() {
-        let message = duckduckgo_block_message(reqwest::StatusCode::OK, true, false)
-            .expect("verification redirects should be classified as a DuckDuckGo block");
-
-        assert!(message.contains("DuckDuckGo blocked"));
-        assert!(message.contains("SearXNG"));
-    }
-
-    #[test]
-    fn test_duckduckgo_block_detection_reports_verification_form_in_html() {
-        let message = duckduckgo_block_message(reqwest::StatusCode::OK, false, true)
-            .expect("verification form HTML should be classified as a DuckDuckGo block");
-
-        assert!(message.contains("DuckDuckGo blocked"));
-        assert!(message.contains("SearXNG"));
-    }
-
-    #[test]
-    fn test_duckduckgo_block_detection_ignores_normal_empty_results() {
-        let message = duckduckgo_block_message(reqwest::StatusCode::OK, false, false);
-
-        assert!(message.is_none());
-    }
-
-    #[test]
-    fn test_duckduckgo_block_detection_is_case_insensitive_without_allocating_html() {
-        assert!(contains_ascii_case_insensitive(
-            r#"<form action="/WR.DO?u=https%3A%2F%2Fhtml.duckduckgo.com%2Fhtml%2F"></form>"#,
-            "/wr.do?"
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_duckduckgo_request_reports_forbidden_status() {
-        use wiremock::matchers::{method, path, query_param};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/html/"))
-            .and(query_param("q", "test"))
-            .respond_with(ResponseTemplate::new(403))
-            .mount(&server)
-            .await;
-
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
-        let err = tool
-            .search_duckduckgo_at(&format!("{}/html/", server.uri()), "test")
-            .await
-            .expect_err("403 should be reported as a DuckDuckGo block");
-
-        assert!(err.to_string().contains("DuckDuckGo blocked"));
-        assert!(err.to_string().contains("SearXNG"));
-    }
-
-    #[tokio::test]
-    async fn test_duckduckgo_request_reports_verification_redirect_url() {
-        use wiremock::matchers::{method, path, query_param};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/html/"))
-            .and(query_param("q", "test"))
-            .respond_with(
-                ResponseTemplate::new(302)
-                    .insert_header("location", format!("{}/wr.do?u=blocked", server.uri())),
-            )
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/wr.do"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("<html></html>"))
-            .mount(&server)
-            .await;
-
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
-        let err = tool
-            .search_duckduckgo_at(&format!("{}/html/", server.uri()), "test")
-            .await
-            .expect_err("verification redirects should be reported as a DuckDuckGo block");
-
-        assert!(err.to_string().contains("DuckDuckGo blocked"));
-        assert!(err.to_string().contains("SearXNG"));
-    }
-
-    #[tokio::test]
-    async fn test_duckduckgo_request_reports_verification_form_html() {
-        use wiremock::matchers::{method, path, query_param};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/html/"))
-            .and(query_param("q", "test"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<form action="/wr.do?u=https%3A%2F%2Fhtml.duckduckgo.com%2Fhtml%2F"></form>"#,
-            ))
-            .mount(&server)
-            .await;
-
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
-        let err = tool
-            .search_duckduckgo_at(&format!("{}/html/", server.uri()), "test")
-            .await
-            .expect_err("verification HTML should be reported as a DuckDuckGo block");
-
-        assert!(err.to_string().contains("DuckDuckGo blocked"));
-        assert!(err.to_string().contains("SearXNG"));
-    }
-
-    #[tokio::test]
-    async fn test_duckduckgo_request_reports_anomaly_modal_block() {
-        // Regression for #6373: DuckDuckGo's anti-bot page now ships an
-        // `anomaly-modal` interstitial (HTTP 200/202, no `/wr.do?` redirect,
-        // no verification form), and the old detector slid past it,
-        // returning a misleading "No results found" message to the agent.
-        use wiremock::matchers::{method, path, query_param};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/html/"))
-            .and(query_param("q", "test"))
-            .respond_with(ResponseTemplate::new(202).set_body_string(
-                r#"<html><body><div class="anomaly-modal__title">Unusual Traffic Detected</div></body></html>"#,
-            ))
-            .mount(&server)
-            .await;
-
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
-        let err = tool
-            .search_duckduckgo_at(&format!("{}/html/", server.uri()), "test")
-            .await
-            .expect_err("anomaly-modal page should be reported as a DuckDuckGo block");
-
-        assert!(err.to_string().contains("DuckDuckGo blocked"));
-        assert!(err.to_string().contains("SearXNG"));
-    }
-
-    #[tokio::test]
-    async fn test_duckduckgo_request_preserves_normal_empty_results() {
-        use wiremock::matchers::{method, path, query_param};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/html/"))
-            .and(query_param("q", "test"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_string("<html>No results here</html>"),
-            )
-            .mount(&server)
-            .await;
-
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
-        let result = tool
-            .search_duckduckgo_at(&format!("{}/html/", server.uri()), "test")
-            .await
-            .expect("normal empty result HTML should still parse");
-
-        assert!(result.contains("No results found"));
+        let results = vec![LiteSearchResult {
+            title: String::new(),
+            url: "https://example.com".to_string(),
+            snippet: String::new(),
+        }];
+        let result = tool.format_ddg_results(&results, "test").unwrap();
+        assert!(result.contains("No title"));
     }
 
     #[test]
     fn test_constructor_clamps_web_search_limits() {
         let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 0, 0);
-        let html = r#"
-            <a class="result__a" href="https://example.com">Example Title</a>
-            <a class="result__snippet">This is a description</a>
-        "#;
-        let result = tool.parse_duckduckgo_results(html, "test").unwrap();
+        use duckduckgo::response::LiteSearchResult;
+        let results = vec![LiteSearchResult {
+            title: "Example Title".to_string(),
+            url: "https://example.com".to_string(),
+            snippet: "This is a description".to_string(),
+        }];
+        let result = tool.format_ddg_results(&results, "test").unwrap();
         assert!(result.contains("Example Title"));
     }
 

@@ -43,6 +43,14 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = ["c
 tokio-util = { version = "0.7", default-features = false }
 toml = "1.0"
 urlencoding = "2.1"
+duckduckgo = { version = "0.3", default-features = false }
+# NOTE: duckduckgo 0.3.3 pins reqwest ^0.13.3 while the workspace uses
+# reqwest 0.12.  This results in two reqwest versions in the dependency
+# tree (verified in Cargo.lock).  The split is required because
+# duckduckgo::browser::BrowserBuilder::build() creates its own internal
+# reqwest::Client and does not accept a pre-built one; upgrading the
+# workspace reqwest to 0.13 is deferred until the broader ecosystem
+# migrates.
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 which = "8.0"
 
