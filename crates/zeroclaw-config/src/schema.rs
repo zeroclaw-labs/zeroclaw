@@ -9558,6 +9558,12 @@ pub struct MemoryConfig {
     /// Vector width produced by the embedding model — must match the model's native dimension or vectors won't store correctly. Look up the number on the model_provider's model page.
     #[serde(default = "default_embedding_dims")]
     pub embedding_dimensions: usize,
+    /// Optional API key for the embedding endpoint. When set, embedding calls use this key instead of inheriting one from the seed model provider — decoupling embeddings from the chat model. Use it when the chat model runs on a provider that carries no usable embedding credential (e.g. an OAuth-only provider) while embeddings keep hitting an `openai`/`custom:` endpoint with their own key. Leave unset to inherit the seed provider's key (backward-compatible default).
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_api_key: Option<String>,
     /// How heavily vector (semantic) similarity counts when `search_mode = hybrid`. Raise toward 1.0 to favor meaning-based matches; lower it to lean on keyword overlap instead.
     #[serde(default = "default_vector_weight")]
     pub vector_weight: f64,
@@ -9756,6 +9762,7 @@ impl Default for MemoryConfig {
             embedding_provider: default_embedding_provider(),
             embedding_model: default_embedding_model(),
             embedding_dimensions: default_embedding_dims(),
+            embedding_api_key: None,
             vector_weight: default_vector_weight(),
             keyword_weight: default_keyword_weight(),
             search_mode: SearchMode::default(),
@@ -11848,6 +11855,25 @@ pub enum StreamMode {
     MultiMessage,
 }
 
+/// Where a channel registers its skill slash commands. `global` (default)
+/// registers application-wide - the commands work everywhere the bot is, but
+/// Discord takes up to ~1h to propagate changes. `guild` registers to each
+/// guild in `guild_ids`, which propagates instantly (the right choice for fast
+/// iteration and single-server bots). When `guild` is set with an empty
+/// `guild_ids`, the channel logs a warning and falls back to global.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum SlashCommandScope {
+    /// Application-wide commands (propagate in up to ~1h). Default.
+    #[default]
+    Global,
+    /// Commands registered to each guild in `guild_ids` (instant propagation).
+    Guild,
+}
+
 fn default_draft_update_interval_ms() -> u64 {
     1000
 }
@@ -12057,6 +12083,16 @@ pub struct DiscordConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub slash_commands: bool,
+    /// Scope for registered slash commands: `global` (default, application-wide,
+    /// ~1h propagation) or `guild` (registered to each `guild_ids` entry,
+    /// instant). Only meaningful when `slash_commands = true`; `guild` with an
+    /// empty `guild_ids` warns and falls back to global. Switching scope reaps
+    /// owned commands from the now-inactive scope; note that *removing* a guild
+    /// from `guild_ids` (without switching scope) does not reap that guild's
+    /// commands - remove the bot from the guild, or switch scope, to clear them.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub slash_command_scope: SlashCommandScope,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]
@@ -15819,6 +15855,41 @@ impl Config {
         let mut out: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for group in self.peer_groups.values() {
+            let group_matches = match group.channel.split_once('.') {
+                Some((ty, al)) => ty == channel_type && al == alias,
+                None => group.channel == channel_type,
+            };
+            if !group_matches {
+                continue;
+            }
+            for peer in &group.external_peers {
+                let username = peer.as_str().to_string();
+                if seen.insert(username.clone()) {
+                    out.push(username);
+                }
+            }
+        }
+        out
+    }
+
+    /// Voice-peer usernames for `<channel_type>.<alias>` that should always
+    /// receive TTS voice replies.
+    ///
+    /// A `[peer_groups.<name>]` contributes when its `channel` field matches
+    /// (type-wide or dotted) **and** `output_modality = "voice"`.
+    ///
+    /// This is the live-resolve counterpart of `channel_external_peers`,
+    /// filtered to voice-only peer groups. No cache — single source of truth
+    /// is `self.peer_groups`.
+    pub fn channel_voice_peers(&self, channel_type: &str, alias: &str) -> Vec<String> {
+        use crate::multi_agent::OutputModality;
+
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for group in self.peer_groups.values() {
+            if group.output_modality != OutputModality::Voice {
+                continue;
+            }
             let group_matches = match group.channel.split_once('.') {
                 Some((ty, al)) => ty == channel_type && al == alias,
                 None => group.channel == channel_type,
@@ -21429,6 +21500,7 @@ default_temperature = 0.7
             interrupt_on_new_message: false,
             mention_only: false,
             slash_commands: false,
+            slash_command_scope: SlashCommandScope::default(),
             proxy_url: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
@@ -21459,6 +21531,7 @@ default_temperature = 0.7
             interrupt_on_new_message: false,
             mention_only: false,
             slash_commands: false,
+            slash_command_scope: SlashCommandScope::default(),
             proxy_url: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
@@ -23866,6 +23939,32 @@ api_token = "tok"
 
         let _ = build_runtime_proxy_client(&service_key);
         assert!(runtime_proxy_cache_contains(&cache_key));
+    }
+
+    #[test]
+    async fn proxy_reload_applies_new_config_through_rwlock() {
+        set_runtime_proxy_config(ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://boot.example:3128".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            runtime_proxy_config().http_proxy.as_deref(),
+            Some("http://boot.example:3128")
+        );
+
+        set_runtime_proxy_config(ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://reloaded.example:8080".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            runtime_proxy_config().http_proxy.as_deref(),
+            Some("http://reloaded.example:8080"),
+            "RwLock-backed runtime config must reflect the reloaded value"
+        );
+
+        set_runtime_proxy_config(ProxyConfig::default());
     }
 
     #[test]
@@ -29163,6 +29262,117 @@ model_provider = \"ollama.default\"
     // which is #7498.  These tests catch that drift: an empty TOML
     // table (the extreme case of pruning — all fields pruned away)
     // must deserialize to the same value as the struct's `Default`.
+
+    // ── Schema-walked reload round-trip smoke battery ─────────────
+    //
+    // Reload re-reads config.toml and rebuilds the in-memory Config; any
+    // scalar field that does not survive a serialize -> deserialize cycle
+    // is silently lost on reload (the #7498 class). This walks every
+    // scalar prop the derive exposes, mutates it off-default, round-trips
+    // the whole Config through TOML, and asserts the mutated value comes
+    // back. Driven entirely off prop_fields() so it tracks the schema.
+
+    fn values_match(a: &str, b: &str) -> bool {
+        if a == b {
+            return true;
+        }
+        match (a.parse::<f64>(), b.parse::<f64>()) {
+            (Ok(x), Ok(y)) => (x - y).abs() < f64::EPSILON,
+            _ => false,
+        }
+    }
+
+    fn off_default_value_for(
+        field: &crate::traits::PropFieldInfo,
+        current: &str,
+    ) -> Option<String> {
+        match field.kind {
+            PropKind::Bool => Some(if current == "true" { "false" } else { "true" }.to_string()),
+            PropKind::Integer => {
+                let n: i128 = current.parse().unwrap_or(0);
+                Some((n.wrapping_add(7)).to_string())
+            }
+            PropKind::Float => {
+                let n: f64 = current.parse().unwrap_or(0.0);
+                Some(format!("{:.3}", n + 1.5))
+            }
+            PropKind::String => {
+                let probe = "zc_reload_probe";
+                if current == probe {
+                    Some("zc_reload_probe_alt".to_string())
+                } else {
+                    Some(probe.to_string())
+                }
+            }
+            PropKind::Enum => field.enum_variants.and_then(|variants| {
+                variants()
+                    .into_iter()
+                    .find(|v| v != current)
+                    .or_else(|| variants().into_iter().next())
+            }),
+            PropKind::AliasRef
+            | PropKind::StringArray
+            | PropKind::ObjectArray
+            | PropKind::Object => None,
+        }
+    }
+
+    #[test]
+    async fn every_scalar_field_survives_toml_reload_round_trip() {
+        let mut config = Config::default();
+        let fields = config.prop_fields();
+
+        let mut mutated: Vec<(String, String)> = Vec::new();
+        let mut skipped_non_scalar = 0usize;
+        let mut skipped_unsettable = 0usize;
+
+        for field in &fields {
+            if field.is_secret {
+                continue;
+            }
+            let Ok(current) = config.get_prop(&field.name) else {
+                skipped_unsettable += 1;
+                continue;
+            };
+            let Some(target) = off_default_value_for(field, &current) else {
+                skipped_non_scalar += 1;
+                continue;
+            };
+            if config.set_prop(&field.name, &target).is_err() {
+                skipped_unsettable += 1;
+                continue;
+            }
+            mutated.push((field.name.clone(), target));
+        }
+
+        let serialized = toml::to_string(&config).expect("mutated config must serialize");
+        let reloaded: Config =
+            toml::from_str(&serialized).expect("serialized config must deserialize");
+
+        let mut lost: Vec<String> = Vec::new();
+        for (name, expected) in &mutated {
+            match reloaded.get_prop(name) {
+                Ok(got) if values_match(&got, expected) => {}
+                Ok(got) => lost.push(format!("{name}: set {expected:?}, reloaded {got:?}")),
+                Err(e) => lost.push(format!("{name}: set {expected:?}, reload read failed: {e}")),
+            }
+        }
+
+        assert!(
+            lost.is_empty(),
+            "{} scalar field(s) did not survive a TOML reload round-trip ({} mutated, {} non-scalar skipped, {} unsettable skipped):\n{}",
+            lost.len(),
+            mutated.len(),
+            skipped_non_scalar,
+            skipped_unsettable,
+            lost.join("\n")
+        );
+        assert!(
+            mutated.len() > 100,
+            "smoke battery covered only {} scalar fields; schema walk likely regressed",
+            mutated.len()
+        );
+    }
 
     #[test]
     async fn empty_table_round_trips_to_http_request_config_default() {

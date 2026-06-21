@@ -6101,6 +6101,7 @@ mod tests {
         crate::skills::Skill {
             name: name.to_string(),
             description: format!("{name} skill"),
+            description_localizations: Default::default(),
             version: "0.1.0".to_string(),
             author: None,
             tags: vec![],
@@ -6193,6 +6194,7 @@ mod tests {
         let skill = Skill {
             name: "ops".to_string(),
             description: "d".to_string(),
+            description_localizations: Default::default(),
             version: "1".to_string(),
             author: None,
             tags: vec![],
@@ -6474,6 +6476,7 @@ mod tests {
             .workspace_dir(ws_dir.clone())
             .model_name("test-model".into())
             .temperature(Some(0.0))
+            .prompt_builder(SystemPromptBuilder::default())
             .build()
             .expect("agent builder should succeed with valid config");
 
@@ -6498,6 +6501,7 @@ mod tests {
             .workspace_dir(ws_dir)
             .model_name("test-model".into())
             .temperature(Some(0.0))
+            .prompt_builder(SystemPromptBuilder::default())
             .build()
             .expect("agent builder should succeed with valid config");
 

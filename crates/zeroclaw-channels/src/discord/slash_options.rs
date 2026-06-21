@@ -82,6 +82,10 @@ pub struct Choice {
 pub struct OptionSpec {
     pub name: String,
     pub description: String,
+    /// Discord-locale-keyed translations of `description` (from the skill
+    /// manifest, filtered to supported locale codes). Empty → no
+    /// `description_localizations` key is registered for this option.
+    pub description_localizations: std::collections::BTreeMap<String, String>,
     pub kind: OptKind,
     pub required: bool,
     pub choices: Vec<Choice>,
@@ -133,6 +137,12 @@ impl OptionSpec {
         let mut obj = Map::new();
         obj.insert("name".to_string(), json!(self.name));
         obj.insert("description".to_string(), json!(self.description));
+        if !self.description_localizations.is_empty() {
+            obj.insert(
+                "description_localizations".to_string(),
+                json!(self.description_localizations),
+            );
+        }
         obj.insert("type".to_string(), json!(self.kind.wire_type()));
         obj.insert("required".to_string(), json!(self.required));
 
@@ -260,6 +270,7 @@ mod tests {
         OptionSpec {
             name: name.to_string(),
             description: format!("{name} option"),
+            description_localizations: Default::default(),
             kind,
             required,
             choices: Vec::new(),

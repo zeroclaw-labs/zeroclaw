@@ -122,6 +122,7 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
+use zeroclaw_runtime::agent::history::fast_trim_tool_results;
 use zeroclaw_runtime::agent::loop_::{
     LoopKnobs, ToolLoop, apply_policy_tool_filter, apply_text_tool_prompt_policy,
     build_tool_instructions_for_names, clear_model_switch_request, get_model_switch_state,
@@ -1831,13 +1832,35 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
     true
 }
 
+/// Number of most-recent turns whose tool-result payloads are kept at full size
+/// when proactively trimming. The active exchange stays intact; only older
+/// tool results are shrunk to a bounded extract.
+const PROACTIVE_TRIM_PROTECT_LAST_N: usize = 4;
+
 /// Proactively trim conversation turns so that the total estimated character
-/// count stays within [`PROACTIVE_CONTEXT_BUDGET_CHARS`].  Drops the oldest
-/// turns first, but always preserves the most recent turn (the current user
-/// message).  Returns the number of turns dropped.
+/// count stays within [`PROACTIVE_CONTEXT_BUDGET_CHARS`].
+///
+/// Tool-result content is the bulk of an overflowing channel history, so before
+/// dropping any whole turns this first shrinks older `tool`-role payloads to a
+/// bounded head-extract in place (via [`fast_trim_tool_results`]). A trimmed
+/// tool result still tells the model what the tool returned; a *dropped* turn is
+/// gone entirely, which is what makes the bot "respond as if previous messages
+/// don't exist" (#6517). Only if the in-place extracts are still over budget are
+/// the oldest whole turns dropped, and the most recent turn (the current user
+/// message) is always preserved. Returns the number of whole turns dropped.
 fn proactive_trim_turns(turns: &mut Vec<ChatMessage>, budget: usize) -> usize {
     let total_chars: usize = turns.iter().map(|t| t.content.chars().count()).sum();
     if total_chars <= budget || turns.len() <= 1 {
+        return 0;
+    }
+
+    // Content-preserving pre-pass: shrink old tool-result payloads in place,
+    // keeping the messages and their tool-call pairing intact.
+    fast_trim_tool_results(turns, PROACTIVE_TRIM_PROTECT_LAST_N);
+
+    // Recompute after the in-place shrink — we may now fit with no turns dropped.
+    let total_chars: usize = turns.iter().map(|t| t.content.chars().count()).sum();
+    if total_chars <= budget {
         return 0;
     }
 
@@ -5978,6 +6001,11 @@ fn build_channel_by_id(
                 Arc::new(move || cfg_arc.read().channel_external_peers("telegram", &alias))
             };
             let workspace_dir = one_shot_channel_workspace_dir(&config, "telegram", &alias);
+            let voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || cfg_arc.read().channel_voice_peers("telegram", &alias))
+            };
             Ok(Arc::new(
                 TelegramChannel::new(
                     tg.bot_token.clone(),
@@ -5985,13 +6013,13 @@ fn build_channel_by_id(
                     peer_resolver,
                     tg.mention_only,
                 )
+                .with_voice_peer_resolver(voice_peer_resolver)
                 .with_persistence(config_arc.clone())
                 .with_api_base(tg.api_base_url.clone())
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_transcription(config.transcription.clone())
                 .with_tts(&config)
-                .with_voice_peer_prefs(&config, "telegram", alias)
                 .with_workspace_dir(workspace_dir)
                 .with_approval_timeout_secs(tg.approval_timeout_secs),
             ))
@@ -6984,6 +7012,11 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_external_peers("telegram", &alias))
         };
+        let voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || cfg_arc.read().channel_voice_peers("telegram", &alias))
+        };
         channels.push(ConfiguredChannel {
             display_name: "Telegram",
             alias: Some(alias.clone()),
@@ -6995,13 +7028,13 @@ fn collect_configured_channels(
                         peer_resolver,
                         tg.mention_only,
                     )
+                    .with_voice_peer_resolver(voice_peer_resolver)
                     .with_persistence(config_arc.clone())
                     .with_api_base(tg.api_base_url.clone())
                     .with_ack_reactions(ack)
                     .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                     .with_transcription(config.transcription.clone())
                     .with_tts(&config)
-                    .with_voice_peer_prefs(&config, "telegram", alias)
                     .with_workspace_dir(config.channel_workspace_dir(&format!("telegram.{alias}")))
                     .with_proxy_url(tg.proxy_url.clone())
                     .with_tool_command_specs(tool_specs.to_vec())
@@ -7056,6 +7089,7 @@ fn collect_configured_channels(
         .with_stall_timeout(dc.stall_timeout_secs)
         .with_approval_timeout_secs(dc.approval_timeout_secs)
         .with_slash_commands(dc.slash_commands)
+        .with_slash_command_scope(dc.slash_command_scope)
         .with_intents_mask(dc.intents_mask)
         .with_reaction_notifications(dc.reaction_notifications);
         if dc.slash_commands {
@@ -11402,6 +11436,50 @@ api_key = "anthropic-key"
         let dropped = proactive_trim_turns(&mut turns, 100);
         assert_eq!(dropped, 0, "single turn must never be dropped");
         assert_eq!(turns.len(), 1);
+    }
+
+    // #6517: large tool-result content is shrunk to a bounded extract in place
+    // before any whole turn is dropped, so the model keeps a record of what each
+    // tool returned instead of losing entire old turns ("responding as if
+    // previous messages don't exist").
+    #[test]
+    fn proactive_trim_shrinks_tool_results_before_dropping_turns() {
+        let mut turns: Vec<ChatMessage> = Vec::new();
+        for _ in 0..4 {
+            turns.push(ChatMessage::tool("x".repeat(5000)));
+        }
+        // Recent (protected) text turns; no tool payloads here.
+        turns.push(ChatMessage::user("u1".to_string()));
+        turns.push(ChatMessage::assistant("a1".to_string()));
+        turns.push(ChatMessage::user("u2".to_string()));
+        turns.push(ChatMessage::assistant("a2".to_string()));
+
+        let len_before = turns.len();
+        let total_before: usize = turns.iter().map(|t| t.content.chars().count()).sum();
+        let budget = 12_000;
+        assert!(total_before > budget, "test setup must start over budget");
+
+        let dropped = proactive_trim_turns(&mut turns, budget);
+
+        assert_eq!(
+            dropped, 0,
+            "in-place tool-result shrink should bring it under budget with no whole-turn drops"
+        );
+        assert_eq!(turns.len(), len_before, "no whole turn should be removed");
+        assert_eq!(
+            turns.iter().filter(|t| t.role == "tool").count(),
+            4,
+            "every tool turn must survive (shrunk, not dropped)"
+        );
+        assert!(
+            turns[0].content.chars().count() < 5000,
+            "an old tool result must be shrunk in place"
+        );
+        let total_after: usize = turns.iter().map(|t| t.content.chars().count()).sum();
+        assert!(
+            total_after <= budget,
+            "must be within budget after the in-place shrink: {total_after}"
+        );
     }
 
     #[test]
@@ -15848,6 +15926,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let skills = vec![zeroclaw_runtime::skills::Skill {
             name: "code-review".into(),
             description: "Review code for bugs".into(),
+            description_localizations: Default::default(),
             version: "1.0.0".into(),
             author: None,
             tags: vec![],
@@ -15890,6 +15969,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let skills = vec![zeroclaw_runtime::skills::Skill {
             name: "code-review".into(),
             description: "Review code for bugs".into(),
+            description_localizations: Default::default(),
             version: "1.0.0".into(),
             author: None,
             tags: vec![],
@@ -15942,6 +16022,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let skills = vec![zeroclaw_runtime::skills::Skill {
             name: "code<review>&".into(),
             description: "Review \"unsafe\" and 'risky' bits".into(),
+            description_localizations: Default::default(),
             version: "1.0.0".into(),
             author: None,
             tags: vec![],

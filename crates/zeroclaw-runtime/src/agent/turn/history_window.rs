@@ -15,12 +15,13 @@ pub(crate) fn preflight_history_maintenance(
     if context_token_budget > 0 {
         let estimated = estimate_history_tokens(history);
         if estimated > context_token_budget {
-            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"estimated": estimated, "budget": context_token_budget, "iteration": iteration + 1})), "Preemptive context trim: estimated tokens exceed budget");
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Delete).with_category(::zeroclaw_log::EventCategory::Agent).with_attrs(::serde_json::json!({"estimated": estimated, "budget": context_token_budget, "iteration": iteration + 1})), "Preemptive context trim: estimated tokens exceed budget");
             let chars_saved = fast_trim_tool_results(history, 4);
             if chars_saved > 0 {
                 ::zeroclaw_log::record!(
                     INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Delete)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
                         .with_attrs(::serde_json::json!({"chars_saved": chars_saved})),
                     "Preemptive fast-trim applied"
                 );
@@ -38,7 +39,7 @@ pub(crate) fn preflight_history_maintenance(
                     },
                 );
                 if stats.dropped_messages > 0 || stats.collapsed_pairs > 0 {
-                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"collapsed": stats.collapsed_pairs, "dropped": stats.dropped_messages})), "Preemptive history prune applied");
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Delete).with_category(::zeroclaw_log::EventCategory::Agent).with_attrs(::serde_json::json!({"collapsed": stats.collapsed_pairs, "dropped": stats.dropped_messages})), "Preemptive history prune applied");
                 }
             }
         }
@@ -52,7 +53,8 @@ pub(crate) fn preflight_history_maintenance(
     if !pruned_in_loop.is_empty() {
         ::zeroclaw_log::record!(
             WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Delete)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                 .with_attrs(::serde_json::json!({
                     "removed": pruned_in_loop.removed,
