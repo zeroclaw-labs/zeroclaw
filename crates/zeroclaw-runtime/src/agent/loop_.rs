@@ -265,14 +265,14 @@ pub(crate) fn filter_channel_builtin_tools(
     if tools_registry.len() != before_filter {
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_attrs(::serde_json::json!({
                     "before": before_filter,
                     "retained": tools_registry.len(),
                     "policy_allowed": security.allowed_tools.as_ref().map(|v| v.len()),
                     "policy_excluded": security.excluded_tools.as_ref().map(|v| v.len()),
-                })
-            ),
+                })),
             "Applied capability-based tool access filter (process_message)"
         );
     }
@@ -972,7 +972,8 @@ pub async fn run(
         };
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                .with_category(::zeroclaw_log::EventCategory::Memory)
                 .with_attrs(::serde_json::json!({"backend": mem.name()})),
             "Memory initialized"
         );
@@ -981,7 +982,8 @@ pub async fn run(
         if !peripheral_overrides.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
                     .with_attrs(::serde_json::json!({"peripherals": peripheral_overrides})),
                 "Peripheral overrides from CLI (config boards take precedence)"
             );
@@ -1049,7 +1051,8 @@ pub async fn run(
         if count > 0 {
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Register)
+                    .with_category(::zeroclaw_log::EventCategory::Channel)
                     .with_attrs(::serde_json::json!({"count": count})),
                 &format!("Registered {} channel(s) for CLI agent", count),
             );
@@ -1063,7 +1066,8 @@ pub async fn run(
         if !peripheral_tools.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
                     .with_attrs(::serde_json::json!({"count": peripheral_tools.len()})),
                 "Peripheral tools added"
             );
@@ -1085,7 +1089,8 @@ pub async fn run(
         if tools_registry.len() != before_filter {
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
                     .with_attrs(::serde_json::json!({
                         "before": before_filter,
                         "retained": tools_registry.len(),
@@ -1115,7 +1120,8 @@ pub async fn run(
         if config.mcp.enabled && !config.mcp.servers.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                    .with_category(::zeroclaw_log::EventCategory::Tool),
                 &format!(
                     "Initializing MCP client — {} server(s) configured",
                     config.mcp.servers.len()
@@ -1137,8 +1143,9 @@ pub async fn run(
                             INFO,
                             ::zeroclaw_log::Event::new(
                                 module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            ),
+                                ::zeroclaw_log::Action::Load
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Tool),
                             &format!(
                                 "MCP deferred: {} tool stub(s) from {} server(s)",
                                 deferred_set.len(),
@@ -1214,8 +1221,9 @@ pub async fn run(
                             INFO,
                             ::zeroclaw_log::Event::new(
                                 module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            ),
+                                ::zeroclaw_log::Action::Register
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Tool),
                             &format!(
                                 "MCP: {} tool(s) registered from {} server(s), {} skipped by policy",
                                 registered,
@@ -1229,6 +1237,7 @@ pub async fn run(
                     ::zeroclaw_log::record!(
                         ERROR,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                         "MCP registry failed to initialize"
@@ -1246,6 +1255,7 @@ pub async fn run(
                 ::zeroclaw_log::record!(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({"agent_alias": agent_alias})),
                     "agent loop refused: agent.model_provider unresolved and no --provider override"
@@ -1326,7 +1336,8 @@ pub async fn run(
         if let Some(ref rag) = hardware_rag {
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
                     .with_attrs(::serde_json::json!({"chunks": rag.len()})),
                 "Hardware RAG loaded"
             );
@@ -1583,6 +1594,7 @@ pub async fn run(
                                 module_path!(),
                                 ::zeroclaw_log::Action::Note
                             )
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
                             .with_attrs(::serde_json::json!({"thinking_level": level})),
                             "Thinking directive parsed from message"
                         );
@@ -1764,8 +1776,9 @@ pub async fn run(
                                 INFO,
                                 ::zeroclaw_log::Event::new(
                                     module_path!(),
-                                    ::zeroclaw_log::Action::Note
-                                ),
+                                    ::zeroclaw_log::Action::Migrate
+                                )
+                                .with_category(::zeroclaw_log::EventCategory::Provider),
                                 &format!(
                                     "Model switch requested, switching from {} {} to {} {}",
                                     provider_name, model_name, new_model_provider, new_model
@@ -1830,8 +1843,9 @@ pub async fn run(
                                 INFO,
                                 ::zeroclaw_log::Event::new(
                                     module_path!(),
-                                    ::zeroclaw_log::Action::Note
+                                    ::zeroclaw_log::Action::Register
                                 )
+                                .with_category(::zeroclaw_log::EventCategory::Agent)
                                 .with_attrs(::serde_json::json!({"slug": slug})),
                                 "Auto-created skill from execution"
                             );
@@ -1841,8 +1855,9 @@ pub async fn run(
                                 DEBUG,
                                 ::zeroclaw_log::Event::new(
                                     module_path!(),
-                                    ::zeroclaw_log::Action::Note
-                                ),
+                                    ::zeroclaw_log::Action::Skip
+                                )
+                                .with_category(::zeroclaw_log::EventCategory::Agent),
                                 "Skill creation skipped (duplicate or disabled)"
                             );
                         }
@@ -1850,9 +1865,10 @@ pub async fn run(
                             WARN,
                             ::zeroclaw_log::Event::new(
                                 module_path!(),
-                                ::zeroclaw_log::Action::Note
+                                ::zeroclaw_log::Action::Fail
                             )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                             "Skill creation failed"
                         ),
@@ -2014,6 +2030,7 @@ pub async fn run(
                                     module_path!(),
                                     ::zeroclaw_log::Action::Note
                                 )
+                                .with_category(::zeroclaw_log::EventCategory::Agent)
                                 .with_attrs(::serde_json::json!({"thinking_level": level})),
                                 "Thinking directive parsed"
                             );
@@ -2248,8 +2265,9 @@ pub async fn run(
                                     INFO,
                                     ::zeroclaw_log::Event::new(
                                         module_path!(),
-                                        ::zeroclaw_log::Action::Note
-                                    ),
+                                        ::zeroclaw_log::Action::Migrate
+                                    )
+                                    .with_category(::zeroclaw_log::EventCategory::Provider),
                                     &format!(
                                         "Model switch requested, switching from {} {} to {} {}",
                                         provider_name, model_name, new_model_provider, new_model
@@ -2301,9 +2319,9 @@ pub async fn run(
                                     WARN,
                                     ::zeroclaw_log::Event::new(
                                         module_path!(),
-                                        ::zeroclaw_log::Action::Note
+                                        ::zeroclaw_log::Action::Retry
                                     )
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                                    .with_category(::zeroclaw_log::EventCategory::Agent),
                                     "Context overflow in interactive loop, attempting recovery"
                                 );
                                 let mut compressor =
@@ -2328,8 +2346,10 @@ pub async fn run(
                                             INFO,
                                             ::zeroclaw_log::Event::new(
                                                 module_path!(),
-                                                ::zeroclaw_log::Action::Note
-                                            ),
+                                                ::zeroclaw_log::Action::Retry
+                                            )
+                                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                                            .with_outcome(::zeroclaw_log::EventOutcome::Success),
                                             "Context recovered via compression, retrying turn"
                                         );
                                         continue;
@@ -2339,14 +2359,15 @@ pub async fn run(
                                             WARN,
                                             ::zeroclaw_log::Event::new(
                                                 module_path!(),
-                                                ::zeroclaw_log::Action::Note
+                                                ::zeroclaw_log::Action::Fail
                                             )
-                                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
                                             "Compression ran but couldn't reduce enough"
                                         );
                                     }
                                     Err(compress_err) => {
-                                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", compress_err)})), "Compression failed during recovery");
+                                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Agent).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{}", compress_err)})), "Compression failed during recovery");
                                     }
                                 }
                             }
@@ -2392,7 +2413,7 @@ pub async fn run(
                         .await
                     {
                         Ok(result) if result.compressed => {
-                            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"passes": result.passes_used, "before": result.tokens_before, "after": result.tokens_after})), "Context compression complete");
+                            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete).with_category(::zeroclaw_log::EventCategory::Agent).with_outcome(::zeroclaw_log::EventOutcome::Success).with_attrs(::serde_json::json!({"passes": result.passes_used, "before": result.tokens_before, "after": result.tokens_after})), "Context compression complete");
                         }
                         Ok(_) => {} // No compression needed
                         Err(e) => {
@@ -2400,9 +2421,10 @@ pub async fn run(
                                 WARN,
                                 ::zeroclaw_log::Event::new(
                                     module_path!(),
-                                    ::zeroclaw_log::Action::Note
+                                    ::zeroclaw_log::Action::Fail
                                 )
-                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_category(::zeroclaw_log::EventCategory::Agent)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                                 .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                                 "Context compression failed, falling back to history trim"
                             );
@@ -2602,7 +2624,8 @@ pub async fn process_message(
         if count > 0 {
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Register)
+                    .with_category(::zeroclaw_log::EventCategory::Channel)
                     .with_attrs(::serde_json::json!({"count": count})),
                 &format!("Registered {} channel(s) for process_message agent", count),
             );
@@ -2635,7 +2658,8 @@ pub async fn process_message(
         if config.mcp.enabled && !config.mcp.servers.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                    .with_category(::zeroclaw_log::EventCategory::Tool),
                 &format!(
                     "Initializing MCP client — {} server(s) configured",
                     config.mcp.servers.len()
@@ -2655,8 +2679,9 @@ pub async fn process_message(
                             INFO,
                             ::zeroclaw_log::Event::new(
                                 module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            ),
+                                ::zeroclaw_log::Action::Load
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Tool),
                             &format!(
                                 "MCP deferred: {} tool stub(s) from {} server(s)",
                                 deferred_set.len(),
@@ -2730,8 +2755,9 @@ pub async fn process_message(
                             INFO,
                             ::zeroclaw_log::Event::new(
                                 module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            ),
+                                ::zeroclaw_log::Action::Register
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Tool),
                             &format!(
                                 "MCP: {} tool(s) registered from {} server(s), {} skipped by policy",
                                 registered,
@@ -2745,6 +2771,7 @@ pub async fn process_message(
                     ::zeroclaw_log::record!(
                         ERROR,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                         "MCP registry failed to initialize"
@@ -2964,6 +2991,7 @@ pub async fn process_message(
                     ::zeroclaw_log::record!(
                         INFO,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
                             .with_attrs(::serde_json::json!({"thinking_level": level})),
                         "Thinking directive parsed from message"
                     );
@@ -4163,6 +4191,10 @@ mod tests {
             text: String,
             reasoning: String,
         },
+        NarrationThenToolCall {
+            narration_chunks: Vec<String>,
+            tool_call: ToolCall,
+        },
     }
 
     struct StreamingNativeToolEventModelProvider {
@@ -4273,6 +4305,18 @@ mod tests {
                         Ok(StreamEvent::TextDelta(StreamChunk::delta(text))),
                         Ok(StreamEvent::Final),
                     ]))
+                }
+                NativeStreamTurn::NarrationThenToolCall {
+                    narration_chunks,
+                    tool_call,
+                } => {
+                    let mut events: Vec<_> = narration_chunks
+                        .into_iter()
+                        .map(|text| Ok(StreamEvent::TextDelta(StreamChunk::delta(text))))
+                        .collect();
+                    events.push(Ok(StreamEvent::ToolCall(tool_call)));
+                    events.push(Ok(StreamEvent::Final));
+                    Box::pin(futures_util::stream::iter(events))
                 }
             }
         }
@@ -9191,6 +9235,190 @@ This is an example, not an invocation."#;
         );
         assert_eq!(model_provider.chat_calls.load(Ordering::SeqCst), 0);
         assert_eq!(visible_deltas, "done");
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_does_not_duplicate_streamed_narration_before_native_tool_call() {
+        let narration = "About to check the count.";
+        let model_provider = StreamingNativeToolEventModelProvider::with_turns(vec![
+            NativeStreamTurn::NarrationThenToolCall {
+                narration_chunks: vec!["About to ".to_string(), "check the count.".to_string()],
+                tool_call: ToolCall {
+                    id: "call_narrate_1".to_string(),
+                    name: "count_tool".to_string(),
+                    arguments: r#"{"value":"A"}"#.to_string(),
+                    extra_content: None,
+                },
+            },
+            NativeStreamTurn::Text("done".to_string()),
+        ]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("narrate then run native tool"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
+
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "telegram",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 5,
+            cancellation_token: None,
+            on_delta: Some(tx),
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            ingress: IngressContext::internal(),
+        })
+        .await
+        .expect("narration-then-tool streaming should preserve tool loop semantics");
+
+        let mut accumulated = String::new();
+        let mut text_deltas: Vec<String> = Vec::new();
+        while let Some(delta) = rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                accumulated.push_str(&text);
+                text_deltas.push(text);
+            }
+        }
+
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert!(
+            result.ends_with("done"),
+            "final response should end with 'done', got: {result}"
+        );
+        assert_eq!(
+            accumulated.matches(narration).count(),
+            1,
+            "narration must appear exactly once in the accumulated draft; deltas={text_deltas:?} accumulated={accumulated:?}"
+        );
+        assert!(
+            result.contains("done"),
+            "final turn must not be truncated; got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_preserves_guard_withheld_narration_tail_before_tool_call() {
+        let narration_full = "Checking <tool";
+        let model_provider = StreamingNativeToolEventModelProvider::with_turns(vec![
+            NativeStreamTurn::NarrationThenToolCall {
+                narration_chunks: vec!["Checking ".to_string(), "<tool".to_string()],
+                tool_call: ToolCall {
+                    id: "call_tail_1".to_string(),
+                    name: "count_tool".to_string(),
+                    arguments: r#"{"value":"A"}"#.to_string(),
+                    extra_content: None,
+                },
+            },
+            NativeStreamTurn::Text("done".to_string()),
+        ]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("narrate with a guard-buffered tail then run a native tool"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
+
+        let result = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &tools_registry,
+            observer: &observer,
+            provider_name: "mock-provider",
+            model: "mock-model",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "telegram",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 5,
+            cancellation_token: None,
+            on_delta: Some(tx),
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            ingress: IngressContext::internal(),
+        })
+        .await
+        .expect("guard-withheld narration tail should not break the tool loop");
+
+        let mut accumulated = String::new();
+        let mut text_deltas: Vec<String> = Vec::new();
+        while let Some(delta) = rx.recv().await {
+            if let StreamDelta::Text(text) = delta {
+                accumulated.push_str(&text);
+                text_deltas.push(text);
+            }
+        }
+
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert!(
+            accumulated.contains(narration_full),
+            "guard-withheld tail must still reach the draft exactly once; deltas={text_deltas:?} accumulated={accumulated:?}"
+        );
+        assert_eq!(
+            accumulated.matches("<tool").count(),
+            1,
+            "narration tail must not be duplicated; deltas={text_deltas:?} accumulated={accumulated:?}"
+        );
+        assert!(
+            result.ends_with("done"),
+            "final turn must not be truncated; got: {result}"
+        );
     }
 
     #[tokio::test]
