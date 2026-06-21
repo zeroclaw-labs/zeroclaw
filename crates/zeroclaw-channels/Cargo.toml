@@ -19,7 +19,7 @@ zeroclaw-tool-call-parser.workspace = true
 zeroclaw-tools.workspace = true
 anyhow = "1.0"
 lru = "0.16"
-rumqttc = { version = "0.25", optional = true }
+rumqttc = { version = "0.25", optional = true, features = ["use-rustls-no-provider"] }
 lapin = { version = "2", optional = true, default-features = false, features = [
   "rustls",
 ] }
