@@ -1149,13 +1149,13 @@ pub async fn handle_section_select(
             ("memory".to_string(), true)
         }
         Section::Tunnel => {
-            if let Err(e) = working.set_prop_persistent("tunnel.tunnel-provider", &key) {
+            if let Err(e) = working.set_prop_persistent("tunnel.tunnel_provider", &key) {
                 return error_response(
                     ConfigApiError::new(
                         ConfigApiCode::ValidationFailed,
-                        format!("could not set tunnel.tunnel-provider = `{key}`: {e}"),
+                        format!("could not set tunnel.tunnel_provider = `{key}`: {e}"),
                     )
-                    .with_path("tunnel.tunnel-provider"),
+                    .with_path("tunnel.tunnel_provider"),
                 );
             }
             let prefix = if key == "none" {
@@ -1383,6 +1383,80 @@ mod tests {
 
     fn empty_cfg() -> zeroclaw_config::schema::Config {
         zeroclaw_config::schema::Config::default()
+    }
+
+    fn section_test_state(config: zeroclaw_config::schema::Config) -> AppState {
+        let memory: std::sync::Arc<dyn zeroclaw_api::memory_traits::Memory> =
+            std::sync::Arc::new(zeroclaw_memory::NoneMemory::new("none"));
+        AppState {
+            config: std::sync::Arc::new(parking_lot::RwLock::new(config)),
+            model_provider: std::sync::Arc::new(crate::UnconfiguredModelProvider),
+            model: "test-model".to_string(),
+            temperature: None,
+            mem: memory.clone(),
+            memory_strategy: std::sync::Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    memory,
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: std::sync::Arc::new(zeroclaw_runtime::security::pairing::PairingGuard::new(
+                false,
+                &[],
+            )),
+            trust_forwarded_headers: false,
+            rate_limiter: std::sync::Arc::new(crate::GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: std::sync::Arc::new(crate::auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: std::sync::Arc::new(crate::IdempotencyStore::new(
+                std::time::Duration::from_secs(300),
+                1000,
+            )),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-wati")]
+            wati: std::collections::HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: std::sync::Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            tools_registry: std::sync::Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: std::sync::Arc::new(crate::sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: std::sync::Arc::new(crate::nodes::NodeRegistry::new(16)),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+            cancel_tokens: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            pending_reload: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+        }
     }
 
     #[test]
@@ -1640,7 +1714,7 @@ mod tests {
     fn tunnel_picker_marks_active_provider_from_configured_section() {
         let mut cfg = empty_cfg();
         // Persist `tailscale` as the active provider. The Option<T> field
-        // stays None — only `tunnel.tunnel-provider` is what marks
+        // stays None — only `tunnel.tunnel_provider` is what marks
         // "active" in the picker. The provider is statically known from
         // the schema regardless of the Option being Some/None.
         // Set the active-provider field directly; the picker reads it via
@@ -1655,7 +1729,7 @@ mod tests {
         assert_eq!(
             active,
             vec!["tailscale"],
-            "exactly one entry should be active after setting `tunnel.tunnel-provider = tailscale`"
+            "exactly one entry should be active after setting `tunnel.tunnel_provider = tailscale`"
         );
         assert_eq!(
             items[0].key, "none",
@@ -1664,7 +1738,7 @@ mod tests {
     }
 
     /// When an `Option<Tunnel>` is `Some(_)`, its picker entry is badged
-    /// `configured` (independent of `tunnel.tunnel-provider`). This is
+    /// `configured` (independent of `tunnel.tunnel_provider`). This is
     /// the parallel of `schema_walk_picker`'s HashMap "configured" badge
     /// — same UX cue, sourced from the schema's `is_some()` snapshot.
     #[test]
@@ -1695,6 +1769,37 @@ mod tests {
             "tailscale's Option is None, so no badge; got: {:?}",
             tailscale.badge
         );
+    }
+
+    #[tokio::test]
+    async fn tunnel_select_updates_canonical_provider_and_active_picker_badge() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        let state = section_test_state(cfg);
+
+        let response = handle_section_select(
+            State(state.clone()),
+            axum::http::HeaderMap::new(),
+            axum::extract::Path(SectionItemPath {
+                section: "tunnel".to_string(),
+                key: "cloudflare".to_string(),
+            }),
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let cfg = state.config.read().clone();
+        assert_eq!(cfg.tunnel.tunnel_provider, "cloudflare");
+        let items = tunnel_provider_picker(&cfg);
+        let cloudflare = items
+            .iter()
+            .find(|item| item.key == "cloudflare")
+            .expect("cloudflare should appear in the picker");
+        assert_eq!(cloudflare.badge.as_deref(), Some("active"));
     }
 
     /// Empty OneTierAliasMap section yields zero picker items. No
