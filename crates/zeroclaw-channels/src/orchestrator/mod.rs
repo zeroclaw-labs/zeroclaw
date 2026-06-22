@@ -1037,59 +1037,48 @@ fn timestamp_channel_user_content(content: &str) -> String {
     format!("[{}] {}", now.format("%Y-%m-%d %H:%M:%S %Z"), content)
 }
 
-fn channel_history_content_for_user_turn(content: &str) -> String {
-    let (cleaned, image_refs) = zeroclaw_providers::multimodal::parse_image_markers(content);
-    if image_refs.is_empty() {
-        return content.to_string();
-    }
-
-    let mut cleaned = cleaned.trim().to_string();
-    while cleaned.contains("\n\n\n") {
-        cleaned = cleaned.replace("\n\n\n", "\n\n");
-    }
-
-    if cleaned.is_empty() {
-        "[Image attachment processed by vision model]".to_string()
-    } else {
-        cleaned
-    }
-}
-
-fn restore_current_user_turn_media_payload(
-    turns: &mut [ChatMessage],
-    history_content: &str,
-    full_content: &str,
-) {
-    if history_content == full_content {
-        return;
-    }
-
-    if let Some(turn) = turns
-        .iter_mut()
-        .rev()
-        .find(|turn| turn.role == "user" && turn.content == history_content)
-    {
-        turn.content = full_content.to_string();
-    }
-}
-
-fn strip_historical_image_payloads(turns: &mut Vec<ChatMessage>) {
+/// Collapse only heavy inline `data:` image payloads in historical turns while
+/// preserving re-loadable `[IMAGE:<path>]` file references, so a later turn can
+/// re-inflate from disk (#8151) without re-sending megabytes of base64 every
+/// request (#3460). File-path and placeholder markers pass through untouched.
+fn collapse_inline_image_payloads(turns: &mut [ChatMessage]) {
     if turns.len() <= 1 {
         return;
     }
-
     let last_idx = turns.len() - 1;
     for turn in &mut turns[..last_idx] {
-        if turn.content.contains("[IMAGE:") {
-            turn.content = channel_history_content_for_user_turn(&turn.content);
+        if turn.role != "user" || !turn.content.contains("[IMAGE:data:") {
+            continue;
+        }
+        let (_, refs) = zeroclaw_providers::multimodal::parse_image_markers(&turn.content);
+        if refs.iter().any(|r| r.starts_with("data:")) {
+            turn.content = strip_inline_data_image_markers(&turn.content);
         }
     }
+}
 
-    let current = turns.pop();
-    turns.retain(|turn| !turn.content.trim().is_empty());
-    if let Some(current) = current {
-        turns.push(current);
+fn strip_inline_data_image_markers(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut cursor = 0usize;
+    while let Some(rel) = content[cursor..].find("[IMAGE:data:") {
+        let start = cursor + rel;
+        out.push_str(&content[cursor..start]);
+        match content[start..].find(']') {
+            Some(rel_end) => {
+                out.push_str("[Image attachment omitted from history]");
+                cursor = start + rel_end + 1;
+            }
+            None => {
+                out.push_str(&content[start..]);
+                cursor = content.len();
+                break;
+            }
+        }
     }
+    if cursor < content.len() {
+        out.push_str(&content[cursor..]);
+    }
+    out.trim().to_string()
 }
 
 fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
@@ -4269,7 +4258,7 @@ async fn process_channel_message_body(
             return;
         }
     };
-    let history_user_content = channel_history_content_for_user_turn(&msg.content);
+    let history_user_content = msg.content.clone();
     if ctx.auto_save_memory
         && history_user_content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
         && !zeroclaw_memory::should_skip_autosave_content(&history_user_content)
@@ -4311,19 +4300,18 @@ async fn process_channel_message_body(
             .is_some_and(|turns| !turns.is_empty())
     };
 
-    // Preserve the dated user turn before the LLM call so interrupted requests
-    // keep the same temporal context as CLI turns. Keep history compact so
-    // inline image payloads are not reloaded into later requests.
+    // Preserve the dated user turn verbatim before the LLM call so interrupted
+    // requests keep the same temporal context as CLI turns. History stores the
+    // full content for every marker type so a later turn can re-load it.
     let timestamped_content = timestamp_channel_user_content(&msg.content);
-    let timestamped_history_content = timestamp_channel_user_content(&history_user_content);
     append_sender_turn(
         ctx.as_ref(),
         &history_key,
-        ChatMessage::user(&timestamped_history_content),
+        ChatMessage::user(&timestamped_content),
     );
 
     // Build history from per-sender conversation cache.
-    let mut prior_turns_raw = if force_fresh_session {
+    let prior_turns_raw = if force_fresh_session {
         vec![ChatMessage::user(&timestamped_content)]
     } else {
         ctx.conversation_histories
@@ -4333,13 +4321,6 @@ async fn process_channel_message_body(
             .cloned()
             .unwrap_or_default()
     };
-    if !force_fresh_session {
-        restore_current_user_turn_media_payload(
-            &mut prior_turns_raw,
-            &timestamped_history_content,
-            &timestamped_content,
-        );
-    }
     let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
 
     // Strip stale tool_result blocks from cached turns so the LLM never
@@ -4359,10 +4340,11 @@ async fn process_channel_message_body(
         }
     }
 
-    // Strip [IMAGE:] markers from older cached turns before context
-    // compression. The current message keeps its full payload so vision still
-    // works for the active turn; historical turns keep compact annotations.
-    strip_historical_image_payloads(&mut prior_turns);
+    // Collapse only heavy inline `data:` image payloads in older cached turns.
+    // Re-loadable `[IMAGE:<path>]` references survive so a later turn can
+    // re-inflate from disk (#8151); inline base64 is dropped to keep history
+    // within the context budget (#3460).
+    collapse_inline_image_payloads(&mut prior_turns);
 
     // Proactively trim conversation history before sending to the model_provider
     // to prevent context-window-exceeded errors (bug #3460).
@@ -5461,11 +5443,7 @@ async fn process_channel_message_body(
                 );
                 let should_rollback_user_turn = should_rollback_failed_user_turn(&e);
                 let rolled_back = should_rollback_user_turn
-                    && rollback_orphan_user_turn(
-                        ctx.as_ref(),
-                        &history_key,
-                        &timestamped_history_content,
-                    );
+                    && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &timestamped_content);
 
                 if !rolled_back {
                     // Close the orphan user turn so subsequent messages don't
@@ -17811,7 +17789,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn process_channel_message_sends_image_payload_without_persisting_it() {
+    async fn process_channel_message_persists_image_payload_verbatim() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 
@@ -17945,8 +17923,8 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(turns[0].content.starts_with('['));
         assert!(turns[0].content.contains("[Image: sticker.png attached"));
         assert!(turns[0].content.contains("please inspect this"));
-        assert!(!turns[0].content.contains("[IMAGE:data:"));
-        assert!(!turns[0].content.contains("AQIDBA"));
+        assert!(turns[0].content.contains("[IMAGE:data:"));
+        assert!(turns[0].content.contains("AQIDBA"));
     }
 
     #[tokio::test]
@@ -19051,49 +19029,67 @@ This is an example JSON object for profile settings."#;
     }
 
     #[test]
-    fn channel_history_content_for_user_turn_strips_inline_image_payload() {
-        let content =
-            "[Image: sticker.webp attached]\n[IMAGE:data:image/png;base64,abcd]\n\nwhat is this?";
-
-        let history_content = channel_history_content_for_user_turn(content);
-
-        assert_eq!(
-            history_content,
-            "[Image: sticker.webp attached]\n\nwhat is this?"
-        );
-        assert!(!history_content.contains("[IMAGE:data:"));
-        assert!(!history_content.contains("abcd"));
-    }
-
-    #[test]
-    fn channel_history_content_for_image_only_turn_keeps_compact_placeholder() {
-        let history_content =
-            channel_history_content_for_user_turn("[IMAGE:data:image/png;base64,abcd]");
-
-        assert_eq!(
-            history_content,
-            "[Image attachment processed by vision model]"
-        );
-    }
-
-    #[test]
-    fn strip_historical_image_payloads_preserves_current_turn_payload() {
+    fn channel_history_preserves_image_marker_verbatim_across_followup() {
+        let img = "[IMAGE:/tmp/media/screenshot.png] wait look at this";
         let mut turns = vec![
-            ChatMessage::user("[Image: old.png attached]\n[IMAGE:data:image/png;base64,old]"),
-            ChatMessage::assistant("I saw the old image."),
-            ChatMessage::user("[Image: now.png attached]\n[IMAGE:data:image/png;base64,current]"),
+            ChatMessage::user(img),
+            ChatMessage::assistant("\u{1f44d}"),
+            ChatMessage::user("can you see the screenshot?"),
         ];
 
-        strip_historical_image_payloads(&mut turns);
+        let kept: Vec<ChatMessage> = normalize_cached_channel_turns(std::mem::take(&mut turns));
 
-        assert_eq!(turns.len(), 3);
-        assert!(turns[0].content.contains("[Image: old.png attached]"));
-        assert!(!turns[0].content.contains("[IMAGE:data:"));
-        assert!(!turns[0].content.contains("base64,old"));
+        assert_eq!(kept[0].content, img);
+        assert!(kept[0].content.contains("/tmp/media/screenshot.png"));
+        assert!(!kept[0].content.contains("processed by vision model"));
+    }
+
+    #[test]
+    fn channel_history_preserves_document_voice_and_text_verbatim() {
+        let doc = "[Document: report.pdf] /tmp/media/report.pdf summarize this";
+        let voice = "[Voice] what did i just send";
+        let text = "plain text with no markers";
+        let mut turns = vec![
+            ChatMessage::user(doc),
+            ChatMessage::assistant("ok"),
+            ChatMessage::user(voice),
+            ChatMessage::assistant("ok"),
+            ChatMessage::user(text),
+        ];
+
+        let kept: Vec<ChatMessage> = normalize_cached_channel_turns(std::mem::take(&mut turns));
+
+        assert_eq!(kept[0].content, doc);
+        assert_eq!(kept[2].content, voice);
+        assert_eq!(kept[4].content, text);
+    }
+
+    #[test]
+    fn collapse_inline_image_payloads_drops_data_uri_keeps_path() {
+        let path_turn = "[IMAGE:/tmp/media/screenshot.png] can you see this?";
+        let data_turn = format!(
+            "[IMAGE:data:image/png;base64,{}] old screenshot",
+            "AQIDBAUGBwg".repeat(64)
+        );
+        let mut turns = vec![
+            ChatMessage::user(path_turn),
+            ChatMessage::assistant("ok"),
+            ChatMessage::user(&data_turn),
+            ChatMessage::assistant("ok"),
+            ChatMessage::user("[IMAGE:/tmp/media/current.png] and this?"),
+        ];
+
+        collapse_inline_image_payloads(&mut turns);
+
+        assert_eq!(turns[0].content, path_turn, "file-path marker must survive");
         assert!(
-            turns[2]
-                .content
-                .contains("[IMAGE:data:image/png;base64,current]")
+            !turns[2].content.contains("base64"),
+            "inline data payload must be collapsed"
+        );
+        assert!(turns[2].content.contains("old screenshot"));
+        assert_eq!(
+            turns[4].content, "[IMAGE:/tmp/media/current.png] and this?",
+            "current turn is never collapsed"
         );
     }
 
