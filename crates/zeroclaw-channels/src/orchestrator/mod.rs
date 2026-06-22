@@ -122,11 +122,13 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
+use zeroclaw_runtime::agent::history::fast_trim_tool_results;
 use zeroclaw_runtime::agent::loop_::{
-    LoopKnobs, ToolLoop, apply_policy_tool_filter, apply_text_tool_prompt_policy,
-    build_tool_instructions_for_names, clear_model_switch_request, get_model_switch_state,
-    is_model_switch_requested, run_tool_call_loop, scope_session_key, scope_thread_id,
-    scrub_credentials,
+    LoopKnobs, ResolvedAgentExecution, ResolvedModelAccess, ToolLoop, apply_policy_tool_filter,
+    apply_text_tool_prompt_policy, build_tool_instructions_for_names, clear_model_switch_request,
+    eager_mcp_tool_allowed, get_model_switch_state, is_model_switch_requested,
+    mcp_tool_access_policy, register_eager_mcp_tool_if_allowed, run_tool_call_loop,
+    scope_session_key, scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
 use zeroclaw_runtime::observability::traits::{ObserverEvent, ObserverMetric};
@@ -1831,13 +1833,35 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
     true
 }
 
+/// Number of most-recent turns whose tool-result payloads are kept at full size
+/// when proactively trimming. The active exchange stays intact; only older
+/// tool results are shrunk to a bounded extract.
+const PROACTIVE_TRIM_PROTECT_LAST_N: usize = 4;
+
 /// Proactively trim conversation turns so that the total estimated character
-/// count stays within [`PROACTIVE_CONTEXT_BUDGET_CHARS`].  Drops the oldest
-/// turns first, but always preserves the most recent turn (the current user
-/// message).  Returns the number of turns dropped.
+/// count stays within [`PROACTIVE_CONTEXT_BUDGET_CHARS`].
+///
+/// Tool-result content is the bulk of an overflowing channel history, so before
+/// dropping any whole turns this first shrinks older `tool`-role payloads to a
+/// bounded head-extract in place (via [`fast_trim_tool_results`]). A trimmed
+/// tool result still tells the model what the tool returned; a *dropped* turn is
+/// gone entirely, which is what makes the bot "respond as if previous messages
+/// don't exist" (#6517). Only if the in-place extracts are still over budget are
+/// the oldest whole turns dropped, and the most recent turn (the current user
+/// message) is always preserved. Returns the number of whole turns dropped.
 fn proactive_trim_turns(turns: &mut Vec<ChatMessage>, budget: usize) -> usize {
     let total_chars: usize = turns.iter().map(|t| t.content.chars().count()).sum();
     if total_chars <= budget || turns.len() <= 1 {
+        return 0;
+    }
+
+    // Content-preserving pre-pass: shrink old tool-result payloads in place,
+    // keeping the messages and their tool-call pairing intact.
+    fast_trim_tool_results(turns, PROACTIVE_TRIM_PROTECT_LAST_N);
+
+    // Recompute after the in-place shrink — we may now fit with no turns dropped.
+    let total_chars: usize = turns.iter().map(|t| t.content.chars().count()).sum();
+    if total_chars <= budget {
         return 0;
     }
 
@@ -4791,16 +4815,20 @@ async fn process_channel_message_body(
     // loop returns. Wrapped in `Arc` so the same handle can be shared into
     // `TOOL_LOOP_RECEIPT_CONTEXT` for subagent forwarding. Inert when
     // `receipt_generator` is `None`.
+    let tool_receipts_collector: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let receipt_scope = ctx.receipt_generator.as_ref().map(|generator| {
-        zeroclaw_runtime::agent::tool_receipts::ReceiptScope::with_generator(generator.clone())
+        zeroclaw_runtime::agent::tool_receipts::ReceiptScope {
+            generator: generator.clone(),
+            collector: std::sync::Arc::clone(&tool_receipts_collector),
+        }
     });
-    let tool_receipts_collector = receipt_scope.as_ref().map(|scope| scope.collector.clone());
     let loop_knobs = LoopKnobs::default();
     let (llm_result, fallback_info) = scope_provider_fallback(async {
         let llm_result = loop {
             let loop_result = tokio::select! {
                 () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
-                result = Box::pin(tokio::time::timeout(
+                result = tokio::time::timeout(
                     Duration::from_secs(timeout_budget_secs),
                     scope_thread_id(
                         msg.interruption_scope_id.clone()
@@ -4810,60 +4838,66 @@ async fn process_channel_message_body(
                         Some(history_key.clone()),
                         zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                             cost_tracking_context.clone(),
-                        zeroclaw_runtime::agent::tool_receipts::scope_receipts(
+                        zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT.scope(
                             receipt_scope.clone(),
                         run_tool_call_loop(ToolLoop {
-                        model_provider: active_model_provider.as_ref(),
-                        history: &mut history,
-                        tools_registry: ctx.tools_registry.as_ref(),
-                        observer: notify_observer.as_ref() as &dyn Observer,
-                        provider_name: route.model_provider.as_str(),
-                        model: route.model.as_str(),
-                        temperature: runtime_defaults.defaults.temperature,
-                        silent: true,
-                        approval: Some(&*ctx.approval_manager),
-                        channel_name: msg.channel.as_str(),
-                        channel_reply_target: Some(msg.reply_target.as_str()),
-                        multimodal_config: &ctx.multimodal,
-                        max_tool_iterations: ctx.max_tool_iterations,
-                        cancellation_token: Some(cancellation_token.clone()),
-                        on_delta: delta_tx.clone(),
-                        hooks: ctx.hooks.as_deref(),
-                        excluded_tools: if msg.channel == "cli"
+exec: ResolvedAgentExecution {
+model_access: ResolvedModelAccess {
+model_provider: active_model_provider.as_ref(),
+provider_name: route.model_provider.as_str(),
+model: route.model.as_str(),
+temperature: runtime_defaults.defaults.temperature,
+},
+tools_registry: ctx.tools_registry.as_ref(),
+observer: notify_observer.as_ref() as &dyn Observer,
+silent: true,
+approval: Some(&*ctx.approval_manager),
+multimodal_config: &ctx.multimodal,
+max_tool_iterations: ctx.max_tool_iterations,
+hooks: ctx.hooks.as_deref(),
+excluded_tools: if msg.channel == "cli"
                             || ctx.autonomy_level == AutonomyLevel::Full
                         {
                             &[]
                         } else {
                             ctx.non_cli_excluded_tools.as_ref()
                         },
-                        dedup_exempt_tools: ctx.tool_call_dedup_exempt.as_ref(),
-                        activated_tools: ctx.activated_tools.as_ref(),
-                        model_switch_callback: Some(model_switch_callback.clone()),
-                        pacing: &ctx.pacing,
-                        strict_tool_parsing: ctx
+dedup_exempt_tools: ctx.tool_call_dedup_exempt.as_ref(),
+activated_tools: ctx.activated_tools.as_ref(),
+model_switch_callback: Some(model_switch_callback.clone()),
+pacing: &ctx.pacing,
+strict_tool_parsing: ctx
                             .prompt_config
                             .agent(ctx.agent_alias.as_str())
                             .is_some_and(|agent| agent.resolved.strict_tool_parsing),
-                        parallel_tools: ctx
+parallel_tools: ctx
                             .prompt_config
                             .agent(ctx.agent_alias.as_str())
                             .is_some_and(|agent| agent.resolved.parallel_tools),
-                        max_tool_result_chars: ctx.max_tool_result_chars,
-                        context_token_budget: ctx.context_token_budget,
-                        shared_budget: None,
-                        channel: target_channel.as_deref(),
-                        receipt_generator: receipt_scope.as_ref().map(
-                            zeroclaw_runtime::agent::tool_receipts::ReceiptScope::generator,
-                        ),
-                        collected_receipts: receipt_scope.as_ref().map(
-                            zeroclaw_runtime::agent::tool_receipts::ReceiptScope::collector,
-                        ),
-                        event_tx: None,
-                        steering: None,
-                        new_messages_out: None,
-                        knobs: &loop_knobs,
-                        image_cache: None,
-                        // Phase 1: stamp Internal/Trusted. Real per-transport
+max_tool_result_chars: ctx.max_tool_result_chars,
+context_token_budget: ctx.context_token_budget,
+receipt_generator: ctx.receipt_generator.as_ref(),
+knobs: &loop_knobs,
+},
+history: &mut history,
+channel_name: msg.channel.as_str(),
+channel_reply_target: Some(msg.reply_target.as_str()),
+cancellation_token: Some(cancellation_token.clone()),
+on_delta: delta_tx.clone(),
+shared_budget: None,
+channel: target_channel.as_deref(),
+// Collector is meaningful only when the generator is
+                        // active. Pass None when receipts are disabled so the
+                        // call site reflects that coupling explicitly.
+                        collected_receipts: ctx
+                            .receipt_generator
+                            .as_ref()
+                            .map(|_| tool_receipts_collector.as_ref()),
+event_tx: None,
+steering: None,
+new_messages_out: None,
+image_cache: None,
+// Phase 1: stamp Internal/Trusted. Real per-transport
                         // stamping is PR C (RFC #6971 §4).
                         ingress: zeroclaw_api::ingress::IngressContext::internal(),
 }),
@@ -4871,7 +4905,7 @@ async fn process_channel_message_body(
                     ),
                     ),
                     ),
-                )) => LlmExecutionResult::Completed(result),
+                ) => LlmExecutionResult::Completed(result),
             };
 
             // Handle model switch: re-create the model_provider and retry
@@ -5232,19 +5266,19 @@ async fn process_channel_message_body(
             // `Arc<Mutex<Vec<String>>>` is forwarded via
             // `TOOL_LOOP_RECEIPT_CONTEXT` into sub-loops.
             let receipts_block = if ctx.show_receipts_in_response {
-                tool_receipts_collector.as_ref().and_then(|collector| {
-                    let receipts = collector.lock().unwrap_or_else(|e| e.into_inner());
-                    if receipts.is_empty() {
-                        None
-                    } else {
-                        use std::fmt::Write as _;
-                        let mut block = String::from("---\nTool receipts:");
-                        for r in receipts.iter() {
-                            write!(block, "\n  {r}").ok();
-                        }
-                        Some(block)
+                let receipts = tool_receipts_collector
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if receipts.is_empty() {
+                    None
+                } else {
+                    use std::fmt::Write as _;
+                    let mut block = String::from("---\nTool receipts:");
+                    for r in receipts.iter() {
+                        write!(block, "\n  {r}").ok();
                     }
-                })
+                    Some(block)
+                }
             } else {
                 None
             };
@@ -8887,89 +8921,132 @@ pub async fn start_channels(
         // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
         let mut ch_mcp_elevation_arcs: Vec<std::sync::Arc<dyn zeroclaw_runtime::tools::Tool>> =
             Vec::new();
-        if config.mcp.enabled && !config.mcp.servers.is_empty() {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"agent": agent_alias})),
-                &format!(
-                    "Initializing MCP client — {} server(s) configured",
-                    config.mcp.servers.len()
-                )
+        // Secure by default: an agent is granted only the MCP servers its
+        // `mcp_bundles` name (omission is not a grant). Connecting to the
+        // global server list here would let one agent's servers surface in a
+        // co-resident agent that was never granted them.
+        let agent_mcp_servers = if config.mcp.enabled {
+            config.mcp_servers_for_agent(agent_alias)
+        } else {
+            Vec::new()
+        };
+        if !agent_mcp_servers.is_empty() {
+            use ::zeroclaw_log::Instrument;
+            let mcp_model_provider = agent.model_provider.as_str().to_string();
+            let mcp_model = config
+                .model_provider_for_agent(agent_alias)
+                .and_then(|p| p.model.clone())
+                .unwrap_or_default();
+            let attribution_span = ::zeroclaw_log::attribution_span!(
+                &zeroclaw_runtime::agent::AgentAttribution(agent_alias)
             );
-            match zeroclaw_runtime::tools::McpRegistry::connect_all(&config.mcp.servers).await {
-                Ok(registry) => {
-                    let registry = std::sync::Arc::new(registry);
-                    ch_mcp_elevation_arcs =
-                        zeroclaw_runtime::tools::collect_mcp_elevation_arcs(&registry).await;
-                    if config.mcp.deferred_loading {
-                        let deferred_set =
-                            zeroclaw_runtime::tools::DeferredMcpToolSet::from_registry(
-                                std::sync::Arc::clone(&registry),
-                            )
-                            .await;
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({"agent": agent_alias})),
-                            &format!(
-                                "MCP deferred: {} tool stub(s) from {} server(s)",
-                                deferred_set.len(),
-                                registry.server_count()
-                            )
-                        );
-                        deferred_section =
-                            zeroclaw_runtime::tools::build_deferred_tools_section(&deferred_set);
-                        let activated = std::sync::Arc::new(std::sync::Mutex::new(
-                            zeroclaw_runtime::tools::ActivatedToolSet::new(),
-                        ));
-                        ch_activated_handle = Some(std::sync::Arc::clone(&activated));
-                        built_tools.push(Box::new(zeroclaw_runtime::tools::ToolSearchTool::new(
-                            deferred_set,
-                            activated,
-                        )));
-                    } else {
-                        let names = registry.tool_names();
-                        let mut registered = 0usize;
-                        for name in names {
-                            if let Some(def) = registry.get_tool_def(&name).await {
-                                let wrapper: std::sync::Arc<dyn Tool> = std::sync::Arc::new(
-                                    zeroclaw_runtime::tools::McpToolWrapper::new(
-                                        name,
-                                        def,
+            ::zeroclaw_log::scope!(
+                model_provider: mcp_model_provider,
+                model: mcp_model,
+                =>
+                async {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        &format!(
+                            "Initializing MCP client - {} server(s) granted via mcp_bundles",
+                            agent_mcp_servers.len()
+                        )
+                    );
+                    match zeroclaw_runtime::tools::McpRegistry::connect_all(&agent_mcp_servers).await {
+                        Ok(registry) => {
+                            let registry = std::sync::Arc::new(registry);
+                            ch_mcp_elevation_arcs =
+                                zeroclaw_runtime::tools::collect_mcp_elevation_arcs(&registry).await;
+                            let mcp_policy = mcp_tool_access_policy(security.as_ref(), None);
+                            if config.mcp.deferred_loading {
+                                let deferred_set =
+                                    zeroclaw_runtime::tools::DeferredMcpToolSet::from_registry(
                                         std::sync::Arc::clone(&registry),
+                                    )
+                                    .await;
+                                ::zeroclaw_log::record!(
+                                    INFO,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
                                     ),
+                                    &format!(
+                                        "MCP deferred: {} tool stub(s) from {} server(s)",
+                                        deferred_set.len(),
+                                        registry.server_count()
+                                    )
                                 );
-                                if let Some(ref handle) = delegate_handle_ch {
-                                    handle.write().push(std::sync::Arc::clone(&wrapper));
+                                deferred_section =
+                                    zeroclaw_runtime::tools::build_deferred_tools_section_filtered(
+                                        &deferred_set,
+                                        mcp_policy.as_ref(),
+                                    );
+                                let activated = std::sync::Arc::new(std::sync::Mutex::new(
+                                    zeroclaw_runtime::tools::ActivatedToolSet::new(),
+                                ));
+                                ch_activated_handle = Some(std::sync::Arc::clone(&activated));
+                                let mut tool_search =
+                                    zeroclaw_runtime::tools::ToolSearchTool::new(
+                                        deferred_set,
+                                        activated,
+                                    );
+                                if let Some(policy) = mcp_policy {
+                                    tool_search = tool_search.with_access_policy(policy);
                                 }
-                                built_tools
-                                    .push(Box::new(zeroclaw_runtime::tools::ArcToolRef(wrapper)));
-                                registered += 1;
+                                built_tools.push(Box::new(tool_search));
+                            } else {
+                                let names = registry.tool_names();
+                                let mut registered = 0usize;
+                                let mut skipped = 0usize;
+                                for name in names {
+                                    if !eager_mcp_tool_allowed(&name, mcp_policy.as_ref()) {
+                                        skipped += 1;
+                                        continue;
+                                    }
+                                    if let Some(def) = registry.get_tool_def(&name).await {
+                                        let wrapper: std::sync::Arc<dyn Tool> = std::sync::Arc::new(
+                                            zeroclaw_runtime::tools::McpToolWrapper::new(
+                                                name,
+                                                def,
+                                                std::sync::Arc::clone(&registry),
+                                            ),
+                                        );
+                                        if register_eager_mcp_tool_if_allowed(
+                                            wrapper,
+                                            &mut built_tools,
+                                            delegate_handle_ch.as_ref(),
+                                            mcp_policy.as_ref(),
+                                        ) {
+                                            registered += 1;
+                                        }
+                                    }
+                                }
+                                ::zeroclaw_log::record!(
+                                    INFO,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_attrs(::serde_json::json!({
+                                        "skipped": skipped,
+                                    })),
+                                    &format!(
+                                        "MCP: {} tool(s) registered from {} server(s)",
+                                        registered,
+                                        registry.server_count()
+                                    )
+                                );
                             }
                         }
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({"agent": agent_alias})),
-                            &format!(
-                                "MCP: {} tool(s) registered from {} server(s)",
-                                registered,
-                                registry.server_count()
-                            )
-                        );
+                        Err(e) => {
+                            ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "MCP registry failed to initialize");
+                        }
                     }
                 }
-                Err(e) => {
-                    ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"agent_alias": agent_alias, "error": format!("{}", e)})), "MCP registry failed to initialize");
-                }
-            }
+            )
+            .instrument(attribution_span)
+            .await;
         }
 
         // Skill tools share the workspace-loaded `skills` Vec but each
@@ -11409,6 +11486,50 @@ api_key = "anthropic-key"
         assert_eq!(turns.len(), 1);
     }
 
+    // #6517: large tool-result content is shrunk to a bounded extract in place
+    // before any whole turn is dropped, so the model keeps a record of what each
+    // tool returned instead of losing entire old turns ("responding as if
+    // previous messages don't exist").
+    #[test]
+    fn proactive_trim_shrinks_tool_results_before_dropping_turns() {
+        let mut turns: Vec<ChatMessage> = Vec::new();
+        for _ in 0..4 {
+            turns.push(ChatMessage::tool("x".repeat(5000)));
+        }
+        // Recent (protected) text turns; no tool payloads here.
+        turns.push(ChatMessage::user("u1".to_string()));
+        turns.push(ChatMessage::assistant("a1".to_string()));
+        turns.push(ChatMessage::user("u2".to_string()));
+        turns.push(ChatMessage::assistant("a2".to_string()));
+
+        let len_before = turns.len();
+        let total_before: usize = turns.iter().map(|t| t.content.chars().count()).sum();
+        let budget = 12_000;
+        assert!(total_before > budget, "test setup must start over budget");
+
+        let dropped = proactive_trim_turns(&mut turns, budget);
+
+        assert_eq!(
+            dropped, 0,
+            "in-place tool-result shrink should bring it under budget with no whole-turn drops"
+        );
+        assert_eq!(turns.len(), len_before, "no whole turn should be removed");
+        assert_eq!(
+            turns.iter().filter(|t| t.role == "tool").count(),
+            4,
+            "every tool turn must survive (shrunk, not dropped)"
+        );
+        assert!(
+            turns[0].content.chars().count() < 5000,
+            "an old tool result must be shrunk in place"
+        );
+        let total_after: usize = turns.iter().map(|t| t.content.chars().count()).sum();
+        assert!(
+            total_after <= budget,
+            "must be within budget after the in-place shrink: {total_after}"
+        );
+    }
+
     #[test]
     fn append_sender_turn_stores_single_turn_per_call() {
         let sender = "telegram_u2".to_string();
@@ -12686,6 +12807,83 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             names.contains(&"file_read"),
             "allowlisted tool must survive the filter; got {names:?}"
+        );
+    }
+
+    /// `start_channels` must apply the agent's risk-profile `excluded_tools`
+    /// denylist to MCP tools at registration, at parity with the runtime eager
+    /// path. Before this fix the channel path pushed every MCP tool into every
+    /// agent's registry unconditionally, so one agent's MCP server tools leaked
+    /// into a co-resident agent whose `excluded_tools` denied them (the Discord
+    /// tool leak). A non-denied `<server>__<tool>` name is still auto-admitted,
+    /// so a server the agent does want is not silently dropped.
+    #[test]
+    fn channel_path_excluded_tools_drops_denied_mcp_tool() {
+        use zeroclaw_runtime::agent::loop_::{
+            mcp_tool_access_policy, register_eager_mcp_tool_if_allowed,
+        };
+        let policy = SecurityPolicy {
+            excluded_tools: Some(vec!["aa_mcp__find_items".to_string()]),
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        };
+        let mcp_policy = mcp_tool_access_policy(&policy, None);
+        let mut built_tools: Vec<Box<dyn Tool>> = Vec::new();
+        let denied: Arc<dyn Tool> = Arc::new(NamedMockTool("aa_mcp__find_items"));
+        let allowed: Arc<dyn Tool> = Arc::new(NamedMockTool("aa_mcp__find_npcs"));
+        let registered_denied =
+            register_eager_mcp_tool_if_allowed(denied, &mut built_tools, None, mcp_policy.as_ref());
+        let registered_allowed = register_eager_mcp_tool_if_allowed(
+            allowed,
+            &mut built_tools,
+            None,
+            mcp_policy.as_ref(),
+        );
+        assert!(
+            !registered_denied,
+            "an `excluded_tools`-denied MCP tool must not be registered on the channel path"
+        );
+        assert!(
+            registered_allowed,
+            "a non-denied MCP tool must still be registered (allowlist auto-admit)"
+        );
+        let names: Vec<&str> = built_tools.iter().map(|t| t.name()).collect();
+        assert!(
+            !names.contains(&"aa_mcp__find_items"),
+            "denied MCP tool leaked into the channel registry; got {names:?}"
+        );
+        assert!(
+            names.contains(&"aa_mcp__find_npcs"),
+            "allowed MCP tool missing from the channel registry; got {names:?}"
+        );
+    }
+
+    /// Companion to the MCP denylist test, pinning the built-in side: the same
+    /// channel-path gate must drop a built-in named in the agent's
+    /// `excluded_tools` (e.g. a `readonly` profile denying `shell`). Built-ins
+    /// always went through `apply_policy_tool_filter`; this guards that the MCP
+    /// gate fix did not regress the built-in denylist, and that `shell` is not
+    /// leaked into a co-resident agent that excluded it.
+    #[test]
+    fn channel_path_excluded_tools_drops_denied_builtin() {
+        let mut built_tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(NamedMockTool("shell")),
+            Box::new(NamedMockTool("file_read")),
+        ];
+        let policy = SecurityPolicy {
+            excluded_tools: Some(vec!["shell".to_string()]),
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        };
+        apply_policy_tool_filter(&mut built_tools, Some(&policy), None);
+        let names: Vec<&str> = built_tools.iter().map(|t| t.name()).collect();
+        assert!(
+            !names.contains(&"shell"),
+            "an `excluded_tools`-denied built-in must be dropped on the channel path; got {names:?}"
+        );
+        assert!(
+            names.contains(&"file_read"),
+            "a non-excluded built-in must survive the filter; got {names:?}"
         );
     }
 

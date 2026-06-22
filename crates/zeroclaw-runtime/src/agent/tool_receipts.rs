@@ -132,18 +132,15 @@ pub struct ReceiptScope {
 
 impl ReceiptScope {
     /// Single source of truth for turning resolved receipt config into a live
-    /// scope. Returns `None` when receipts are disabled so every turn
-    /// entrypoint (channel orchestrator, ACP, gateway WS) gates identically
-    /// without duplicating the construct-generator-allocate-collector glue.
+    /// scope. Returns `None` when receipts are disabled so each turn entrypoint
+    /// gates identically without duplicating the generator/collector glue.
     pub fn from_config(config: &zeroclaw_config::schema::ToolReceiptsConfig) -> Option<Self> {
         config
             .enabled
             .then(|| Self::with_generator(ReceiptGenerator::new()))
     }
 
-    /// Wrap an existing generator with a fresh per-turn collector. Used by the
-    /// channel orchestrator, which holds a long-lived generator on its context
-    /// and assembles one scope per message through this same seam.
+    /// Wrap an existing generator with a fresh per-turn collector.
     pub fn with_generator(generator: ReceiptGenerator) -> Self {
         Self {
             generator,
