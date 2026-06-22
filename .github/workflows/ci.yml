@@ -315,6 +315,8 @@ jobs:
         run: cargo install cargo-deny --locked
       - name: Check licenses, sources, and advisories
         run: cargo deny check
+      - name: Lockfile integrity
+        run: cargo verify-project && cargo fetch --locked
 
   nix-eval:
     name: Nix Module Eval
