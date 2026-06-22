@@ -1699,14 +1699,6 @@ pub async fn run(
                 ChatMessage::user(&enriched),
             ];
 
-            // Prune history for token efficiency (when enabled).
-            if agent.resolved.history_pruning.enabled {
-                let _stats = crate::agent::history_pruner::prune_history(
-                    &mut history,
-                    &agent.resolved.history_pruning,
-                );
-            }
-
             // Compute per-turn excluded MCP tools from tool_filter_groups.
             let excluded_tools = compute_excluded_mcp_tools(
                 &tools_registry,
