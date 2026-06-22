@@ -710,11 +710,11 @@ pub fn all_tools_with_runtime(
         root_config.skills.prompt_injection_mode,
         zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
     ) {
+        // ReadSkillTool now holds full config to support all skill sources:
+        // workspace skills, open-skills, agent-bound bundles, and plugin skills.
         tool_arcs.push(Arc::new(ReadSkillTool::new(
-            root_config.data_dir.clone(),
-            root_config.skills.open_skills_enabled,
-            root_config.skills.open_skills_dir.clone(),
-            root_config.skills.allow_scripts,
+            config.clone(),
+            agent_alias.to_string(),
         )));
     }
 
