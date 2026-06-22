@@ -12346,6 +12346,7 @@ Let me check the result."#;
     async fn trim_record_carries_model_attribution() {
         use super::{ToolLoop, run_tool_call_loop};
         use crate::observability::noop::NoopObserver;
+        use ::zeroclaw_log::Instrument;
 
         let _writer_guard = zeroclaw_log::__private_test_writer_lock();
         let _hook_guard = zeroclaw_log::__private_test_hook_lock();
@@ -12415,6 +12416,9 @@ Let me check the result."#;
             image_cache: None,
             ingress: IngressContext::internal(),
         })
+        .instrument(zeroclaw_log::attribution_span!(
+            &crate::agent::AgentAttribution("trimtest")
+        ))
         .await
         .expect("loop should succeed");
 
@@ -12445,6 +12449,10 @@ Let me check the result."#;
         assert_eq!(
             value["zeroclaw"]["model_provider"], "anthropic.personal",
             "trim record must carry model_provider attribution, got: {value}"
+        );
+        assert_eq!(
+            value["zeroclaw"]["agent_alias"], "trimtest",
+            "trim record must inherit agent_alias from the agent attribution span, got: {value}"
         );
     }
     //

@@ -71,11 +71,19 @@ When `trimmed` is true the caller does two things so the loss is always visible:
 1. Injects a breadcrumb into the history, after the leading system messages and
    before the first kept turn:
    `[earlier turns omitted to fit the context window]` (`history_trim::breadcrumb`).
-2. Emits a `session/update` RPC notification of type `history_trimmed`
-   (`SessionUpdateEvent::HistoryTrimmed`) carrying `session_id`,
-   `dropped_messages`, `kept_turns`, and `reason`. This is the same
-   RPC-visibility contract that turn cancellation uses: when the context
-   changes underneath the model, the end user is told why.
+2. Emits a visible "context was trimmed" signal on every client surface, the
+   same multi-surface visibility contract that turn cancellation uses:
+   - **ACP** (`session/update` of type `history_trimmed`, mapped in
+     `acp_server.rs`) carrying `sessionId`, `droppedMessages`, `keptTurns`,
+     and `reason` (`SessionUpdateEvent::HistoryTrimmed`).
+   - **Gateway WebSocket** (`{"type":"history_trimmed", ...}`, mapped in
+     `ws.rs` from `TurnEvent::HistoryTrimmed`).
+   - **SSE `/api/events`** (`{"type":"history_trimmed", ...}`, mapped in
+     `sse.rs` from `ObserverEvent::HistoryTrimmed`) carrying
+     `dropped_messages`, `kept_turns`, `reason`, plus `agent_alias` /
+     `channel` / `turn_id` when the attribution span carries them.
+
+   When the context changes underneath the model, the end user is told why.
 
 The breadcrumb matters beyond the UI. With it in context, a model asked to
 recall dropped work answers honestly ("the earlier turns were omitted from my
