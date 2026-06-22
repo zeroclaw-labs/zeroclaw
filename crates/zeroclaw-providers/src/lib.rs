@@ -1867,7 +1867,8 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("sglang", "SGLang", true),
             ("vllm", "vLLM", true),
             ("osaurus", "Osaurus", true),
-            ("nvidia", "NVIDIA NIM", false),
+            // NVIDIA NIM supports vision models (LLaVA, etc.) — see issue #8099
+            ("nvidia", "NVIDIA NIM", true),
             ("siliconflow", "SiliconFlow", false),
             ("aihubmix", "AiHubMix", false),
             ("litellm", "LiteLLM", false),
