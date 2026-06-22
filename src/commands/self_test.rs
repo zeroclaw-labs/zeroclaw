@@ -437,7 +437,11 @@ async fn check_websocket_handshake(config: &crate::config::Config) -> CheckResul
 
 #[cfg(test)]
 mod tests {
-    use super::{format_probe_url, resolve_probe_host, web_dist_dir_expansion_reason_key};
+    use super::{
+        check_config, check_model_provider_registry, check_version, format_probe_url,
+        resolve_probe_host, web_dist_dir_expansion_reason_key,
+    };
+    use std::path::PathBuf;
 
     #[test]
     fn web_dist_dir_with_tilde_resolves_to_tilde_reason_key() {
@@ -584,5 +588,47 @@ mod tests {
             format_probe_url("ws", "127.0.0.1", 42617, "/ws/chat"),
             "ws://127.0.0.1:42617/ws/chat"
         );
+    }
+
+    #[test]
+    fn check_config_with_existing_file() {
+        let mut config = crate::config::Config::default();
+        // Create a temp file to simulate an existing config
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+        std::fs::write(&config_path, "# test config").unwrap();
+        config.config_path = config_path;
+
+        let result = check_config(&config);
+        assert!(result.passed, "existing config should pass");
+        assert!(result.detail.contains("loaded from"));
+    }
+
+    #[test]
+    fn check_config_with_missing_file() {
+        let mut config = crate::config::Config::default();
+        config.config_path = PathBuf::from("/nonexistent/path/config.toml");
+
+        let result = check_config(&config);
+        assert!(!result.passed, "missing config should fail");
+        assert_eq!(result.detail, "config file not found (using defaults)");
+    }
+
+    #[test]
+    fn check_version_returns_valid_format() {
+        let result = check_version();
+        assert!(result.passed, "version check should always pass");
+        assert!(
+            result.detail.starts_with('v'),
+            "version should start with 'v'"
+        );
+    }
+
+    #[test]
+    fn check_model_provider_registry_has_entries() {
+        let result = check_model_provider_registry();
+        // The compiled binary must have at least one registered provider.
+        assert!(result.passed, "expected at least one model provider; got: {}", result.detail);
+        assert!(result.detail.contains("model providers available"));
     }
 }
