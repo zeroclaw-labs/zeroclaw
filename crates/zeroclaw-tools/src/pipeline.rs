@@ -117,10 +117,10 @@ impl PipelineTool {
             if !self.allowed_set.contains(&step.tool) {
                 return Err(PipelineError::UnknownTool(step.tool.clone()));
             }
-            if let Some(ref policy) = self.access_policy {
-                if !policy.is_tool_allowed(&step.tool) {
-                    return Err(PipelineError::UnknownTool(step.tool.clone()));
-                }
+            if let Some(ref policy) = self.access_policy
+                && !policy.is_tool_allowed(&step.tool)
+            {
+                return Err(PipelineError::UnknownTool(step.tool.clone()));
             }
         }
 
