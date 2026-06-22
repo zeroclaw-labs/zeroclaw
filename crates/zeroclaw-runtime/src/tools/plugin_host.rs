@@ -9,8 +9,9 @@
 //!
 //! `tool-invoke` is intentionally NOT wired yet (it stays deny-by-default); the
 //! alias-indirection + recursion-guard design is a follow-up.
-
-#![cfg(feature = "plugins-wasm")]
+//!
+//! The module is gated at its `mod` declaration in `tools/mod.rs`, so no inner
+//! `#![cfg]` is needed here (a second one would be a duplicated-attribute lint).
 
 use std::collections::HashMap;
 use std::io::Read;
