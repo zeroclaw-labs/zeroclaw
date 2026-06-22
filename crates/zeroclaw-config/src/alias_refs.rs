@@ -601,9 +601,12 @@ impl std::error::Error for CreateError {}
 /// delegating to the generated [`Config::create_map_key`] for the insert.
 ///
 /// The reserved-agent rule (the `default` runtime fallback) is enforced HERE, at
-/// the shared config boundary, so every create surface (the gateway HTTP handler
-/// and the RPC dispatch) inherits it from one place instead of each re-deriving
-/// it, which is how the guard would drift per surface. Symmetric with
+/// the shared config boundary, so every operator-facing create surface (the
+/// gateway config-write handlers and the RPC dispatch) inherits it from one place
+/// instead of each re-deriving it, which is how the guard would drift per surface.
+/// First-run seeders (quickstart, env-override materialization) call the raw
+/// `create_map_key` directly on purpose: they may legitimately seed the fallback
+/// agent. Symmetric with
 /// [`rename_with_cascade`]'s reserved guard: rename refuses renaming to or from
 /// `default`, and this refuses creating it, so no surface can author an
 /// `agents.default` that the rename guard then traps. `create_map_key` still
