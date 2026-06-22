@@ -359,12 +359,13 @@ pub fn extract_account_id_from_jwt(token: &str) -> Option<String> {
 
     // Real OpenAI OAuth tokens namespace custom claims under
     // https://api.openai.com/auth as a JSON object, not a flat dotted key.
-    if let Some(auth_obj) = claims.get("https://api.openai.com/auth") {
-        if let Some(value) = auth_obj.get("chatgpt_account_id").and_then(|v| v.as_str())
-            && !value.trim().is_empty()
-        {
-            return Some(value.to_string());
-        }
+    if let Some(value) = claims
+        .get("https://api.openai.com/auth")
+        .and_then(|auth| auth.get("chatgpt_account_id"))
+        .and_then(|v| v.as_str())
+        && !value.trim().is_empty()
+    {
+        return Some(value.to_string());
     }
 
     for key in [
