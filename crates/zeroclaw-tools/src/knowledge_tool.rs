@@ -1,13 +1,28 @@
 //! Knowledge management tool for capturing, searching, and reusing expertise.
 //!
 //! Exposes the knowledge graph to the agent via the `Tool` trait with actions:
-//! capture, search, relate, suggest, expert_find, lessons_extract, graph_stats.
+//! capture, search, relate, suggest, expert_find, lessons_extract, graph_stats,
+//! client_network, interaction_log.
 
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_memory::knowledge_graph::{KnowledgeGraph, NodeType, Relation};
+
+const CLIENT_NETWORK_INTERACTION_LIMIT: usize = 20;
+
+const KNOWLEDGE_ACTIONS: &[&str] = &[
+    "capture",
+    "search",
+    "relate",
+    "suggest",
+    "expert_find",
+    "lessons_extract",
+    "graph_stats",
+    "client_network",
+    "interaction_log",
+];
 
 /// Tool for managing a knowledge graph of patterns, decisions, lessons, and experts.
 pub struct KnowledgeTool {
@@ -27,7 +42,7 @@ impl Tool for KnowledgeTool {
     }
 
     fn description(&self) -> &str {
-        "Manage a knowledge graph of architecture decisions, solution patterns, lessons learned, and experts. Actions: capture, search, relate, suggest, expert_find, lessons_extract, graph_stats."
+        "Manage a knowledge graph of architecture decisions, solution patterns, lessons learned, experts, and client relationships. Actions: capture, search, relate, suggest, expert_find, lessons_extract, graph_stats, client_network, interaction_log."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -36,12 +51,12 @@ impl Tool for KnowledgeTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["capture", "search", "relate", "suggest", "expert_find", "lessons_extract", "graph_stats"],
+                    "enum": KNOWLEDGE_ACTIONS,
                     "description": "The action to perform"
                 },
                 "node_type": {
                     "type": "string",
-                    "enum": ["pattern", "decision", "lesson", "expert", "technology"],
+                    "enum": NodeType::schema_values(),
                     "description": "Type of knowledge node (for capture)"
                 },
                 "title": {
@@ -75,13 +90,22 @@ impl Tool for KnowledgeTool {
                 },
                 "relation": {
                     "type": "string",
-                    "enum": ["uses", "replaces", "extends", "authored_by", "applies_to"],
+                    "enum": Relation::schema_values(),
                     "description": "Relationship type (for relate)"
+                },
+                "client_id": {
+                    "type": "string",
+                    "description": "Client node ID (for client_network, interaction_log)"
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum number of results to return (for interaction_log)"
                 },
                 "filters": {
                     "type": "object",
                     "properties": {
-                        "node_type": { "type": "string" },
+                        "node_type": { "type": "string", "enum": NodeType::schema_values() },
                         "tags": { "type": "array", "items": { "type": "string" } },
                         "project": { "type": "string" }
                     },
@@ -112,6 +136,8 @@ impl Tool for KnowledgeTool {
             "expert_find" => self.handle_expert_find(&args),
             "lessons_extract" => self.handle_lessons_extract(&args),
             "graph_stats" => self.handle_graph_stats(),
+            "client_network" => self.handle_client_network(&args),
+            "interaction_log" => self.handle_interaction_log(&args),
             other => Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -530,6 +556,162 @@ impl KnowledgeTool {
             }),
         }
     }
+
+    fn handle_client_network(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        let client = match self.client_node(args, "client_network") {
+            Ok(client) => client,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(e.to_string()),
+                });
+            }
+        };
+        let inbound = self.graph.find_inbound(&client.id)?;
+
+        let contacts: Vec<_> = inbound
+            .iter()
+            .filter(|(node, relation)| {
+                node.node_type == NodeType::Contact && *relation == Relation::ContactOf
+            })
+            .map(|(node, _)| json!({"id": &node.id, "name": &node.title, "tags": &node.tags}))
+            .collect();
+
+        let managers: Vec<_> = inbound
+            .iter()
+            .filter(|(node, relation)| {
+                node.node_type == NodeType::Expert && *relation == Relation::ManagesClient
+            })
+            .map(|(node, _)| {
+                json!({
+                    "id": &node.id,
+                    "type": node.node_type,
+                    "name": &node.title,
+                    "tags": &node.tags,
+                })
+            })
+            .collect();
+
+        let interactions =
+            self.client_interactions(&client.id, CLIENT_NETWORK_INTERACTION_LIMIT)?;
+
+        let interactions: Vec<_> = interactions
+            .iter()
+            .map(|node| {
+                json!({
+                    "id": &node.id,
+                    "title": &node.title,
+                    "date": node.created_at,
+                    "summary": truncate_str(&node.content, 200),
+                    "tags": &node.tags,
+                })
+            })
+            .collect();
+
+        Ok(ToolResult {
+            success: true,
+            output: json!({
+                "client": {"id": &client.id, "name": &client.title, "tags": &client.tags},
+                "contacts": contacts,
+                "managers": managers,
+                "interactions": interactions,
+                "contact_count": contacts.len(),
+                "manager_count": managers.len(),
+                "interaction_count": interactions.len(),
+            })
+            .to_string(),
+            error: None,
+        })
+    }
+
+    fn handle_interaction_log(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        let client = match self.client_node(args, "interaction_log") {
+            Ok(client) => client,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(e.to_string()),
+                });
+            }
+        };
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| usize::try_from(v).ok())
+            .unwrap_or(20)
+            .max(1);
+
+        let interactions = self.client_interactions(&client.id, limit)?;
+
+        let entries: Vec<_> = interactions
+            .iter()
+            .map(|node| {
+                json!({
+                    "id": &node.id,
+                    "title": &node.title,
+                    "content": &node.content,
+                    "date": node.created_at,
+                    "tags": &node.tags,
+                })
+            })
+            .collect();
+
+        Ok(ToolResult {
+            success: true,
+            output: json!({"interactions": entries, "count": entries.len()}).to_string(),
+            error: None,
+        })
+    }
+
+    fn client_node(
+        &self,
+        args: &serde_json::Value,
+        action: &'static str,
+    ) -> anyhow::Result<zeroclaw_memory::knowledge_graph::KnowledgeNode> {
+        let client_id = args
+            .get("client_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "action": action,
+                            "param": "client_id",
+                        })),
+                    "knowledge_tool: client action missing client_id"
+                );
+                anyhow::Error::msg(format!("missing 'client_id' for {action}"))
+            })?;
+
+        let Some(client) = self.graph.get_node(client_id)? else {
+            anyhow::bail!("client node not found: {client_id}");
+        };
+        if client.node_type != NodeType::Client {
+            anyhow::bail!(
+                "node {} is not a client (is {})",
+                client_id,
+                client.node_type.as_str()
+            );
+        }
+        Ok(client)
+    }
+
+    fn client_interactions(
+        &self,
+        client_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<zeroclaw_memory::knowledge_graph::KnowledgeNode>> {
+        self.graph.find_outbound_by_relation_and_type(
+            client_id,
+            Relation::InteractedWith,
+            NodeType::Interaction,
+            limit,
+        )
+    }
 }
 
 fn truncate_str(s: &str, max_len: usize) -> String {
@@ -697,5 +879,172 @@ mod tests {
         assert_eq!(tool.name(), "knowledge");
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["action"].is_object());
+        assert!(
+            schema["properties"]["action"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("client_network"))
+        );
+        assert!(
+            schema["properties"]["node_type"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("client"))
+        );
+        assert!(
+            schema["properties"]["relation"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("contact_of"))
+        );
+    }
+
+    #[tokio::test]
+    async fn client_network_returns_contacts_managers_and_interactions() {
+        let (_tmp, tool) = test_tool();
+
+        let client_id = capture_node(
+            &tool,
+            "client",
+            "Example Account",
+            "Enterprise account for relationship tracking",
+        )
+        .await;
+        let contact_id = capture_node(&tool, "contact", "Contact Alpha", "Technical contact").await;
+        let manager_id = capture_node(&tool, "expert", "Expert Alpha", "Relationship owner").await;
+        let interaction_id = capture_node(
+            &tool,
+            "interaction",
+            "Discovery call",
+            "Discussed integration requirements",
+        )
+        .await;
+
+        relate_nodes(&tool, &contact_id, &client_id, "contact_of").await;
+        relate_nodes(&tool, &manager_id, &client_id, "manages_client").await;
+        relate_nodes(&tool, &client_id, &interaction_id, "interacted_with").await;
+
+        let result = tool
+            .execute(json!({
+                "action": "client_network",
+                "client_id": client_id
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["client"]["name"], "Example Account");
+        assert_eq!(output["contact_count"], 1);
+        assert_eq!(output["manager_count"], 1);
+        assert_eq!(output["interaction_count"], 1);
+        assert_eq!(output["contacts"][0]["name"], "Contact Alpha");
+        assert_eq!(output["managers"][0]["name"], "Expert Alpha");
+        assert_eq!(output["interactions"][0]["title"], "Discovery call");
+    }
+
+    #[tokio::test]
+    async fn client_network_ignores_malformed_manager_edges() {
+        let (_tmp, tool) = test_tool();
+
+        let client_id = capture_node(&tool, "client", "Example Account", "Account").await;
+        let interaction_id =
+            capture_node(&tool, "interaction", "Status call", "Not a manager").await;
+
+        relate_nodes(&tool, &interaction_id, &client_id, "manages_client").await;
+
+        let result = tool
+            .execute(json!({
+                "action": "client_network",
+                "client_id": client_id
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["manager_count"], 0);
+        assert!(output["managers"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn interaction_log_sorts_recent_first_and_respects_limit() {
+        let (_tmp, tool) = test_tool();
+
+        let client_id = capture_node(&tool, "client", "Example Account", "Account").await;
+        let first_id = capture_node(&tool, "interaction", "First call", "Initial discussion").await;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let second_id = capture_node(&tool, "interaction", "Second call", "Follow-up").await;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let third_id = capture_node(&tool, "interaction", "Third call", "Next step").await;
+
+        relate_nodes(&tool, &client_id, &first_id, "interacted_with").await;
+        relate_nodes(&tool, &client_id, &second_id, "interacted_with").await;
+        relate_nodes(&tool, &client_id, &third_id, "interacted_with").await;
+
+        let result = tool
+            .execute(json!({
+                "action": "interaction_log",
+                "client_id": client_id,
+                "limit": 2
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["count"], 2);
+        assert_eq!(output["interactions"][0]["title"], "Third call");
+        assert_eq!(output["interactions"][1]["title"], "Second call");
+    }
+
+    #[tokio::test]
+    async fn client_actions_reject_non_client_node() {
+        let (_tmp, tool) = test_tool();
+        let pattern_id = capture_node(&tool, "pattern", "Pattern Alpha", "Not a client").await;
+
+        let result = tool
+            .execute(json!({
+                "action": "client_network",
+                "client_id": pattern_id
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("not a client"));
+    }
+
+    async fn capture_node(
+        tool: &KnowledgeTool,
+        node_type: &str,
+        title: &str,
+        content: &str,
+    ) -> String {
+        let result = tool
+            .execute(json!({
+                "action": "capture",
+                "node_type": node_type,
+                "title": title,
+                "content": content,
+            }))
+            .await
+            .unwrap();
+        assert!(result.success);
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        output["node_id"].as_str().unwrap().to_string()
+    }
+
+    async fn relate_nodes(tool: &KnowledgeTool, from_id: &str, to_id: &str, relation: &str) {
+        let result = tool
+            .execute(json!({
+                "action": "relate",
+                "from_id": from_id,
+                "to_id": to_id,
+                "relation": relation,
+            }))
+            .await
+            .unwrap();
+        assert!(result.success);
     }
 }

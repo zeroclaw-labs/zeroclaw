@@ -1,9 +1,10 @@
 //! Knowledge graph for capturing, organizing, and reusing expertise.
 //!
 //! SQLite-backed storage for knowledge nodes (patterns, decisions, lessons,
-//! experts, technologies) and directed edges (uses, replaces, extends,
-//! authored_by, applies_to). Supports full-text search, tag filtering,
-//! and relation traversal.
+//! experts, technologies, clients, contacts, and interactions) and directed
+//! edges (uses, replaces, extends, authored_by, applies_to, manages_client,
+//! contact_of, interacted_with). Supports full-text search, tag filtering, and
+//! relation traversal.
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
@@ -16,72 +17,76 @@ use uuid::Uuid;
 
 // ── Domain types ────────────────────────────────────────────────
 
-/// The kind of knowledge captured in a node.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NodeType {
-    Pattern,
-    Decision,
-    Lesson,
-    Expert,
-    Technology,
+macro_rules! knowledge_enum {
+    (
+        $(#[$meta:meta])*
+        pub enum $name:ident {
+            $($variant:ident => $value:literal),+ $(,)?
+        }
+        error = $error_label:literal
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum $name {
+            $($variant),+
+        }
+
+        impl $name {
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+            pub const SCHEMA_VALUES: &'static [&'static str] = &[$($value),+];
+
+            pub fn as_str(&self) -> &'static str {
+                match self {
+                    $(Self::$variant => $value),+
+                }
+            }
+
+            pub fn schema_values() -> &'static [&'static str] {
+                Self::SCHEMA_VALUES
+            }
+
+            pub fn parse(s: &str) -> anyhow::Result<Self> {
+                match s {
+                    $($value => Ok(Self::$variant),)+
+                    other => anyhow::bail!(
+                        "unknown {}: {other}",
+                        $error_label
+                    ),
+                }
+            }
+        }
+    };
 }
 
-impl NodeType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Pattern => "pattern",
-            Self::Decision => "decision",
-            Self::Lesson => "lesson",
-            Self::Expert => "expert",
-            Self::Technology => "technology",
-        }
+knowledge_enum! {
+    /// The kind of knowledge captured in a node.
+    pub enum NodeType {
+        Pattern => "pattern",
+        Decision => "decision",
+        Lesson => "lesson",
+        Expert => "expert",
+        Technology => "technology",
+        Client => "client",
+        Contact => "contact",
+        Interaction => "interaction",
     }
-
-    pub fn parse(s: &str) -> anyhow::Result<Self> {
-        match s {
-            "pattern" => Ok(Self::Pattern),
-            "decision" => Ok(Self::Decision),
-            "lesson" => Ok(Self::Lesson),
-            "expert" => Ok(Self::Expert),
-            "technology" => Ok(Self::Technology),
-            other => anyhow::bail!("unknown node type: {other}"),
-        }
-    }
+    error = "node type"
 }
 
-/// Directed relationship between two knowledge nodes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Relation {
-    Uses,
-    Replaces,
-    Extends,
-    AuthoredBy,
-    AppliesTo,
-}
-
-impl Relation {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Uses => "uses",
-            Self::Replaces => "replaces",
-            Self::Extends => "extends",
-            Self::AuthoredBy => "authored_by",
-            Self::AppliesTo => "applies_to",
-        }
+knowledge_enum! {
+    /// Directed relationship between two knowledge nodes.
+    pub enum Relation {
+        Uses => "uses",
+        Replaces => "replaces",
+        Extends => "extends",
+        AuthoredBy => "authored_by",
+        AppliesTo => "applies_to",
+        ManagesClient => "manages_client",
+        ContactOf => "contact_of",
+        InteractedWith => "interacted_with",
     }
-
-    pub fn parse(s: &str) -> anyhow::Result<Self> {
-        match s {
-            "uses" => Ok(Self::Uses),
-            "replaces" => Ok(Self::Replaces),
-            "extends" => Ok(Self::Extends),
-            "authored_by" => Ok(Self::AuthoredBy),
-            "applies_to" => Ok(Self::AppliesTo),
-            other => anyhow::bail!("unknown relation: {other}"),
-        }
-    }
+    error = "relation"
 }
 
 /// A node in the knowledge graph.
@@ -383,6 +388,81 @@ impl KnowledgeGraph {
             let relation_str: String = row.get(8)?;
             let relation = Relation::parse(&relation_str)?;
             results.push((node, relation));
+        }
+        Ok(results)
+    }
+
+    /// Find nodes with edges pointing to the given node.
+    pub fn find_inbound(&self, node_id: &str) -> anyhow::Result<Vec<(KnowledgeNode, Relation)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT n.id, n.node_type, n.title, n.content, n.tags,
+                    n.created_at, n.updated_at, n.source_project,
+                    e.relation
+             FROM edges e
+             JOIN nodes n ON n.id = e.from_id
+             WHERE e.to_id = ?1",
+        )?;
+
+        let mut results = Vec::new();
+        let mut rows = stmt.query(params![node_id])?;
+        while let Some(row) = rows.next()? {
+            let node = row_to_node(row)?;
+            let relation_str: String = row.get(8)?;
+            let relation = Relation::parse(&relation_str)?;
+            results.push((node, relation));
+        }
+        Ok(results)
+    }
+
+    /// Query nodes by type, ordered by most recently updated.
+    pub fn query_by_type(
+        &self,
+        node_type: NodeType,
+        limit: usize,
+    ) -> anyhow::Result<Vec<KnowledgeNode>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, node_type, title, content, tags, created_at, updated_at, source_project
+             FROM nodes WHERE node_type = ?1 ORDER BY updated_at DESC LIMIT ?2",
+        )?;
+
+        let mut results = Vec::new();
+        let mut rows = stmt.query(params![node_type.as_str(), limit as i64])?;
+        while let Some(row) = rows.next()? {
+            results.push(row_to_node(row)?);
+        }
+        Ok(results)
+    }
+
+    /// Find outbound nodes matching a relation and node type.
+    pub fn find_outbound_by_relation_and_type(
+        &self,
+        node_id: &str,
+        relation: Relation,
+        node_type: NodeType,
+        limit: usize,
+    ) -> anyhow::Result<Vec<KnowledgeNode>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT n.id, n.node_type, n.title, n.content, n.tags,
+                    n.created_at, n.updated_at, n.source_project
+             FROM edges e
+             JOIN nodes n ON n.id = e.to_id
+             WHERE e.from_id = ?1 AND e.relation = ?2 AND n.node_type = ?3
+             ORDER BY n.created_at DESC
+             LIMIT ?4",
+        )?;
+
+        let mut results = Vec::new();
+        let mut rows = stmt.query(params![
+            node_id,
+            relation.as_str(),
+            node_type.as_str(),
+            limit as i64
+        ])?;
+        while let Some(row) = rows.next()? {
+            results.push(row_to_node(row)?);
         }
         Ok(results)
     }
@@ -834,27 +914,128 @@ mod tests {
 
     #[test]
     fn node_type_roundtrip() {
-        for nt in &[
-            NodeType::Pattern,
-            NodeType::Decision,
-            NodeType::Lesson,
-            NodeType::Expert,
-            NodeType::Technology,
-        ] {
-            assert_eq!(&NodeType::parse(nt.as_str()).unwrap(), nt);
+        for nt in NodeType::ALL {
+            assert_eq!(NodeType::parse(nt.as_str()).unwrap(), *nt);
         }
+        assert_eq!(
+            NodeType::schema_values(),
+            &[
+                "pattern",
+                "decision",
+                "lesson",
+                "expert",
+                "technology",
+                "client",
+                "contact",
+                "interaction",
+            ],
+        );
     }
 
     #[test]
     fn relation_roundtrip() {
-        for r in &[
-            Relation::Uses,
-            Relation::Replaces,
-            Relation::Extends,
-            Relation::AuthoredBy,
-            Relation::AppliesTo,
-        ] {
-            assert_eq!(&Relation::parse(r.as_str()).unwrap(), r);
+        for r in Relation::ALL {
+            assert_eq!(Relation::parse(r.as_str()).unwrap(), *r);
         }
+        assert_eq!(
+            Relation::schema_values(),
+            &[
+                "uses",
+                "replaces",
+                "extends",
+                "authored_by",
+                "applies_to",
+                "manages_client",
+                "contact_of",
+                "interacted_with",
+            ],
+        );
+    }
+
+    #[test]
+    fn client_relationship_types_roundtrip_through_queries() {
+        let (_tmp, graph) = test_graph();
+        let client = graph
+            .add_node(
+                NodeType::Client,
+                "Example Account",
+                "Enterprise account for relationship tracking",
+                &["enterprise".into()],
+                None,
+            )
+            .unwrap();
+        let contact = graph
+            .add_node(
+                NodeType::Contact,
+                "Contact Alpha",
+                "Primary technical contact",
+                &["technical".into()],
+                None,
+            )
+            .unwrap();
+        let expert = graph
+            .add_node(
+                NodeType::Expert,
+                "Expert Alpha",
+                "Owns the account relationship",
+                &["relationship-owner".into()],
+                None,
+            )
+            .unwrap();
+        let interaction = graph
+            .add_node(
+                NodeType::Interaction,
+                "Discovery call",
+                "Discussed integration requirements",
+                &["call".into()],
+                None,
+            )
+            .unwrap();
+
+        graph
+            .add_edge(&contact, &client, Relation::ContactOf)
+            .unwrap();
+        graph
+            .add_edge(&expert, &client, Relation::ManagesClient)
+            .unwrap();
+        graph
+            .add_edge(&client, &interaction, Relation::InteractedWith)
+            .unwrap();
+
+        let clients = graph.query_by_type(NodeType::Client, 10).unwrap();
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].id, client);
+
+        let interactions = graph
+            .find_outbound_by_relation_and_type(
+                &client,
+                Relation::InteractedWith,
+                NodeType::Interaction,
+                10,
+            )
+            .unwrap();
+        assert_eq!(interactions.len(), 1);
+        assert_eq!(interactions[0].id, interaction);
+
+        let inbound = graph.find_inbound(&client).unwrap();
+        assert!(
+            inbound
+                .iter()
+                .any(|(node, relation)| node.id == contact && *relation == Relation::ContactOf)
+        );
+        assert!(
+            inbound
+                .iter()
+                .any(|(node, relation)| node.id == expert && *relation == Relation::ManagesClient)
+        );
+
+        let (nodes, edges) = graph.get_subgraph(&client, 1).unwrap();
+        assert_eq!(nodes.len(), 4);
+        assert_eq!(edges.len(), 3);
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.relation == Relation::InteractedWith)
+        );
     }
 }
