@@ -2132,8 +2132,10 @@ mod tests {
     #[tokio::test]
     async fn update_context_windows_uses_exact_alias_not_model_uri() {
         let temp_dir = tempfile::TempDir::new().expect("temp dir");
-        let mut config = Config::default();
-        config.config_path = temp_dir.path().join("config.toml");
+        let mut config = Config {
+            config_path: temp_dir.path().join("config.toml"),
+            ..Default::default()
+        };
 
         // Create two groq provider aliases with SAME model and URI
         // This simulates the bug scenario where multiple aliases share the same
