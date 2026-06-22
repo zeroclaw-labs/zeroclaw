@@ -8,7 +8,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::PipelineConfig;
 
@@ -76,31 +76,25 @@ pub struct PipelineTool {
     config: PipelineConfig,
     tools: Vec<Arc<dyn Tool>>,
     allowed_set: HashSet<String>,
-    tool_access_policy: Arc<Mutex<Option<ToolAccessPolicy>>>,
+    /// Per-agent policy gate, baked in at construction. `None` only when
+    /// no SecurityPolicy gates are configured (all tools allowed, none
+    /// excluded); in that case `validate()` skips the per-agent check.
+    access_policy: Option<ToolAccessPolicy>,
 }
 
 impl PipelineTool {
     pub fn new(
         config: PipelineConfig,
         tools: Vec<Arc<dyn Tool>>,
-        tool_access_policy: Arc<Mutex<Option<ToolAccessPolicy>>>,
+        access_policy: Option<ToolAccessPolicy>,
     ) -> Self {
         let allowed_set: HashSet<String> = config.allowed_tools.iter().cloned().collect();
         Self {
             config,
             tools,
             allowed_set,
-            tool_access_policy,
+            access_policy,
         }
-    }
-
-    /// Set the per-agent tool access policy that gates sub-tool execution.
-    ///
-    /// Callers must invoke this after construction and before any pipeline
-    /// execution so that the per-agent `ToolAccessPolicy` is respected in
-    /// addition to the global `[pipeline].allowed_tools` config.
-    pub fn set_access_policy(&self, policy: ToolAccessPolicy) {
-        *self.tool_access_policy.lock().unwrap() = Some(policy);
     }
 
     /// Find a tool by name in the registry.
@@ -118,16 +112,15 @@ impl PipelineTool {
         }
 
         // Two-gate check: global pipeline allowlist AND per-agent access policy.
-        // The per-agent gate is a shared mutable slot set externally by loop_.rs
-        // after constructing the tool registry. When unset the gate is open.
-        let policy_guard = self.tool_access_policy.lock().unwrap();
+        // The per-agent policy is baked in at construction — no mutable slot.
         for step in &request.steps {
-            if !self.allowed_set.contains(&step.tool)
-                || policy_guard
-                    .as_ref()
-                    .is_some_and(|p| !p.is_tool_allowed(&step.tool))
-            {
+            if !self.allowed_set.contains(&step.tool) {
                 return Err(PipelineError::UnknownTool(step.tool.clone()));
+            }
+            if let Some(ref policy) = self.access_policy {
+                if !policy.is_tool_allowed(&step.tool) {
+                    return Err(PipelineError::UnknownTool(step.tool.clone()));
+                }
             }
         }
 
@@ -561,7 +554,7 @@ mod tests {
             max_steps: 2,
             allowed_tools: vec!["shell".to_string()],
         };
-        let tool = PipelineTool::new(config, vec![], Arc::new(Mutex::new(None)));
+        let tool = PipelineTool::new(config, vec![], None);
 
         let request = PipelineRequest {
             steps: vec![
@@ -593,7 +586,7 @@ mod tests {
             max_steps: 20,
             allowed_tools: vec!["shell".to_string()],
         };
-        let tool = PipelineTool::new(config, vec![], Arc::new(Mutex::new(None)));
+        let tool = PipelineTool::new(config, vec![], None);
 
         let request = PipelineRequest {
             steps: vec![PipelineStep {
@@ -615,7 +608,7 @@ mod tests {
             max_steps: 20,
             allowed_tools: vec!["shell".to_string(), "file_read".to_string()],
         };
-        let tool = PipelineTool::new(config, vec![], Arc::new(Mutex::new(None)));
+        let tool = PipelineTool::new(config, vec![], None);
 
         let request = PipelineRequest {
             steps: vec![
@@ -642,7 +635,7 @@ mod tests {
             max_steps: 20,
             allowed_tools: vec![],
         };
-        let tool = PipelineTool::new(config, vec![], Arc::new(Mutex::new(None)));
+        let tool = PipelineTool::new(config, vec![], None);
 
         let request = PipelineRequest {
             steps: vec![],
@@ -651,6 +644,73 @@ mod tests {
         };
 
         assert!(tool.validate(&request).is_ok());
+    }
+
+    // ── Per-agent policy gate ──────────────────────────────
+    //
+    // Regression for #7947: a tool present in [pipeline].allowed_tools
+    // must still be rejected when the calling agent's SecurityPolicy
+    // denies it. The per-agent policy is baked into PipelineTool at
+    // construction — no mutable slot.
+
+    #[test]
+    fn validate_per_agent_policy_denies_subtool() {
+        // Global pipeline allowlist admits shell.
+        let config = PipelineConfig {
+            enabled: true,
+            max_steps: 20,
+            allowed_tools: vec!["shell".to_string(), "file_read".to_string()],
+        };
+        // Per-agent policy only allows file_read — shell is denied.
+        let policy = ToolAccessPolicy {
+            allowed: Some(vec!["file_read".to_string()]),
+            ..ToolAccessPolicy::default()
+        };
+        let tool = PipelineTool::new(config, vec![], Some(policy));
+
+        let request = PipelineRequest {
+            steps: vec![PipelineStep {
+                tool: "shell".into(),
+                args: serde_json::json!({}),
+            }],
+            parallel: false,
+            result: PipelineResultMode::default(),
+        };
+
+        let err = tool.validate(&request).unwrap_err();
+        assert!(
+            matches!(err, PipelineError::UnknownTool(ref name) if name == "shell"),
+            "shell must be rejected by per-agent policy even though pipeline allowlist includes it, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_per_agent_policy_allows_subtool() {
+        let config = PipelineConfig {
+            enabled: true,
+            max_steps: 20,
+            allowed_tools: vec!["shell".to_string(), "file_read".to_string()],
+        };
+        // Per-agent policy allows both.
+        let policy = ToolAccessPolicy {
+            allowed: Some(vec!["shell".to_string(), "file_read".to_string()]),
+            ..ToolAccessPolicy::default()
+        };
+        let tool = PipelineTool::new(config, vec![], Some(policy));
+
+        let request = PipelineRequest {
+            steps: vec![PipelineStep {
+                tool: "shell".into(),
+                args: serde_json::json!({}),
+            }],
+            parallel: false,
+            result: PipelineResultMode::default(),
+        };
+
+        assert!(
+            tool.validate(&request).is_ok(),
+            "shell must be allowed when both pipeline and per-agent policy admit it"
+        );
     }
 
     // ── Template resolution ────────────────────────────────
@@ -726,7 +786,7 @@ mod tests {
                 output: "final answer".into(),
             }),
         ];
-        PipelineTool::new(config, tools, Arc::new(Mutex::new(None)))
+        PipelineTool::new(config, tools, None)
     }
 
     #[tokio::test]
