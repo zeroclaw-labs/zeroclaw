@@ -585,4 +585,13 @@ mod tests {
             "ws://127.0.0.1:42617/ws/chat"
         );
     }
+
+    #[test]
+    fn check_config_with_default_config() {
+        let config = crate::config::Config::default();
+        let result = check_config(&config);
+        // Default config should fail since no config file exists
+        assert!(!result.passed, "default config should not have a config file");
+        assert_eq!(result.detail, "config file not found (using defaults)");
+    }
 }
