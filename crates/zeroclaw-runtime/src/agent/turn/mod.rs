@@ -87,7 +87,9 @@ pub use outcome::{
 };
 #[cfg(test)]
 pub(crate) use parse_response::build_native_assistant_history;
-pub(crate) use parse_response::{interpret_chat_response, resolve_display_text};
+pub(crate) use parse_response::{
+    interpret_chat_response, resolve_display_text, unforwarded_narration,
+};
 pub(crate) use post_exec::record_executed_outcomes;
 pub(crate) use provider_call::{
     ProviderCallOutcome, announce_llm_request, call_provider, enforce_tool_loop_budget,
@@ -378,10 +380,11 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             if remaining == 0 {
                 ::zeroclaw_log::record!(
                     WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({"iteration": iteration})),
-                    "Shared iteration budget exhausted at iteration "
+                    "Shared iteration budget exhausted at iteration"
                 );
                 break;
             }
@@ -398,7 +401,8 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         {
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Migrate)
+                    .with_category(::zeroclaw_log::EventCategory::Provider),
                 &format!(
                     "Model switch detected: {} {} -> {} {}",
                     provider_name, model, new_model_provider, new_model
@@ -482,6 +486,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
                     .with_attrs(::serde_json::json!({
                         "has_on_delta": on_delta.is_some(),
                         "has_event_tx": event_tx.is_some(),
@@ -502,6 +507,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             chat_result,
             streamed_live_deltas,
             streamed_protocol_suppressed,
+            streamed_visible_text,
         } = call_provider(
             &ctx,
             active_model_provider,
@@ -609,6 +615,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Provider)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(serde_json::json!({
                         "channel": channel_name,
@@ -622,6 +629,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Provider)
                     .with_attrs(serde_json::json!({
                     "iteration": iteration + 1,
                     "retry": malformed_tool_protocol_retries,
@@ -682,6 +690,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_attrs(::serde_json::json!({
                         "model": model,
@@ -724,17 +733,23 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         // can still see it live through `on_delta` below, but the final
         // delivered response must only contain the final assistant turn.
 
-        // Native tool-call model_providers can return assistant text separately from
-        // the structured call payload; relay it to draft-capable channels.
+        // Relay only the portion of narration the live stream did not already
+        // deliver: re-sending the whole thing duplicates it.
         if !display_text.is_empty() {
+            // `protocol_suppressed` withholds the whole turn; the empty-remainder
+            // skip below handles the guard-passed case where the live stream already forwarded every byte.
             if !native_tool_calls.is_empty()
+                && !protocol_suppressed
                 && let Some(ref tx) = on_delta
             {
-                let mut narration = display_text.clone();
-                if !narration.ends_with('\n') {
-                    narration.push('\n');
+                let remainder = unforwarded_narration(&display_text, &streamed_visible_text);
+                if !remainder.is_empty() {
+                    let mut narration = remainder.to_string();
+                    if !narration.ends_with('\n') {
+                        narration.push('\n');
+                    }
+                    let _ = tx.send(StreamDelta::Text(narration)).await;
                 }
-                let _ = tx.send(StreamDelta::Text(narration)).await;
             }
             if !silent {
                 eprint!("{display_text}");

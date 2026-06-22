@@ -32,6 +32,7 @@ pub(crate) struct ProviderCallOutcome {
     pub(crate) chat_result: Result<ChatResponse>,
     pub(crate) streamed_live_deltas: bool,
     pub(crate) streamed_protocol_suppressed: bool,
+    pub(crate) streamed_visible_text: String,
 }
 
 /// Announce the upcoming LLM request: progress Status, observer `LlmRequest`,
@@ -108,6 +109,7 @@ pub(crate) async fn announce_llm_request(
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                .with_category(::zeroclaw_log::EventCategory::Provider)
                 .with_attrs(attrs),
             "llm_request"
         );
@@ -134,6 +136,7 @@ pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_category(::zeroclaw_log::EventCategory::Provider)
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                 .with_attrs(::serde_json::json!({
                     "current_usd": current_usd,
@@ -167,6 +170,7 @@ pub(crate) async fn call_provider(
 ) -> Result<ProviderCallOutcome> {
     let mut streamed_live_deltas = false;
     let mut streamed_protocol_suppressed = false;
+    let mut streamed_visible_text = String::new();
 
     let chat_result = if should_consume_provider_stream {
         // Attribution is opened by ProviderDispatch::from_ref(...).stream_chat
@@ -187,6 +191,7 @@ pub(crate) async fn call_provider(
             Ok(streamed) => {
                 streamed_live_deltas = streamed.forwarded_live_deltas;
                 streamed_protocol_suppressed = streamed.suppressed_protocol;
+                streamed_visible_text = streamed.forwarded_visible_text;
                 let reasoning_content = if streamed.reasoning_content.is_empty() {
                     None
                 } else {
@@ -217,6 +222,7 @@ pub(crate) async fn call_provider(
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_category(::zeroclaw_log::EventCategory::Provider)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({
                             "model": active_model,
@@ -309,6 +315,7 @@ pub(crate) async fn call_provider(
         chat_result,
         streamed_live_deltas,
         streamed_protocol_suppressed,
+        streamed_visible_text,
     })
 }
 
