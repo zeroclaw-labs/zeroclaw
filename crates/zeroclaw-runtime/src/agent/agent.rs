@@ -1227,16 +1227,23 @@ impl Agent {
         let mut activated_tools: Option<Arc<std::sync::Mutex<tools::ActivatedToolSet>>> = None;
         // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
         let mut mcp_elevation_arcs: Vec<Arc<dyn tools::Tool>> = Vec::new();
-        if initialize_mcp && config.mcp.enabled && !config.mcp.servers.is_empty() {
+        // Secure by default: only the MCP servers granted by this agent's
+        // `mcp_bundles` (omission is not a grant).
+        let agent_mcp_servers = if initialize_mcp && config.mcp.enabled {
+            config.mcp_servers_for_agent(agent_alias)
+        } else {
+            Vec::new()
+        };
+        if !agent_mcp_servers.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 &format!(
-                    "Initializing MCP client — {} server(s) configured",
-                    config.mcp.servers.len()
+                    "Initializing MCP client - {} server(s) granted via mcp_bundles",
+                    agent_mcp_servers.len()
                 )
             );
-            match tools::McpRegistry::connect_all(&config.mcp.servers).await {
+            match tools::McpRegistry::connect_all(&agent_mcp_servers).await {
                 Ok(registry) => {
                     let registry = std::sync::Arc::new(registry);
                     mcp_elevation_arcs = tools::collect_mcp_elevation_arcs(&registry).await;
@@ -1960,39 +1967,43 @@ impl Agent {
             .scope(
                 Some(cost_context.clone()),
                 crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
-                    model_provider: self.model_provider.as_ref(),
+                    exec: crate::agent::loop_::ResolvedAgentExecution {
+                        model_access: crate::agent::loop_::ResolvedModelAccess {
+                            model_provider: self.model_provider.as_ref(),
+                            provider_name: &self.model_provider_name,
+                            model: &effective_model,
+                            temperature: self.temperature,
+                        },
+                        tools_registry: &self.tools,
+                        observer: self.observer.as_ref(),
+                        silent: false,
+                        approval: self.approval_manager.as_deref(),
+                        multimodal_config: &self.multimodal_config,
+                        max_tool_iterations: self.config.resolved.max_tool_iterations,
+                        hooks: self.hook_runner.as_deref(),
+                        excluded_tools: &[],
+                        dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
+                        activated_tools: self.activated_tools.as_ref(),
+                        model_switch_callback: None,
+                        pacing: &pacing,
+                        strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                        parallel_tools: self.config.resolved.parallel_tools,
+                        max_tool_result_chars: self.config.resolved.max_tool_result_chars,
+                        context_token_budget: self.config.resolved.effective_context_budget(),
+                        receipt_generator: None,
+                        knobs: &knobs,
+                    },
                     history: &mut loop_history,
-                    tools_registry: &self.tools,
-                    observer: self.observer.as_ref(),
-                    provider_name: &self.model_provider_name,
-                    model: &effective_model,
-                    temperature: self.temperature,
-                    silent: false,
-                    approval: self.approval_manager.as_deref(),
                     channel_name: "cli",
                     channel_reply_target: None,
-                    multimodal_config: &self.multimodal_config,
-                    max_tool_iterations: self.config.resolved.max_tool_iterations,
                     cancellation_token: None,
                     on_delta: None,
-                    hooks: self.hook_runner.as_deref(),
-                    excluded_tools: &[],
-                    dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
-                    activated_tools: self.activated_tools.as_ref(),
-                    model_switch_callback: None,
-                    pacing: &pacing,
-                    strict_tool_parsing: self.config.resolved.strict_tool_parsing,
-                    parallel_tools: self.config.resolved.parallel_tools,
-                    max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                    context_token_budget: self.config.resolved.effective_context_budget(),
                     shared_budget: None,
                     channel: None,
-                    receipt_generator: None,
                     collected_receipts: None,
                     event_tx: None,
                     steering: None,
                     new_messages_out: Some(&mut loop_new_messages),
-                    knobs: &knobs,
                     image_cache: Some(&mut self.image_cache),
                     // Phase 1: stamp Internal/Trusted. Real per-transport
                     // stamping is PR C (RFC #6971 §4).
@@ -2353,39 +2364,43 @@ impl Agent {
                 .scope(
                     Some(cost_context.clone()),
                     crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
-                        model_provider: self.model_provider.as_ref(),
+                        exec: crate::agent::loop_::ResolvedAgentExecution {
+                            model_access: crate::agent::loop_::ResolvedModelAccess {
+                                model_provider: self.model_provider.as_ref(),
+                                provider_name: &self.model_provider_name,
+                                model: &effective_model,
+                                temperature: self.temperature,
+                            },
+                            tools_registry: &self.tools,
+                            observer: self.observer.as_ref(),
+                            silent: true,
+                            approval: self.approval_manager.as_deref(),
+                            multimodal_config: &self.multimodal_config,
+                            max_tool_iterations: self.config.resolved.max_tool_iterations,
+                            hooks: self.hook_runner.as_deref(),
+                            excluded_tools: &[],
+                            dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
+                            activated_tools: self.activated_tools.as_ref(),
+                            model_switch_callback: None,
+                            pacing: &pacing,
+                            strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                            parallel_tools: self.config.resolved.parallel_tools,
+                            max_tool_result_chars: self.config.resolved.max_tool_result_chars,
+                            context_token_budget: self.config.resolved.effective_context_budget(),
+                            receipt_generator: None,
+                            knobs: &knobs,
+                        },
                         history: &mut loop_history,
-                        tools_registry: &self.tools,
-                        observer: self.observer.as_ref(),
-                        provider_name: &self.model_provider_name,
-                        model: &effective_model,
-                        temperature: self.temperature,
-                        silent: true,
-                        approval: self.approval_manager.as_deref(),
                         channel_name: "cli",
                         channel_reply_target: None,
-                        multimodal_config: &self.multimodal_config,
-                        max_tool_iterations: self.config.resolved.max_tool_iterations,
                         cancellation_token: cancel_token.clone(),
                         on_delta: None,
-                        hooks: self.hook_runner.as_deref(),
-                        excluded_tools: &[],
-                        dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
-                        activated_tools: self.activated_tools.as_ref(),
-                        model_switch_callback: None,
-                        pacing: &pacing,
-                        strict_tool_parsing: self.config.resolved.strict_tool_parsing,
-                        parallel_tools: self.config.resolved.parallel_tools,
-                        max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                        context_token_budget: self.config.resolved.effective_context_budget(),
                         shared_budget: None,
                         channel: approval_bridge.as_deref(),
-                        receipt_generator: None,
                         collected_receipts: None,
                         event_tx: Some(event_tx.clone()),
                         steering: None,
                         new_messages_out: Some(&mut round_added),
-                        knobs: &knobs,
                         image_cache: Some(&mut self.image_cache),
                         // Phase 1: stamp Internal/Trusted. Real per-transport
                         // stamping is PR C (RFC #6971 §4).
