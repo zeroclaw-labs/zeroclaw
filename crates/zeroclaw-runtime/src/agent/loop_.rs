@@ -1369,17 +1369,16 @@ pub async fn run(
         }
 
         // ── Wire per-agent policy into PipelineTool ────────────────────
-        // PipelineTool carries an unfiltered internal registry (every
-        // built-in tool is available to it at construction). The filter above
-        // gates the top-level Vec<Box<dyn Tool>> but PipelineTool.validate()
-        // must also reject steps that use tools denied by the agent's
-        // SecurityPolicy. The shared Mutex slot lets us inject the per-agent
-        // ToolAccessPolicy after construction without downcasting.
-        if let Some(ref slot) = all_tools_result.pipeline_access_policy {
-            if let Some(policy) =
-                mcp_tool_access_policy(security.as_ref(), allowed_tools.as_deref())
+        // PipelineTool construction is deferred so the per-agent
+        // ToolAccessPolicy is baked in immutably at construction time —
+        // no mutable slot, no stale/missing policy.
+        if let Some(ref raw) = all_tools_result.pipeline_raw {
+            let policy =
+                mcp_tool_access_policy(security.as_ref(), allowed_tools.as_deref());
+            if let Some(pipe) =
+                crate::tools::build_pipeline_tool(raw, policy)
             {
-                *slot.lock().unwrap() = Some(policy);
+                tools_registry.push(pipe);
             }
         }
 
@@ -3014,12 +3013,12 @@ pub async fn process_message(
         filter_channel_builtin_tools(&mut tools_registry, security.as_ref());
 
         // ── Wire per-agent policy into PipelineTool (process_message path) ──
-        // Same rationale as the CLI path: PipelineTool's internal registry is
-        // unfiltered, so we inject the per-agent ToolAccessPolicy via the
-        // shared Mutex slot so validate() gates sub-tool steps.
-        if let Some(ref slot) = all_tools_result_pm.pipeline_access_policy {
-            if let Some(policy) = mcp_tool_access_policy(security.as_ref(), None) {
-                *slot.lock().unwrap() = Some(policy);
+        // Same as the CLI path: defer construction so the per-agent
+        // ToolAccessPolicy is baked in immutably at construction time.
+        if let Some(ref raw) = all_tools_result_pm.pipeline_raw {
+            let policy = mcp_tool_access_policy(security.as_ref(), None);
+            if let Some(pipe) = crate::tools::build_pipeline_tool(raw, policy) {
+                tools_registry.push(pipe);
             }
         }
 
