@@ -92,6 +92,12 @@ secure.
 answers inside a thread if a message there @-mentions it, instead of replying to
 every message in a thread it's part of.
 
+`thread_history_scope` controls which Slack messages share one conversation
+history. The default `sender` preserves the historical behavior: a thread is
+split by sender. Set it to `thread` for support-style bots where everyone in
+the same Slack thread should share context, or `channel` to reuse one history
+across the whole Slack channel.
+
 ## Mentions and formatting
 
 - `mention_only`: when `true`, the bot only answers messages that @-mention it,

@@ -601,9 +601,53 @@ fn channel_scope(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
 }
 
 pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    conversation_history_key_with_slack_scope(
+        msg,
+        zeroclaw_config::schema::SlackThreadHistoryScope::Sender,
+    )
+}
+
+fn conversation_history_key_for_context(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> String {
+    let slack_scope = if msg.channel == "slack" {
+        msg.channel_alias
+            .as_deref()
+            .and_then(|alias| ctx.prompt_config.channels.slack.get(alias))
+            .map(|slack| slack.thread_history_scope)
+            .unwrap_or_default()
+    } else {
+        zeroclaw_config::schema::SlackThreadHistoryScope::Sender
+    };
+    conversation_history_key_with_slack_scope(msg, slack_scope)
+}
+
+fn conversation_history_key_with_slack_scope(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    slack_scope: zeroclaw_config::schema::SlackThreadHistoryScope,
+) -> String {
     let channel_scope = channel_scope(msg);
     if msg.channel == "wecom_ws" {
         return sanitize_session_key(&format!("{channel_scope}_{}", msg.reply_target));
+    }
+    if msg.channel == "slack" {
+        match slack_scope {
+            zeroclaw_config::schema::SlackThreadHistoryScope::Channel => {
+                return sanitize_session_key(&format!("{channel_scope}_{}", msg.reply_target));
+            }
+            zeroclaw_config::schema::SlackThreadHistoryScope::Thread
+                if msg.thread_ts.as_deref().is_some_and(|tid| !tid.is_empty()) =>
+            {
+                let tid = msg.thread_ts.as_deref().unwrap_or_default();
+                return sanitize_session_key(&format!(
+                    "{channel_scope}_{}_{tid}",
+                    msg.reply_target
+                ));
+            }
+            zeroclaw_config::schema::SlackThreadHistoryScope::Thread
+            | zeroclaw_config::schema::SlackThreadHistoryScope::Sender => {}
+        }
     }
     // reply_target gives per-channel isolation (distinct Discord/Slack
     // channels) and thread_ts gives per-topic isolation in forum groups.
@@ -2669,7 +2713,7 @@ fn build_scope_override_summary(
             scope_line(OverrideScope::Agent),
         )
     };
-    let sender_key = conversation_history_key(msg);
+    let sender_key = conversation_history_key_for_context(ctx, msg);
     let session = ctx
         .route_overrides
         .lock()
@@ -2699,7 +2743,7 @@ async fn handle_runtime_command_if_needed(
         return true;
     };
 
-    let sender_key = conversation_history_key(msg);
+    let sender_key = conversation_history_key_for_context(ctx, msg);
     let defaults_snapshot = runtime_defaults_snapshot(ctx);
     let mut current = get_route_selection(ctx, msg, &sender_key, &defaults_snapshot);
 
@@ -4385,7 +4429,7 @@ async fn process_channel_message_body(
         }
     }
 
-    let history_key = conversation_history_key(&msg);
+    let history_key = conversation_history_key_for_context(ctx.as_ref(), &msg);
     stamp_session_routing_context(ctx.as_ref(), &msg, &history_key);
     if msg.passive_context {
         record_passive_context(ctx.as_ref(), &msg, &history_key);
@@ -6013,7 +6057,7 @@ async fn run_message_dispatch_loop(
         // ── Debounce: accumulate rapid messages per sender ──────────
         // CLI messages bypass debouncing so the interactive loop stays responsive.
         let msg = if msg.channel != "cli" && ctx.debouncer.enabled() {
-            let debounce_key = conversation_history_key(&msg);
+            let debounce_key = conversation_history_key_for_context(ctx.as_ref(), &msg);
             match ctx.debouncer.debounce(&debounce_key, &msg.content).await {
                 zeroclaw_infra::debounce::DebounceResult::Pending(rx) => {
                     // Spawn a lightweight task that waits for the debounce window
@@ -17834,6 +17878,122 @@ BTC is currently around $65,000 based on latest tool output."#
             "wecom_ws_work_group--room-1"
         );
         assert_eq!(interruption_scope_key(&msg), "wecom_ws_work_group--room-1");
+    }
+
+    #[test]
+    fn slack_thread_history_scope_sender_preserves_sender_isolation() {
+        let first = zeroclaw_api::channel::ChannelMessage {
+            id: "slack_C123_1741234567.100001".into(),
+            sender: "U123".into(),
+            reply_target: "C123".into(),
+            content: "hello".into(),
+            channel: "slack".into(),
+            channel_alias: Some("support".into()),
+            timestamp: 1,
+            thread_ts: Some("1741234567.000001".into()),
+            interruption_scope_id: Some("1741234567.000001".into()),
+            attachments: vec![],
+            subject: None,
+            ..Default::default()
+        };
+        let second = zeroclaw_api::channel::ChannelMessage {
+            id: "slack_C123_1741234567.200002".into(),
+            sender: "U456".into(),
+            content: "same thread".into(),
+            timestamp: 2,
+            ..first.clone()
+        };
+
+        let first_key = conversation_history_key_with_slack_scope(
+            &first,
+            zeroclaw_config::schema::SlackThreadHistoryScope::Sender,
+        );
+        let second_key = conversation_history_key_with_slack_scope(
+            &second,
+            zeroclaw_config::schema::SlackThreadHistoryScope::Sender,
+        );
+
+        assert_ne!(first_key, second_key);
+        assert!(first_key.contains("U123"));
+        assert!(second_key.contains("U456"));
+    }
+
+    #[test]
+    fn slack_thread_history_scope_thread_shares_thread_across_senders() {
+        let first = zeroclaw_api::channel::ChannelMessage {
+            id: "slack_C123_1741234567.100001".into(),
+            sender: "U123".into(),
+            reply_target: "C123".into(),
+            content: "hello".into(),
+            channel: "slack".into(),
+            channel_alias: Some("support".into()),
+            timestamp: 1,
+            thread_ts: Some("1741234567.000001".into()),
+            interruption_scope_id: Some("1741234567.000001".into()),
+            attachments: vec![],
+            subject: None,
+            ..Default::default()
+        };
+        let second = zeroclaw_api::channel::ChannelMessage {
+            id: "slack_C123_1741234567.200002".into(),
+            sender: "U456".into(),
+            content: "same thread".into(),
+            timestamp: 2,
+            ..first.clone()
+        };
+
+        let first_key = conversation_history_key_with_slack_scope(
+            &first,
+            zeroclaw_config::schema::SlackThreadHistoryScope::Thread,
+        );
+        let second_key = conversation_history_key_with_slack_scope(
+            &second,
+            zeroclaw_config::schema::SlackThreadHistoryScope::Thread,
+        );
+
+        assert_eq!(first_key, second_key);
+        assert_eq!(first_key, "slack_support_C123_1741234567_000001");
+        assert!(!first_key.contains("U123"));
+        assert!(!first_key.contains("U456"));
+    }
+
+    #[test]
+    fn slack_thread_history_scope_channel_shares_channel_across_threads_and_senders() {
+        let first = zeroclaw_api::channel::ChannelMessage {
+            id: "slack_C123_1741234567.100001".into(),
+            sender: "U123".into(),
+            reply_target: "C123".into(),
+            content: "hello".into(),
+            channel: "slack".into(),
+            channel_alias: Some("support".into()),
+            timestamp: 1,
+            thread_ts: Some("1741234567.000001".into()),
+            interruption_scope_id: Some("1741234567.000001".into()),
+            attachments: vec![],
+            subject: None,
+            ..Default::default()
+        };
+        let second = zeroclaw_api::channel::ChannelMessage {
+            id: "slack_C123_1741234568.200002".into(),
+            sender: "U456".into(),
+            content: "different thread".into(),
+            timestamp: 2,
+            thread_ts: Some("1741234568.000001".into()),
+            interruption_scope_id: Some("1741234568.000001".into()),
+            ..first.clone()
+        };
+
+        let first_key = conversation_history_key_with_slack_scope(
+            &first,
+            zeroclaw_config::schema::SlackThreadHistoryScope::Channel,
+        );
+        let second_key = conversation_history_key_with_slack_scope(
+            &second,
+            zeroclaw_config::schema::SlackThreadHistoryScope::Channel,
+        );
+
+        assert_eq!(first_key, second_key);
+        assert_eq!(first_key, "slack_support_C123");
     }
 
     #[test]
