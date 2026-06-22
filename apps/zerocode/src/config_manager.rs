@@ -221,7 +221,12 @@ fn shorten_home(path: &Path) -> String {
     let Some(home) = home else {
         return path.display().to_string();
     };
-    let home_path = PathBuf::from(home);
+    // Canonicalize the home directory so the comparison is symmetric with the
+    // canonicalized config path. This handles symlinked $HOME setups common on
+    // macOS, NixOS, and container images.
+    let home_path = PathBuf::from(&home)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(home));
     let to_tilde = |p: &Path| -> String {
         match p.strip_prefix(&home_path) {
             Ok(rel) => format!("~/{}", rel.to_string_lossy().trim_end_matches('/')),
@@ -238,13 +243,10 @@ fn shorten_home(path: &Path) -> String {
 
 pub(crate) struct App {
     rpc: Arc<RpcClient>,
-    /// Active config directory the Config pane is editing. Resolved by
-    /// `client::resolve_config_dir` from `--config-dir`, `$ZEROCLAW_CONFIG_DIR`,
-    /// or the default home directory. Stored here so the Config header can
-    /// surface the source and so users can tell which config a value came
-    /// from when running against an alternate directory or a daemon backed
-    /// by a different on-disk state.
-    config_dir: PathBuf,
+    /// Cached display string for the active config directory, computed once at
+    /// construction so the tab bar does not re-stat the filesystem on every
+    /// render.
+    config_dir_display: String,
     section: ConfigSection,
     zerocode: crate::zerocode_pane::ZerocodePane,
     section_tab_area: Option<Rect>,
@@ -321,7 +323,7 @@ impl App {
     pub(crate) fn new(rpc: Arc<RpcClient>, config_dir: &Path) -> Self {
         Self {
             rpc,
-            config_dir: config_dir.to_path_buf(),
+            config_dir_display: shorten_home(config_dir),
             section: ConfigSection::Zeroclaw,
             zerocode: crate::zerocode_pane::ZerocodePane::new(config_dir),
             section_tab_area: None,
@@ -550,7 +552,7 @@ impl App {
         // different config source.
         spans.push(Span::styled("   ", theme::dim_style()));
         spans.push(Span::styled(
-            format!("config: {}", shorten_home(&self.config_dir)),
+            format!("config: {}", self.config_dir_display),
             theme::dim_style(),
         ));
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
