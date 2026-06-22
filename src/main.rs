@@ -4435,6 +4435,34 @@ async fn main() -> Result<()> {
                     }
                 );
             }
+            let uncompiled =
+                zeroclaw_channels::listing::configured_uncompiled_channels(&config.channels);
+            if !uncompiled.is_empty() {
+                println!(
+                    "{}",
+                    t(
+                        "cli-channels-not-compiled-header",
+                        "  Configured but not compiled in this binary:"
+                    )
+                );
+                for entry in &uncompiled {
+                    println!(
+                        "  {:9} {}",
+                        entry.name,
+                        t(
+                            "cli-status-channel-not-compiled",
+                            "🚫 configured, not compiled"
+                        )
+                    );
+                }
+                println!(
+                    "{}",
+                    t(
+                        "cli-channels-build-hint",
+                        "  Build from source with `./install.sh --source --preset full`, `--features channels-full`, or the specific `channel-*` feature."
+                    )
+                );
+            }
             println!();
             println!("{}", t("cli-status-peripherals", "Peripherals:"));
             let peripherals_enabled = if config.peripherals.enabled {
