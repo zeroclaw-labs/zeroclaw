@@ -125,8 +125,9 @@ use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
 use zeroclaw_runtime::agent::history::fast_trim_tool_results;
 use zeroclaw_runtime::agent::loop_::{
     LoopKnobs, ToolLoop, apply_policy_tool_filter, apply_text_tool_prompt_policy,
-    build_tool_instructions_for_names, clear_model_switch_request, get_model_switch_state,
-    is_model_switch_requested, run_tool_call_loop, scope_session_key, scope_thread_id,
+    build_tool_instructions_for_names, clear_model_switch_request, eager_mcp_tool_allowed,
+    get_model_switch_state, is_model_switch_requested, mcp_tool_access_policy,
+    register_eager_mcp_tool_if_allowed, run_tool_call_loop, scope_session_key, scope_thread_id,
     scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
@@ -8916,21 +8917,35 @@ pub async fn start_channels(
         // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
         let mut ch_mcp_elevation_arcs: Vec<std::sync::Arc<dyn zeroclaw_runtime::tools::Tool>> =
             Vec::new();
-        if config.mcp.enabled && !config.mcp.servers.is_empty() {
+        // Secure by default: an agent is granted only the MCP servers its
+        // `mcp_bundles` name (omission is not a grant). Connecting to the
+        // global server list here would let one agent's servers surface in a
+        // co-resident agent that was never granted them.
+        let agent_mcp_servers = config.mcp_servers_for_agent(agent_alias);
+        if config.mcp.enabled && !agent_mcp_servers.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_attrs(::serde_json::json!({"agent": agent_alias})),
                 &format!(
-                    "Initializing MCP client — {} server(s) configured",
-                    config.mcp.servers.len()
+                    "Initializing MCP client — {} server(s) granted via mcp_bundles",
+                    agent_mcp_servers.len()
                 )
             );
-            match zeroclaw_runtime::tools::McpRegistry::connect_all(&config.mcp.servers).await {
+            match zeroclaw_runtime::tools::McpRegistry::connect_all(&agent_mcp_servers).await {
                 Ok(registry) => {
                     let registry = std::sync::Arc::new(registry);
                     ch_mcp_elevation_arcs =
                         zeroclaw_runtime::tools::collect_mcp_elevation_arcs(&registry).await;
+                    // Per-agent MCP tool gate. The channel path previously pushed
+                    // every MCP tool into every agent's registry with no policy
+                    // check, so one agent's MCP server tools leaked into a
+                    // co-resident agent whose `excluded_tools` denied them. Build
+                    // the same policy the runtime `run` / `from_config` /
+                    // `process_message` paths use and gate both the eager and the
+                    // deferred branch through it: the risk-profile denylist is
+                    // enforced while the allowlist still auto-admits MCP names.
+                    let mcp_policy = mcp_tool_access_policy(security.as_ref(), None);
                     if config.mcp.deferred_loading {
                         let deferred_set =
                             zeroclaw_runtime::tools::DeferredMcpToolSet::from_registry(
@@ -8951,19 +8966,32 @@ pub async fn start_channels(
                             )
                         );
                         deferred_section =
-                            zeroclaw_runtime::tools::build_deferred_tools_section(&deferred_set);
+                            zeroclaw_runtime::tools::build_deferred_tools_section_filtered(
+                                &deferred_set,
+                                mcp_policy.as_ref(),
+                            );
                         let activated = std::sync::Arc::new(std::sync::Mutex::new(
                             zeroclaw_runtime::tools::ActivatedToolSet::new(),
                         ));
                         ch_activated_handle = Some(std::sync::Arc::clone(&activated));
-                        built_tools.push(Box::new(zeroclaw_runtime::tools::ToolSearchTool::new(
-                            deferred_set,
-                            activated,
-                        )));
+                        let mut tool_search =
+                            zeroclaw_runtime::tools::ToolSearchTool::new(deferred_set, activated);
+                        if let Some(policy) = mcp_policy {
+                            tool_search = tool_search.with_access_policy(policy);
+                        }
+                        built_tools.push(Box::new(tool_search));
                     } else {
+                        // Register only MCP tools the agent's policy admits
+                        // (parity with the runtime eager path): the denylist
+                        // drops excluded tools, the allowlist auto-admits the rest.
                         let names = registry.tool_names();
                         let mut registered = 0usize;
+                        let mut skipped = 0usize;
                         for name in names {
+                            if !eager_mcp_tool_allowed(&name, mcp_policy.as_ref()) {
+                                skipped += 1;
+                                continue;
+                            }
                             if let Some(def) = registry.get_tool_def(&name).await {
                                 let wrapper: std::sync::Arc<dyn Tool> = std::sync::Arc::new(
                                     zeroclaw_runtime::tools::McpToolWrapper::new(
@@ -8972,12 +9000,14 @@ pub async fn start_channels(
                                         std::sync::Arc::clone(&registry),
                                     ),
                                 );
-                                if let Some(ref handle) = delegate_handle_ch {
-                                    handle.write().push(std::sync::Arc::clone(&wrapper));
+                                if register_eager_mcp_tool_if_allowed(
+                                    wrapper,
+                                    &mut built_tools,
+                                    delegate_handle_ch.as_ref(),
+                                    mcp_policy.as_ref(),
+                                ) {
+                                    registered += 1;
                                 }
-                                built_tools
-                                    .push(Box::new(zeroclaw_runtime::tools::ArcToolRef(wrapper)));
-                                registered += 1;
                             }
                         }
                         ::zeroclaw_log::record!(
@@ -8986,7 +9016,10 @@ pub async fn start_channels(
                                 module_path!(),
                                 ::zeroclaw_log::Action::Note
                             )
-                            .with_attrs(::serde_json::json!({"agent": agent_alias})),
+                            .with_attrs(::serde_json::json!({
+                                "agent": agent_alias,
+                                "skipped": skipped,
+                            })),
                             &format!(
                                 "MCP: {} tool(s) registered from {} server(s)",
                                 registered,
@@ -12759,6 +12792,83 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             names.contains(&"file_read"),
             "allowlisted tool must survive the filter; got {names:?}"
+        );
+    }
+
+    /// `start_channels` must apply the agent's risk-profile `excluded_tools`
+    /// denylist to MCP tools at registration, at parity with the runtime eager
+    /// path. Before this fix the channel path pushed every MCP tool into every
+    /// agent's registry unconditionally, so one agent's MCP server tools leaked
+    /// into a co-resident agent whose `excluded_tools` denied them (the Discord
+    /// tool leak). A non-denied `<server>__<tool>` name is still auto-admitted,
+    /// so a server the agent does want is not silently dropped.
+    #[test]
+    fn channel_path_excluded_tools_drops_denied_mcp_tool() {
+        use zeroclaw_runtime::agent::loop_::{
+            mcp_tool_access_policy, register_eager_mcp_tool_if_allowed,
+        };
+        let policy = SecurityPolicy {
+            excluded_tools: Some(vec!["aa_mcp__find_items".to_string()]),
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        };
+        let mcp_policy = mcp_tool_access_policy(&policy, None);
+        let mut built_tools: Vec<Box<dyn Tool>> = Vec::new();
+        let denied: Arc<dyn Tool> = Arc::new(NamedMockTool("aa_mcp__find_items"));
+        let allowed: Arc<dyn Tool> = Arc::new(NamedMockTool("aa_mcp__find_npcs"));
+        let registered_denied =
+            register_eager_mcp_tool_if_allowed(denied, &mut built_tools, None, mcp_policy.as_ref());
+        let registered_allowed = register_eager_mcp_tool_if_allowed(
+            allowed,
+            &mut built_tools,
+            None,
+            mcp_policy.as_ref(),
+        );
+        assert!(
+            !registered_denied,
+            "an `excluded_tools`-denied MCP tool must not be registered on the channel path"
+        );
+        assert!(
+            registered_allowed,
+            "a non-denied MCP tool must still be registered (allowlist auto-admit)"
+        );
+        let names: Vec<&str> = built_tools.iter().map(|t| t.name()).collect();
+        assert!(
+            !names.contains(&"aa_mcp__find_items"),
+            "denied MCP tool leaked into the channel registry; got {names:?}"
+        );
+        assert!(
+            names.contains(&"aa_mcp__find_npcs"),
+            "allowed MCP tool missing from the channel registry; got {names:?}"
+        );
+    }
+
+    /// Companion to the MCP denylist test, pinning the built-in side: the same
+    /// channel-path gate must drop a built-in named in the agent's
+    /// `excluded_tools` (e.g. a `readonly` profile denying `shell`). Built-ins
+    /// always went through `apply_policy_tool_filter`; this guards that the MCP
+    /// gate fix did not regress the built-in denylist, and that `shell` is not
+    /// leaked into a co-resident agent that excluded it.
+    #[test]
+    fn channel_path_excluded_tools_drops_denied_builtin() {
+        let mut built_tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(NamedMockTool("shell")),
+            Box::new(NamedMockTool("file_read")),
+        ];
+        let policy = SecurityPolicy {
+            excluded_tools: Some(vec!["shell".to_string()]),
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        };
+        apply_policy_tool_filter(&mut built_tools, Some(&policy), None);
+        let names: Vec<&str> = built_tools.iter().map(|t| t.name()).collect();
+        assert!(
+            !names.contains(&"shell"),
+            "an `excluded_tools`-denied built-in must be dropped on the channel path; got {names:?}"
+        );
+        assert!(
+            names.contains(&"file_read"),
+            "a non-excluded built-in must survive the filter; got {names:?}"
         );
     }
 

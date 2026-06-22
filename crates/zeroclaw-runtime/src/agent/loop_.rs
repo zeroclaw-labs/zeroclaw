@@ -203,7 +203,11 @@ pub fn apply_policy_tool_filter(
     });
 }
 
-pub(crate) fn mcp_tool_access_policy(
+/// Build the MCP tool-access policy for an agent from its `SecurityPolicy`
+/// (`allowed_tools` + `excluded_tools`) and an optional caller-supplied
+/// allowlist. Shared by the runtime agent loop and the channels orchestrator
+/// so every MCP registration site gates through identical logic.
+pub fn mcp_tool_access_policy(
     security: &zeroclaw_config::policy::SecurityPolicy,
     caller_allowed: Option<&[String]>,
 ) -> Option<zeroclaw_tools::tool_search::ToolAccessPolicy> {
@@ -214,7 +218,11 @@ pub(crate) fn mcp_tool_access_policy(
     )
 }
 
-pub(crate) fn eager_mcp_tool_allowed(
+/// Whether an MCP tool name is admitted by `policy` (a `None` policy admits
+/// everything). The risk-profile denylist always wins; the allowlist
+/// auto-admits `<server>__<tool>` names so a restrictive allowlist does not
+/// silently drop a configured server's tools.
+pub fn eager_mcp_tool_allowed(
     name: &str,
     policy: Option<&zeroclaw_tools::tool_search::ToolAccessPolicy>,
 ) -> bool {
@@ -231,7 +239,10 @@ pub(crate) fn mcp_allowed_tool_count<'a>(
         .count()
 }
 
-pub(crate) fn register_eager_mcp_tool_if_allowed(
+/// Register an eager MCP tool wrapper into `tools` (and the delegate handle,
+/// when present) only if `policy` admits it. Returns `true` when the tool was
+/// registered, `false` when the policy dropped it.
+pub fn register_eager_mcp_tool_if_allowed(
     wrapper: std::sync::Arc<dyn Tool>,
     tools: &mut Vec<Box<dyn Tool>>,
     delegate_handle: Option<&tools::DelegateParentToolsHandle>,
@@ -1117,17 +1128,20 @@ pub async fn run(
         > = None;
         // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
         let mut mcp_elevation_arcs: Vec<std::sync::Arc<dyn Tool>> = Vec::new();
-        if config.mcp.enabled && !config.mcp.servers.is_empty() {
+        // Secure by default: only the MCP servers granted by this agent's
+        // `mcp_bundles` (omission is not a grant).
+        let agent_mcp_servers = config.mcp_servers_for_agent(agent_alias);
+        if config.mcp.enabled && !agent_mcp_servers.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
                     .with_category(::zeroclaw_log::EventCategory::Tool),
                 &format!(
-                    "Initializing MCP client — {} server(s) configured",
-                    config.mcp.servers.len()
+                    "Initializing MCP client — {} server(s) granted via mcp_bundles",
+                    agent_mcp_servers.len()
                 )
             );
-            match crate::tools::McpRegistry::connect_all(&config.mcp.servers).await {
+            match crate::tools::McpRegistry::connect_all(&agent_mcp_servers).await {
                 Ok(registry) => {
                     let registry = std::sync::Arc::new(registry);
                     mcp_elevation_arcs = crate::tools::collect_mcp_elevation_arcs(&registry).await;
@@ -2655,17 +2669,20 @@ pub async fn process_message(
         > = None;
         // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
         let mut mcp_elevation_arcs: Vec<std::sync::Arc<dyn Tool>> = Vec::new();
-        if config.mcp.enabled && !config.mcp.servers.is_empty() {
+        // Secure by default: only the MCP servers granted by this agent's
+        // `mcp_bundles` (omission is not a grant).
+        let agent_mcp_servers = config.mcp_servers_for_agent(agent_alias);
+        if config.mcp.enabled && !agent_mcp_servers.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
                     .with_category(::zeroclaw_log::EventCategory::Tool),
                 &format!(
-                    "Initializing MCP client — {} server(s) configured",
-                    config.mcp.servers.len()
+                    "Initializing MCP client — {} server(s) granted via mcp_bundles",
+                    agent_mcp_servers.len()
                 )
             );
-            match crate::tools::McpRegistry::connect_all(&config.mcp.servers).await {
+            match crate::tools::McpRegistry::connect_all(&agent_mcp_servers).await {
                 Ok(registry) => {
                     let registry = std::sync::Arc::new(registry);
                     mcp_elevation_arcs = crate::tools::collect_mcp_elevation_arcs(&registry).await;
