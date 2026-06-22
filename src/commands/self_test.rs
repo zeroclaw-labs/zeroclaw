@@ -585,4 +585,12 @@ mod tests {
             "ws://127.0.0.1:42617/ws/chat"
         );
     }
+
+    #[tokio::test]
+    async fn check_memory_roundtrip_with_default_config() {
+        let config = crate::config::Config::default();
+        let result = check_memory_roundtrip(&config).await;
+        // Memory roundtrip should succeed with default config
+        assert!(result.passed, "memory roundtrip should pass with default config");
+    }
 }
