@@ -10155,29 +10155,6 @@ temperature = 0.3
         );
     }
 
-    fn seed_sender_history(ctx: &ChannelRuntimeContext, sender: &str, turns: Vec<ChatMessage>) {
-        let mut histories = ctx
-            .conversation_histories
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        histories.push(sender.to_string(), turns);
-    }
-
-    fn cloned_sender_history(ctx: &ChannelRuntimeContext, sender: &str) -> Vec<ChatMessage> {
-        let histories = ctx
-            .conversation_histories
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        histories.peek(sender).cloned().unwrap_or_default()
-    }
-
-    fn history_signature(turns: &[ChatMessage]) -> Vec<(String, String)> {
-        turns
-            .iter()
-            .map(|turn| (turn.role.clone(), turn.content.clone()))
-            .collect()
-    }
-
     #[test]
     fn agent_router_multi_routes_each_alias_to_its_owning_agent() {
         // Two enabled agents, each owning one Discord bot. A message tagged
