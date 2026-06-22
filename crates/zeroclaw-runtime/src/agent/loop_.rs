@@ -2086,6 +2086,7 @@ pub async fn run(
                             agent.resolved.max_tool_result_chars,
                             agent.resolved.max_context_tokens,
                             None, // cancellation_token — no parent token in single-shot run
+                            Some(agent_alias),
                         ),
                     )
                     .await;
@@ -13262,6 +13263,7 @@ Let me check the result."#;
                     0,
                     0,
                     None,
+                    None, // agent_alias — no parent alias in the review-fork test fixture
                 ),
             )
             .await;
@@ -13345,6 +13347,7 @@ Let me check the result."#;
                     0,
                     0,
                     None,
+                    None, // agent_alias — no parent alias in the review-fork test fixture
                 ),
             )
             .await;
