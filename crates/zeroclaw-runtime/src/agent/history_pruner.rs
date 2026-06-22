@@ -16,25 +16,6 @@ pub struct PrunedOrphans {
     pub orphan_tool_call_ids: Vec<String>,
 }
 
-fn assistant_tool_calls_have_immediate_results(
-    messages: &[ChatMessage],
-    assistant_idx: usize,
-    tool_call_ids: &[String],
-) -> bool {
-    if tool_call_ids.is_empty() {
-        return false;
-    }
-
-    tool_call_ids.iter().all(|expected| {
-        messages
-            .iter()
-            .skip(assistant_idx + 1)
-            .take_while(|msg| msg.role == "tool")
-            .filter_map(|msg| extract_tool_call_id(&msg.content))
-            .any(|actual| actual == *expected)
-    })
-}
-
 /// True when the assistant at `prev_idx` is itself an unresolved tool-call
 /// dispatch: it claims `tool_calls` but the rows between it and `next_idx`
 /// do not answer all of them. This is the genuinely poisoned shape where a
@@ -98,9 +79,7 @@ pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> PrunedO
         if let Some(doomed_ids) = assistant_tool_call_ids
             && i > 0
             && messages[i - 1].role == "assistant"
-            && ((messages[i - 1].is_pruned_tool_exchange_summary()
-                && !assistant_tool_calls_have_immediate_results(messages, i, &doomed_ids))
-                || assistant_is_unresolved_dispatch(messages, i - 1, i))
+            && assistant_is_unresolved_dispatch(messages, i - 1, i)
         {
             outcome
                 .orphan_tool_call_ids

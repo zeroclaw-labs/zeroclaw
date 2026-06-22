@@ -2073,27 +2073,6 @@ fn history_notifications_for_message(
 ) -> Vec<JsonRpcNotification> {
     match msg {
         ConversationMessage::Chat(chat) => {
-            if chat.is_pruned_tool_exchange_summary() {
-                return vec![JsonRpcNotification {
-                    jsonrpc: "2.0",
-                    method: "session/update",
-                    params: serde_json::json!({
-                        "sessionId": session_id,
-                        "update": {
-                            "sessionUpdate": "tool_call",
-                            "toolCallId": format!("history-pruner-{session_id}"),
-                            "name": "history-pruner",
-                            "title": "history-pruner",
-                            "kind": "think",
-                            "status": "completed",
-                            "content": [{
-                                "type": "content",
-                                "content": { "type": "text", "text": &chat.content }
-                            }]
-                        }
-                    }),
-                }];
-            }
             let update_type = match chat.role.as_str() {
                 "user" => "user_message_chunk",
                 "assistant" => "agent_message_chunk",
@@ -3430,37 +3409,6 @@ mod tests {
             update["content"][0]["content"]["text"]
                 .as_str()
                 .is_some_and(|t| !t.is_empty())
-        );
-    }
-
-    #[test]
-    fn history_pruner_marker_replays_as_tool_call_not_agent_message() {
-        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
-        let marker = ChatMessage::pruned_tool_exchange_summary(3);
-        let msg = ConversationMessage::Chat(ChatMessage::assistant(&marker));
-        let notes = history_notifications_for_message("sess-x", &msg);
-        assert_eq!(notes.len(), 1);
-        let update = &notes[0].params["update"];
-        assert_eq!(update["sessionUpdate"], "tool_call");
-        assert_eq!(update["name"], "history-pruner");
-        assert_eq!(update["content"][0]["content"]["text"], marker);
-
-        let plain = ConversationMessage::Chat(ChatMessage::assistant("normal reply"));
-        let plain_notes = history_notifications_for_message("sess-x", &plain);
-        assert_eq!(
-            plain_notes[0].params["update"]["sessionUpdate"],
-            "agent_message_chunk"
-        );
-
-        // Sessions pruned before #7684 carry the legacy marker; they must still
-        // replay as the styled tool_call, not leak the raw marker as agent text.
-        let legacy = ConversationMessage::Chat(ChatMessage::assistant(
-            "[Tool exchange: 3 tool call(s) results collapsed]",
-        ));
-        let legacy_notes = history_notifications_for_message("sess-x", &legacy);
-        assert_eq!(
-            legacy_notes[0].params["update"]["sessionUpdate"],
-            "tool_call"
         );
     }
 
