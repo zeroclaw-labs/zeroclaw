@@ -136,10 +136,9 @@ pub use super::cost::{
 
 // History management moved to `super::history`.
 pub use super::history::{
-    append_or_merge_system_message, canonicalize_tool_result_media_markers, emergency_history_trim,
-    estimate_history_tokens, fast_trim_tool_results, load_interactive_session_history,
-    normalize_system_messages, save_interactive_session_history, trim_history,
-    truncate_tool_result,
+    append_or_merge_system_message, canonicalize_tool_result_media_markers,
+    estimate_history_tokens, load_interactive_session_history, normalize_system_messages,
+    save_interactive_session_history, trim_history, truncate_tool_result,
 };
 
 /// Minimum user-message length (in chars) for auto-save to memory.
@@ -1836,13 +1835,12 @@ pub async fn run(
                 ChatMessage::user(&enriched),
             ];
 
-            // Prune history for token efficiency (when enabled).
-            if agent.resolved.history_pruning.enabled {
-                let _stats = crate::agent::history_pruner::prune_history(
-                    &mut history,
-                    &agent.resolved.history_pruning,
-                );
-            }
+            // Compute per-turn excluded MCP tools from tool_filter_groups.
+            let excluded_tools = compute_excluded_mcp_tools(
+                &tools_registry,
+                &agent.resolved.tool_filter_groups,
+                &effective_msg,
+            );
 
             #[allow(unused_assignments)]
             let mut response = String::new();
@@ -1900,7 +1898,7 @@ pub async fn run(
                                     strict_tool_parsing: agent.resolved.strict_tool_parsing,
                                     parallel_tools: agent.resolved.parallel_tools,
                                     max_tool_result_chars: agent.resolved.max_tool_result_chars,
-                                    context_token_budget: agent.resolved.max_context_tokens,
+                                    context_token_budget: agent.resolved.effective_context_budget(),
                                     receipt_generator: None,
                                     knobs: &LoopKnobs::default(),
                                 },
@@ -2405,7 +2403,9 @@ pub async fn run(
                                         strict_tool_parsing: agent.resolved.strict_tool_parsing,
                                         parallel_tools: agent.resolved.parallel_tools,
                                         max_tool_result_chars: agent.resolved.max_tool_result_chars,
-                                        context_token_budget: agent.resolved.max_context_tokens,
+                                        context_token_budget: agent
+                                            .resolved
+                                            .effective_context_budget(),
                                         receipt_generator: None,
                                         knobs: &LoopKnobs::default(),
                                     },
@@ -2490,7 +2490,8 @@ pub async fn run(
 
                                 continue;
                             }
-                            // Context overflow recovery: compress and retry
+                            // Context overflow recovery: drop oldest whole
+                            // turns and retry. No summarization, no splicing.
                             if zeroclaw_providers::reliable::is_context_window_exceeded(&e) {
                                 ::zeroclaw_log::record!(
                                     WARN,
@@ -2501,24 +2502,28 @@ pub async fn run(
                                     .with_category(::zeroclaw_log::EventCategory::Agent),
                                     "Context overflow in interactive loop, attempting recovery"
                                 );
-                                let mut compressor =
-                                    crate::agent::context_compressor::ContextCompressor::new(
-                                        agent.resolved.context_compression.clone(),
-                                        eff_max_context_tokens,
-                                    )
-                                    .with_memory(mem.clone());
-                                let error_msg = format!("{e}");
-                                match compressor
-                                    .compress_on_error(
-                                        &mut history,
-                                        model_provider.as_ref(),
-                                        &model_name,
-                                        temperature,
-                                        &error_msg,
-                                    )
-                                    .await
-                                {
-                                    Ok(true) => {
+                                let taken = std::mem::take(&mut history);
+                                let result = crate::agent::history_trim::trim_to_recent_turns(
+                                    taken,
+                                    eff_max_context_tokens,
+                                );
+                                if result.trimmed {
+                                    let mut trimmed = result.history;
+                                    let system_count =
+                                        trimmed.iter().take_while(|m| m.role == "system").count();
+                                    trimmed.insert(
+                                        system_count,
+                                        crate::agent::history_trim::breadcrumb(),
+                                    );
+                                    history = trimmed;
+                                    {
+                                        let __zc_trim_span = ::zeroclaw_log::info_span!(
+                                            target: "zeroclaw_log_internal_scope",
+                                            "zeroclaw_scope",
+                                            model = %model_name,
+                                            model_provider = %provider_name,
+                                        );
+                                        let _zc_trim_guard = __zc_trim_span.entered();
                                         ::zeroclaw_log::record!(
                                             INFO,
                                             ::zeroclaw_log::Event::new(
@@ -2526,26 +2531,36 @@ pub async fn run(
                                                 ::zeroclaw_log::Action::Retry
                                             )
                                             .with_category(::zeroclaw_log::EventCategory::Agent)
-                                            .with_outcome(::zeroclaw_log::EventOutcome::Success),
-                                            "Context recovered via compression, retrying turn"
-                                        );
-                                        continue;
-                                    }
-                                    Ok(false) => {
-                                        ::zeroclaw_log::record!(
-                                            WARN,
-                                            ::zeroclaw_log::Event::new(
-                                                module_path!(),
-                                                ::zeroclaw_log::Action::Fail
-                                            )
-                                            .with_category(::zeroclaw_log::EventCategory::Agent)
-                                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                                            "Compression ran but couldn't reduce enough"
+                                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                                            .with_attrs(::serde_json::json!({
+                                                "dropped_messages": result.dropped_messages,
+                                                "dropped_turns": result.dropped_turns,
+                                                "kept_turns": result.kept_turns,
+                                            })),
+                                            "Context recovered via whole-turn trim, retrying turn"
                                         );
                                     }
-                                    Err(compress_err) => {
-                                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Agent).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{}", compress_err)})), "Compression failed during recovery");
-                                    }
+                                    continue;
+                                }
+                                history = result.history;
+                                {
+                                    let __zc_trim_span = ::zeroclaw_log::info_span!(
+                                        target: "zeroclaw_log_internal_scope",
+                                        "zeroclaw_scope",
+                                        model = %model_name,
+                                        model_provider = %provider_name,
+                                    );
+                                    let _zc_trim_guard = __zc_trim_span.entered();
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Fail
+                                        )
+                                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                                        "Context overflow but only one turn remains; cannot trim further"
+                                    );
                                 }
                             }
 
@@ -2572,43 +2587,6 @@ pub async fn run(
                     eprintln!("\nError sending CLI response: {e}\n");
                 }
                 observer.record_event(&ObserverEvent::TurnComplete);
-
-                // Context compression before hard trimming to preserve long-context signal.
-                {
-                    let compressor = crate::agent::context_compressor::ContextCompressor::new(
-                        agent.resolved.context_compression.clone(),
-                        eff_max_context_tokens,
-                    )
-                    .with_memory(mem.clone());
-                    match compressor
-                        .compress_if_needed(
-                            &mut history,
-                            model_provider.as_ref(),
-                            &model_name,
-                            temperature,
-                        )
-                        .await
-                    {
-                        Ok(result) if result.compressed => {
-                            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete).with_category(::zeroclaw_log::EventCategory::Agent).with_outcome(::zeroclaw_log::EventOutcome::Success).with_attrs(::serde_json::json!({"passes": result.passes_used, "before": result.tokens_before, "after": result.tokens_after})), "Context compression complete");
-                        }
-                        Ok(_) => {} // No compression needed
-                        Err(e) => {
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Fail
-                                )
-                                .with_category(::zeroclaw_log::EventCategory::Agent)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                                "Context compression failed, falling back to history trim"
-                            );
-                            trim_history(&mut history, eff_max_history_messages / 2);
-                        }
-                    }
-                }
 
                 // Hard cap as a safety net.
                 trim_history(&mut history, eff_max_history_messages);
@@ -3306,10 +3284,10 @@ pub async fn process_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_text_tool_prompt_policy, build_context, emergency_history_trim,
-        estimate_history_tokens, fast_trim_tool_results, load_interactive_session_history,
-        make_query_summary, maybe_inject_channel_delivery_defaults,
-        save_interactive_session_history, truncate_tool_result,
+        apply_text_tool_prompt_policy, build_context, estimate_history_tokens,
+        load_interactive_session_history, make_query_summary,
+        maybe_inject_channel_delivery_defaults, save_interactive_session_history,
+        truncate_tool_result,
     };
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
     use crate::agent::tool_execution::execute_one_tool;
@@ -3480,102 +3458,6 @@ mod tests {
         use crate::agent::history::truncate_tool_message;
         let msg = r#"{"tool_call_id":"call_1","content":"ok"}"#;
         assert_eq!(truncate_tool_message(msg, 2000), msg);
-    }
-
-    // ── fast_trim_tool_results tests ────────────────────────────
-
-    #[test]
-    fn fast_trim_protects_recent_messages() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::tool("a".repeat(5000)),
-            ChatMessage::tool("b".repeat(5000)),
-            ChatMessage::user("recent user msg"),
-            ChatMessage::tool("c".repeat(5000)), // recent, should be protected
-        ];
-        // protect_last_n = 2 → last 2 messages protected
-        let saved = fast_trim_tool_results(&mut history, 2);
-        assert!(saved > 0);
-        // First two tool messages should be trimmed
-        assert!(history[1].content.len() <= 2100);
-        assert!(history[2].content.len() <= 2100);
-        // Last tool message (protected) should be unchanged
-        assert_eq!(history[4].content.len(), 5000);
-    }
-
-    #[test]
-    fn fast_trim_skips_non_tool_messages() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("a".repeat(5000)),
-            ChatMessage::assistant("b".repeat(5000)),
-        ];
-        let saved = fast_trim_tool_results(&mut history, 0);
-        assert_eq!(saved, 0);
-        assert_eq!(history[1].content.len(), 5000);
-        assert_eq!(history[2].content.len(), 5000);
-    }
-
-    #[test]
-    fn fast_trim_small_tool_results_unchanged() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::tool("short result"),
-        ];
-        let saved = fast_trim_tool_results(&mut history, 0);
-        assert_eq!(saved, 0);
-        assert_eq!(history[1].content, "short result");
-    }
-
-    // ── emergency_history_trim tests ──────────────────────────────
-
-    #[test]
-    fn emergency_trim_preserves_system() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("msg1"),
-            ChatMessage::assistant("resp1"),
-            ChatMessage::user("msg2"),
-            ChatMessage::assistant("resp2"),
-            ChatMessage::user("msg3"),
-        ];
-        let dropped = emergency_history_trim(&mut history, 2);
-        assert!(dropped > 0);
-        // System message should always be preserved
-        assert_eq!(history[0].role, "system");
-        assert_eq!(history[0].content, "sys");
-        // Last 2 messages should be preserved
-        let len = history.len();
-        assert_eq!(history[len - 1].content, "msg3");
-    }
-
-    #[test]
-    fn emergency_trim_preserves_recent() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("old1"),
-            ChatMessage::user("old2"),
-            ChatMessage::user("recent1"),
-            ChatMessage::user("recent2"),
-        ];
-        let dropped = emergency_history_trim(&mut history, 2);
-        assert!(dropped > 0);
-        // Last 2 should be preserved
-        let len = history.len();
-        assert_eq!(history[len - 1].content, "recent2");
-        assert_eq!(history[len - 2].content, "recent1");
-    }
-
-    #[test]
-    fn emergency_trim_nothing_to_drop() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("only user msg"),
-        ];
-        // protect_last = 1, system is protected → only 1 droppable
-        // target_drop = 2/3 = 0 → nothing dropped
-        let dropped = emergency_history_trim(&mut history, 1);
-        assert_eq!(dropped, 0);
     }
 
     // ── estimate_history_tokens tests ─────────────────────────────
@@ -12459,7 +12341,112 @@ Let me check the result."#;
         assert_eq!(result, "ok");
     }
 
-    // ── Skill review fork cost-accounting tests ──
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn trim_record_carries_model_attribution() {
+        use super::{ToolLoop, run_tool_call_loop};
+        use crate::observability::noop::NoopObserver;
+
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let model_provider = ScriptedModelProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            }]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+        let observer = NoopObserver;
+
+        let big = "x".repeat(4000);
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("turn1 {big}")),
+            ChatMessage::assistant("a1"),
+            ChatMessage::user(format!("turn2 {big}")),
+            ChatMessage::assistant("a2"),
+            ChatMessage::user("turn3 short"),
+        ];
+
+        let _ = run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "anthropic.personal",
+                    model: "claude-opus-4-8",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &[],
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                max_tool_iterations: 1,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 50,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            ingress: IngressContext::internal(),
+        })
+        .await
+        .expect("loop should succeed");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut trim_event = None;
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|m| m.starts_with("History trimmed:"))
+                    {
+                        trim_event = Some(value);
+                        break;
+                    }
+                }
+                Ok(Err(_)) => break,
+                Err(_) => continue,
+            }
+        }
+
+        let value = trim_event.expect("trim record must be emitted when history exceeds budget");
+        assert_eq!(
+            value["zeroclaw"]["model"], "claude-opus-4-8",
+            "trim record must carry model attribution, got: {value}"
+        );
+        assert_eq!(
+            value["zeroclaw"]["model_provider"], "anthropic.personal",
+            "trim record must carry model_provider attribution, got: {value}"
+        );
+    }
     //
     // The post-turn skill-review fork (`crate::skills::review::maybe_run_skill_review`)
     // runs AFTER the parent turn's `TOOL_LOOP_COST_TRACKING_CONTEXT.scope(...)`

@@ -2007,7 +2007,7 @@ impl Agent {
                             strict_tool_parsing: self.config.resolved.strict_tool_parsing,
                             parallel_tools: self.config.resolved.parallel_tools,
                             max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                            context_token_budget: self.config.resolved.max_context_tokens,
+                            context_token_budget: self.config.resolved.effective_context_budget(),
                             receipt_generator: receipt_scope
                                 .as_ref()
                                 .map(crate::agent::tool_receipts::ReceiptScope::generator),
@@ -2416,7 +2416,7 @@ impl Agent {
                                 strict_tool_parsing: self.config.resolved.strict_tool_parsing,
                                 parallel_tools: self.config.resolved.parallel_tools,
                                 max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                                context_token_budget: self.config.resolved.max_context_tokens,
+                                context_token_budget: self.config.resolved.effective_context_budget(),
                                 receipt_generator: receipt_scope
                                     .as_ref()
                                     .map(crate::agent::tool_receipts::ReceiptScope::generator),

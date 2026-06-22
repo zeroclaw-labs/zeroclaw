@@ -122,7 +122,6 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
-use zeroclaw_runtime::agent::history::fast_trim_tool_results;
 use zeroclaw_runtime::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedModelAccess, ToolLoop, apply_policy_tool_filter,
     apply_text_tool_prompt_policy, build_tool_instructions_for_names, clear_model_switch_request,
@@ -245,12 +244,6 @@ const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
 const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
 const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
 /// Proactive context-window budget in estimated characters (~4 chars/token).
-/// When the total character count of conversation history exceeds this limit,
-/// older turns are dropped before the request is sent to the model_provider,
-/// preventing context-window-exceeded errors.  Set conservatively below
-/// common context windows (128 k tokens ≈ 512 k chars) to leave room for
-/// system prompt, memory context, and model output.
-const PROACTIVE_CONTEXT_BUDGET_CHARS: usize = 400_000;
 /// Guardrail for hook-modified outbound channel content.
 const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 
@@ -1825,50 +1818,6 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
 /// Number of most-recent turns whose tool-result payloads are kept at full size
 /// when proactively trimming. The active exchange stays intact; only older
 /// tool results are shrunk to a bounded extract.
-const PROACTIVE_TRIM_PROTECT_LAST_N: usize = 4;
-
-/// Proactively trim conversation turns so that the total estimated character
-/// count stays within [`PROACTIVE_CONTEXT_BUDGET_CHARS`].
-///
-/// Tool-result content is the bulk of an overflowing channel history, so before
-/// dropping any whole turns this first shrinks older `tool`-role payloads to a
-/// bounded head-extract in place (via [`fast_trim_tool_results`]). A trimmed
-/// tool result still tells the model what the tool returned; a *dropped* turn is
-/// gone entirely, which is what makes the bot "respond as if previous messages
-/// don't exist" (#6517). Only if the in-place extracts are still over budget are
-/// the oldest whole turns dropped, and the most recent turn (the current user
-/// message) is always preserved. Returns the number of whole turns dropped.
-fn proactive_trim_turns(turns: &mut Vec<ChatMessage>, budget: usize) -> usize {
-    let total_chars: usize = turns.iter().map(|t| t.content.chars().count()).sum();
-    if total_chars <= budget || turns.len() <= 1 {
-        return 0;
-    }
-
-    // Content-preserving pre-pass: shrink old tool-result payloads in place,
-    // keeping the messages and their tool-call pairing intact.
-    fast_trim_tool_results(turns, PROACTIVE_TRIM_PROTECT_LAST_N);
-
-    // Recompute after the in-place shrink — we may now fit with no turns dropped.
-    let total_chars: usize = turns.iter().map(|t| t.content.chars().count()).sum();
-    if total_chars <= budget {
-        return 0;
-    }
-
-    let mut excess = total_chars.saturating_sub(budget);
-    let mut drop_count = 0;
-
-    // Walk from the oldest turn forward, but never drop the very last turn.
-    while excess > 0 && drop_count < turns.len().saturating_sub(1) {
-        excess = excess.saturating_sub(turns[drop_count].content.chars().count());
-        drop_count += 1;
-    }
-
-    if drop_count > 0 {
-        turns.drain(..drop_count);
-    }
-    drop_count
-}
-
 fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
     // Persist to JSONL before adding to in-memory history.
     if let Some(ref store) = ctx.session_store
@@ -1932,102 +1881,6 @@ fn extract_current_turn_tool_messages(history: &[ChatMessage]) -> Vec<ChatMessag
         .filter(|m| m.role == "assistant" || m.role == "tool")
         .cloned()
         .collect()
-}
-
-/// Remove tool-role and intermediate assistant tool-call messages from
-/// conversation turns older than the most recent `keep_turns` user→assistant
-/// exchanges.  This prevents unbounded history growth while preserving
-/// tool context for the N most recent turns.
-fn strip_old_tool_context(ctx: &ChannelRuntimeContext, sender_key: &str, keep_turns: usize) {
-    let mut histories = ctx
-        .conversation_histories
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-
-    let Some(turns) = histories.get_mut(sender_key) else {
-        return;
-    };
-
-    // Walk backwards to find the oldest user message that still belongs to the
-    // most recent `keep_turns` exchanges. Everything before that boundary is
-    // old enough to strip. If the session has fewer than `keep_turns` user
-    // turns, preserve every message.
-    let mut user_count = 0;
-    let mut strip_before = 0;
-    for (i, turn) in turns.iter().enumerate().rev() {
-        if turn.role == "user" {
-            user_count += 1;
-            if user_count == keep_turns {
-                strip_before = i;
-                break;
-            }
-        }
-    }
-
-    if user_count < keep_turns {
-        return;
-    }
-
-    // Remove tool and intermediate assistant messages before the boundary.
-    // An "intermediate assistant" is one whose content looks like a tool
-    // call, either in legacy XML / JSON forms or in native `tool_calls` JSON.
-    let mut i = 0;
-    while i < strip_before && i < turns.len() {
-        let dominated = turns[i].role == "tool"
-            || (turns[i].role == "assistant" && is_tool_call_content(&turns[i].content));
-        if dominated {
-            turns.remove(i);
-            // Adjust boundary since we removed an element.
-            strip_before = strip_before.saturating_sub(1);
-        } else {
-            i += 1;
-        }
-    }
-}
-
-/// Heuristic: does this assistant message content represent a tool call
-/// rather than a final text response?
-fn is_tool_call_content(content: &str) -> bool {
-    let trimmed = content.trim();
-    trimmed.contains("<tool_call>")
-        || trimmed.starts_with("{\"tool_call\"")
-        || is_named_tool_call_json(trimmed)
-        || is_native_tool_call_json(trimmed)
-}
-
-fn is_named_tool_call_json(content: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
-        return false;
-    };
-
-    value
-        .get("name")
-        .and_then(|name| name.as_str())
-        .is_some_and(|name| {
-            !name.is_empty()
-                && (value.get("args").is_some()
-                    || value.get("arguments").is_some()
-                    || value.get("parameters").is_some())
-        })
-}
-
-fn is_native_tool_call_json(content: &str) -> bool {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
-        return false;
-    };
-
-    let Some(tool_calls) = value.get("tool_calls").and_then(|calls| calls.as_array()) else {
-        return false;
-    };
-
-    !tool_calls.is_empty()
-        && tool_calls.iter().all(|call| {
-            call.get("function")
-                .and_then(|function| function.get("name"))
-                .and_then(|name| name.as_str())
-                .or_else(|| call.get("name").and_then(|name| name.as_str()))
-                .is_some()
-        })
 }
 
 fn rollback_orphan_user_turn(
@@ -4381,13 +4234,6 @@ async fn process_channel_message_body(
     // within the context budget (#3460).
     collapse_inline_image_payloads(&mut prior_turns);
 
-    // Proactively trim conversation history before sending to the model_provider
-    // to prevent context-window-exceeded errors (bug #3460).
-    let dropped = proactive_trim_turns(&mut prior_turns, PROACTIVE_CONTEXT_BUDGET_CHARS);
-    if dropped > 0 {
-        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"sender": msg.sender, "dropped_turns": dropped, "remaining_turns": prior_turns.len()})), "Proactively trimmed conversation history to fit context budget");
-    }
-
     // ── Dual-scope memory recall ──────────────────────────────────
     // Always recall before each LLM call (not just first turn).
     // For group chats: merge sender-scope + group-scope memories.
@@ -4459,42 +4305,6 @@ async fn process_channel_message_body(
     }
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
-
-    // ── Proactive context compression ────────────────────────────
-    // Use the existing ContextCompressor to summarize older history
-    // before the LLM call, preventing context-window-exceeded errors
-    // and preserving key decisions through LLM-driven summarization.
-    {
-        let cc_config = ctx.agent_cfg.resolved.context_compression.clone();
-        let compressor = zeroclaw_runtime::agent::context_compressor::ContextCompressor::new(
-            cc_config,
-            ctx.context_token_budget,
-        )
-        .with_memory(Arc::clone(&ctx.memory));
-        match compressor
-            .compress_if_needed(
-                &mut history,
-                active_model_provider.as_ref(),
-                route.model.as_str(),
-                runtime_defaults.defaults.temperature,
-            )
-            .await
-        {
-            Ok(result) if result.compressed => {
-                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"sender": msg.sender, "tokens_before": result.tokens_before, "tokens_after": result.tokens_after, "passes": result.passes_used})), "Proactive context compression applied before LLM call");
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "Context compression failed, proceeding without"
-                );
-            }
-            _ => {}
-        }
-    }
 
     // ── Reply-intent precheck ────────────────────────────────────────
     let explicit_channel_address =
@@ -5204,12 +5014,6 @@ image_cache: None,
                 &history_key,
                 ChatMessage::assistant(&history_response),
             );
-
-            // Strip tool-call messages from turns older than
-            // keep_tool_context_turns to prevent unbounded growth.
-            if keep_tool_turns > 0 {
-                strip_old_tool_context(ctx.as_ref(), &history_key, keep_tool_turns);
-            }
 
             // Fire-and-forget LLM-driven memory consolidation. Passes the
             // agent's resolved temperature through unchanged — `None`
@@ -10526,29 +10330,6 @@ temperature = 0.3
         );
     }
 
-    fn seed_sender_history(ctx: &ChannelRuntimeContext, sender: &str, turns: Vec<ChatMessage>) {
-        let mut histories = ctx
-            .conversation_histories
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        histories.push(sender.to_string(), turns);
-    }
-
-    fn cloned_sender_history(ctx: &ChannelRuntimeContext, sender: &str) -> Vec<ChatMessage> {
-        let histories = ctx
-            .conversation_histories
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        histories.peek(sender).cloned().unwrap_or_default()
-    }
-
-    fn history_signature(turns: &[ChatMessage]) -> Vec<(String, String)> {
-        turns
-            .iter()
-            .map(|turn| (turn.role.clone(), turn.content.clone()))
-            .collect()
-    }
-
     #[test]
     fn agent_router_multi_routes_each_alias_to_its_owning_agent() {
         // Two enabled agents, each owning one Discord bot. A message tagged
@@ -11564,97 +11345,6 @@ api_key = "anthropic-key"
                 || (len <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS + 3
                     && turn.content.ends_with("..."))
         }));
-    }
-
-    #[test]
-    fn proactive_trim_drops_oldest_turns_when_over_budget() {
-        // Each message is 100 chars; 10 messages = 1000 chars total.
-        let mut turns: Vec<ChatMessage> = (0..10)
-            .map(|i| {
-                let content = format!("m{i}-{}", "a".repeat(96));
-                if i % 2 == 0 {
-                    ChatMessage::user(content)
-                } else {
-                    ChatMessage::assistant(content)
-                }
-            })
-            .collect();
-
-        // Budget of 500 should drop roughly half (oldest turns).
-        let dropped = proactive_trim_turns(&mut turns, 500);
-        assert!(dropped > 0, "should have dropped some turns");
-        assert!(turns.len() < 10, "should have fewer turns after trimming");
-        // Last turn should always be preserved.
-        assert!(
-            turns.last().unwrap().content.starts_with("m9-"),
-            "most recent turn must be preserved"
-        );
-        // Total chars should now be within budget.
-        let total: usize = turns.iter().map(|t| t.content.chars().count()).sum();
-        assert!(total <= 500, "total chars {total} should be within budget");
-    }
-
-    #[test]
-    fn proactive_trim_noop_when_within_budget() {
-        let mut turns = vec![
-            ChatMessage::user("hello".to_string()),
-            ChatMessage::assistant("hi there".to_string()),
-        ];
-        let dropped = proactive_trim_turns(&mut turns, 10_000);
-        assert_eq!(dropped, 0);
-        assert_eq!(turns.len(), 2);
-    }
-
-    #[test]
-    fn proactive_trim_preserves_last_turn_even_when_over_budget() {
-        let mut turns = vec![ChatMessage::user("x".repeat(2000))];
-        let dropped = proactive_trim_turns(&mut turns, 100);
-        assert_eq!(dropped, 0, "single turn must never be dropped");
-        assert_eq!(turns.len(), 1);
-    }
-
-    // #6517: large tool-result content is shrunk to a bounded extract in place
-    // before any whole turn is dropped, so the model keeps a record of what each
-    // tool returned instead of losing entire old turns ("responding as if
-    // previous messages don't exist").
-    #[test]
-    fn proactive_trim_shrinks_tool_results_before_dropping_turns() {
-        let mut turns: Vec<ChatMessage> = Vec::new();
-        for _ in 0..4 {
-            turns.push(ChatMessage::tool("x".repeat(5000)));
-        }
-        // Recent (protected) text turns; no tool payloads here.
-        turns.push(ChatMessage::user("u1".to_string()));
-        turns.push(ChatMessage::assistant("a1".to_string()));
-        turns.push(ChatMessage::user("u2".to_string()));
-        turns.push(ChatMessage::assistant("a2".to_string()));
-
-        let len_before = turns.len();
-        let total_before: usize = turns.iter().map(|t| t.content.chars().count()).sum();
-        let budget = 12_000;
-        assert!(total_before > budget, "test setup must start over budget");
-
-        let dropped = proactive_trim_turns(&mut turns, budget);
-
-        assert_eq!(
-            dropped, 0,
-            "in-place tool-result shrink should bring it under budget with no whole-turn drops"
-        );
-        assert_eq!(turns.len(), len_before, "no whole turn should be removed");
-        assert_eq!(
-            turns.iter().filter(|t| t.role == "tool").count(),
-            4,
-            "every tool turn must survive (shrunk, not dropped)"
-        );
-        assert!(
-            turns[0].content.chars().count() < 5000,
-            "an old tool result must be shrunk in place"
-        );
-        let total_after: usize = turns.iter().map(|t| t.content.chars().count()).sum();
-        assert!(
-            total_after <= budget,
-            "must be within budget after the in-place shrink: {total_after}"
-        );
     }
 
     #[test]
@@ -21444,126 +21134,6 @@ Done."#;
 
         let tool_msgs = extract_current_turn_tool_messages(&history);
         assert_eq!(tool_msgs.len(), 4);
-    }
-
-    #[test]
-    fn is_tool_call_content_detects_tool_calls() {
-        assert!(is_tool_call_content("{\"tool_call\": \"shell\"}"));
-        assert!(is_tool_call_content("<tool_call>shell</tool_call>"));
-        assert!(is_tool_call_content(
-            "{\"name\": \"read_file\", \"args\": {}}"
-        ));
-        assert!(!is_tool_call_content("The iPad has been blocked."));
-        assert!(!is_tool_call_content(""));
-    }
-
-    #[test]
-    fn is_tool_call_content_does_not_misclassify_regular_name_json() {
-        assert!(!is_tool_call_content(
-            "{\"name\":\"Alice\",\"role\":\"admin\"}"
-        ));
-    }
-
-    #[test]
-    fn strip_old_tool_context_preserves_recent_tool_context_when_history_within_keep_window() {
-        let ctx = router_test_ctx();
-        let sender = "tool-window-short";
-        seed_sender_history(
-            ctx.as_ref(),
-            sender,
-            vec![
-                ChatMessage::user("block the iPad"),
-                ChatMessage::assistant("{\"tool_call\": \"shell\"}"),
-                ChatMessage::tool(r#"{"tool_call_id":"call_1","content":"ok"}"#),
-                ChatMessage::assistant("Done, iPad is blocked."),
-            ],
-        );
-
-        strip_old_tool_context(ctx.as_ref(), sender, 2);
-
-        let turns = cloned_sender_history(ctx.as_ref(), sender);
-        assert_eq!(
-            turns.len(),
-            4,
-            "tool context in protected turns must not be stripped"
-        );
-        assert_eq!(turns[1].role, "assistant");
-        assert!(turns[1].content.contains("tool_call"));
-        assert_eq!(turns[2].role, "tool");
-    }
-
-    #[test]
-    fn strip_old_tool_context_strips_tool_context_before_keep_window_boundary() {
-        let ctx = router_test_ctx();
-        let sender = "tool-window-boundary";
-        seed_sender_history(
-            ctx.as_ref(),
-            sender,
-            vec![
-                ChatMessage::user("first task"),
-                ChatMessage::assistant("{\"tool_call\": \"shell\"}"),
-                ChatMessage::tool("ok"),
-                ChatMessage::assistant("first task done"),
-                ChatMessage::user("second task"),
-                ChatMessage::assistant("second task done"),
-                ChatMessage::user("third task"),
-                ChatMessage::assistant("third task done"),
-            ],
-        );
-
-        strip_old_tool_context(ctx.as_ref(), sender, 2);
-
-        let turns = cloned_sender_history(ctx.as_ref(), sender);
-        assert_eq!(
-            history_signature(&turns),
-            vec![
-                ("user".to_string(), "first task".to_string()),
-                ("assistant".to_string(), "first task done".to_string()),
-                ("user".to_string(), "second task".to_string()),
-                ("assistant".to_string(), "second task done".to_string()),
-                ("user".to_string(), "third task".to_string()),
-                ("assistant".to_string(), "third task done".to_string()),
-            ],
-            "tool context older than the protected keep window should be stripped"
-        );
-    }
-
-    #[test]
-    fn strip_old_tool_context_removes_native_tool_call_assistant_messages() {
-        let ctx = router_test_ctx();
-        let sender = "tool-window-native";
-        seed_sender_history(
-            ctx.as_ref(),
-            sender,
-            vec![
-                ChatMessage::user("first task"),
-                ChatMessage::assistant(
-                    r#"{"content":"Need to call tool","tool_calls":[{"id":"call_1","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#,
-                ),
-                ChatMessage::tool(r#"{"tool_call_id":"call_1","content":"ok"}"#),
-                ChatMessage::assistant("first task done"),
-                ChatMessage::user("second task"),
-                ChatMessage::assistant("second task done"),
-                ChatMessage::user("third task"),
-                ChatMessage::assistant("third task done"),
-            ],
-        );
-
-        strip_old_tool_context(ctx.as_ref(), sender, 1);
-
-        let turns = cloned_sender_history(ctx.as_ref(), sender);
-        assert_eq!(
-            history_signature(&turns),
-            vec![
-                ("user".to_string(), "first task".to_string()),
-                ("assistant".to_string(), "first task done".to_string()),
-                ("user".to_string(), "second task".to_string()),
-                ("assistant".to_string(), "second task done".to_string()),
-                ("user".to_string(), "third task".to_string()),
-                ("assistant".to_string(), "third task done".to_string()),
-            ],
-            "native assistant tool-call JSON should be stripped together with old tool results"
-        );
     }
 
     #[test]

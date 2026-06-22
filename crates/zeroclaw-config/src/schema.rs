@@ -3278,6 +3278,20 @@ pub struct ResolvedRuntime {
     pub tool_receipts: ToolReceiptsConfig,
 }
 
+impl ResolvedRuntime {
+    /// Effective token budget for preemptive whole-turn history trimming.
+    /// When `history_pruning.enabled` is set, an explicit `max_tokens` floor
+    /// trims earlier than the hard context ceiling; otherwise the ceiling is
+    /// the only trigger. Reuses the existing `history_pruning.*` idents.
+    pub fn effective_context_budget(&self) -> usize {
+        if self.history_pruning.enabled && self.history_pruning.max_tokens > 0 {
+            self.max_context_tokens.min(self.history_pruning.max_tokens)
+        } else {
+            self.max_context_tokens
+        }
+    }
+}
+
 impl Default for ResolvedRuntime {
     fn default() -> Self {
         Self {
