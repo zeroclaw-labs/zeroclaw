@@ -747,7 +747,11 @@ pub fn all_tools_with_runtime(
 
     if browser_config.enabled {
         // Add legacy browser_open tool for simple URL opening
-        match BrowserOpenTool::new(security.clone(), browser_config.allowed_domains.clone()) {
+        match BrowserOpenTool::new_with_private_hosts(
+            security.clone(),
+            browser_config.allowed_domains.clone(),
+            browser_config.allowed_private_hosts.clone(),
+        ) {
             Ok(tool) => {
                 tool_arcs.push(Arc::new(tool));
             }
@@ -780,6 +784,7 @@ pub fn all_tools_with_runtime(
                 max_coordinate_x: browser_config.computer_use.max_coordinate_x,
                 max_coordinate_y: browser_config.computer_use.max_coordinate_y,
             },
+            browser_config.allowed_private_hosts.clone(),
         ) {
             Ok(tool) => {
                 tool_arcs.push(Arc::new(RateLimitedTool::new(tool, security.clone())));

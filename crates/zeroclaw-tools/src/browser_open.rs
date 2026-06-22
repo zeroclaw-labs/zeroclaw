@@ -9,6 +9,7 @@ use zeroclaw_config::policy::SecurityPolicy;
 pub struct BrowserOpenTool {
     security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
+    allowed_private_hosts: Vec<String>,
 }
 
 impl BrowserOpenTool {
@@ -16,11 +17,23 @@ impl BrowserOpenTool {
         security: Arc<SecurityPolicy>,
         allowed_domains: Vec<String>,
     ) -> anyhow::Result<Self> {
+        Self::new_with_private_hosts(security, allowed_domains, Vec::new())
+    }
+
+    pub fn new_with_private_hosts(
+        security: Arc<SecurityPolicy>,
+        allowed_domains: Vec<String>,
+        allowed_private_hosts: Vec<String>,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             security,
             allowed_domains: domain_guard::normalize_allowed_domains(
                 allowed_domains,
                 "browser.allowed_domains",
+            )?,
+            allowed_private_hosts: domain_guard::normalize_allowed_domains(
+                allowed_private_hosts,
+                "browser.allowed_private_hosts",
             )?,
         })
     }
@@ -40,16 +53,23 @@ impl BrowserOpenTool {
             anyhow::bail!("Only http:// or https:// URLs are allowed");
         }
 
-        if self.allowed_domains.is_empty() {
+        if self.allowed_domains.is_empty() && self.allowed_private_hosts.is_empty() {
             anyhow::bail!(
                 "Browser tool is enabled but no allowed_domains are configured. Add [browser].allowed_domains in config.toml"
             );
         }
 
         let host = extract_host(url)?;
+        let private_host = domain_guard::is_private_or_local_host(&host);
+        let private_host_allowed = private_host
+            && domain_guard::host_matches_allowlist(&host, &self.allowed_private_hosts);
 
-        if domain_guard::is_private_or_local_host(&host) {
+        if private_host && !private_host_allowed {
             anyhow::bail!("Blocked local/private host: {host}");
+        }
+
+        if private_host_allowed {
+            return Ok(url.to_string());
         }
 
         if !domain_guard::host_matches_allowlist(&host, &self.allowed_domains) {
@@ -315,6 +335,25 @@ mod tests {
         .unwrap()
     }
 
+    fn test_tool_with_private(
+        allowed_domains: Vec<&str>,
+        allowed_private_hosts: Vec<&str>,
+    ) -> BrowserOpenTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        BrowserOpenTool::new_with_private_hosts(
+            security,
+            allowed_domains.into_iter().map(String::from).collect(),
+            allowed_private_hosts
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn validate_accepts_exact_domain() {
         let tool = test_tool(vec!["example.com"]);
@@ -472,5 +511,59 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("rate limit"));
+    }
+
+    // ── allowed_private_hosts opt-in tests ──────────────────────
+
+    #[test]
+    fn wildcard_private_allowlist_permits_localhost() {
+        let tool = test_tool_with_private(vec![], vec!["*"]);
+        assert!(tool.validate_url("https://localhost:8443").is_ok());
+    }
+
+    #[test]
+    fn wildcard_private_allowlist_permits_private_ipv4() {
+        let tool = test_tool_with_private(vec![], vec!["*"]);
+        assert!(tool.validate_url("https://192.168.1.5").is_ok());
+    }
+
+    #[test]
+    fn allowed_private_hosts_entry_permits_listed_host() {
+        let tool = test_tool_with_private(vec![], vec!["10.0.0.1"]);
+        assert!(tool.validate_url("https://10.0.0.1").is_ok());
+    }
+
+    #[test]
+    fn allowed_private_hosts_does_not_permit_unlisted_host() {
+        let tool = test_tool_with_private(vec![], vec!["10.0.0.1"]);
+        let err = tool
+            .validate_url("https://10.0.0.2")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"));
+    }
+
+    #[test]
+    fn empty_private_allowlist_still_rejects_private() {
+        let tool = test_tool_with_private(vec!["*"], vec![]);
+        let err = tool
+            .validate_url("https://localhost")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"));
+    }
+
+    #[test]
+    fn wildcard_private_allowlist_alone_satisfies_allowlist_requirement() {
+        // allowed_domains empty + allowed_private_hosts=["*"] should not surface
+        // the "no allowed_domains configured" error for private hosts.
+        let tool = test_tool_with_private(vec![], vec!["*"]);
+        assert!(tool.validate_url("https://localhost").is_ok());
+    }
+
+    #[test]
+    fn specific_private_host_alone_satisfies_allowlist_requirement() {
+        let tool = test_tool_with_private(vec![], vec!["192.168.1.5"]);
+        assert!(tool.validate_url("https://192.168.1.5").is_ok());
     }
 }

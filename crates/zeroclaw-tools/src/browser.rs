@@ -61,6 +61,7 @@ impl Default for ComputerUseConfig {
 pub struct BrowserTool {
     security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
+    allowed_private_hosts: Vec<String>,
     session_name: Option<String>,
     backend: String,
     headed: Option<bool>,
@@ -216,6 +217,7 @@ impl BrowserTool {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            Vec::new(),
         )
     }
 
@@ -230,12 +232,17 @@ impl BrowserTool {
         native_webdriver_url: String,
         native_chrome_path: Option<String>,
         computer_use: ComputerUseConfig,
+        allowed_private_hosts: Vec<String>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             security,
             allowed_domains: domain_guard::normalize_allowed_domains(
                 allowed_domains,
                 "browser.allowed_domains",
+            )?,
+            allowed_private_hosts: domain_guard::normalize_allowed_domains(
+                allowed_private_hosts,
+                "browser.allowed_private_hosts",
             )?,
             session_name,
             backend,
@@ -449,7 +456,7 @@ impl BrowserTool {
             anyhow::bail!("Only http:// and https:// URLs are allowed");
         }
 
-        if self.allowed_domains.is_empty() {
+        if self.allowed_domains.is_empty() && self.allowed_private_hosts.is_empty() {
             anyhow::bail!(
                 "Browser tool enabled but no allowed_domains configured. \
                 Add [browser].allowed_domains in config.toml"
@@ -457,9 +464,16 @@ impl BrowserTool {
         }
 
         let host = extract_host(url)?;
+        let private_host = domain_guard::is_private_or_local_host(&host);
+        let private_host_allowed = private_host
+            && domain_guard::host_matches_allowlist(&host, &self.allowed_private_hosts);
 
-        if domain_guard::is_private_or_local_host(&host) {
+        if private_host && !private_host_allowed {
             anyhow::bail!("Blocked local/private host: {host}");
+        }
+
+        if private_host_allowed {
+            return Ok(());
         }
 
         if !domain_guard::host_matches_allowlist(&host, &self.allowed_domains) {
@@ -2450,6 +2464,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            Vec::new(),
         )
         .unwrap();
         let cmd = tool.agent_browser_command();
@@ -2477,6 +2492,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            Vec::new(),
         )
         .unwrap();
         let cmd = tool.agent_browser_command();
@@ -2504,6 +2520,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            Vec::new(),
         )
         .unwrap();
         assert_eq!(tool.configured_backend().unwrap(), BrowserBackendKind::Auto);
@@ -2522,6 +2539,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            Vec::new(),
         )
         .unwrap();
         assert_eq!(
@@ -2546,6 +2564,7 @@ mod tests {
                 endpoint: "http://computer-use.example.com/v1/actions".into(),
                 ..ComputerUseConfig::default()
             },
+            Vec::new(),
         )
         .unwrap();
 
@@ -2569,6 +2588,7 @@ mod tests {
                 allow_remote_endpoint: true,
                 ..ComputerUseConfig::default()
             },
+            Vec::new(),
         )
         .unwrap();
 
@@ -2592,6 +2612,7 @@ mod tests {
                 max_coordinate_y: Some(100),
                 ..ComputerUseConfig::default()
             },
+            Vec::new(),
         )
         .unwrap();
 
@@ -2800,5 +2821,108 @@ mod tests {
         } else {
             assert_eq!(cmd, "agent-browser");
         }
+    }
+
+    // ── allowed_private_hosts opt-in tests ──────────────────────
+
+    fn private_host_tool(
+        allowed_domains: Vec<&str>,
+        allowed_private_hosts: Vec<&str>,
+    ) -> BrowserTool {
+        let security = Arc::new(SecurityPolicy::default());
+        BrowserTool::new_with_backend(
+            security,
+            allowed_domains.into_iter().map(String::from).collect(),
+            None,
+            "agent_browser".into(),
+            None,
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+            allowed_private_hosts
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn wildcard_private_allowlist_permits_localhost() {
+        let tool = private_host_tool(vec![], vec!["*"]);
+        assert!(tool.validate_url("http://localhost:8080").is_ok());
+        assert!(tool.validate_url("https://localhost:8443").is_ok());
+    }
+
+    #[test]
+    fn wildcard_private_allowlist_permits_rfc1918() {
+        let tool = private_host_tool(vec![], vec!["*"]);
+        assert!(tool.validate_url("http://192.168.1.5").is_ok());
+        assert!(tool.validate_url("http://10.0.0.1").is_ok());
+        assert!(tool.validate_url("http://172.16.0.1").is_ok());
+    }
+
+    #[test]
+    fn wildcard_private_allowlist_does_not_loosen_file_scheme() {
+        // file:// is always blocked, regardless of allowed_private_hosts.
+        let tool = private_host_tool(vec!["*"], vec!["*"]);
+        let err = tool
+            .validate_url("file:///etc/passwd")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("file://"));
+    }
+
+    #[test]
+    fn allowed_private_hosts_entry_permits_listed_host() {
+        let tool = private_host_tool(vec![], vec!["10.0.0.1"]);
+        assert!(tool.validate_url("http://10.0.0.1").is_ok());
+    }
+
+    #[test]
+    fn allowed_private_hosts_does_not_permit_unlisted_host() {
+        let tool = private_host_tool(vec![], vec!["10.0.0.1"]);
+        let err = tool
+            .validate_url("http://10.0.0.2")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"));
+    }
+
+    #[test]
+    fn empty_private_allowlist_still_rejects_private() {
+        let tool = private_host_tool(vec!["*"], vec![]);
+        let err = tool
+            .validate_url("https://localhost")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"));
+    }
+
+    #[test]
+    fn wildcard_private_allowlist_satisfies_allowlist_requirement() {
+        // allowed_domains empty + allowed_private_hosts=["*"] should not surface
+        // the "no allowed_domains configured" error for private hosts.
+        let tool = private_host_tool(vec![], vec!["*"]);
+        assert!(tool.validate_url("http://localhost").is_ok());
+    }
+
+    #[test]
+    fn specific_private_host_alone_satisfies_allowlist_requirement() {
+        let tool = private_host_tool(vec![], vec!["192.168.1.5"]);
+        assert!(tool.validate_url("http://192.168.1.5").is_ok());
+    }
+
+    #[test]
+    fn wildcard_private_allowlist_does_not_widen_public_allowlist() {
+        // Public hosts are still subject to allowed_domains when private hosts
+        // are wide-open — the bypass is scoped to private/local hosts only.
+        let tool = private_host_tool(vec!["example.com"], vec!["*"]);
+        let err = tool
+            .validate_url("https://other.com")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("allowed_domains"));
     }
 }
