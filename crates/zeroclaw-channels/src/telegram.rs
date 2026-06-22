@@ -1404,12 +1404,11 @@ impl TelegramChannel {
 
         // If the user is replying directly to the bot's message, bypass the
         // mention check — replies are an unambiguous signal of intent.
-        if let Some(caption) = caption {
-            if let Some(bot_id) = *self.bot_id.lock() {
-                if Self::is_reply_to_bot(message, bot_id) {
-                    return Some(Self::normalize_incoming_content(caption, bot_username));
-                }
-            }
+        if let Some(caption) = caption
+            && let Some(bot_id) = *self.bot_id.lock()
+            && Self::is_reply_to_bot(message, bot_id)
+        {
+            return Some(Self::normalize_incoming_content(caption, bot_username));
         }
 
         let caption = caption?;
@@ -5757,7 +5756,9 @@ mod tests {
         let parsed = ch
             .parse_update_message(&update)
             .expect("reply-to-bot should bypass mention_only gate");
-        assert_eq!(parsed.content, "do this");
+        // extract_reply_context prepends the quote; the gate returns the body,
+        // and the quote is re-added by the normal reply-handling path.
+        assert_eq!(parsed.content, "> @mybot:\n> original\n\ndo this");
     }
 
     #[test]
@@ -5850,28 +5851,35 @@ mod tests {
         }
 
         // Photo with a caption, replying to the bot — caption should pass.
-        let update = serde_json::json!({
-            "update_id": 23,
-            "message": {
-                "message_id": 58,
-                "caption": "enhance this",
-                "from": { "id": 555, "username": "alice" },
-                "chat": { "id": -100_200_300, "type": "group" },
-                "photo": [
-                    { "file_id": "abc", "width": 100, "height": 100 }
-                ],
-                "reply_to_message": {
-                    "message_id": 53,
-                    "from": { "id": 42, "username": "mybot", "is_bot": true },
-                    "text": "original photo"
-                }
+        // This exercises check_media_mention_gate directly because
+        // parse_update_message requires `message.text` and photo updates
+        // carry only `message.caption`.
+        let message = serde_json::json!({
+            "message_id": 58,
+            "caption": "enhance this",
+            "from": { "id": 555, "username": "alice" },
+            "chat": { "id": -100_200_300, "type": "group" },
+            "photo": [
+                { "file_id": "abc", "width": 100, "height": 100 }
+            ],
+            "reply_to_message": {
+                "message_id": 53,
+                "from": { "id": 42, "username": "mybot", "is_bot": true },
+                "text": "original photo"
             }
         });
 
-        let parsed = ch
-            .parse_update_message(&update)
-            .expect("reply-to-bot caption should bypass mention_only gate");
-        assert_eq!(parsed.content, "enhance this");
+        let result = ch.check_media_mention_gate(&message, Some("enhance this"));
+        assert!(
+            result.is_some(),
+            "reply-to-bot caption should bypass mention_only gate"
+        );
+        let gated = result.unwrap();
+        assert!(
+            gated.is_some(),
+            "gate should return the normalized caption"
+        );
+        assert_eq!(gated.unwrap(), "enhance this");
     }
 
     #[test]
