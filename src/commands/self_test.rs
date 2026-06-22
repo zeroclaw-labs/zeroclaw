@@ -585,4 +585,12 @@ mod tests {
             "ws://127.0.0.1:42617/ws/chat"
         );
     }
+
+    #[test]
+    fn check_sqlite_with_temp_directory() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let result = check_sqlite(temp_dir.path());
+        // SQLite should be able to create and open a new database file
+        assert!(result.passed, "sqlite check should pass with writable directory");
+    }
 }
