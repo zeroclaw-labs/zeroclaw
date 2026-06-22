@@ -9,6 +9,13 @@ use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_config::schema::ClaudeCodeRunnerConfig;
 
 /// Environment variables safe to pass through to the `claude` subprocess.
+///
+/// Note: This runner is Unix/WSL-only because it depends on `tmux` for session
+/// management. Windows native execution should use the foreground
+/// [`ClaudeCodeTool`](super::claude_code::ClaudeCodeTool) which handles the
+/// Windows-specific binary resolution and environment allowlist. The
+/// `clean_verbatim_path()` call in this runner is purely path hygiene for
+/// tmux compatibility and does not provide Windows subprocess launch support.
 const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
@@ -135,6 +142,16 @@ impl Tool for ClaudeCodeRunnerTool {
         // Validate working directory
         let work_dir = if let Some(wd) = args.get("working_directory").and_then(|v| v.as_str()) {
             let wd_path = std::path::PathBuf::from(wd);
+            // Resolve relative working_directory against workspace_dir, NOT
+            // the daemon's current working directory. This prevents the bug
+            // where an external coding tool's relative working_directory
+            // would silently resolve to a path outside the workspace when
+            // the daemon cwd differs from workspace_dir.
+            let wd_path = if wd_path.is_relative() {
+                self.security.workspace_dir.join(&wd_path)
+            } else {
+                wd_path
+            };
             let workspace = &self.security.workspace_dir;
             let canonical_wd = match wd_path.canonicalize() {
                 Ok(p) => p,
@@ -225,7 +242,11 @@ impl Tool for ClaudeCodeRunnerTool {
         let create_result = Command::new("tmux")
             .args(["new-session", "-d", "-s", &session_name])
             .arg("-c")
-            .arg(work_dir.to_str().unwrap_or("."))
+            .arg(
+                crate::util_helpers::clean_verbatim_path(&work_dir)
+                    .to_str()
+                    .unwrap_or("."),
+            )
             .output()
             .await;
 

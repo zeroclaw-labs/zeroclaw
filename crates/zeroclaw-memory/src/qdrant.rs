@@ -789,6 +789,66 @@ impl Memory for QdrantMemory {
         Ok(matches)
     }
 
+    async fn purge_agent(&self, agent_alias: &str) -> Result<usize> {
+        // Qdrant stores the agent alias in the `agent_id` payload field.
+        let matches = self
+            .list_for_agents(&[agent_alias], None, None)
+            .await?
+            .len();
+        if matches == 0 {
+            return Ok(0);
+        }
+        self.delete_points_matching(&[("agent_id", agent_alias)])
+            .await?;
+        Ok(matches)
+    }
+
+    async fn export_agent(&self, agent_alias: &str) -> Result<Vec<MemoryEntry>> {
+        self.list_for_agents(&[agent_alias], None, None).await
+    }
+
+    async fn rename_agent(&self, from: &str, to: &str) -> Result<usize> {
+        // Qdrant keys memory points by the agent alias in the `agent_id`
+        // payload field (no UUID indirection), so rename rewrites that field on
+        // every matching point via set-payload-by-filter (mirrors the
+        // `session_id` migration path). Returns the count of points re-pointed.
+        self.ensure_initialized().await?;
+        let matches = self.list_for_agents(&[from], None, None).await?.len();
+        if matches == 0 {
+            return Ok(0);
+        }
+        let body = serde_json::json!({
+            "payload": { "agent_id": to },
+            "filter": Self::must_filter(&[("agent_id", from)]),
+        });
+        let resp = self
+            .request(
+                reqwest::Method::POST,
+                &format!("/collections/{}/points/payload", self.collection),
+            )
+            .query(&[("wait", "true")])
+            .json(&body)
+            .send()
+            .await
+            .context("failed to set payload during Qdrant agent rename")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Qdrant set payload failed during agent rename ({status}): {text}");
+        }
+        Ok(matches)
+    }
+
+    async fn count_agent(&self, agent_alias: &str) -> Result<usize> {
+        // Qdrant keys memory points by the alias in the `agent_id` payload field,
+        // so `rename_agent` re-points exactly the points `list_for_agents` returns;
+        // residue is that match count.
+        Ok(self
+            .list_for_agents(&[agent_alias], None, None)
+            .await?
+            .len())
+    }
+
     async fn count(&self) -> Result<usize> {
         self.ensure_initialized().await?;
 

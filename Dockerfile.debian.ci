@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy the pre-built binary for this platform (amd64 or arm64)
 COPY bin/${TARGETARCH}/zeroclaw /usr/local/bin/zeroclaw
+COPY bin/${TARGETARCH}/zerocode /usr/local/bin/zerocode
 
 # Copy the web dashboard bundled alongside the binary in the release tarball.
 # Installed at /usr/share/zeroclawlabs/web/dist (outside the documented

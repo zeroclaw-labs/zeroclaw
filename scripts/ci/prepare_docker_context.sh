@@ -34,10 +34,12 @@ case "$mode" in
     tar xzf "$artifact_dir/zeroclaw-x86_64-unknown-linux-gnu.tar.gz" -C "$context_dir/bin/amd64"
     tar xzf "$artifact_dir/zeroclaw-aarch64-unknown-linux-gnu.tar.gz" -C "$context_dir/bin/arm64"
     for arch in amd64 arm64; do
-      [[ -x "$context_dir/bin/$arch/zeroclaw" ]] || {
-        echo "missing executable: $context_dir/bin/$arch/zeroclaw" >&2
-        exit 1
-      }
+      for bin in zeroclaw zerocode; do
+        [[ -x "$context_dir/bin/$arch/$bin" ]] || {
+          echo "missing executable: $context_dir/bin/$arch/$bin" >&2
+          exit 1
+        }
+      done
       [[ -f "$context_dir/bin/$arch/web/dist/index.html" ]] || {
         echo "missing dashboard bundle: $context_dir/bin/$arch/web/dist/index.html" >&2
         exit 1
@@ -47,11 +49,13 @@ case "$mode" in
   smoke)
     for arch in amd64 arm64; do
       mkdir -p "$context_dir/bin/$arch/web/dist"
-      cat > "$context_dir/bin/$arch/zeroclaw" <<'EOF'
+      for bin in zeroclaw zerocode; do
+        cat > "$context_dir/bin/$arch/$bin" <<EOF
 #!/usr/bin/env sh
-echo "zeroclaw smoke binary"
+echo "$bin smoke binary"
 EOF
-      chmod +x "$context_dir/bin/$arch/zeroclaw"
+        chmod +x "$context_dir/bin/$arch/$bin"
+      done
       printf '<!doctype html><title>ZeroClaw smoke dashboard</title>\n' \
         > "$context_dir/bin/$arch/web/dist/index.html"
     done
