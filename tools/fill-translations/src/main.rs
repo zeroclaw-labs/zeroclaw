@@ -417,10 +417,26 @@ async fn main() -> anyhow::Result<()> {
             LeakCheck::Clean => {}
             LeakCheck::Recovered(r) => {
                 lines[entry.msgstr_line] = format!("msgstr \"{}\"", encode_po_string(&r));
+                // Clear continuation lines that belonged to the leaked msgstr
+                // block, matching the skip logic in write_po. Without this,
+                // re-parse re-appends the orphaned continuation text into the
+                // entry's decoded msgstr, silently preserving leaked content.
+                let mut ci = entry.msgstr_line + 1;
+                while ci < lines.len() && lines[ci].trim_start().starts_with('"') {
+                    lines[ci] = String::new();
+                    ci += 1;
+                }
                 leak_recovered += 1;
             }
             LeakCheck::Unrecoverable => {
                 lines[entry.msgstr_line] = "msgstr \"\"".to_string();
+                // Same: blank the continuation lines so the entry's decoded
+                // msgstr is truly empty and eligible for re-translation.
+                let mut ci = entry.msgstr_line + 1;
+                while ci < lines.len() && lines[ci].trim_start().starts_with('"') {
+                    lines[ci] = String::new();
+                    ci += 1;
+                }
                 leak_blanked += 1;
             }
         }
@@ -529,4 +545,69 @@ async fn main() -> anyhow::Result<()> {
         translations.len()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leak_repair_removes_continuation_lines() {
+        // A leaked entry with multi-line msgstr continuation lines.
+        // After repair, the continuation lines must be cleared so re-parse
+        // does not re-append the leaked text into the decoded msgstr.
+        let lines: Vec<String> = vec![
+            "msgid \"Save\"".into(),
+            "msgstr \"\"".into(),
+            "\"- You translate English technical documentation strings.\\n\"".into(),
+            "\"- Do not translate brand names.\\n\"".into(),
+            "".into(),
+        ];
+        let entries = parse_po(&lines);
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        // The decoded msgstr contains the leaked continuation text
+        assert!(!entry.msgstr.is_empty());
+
+        // Simulate the Unrecoverable path: blank the msgstr and its continuations
+        let mut repaired: Vec<String> = lines.clone();
+        repaired[entry.msgstr_line] = "msgstr \"\"".to_string();
+        let mut ci = entry.msgstr_line + 1;
+        while ci < repaired.len() && repaired[ci].trim_start().starts_with('"') {
+            repaired[ci] = String::new();
+            ci += 1;
+        }
+
+        // Re-parse: the entry must now have a truly empty msgstr
+        let re_parsed = parse_po(&repaired);
+        assert_eq!(re_parsed.len(), 1);
+        assert!(re_parsed[0].msgstr.is_empty(), "msgstr must be empty after clearing continuations, got: {:?}", re_parsed[0].msgstr);
+    }
+
+    #[test]
+    fn leak_repair_recovered_removes_continuation_lines() {
+        // Recovered path: replace msgstr with recovered text and clear continuations.
+        let lines: Vec<String> = vec![
+            "msgid \"Save\"".into(),
+            "msgstr \"\"".into(),
+            "\"- You translate English technical documentation strings.\\n\"".into(),
+            "\"- Do not translate brand names.\\n\"".into(),
+            "".into(),
+        ];
+        let entries = parse_po(&lines);
+        let entry = &entries[0];
+
+        let mut repaired: Vec<String> = lines.clone();
+        let recovered = "保存";
+        repaired[entry.msgstr_line] = format!("msgstr \"{}\"", encode_po_string(recovered));
+        let mut ci = entry.msgstr_line + 1;
+        while ci < repaired.len() && repaired[ci].trim_start().starts_with('"') {
+            repaired[ci] = String::new();
+            ci += 1;
+        }
+
+        let re_parsed = parse_po(&repaired);
+        assert_eq!(re_parsed.len(), 1);
+        assert_eq!(re_parsed[0].msgstr, "保存", "msgstr must contain only recovered text, got: {:?}", re_parsed[0].msgstr);
+    }
 }
