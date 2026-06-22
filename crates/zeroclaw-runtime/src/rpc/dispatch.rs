@@ -2286,10 +2286,10 @@ impl RpcDispatcher {
                 .unregister_channel("rpc");
         }
         let existed = self.ctx.sessions.remove(&req.session_id).await;
-        if existed {
-            if let Some(ref hooks) = self.ctx.hooks {
-                hooks.fire_session_end(&req.session_id, "rpc").await;
-            }
+        if existed
+            && let Some(ref hooks) = self.ctx.hooks
+        {
+            hooks.fire_session_end(&req.session_id, "rpc").await;
         }
         // Remove from persistent backend — try raw id, then prefixed variants.
         if let Some(ref backend) = self.ctx.session_backend {

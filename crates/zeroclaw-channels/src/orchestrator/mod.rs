@@ -9844,20 +9844,9 @@ pub async fn start_channels(
             transcription_config: config.transcription.clone(),
             agent_transcription_provider: agent.transcription_provider.as_str().to_string(),
             hooks: if config.hooks.enabled {
-                let mut runner = zeroclaw_runtime::hooks::HookRunner::new();
-                if config.hooks.builtin.command_logger {
-                    runner.register(Box::new(
-                        zeroclaw_runtime::hooks::builtin::CommandLoggerHook::new(),
-                    ));
-                }
-                if config.hooks.builtin.webhook_audit.enabled {
-                    runner.register(Box::new(
-                        zeroclaw_runtime::hooks::builtin::WebhookAuditHook::new(
-                            config.hooks.builtin.webhook_audit.clone(),
-                        ),
-                    ));
-                }
-                Some(Arc::new(runner))
+                Some(Arc::new(
+                    zeroclaw_runtime::hooks::HookRunner::from_config(&config.hooks),
+                ))
             } else {
                 None
             },
