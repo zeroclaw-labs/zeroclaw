@@ -3036,6 +3036,7 @@ impl Channel for DiscordChannel {
                                     let peers = (self.peer_resolver)();
                                     let guild_filter = guild_filter.clone();
                                     let channel_filter = channel_filter.clone();
+                                    let thread_channels = Arc::clone(&self.thread_channels);
                                     let resolver = self.slash_command_resolver.clone();
 
                                     zeroclaw_spawn::spawn!(async move {
@@ -3046,12 +3047,30 @@ impl Channel for DiscordChannel {
                                         // don't make here). On denial OR no
                                         // matches we answer an empty choice set.
                                         //
-                                        // No thread-parent REST lookup: it is an
-                                        // authenticated round-trip per keystroke
-                                        // and would defeat the side-effect-free
-                                        // requirement, so a channel-filtered
-                                        // thread simply yields no completions
-                                        // (fail-closed) rather than probing.
+                                        // Thread-parent authorization WITHOUT a
+                                        // REST round-trip: check the in-memory
+                                        // `thread_channels` cache (populated by
+                                        // the MESSAGE_CREATE and type-2 interaction
+                                        // arms). A cache miss means the thread
+                                        // hasn't been seen yet, so we fall back to
+                                        // fail-closed (None) rather than probing
+                                        // Discord — zero extra latency, zero
+                                        // authenticated calls per keystroke.
+                                        let cached_parent = if !channel_filter.is_empty()
+                                            && !interaction_channel.is_empty()
+                                            && !channel_filter
+                                                .iter()
+                                                .any(|c| c == &interaction_channel)
+                                        {
+                                            thread_channels
+                                                .lock()
+                                                .await
+                                                .get(&interaction_channel)
+                                                .cloned()
+                                                .flatten()
+                                        } else {
+                                            None
+                                        };
                                         let authorized = interaction_gate(
                                             &peers,
                                             &guild_filter,
@@ -3059,7 +3078,7 @@ impl Channel for DiscordChannel {
                                             &user_id,
                                             interaction_guild.as_deref(),
                                             &interaction_channel,
-                                            None,
+                                            cached_parent.as_deref(),
                                         )
                                         .is_ok();
 
