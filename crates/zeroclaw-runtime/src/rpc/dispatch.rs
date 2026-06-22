@@ -721,6 +721,13 @@ impl RpcDispatcher {
         self.handle_session_messages(params).await
     }
 
+    /// Drive a full JSON-RPC request line through the dispatcher from an
+    /// external integration test, including notification emission on the
+    /// outbound channel. Mirrors the transport `process_line` path.
+    pub async fn process_line_for_test(&mut self, line: &str) {
+        self.process_line(line).await;
+    }
+
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
         let req: SessionNewParams = parse_params(params)?;
         let resuming = req.session_id.is_some();
