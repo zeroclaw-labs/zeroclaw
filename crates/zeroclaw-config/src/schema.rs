@@ -3931,7 +3931,7 @@ impl Config {
     ///   is removed from the grant, regardless of which bundle included it.
     /// - An unknown bundle alias grants nothing (it is skipped, not an error)
     ///   and a server name with no matching `[mcp.servers]` entry grants
-    ///   nothing. Both fail closed — a misconfiguration narrows access, never
+    ///   nothing. Both fail closed: a misconfiguration narrows access, never
     ///   widens it.
     #[must_use]
     pub fn mcp_servers_for_bundles(&self, bundle_aliases: &[String]) -> Vec<McpServerConfig> {
@@ -16940,7 +16940,7 @@ impl Config {
             }
         }
 
-        // MCP bundles — resolution is secure by default, so a dangling
+        // MCP bundles: resolution is secure by default, so a dangling
         // reference fails closed (the agent is granted fewer servers, never
         // more). Surface the misconfiguration as a warning so an operator is
         // not left wondering why an agent's MCP tools vanished, without

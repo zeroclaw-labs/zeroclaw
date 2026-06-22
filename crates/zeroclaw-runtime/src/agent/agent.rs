@@ -1235,7 +1235,7 @@ impl Agent {
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 &format!(
-                    "Initializing MCP client — {} server(s) granted via mcp_bundles",
+                    "Initializing MCP client - {} server(s) granted via mcp_bundles",
                     agent_mcp_servers.len()
                 )
             );

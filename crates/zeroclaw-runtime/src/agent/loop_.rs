@@ -1137,7 +1137,7 @@ pub async fn run(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
                     .with_category(::zeroclaw_log::EventCategory::Tool),
                 &format!(
-                    "Initializing MCP client — {} server(s) granted via mcp_bundles",
+                    "Initializing MCP client - {} server(s) granted via mcp_bundles",
                     agent_mcp_servers.len()
                 )
             );
@@ -2678,7 +2678,7 @@ pub async fn process_message(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
                     .with_category(::zeroclaw_log::EventCategory::Tool),
                 &format!(
-                    "Initializing MCP client — {} server(s) granted via mcp_bundles",
+                    "Initializing MCP client - {} server(s) granted via mcp_bundles",
                     agent_mcp_servers.len()
                 )
             );

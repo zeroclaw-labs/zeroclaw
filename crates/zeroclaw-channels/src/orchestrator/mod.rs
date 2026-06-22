@@ -8928,7 +8928,7 @@ pub async fn start_channels(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_attrs(::serde_json::json!({"agent": agent_alias})),
                 &format!(
-                    "Initializing MCP client — {} server(s) granted via mcp_bundles",
+                    "Initializing MCP client - {} server(s) granted via mcp_bundles",
                     agent_mcp_servers.len()
                 )
             );
