@@ -143,6 +143,65 @@ impl DeviceRegistry {
         self.cache.lock().insert(token_hash, info);
     }
 
+    /// Backfill placeholder rows for paired tokens that have no device entry.
+    ///
+    /// Bearer tokens paired through the legacy `/pair` route (`handle_pair`)
+    /// historically never called [`register`](Self::register), so their hashes
+    /// live in `gateway.paired_tokens` — the canonical credential set the auth
+    /// gate checks — with no matching device row. Such tokens fully
+    /// authenticate yet are invisible in `GET /api/devices` and cannot be
+    /// revoked from the management UI, which is a security-management gap.
+    ///
+    /// This reconciles the registry (metadata, keyed by `token_hash`) against
+    /// that canonical set on startup: every hash without a row gets a neutral
+    /// `"legacy"` placeholder so it surfaces and can be revoked like any other
+    /// device. The source of truth for *which* tokens are valid remains
+    /// `PairingGuard`/`gateway.paired_tokens` — this never invents a token,
+    /// only surfaces ones that already authenticate. `INSERT OR IGNORE` keeps a
+    /// real row from being clobbered. Returns the number of rows inserted.
+    pub fn reconcile_from_token_hashes(
+        &self,
+        token_hashes: &[String],
+    ) -> Result<usize, rusqlite::Error> {
+        let conn = self.open_db();
+        let mut cache = self.cache.lock();
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let mut inserted = 0usize;
+        for token_hash in token_hashes {
+            if cache.contains_key(token_hash) {
+                continue;
+            }
+            let info = DeviceInfo {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: None,
+                device_type: Some("legacy".to_string()),
+                paired_at: now,
+                last_seen: now,
+                ip_address: None,
+                capabilities: None,
+            };
+            let affected = conn.execute(
+                "INSERT OR IGNORE INTO devices (token_hash, id, name, device_type, paired_at, last_seen, ip_address, capabilities) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    token_hash,
+                    info.id,
+                    info.name,
+                    info.device_type,
+                    now_str,
+                    now_str,
+                    info.ip_address,
+                    None::<String>,
+                ],
+            )?;
+            if affected > 0 {
+                cache.insert(token_hash.clone(), info);
+                inserted += 1;
+            }
+        }
+        Ok(inserted)
+    }
+
     pub fn list(&self) -> Vec<DeviceInfo> {
         let conn = self.open_db();
         let mut stmt = conn

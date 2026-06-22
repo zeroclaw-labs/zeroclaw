@@ -1874,6 +1874,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("atomic_chat", "Atomic Chat", true),
             ("astrai", "Astrai", false),
             ("deepmyst", "DeepMyst", false),
+            ("manifest", "Manifest", false),
             ("morph", "Morph (Fast Apply)", false),
             ("github_models", "GitHub Models", false),
             ("upstage", "Upstage Solar", false),
