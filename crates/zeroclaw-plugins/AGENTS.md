@@ -45,4 +45,4 @@ capability implementations belong in `zeroclaw-runtime`.
 
 - WIT contract: `wit/v0/` (package `zeroclaw:plugin@0.1.0`)
 - Protocol reference: `docs/book/src/developing/plugin-protocol.md`
-- Example plugin: `plugins/wikipedia-summary`
+- Example plugins + registry: [zeroclaw-labs/zeroclaw-plugins](https://github.com/zeroclaw-labs/zeroclaw-plugins) (examples are NOT vendored in this repo)
