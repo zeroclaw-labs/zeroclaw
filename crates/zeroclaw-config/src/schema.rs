@@ -3337,9 +3337,11 @@ pub struct AliasedAgentConfig {
     #[tab(Bundles)]
     #[serde(default)]
     pub knowledge_bundles: Vec<String>,
-    /// MCP bundle aliases. Each entry references `mcp_bundles[key]`,
-    /// itself a named group of MCP servers; agents pick which bundles to
-    /// load.
+    /// MCP bundle aliases. Each entry references `mcp_bundles[key]`, a named
+    /// group of MCP servers. Secure by default: an agent is granted only the
+    /// servers named by its bundles. An agent with no `mcp_bundles` receives
+    /// no MCP servers (omission is not a grant). See
+    /// `Config::mcp_servers_for_agent`.
     #[tab(Bundles)]
     #[serde(default)]
     pub mcp_bundles: Vec<String>,
@@ -3902,6 +3904,68 @@ impl Config {
             .join("agents")
             .join(agent_alias)
             .join("workspace")
+    }
+
+    /// Effective MCP servers granted to an agent by its `mcp_bundles`.
+    ///
+    /// Secure by default: omission is not a grant. An agent is reached via
+    /// `resolved_agent_config`; an unknown alias or one with no `mcp_bundles`
+    /// receives NO MCP servers. See [`Self::mcp_servers_for_bundles`] for how
+    /// a non-empty bundle list resolves to servers.
+    #[must_use]
+    pub fn mcp_servers_for_agent(&self, agent_alias: &str) -> Vec<McpServerConfig> {
+        match self.resolved_agent_config(agent_alias) {
+            Some(agent) => self.mcp_servers_for_bundles(&agent.mcp_bundles),
+            None => Vec::new(),
+        }
+    }
+
+    /// Resolve a set of `[mcp_bundles.<alias>]` references to the concrete
+    /// `[mcp.servers]` entries they grant.
+    ///
+    /// Secure by default: omission is not a grant.
+    /// - An empty `bundle_aliases` grants NO servers (`Vec::new()`).
+    /// - The grant is the union of each referenced bundle's `servers`, in
+    ///   first-seen order with duplicates dropped.
+    /// - Deny wins: a server name listed in ANY referenced bundle's `exclude`
+    ///   is removed from the grant, regardless of which bundle included it.
+    /// - An unknown bundle alias grants nothing (it is skipped, not an error)
+    ///   and a server name with no matching `[mcp.servers]` entry grants
+    ///   nothing. Both fail closed: a misconfiguration narrows access, never
+    ///   widens it.
+    #[must_use]
+    pub fn mcp_servers_for_bundles(&self, bundle_aliases: &[String]) -> Vec<McpServerConfig> {
+        if bundle_aliases.is_empty() {
+            return Vec::new();
+        }
+        // Deny wins: collect every excluded name across the referenced bundles
+        // first, so an include in one bundle cannot defeat an exclude in another.
+        let mut excluded: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for alias in bundle_aliases {
+            if let Some(bundle) = self.mcp_bundles.get(alias) {
+                for name in &bundle.exclude {
+                    excluded.insert(name.as_str());
+                }
+            }
+        }
+        // Union of granted names in first-seen order, skipping excludes.
+        let mut granted: Vec<&str> = Vec::new();
+        for alias in bundle_aliases {
+            if let Some(bundle) = self.mcp_bundles.get(alias) {
+                for name in &bundle.servers {
+                    let n = name.as_str();
+                    if !excluded.contains(n) && !granted.contains(&n) {
+                        granted.push(n);
+                    }
+                }
+            }
+        }
+        // Resolve names against the configured servers. A name that matches no
+        // `[mcp.servers]` entry is not granted.
+        granted
+            .into_iter()
+            .filter_map(|name| self.mcp.servers.iter().find(|s| s.name == name).cloned())
+            .collect()
     }
 
     /// `<install>/shared/` — directory shared across every agent on this
@@ -5295,6 +5359,44 @@ pub enum SkillsPromptInjectionMode {
     Compact,
 }
 
+/// An external, user-configured skill registry ZeroClaw can install from.
+///
+/// Reuses the same git-clone mechanism as the default `zeroclaw-skills`
+/// registry. Install a skill from it with `registry:<name>/<skill>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct ExternalRegistry {
+    /// Short alias used in `registry:<name>/<skill>` install specs.
+    pub name: String,
+    /// Git repository URL of the registry (must expose a top-level `skills/` dir).
+    pub url: String,
+    /// Registry protocol. Only `"git"` is supported today; other protocols
+    /// are reserved for a future additive release.
+    #[serde(default = "default_extra_registry_kind")]
+    pub kind: String,
+    /// Whether this registry is eligible for installs. Default: `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl ExternalRegistry {
+    /// Returns true when `name` can be addressed by `registry:<name>/<skill>`.
+    ///
+    /// Keep this as the single registry-alias rule used by both config
+    /// validation and runtime install-spec parsing. Lowercase aliases also
+    /// avoid clone-directory collisions on case-insensitive filesystems.
+    pub fn is_valid_name(name: &str) -> bool {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    }
+}
+
+fn default_extra_registry_kind() -> String {
+    "git".to_string()
+}
+
 /// Skills loading configuration (`[skills]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -5316,6 +5418,11 @@ pub struct SkillsConfig {
     /// Default: `https://github.com/zeroclaw-labs/zeroclaw-skills`
     #[serde(default)]
     pub registry_url: Option<String>,
+    /// Additional user-configured skill registries, installed via
+    /// `registry:<name>/<skill>`. Each reuses the git-clone registry path and
+    /// is cloned to its own `extra-registry-<name>/` workspace directory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_registries: Vec<ExternalRegistry>,
     /// Controls how skills are injected into the system prompt.
     /// `full` preserves legacy behavior. `compact` keeps context small and loads skills on demand.
     #[serde(default)]
@@ -10411,15 +10518,21 @@ pub struct KnowledgeBundleConfig {
 
 /// Named MCP server bundle (`[mcp_bundles.<alias>]`).
 ///
-/// A reusable group of MCP servers that can be activated together by alias.
+/// A reusable group of MCP servers granted to an agent that references the
+/// bundle by alias in `agents.<alias>.mcp_bundles`. Server IDs are matched
+/// against `[mcp.servers]` by `name`. Resolution is secure by default (see
+/// `Config::mcp_servers_for_bundles`): an ID with no matching server grants
+/// nothing, and `exclude` wins over `servers` across every bundle an agent
+/// references.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "mcp_bundle"]
 #[serde(default)]
 pub struct McpBundleConfig {
-    /// MCP server IDs to include in this bundle.
+    /// MCP server IDs (`[mcp.servers].name`) granted by this bundle.
     pub servers: Vec<String>,
-    /// MCP server IDs to exclude from this bundle.
+    /// MCP server IDs removed from the grant. Deny wins: a name listed here is
+    /// excluded even if another referenced bundle includes it.
     pub exclude: Vec<String>,
 }
 
@@ -16827,6 +16940,57 @@ impl Config {
             }
         }
 
+        // MCP bundles: resolution is secure by default, so a dangling
+        // reference fails closed (the agent is granted fewer servers, never
+        // more). Surface the misconfiguration as a warning so an operator is
+        // not left wondering why an agent's MCP tools vanished, without
+        // turning a typo into a hard startup failure.
+        {
+            let known_servers: std::collections::HashSet<&str> =
+                self.mcp.servers.iter().map(|s| s.name.as_str()).collect();
+            for (bundle_alias, bundle) in &self.mcp_bundles {
+                for server in bundle.servers.iter().chain(bundle.exclude.iter()) {
+                    if !known_servers.contains(server.as_str()) {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "mcp_bundle": bundle_alias,
+                                "server": server,
+                            })),
+                            "mcp_bundles.<alias> references an MCP server name not in [mcp.servers]; it grants nothing"
+                        );
+                    }
+                }
+            }
+            for agent_alias in self.agents.keys() {
+                let Some(agent) = self.resolved_agent_config(agent_alias) else {
+                    continue;
+                };
+                for bundle_alias in &agent.mcp_bundles {
+                    if !self.mcp_bundles.contains_key(bundle_alias) {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "agent": agent_alias,
+                                "mcp_bundle": bundle_alias,
+                            })),
+                            "agents.<alias>.mcp_bundles references an undefined [mcp_bundles.<alias>]; the agent is granted no servers from it"
+                        );
+                    }
+                }
+            }
+        }
+
         // Validate every configured risk profile. Each profile stands on
         // its own — there is no "active" or "default" risk profile concept;
         // an agent's `risk_profile` field names exactly which one applies.
@@ -17421,6 +17585,50 @@ impl Config {
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
         self.cloud_ops.validate()?;
+
+        // Skills — extra registries
+        {
+            let mut seen = std::collections::HashSet::new();
+            for (i, reg) in self.skills.extra_registries.iter().enumerate() {
+                if reg.name.trim().is_empty() {
+                    anyhow::bail!("skills.extra_registries[{i}].name must not be empty");
+                }
+                if !ExternalRegistry::is_valid_name(&reg.name) {
+                    anyhow::bail!(
+                        "skills.extra_registries[{i}].name '{}' is invalid; use only lowercase ASCII letters, numbers, '-' or '_' so it can be addressed as registry:<name>/<skill>",
+                        reg.name
+                    );
+                }
+                if !seen.insert(reg.name.as_str()) {
+                    anyhow::bail!("skills.extra_registries has duplicate name '{}'", reg.name);
+                }
+                if reg.url.trim().is_empty() {
+                    anyhow::bail!(
+                        "skills.extra_registries[{}].url must not be empty",
+                        reg.name
+                    );
+                }
+                if reg.kind != "git" {
+                    anyhow::bail!(
+                        "skills.extra_registries[{}].kind must be 'git' (got '{}'); other protocols are not yet supported",
+                        reg.name,
+                        reg.kind
+                    );
+                }
+                match reqwest::Url::parse(&reg.url) {
+                    Ok(u) if matches!(u.scheme(), "http" | "https" | "file") => {}
+                    Ok(u) => anyhow::bail!(
+                        "skills.extra_registries[{}].url scheme '{}' is unsupported (use http, https, or file)",
+                        reg.name,
+                        u.scheme()
+                    ),
+                    Err(e) => anyhow::bail!(
+                        "skills.extra_registries[{}].url is not a valid URL: {e}",
+                        reg.name
+                    ),
+                }
+            }
+        }
 
         // Notion
         if self.notion.enabled {
@@ -19331,6 +19539,154 @@ mod tests {
             .any(|line| line == exact || line.starts_with(&nested))
     }
 
+    fn mcp_server(name: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            ..McpServerConfig::default()
+        }
+    }
+
+    /// A config with three configured servers (`a`, `b`, `c`) plus the given
+    /// `[mcp_bundles.<alias>]` entries. Uses `push`/`insert` (not field
+    /// assignment) to avoid `clippy::field_reassign_with_default`.
+    fn config_with_mcp_bundles(bundles: Vec<(&str, McpBundleConfig)>) -> Config {
+        let mut config = Config::default();
+        config.mcp.servers.push(mcp_server("a"));
+        config.mcp.servers.push(mcp_server("b"));
+        config.mcp.servers.push(mcp_server("c"));
+        for (alias, bundle) in bundles {
+            config.mcp_bundles.insert(alias.to_string(), bundle);
+        }
+        config
+    }
+
+    #[test]
+    async fn mcp_bundles_empty_grants_no_servers() {
+        // Secure by default: omission is not a grant.
+        let config = config_with_mcp_bundles(vec![]);
+        assert!(config.mcp_servers_for_bundles(&[]).is_empty());
+    }
+
+    #[test]
+    async fn mcp_bundles_union_resolves_and_dedups() {
+        let config = config_with_mcp_bundles(vec![
+            (
+                "x",
+                McpBundleConfig {
+                    servers: vec!["a".into(), "b".into()],
+                    exclude: vec![],
+                },
+            ),
+            (
+                "y",
+                McpBundleConfig {
+                    servers: vec!["b".into(), "c".into()],
+                    exclude: vec![],
+                },
+            ),
+        ]);
+        let names: Vec<String> = config
+            .mcp_servers_for_bundles(&["x".to_string(), "y".to_string()])
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a", "b", "c"],
+            "union across bundles, first-seen order, deduplicated"
+        );
+    }
+
+    #[test]
+    async fn mcp_bundles_exclude_wins_across_bundles() {
+        // `b` is included by bundle `x` but excluded by bundle `y`; deny wins.
+        let config = config_with_mcp_bundles(vec![
+            (
+                "x",
+                McpBundleConfig {
+                    servers: vec!["a".into(), "b".into()],
+                    exclude: vec![],
+                },
+            ),
+            (
+                "y",
+                McpBundleConfig {
+                    servers: vec!["c".into()],
+                    exclude: vec!["b".into()],
+                },
+            ),
+        ]);
+        let names: Vec<String> = config
+            .mcp_servers_for_bundles(&["x".to_string(), "y".to_string()])
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a", "c"],
+            "an excluded server is denied even when another referenced bundle includes it"
+        );
+    }
+
+    #[test]
+    async fn mcp_bundles_unknown_bundle_and_dangling_name_grant_nothing() {
+        // An unknown bundle alias and a server name with no `[mcp.servers]`
+        // entry both fail closed (grant nothing).
+        let config = config_with_mcp_bundles(vec![(
+            "x",
+            McpBundleConfig {
+                servers: vec!["a".into(), "ghost".into()],
+                exclude: vec![],
+            },
+        )]);
+        let names: Vec<String> = config
+            .mcp_servers_for_bundles(&["x".to_string(), "missing".to_string()])
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["a"],
+            "a dangling server name and an unknown bundle alias grant nothing"
+        );
+    }
+
+    #[test]
+    async fn mcp_servers_for_agent_grants_only_via_agent_bundles() {
+        let mut config = config_with_mcp_bundles(vec![(
+            "aa",
+            McpBundleConfig {
+                servers: vec!["a".into()],
+                exclude: vec![],
+            },
+        )]);
+        config.agents.insert(
+            "aaatools".to_string(),
+            AliasedAgentConfig {
+                mcp_bundles: vec!["aa".to_string()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config
+            .agents
+            .insert("defzc".to_string(), AliasedAgentConfig::default());
+
+        let granted: Vec<String> = config
+            .mcp_servers_for_agent("aaatools")
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(granted, vec!["a"], "agent is granted its bundle's servers");
+        assert!(
+            config.mcp_servers_for_agent("defzc").is_empty(),
+            "an agent with no mcp_bundles is granted no MCP servers (omission is not a grant)"
+        );
+        assert!(
+            config.mcp_servers_for_agent("ghost").is_empty(),
+            "an unknown agent is granted no MCP servers"
+        );
+    }
+
     fn parse_test_config(raw: &str) -> Config {
         let mut merged = raw.trim().to_string();
         for table in [
@@ -19566,6 +19922,96 @@ enabled = true
             msg.contains("channels.telegram.default.reply_min_interval_secs"),
             "error must name the offending path; got: {msg}"
         );
+    }
+
+    fn ext_reg(name: &str, url: &str, kind: &str) -> ExternalRegistry {
+        ExternalRegistry {
+            name: name.to_string(),
+            url: url.to_string(),
+            kind: kind.to_string(),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    async fn validate_accepts_git_extra_registry() {
+        let mut config = Config::default();
+        config.skills.extra_registries =
+            vec![ext_reg("team", "https://github.com/acme/skills", "git")];
+        assert!(config.validate().is_ok(), "valid git registry must pass");
+    }
+
+    #[test]
+    async fn validate_rejects_extra_registry_non_git_kind() {
+        let mut config = Config::default();
+        config.skills.extra_registries =
+            vec![ext_reg("team", "https://github.com/acme/skills", "zip-api")];
+        let err = config
+            .validate()
+            .expect_err("non-git kind must be rejected");
+        assert!(err.to_string().contains("kind must be 'git'"), "got: {err}");
+    }
+
+    #[test]
+    async fn validate_rejects_extra_registry_duplicate_names() {
+        let mut config = Config::default();
+        config.skills.extra_registries = vec![
+            ext_reg("team", "https://github.com/acme/a", "git"),
+            ext_reg("team", "https://github.com/acme/b", "git"),
+        ];
+        let err = config
+            .validate()
+            .expect_err("duplicate names must be rejected");
+        assert!(
+            err.to_string().contains("duplicate name 'team'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_extra_registry_unaddressable_names() {
+        for name in [
+            "team.prod",
+            "team prod",
+            "team/prod",
+            "..",
+            " team",
+            "team ",
+            "Team",
+            "teamProd",
+        ] {
+            let mut config = Config::default();
+            config.skills.extra_registries =
+                vec![ext_reg(name, "https://github.com/acme/skills", "git")];
+            let err = config
+                .validate()
+                .expect_err("unaddressable extra-registry name must be rejected");
+            assert!(
+                err.to_string().contains("registry:<name>/<skill>"),
+                "name {name:?} produced unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    async fn validate_rejects_extra_registry_empty_name_or_url() {
+        let mut config = Config::default();
+        config.skills.extra_registries = vec![ext_reg("", "https://github.com/acme/a", "git")];
+        assert!(config.validate().is_err(), "empty name must be rejected");
+
+        let mut config = Config::default();
+        config.skills.extra_registries = vec![ext_reg("team", "   ", "git")];
+        assert!(config.validate().is_err(), "empty url must be rejected");
+    }
+
+    #[test]
+    async fn validate_rejects_extra_registry_bad_url_scheme() {
+        let mut config = Config::default();
+        config.skills.extra_registries = vec![ext_reg("team", "ftp://example.com/x", "git")];
+        let err = config
+            .validate()
+            .expect_err("non-http(s)/file scheme must be rejected");
+        assert!(err.to_string().contains("scheme"), "got: {err}");
     }
 
     #[test]
