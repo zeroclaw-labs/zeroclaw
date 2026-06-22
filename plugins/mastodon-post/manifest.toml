@@ -1,0 +1,21 @@
+name = "mastodon-post"
+version = "0.1.0"
+description = "Post a status (toot) to a Mastodon instance"
+author = "ZeroClaw Labs"
+wasm_path = "mastodon_post.wasm"
+capabilities = ["tool"]
+# http_client to reach the instance; secret_exists so the guest can confirm the
+# token is configured (it can never read the value).
+permissions = ["http_client", "secret_exists"]
+
+# Host-injected credential: the host adds `Authorization: Bearer <MASTODON_TOKEN>`
+# to outbound requests; the WASM guest never sees the token value. The token is
+# resolved from [http_request].secrets (or the environment) on the host.
+[[credentials]]
+secret = "MASTODON_TOKEN"
+header = "Authorization"
+value_template = "Bearer {secret}"
+# Optional but recommended: scope injection to your instance so the token is
+# only ever attached to requests to that host. Omit to inject on any request the
+# HTTP allowlist permits.
+url_prefix = "https://mastodon.social/"
