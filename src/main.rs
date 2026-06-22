@@ -4864,8 +4864,15 @@ async fn main() -> Result<()> {
                 let info = commands::update::check(version.as_deref()).await?;
                 if info.is_newer {
                     println!(
-                        "Update available: v{} -> v{}",
-                        info.current_version, info.latest_version
+                        "{}",
+                        ta(
+                            "cli-update-available",
+                            &[
+                                ("current", &info.current_version),
+                                ("latest", &info.latest_version)
+                            ],
+                            "Update available"
+                        )
                     );
                 } else {
                     println!(

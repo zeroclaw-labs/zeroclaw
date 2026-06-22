@@ -43,6 +43,54 @@ fn prebuilt_channel_note_message() -> String {
     }
 }
 
+fn update_available_message(current: &str, latest: &str) -> String {
+    #[cfg(feature = "agent-runtime")]
+    {
+        get_required_cli_string_with_args(
+            "cli-update-available",
+            &[("current", current), ("latest", latest)],
+        )
+    }
+
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        format!("Update available: v{current} -> v{latest}")
+    }
+}
+
+fn update_forcing_reinstall_message(current: &str, latest: &str) -> String {
+    #[cfg(feature = "agent-runtime")]
+    {
+        get_required_cli_string_with_args(
+            "cli-update-forcing-reinstall",
+            &[("current", current), ("latest", latest)],
+        )
+    }
+
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        format!("Forcing reinstall: v{current} -> v{latest}")
+    }
+}
+
+fn install_dir_not_writable_message(dir: &str, error: &str) -> String {
+    #[cfg(feature = "agent-runtime")]
+    {
+        get_required_cli_string_with_args(
+            "cli-update-not-writable",
+            &[("dir", dir), ("error", error)],
+        )
+    }
+
+    #[cfg(not(feature = "agent-runtime"))]
+    {
+        format!(
+            "install directory {dir} is not writable ({error}); re-run `zeroclaw update` with \
+             elevated privileges (sudo on macOS/Linux, an Administrator console on Windows)"
+        )
+    }
+}
+
 const GITHUB_RELEASES_LATEST_URL: &str =
     "https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest";
 const GITHUB_RELEASES_TAG_URL: &str =
@@ -134,14 +182,17 @@ pub async fn run(target_version: Option<&str>, force: bool) -> Result<()> {
 
     if update_info.is_newer {
         println!(
-            "Update available: v{} -> v{}",
-            update_info.current_version, update_info.latest_version
+            "{}",
+            update_available_message(&update_info.current_version, &update_info.latest_version)
         );
     } else {
         // --force on a version that is not newer: reinstall or downgrade/pin.
         println!(
-            "Forcing reinstall: v{} -> v{}",
-            update_info.current_version, update_info.latest_version
+            "{}",
+            update_forcing_reinstall_message(
+                &update_info.current_version,
+                &update_info.latest_version
+            )
         );
     }
 
@@ -695,11 +746,10 @@ async fn ensure_install_dir_writable(exe: &Path) -> Result<()> {
             let _ = tokio::fs::remove_file(&probe).await;
             Ok(())
         }
-        Err(e) => bail!(
-            "install directory {} is not writable ({e}); re-run `zeroclaw update` with \
-             elevated privileges (sudo on macOS/Linux, an Administrator console on Windows)",
-            dir.display()
-        ),
+        Err(e) => bail!(install_dir_not_writable_message(
+            &dir.display().to_string(),
+            &e.to_string()
+        )),
     }
 }
 
@@ -1466,7 +1516,12 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("not writable"), "got: {err}");
+        // Assert on the install-directory path, which the message interpolates in
+        // every locale, rather than the (now localized) "not writable" wording.
+        assert!(
+            err.contains("no-such-zeroclaw-install-dir-9f1c"),
+            "got: {err}"
+        );
     }
 
     #[tokio::test]
