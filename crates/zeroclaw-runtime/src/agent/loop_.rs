@@ -136,10 +136,9 @@ pub use super::cost::{
 
 // History management moved to `super::history`.
 pub use super::history::{
-    append_or_merge_system_message, canonicalize_tool_result_media_markers, emergency_history_trim,
-    estimate_history_tokens, fast_trim_tool_results, load_interactive_session_history,
-    normalize_system_messages, save_interactive_session_history, trim_history,
-    truncate_tool_result,
+    append_or_merge_system_message, canonicalize_tool_result_media_markers, estimate_history_tokens,
+    load_interactive_session_history, normalize_system_messages, save_interactive_session_history,
+    trim_history, truncate_tool_result,
 };
 
 /// Minimum user-message length (in chars) for auto-save to memory.
@@ -3086,10 +3085,10 @@ pub async fn process_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_text_tool_prompt_policy, build_context, emergency_history_trim,
-        estimate_history_tokens, fast_trim_tool_results, load_interactive_session_history,
-        make_query_summary, maybe_inject_channel_delivery_defaults,
-        save_interactive_session_history, truncate_tool_result,
+        apply_text_tool_prompt_policy, build_context, estimate_history_tokens,
+        load_interactive_session_history, make_query_summary,
+        maybe_inject_channel_delivery_defaults, save_interactive_session_history,
+        truncate_tool_result,
     };
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
     use crate::agent::tool_execution::execute_one_tool;
@@ -3260,102 +3259,6 @@ mod tests {
         use crate::agent::history::truncate_tool_message;
         let msg = r#"{"tool_call_id":"call_1","content":"ok"}"#;
         assert_eq!(truncate_tool_message(msg, 2000), msg);
-    }
-
-    // ── fast_trim_tool_results tests ────────────────────────────
-
-    #[test]
-    fn fast_trim_protects_recent_messages() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::tool("a".repeat(5000)),
-            ChatMessage::tool("b".repeat(5000)),
-            ChatMessage::user("recent user msg"),
-            ChatMessage::tool("c".repeat(5000)), // recent, should be protected
-        ];
-        // protect_last_n = 2 → last 2 messages protected
-        let saved = fast_trim_tool_results(&mut history, 2);
-        assert!(saved > 0);
-        // First two tool messages should be trimmed
-        assert!(history[1].content.len() <= 2100);
-        assert!(history[2].content.len() <= 2100);
-        // Last tool message (protected) should be unchanged
-        assert_eq!(history[4].content.len(), 5000);
-    }
-
-    #[test]
-    fn fast_trim_skips_non_tool_messages() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("a".repeat(5000)),
-            ChatMessage::assistant("b".repeat(5000)),
-        ];
-        let saved = fast_trim_tool_results(&mut history, 0);
-        assert_eq!(saved, 0);
-        assert_eq!(history[1].content.len(), 5000);
-        assert_eq!(history[2].content.len(), 5000);
-    }
-
-    #[test]
-    fn fast_trim_small_tool_results_unchanged() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::tool("short result"),
-        ];
-        let saved = fast_trim_tool_results(&mut history, 0);
-        assert_eq!(saved, 0);
-        assert_eq!(history[1].content, "short result");
-    }
-
-    // ── emergency_history_trim tests ──────────────────────────────
-
-    #[test]
-    fn emergency_trim_preserves_system() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("msg1"),
-            ChatMessage::assistant("resp1"),
-            ChatMessage::user("msg2"),
-            ChatMessage::assistant("resp2"),
-            ChatMessage::user("msg3"),
-        ];
-        let dropped = emergency_history_trim(&mut history, 2);
-        assert!(dropped > 0);
-        // System message should always be preserved
-        assert_eq!(history[0].role, "system");
-        assert_eq!(history[0].content, "sys");
-        // Last 2 messages should be preserved
-        let len = history.len();
-        assert_eq!(history[len - 1].content, "msg3");
-    }
-
-    #[test]
-    fn emergency_trim_preserves_recent() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("old1"),
-            ChatMessage::user("old2"),
-            ChatMessage::user("recent1"),
-            ChatMessage::user("recent2"),
-        ];
-        let dropped = emergency_history_trim(&mut history, 2);
-        assert!(dropped > 0);
-        // Last 2 should be preserved
-        let len = history.len();
-        assert_eq!(history[len - 1].content, "recent2");
-        assert_eq!(history[len - 2].content, "recent1");
-    }
-
-    #[test]
-    fn emergency_trim_nothing_to_drop() {
-        let mut history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user("only user msg"),
-        ];
-        // protect_last = 1, system is protected → only 1 droppable
-        // target_drop = 2/3 = 0 → nothing dropped
-        let dropped = emergency_history_trim(&mut history, 1);
-        assert_eq!(dropped, 0);
     }
 
     // ── estimate_history_tokens tests ─────────────────────────────

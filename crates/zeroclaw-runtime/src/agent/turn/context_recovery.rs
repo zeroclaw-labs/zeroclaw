@@ -1,7 +1,8 @@
 //! LLM-failure recording and in-loop context-overflow recovery.
 
 use super::outcome::is_tool_loop_cancelled;
-use crate::agent::history::{emergency_history_trim, fast_trim_tool_results};
+use crate::agent::history::estimate_history_tokens;
+use crate::agent::history_trim::trim_to_recent_turns;
 use crate::observability::{Observer, ObserverEvent};
 use std::time::Instant;
 use zeroclaw_providers::ChatMessage;
@@ -71,28 +72,30 @@ pub(crate) fn try_recover_context_overflow(
             "Context window exceeded, attempting in-loop recovery"
         );
 
-        // Step 1: fast-trim old tool results (cheap)
-        let chars_saved = fast_trim_tool_results(history, 4);
-        if chars_saved > 0 {
+        // One rule: drop oldest whole turns until we are under a budget
+        // forced below the current size. Never splits a tool_use/tool_result
+        // pair, never silently shrinks a result. Whole turns or nothing.
+        let tokens_now = estimate_history_tokens(history);
+        let budget = tokens_now.saturating_mul(2) / 3;
+        let owned = std::mem::take(history);
+        let result = trim_to_recent_turns(owned, budget);
+        let trimmed = result.trimmed;
+        let dropped_turns = result.dropped_turns;
+        let dropped_messages = result.dropped_messages;
+        let tokens_after = result.tokens_after;
+        *history = result.history;
+        if trimmed {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Retry)
                     .with_category(::zeroclaw_log::EventCategory::Agent)
-                    .with_attrs(::serde_json::json!({"chars_saved": chars_saved})),
-                "Context recovery: trimmed old tool results, retrying"
-            );
-            return true;
-        }
-
-        // Step 2: emergency drop oldest non-system messages
-        let dropped = emergency_history_trim(history, 4);
-        if dropped > 0 {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Retry)
-                    .with_category(::zeroclaw_log::EventCategory::Agent)
-                    .with_attrs(::serde_json::json!({"dropped": dropped})),
-                "Context recovery: dropped old messages, retrying"
+                    .with_attrs(::serde_json::json!({
+                        "dropped_turns": dropped_turns,
+                        "dropped_messages": dropped_messages,
+                        "tokens_before": tokens_now,
+                        "tokens_after": tokens_after,
+                    })),
+                "Context recovery: dropped oldest whole turns, retrying"
             );
             return true;
         }
@@ -103,7 +106,7 @@ pub(crate) fn try_recover_context_overflow(
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                 .with_category(::zeroclaw_log::EventCategory::Agent)
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-            "Context overflow unrecoverable: no trimmable messages"
+            "Context overflow unrecoverable: only one turn left, cannot trim further"
         );
     }
     false
