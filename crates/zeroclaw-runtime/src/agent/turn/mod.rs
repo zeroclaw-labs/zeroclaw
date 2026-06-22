@@ -235,7 +235,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         strict_tool_parsing,
         parallel_tools,
         max_tool_result_chars,
-        context_token_budget: _context_token_budget,
+        context_token_budget,
         shared_budget,
         channel,
         receipt_generator,
@@ -392,6 +392,41 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         }
 
         preflight_history_maintenance(history);
+
+        if iteration == 0 && context_token_budget > 0 {
+            let taken = std::mem::take(history);
+            let result =
+                crate::agent::history_trim::trim_to_recent_turns(taken, context_token_budget);
+            if result.trimmed {
+                let mut trimmed = result.history;
+                let system_count = trimmed.iter().take_while(|m| m.role == "system").count();
+                trimmed.insert(system_count, crate::agent::history_trim::breadcrumb());
+                *history = trimmed;
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Delete)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_attrs(::serde_json::json!({
+                            "dropped_messages": result.dropped_messages,
+                            "dropped_turns": result.dropped_turns,
+                            "kept_turns": result.kept_turns,
+                            "budget": context_token_budget,
+                        })),
+                    "History trimmed: dropped oldest whole turns to fit context budget"
+                );
+                if let Some(tx) = event_tx.as_ref() {
+                    let _ = tx
+                        .send(TurnEvent::HistoryTrimmed {
+                            dropped_messages: result.dropped_messages,
+                            kept_turns: result.kept_turns,
+                            reason: "context token budget exceeded".to_string(),
+                        })
+                        .await;
+                }
+            } else {
+                *history = result.history;
+            }
+        }
 
         // Check if model switch was requested via model_switch tool
         if let Some(ref callback) = model_switch_callback

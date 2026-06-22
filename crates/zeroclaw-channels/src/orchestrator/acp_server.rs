@@ -2040,6 +2040,23 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
         // WS is registered to handle them; on ACP-only sessions they should
         // not arrive here.
         TurnEvent::ApprovalRequest { .. } => return None,
+        TurnEvent::HistoryTrimmed {
+            dropped_messages,
+            kept_turns,
+            reason,
+        } => JsonRpcNotification {
+            jsonrpc: "2.0",
+            method: "session/update",
+            params: serde_json::json!({
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "history_trimmed",
+                    "droppedMessages": dropped_messages,
+                    "keptTurns": kept_turns,
+                    "reason": reason,
+                }
+            }),
+        },
         // Usage events are filtered out at every call site (ACP has no
         // `session/update` shape for them; the cost tracker records them
         // out-of-band). Reaching this arm means a caller forgot the filter.

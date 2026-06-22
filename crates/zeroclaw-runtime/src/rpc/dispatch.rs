@@ -3585,6 +3585,16 @@ fn notification_for_turn_event(
             arguments_summary: arguments_summary.clone(),
             timeout_secs: *timeout_secs,
         },
+        TurnEvent::HistoryTrimmed {
+            dropped_messages,
+            kept_turns,
+            reason,
+        } => SessionUpdateEvent::HistoryTrimmed {
+            session_id: session_id.to_string(),
+            dropped_messages: *dropped_messages,
+            kept_turns: *kept_turns,
+            reason: reason.clone(),
+        },
         TurnEvent::Usage {
             input_tokens,
             cached_input_tokens: _,
