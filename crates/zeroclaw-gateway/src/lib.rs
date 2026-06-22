@@ -907,7 +907,8 @@ pub async fn run_gateway(
                                 ::zeroclaw_log::Event::new(
                                     module_path!(),
                                     ::zeroclaw_log::Action::Note
-                                ),
+                                )
+                                .with_attrs(::serde_json::json!({"agent": agent_alias})),
                                 &format!(
                                     "Gateway MCP deferred: {} tool stub(s) from {} server(s)",
                                     deferred_set.len(),
@@ -955,7 +956,9 @@ pub async fn run_gateway(
                                     module_path!(),
                                     ::zeroclaw_log::Action::Note
                                 )
-                                .with_attrs(::serde_json::json!({"skipped": skipped})),
+                                .with_attrs(
+                                    ::serde_json::json!({"agent": agent_alias, "skipped": skipped})
+                                ),
                                 &format!(
                                     "Gateway MCP: {} tool(s) registered from {} server(s)",
                                     registered,
@@ -972,7 +975,7 @@ pub async fn run_gateway(
                                 ::zeroclaw_log::Action::Fail
                             )
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            .with_attrs(::serde_json::json!({"agent": agent_alias, "error": format!("{}", e)})),
                             "Gateway MCP registry failed to initialize"
                         );
                     }
