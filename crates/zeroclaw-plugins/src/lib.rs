@@ -298,8 +298,26 @@ fn default_true() -> bool {
 /// - `Udp` — allows outbound UDP to the given address.
 ///
 /// TCP (`TcpBind`) listening is never allowed regardless of permissions.
+///
+/// Adjacently tagged (`type` + `value`) rather than internally tagged:
+/// `Http`/`Tcp`/`Udp` wrap [`AddressString`], which is `#[serde(transparent)]`
+/// over a bare string. Internal tagging requires every variant's payload to
+/// deserialize from the same map the tag lives in, which a bare-string
+/// payload can't do — `toml`/`serde_json` reject it outright
+/// (`invalid type: map, expected a string`). Adjacent tagging puts the
+/// payload under its own `value` key, so string and struct payloads both
+/// work, e.g.:
+/// ```toml
+/// [[fine_grained_permissions]]
+/// type = "http"
+/// value = "example.com"
+///
+/// [[fine_grained_permissions]]
+/// type = "dir"
+/// value = { host_path = "/data", guest_path = "/data" }
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum FineGrainedPermission {
     Dir(PreopenedDir),
     Http(AddressString),
@@ -416,5 +434,57 @@ mod tests {
 
         let invalid = serde_json::from_str::<AddressString>("\"com\"");
         assert!(invalid.is_err());
+    }
+
+    // ── FineGrainedPermission TOML round-trip ───────────────────────────────
+
+    #[test]
+    fn fine_grained_permission_http_round_trips_through_toml() {
+        let toml_str = r#"
+[[perm]]
+type = "http"
+value = "example.com"
+"#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            perm: Vec<FineGrainedPermission>,
+        }
+        let parsed: Wrapper = toml::from_str(toml_str).expect("manifest-shaped TOML must parse");
+        assert!(matches!(
+            &parsed.perm[..],
+            [FineGrainedPermission::Http(addr)] if addr.as_str() == "example.com"
+        ));
+    }
+
+    #[test]
+    fn fine_grained_permission_dir_round_trips_through_toml() {
+        let toml_str = r#"
+[[perm]]
+type = "dir"
+value = { host_path = "/data", guest_path = "/data" }
+"#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            perm: Vec<FineGrainedPermission>,
+        }
+        let parsed: Wrapper = toml::from_str(toml_str).expect("manifest-shaped TOML must parse");
+        assert!(matches!(
+            &parsed.perm[..],
+            [FineGrainedPermission::Dir(dir)] if dir.guest_path == "/data"
+        ));
+    }
+
+    #[test]
+    fn fine_grained_permission_serializes_and_round_trips_through_json() {
+        for perm in [
+            FineGrainedPermission::Http(AddressString::new("example.com").unwrap()),
+            FineGrainedPermission::Tcp(AddressString::new("127.0.0.1").unwrap()),
+            FineGrainedPermission::Udp(AddressString::new("*.example.com").unwrap()),
+        ] {
+            let json = serde_json::to_string(&perm).expect("must serialize");
+            let back: FineGrainedPermission =
+                serde_json::from_str(&json).expect("must round-trip");
+            assert_eq!(format!("{perm:?}"), format!("{back:?}"));
+        }
     }
 }
