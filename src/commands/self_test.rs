@@ -437,7 +437,10 @@ async fn check_websocket_handshake(config: &crate::config::Config) -> CheckResul
 
 #[cfg(test)]
 mod tests {
-    use super::{format_probe_url, resolve_probe_host, web_dist_dir_expansion_reason_key};
+    use super::{
+        check_security_policy, check_tool_registry, format_probe_url, resolve_probe_host,
+        web_dist_dir_expansion_reason_key,
+    };
 
     #[test]
     fn web_dist_dir_with_tilde_resolves_to_tilde_reason_key() {
@@ -584,5 +587,21 @@ mod tests {
             format_probe_url("ws", "127.0.0.1", 42617, "/ws/chat"),
             "ws://127.0.0.1:42617/ws/chat"
         );
+    }
+
+    #[test]
+    fn check_security_policy_with_no_enabled_agents() {
+        let config = crate::config::Config::default();
+        let result = check_security_policy(&config);
+        assert!(!result.passed, "no enabled agents should fail");
+        assert_eq!(result.detail, "no enabled agents configured");
+    }
+
+    #[test]
+    fn check_tool_registry_with_no_enabled_agents() {
+        let config = crate::config::Config::default();
+        let result = check_tool_registry(&config);
+        assert!(!result.passed, "no enabled agents should fail");
+        assert_eq!(result.detail, "no enabled agents configured");
     }
 }
