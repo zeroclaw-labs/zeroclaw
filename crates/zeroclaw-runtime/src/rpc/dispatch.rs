@@ -3837,6 +3837,23 @@ mod tests {
     }
 
     #[test]
+    fn history_trimmed_notification() {
+        let event = TurnEvent::HistoryTrimmed {
+            dropped_messages: 12,
+            kept_turns: 1,
+            reason: "context token budget exceeded".into(),
+        };
+        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["method"], "session/update");
+        assert_eq!(v["params"]["type"], "history_trimmed");
+        assert_eq!(v["params"]["session_id"], "s1");
+        assert_eq!(v["params"]["dropped_messages"], 12);
+        assert_eq!(v["params"]["kept_turns"], 1);
+        assert_eq!(v["params"]["reason"], "context token budget exceeded");
+    }
+
+    #[test]
     fn usage_event_emits_context_usage_notification() {
         let event = TurnEvent::Usage {
             input_tokens: Some(100),
