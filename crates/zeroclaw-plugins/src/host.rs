@@ -913,4 +913,74 @@ capabilities = ["tool"]
         assert!(host.channel_plugins().is_empty());
         assert_eq!(host.skill_plugins().len(), 1);
     }
+
+    fn write_unsigned_tool_plugin(plugins_dir: &Path, name: &str) {
+        let plugin_dir = plugins_dir.join(name);
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            format!(
+                "name = \"{name}\"\nversion = \"0.1.0\"\ncapabilities = [\"tool\"]\nwasm_path = \"plugin.wasm\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
+    }
+
+    #[test]
+    fn from_plugins_dir_with_security_strict_drops_unsigned_plugin() {
+        let dir = tempdir().unwrap();
+        write_unsigned_tool_plugin(dir.path(), "unsigned-tool");
+
+        let host = PluginHost::from_plugins_dir_with_security(
+            dir.path(),
+            SignatureMode::Strict,
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert!(
+            host.list_plugins().is_empty(),
+            "strict mode must reject an unsigned plugin during discovery"
+        );
+    }
+
+    #[test]
+    fn from_plugins_dir_with_security_disabled_loads_unsigned_plugin() {
+        let dir = tempdir().unwrap();
+        write_unsigned_tool_plugin(dir.path(), "unsigned-tool");
+
+        let host = PluginHost::from_plugins_dir_with_security(
+            dir.path(),
+            SignatureMode::Disabled,
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            host.list_plugins().len(),
+            1,
+            "disabled mode must load an unsigned plugin"
+        );
+    }
+
+    #[test]
+    fn parse_signature_mode_maps_config_strings() {
+        assert_eq!(
+            PluginHost::parse_signature_mode("strict"),
+            SignatureMode::Strict
+        );
+        assert_eq!(
+            PluginHost::parse_signature_mode("permissive"),
+            SignatureMode::Permissive
+        );
+        assert_eq!(
+            PluginHost::parse_signature_mode("disabled"),
+            SignatureMode::Disabled
+        );
+        assert_eq!(
+            PluginHost::parse_signature_mode("nonsense"),
+            SignatureMode::Disabled
+        );
+    }
 }

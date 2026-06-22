@@ -1382,7 +1382,15 @@ pub fn all_tools_with_runtime(
         let plugin_path = config.plugins.resolved_plugins_dir();
 
         if plugin_path.exists() && config.plugins.enabled {
-            match zeroclaw_plugins::host::PluginHost::from_plugins_dir(&plugin_path) {
+            let signature_mode = zeroclaw_plugins::host::PluginHost::parse_signature_mode(
+                &config.plugins.security.signature_mode,
+            );
+            let trusted_publisher_keys = config.plugins.security.trusted_publisher_keys.clone();
+            match zeroclaw_plugins::host::PluginHost::from_plugins_dir_with_security(
+                &plugin_path,
+                signature_mode,
+                trusted_publisher_keys,
+            ) {
                 Ok(host) => {
                     let details = host.tool_plugin_details();
                     let count = details.len();
