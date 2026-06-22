@@ -585,4 +585,15 @@ mod tests {
             "ws://127.0.0.1:42617/ws/chat"
         );
     }
+
+    #[test]
+    fn check_version_returns_semver_format() {
+        let result = check_version();
+        assert!(result.passed, "version check should always pass");
+        assert!(
+            result.detail.starts_with('v'),
+            "version should start with 'v', got: {}",
+            result.detail
+        );
+    }
 }
