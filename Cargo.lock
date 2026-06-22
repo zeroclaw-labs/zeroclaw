@@ -14465,6 +14465,7 @@ dependencies = [
  "wasmtime 43.0.2",
  "zeroclaw-api",
  "zeroclaw-log",
+ "zeroclaw-tools",
 ]
 
 [[package]]

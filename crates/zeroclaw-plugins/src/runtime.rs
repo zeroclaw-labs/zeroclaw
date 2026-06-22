@@ -61,6 +61,36 @@ struct PluginToolResult {
 
 // ── Host function implementations ─────────────────────────────────
 
+fn reject_ssrf_url(raw_url: &str) -> Result<(), Error> {
+    let parsed = reqwest::Url::parse(raw_url)
+        .map_err(|e| Error::msg(format!("invalid HTTP request URL: {e}")))?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(Error::msg(format!(
+            "blocked HTTP request URL scheme: {scheme}"
+        )));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| Error::msg("HTTP request URL has no host"))?;
+    if zeroclaw_tools::helpers::domain_guard::is_private_or_local_host(host) {
+        return Err(Error::msg(
+            "blocked HTTP request to a private or local host",
+        ));
+    }
+    for addr in parsed
+        .socket_addrs(|| None)
+        .map_err(|e| Error::msg(format!("failed to resolve HTTP request host: {e}")))?
+    {
+        if zeroclaw_tools::helpers::domain_guard::is_private_or_local_host(&addr.ip().to_string()) {
+            return Err(Error::msg(
+                "blocked HTTP request resolving to a private or local address",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn handle_http_request(
     plugin: &mut CurrentPlugin,
     inputs: &[Val],
@@ -81,6 +111,8 @@ fn handle_http_request(
 
     let req: HttpRequest = serde_json::from_str(&request_json)
         .map_err(|e| Error::msg(format!("invalid HTTP request JSON: {e}")))?;
+
+    reject_ssrf_url(&req.url)?;
 
     // 120s ceiling covers legitimate slow cases: large file downloads and slow
     // model-inference endpoints (fal.ai image generation routinely takes 20-60s
@@ -221,6 +253,21 @@ pub fn call_execute(plugin: &mut extism::Plugin, args_json: &[u8]) -> Result<Too
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reject_ssrf_url_blocks_loopback_and_metadata() {
+        assert!(reject_ssrf_url("http://127.0.0.1/").is_err());
+        assert!(reject_ssrf_url("http://localhost:8080/admin").is_err());
+        assert!(reject_ssrf_url("http://169.254.169.254/latest/meta-data/").is_err());
+        assert!(reject_ssrf_url("http://10.0.0.5/internal").is_err());
+        assert!(reject_ssrf_url("http://[::1]/").is_err());
+    }
+
+    #[test]
+    fn reject_ssrf_url_blocks_non_http_scheme() {
+        assert!(reject_ssrf_url("file:///etc/passwd").is_err());
+        assert!(reject_ssrf_url("gopher://example.com/").is_err());
+    }
 
     #[test]
     fn host_context_permission_check() {
