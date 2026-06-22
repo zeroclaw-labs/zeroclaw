@@ -129,6 +129,10 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   const switchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsVersionRef = useRef(0);
   const localMessageMutationVersionRef = useRef(0);
+  // Tracks whether this provider has already seen a successful connection.
+  // Used to trigger a model-info refresh on reconnect (e.g. after daemon
+  // reload) so the UI picks up newly-added providers from Quickstart (#8094).
+  const hasConnectedBefore = useRef(false);
 
   // Prime the model-provider catalog once so error formatting can resolve
   // display names from the backend registry rather than a local shadow list.
@@ -421,6 +425,14 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       if (version !== wsVersionRef.current) return;
       setConnected(true);
       setError(null);
+
+      // On reconnect (not the initial mount connection), refresh the model list
+      // so that providers added via Quickstart after a daemon reload are
+      // reflected in the UI without requiring a full page reset (#8094).
+      if (hasConnectedBefore.current) {
+        setModelInfoVersion((v) => v + 1);
+      }
+      hasConnectedBefore.current = true;
 
       // If we just reconnected after a model switch, apply the pending model now.
       if (pendingModelSwitchRef.current) {
