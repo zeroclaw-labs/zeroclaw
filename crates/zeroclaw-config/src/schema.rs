@@ -13705,6 +13705,12 @@ pub struct LineConfig {
     #[serde(default)]
     pub proxy_url: Option<String>,
 
+    /// Display name shown as the sender in LINE chat bubbles.
+    /// Defaults to `"AI"` when unset or empty.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub sender_name: Option<String>,
+
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
     #[tab(Behavior)]

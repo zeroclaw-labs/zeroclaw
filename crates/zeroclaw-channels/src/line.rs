@@ -8,6 +8,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_config::schema::{Config, LineDmPolicy, LineGroupPolicy};
+use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::security::pairing::PairingGuard;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -153,19 +154,31 @@ async fn send_bind_reply(
         "replyToken": reply_token,
         "messages": [{"type": "text", "text": text}],
     });
-    if let Err(e) = client
+    match client
         .post(format!("{api_base_url}/v2/bot/message/reply"))
         .bearer_auth(channel_access_token)
         .json(&body)
         .send()
         .await
     {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-            &format!("bind reply failed: {e}")
-        );
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!("bind reply failed: {e}")
+            );
+        }
+        Ok(resp) if !resp.status().is_success() => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"status": resp.status().as_u16()})),
+                "bind reply returned non-2xx from LINE"
+            );
+        }
+        Ok(_) => {}
     }
 }
 
@@ -530,7 +543,9 @@ async fn handle_webhook(
                                                 &state.channel_access_token,
                                                 &state.api_base_url,
                                                 token,
-                                                "Paired! You can now chat.",
+                                                &i18n::get_required_cli_string(
+                                                    "channel-line-bind-success",
+                                                ),
                                             )
                                             .await;
                                         }
@@ -552,7 +567,9 @@ async fn handle_webhook(
                                                 &state.channel_access_token,
                                                 &state.api_base_url,
                                                 token,
-                                                "Invalid code. Please try again.",
+                                                &i18n::get_required_cli_string(
+                                                    "channel-line-bind-invalid-code",
+                                                ),
                                             )
                                             .await;
                                         }
@@ -560,13 +577,16 @@ async fn handle_webhook(
                                     Err(wait_ms) => {
                                         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"user_id": user_id, "wait_ms": wait_ms})), "bind rate-limited for userId=, retry after ms");
                                         if let Some(ref token) = bind_reply_token {
-                                            let secs = wait_ms / 1000;
+                                            let secs = (wait_ms / 1000).to_string();
                                             send_bind_reply(
                                                 &state.client,
                                                 &state.channel_access_token,
                                                 &state.api_base_url,
                                                 token,
-                                                &format!("Too many attempts. Retry in {secs}s."),
+                                                &i18n::get_required_cli_string_with_args(
+                                                    "channel-line-bind-rate-limited",
+                                                    &[("secs", &secs)],
+                                                ),
                                             )
                                             .await;
                                         }
@@ -742,7 +762,7 @@ impl LineChannel {
         alias: impl Into<String>,
         peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     ) -> Self {
-        Self::new(
+        let ch = Self::new(
             config.channel_access_token.clone(),
             config.channel_secret.clone(),
             config.dm_policy.clone(),
@@ -751,7 +771,11 @@ impl LineChannel {
             peer_resolver,
             config.webhook_port,
         )
-        .with_proxy_url(config.proxy_url.clone())
+        .with_proxy_url(config.proxy_url.clone());
+        if let Some(name) = config.sender_name.as_deref().filter(|s| !s.is_empty()) {
+            *ch.sender_name.write() = name.to_string();
+        }
+        ch
     }
 
     /// Override the proxy URL for outbound HTTP calls.
@@ -1144,7 +1168,9 @@ impl Channel for LineChannel {
     /// via `message.mention.mentionees`.
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let bot_info = self.fetch_bot_info().await?;
-        *self.sender_name.write() = "AI".to_string();
+        if self.sender_name.read().is_empty() {
+            *self.sender_name.write() = "AI".to_string();
+        }
         *self.sender_icon.write() = bot_info.picture_url;
         ::zeroclaw_log::record!(
             INFO,
@@ -2578,7 +2604,10 @@ mod tests {
             .expect("reply not sent after successful bind");
         let body: serde_json::Value = serde_json::from_slice(&reply_req.body).unwrap();
         assert_eq!(body["replyToken"], "rt-bind");
-        assert_eq!(body["messages"][0]["text"], "Paired! You can now chat.");
+        assert_eq!(
+            body["messages"][0]["text"],
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-line-bind-success")
+        );
 
         api_server.verify().await;
         abort.abort();
@@ -2633,7 +2662,7 @@ mod tests {
         assert_eq!(body["replyToken"], "rt-bad");
         assert_eq!(
             body["messages"][0]["text"],
-            "Invalid code. Please try again."
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-line-bind-invalid-code")
         );
 
         api_server.verify().await;
