@@ -7,6 +7,7 @@
 //! convention and keeps names valid under OpenAI-compatible function-name
 //! rules (`^[a-zA-Z0-9_-]+$`), which reject `.`.
 
+use crate::platform::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -20,6 +21,30 @@ use zeroclaw_api::tool::{Tool, ToolResult};
 const SKILL_SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1 MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
+
+#[cfg(not(target_os = "windows"))]
+const SAFE_ENV_VARS: &[&str] = &[
+    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
+];
+
+#[cfg(target_os = "windows")]
+const SAFE_ENV_VARS: &[&str] = &[
+    "PATH",
+    "PATHEXT",
+    "HOME",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "TEMP",
+    "TMP",
+    "TERM",
+    "LANG",
+    "USERNAME",
+];
 
 /// Maximum provider function-name length. Anthropic's current client-tool
 /// contract is the strictest we rely on: `name` must match
@@ -93,6 +118,20 @@ fn sanitize_tool_name(raw: &str) -> String {
     format!("{head}{suffix}")
 }
 
+/// Name of the environment variable that carries the in-flight session key
+/// into skill shell tools.
+const SESSION_ID_ENV_VAR: &str = "ZEROCLAW_SESSION_ID";
+
+/// The session key for the current turn, or `None` when the turn is unscoped
+/// (one-shot / webhook). Empty keys are treated as absent.
+fn get_session_id() -> Option<String> {
+    zeroclaw_api::TOOL_LOOP_SESSION_KEY
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .filter(|key| !key.is_empty())
+}
+
 /// A tool derived from a skill's `[[tools]]` section that executes shell commands.
 pub struct SkillShellTool {
     tool_name: String,
@@ -100,6 +139,7 @@ pub struct SkillShellTool {
     command_template: String,
     args: HashMap<String, String>,
     security: Arc<SecurityPolicy>,
+    runtime: Arc<dyn RuntimeAdapter>,
     /// Resolved per-command timeout in seconds (manifest `timeout_secs`, or the
     /// `SKILL_SHELL_TIMEOUT_SECS` default), clamped to a minimum of 1.
     timeout_secs: u64,
@@ -115,12 +155,22 @@ impl SkillShellTool {
         tool: &crate::skills::SkillTool,
         security: Arc<SecurityPolicy>,
     ) -> Self {
+        Self::new_with_runtime(skill_name, tool, security, Arc::new(NativeRuntime::new()))
+    }
+
+    pub fn new_with_runtime(
+        skill_name: &str,
+        tool: &crate::skills::SkillTool,
+        security: Arc<SecurityPolicy>,
+        runtime: Arc<dyn RuntimeAdapter>,
+    ) -> Self {
         Self {
             tool_name: composed_tool_name(skill_name, &tool.name),
             tool_description: tool.description.clone(),
             command_template: tool.command.clone(),
             args: tool.args.clone(),
             security,
+            runtime,
             timeout_secs: tool.timeout_secs.unwrap_or(SKILL_SHELL_TIMEOUT_SECS).max(1),
         }
     }
@@ -206,19 +256,31 @@ impl Tool for SkillShellTool {
             });
         }
 
-        // Build and execute the command
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c").arg(&command);
-        cmd.current_dir(&self.security.workspace_dir);
+        let mut cmd = match self
+            .runtime
+            .build_shell_command(&command, &self.security.workspace_dir)
+        {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to build runtime command: {e}")),
+                });
+            }
+        };
         cmd.env_clear();
 
         // Only pass safe environment variables
-        for var in &[
-            "PATH", "HOME", "TERM", "LANG", "LC_ALL", "USER", "SHELL", "TMPDIR",
-        ] {
+        for var in SAFE_ENV_VARS {
             if let Ok(val) = std::env::var(var) {
                 cmd.env(var, val);
             }
+        }
+
+        // Injected after env_clear so it survives; absent when the turn is unscoped.
+        if let Some(session_id) = get_session_id() {
+            cmd.env(SESSION_ID_ENV_VAR, session_id);
         }
 
         let result =
@@ -416,6 +478,28 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         })
+    }
+
+    #[tokio::test]
+    async fn get_session_id_returns_scoped_session_key() {
+        let got = crate::agent::loop_::scope_session_key(Some("gw_abc-123".to_string()), async {
+            get_session_id()
+        })
+        .await;
+        assert_eq!(got, Some("gw_abc-123".to_string()));
+    }
+
+    #[test]
+    fn get_session_id_none_outside_a_scoped_turn() {
+        assert_eq!(get_session_id(), None);
+    }
+
+    #[tokio::test]
+    async fn get_session_id_none_for_empty_session_key() {
+        let got =
+            crate::agent::loop_::scope_session_key(Some(String::new()), async { get_session_id() })
+                .await;
+        assert_eq!(got, None);
     }
 
     fn sample_skill_tool() -> SkillTool {
@@ -1061,6 +1145,7 @@ mod tests {
         let skill = Skill {
             name: "ops".to_string(),
             description: "d".to_string(),
+            description_localizations: Default::default(),
             version: "1".to_string(),
             author: None,
             tags: vec![],
@@ -1075,6 +1160,7 @@ mod tests {
                 timeout_secs: None,
             }],
             prompts: vec![],
+            slash_options: Vec::new(),
             location: None,
         };
         crate::tools::register_skill_tools_with_context(

@@ -318,13 +318,33 @@ pub fn register_skill_tools_with_context(
     security: Arc<SecurityPolicy>,
     unfiltered_registry: &[Arc<dyn Tool>],
 ) {
+    register_skill_tools_with_context_and_runtime(
+        tools_registry,
+        skills,
+        security,
+        unfiltered_registry,
+        Arc::new(NativeRuntime::new()),
+    );
+}
+
+pub fn register_skill_tools_with_context_and_runtime(
+    tools_registry: &mut Vec<Box<dyn Tool>>,
+    skills: &[crate::skills::Skill],
+    security: Arc<SecurityPolicy>,
+    unfiltered_registry: &[Arc<dyn Tool>],
+    runtime: Arc<dyn RuntimeAdapter>,
+) {
     if skills.is_empty() {
         return;
     }
 
     let before = tools_registry.len();
-    let skill_tools =
-        crate::skills::skills_to_tools_with_context(skills, security, unfiltered_registry);
+    let skill_tools = crate::skills::skills_to_tools_with_context_and_runtime(
+        skills,
+        security,
+        unfiltered_registry,
+        runtime,
+    );
     let existing_names: std::collections::HashSet<String> = tools_registry
         .iter()
         .map(|t| t.name().to_string())
@@ -690,11 +710,11 @@ pub fn all_tools_with_runtime(
         root_config.skills.prompt_injection_mode,
         zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
     ) {
+        // ReadSkillTool now holds full config to support all skill sources:
+        // workspace skills, open-skills, agent-bound bundles, and plugin skills.
         tool_arcs.push(Arc::new(ReadSkillTool::new(
-            root_config.data_dir.clone(),
-            root_config.skills.open_skills_enabled,
-            root_config.skills.open_skills_dir.clone(),
-            root_config.skills.allow_scripts,
+            config.clone(),
+            agent_alias.to_string(),
         )));
     }
 

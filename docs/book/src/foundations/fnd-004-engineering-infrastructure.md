@@ -258,7 +258,7 @@ The architecture RFC §4.4.2 defines the following release artifacts:
 | Kernel binary (standard) | x86_64-linux-musl, aarch64-linux-gnu, armv7-linux-gnueabihf, x86_64-darwin, aarch64-darwin, x86_64-windows | GitHub Releases |
 | Kernel binary (hardware) | aarch64-linux-gnu, armv7-linux-gnueabihf | GitHub Releases |
 | Gateway binary | Same platform matrix | GitHub Releases |
-| WASM plugin files | wasm32-wasip1 | Plugin registry |
+| WASM plugin files | wasm32-wasip2 | Plugin registry |
 | Desktop installer | x86_64 + aarch64, macOS/Windows/Linux | GitHub Releases, platform stores |
 
 The current release workflows know about exactly one of these: the standard binary. The rest do not exist in the automation yet. This is appropriate for now: the plugin system is not yet complete. But the release workflows should be designed with this model in mind so they do not need to be rewritten as each new artifact type is introduced.
@@ -273,7 +273,7 @@ version-bump (release-plz PR merged)
     ├── build-kernel-standard (matrix: 6 targets)
     ├── build-kernel-hardware (matrix: 2 ARM targets + hardware flags)
     ├── build-gateway (matrix: 6 targets)
-    ├── build-plugins-wasm (matrix: all plugin crates → wasm32-wasip1)
+    ├── build-plugins-wasm (matrix: all plugin crates → wasm32-wasip2)
     └── build-desktop (matrix: macOS, Windows, Linux AppImage/deb)
             │
             ├── publish-github-release (attaches all kernel + gateway binaries)
@@ -507,7 +507,7 @@ Consolidate `release-stable-manual.yml`, `release-beta-on-push.yml`, `pub-aur.ym
 
 ##### D1: Activate WASM plugin build jobs
 
-Implement `build-plugins-wasm` in the release pipeline. Each plugin crate builds to `wasm32-wasip1` in a dedicated job. Plugin manifests are generated and signed. The `publish-plugin-registry` job uploads signed WASM files to the plugin registry.
+Implement `build-plugins-wasm` in the release pipeline. Each plugin crate builds to `wasm32-wasip2` in a dedicated job. Plugin manifests are generated and signed. The `publish-plugin-registry` job uploads signed WASM files to the plugin registry.
 
 ##### D2: Desktop installer build and publish
 

@@ -116,6 +116,7 @@ mod tests {
             listen_to_bots: false,
             interrupt_on_new_message: false,
             mention_only: false,
+            slash_command_scope: schema::SlashCommandScope::default(),
             proxy_url: None,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
