@@ -1643,10 +1643,12 @@ pub async fn handle_refresh_context_window(
         .ok()
         .unwrap_or_default();
     let uri = working.get_prop(&format!("{path}.uri")).ok();
+    let api_key = working.get_prop(&format!("{path}.api_key")).ok();
 
     let provider_config = zeroclaw_config::schema::ModelProviderConfig {
         model: Some(model),
         uri,
+        api_key,
         ..Default::default()
     };
 

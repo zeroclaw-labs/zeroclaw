@@ -4611,6 +4611,7 @@ async fn main() -> Result<()> {
                     &mut config,
                     model_provider.as_deref(),
                     dry_run,
+                    None,
                 ))
                 .await?;
                 Ok(())

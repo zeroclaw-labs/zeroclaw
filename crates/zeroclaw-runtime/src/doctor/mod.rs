@@ -442,16 +442,42 @@ pub async fn run_models(
     Ok(())
 }
 
+/// Function type for fetching context window from provider.
+/// Allows injection of mock fetch for testing.
+type FetchContextWindowFn = Box<
+    dyn for<'a> Fn(
+            &'a str,
+            &'a zeroclaw_config::schema::ModelProviderConfig,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<usize>> + Send + 'a>,
+        > + Send
+        + Sync,
+>;
+
 /// Update context_window in config.toml from provider /models endpoints.
 /// Returns the number of providers updated.
 pub async fn update_context_windows(
     config: &mut zeroclaw_config::schema::Config,
     provider_override: Option<&str>,
     dry_run: bool,
+    fetch_fn: Option<FetchContextWindowFn>,
 ) -> anyhow::Result<usize> {
+    let fetch_fn = fetch_fn.unwrap_or_else(|| {
+        Box::new(
+            |provider_type: &str,
+             provider_config: &zeroclaw_config::schema::ModelProviderConfig| {
+                Box::pin(zeroclaw_providers::fetch_context_window(
+                    provider_type,
+                    provider_config,
+                ))
+            },
+        )
+    });
     let mut updated = 0usize;
 
     type ProviderTarget = (
+        String,
+        String,
         String,
         String,
         Option<String>,
@@ -462,9 +488,11 @@ pub async fn update_context_windows(
     // Collect all the data we need first to avoid borrow conflicts
     let targets: Vec<ProviderTarget> = if let Some(model_provider) = provider_override {
         // Single provider - use find_by_name to look up by "type.alias" format
-        if let Some((_, _, entry)) = config.providers.models.find_by_name(model_provider) {
+        if let Some((t, a, entry)) = config.providers.models.find_by_name(model_provider) {
             vec![(
                 model_provider.to_string(),
+                t.to_string(),
+                a.to_string(),
                 entry.model.clone().unwrap_or_default(),
                 entry.uri.clone(),
                 entry.api_key.clone(),
@@ -482,6 +510,8 @@ pub async fn update_context_windows(
             .map(|(t, a, e)| {
                 (
                     format!("{t}.{a}"),
+                    t.to_string(),
+                    a.to_string(),
                     e.model.clone().unwrap_or_default(),
                     e.uri.clone(),
                     e.api_key.clone(),
@@ -491,7 +521,9 @@ pub async fn update_context_windows(
             .collect()
     };
 
-    for (provider_ref, model, uri, api_key, existing_context_window) in targets {
+    for (provider_ref, provider_type, alias, model, uri, api_key, existing_context_window) in
+        targets
+    {
         // Skip if already has context_window set
         if let Some(ctx) = existing_context_window {
             println!(
@@ -519,21 +551,14 @@ pub async fn update_context_windows(
             continue;
         }
 
-        // Build minimal provider config for fetch
-        let provider_type = provider_ref.split('.').next().unwrap_or("");
-
         // Fetch context window from provider
-        match zeroclaw_providers::fetch_context_window(
-            provider_type,
-            &zeroclaw_config::schema::ModelProviderConfig {
-                model: Some(model.clone()),
-                uri: uri.clone(),
-                api_key,
-                ..Default::default()
-            },
-        )
-        .await
-        {
+        let provider_config = zeroclaw_config::schema::ModelProviderConfig {
+            model: Some(model.clone()),
+            uri: uri.clone(),
+            api_key,
+            ..Default::default()
+        };
+        match fetch_fn(&provider_type, &provider_config).await {
             Some(ctx) => {
                 if dry_run {
                     println!(
@@ -547,13 +572,9 @@ pub async fn update_context_windows(
                         )
                     );
                 } else {
-                    // Update the config - need to find and mutate
-                    let mut found = false;
-                    for entry_mut in config.providers.models.iter_entries_mut() {
-                        if entry_mut.2.model.as_deref() == Some(model.as_str())
-                            && entry_mut.2.uri == uri
-                        {
-                            entry_mut.2.context_window = Some(ctx);
+                    let path = format!("providers.models.{provider_type}.{alias}.context_window");
+                    match config.set_prop_persistent(&path, &ctx.to_string()) {
+                        Ok(_) => {
                             updated += 1;
                             println!(
                                 "{}",
@@ -565,18 +586,23 @@ pub async fn update_context_windows(
                                     ],
                                 )
                             );
-                            found = true;
-                            break;
                         }
-                    }
-                    if !found {
-                        println!(
-                            "{}",
+                        Err(e) => {
+                            println!(
+                                "{}",
+                                crate::i18n::get_required_cli_string_with_args(
+                                    "cli-doctor-ctxwin-not-found",
+                                    &[("provider_ref", provider_ref.as_str())],
+                                )
+                            );
                             crate::i18n::get_required_cli_string_with_args(
-                                "cli-doctor-ctxwin-not-found",
-                                &[("provider_ref", provider_ref.as_str())],
-                            )
-                        );
+                                "cli-doctor-ctxwin-write-failed",
+                                &[
+                                    ("provider_ref", provider_ref.as_str()),
+                                    ("error", &e.to_string()),
+                                ],
+                            );
+                        }
                     }
                 }
             }
@@ -2101,5 +2127,75 @@ mod tests {
         assert_eq!(agent_messages.len(), 2);
         assert!(agent_messages[0].contains("agent \"alpha\""));
         assert!(agent_messages[1].contains("agent \"zeta\""));
+    }
+
+    #[tokio::test]
+    async fn update_context_windows_uses_exact_alias_not_model_uri() {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let mut config = Config::default();
+        config.config_path = temp_dir.path().join("config.toml");
+
+        // Create two groq provider aliases with SAME model and URI
+        // This simulates the bug scenario where multiple aliases share the same
+        // model/endpoint but should be updated independently
+        {
+            let entry1 = config
+                .providers
+                .models
+                .ensure("groq", "alias1")
+                .expect("groq provider type exists");
+            entry1.model = Some("llama-3.1-8b-instant".into());
+            entry1.context_window = Some(8192);
+        }
+        {
+            let entry2 = config
+                .providers
+                .models
+                .ensure("groq", "alias2")
+                .expect("groq provider type exists");
+            entry2.model = Some("llama-3.1-8b-instant".into());
+        }
+
+        // Call update_context_windows for alias2 only
+        // This should ONLY update alias2, leaving alias1 at 8192
+        let mock_fetch: FetchContextWindowFn = Box::new(
+            |_type: &str, _config: &zeroclaw_config::schema::ModelProviderConfig| {
+                Box::pin(async move { Some(4096usize) })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = Option<usize>> + Send>>
+            },
+        );
+        let updated =
+            update_context_windows(&mut config, Some("groq.alias2"), false, Some(mock_fetch))
+                .await
+                .expect("update_context_windows should succeed");
+
+        // Should have updated exactly 1 entry (alias2)
+        assert_eq!(updated, 1);
+
+        // alias1 should remain unchanged at 8192
+        let alias1_ctx = config
+            .providers
+            .models
+            .find("groq", "alias1")
+            .expect("alias1 should exist")
+            .context_window;
+        assert_eq!(
+            alias1_ctx,
+            Some(8192),
+            "alias1 context_window should not be modified"
+        );
+
+        // alias2 should be updated to the mock fetch value (4096)
+        let alias2_ctx = config
+            .providers
+            .models
+            .find("groq", "alias2")
+            .expect("alias2 should exist")
+            .context_window;
+        assert_eq!(
+            alias2_ctx,
+            Some(4096),
+            "alias2 context_window should be set to mock fetch value"
+        );
     }
 }

@@ -1082,8 +1082,6 @@ fn apply_model_provider(
             let provider_config = zeroclaw_config::schema::ModelProviderConfig {
                 model: Some(choice.model.clone()),
                 uri: config.get_prop(&format!("{prefix}.uri")).ok(),
-                // Use plaintext api_key from choice.fields (before encryption) instead of reading
-                // back from config which returns encrypted value. decryption only happens at config load.
                 api_key: choice
                     .fields
                     .get("api_key")
