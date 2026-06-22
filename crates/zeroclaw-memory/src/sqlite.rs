@@ -1242,6 +1242,69 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn rename_agent(&self, from: &str, to: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.clone();
+        let from = from.to_string();
+        let to = to.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = conn.lock();
+            // Memory rows ride `memories.agent_id` (FK → agents.id, a stable
+            // UUID); only the human `alias` column moves, so this is a single
+            // agents-row update. An unknown `from` matches nothing → Ok(0).
+            //
+            // Collision-safety: `agents.alias` is UNIQUE, and deleting an agent
+            // purges its memories but leaves the `agents` row behind (an orphan
+            // holding the alias). A bare UPDATE onto a previously-used-then-
+            // deleted `to` alias would hit the UNIQUE constraint and fail. We
+            // hold the connection lock across the whole sequence (single writer),
+            // so: refuse if `to` still has memory rows (a genuine conflict we
+            // won't silently merge), otherwise drop the orphan `to` row and
+            // proceed. (`COUNT(*)` over a NULL subselect when no `to` row exists
+            // is 0, so the common no-collision path falls straight through.)
+            let to_rows: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM memories WHERE agent_id = (SELECT id FROM agents WHERE alias = ?1 LIMIT 1)",
+                params![to],
+                |row| row.get(0),
+            )?;
+            if to_rows > 0 {
+                anyhow::bail!(
+                    "cannot rename agent memory to `{to}`: an existing memory store under that alias has {to_rows} row(s); refusing to merge"
+                );
+            }
+            // Drop any orphan `to` agents row (verified above to own no memories).
+            conn.execute("DELETE FROM agents WHERE alias = ?1", params![to])?;
+            let affected = conn.execute(
+                "UPDATE agents SET alias = ?2 WHERE alias = ?1",
+                params![from, to],
+            )?;
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            Ok(affected)
+        })
+        .await?
+    }
+
+    async fn count_agent(&self, agent_alias: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.clone();
+        let agent_alias = agent_alias.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = conn.lock();
+            // Mirror `rename_agent`: it moves the `agents` row (alias -> id), not
+            // the memory rows, so residue is the presence of that alias row (0 or
+            // 1). A memory-row count would miss an agent with an `agents` row but
+            // no memories - a real lag `rename_agent` would still re-point.
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM agents WHERE alias = ?1",
+                params![agent_alias],
+                |row| row.get(0),
+            )?;
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            Ok(count as usize)
+        })
+        .await?
+    }
+
     async fn count(&self) -> anyhow::Result<usize> {
         let conn = self.conn.clone();
 
@@ -1394,6 +1457,43 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn export_agent(&self, agent_alias: &str) -> anyhow::Result<Vec<MemoryEntry>> {
+        let conn = self.conn.clone();
+        let agent_alias = agent_alias.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, a.alias, m.agent_id \
+                 FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
+                 WHERE m.agent_id = (SELECT id FROM agents WHERE alias = ?1 LIMIT 1) \
+                 ORDER BY m.created_at ASC",
+            )?;
+            let rows = stmt.query_map(params![agent_alias], |row| {
+                Ok(MemoryEntry {
+                    id: row.get(0)?,
+                    key: row.get(1)?,
+                    content: row.get(2)?,
+                    category: Self::str_to_category(&row.get::<_, String>(3)?),
+                    timestamp: row.get(4)?,
+                    session_id: row.get(5)?,
+                    score: None,
+                    namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
+                    importance: row.get(7)?,
+                    superseded_by: row.get(8)?,
+                    agent_alias: row.get(9)?,
+                    agent_id: row.get(10)?,
+                })
+            })?;
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            Ok(results)
+        })
+        .await?
+    }
+
     async fn recall_namespaced(
         &self,
         namespace: &str,
@@ -1442,10 +1542,29 @@ impl Memory for SqliteMemory {
         importance: Option<f64>,
         agent_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        let embedding_bytes = self
-            .get_or_compute_embedding(content)
-            .await?
-            .map(|emb| vector::vec_to_bytes(&emb));
+        // Graceful degrade: an embedding failure (provider 404/401, rate limit,
+        // outage, rotated key) must NOT discard the write. Persist the row with
+        // a NULL vector and log a recoverable warning — `zeroclaw memory
+        // reindex` backfills NULL embeddings from the retained `content` once
+        // the embedder is healthy again. Propagating the error here previously
+        // turned a transient credential fault into silent, permanent data loss.
+        let embedding_bytes = match self.get_or_compute_embedding(content).await {
+            Ok(emb) => emb.map(|emb| vector::vec_to_bytes(&emb)),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "key": key,
+                            "error": format!("{e}"),
+                        })),
+                    "memory store: embedding failed; persisting row without a vector \
+                     (run `zeroclaw memory reindex` to backfill once the embedder recovers)"
+                );
+                None
+            }
+        };
 
         let conn = self.conn.clone();
         let key = key.to_string();
@@ -1746,6 +1865,127 @@ mod tests {
         let purged_ghost = mem.purge_agent("ghost").await.unwrap();
         assert_eq!(purged_ghost, 0);
         assert_eq!(mem.count().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn sqlite_rename_agent_repoints_rows_under_new_alias() {
+        let (_tmp, mem) = temp_sqlite();
+        let alpha = mem.ensure_agent_uuid("alpha").await.unwrap();
+        for idx in 0..3 {
+            mem.store_with_agent(
+                &format!("alpha-{idx}"),
+                "alpha row",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(&alpha),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Rename alpha → beta: memory rows ride the UUID, so this updates exactly
+        // one `agents` row and the rows now resolve under the new alias.
+        let renamed = mem.rename_agent("alpha", "beta").await.unwrap();
+        assert_eq!(renamed, 1, "exactly one agents row re-aliased");
+
+        // The rows now resolve under `beta`, and `alpha` resolves to nothing.
+        assert_eq!(mem.export_agent("beta").await.unwrap().len(), 3);
+        assert_eq!(mem.export_agent("alpha").await.unwrap().len(), 0);
+        assert_eq!(mem.count().await.unwrap(), 3, "no rows lost on rename");
+
+        // Unknown source → nothing updated.
+        assert_eq!(mem.rename_agent("ghost", "phantom").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn sqlite_rename_agent_reclaims_orphan_and_refuses_live_collision() {
+        let (_tmp, mem) = temp_sqlite();
+        let alpha = mem.ensure_agent_uuid("alpha").await.unwrap();
+        mem.store_with_agent(
+            "a-0",
+            "alpha row",
+            MemoryCategory::Core,
+            None,
+            None,
+            None,
+            Some(&alpha),
+        )
+        .await
+        .unwrap();
+
+        // Simulate a prior delete of `beta`: its memories were purged but the
+        // agents row survives (delete never removes it) — an orphan in the
+        // UNIQUE alias slot. A bare UPDATE alpha→beta would hit the constraint.
+        let _beta = mem.ensure_agent_uuid("beta").await.unwrap();
+        assert_eq!(mem.purge_agent("beta").await.unwrap(), 0); // no memories anyway
+        // Rename succeeds: the orphan `beta` row is dropped, alpha→beta proceeds.
+        assert_eq!(mem.rename_agent("alpha", "beta").await.unwrap(), 1);
+        assert_eq!(mem.export_agent("beta").await.unwrap().len(), 1);
+        assert_eq!(mem.export_agent("alpha").await.unwrap().len(), 0);
+
+        // Now `beta` has a live memory. Renaming another agent ONTO it must
+        // refuse (we won't silently merge two agents' memories).
+        let gamma = mem.ensure_agent_uuid("gamma").await.unwrap();
+        mem.store_with_agent(
+            "g-0",
+            "gamma row",
+            MemoryCategory::Core,
+            None,
+            None,
+            None,
+            Some(&gamma),
+        )
+        .await
+        .unwrap();
+        let err = mem.rename_agent("gamma", "beta").await.unwrap_err();
+        assert!(
+            err.to_string().contains("refusing to merge"),
+            "expected merge-refusal, got: {err}"
+        );
+        // Nothing changed: both still resolve under their own aliases.
+        assert_eq!(mem.export_agent("beta").await.unwrap().len(), 1);
+        assert_eq!(mem.export_agent("gamma").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_export_agent_returns_only_that_agents_rows() {
+        let (_tmp, mem) = temp_sqlite();
+        let alpha = mem.ensure_agent_uuid("alpha").await.unwrap();
+        let rogue = mem.ensure_agent_uuid("rogue").await.unwrap();
+        for idx in 0..3 {
+            mem.store_with_agent(
+                &format!("alpha-{idx}"),
+                "alpha row",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(&alpha),
+            )
+            .await
+            .unwrap();
+        }
+        mem.store_with_agent(
+            "rogue-0",
+            "rogue row",
+            MemoryCategory::Core,
+            None,
+            None,
+            None,
+            Some(&rogue),
+        )
+        .await
+        .unwrap();
+
+        let exported = mem.export_agent("alpha").await.unwrap();
+        assert_eq!(exported.len(), 3, "export only alpha's rows");
+        assert!(exported.iter().all(|e| e.key.starts_with("alpha-")));
+        assert_eq!(mem.export_agent("rogue").await.unwrap().len(), 1);
+        assert!(mem.export_agent("ghost").await.unwrap().is_empty());
+        // export does NOT delete.
+        assert_eq!(mem.count().await.unwrap(), 4);
     }
 
     #[tokio::test]
@@ -2176,6 +2416,58 @@ mod tests {
         .unwrap();
         let entry = mem.get("timeout_key").await.unwrap().unwrap();
         assert_eq!(entry.content, "value with timeout");
+    }
+
+    // ── Graceful degrade on embedding failure ────────────────────
+
+    /// Embedder that advertises a real dimension but always fails to embed,
+    /// simulating a provider 404/401/outage (e.g. a wrong or revoked embedding
+    /// key — exactly the live failure that silently dropped 6 days of writes).
+    struct FailingEmbedding;
+
+    #[async_trait::async_trait]
+    impl super::super::embeddings::EmbeddingProvider for FailingEmbedding {
+        fn name(&self) -> &str {
+            "failing"
+        }
+        fn dimensions(&self) -> usize {
+            1536
+        }
+        async fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            anyhow::bail!("Embedding API error 404 Not Found — \"Requested entity was not found.\"")
+        }
+    }
+
+    #[tokio::test]
+    async fn store_degrades_gracefully_when_embedding_fails() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            Arc::new(FailingEmbedding),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::default(),
+        )
+        .unwrap();
+
+        // A failing embedder must NOT cost us the write. The row has to persist
+        // with a NULL vector rather than the whole store aborting — that abort
+        // was the data-loss bug. `reindex` can backfill the vector later.
+        mem.store(
+            "survives",
+            "this content must be retained",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .expect("store must succeed even when the embedder fails");
+
+        assert_eq!(mem.count().await.unwrap(), 1, "row must be persisted");
+        let entry = mem.get("survives").await.unwrap().unwrap();
+        assert_eq!(entry.content, "this content must be retained");
     }
 
     // ── With-embedder constructor test ───────────────────────────
@@ -3549,5 +3841,175 @@ mod tests {
         let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         let entry = mem.get("global").await.unwrap().expect("row should exist");
         assert!(entry.session_id.is_none());
+    }
+
+    // ── §4.8 Issue #7694: storage-reader timestamp / ordering coverage ──
+    //
+    // These tests guard regressions in the storage reader's timestamp
+    // loading and session-metadata ordering paths. They use neutral
+    // fixture data only (no user-provided content) and rely on the
+    // public `Memory` trait surface so they catch breakage at the
+    // boundary a real caller would observe.
+
+    /// Regression test for issue #7694: every recalled entry must expose
+    /// a parseable RFC 3339 timestamp. A regression here would silently
+    /// break UI rendering and time-windowed recall filters.
+    #[tokio::test]
+    async fn sqlite_timestamp_loading_is_rfc3339_round_trippable() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store(
+            "ts-key-1",
+            "content one",
+            MemoryCategory::Core,
+            Some("sess-7694"),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        mem.store(
+            "ts-key-2",
+            "content two",
+            MemoryCategory::Core,
+            Some("sess-7694"),
+        )
+        .await
+        .unwrap();
+
+        let entries = mem.list(None, Some("sess-7694")).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        for entry in &entries {
+            // RFC 3339 / ISO 8601 with timezone designator and millisecond
+            // precision — chrono's default serialization. Anything else
+            // would mean the schema or row mapper silently changed.
+            let parsed =
+                chrono::DateTime::parse_from_rfc3339(&entry.timestamp).unwrap_or_else(|err| {
+                    panic!(
+                        "entry {:?} returned non-RFC3339 timestamp {:?}: {err}",
+                        entry.key, entry.timestamp
+                    )
+                });
+            // Round-trip must preserve the original instant.
+            assert_eq!(parsed.to_rfc3339(), entry.timestamp);
+        }
+    }
+
+    /// Regression test for issue #7694: `list()` must return rows for a
+    /// single session in stable `updated_at DESC` order so that the UI
+    /// doesn't reshuffle rows on every refresh.
+    #[tokio::test]
+    async fn sqlite_session_metadata_ordering_is_stable_descending() {
+        let (_tmp, mem) = temp_sqlite();
+        // Seed with sleep gaps wide enough that updated_at strictly differs.
+        // 50ms is well above the SQLite `created_at`/`updated_at` millisecond
+        // resolution and stays comfortably under any reasonable CI time
+        // budget; 15ms (the original value) was observed to flake on slow
+        // shared runners where two adjacent writes landed within the same
+        // millisecond bucket.
+        let keys = ["ord-a", "ord-b", "ord-c", "ord-d"];
+        for key in keys {
+            mem.store(key, "body", MemoryCategory::Core, Some("sess-order"))
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // First read: capture the ordering.
+        let first = mem.list(None, Some("sess-order")).await.unwrap();
+        assert_eq!(first.len(), keys.len());
+        let first_order: Vec<&str> = first.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            first_order,
+            vec!["ord-d", "ord-c", "ord-b", "ord-a"],
+            "list() must order rows by updated_at DESC (newest first)"
+        );
+
+        // Second read with no writes in between: order must be identical.
+        let second = mem.list(None, Some("sess-order")).await.unwrap();
+        let second_order: Vec<&str> = second.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            first_order, second_order,
+            "ordering must be stable across reads"
+        );
+
+        // And every row must carry the session metadata we asked for.
+        for entry in &first {
+            assert_eq!(entry.session_id.as_deref(), Some("sess-order"));
+        }
+    }
+
+    /// Regression test for issue #7694: when two rows in the same
+    /// session share an `updated_at` boundary timestamp, `list()` must
+    /// still return them deterministically (not randomly swap order on
+    /// each read).
+    ///
+    /// Implementation note: `Local::now()` in `store()` carries
+    /// nanosecond precision on this host (e.g. `…15.007463284+08:00`),
+    /// so two back-to-back `store()` calls naturally land in distinct
+    /// `updated_at` buckets and never tie. To exercise the tie path
+    /// deterministically we seed the rows through the public `store()`
+    /// API and then collapse both `updated_at` values to a single
+    /// RFC 3339 timestamp via a direct SQL update through the public
+    /// `connection()` accessor. The `list()` calls themselves still go
+    /// through the public `Memory` trait surface.
+    ///
+    /// Scope note: this test verifies stable read-ordering when a tie
+    /// has been forced. A query-level secondary sort key (e.g.
+    /// `ORDER BY updated_at DESC, rowid ASC`) that would make
+    /// tied-timestamp ordering *guaranteed* rather than
+    /// implementation-defined is a production-logic change and is
+    /// tracked separately — see PR #7921's follow-up notes for the
+    /// reader-cursor side of the same family of issues.
+    #[tokio::test]
+    async fn sqlite_session_metadata_ordering_ties_are_deterministic() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("tie-x", "x", MemoryCategory::Core, Some("sess-tie"))
+            .await
+            .unwrap();
+        mem.store("tie-y", "y", MemoryCategory::Core, Some("sess-tie"))
+            .await
+            .unwrap();
+
+        // Force both rows to share the exact same `created_at` /
+        // `updated_at` value. Without this, two back-to-back `store()`
+        // calls on this host produce distinct nanosecond timestamps
+        // and the test would never exercise the tie path. We pin both
+        // columns because `list()` exposes `m.created_at` as the
+        // entry's `timestamp` while ordering by `m.updated_at`.
+        let tied_ts = "2026-06-19T00:00:00.000000000+00:00";
+        {
+            let conn = mem.connection().lock();
+            conn.execute(
+                "UPDATE memories SET created_at = ?1, updated_at = ?1 \
+                 WHERE key IN (?2, ?3)",
+                rusqlite::params![tied_ts, "tie-x", "tie-y"],
+            )
+            .unwrap();
+        }
+
+        let first = mem.list(None, Some("sess-tie")).await.unwrap();
+        assert_eq!(first.len(), 2);
+
+        // Lock in that a tie really occurred. Without this, the test
+        // degrades into a generic "stable order" check and the
+        // function name overstates what it covers.
+        assert_eq!(
+            first[0].timestamp, first[1].timestamp,
+            "expected both rows to share the forced updated_at"
+        );
+        assert_eq!(first[0].timestamp, tied_ts);
+
+        // Capture the order once.
+        let snapshot: Vec<String> = first.iter().map(|e| e.key.clone()).collect();
+
+        // Five more reads must all agree with the snapshot. If ordering
+        // were non-deterministic at a tied timestamp, this would flake.
+        for _ in 0..5 {
+            let again = mem.list(None, Some("sess-tie")).await.unwrap();
+            let again_keys: Vec<String> = again.iter().map(|e| e.key.clone()).collect();
+            assert_eq!(
+                again_keys, snapshot,
+                "list() must yield a deterministic order across reads"
+            );
+        }
     }
 }

@@ -1262,6 +1262,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn run_job_command_success() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
@@ -1275,6 +1276,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn run_job_command_failure() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
@@ -1288,6 +1290,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn run_job_command_times_out() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
@@ -1332,14 +1335,15 @@ mod tests {
             .entry(TEST_AGENT.into())
             .or_default()
             .allowed_commands = vec!["cat".into()];
-        let job = test_job("cat /etc/passwd");
+        let outside_path = absolute_path_outside_workspace();
+        let job = test_job(&format!("cat {outside_path}"));
         let security = test_security(&config);
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("forbidden path argument"));
-        assert!(output.contains("/etc/passwd"));
+        assert!(output.contains(outside_path));
     }
 
     #[tokio::test]
@@ -1351,14 +1355,15 @@ mod tests {
             .entry(TEST_AGENT.into())
             .or_default()
             .allowed_commands = vec!["grep".into()];
-        let job = test_job("grep --file=/etc/passwd root ./src");
+        let outside_path = absolute_path_outside_workspace();
+        let job = test_job(&format!("grep --file={outside_path} root ./src"));
         let security = test_security(&config);
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("forbidden path argument"));
-        assert!(output.contains("/etc/passwd"));
+        assert!(output.contains(outside_path));
     }
 
     #[tokio::test]
@@ -1370,17 +1375,19 @@ mod tests {
             .entry(TEST_AGENT.into())
             .or_default()
             .allowed_commands = vec!["grep".into()];
-        let job = test_job("grep -f/etc/passwd root ./src");
+        let outside_path = absolute_path_outside_workspace();
+        let job = test_job(&format!("grep -f{outside_path} root ./src"));
         let security = test_security(&config);
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("forbidden path argument"));
-        assert!(output.contains("/etc/passwd"));
+        assert!(output.contains(outside_path));
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn run_job_command_blocks_tilde_user_path_argument() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
@@ -1400,6 +1407,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn run_job_command_blocks_input_redirection_path_bypass() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
@@ -1453,7 +1461,18 @@ mod tests {
         assert!(output.contains("rate limit exceeded"));
     }
 
+    #[cfg(target_os = "windows")]
+    fn absolute_path_outside_workspace() -> &'static str {
+        r"C:\Windows\win.ini"
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn absolute_path_outside_workspace() -> &'static str {
+        "/etc/passwd"
+    }
+
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn execute_job_with_retry_recovers_after_first_failure() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
@@ -1486,6 +1505,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
     async fn execute_job_with_retry_exhausts_attempts() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;

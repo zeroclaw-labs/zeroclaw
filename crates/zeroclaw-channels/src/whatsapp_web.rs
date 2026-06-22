@@ -29,16 +29,16 @@
 //! The Cloud API channel is used when `phone_number_id` is set.
 
 use super::whatsapp_storage::RusqliteStore;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::select;
 use waproto::whatsapp::device_props::PlatformType;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 #[cfg(feature = "whatsapp-web")]
 use zeroclaw_api::media::MediaAttachment;
-#[cfg(not(feature = "whatsapp-web"))]
 use zeroclaw_runtime::i18n;
 
 /// WhatsApp Web channel using wa-rs with custom rusqlite storage
@@ -114,6 +114,11 @@ pub struct WhatsAppWebChannel {
     /// When non-empty, only group messages matching at least one pattern are
     /// processed; matched fragments are stripped from the forwarded content.
     group_mention_patterns: Arc<Vec<regex::Regex>>,
+    /// Resolved channel workspace root used to bound outbound local media
+    /// marker reads. The source of truth remains
+    /// `Config::channel_workspace_dir("whatsapp.<alias>")`; this is the
+    /// runtime trust boundary for file delivery.
+    workspace_dir: Option<PathBuf>,
 }
 
 impl WhatsAppWebChannel {
@@ -180,6 +185,7 @@ impl WhatsAppWebChannel {
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             dm_mention_patterns: Arc::new(Vec::new()),
             group_mention_patterns: Arc::new(Vec::new()),
+            workspace_dir: None,
         }
     }
 
@@ -187,6 +193,12 @@ impl WhatsAppWebChannel {
     /// channel handle is bound to.
     pub fn alias(&self) -> &str {
         &self.alias
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
+        self.workspace_dir = Some(dir);
+        self
     }
 
     /// Configure voice transcription (STT) for incoming voice notes.
@@ -935,6 +947,108 @@ impl WhatsAppWebChannel {
         Ok(())
     }
 
+    #[cfg(feature = "whatsapp-web")]
+    async fn send_media_marker(
+        client: &whatsapp_rust::Client,
+        to: &wacore_binary::jid::Jid,
+        marker: &WhatsAppMediaMarker,
+        path: &Path,
+    ) -> Result<()> {
+        let bytes = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("read WhatsApp marker target {}", path.display()))?;
+        if bytes.is_empty() {
+            anyhow::bail!("WhatsApp marker target {} is empty", path.display());
+        }
+
+        let media_type = marker.kind.media_type();
+        let mime = marker.kind.mime_for_path(path);
+
+        use whatsapp_rust::upload::UploadOptions;
+        let upload = client
+            .upload(bytes, media_type, UploadOptions::default())
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("WhatsApp media upload failed: {e}")))?;
+
+        let media_key = upload.media_key_vec();
+        let file_enc_sha256 = upload.file_enc_sha256_vec();
+        let file_sha256 = upload.file_sha256_vec();
+        let outgoing = match marker.kind {
+            WhatsAppMediaKind::Image => waproto::whatsapp::Message {
+                image_message: Some(Box::new(waproto::whatsapp::message::ImageMessage {
+                    url: Some(upload.url),
+                    direct_path: Some(upload.direct_path),
+                    media_key: Some(media_key),
+                    file_enc_sha256: Some(file_enc_sha256),
+                    file_sha256: Some(file_sha256),
+                    file_length: Some(upload.file_length),
+                    mimetype: Some(mime),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            WhatsAppMediaKind::Video => waproto::whatsapp::Message {
+                video_message: Some(Box::new(waproto::whatsapp::message::VideoMessage {
+                    url: Some(upload.url),
+                    direct_path: Some(upload.direct_path),
+                    media_key: Some(media_key),
+                    file_enc_sha256: Some(file_enc_sha256),
+                    file_sha256: Some(file_sha256),
+                    file_length: Some(upload.file_length),
+                    mimetype: Some(mime),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            WhatsAppMediaKind::Audio | WhatsAppMediaKind::Voice => {
+                #[allow(clippy::cast_possible_truncation)]
+                let estimated_seconds = std::cmp::max(1, (upload.file_length / 4000) as u32);
+                waproto::whatsapp::Message {
+                    audio_message: Some(Box::new(waproto::whatsapp::message::AudioMessage {
+                        url: Some(upload.url),
+                        direct_path: Some(upload.direct_path),
+                        media_key: Some(media_key),
+                        file_enc_sha256: Some(file_enc_sha256),
+                        file_sha256: Some(file_sha256),
+                        file_length: Some(upload.file_length),
+                        mimetype: Some(mime),
+                        ptt: Some(matches!(marker.kind, WhatsAppMediaKind::Voice)),
+                        seconds: Some(estimated_seconds),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }
+            }
+            WhatsAppMediaKind::Document => {
+                let file_name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("attachment")
+                    .to_string();
+                waproto::whatsapp::Message {
+                    document_message: Some(Box::new(waproto::whatsapp::message::DocumentMessage {
+                        url: Some(upload.url),
+                        direct_path: Some(upload.direct_path),
+                        media_key: Some(media_key),
+                        file_enc_sha256: Some(file_enc_sha256),
+                        file_sha256: Some(file_sha256),
+                        file_length: Some(upload.file_length),
+                        mimetype: Some(mime),
+                        file_name: Some(file_name.clone()),
+                        title: Some(file_name),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }
+            }
+        };
+
+        Box::pin(client.send_message(to.clone(), outgoing))
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("WhatsApp media send failed: {e}")))?;
+        Ok(())
+    }
+
     // ── Mention detection helpers (used when mention_only is enabled) ──
 
     /// Extract digits from a JID string (e.g. "919211916069@s.whatsapp.net" -> "919211916069").
@@ -1083,6 +1197,232 @@ fn fromme_outside_self_chat_is_operator_trigger(
 }
 
 #[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WhatsAppMediaKind {
+    Image,
+    Document,
+    Video,
+    Audio,
+    Voice,
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl WhatsAppMediaKind {
+    fn from_marker(kind: &str) -> Option<Self> {
+        match kind {
+            "IMAGE" | "PHOTO" => Some(Self::Image),
+            "DOCUMENT" | "FILE" => Some(Self::Document),
+            "VIDEO" => Some(Self::Video),
+            "AUDIO" => Some(Self::Audio),
+            "VOICE" => Some(Self::Voice),
+            _ => None,
+        }
+    }
+
+    fn media_type(self) -> wacore::download::MediaType {
+        match self {
+            Self::Image => wacore::download::MediaType::Image,
+            Self::Document => wacore::download::MediaType::Document,
+            Self::Video => wacore::download::MediaType::Video,
+            Self::Audio | Self::Voice => wacore::download::MediaType::Audio,
+        }
+    }
+
+    fn mime_for_path(self, path: &Path) -> String {
+        let ext = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase);
+        if matches!(self, Self::Voice) && matches!(ext.as_deref(), Some("ogg" | "oga" | "opus")) {
+            return "audio/ogg; codecs=opus".to_string();
+        }
+        match ext.as_deref() {
+            Some("png") => "image/png",
+            Some("jpg" | "jpeg") => "image/jpeg",
+            Some("gif") => "image/gif",
+            Some("webp") => "image/webp",
+            Some("bmp") => "image/bmp",
+            Some("mp4") => "video/mp4",
+            Some("mov") => "video/quicktime",
+            Some("mkv") => "video/x-matroska",
+            Some("avi") => "video/x-msvideo",
+            Some("webm") => "video/webm",
+            Some("mp3") => "audio/mpeg",
+            Some("m4a") => "audio/mp4",
+            Some("wav") => "audio/wav",
+            Some("flac") => "audio/flac",
+            Some("ogg" | "oga") => "audio/ogg",
+            Some("opus") => "audio/opus",
+            Some("pdf") => "application/pdf",
+            Some("doc") => "application/msword",
+            Some("docx") => {
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            }
+            Some("xls") => "application/vnd.ms-excel",
+            Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            Some("csv") => "text/csv",
+            Some("txt") => "text/plain",
+            _ => "application/octet-stream",
+        }
+        .to_string()
+    }
+}
+
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WhatsAppMediaMarker {
+    kind: WhatsAppMediaKind,
+    target: String,
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl WhatsAppMediaMarker {
+    fn from_shared_marker(kind: String, target: String) -> Option<Self> {
+        let kind = WhatsAppMediaKind::from_marker(&kind)?;
+        Some(Self { kind, target })
+    }
+}
+
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WhatsAppMarkerFailure {
+    Refused,
+    Failed,
+}
+
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug)]
+enum WhatsAppMarkerError {
+    Refused(anyhow::Error),
+    Failed(anyhow::Error),
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl std::fmt::Display for WhatsAppMarkerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(err) | Self::Failed(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+#[cfg(feature = "whatsapp-web")]
+impl WhatsAppMarkerError {
+    fn kind(&self) -> WhatsAppMarkerFailure {
+        match self {
+            Self::Refused(_) => WhatsAppMarkerFailure::Refused,
+            Self::Failed(_) => WhatsAppMarkerFailure::Failed,
+        }
+    }
+}
+
+#[cfg(feature = "whatsapp-web")]
+fn validate_whatsapp_marker_target(
+    target: &str,
+    workspace_dir: Option<&Path>,
+) -> std::result::Result<PathBuf, WhatsAppMarkerError> {
+    if target.starts_with("http://") || target.starts_with("https://") {
+        return Err(WhatsAppMarkerError::Refused(anyhow::Error::msg(
+            "WhatsApp Web media markers currently accept local workspace files only",
+        )));
+    }
+    let disallowed_scheme = if target.starts_with("data:") {
+        Some("data")
+    } else if target.starts_with("file:") {
+        Some("file")
+    } else if target.contains("://") {
+        Some(target.split("://").next().unwrap_or("?"))
+    } else {
+        None
+    };
+    if let Some(scheme) = disallowed_scheme {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"scheme": scheme})),
+            "whatsapp-web: marker target uses disallowed scheme"
+        );
+        return Err(WhatsAppMarkerError::Refused(anyhow::Error::msg(
+            "WhatsApp Web marker target uses a disallowed scheme",
+        )));
+    }
+
+    let workspace = workspace_dir.ok_or_else(|| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"reason": "no_workspace_dir"})),
+            "whatsapp-web: local marker target has no workspace_dir"
+        );
+        WhatsAppMarkerError::Refused(anyhow::Error::msg(
+            "WhatsApp Web channel was started without a workspace_dir",
+        ))
+    })?;
+    let workspace_canon = std::fs::canonicalize(workspace)
+        .with_context(|| format!("canonicalize workspace {}", workspace.display()))
+        .map_err(WhatsAppMarkerError::Refused)?;
+    let target_path = Path::new(target);
+    let absolute = if target_path.is_absolute() {
+        target_path.to_path_buf()
+    } else {
+        workspace_canon.join(target_path)
+    };
+    let target_canon = match std::fs::canonicalize(&absolute) {
+        Ok(path) => path,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"reason": "not_found"})),
+                "whatsapp-web: marker target not found on disk"
+            );
+            return Err(WhatsAppMarkerError::Failed(anyhow::Error::msg(
+                "WhatsApp Web marker target not found on disk",
+            )));
+        }
+        Err(err) => {
+            return Err(WhatsAppMarkerError::Refused(
+                anyhow::Error::from(err).context("canonicalize WhatsApp marker target"),
+            ));
+        }
+    };
+
+    if !target_canon.starts_with(&workspace_canon) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"reason": "outside_workspace"})),
+            "whatsapp-web: marker target escapes workspace_dir"
+        );
+        return Err(WhatsAppMarkerError::Refused(anyhow::Error::msg(
+            "WhatsApp Web marker target resolves outside workspace_dir",
+        )));
+    }
+    Ok(target_canon)
+}
+
+#[cfg(feature = "whatsapp-web")]
+fn whatsapp_delivery_failure_note(failure_count: usize) -> Option<String> {
+    if failure_count == 0 {
+        return None;
+    }
+    let count = failure_count.to_string();
+    let key = if failure_count == 1 {
+        "channel-whatsapp-web-delivery-failure-note-one"
+    } else {
+        "channel-whatsapp-web-delivery-failure-note-many"
+    };
+    Some(i18n::get_required_cli_string_with_args(
+        key,
+        &[("count", count.as_str())],
+    ))
+}
+
+#[cfg(feature = "whatsapp-web")]
 impl ::zeroclaw_api::attribution::Attributable for WhatsAppWebChannel {
     fn role(&self) -> ::zeroclaw_api::attribution::Role {
         ::zeroclaw_api::attribution::Role::Channel(
@@ -1123,6 +1463,34 @@ impl Channel for WhatsAppWebChannel {
 
         let deliverable_recipient = Self::resolve_outbound_recipient(&message.recipient);
         let to = self.recipient_to_jid(&deliverable_recipient)?;
+        let raw_content = if message.content.contains("<function_calls")
+            || message.content.contains("</function_calls")
+            || message.content.contains("<tool_call")
+            || message.content.contains("</tool_call")
+            || message.content.contains("<tool_calls")
+            || message.content.contains("</tool_calls")
+        {
+            crate::util::strip_tool_call_tags(&message.content)
+        } else {
+            message.content.clone()
+        };
+        let (mut text_content, raw_markers) = if raw_content.contains('[')
+            && raw_content.contains(':')
+            && raw_content.contains(']')
+        {
+            let (cleaned, raw_markers) = super::util::parse_attachment_markers(&raw_content);
+            if raw_markers.is_empty() {
+                (raw_content, raw_markers)
+            } else {
+                (cleaned, raw_markers)
+            }
+        } else {
+            (raw_content, Vec::new())
+        };
+        let markers = raw_markers
+            .into_iter()
+            .filter_map(|(kind, target)| WhatsAppMediaMarker::from_shared_marker(kind, target))
+            .collect::<Vec<_>>();
 
         // Voice chat mode: send text normally AND queue a voice note of the
         // final answer. Only substantive messages (not tool outputs) are queued.
@@ -1135,7 +1503,7 @@ impl Channel for WhatsAppWebChannel {
             .unwrap_or(false);
 
         if is_voice_chat && self.tts_manager.is_some() {
-            let content = &message.content;
+            let content = &text_content;
             // Only queue substantive natural-language replies for voice.
             // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
             let is_substantive = content.len() > 40
@@ -1217,9 +1585,69 @@ impl Channel for WhatsAppWebChannel {
             // Fall through to send text normally (voice chat gets BOTH)
         }
 
+        let mut delivered_markers = 0usize;
+        let mut failed_marker_count = 0usize;
+        for marker in &markers {
+            let target = match validate_whatsapp_marker_target(
+                &marker.target,
+                self.workspace_dir.as_deref(),
+            ) {
+                Ok(path) => path,
+                Err(err) => {
+                    let kind = err.kind();
+                    let reason = match kind {
+                        WhatsAppMarkerFailure::Refused => "trust boundary",
+                        WhatsAppMarkerFailure::Failed => "not found",
+                    };
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "kind": format!("{:?}", marker.kind),
+                                "reason": reason,
+                                "error": err.to_string(),
+                            })),
+                        "whatsapp-web: dropping unresolved outbound attachment marker"
+                    );
+                    failed_marker_count += 1;
+                    continue;
+                }
+            };
+            match Self::send_media_marker(&client, &to, marker, &target).await {
+                Ok(()) => delivered_markers += 1,
+                Err(err) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "kind": format!("{:?}", marker.kind),
+                                "error": err.to_string(),
+                            })),
+                        "whatsapp-web: media marker delivery failed"
+                    );
+                    failed_marker_count += 1;
+                }
+            }
+        }
+
+        if let Some(note) = whatsapp_delivery_failure_note(failed_marker_count) {
+            if text_content.is_empty() {
+                text_content = note;
+            } else {
+                text_content.push_str("\n\n");
+                text_content.push_str(&note);
+            }
+        }
+
+        if !markers.is_empty() && text_content.is_empty() && delivered_markers > 0 {
+            return Ok(());
+        }
+
         // Send text message
         let outgoing = waproto::whatsapp::Message {
-            conversation: Some(message.content.clone()),
+            conversation: Some(text_content),
             ..Default::default()
         };
 
@@ -1994,6 +2422,99 @@ mod tests {
     use super::*;
     #[cfg(feature = "whatsapp-web")]
     use wacore_binary::jid::Jid;
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn media_markers_reuse_shared_parser_kinds() {
+        let (cleaned, raw) = super::super::util::parse_attachment_markers(
+            "send [IMAGE:photo.png] [DOCUMENT:report.pdf] [VOICE:voice.ogg]",
+        );
+        let markers = raw
+            .into_iter()
+            .filter_map(|(kind, target)| WhatsAppMediaMarker::from_shared_marker(kind, target))
+            .collect::<Vec<_>>();
+
+        assert_eq!(cleaned, "send");
+        assert_eq!(
+            markers.iter().map(|marker| marker.kind).collect::<Vec<_>>(),
+            vec![
+                WhatsAppMediaKind::Image,
+                WhatsAppMediaKind::Document,
+                WhatsAppMediaKind::Voice
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn validate_marker_target_accepts_workspace_relative_file() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let file = workspace.path().join("photo.png");
+        std::fs::write(&file, b"png").expect("write fixture");
+
+        let resolved =
+            validate_whatsapp_marker_target("photo.png", Some(workspace.path())).expect("inside");
+
+        assert_eq!(resolved, file.canonicalize().expect("canonical fixture"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn validate_marker_target_rejects_workspace_escape() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::NamedTempFile::new().expect("outside file");
+
+        let err = validate_whatsapp_marker_target(
+            outside.path().to_str().expect("utf8 path"),
+            Some(workspace.path()),
+        )
+        .expect_err("outside workspace must be refused");
+
+        assert_eq!(err.kind(), WhatsAppMarkerFailure::Refused);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn validate_marker_target_rejects_without_workspace() {
+        let err = validate_whatsapp_marker_target("photo.png", None)
+            .expect_err("workspace is required for local marker reads");
+
+        assert_eq!(err.kind(), WhatsAppMarkerFailure::Refused);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn validate_marker_target_marks_missing_as_failed() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+
+        let err = validate_whatsapp_marker_target("missing.png", Some(workspace.path()))
+            .expect_err("missing file should fail delivery");
+
+        assert_eq!(err.kind(), WhatsAppMarkerFailure::Failed);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn delivery_failure_note_is_count_only() {
+        let note = whatsapp_delivery_failure_note(2).expect("note");
+
+        assert!(note.contains("2 WhatsApp media attachments"));
+        assert!(!note.contains("/"));
+        assert!(!note.contains("workspace"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn voice_marker_uses_opus_mime_for_ogg_family() {
+        assert_eq!(
+            WhatsAppMediaKind::Voice.mime_for_path(Path::new("voice.ogg")),
+            "audio/ogg; codecs=opus"
+        );
+        assert_eq!(
+            WhatsAppMediaKind::Audio.mime_for_path(Path::new("voice.ogg")),
+            "audio/ogg"
+        );
+    }
 
     #[test]
     #[cfg(feature = "whatsapp-web")]
