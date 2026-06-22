@@ -46,30 +46,6 @@ targets enforce this via `required-features` in `Cargo.toml` (one
 `[[test]]` per world); a real plugin author's `Cargo.toml` should likewise
 enable exactly one of `tool`/`memory`/`channel`.
 
-## Known limitation: four channel capability-gated functions
-
-`channel::ChannelPlugin::self_handle`, `self_addressed_mention`,
-`drop_self_message`, and `multi_message_delay_ms` are plain sync trait
-methods (matching the WIT export signatures), and `export_channel!` wires
-them correctly — but on the **host** side
-(`zeroclaw-plugins/src/component/v0/bindings.rs`), these four are still
-configured `trappable` rather than `async`, and calling a `trappable`
-(sync) export through a `Store` with async-required imports (which this
-host always has) currently traps with "store configuration requires that
-`*_async` functions are used instead". This was discovered while
-building this SDK (see `zeroclaw-plugins/src/component/v0/channel_component.rs`'s
-`call_plugin_sync!` call sites) but not yet fixed, because fixing it
-properly requires either making the corresponding
-`zeroclaw_api::channel::Channel` trait methods async (broad blast radius
-across every native channel implementation) or blocking on the async
-call from within `call_plugin_sync!`'s sync closure. Until fixed, a
-channel plugin that declares any of the four corresponding
-`channel-capabilities` flags will fail when the host actually calls into
-it. `examples/channel-echo` works around this by declaring zero optional
-capabilities, which is why its round-trip test passes — it never
-exercises the broken path. Fix this in `zeroclaw-plugins`, not here, when
-tackled.
-
 ## What does NOT belong here
 
 - Business logic for any specific plugin — that's the plugin author's own
