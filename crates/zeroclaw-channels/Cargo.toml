@@ -265,7 +265,7 @@ channel-wechat = [
 ]
 channel-wecom = []
 channel-wecom-ws = ["dep:aes", "dep:cbc"]
-channel-inkbox = ["dep:inkbox"]
+channel-inkbox = ["dep:inkbox", "zeroclaw-tools/inkbox"]
 channel-clawdtalk = []
 channel-webhook = []
 channel-whatsapp-cloud = []

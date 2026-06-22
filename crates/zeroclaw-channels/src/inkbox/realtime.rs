@@ -121,16 +121,11 @@ pub(super) fn deliver_consult(id: &str, answer: &str) -> bool {
     }
 }
 
-/// Shared dir where `inkbox_place_call` drops single-use outbound-call context
-/// keyed by `context_token`. Both crates derive the same path from the temp dir.
-fn call_context_dir() -> std::path::PathBuf {
-    std::env::temp_dir().join("inkbox_call_contexts")
-}
-
 /// Resolve [`CallMeta`] for an incoming call-media WS from its `context_token`
-/// query param. A token (set by `inkbox_place_call`) means an outbound call;
-/// we load the queued purpose/opening and delete the file (single-use). No
-/// token means an inbound call.
+/// query param. A token (set by `inkbox_place_call`) means an outbound call; we
+/// reclaim the queued purpose/opening from the in-process registry (single-use).
+/// No token means an inbound call. A token with no matching entry is still an
+/// outbound call, just without context (e.g. the daemon restarted mid-call).
 pub(super) fn load_call_meta(context_token: Option<&str>) -> CallMeta {
     let Some(token) = context_token.map(str::trim).filter(|t| !t.is_empty()) else {
         return CallMeta {
@@ -138,42 +133,13 @@ pub(super) fn load_call_meta(context_token: Option<&str>) -> CallMeta {
             ..Default::default()
         };
     };
-    let path = call_context_dir().join(format!("{token}.json"));
-    let meta = match std::fs::read_to_string(&path) {
-        Ok(s) => {
-            let v: Value = serde_json::from_str(&s).unwrap_or_else(|e| {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                    format!("[inkbox] corrupt call-context file for token {token}; ignoring: {e}"),
-                );
-                json!({})
-            });
-            let pick = |k: &str| {
-                v.get(k)
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-            };
-            CallMeta {
-                call_id: String::new(),
-                direction: "outbound".into(),
-                contact_name: None,
-                purpose: pick("purpose"),
-                opening: pick("opening_message"),
-                ..Default::default()
-            }
-        }
-        // Token present but file gone: still an outbound call, just no context.
-        Err(_) => CallMeta {
-            direction: "outbound".into(),
-            ..Default::default()
-        },
-    };
-    let _ = std::fs::remove_file(&path);
-    meta
+    let ctx = zeroclaw_tools::inkbox::take_call_context(token);
+    CallMeta {
+        direction: "outbound".into(),
+        purpose: ctx.as_ref().and_then(|c| c.purpose.clone()),
+        opening: ctx.and_then(|c| c.opening_message),
+        ..Default::default()
+    }
 }
 
 // ── instructions / greeting / session ──────────────────────────────────────

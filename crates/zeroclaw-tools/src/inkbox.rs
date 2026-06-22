@@ -10,7 +10,8 @@
 //! [`InkboxCtx::run`]; the `AgentIdentity` facade is `!Send`, so it is resolved
 //! and used entirely inside that closure.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use inkbox::contacts::resources::contacts::{
@@ -19,6 +20,7 @@ use inkbox::contacts::resources::contacts::{
 use inkbox::contacts::types::{ContactEmail, ContactPhone};
 use inkbox::phone::resources::texts::TextRecipients;
 use inkbox::{AgentIdentity, Inkbox, InkboxError};
+use parking_lot::Mutex;
 use serde_json::{Value, json};
 use zeroclaw_api::attribution::ToolKind;
 use zeroclaw_api::tool::{Tool, ToolResult};
@@ -136,56 +138,43 @@ fn fail(msg: impl Into<String>) -> ToolResult {
     }
 }
 
-/// Write single-use outbound-call context to the shared temp dir the channel's
-/// voice handler reads (`realtime::load_call_meta`), returning the token to
-/// append to the call WS URL as `context_token`.
-fn write_call_context(
-    to_number: &str,
-    purpose: Option<&str>,
-    opening: Option<&str>,
-) -> Option<String> {
+/// Outbound-call context (why we're calling + an optional opening line) handed
+/// from `inkbox_place_call` to the voice bridge. Both run in the same daemon
+/// process, so it's passed through an in-process registry keyed by a single-use
+/// token (round-tripped via the call WS URL as `?context_token=`) — no temp
+/// file. Mirrors the channel's `CALL_SINKS` / `CONSULT_SINKS` registries.
+#[derive(Clone, Default)]
+pub struct CallContext {
+    /// Why we're calling, surfaced to the realtime model.
+    pub purpose: Option<String>,
+    /// Opening line to say verbatim as the first turn, when set.
+    pub opening_message: Option<String>,
+}
+
+static CALL_CONTEXTS: OnceLock<Mutex<HashMap<String, CallContext>>> = OnceLock::new();
+
+fn call_contexts() -> &'static Mutex<HashMap<String, CallContext>> {
+    CALL_CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Stash single-use outbound-call context, returning the token to append to the
+/// call WS URL as `context_token`. The voice bridge reclaims it via
+/// [`take_call_context`] when Inkbox connects the audio leg.
+fn stash_call_context(purpose: Option<&str>, opening: Option<&str>) -> String {
     let token = uuid::Uuid::new_v4().to_string();
-    let dir = std::env::temp_dir().join("inkbox_call_contexts");
-    let body = json!({
-        "to_number": to_number,
-        "purpose": purpose.unwrap_or(""),
-        "opening_message": opening.unwrap_or(""),
-    });
-    let write = || -> std::io::Result<()> {
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("{token}.json"));
-        // The body carries the call's purpose/opening text; restrict it to the
-        // owner (0600) on Unix so other local users on a shared host can't read it.
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&path)?;
-            f.write_all(body.to_string().as_bytes())?;
-        }
-        #[cfg(not(unix))]
-        std::fs::write(&path, body.to_string())?;
-        Ok(())
+    let ctx = CallContext {
+        purpose: purpose.map(str::to_string).filter(|s| !s.is_empty()),
+        opening_message: opening.map(str::to_string).filter(|s| !s.is_empty()),
     };
-    if let Err(e) = write() {
-        // Surface the failure: the call still places, but without its purpose/
-        // opening — better to know than to silently drop the agent's intent.
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-            format!(
-                "[inkbox] could not write call-context file; call will lack purpose/opening: {e}"
-            ),
-        );
-        return None;
-    }
-    Some(token)
+    call_contexts().lock().insert(token.clone(), ctx);
+    token
+}
+
+/// Take (and remove) the outbound-call context for `token`. Called by the
+/// channel's voice handler on WS connect. `None` if the token is unknown
+/// (already taken, or the daemon restarted between place-call and connect).
+pub fn take_call_context(token: &str) -> Option<CallContext> {
+    call_contexts().lock().remove(token)
 }
 
 // ── tools ────────────────────────────────────────────────────────────────
@@ -441,11 +430,8 @@ impl Tool for InkboxPlaceCall {
                 });
                 // Port call context (purpose/opening) to the realtime bridge via
                 // a single-use token file the voice handler reads on connect.
-                let want_context = ws.is_some() && (purpose.is_some() || opening.is_some());
-                if let Some(token) = want_context
-                    .then(|| write_call_context(&to_number, purpose.as_deref(), opening.as_deref()))
-                    .flatten()
-                {
+                if ws.is_some() && (purpose.is_some() || opening.is_some()) {
+                    let token = stash_call_context(purpose.as_deref(), opening.as_deref());
                     ws = ws.map(|u| {
                         let sep = if u.contains('?') { '&' } else { '?' };
                         format!("{u}{sep}context_token={token}")
@@ -1043,20 +1029,17 @@ mod tests {
     }
 
     #[test]
-    fn write_call_context_writes_owner_only_file_with_body() {
-        let token = write_call_context("+15551230000", Some("confirm order"), None).expect("token");
-        let path = std::env::temp_dir()
-            .join("inkbox_call_contexts")
-            .join(format!("{token}.json"));
-        assert!(path.exists());
-        let body: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(body["purpose"], "confirm order");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600);
-        }
-        let _ = std::fs::remove_file(&path);
+    fn call_context_round_trips_in_memory_and_is_single_use() {
+        let token = stash_call_context(Some("confirm order"), None);
+        let ctx = take_call_context(&token).expect("context present");
+        assert_eq!(ctx.purpose.as_deref(), Some("confirm order"));
+        assert_eq!(ctx.opening_message, None);
+        // Single-use: a second take finds nothing.
+        assert!(take_call_context(&token).is_none());
+        // Empty strings are normalized to None.
+        let t2 = stash_call_context(Some(""), Some("hi"));
+        let c2 = take_call_context(&t2).unwrap();
+        assert_eq!(c2.purpose, None);
+        assert_eq!(c2.opening_message.as_deref(), Some("hi"));
     }
 }
