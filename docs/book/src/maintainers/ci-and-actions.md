@@ -131,7 +131,7 @@ All third-party refs are pinned to a full commit SHA with a trailing version com
 | Action | Used in | Purpose |
 |---|---|---|
 | `actions/checkout` (`v6.0.2`) | Most workflows | Repository checkout |
-| `actions/cache` (`v5.0.5`) | `tweet-release.yml` | Generic dependency caching |
+| `actions/cache` (`v4.2.3`, `v5.0.5`) | `docker-image-pr.yml`, `tweet-release.yml` | Generic dependency and Trivy database caching |
 | `actions/setup-node` (`v6.4.0`) | `release-stable-manual.yml`, `cross-platform-build-manual.yml` | Node toolchain for the web-dashboard build |
 | `actions/upload-artifact` (`v7.0.1`) | `release-stable-manual.yml`, `cross-platform-build-manual.yml` | Upload build artifacts |
 | `actions/download-artifact` (`v8.0.1`) | `release-stable-manual.yml`, `cross-platform-build-manual.yml` | Download build artifacts for packaging |
@@ -144,6 +144,8 @@ All third-party refs are pinned to a full commit SHA with a trailing version com
 | `sigstore/cosign-installer` (`v3.8.1`) | `release-stable-manual.yml`, `docker-publish.yml` | Install cosign for keyless signing of release assets and container images |
 | `anchore/sbom-action` (`v0.17.9`) | `release-stable-manual.yml` | Generate SPDX + CycloneDX SBOMs for each release |
 | `slsa-framework/slsa-github-generator` (`v2.1.0`) | `release-stable-manual.yml` | Reusable workflow that produces SLSA L2 provenance for release artifacts |
+| `aquasecurity/trivy-action` (`v0.36.0`) | `docker-image-pr.yml`, `docker-publish.yml` | Report-only container vulnerability scanning |
+| `github/codeql-action/upload-sarif` (`v3.36.2`) | `docker-publish.yml` | Upload Trivy SARIF reports to the Security tab |
 
 The GitHub Release itself is created with `gh release create` inside the `publish` job, not a release action.
 
@@ -157,6 +159,8 @@ docker/*
 sigstore/cosign-installer@*
 anchore/sbom-action@*
 slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@*
+aquasecurity/trivy-action@*
+github/codeql-action/upload-sarif@*
 ```
 
 Export the current effective policy:

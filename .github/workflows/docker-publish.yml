@@ -5,6 +5,10 @@ name: Docker Publish
 # dev/ci/docker-tags.toml; this workflow consumes it so published tags can never
 # drift from the spec. Each entry produces an immutable version-pinned tag
 # (Alpine-style `<stem>-v<version>`) and a floating tag (`<stem>`).
+#
+# Images are pushed with the canonical platform matrix first, signed by digest,
+# then the pinned tag is scanned in report-only mode (exit-code: 0). Enforcement
+# flips in a follow-up after the baseline is triaged.
 
 on:
   push:
@@ -45,13 +49,15 @@ jobs:
 
   publish:
     name: Build & push ${{ matrix.stem }}
+    if: github.repository == 'zeroclaw-labs/zeroclaw'
     needs: [matrix]
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     permissions:
       contents: read
       packages: write
       id-token: write   # required for keyless cosign OIDC signing of container images
+      security-events: write
     strategy:
       fail-fast: false
       matrix:
@@ -100,3 +106,19 @@ jobs:
         run: |
           cosign sign --yes \
             "${{ env.REGISTRY }}/${{ env.IMAGE }}@${DIGEST}"
+
+      - name: Scan pinned tag with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          skip-dirs: /usr/share/zoneinfo
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ matrix.pinned_tag }}
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: 0
+          severity: HIGH,CRITICAL
+
+      - name: Upload Trivy SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3.36.2
+        if: always() && hashFiles('trivy-results.sarif') != ''
+        with:
+          sarif_file: trivy-results.sarif
