@@ -344,6 +344,40 @@ export function getHealth(): Promise<HealthSnapshot> {
   ).then((data) => unwrapField(data, "health"));
 }
 
+// ── Version check (version.rs) ───────────────────────────────────────
+
+export interface VersionCheckResponse {
+  current_version: string;
+  /** Latest release version, or null when the check could not complete. */
+  latest_version: string | null;
+  is_newer: boolean;
+  release_url?: string | null;
+  /** Release notes body (Markdown). */
+  release_notes?: string | null;
+  published_at?: string | null;
+  /** Set when the check failed; the dashboard degrades gracefully. */
+  error?: string;
+}
+
+/**
+ * GET /api/version/check — is a newer release available?
+ *
+ * Backed by `zeroclaw update --check --json`, cached server-side for 1h.
+ * Pass `force` to bypass the cache, or `version` to check a specific tag.
+ */
+export function checkVersion(opts?: {
+  force?: boolean;
+  version?: string;
+}): Promise<VersionCheckResponse> {
+  const params = new URLSearchParams();
+  if (opts?.force) params.set("force", "true");
+  if (opts?.version) params.set("version", opts.version);
+  const qs = params.toString();
+  return apiFetch<VersionCheckResponse>(
+    `/api/version/check${qs ? `?${qs}` : ""}`,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // TUIs
 // ---------------------------------------------------------------------------

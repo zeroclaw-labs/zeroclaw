@@ -922,6 +922,9 @@ Examples:
         /// Target version (default: latest)
         #[arg(long)]
         version: Option<String>,
+        /// With --check, emit machine-readable JSON instead of human text
+        #[arg(long)]
+        json: bool,
     },
 
     /// Run diagnostic self-tests
@@ -4859,10 +4862,25 @@ async fn main() -> Result<()> {
             check,
             force: _force,
             version,
+            json,
         } => {
             if check {
                 let info = commands::update::check(version.as_deref()).await?;
-                if info.is_newer {
+                if json {
+                    // Machine-readable shape consumed by the gateway's
+                    // `GET /api/version/check`. Keep field names stable.
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "current_version": info.current_version,
+                            "latest_version": info.latest_version,
+                            "is_newer": info.is_newer,
+                            "release_url": info.release_url,
+                            "release_notes": info.release_notes,
+                            "published_at": info.published_at,
+                        }))?
+                    );
+                } else if info.is_newer {
                     println!(
                         "Update available: v{} -> v{}",
                         info.current_version, info.latest_version

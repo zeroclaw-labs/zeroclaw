@@ -55,6 +55,12 @@ pub struct UpdateInfo {
     pub download_url: Option<String>,
     pub sha256sums_url: Option<String>,
     pub is_newer: bool,
+    /// GitHub release page URL (`html_url`), for "view release" links.
+    pub release_url: Option<String>,
+    /// Release notes body (Markdown), for rendering in the dashboard.
+    pub release_notes: Option<String>,
+    /// Release publish timestamp (ISO-8601), as returned by GitHub.
+    pub published_at: Option<String>,
 }
 
 /// Check for available updates without downloading.
@@ -101,12 +107,22 @@ pub async fn check(target_version: Option<&str>) -> Result<UpdateInfo> {
     let sha256sums_url = find_sha256sums_url(&release);
     let is_newer = version_is_newer(&current, &tag);
 
+    let release_url = release["html_url"].as_str().map(str::to_string);
+    let release_notes = release["body"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let published_at = release["published_at"].as_str().map(str::to_string);
+
     Ok(UpdateInfo {
         current_version: current,
         latest_version: tag,
         download_url,
         sha256sums_url,
         is_newer,
+        release_url,
+        release_notes,
+        published_at,
     })
 }
 

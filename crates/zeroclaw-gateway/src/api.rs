@@ -285,6 +285,10 @@ pub async fn handle_api_status(
 
     let process = zeroclaw_runtime::process_stats::sample();
 
+    // Upgrade affordance: whether the dashboard should poll for updates / offer
+    // the upgrade button, and which restart command to show afterwards.
+    let restart = crate::version::detect_restart();
+
     let body = serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "model_provider": model_provider,
@@ -300,6 +304,10 @@ pub async fn handle_api_status(
         "health": health,
         "agent_alias": agent_alias,
         "process": process,
+        "check_updates": config.gateway.check_updates,
+        "allow_self_upgrade": config.gateway.allow_self_upgrade,
+        "restart_mode": restart.mode.as_str(),
+        "restart_hint": restart.hint,
     });
 
     Json(body).into_response()

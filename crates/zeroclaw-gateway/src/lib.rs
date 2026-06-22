@@ -44,6 +44,7 @@ pub mod session_queue;
 pub mod sse;
 pub mod static_files;
 pub mod tls;
+pub mod version;
 #[cfg(feature = "gateway-voice-duplex")]
 pub mod voice_duplex;
 pub mod ws;
@@ -1584,6 +1585,7 @@ pub async fn run_gateway(
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
+        .route("/api/version/check", get(version::handle_version_check))
         .route("/api/logs", get(api_logs::handle_api_logs))
         .route(
             "/api/config",
