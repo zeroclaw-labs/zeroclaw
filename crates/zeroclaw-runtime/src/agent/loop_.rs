@@ -282,10 +282,8 @@ pub(crate) fn filter_channel_builtin_tools(
     // operator-added auto_approve entries (e.g. shell) still require
     // explicit allowlisting via allowed_tools.
     if security.autonomy != AutonomyLevel::Full {
-        let safe_defaults: HashSet<&str> = zeroclaw_config::schema::default_auto_approve()
-            .iter()
-            .map(String::as_str)
-            .collect();
+        let defaults = zeroclaw_config::schema::default_auto_approve();
+        let safe_defaults: HashSet<&str> = defaults.iter().map(String::as_str).collect();
         tools_registry.retain(|t| {
             let name = t.name();
             if safe_defaults.contains(name) {
@@ -14221,7 +14219,7 @@ Let me check the result."#;
         // admitted by the policy itself.
         let policy = TestPolicy {
             allowed_tools: Some(vec!["shell".into()]),
-            autonomy: AutonomyLevel::Normal,
+            autonomy: AutonomyLevel::Supervised,
             ..TestPolicy::default()
         };
 
@@ -14287,7 +14285,7 @@ Let me check the result."#;
         let policy = TestPolicy {
             allowed_tools: Some(vec!["file_read".into()]),
             auto_approve: vec!["shell".into()],
-            autonomy: AutonomyLevel::Normal,
+            autonomy: AutonomyLevel::Supervised,
             ..TestPolicy::default()
         };
 
