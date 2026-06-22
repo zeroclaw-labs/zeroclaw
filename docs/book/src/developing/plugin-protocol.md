@@ -149,7 +149,7 @@ secret-exists: func(name: string) -> bool;
 ## Writing a plugin in Rust (`wit-bindgen`)
 
 See the [zeroclaw-plugins registry](https://github.com/zeroclaw-labs/zeroclaw-plugins)
-for complete, working examples (e.g. `wikipedia-summary` and `mastodon-post`).
+for a complete, working example (`mastodon-post`).
 Example plugins live in that repository, not the main tree, so the core stays
 lean and plugins can be fetched and installed on demand.
 
