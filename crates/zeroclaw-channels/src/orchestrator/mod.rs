@@ -4101,43 +4101,6 @@ async fn process_channel_message_body(
         msg
     };
 
-    // ── Media pipeline: enrich inbound message with media annotations ──
-    if ctx.media_pipeline.enabled && !msg.attachments.is_empty() {
-        let vision = ctx.model_provider.supports_vision();
-        let transcription_manager =
-            crate::transcription::TranscriptionManager::new(&ctx.transcription_config)
-                .ok()
-                .map(|m| {
-                    m.with_agent_transcription_provider(ctx.agent_transcription_provider.clone())
-                });
-        let pipeline = media_pipeline::MediaPipeline::new(
-            &ctx.media_pipeline,
-            transcription_manager.as_ref(),
-            vision,
-        );
-        msg.content = Box::pin(pipeline.process(&msg.content, &msg.attachments)).await;
-    }
-
-    // ── Link enricher: prepend URL summaries before agent sees the message ──
-    let le_config = &ctx.prompt_config.link_enricher;
-    if le_config.enabled {
-        let enricher_cfg = link_enricher::LinkEnricherConfig {
-            enabled: le_config.enabled,
-            max_links: le_config.max_links,
-            timeout_secs: le_config.timeout_secs,
-        };
-        let enriched = link_enricher::enrich_message(&msg.content, &enricher_cfg).await;
-        if enriched != msg.content {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"sender": msg.sender})),
-                "Link enricher: prepended URL summaries to message"
-            );
-            msg.content = enriched;
-        }
-    }
-
     let target_channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
 
     // Self-loop guard, two-layer.
@@ -4173,6 +4136,78 @@ async fn process_channel_message_body(
                 "dropping self-authored inbound message (self-loop guard, agent-loop fallback)"
             );
             return;
+        }
+    }
+
+    if resolve_channel_ack_reactions(&ctx, &msg)
+        && let Some(channel) = target_channel.clone()
+    {
+        let reply_target = msg.reply_target.clone();
+        let message_id = msg.id.clone();
+        let message_id_label = message_id.clone();
+        let agent_alias = Arc::clone(&ctx.agent_alias);
+        let sender = msg.sender.clone();
+        let channel_label = channel.name().to_string();
+        let span = ::zeroclaw_log::attribution_span!(&*channel);
+        zeroclaw_spawn::spawn!(
+            ::zeroclaw_log::scope!(
+                category: "channel",
+                agent_alias: agent_alias.as_str(),
+                channel: channel_label.as_str(),
+                sender: sender.as_str(),
+                message_id: message_id_label.as_str(),
+                => async move {
+                    if let Err(e) = channel
+                        .add_reaction(&reply_target, &message_id, "\u{1F440}")
+                        .await
+                    {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "Failed to add ack reaction"
+                        );
+                    }
+                }
+            )
+            .instrument(span)
+        );
+    }
+
+    // ── Media pipeline: enrich inbound message with media annotations ──
+    if ctx.media_pipeline.enabled && !msg.attachments.is_empty() {
+        let vision = ctx.model_provider.supports_vision();
+        let transcription_manager =
+            crate::transcription::TranscriptionManager::new(&ctx.transcription_config)
+                .ok()
+                .map(|m| {
+                    m.with_agent_transcription_provider(ctx.agent_transcription_provider.clone())
+                });
+        let pipeline = media_pipeline::MediaPipeline::new(
+            &ctx.media_pipeline,
+            transcription_manager.as_ref(),
+            vision,
+        );
+        msg.content = Box::pin(pipeline.process(&msg.content, &msg.attachments)).await;
+    }
+
+    // ── Link enricher: prepend URL summaries before agent sees the message ──
+    let le_config = &ctx.prompt_config.link_enricher;
+    if le_config.enabled {
+        let enricher_cfg = link_enricher::LinkEnricherConfig {
+            enabled: le_config.enabled,
+            max_links: le_config.max_links,
+            timeout_secs: le_config.timeout_secs,
+        };
+        let enriched = link_enricher::enrich_message(&msg.content, &enricher_cfg).await;
+        if enriched != msg.content {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"sender": msg.sender})),
+                "Link enricher: prepended URL summaries to message"
+            );
+            msg.content = enriched;
         }
     }
 
@@ -4712,21 +4747,6 @@ async fn process_channel_message_body(
     } else {
         None
     };
-
-    // React with 👀 to acknowledge the incoming message
-    if resolve_channel_ack_reactions(&ctx, &msg)
-        && let Some(channel) = target_channel.as_ref()
-        && let Err(e) = channel
-            .add_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
-            .await
-    {
-        ::zeroclaw_log::record!(
-            DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-            "Failed to add reaction"
-        );
-    }
 
     // Skip typing only for Partial mode — the draft message itself provides
     // visual feedback. MultiMessage and Off both keep typing active.
