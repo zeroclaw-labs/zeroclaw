@@ -1387,6 +1387,14 @@ pub fn all_tools_with_runtime(
                     let details = host.tool_plugin_details();
                     let count = details.len();
                     for (manifest, wasm_path) in details {
+                        // SSOT: `config` is the snapshot the whole tool set is
+                        // built from, identical to every other tool here. A
+                        // config reload tears down and rebuilds the daemon
+                        // iteration (rpc ConfigReload -> reload_tx), so the
+                        // agent and its tools are reconstructed from the new
+                        // Config; plugin config is never hot-swapped into a live
+                        // WasmTool. The owned map below is that fresh snapshot,
+                        // not a second source of truth.
                         let plugin_config = config
                             .plugins
                             .entry_config(&manifest.name)
