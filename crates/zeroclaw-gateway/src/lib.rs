@@ -143,6 +143,9 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_infra::session_backend::SessionBackend;
 use zeroclaw_memory::{self, Memory, MemoryCategory};
 use zeroclaw_providers::{self, ModelProvider};
+use zeroclaw_runtime::agent::loop_::{
+    eager_mcp_tool_allowed, mcp_tool_access_policy, register_eager_mcp_tool_if_allowed,
+};
 use zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy;
 use zeroclaw_runtime::cost::CostTracker;
 use zeroclaw_runtime::i18n;
@@ -827,7 +830,7 @@ pub async fn run_gateway(
         Some((risk_profile, security))
     });
 
-    let (mut tools_registry_raw, delegate_handle_gw) = match (&agent_alias_opt, agent_setup) {
+    let (tools_registry_raw, _delegate_handle_gw) = match (&agent_alias_opt, agent_setup) {
         (Some(agent_alias), Some((risk_profile, security))) => {
             let all_tools_result = tools::all_tools_with_runtime(
                 Arc::new(config.clone()),
@@ -877,7 +880,127 @@ pub async fn run_gateway(
                     ),
                 );
             }
-            (all_tools_result.tools, all_tools_result.delegate_handle)
+            let mut gw_tools = all_tools_result.tools;
+            let gw_delegate = all_tools_result.delegate_handle;
+            // ── MCP tools, scoped to this agent's `mcp_bundles` and gated by
+            // its tool policy (parity with the orchestrator + runtime paths;
+            // omission is not a grant). Wiring here, inside the resolved-agent
+            // arm, means a gateway with no resolved agent gets no MCP servers,
+            // and the previous unscoped/ungated global registration is gone.
+            let agent_mcp_servers = if config.mcp.enabled {
+                config.mcp_servers_for_agent(agent_alias)
+            } else {
+                Vec::new()
+            };
+            if !agent_mcp_servers.is_empty() {
+                use ::zeroclaw_log::Instrument;
+                let mcp_policy = mcp_tool_access_policy(&security, None);
+                let mcp_model_provider = config
+                    .agents
+                    .get(agent_alias)
+                    .map(|a| a.model_provider.as_str().to_string())
+                    .unwrap_or_default();
+                let mcp_model = config
+                    .model_provider_for_agent(agent_alias)
+                    .and_then(|p| p.model.clone())
+                    .unwrap_or_default();
+                let attribution_span = ::zeroclaw_log::attribution_span!(
+                    &zeroclaw_runtime::agent::AgentAttribution(agent_alias)
+                );
+                ::zeroclaw_log::scope!(
+                    model_provider: mcp_model_provider,
+                    model: mcp_model,
+                    =>
+                    async {
+                        match tools::McpRegistry::connect_all(&agent_mcp_servers).await {
+                            Ok(registry) => {
+                                let registry = std::sync::Arc::new(registry);
+                                if config.mcp.deferred_loading {
+                                    let deferred_set = tools::DeferredMcpToolSet::from_registry(
+                                        std::sync::Arc::clone(&registry),
+                                    )
+                                    .await;
+                                    ::zeroclaw_log::record!(
+                                        INFO,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        ),
+                                        &format!(
+                                            "Gateway MCP deferred: {} tool stub(s) from {} server(s)",
+                                            deferred_set.len(),
+                                            registry.server_count()
+                                        )
+                                    );
+                                    let activated = std::sync::Arc::new(std::sync::Mutex::new(
+                                        tools::ActivatedToolSet::new(),
+                                    ));
+                                    let mut tool_search =
+                                        tools::ToolSearchTool::new(deferred_set, activated);
+                                    if let Some(policy) = mcp_policy {
+                                        tool_search = tool_search.with_access_policy(policy);
+                                    }
+                                    gw_tools.push(Box::new(tool_search));
+                                } else {
+                                    let names = registry.tool_names();
+                                    let mut registered = 0usize;
+                                    let mut skipped = 0usize;
+                                    for name in names {
+                                        if !eager_mcp_tool_allowed(&name, mcp_policy.as_ref()) {
+                                            skipped += 1;
+                                            continue;
+                                        }
+                                        if let Some(def) = registry.get_tool_def(&name).await {
+                                            let wrapper: std::sync::Arc<dyn tools::Tool> =
+                                                std::sync::Arc::new(tools::McpToolWrapper::new(
+                                                    name,
+                                                    def,
+                                                    std::sync::Arc::clone(&registry),
+                                                ));
+                                            if register_eager_mcp_tool_if_allowed(
+                                                wrapper,
+                                                &mut gw_tools,
+                                                gw_delegate.as_ref(),
+                                                mcp_policy.as_ref(),
+                                            ) {
+                                                registered += 1;
+                                            }
+                                        }
+                                    }
+                                    ::zeroclaw_log::record!(
+                                        INFO,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_attrs(::serde_json::json!({"skipped": skipped})),
+                                        &format!(
+                                            "Gateway MCP: {} tool(s) registered from {} server(s)",
+                                            registered,
+                                            registry.server_count()
+                                        )
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                ::zeroclaw_log::record!(
+                                    ERROR,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                    "Gateway MCP registry failed to initialize"
+                                );
+                            }
+                        }
+                    }
+                )
+                .instrument(attribution_span)
+                .await;
+            }
+            (gw_tools, gw_delegate)
         }
         (Some(_), None) => {
             // Agent existed but its config failed to resolve. Warned
@@ -896,80 +1019,6 @@ pub async fn run_gateway(
             (Vec::new(), None)
         }
     };
-
-    // ── Wire MCP tools into the gateway tool registry (non-fatal) ───
-    // Without this, the `/api/tools` endpoint misses MCP tools.
-    if config.mcp.enabled && !config.mcp.servers.is_empty() {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            &format!(
-                "Gateway: initializing MCP client — {} server(s) configured",
-                config.mcp.servers.len()
-            )
-        );
-        match tools::McpRegistry::connect_all(&config.mcp.servers).await {
-            Ok(registry) => {
-                let registry = std::sync::Arc::new(registry);
-                if config.mcp.deferred_loading {
-                    let deferred_set =
-                        tools::DeferredMcpToolSet::from_registry(std::sync::Arc::clone(&registry))
-                            .await;
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                        &format!(
-                            "Gateway MCP deferred: {} tool stub(s) from {} server(s)",
-                            deferred_set.len(),
-                            registry.server_count()
-                        )
-                    );
-                    let activated =
-                        std::sync::Arc::new(std::sync::Mutex::new(tools::ActivatedToolSet::new()));
-                    tools_registry_raw.push(Box::new(tools::ToolSearchTool::new(
-                        deferred_set,
-                        activated,
-                    )));
-                } else {
-                    let names = registry.tool_names();
-                    let mut registered = 0usize;
-                    for name in names {
-                        if let Some(def) = registry.get_tool_def(&name).await {
-                            let wrapper: std::sync::Arc<dyn tools::Tool> =
-                                std::sync::Arc::new(tools::McpToolWrapper::new(
-                                    name,
-                                    def,
-                                    std::sync::Arc::clone(&registry),
-                                ));
-                            if let Some(ref handle) = delegate_handle_gw {
-                                handle.write().push(std::sync::Arc::clone(&wrapper));
-                            }
-                            tools_registry_raw.push(Box::new(tools::ArcToolRef(wrapper)));
-                            registered += 1;
-                        }
-                    }
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                        &format!(
-                            "Gateway MCP: {} tool(s) registered from {} server(s)",
-                            registered,
-                            registry.server_count()
-                        )
-                    );
-                }
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                    "MCP registry failed to initialize"
-                );
-            }
-        }
-    }
 
     let tools_registry: Arc<Vec<ToolSpec>> =
         Arc::new(tools_registry_raw.iter().map(|t| t.spec()).collect());
@@ -4172,6 +4221,69 @@ mod tests {
     fn generate_test_secret() -> String {
         let bytes: [u8; 32] = rand::random();
         hex::encode(bytes)
+    }
+
+    struct NamedMcpMockTool(&'static str);
+    zeroclaw_api::mock_tool_attribution!(NamedMcpMockTool);
+    #[async_trait]
+    impl tools::Tool for NamedMcpMockTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "mcp mock"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<tools::ToolResult> {
+            Ok(tools::ToolResult {
+                success: true,
+                output: String::new(),
+                error: None,
+            })
+        }
+    }
+
+    /// Gateway parity with the channel path: the gateway now scopes MCP servers
+    /// by `mcp_bundles` and gates registration through the same
+    /// `register_eager_mcp_tool_if_allowed` helper, so an `excluded_tools`-denied
+    /// MCP tool must not be registered while a non-denied one is auto-admitted.
+    /// Pins the fifth-site fix from PR #8120 against silent regression.
+    #[test]
+    fn gateway_excluded_tools_drops_denied_mcp_tool() {
+        let policy = SecurityPolicy {
+            excluded_tools: Some(vec!["aa_mcp__find_items".to_string()]),
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        };
+        let mcp_policy = mcp_tool_access_policy(&policy, None);
+        let mut gw_tools: Vec<Box<dyn tools::Tool>> = Vec::new();
+        let denied: std::sync::Arc<dyn tools::Tool> =
+            std::sync::Arc::new(NamedMcpMockTool("aa_mcp__find_items"));
+        let allowed: std::sync::Arc<dyn tools::Tool> =
+            std::sync::Arc::new(NamedMcpMockTool("aa_mcp__find_npcs"));
+        let registered_denied =
+            register_eager_mcp_tool_if_allowed(denied, &mut gw_tools, None, mcp_policy.as_ref());
+        let registered_allowed =
+            register_eager_mcp_tool_if_allowed(allowed, &mut gw_tools, None, mcp_policy.as_ref());
+        assert!(
+            !registered_denied,
+            "gateway must not register an `excluded_tools`-denied MCP tool"
+        );
+        assert!(
+            registered_allowed,
+            "gateway must register a non-denied MCP tool (allowlist auto-admit)"
+        );
+        let names: Vec<&str> = gw_tools.iter().map(|t| t.name()).collect();
+        assert!(
+            !names.contains(&"aa_mcp__find_items"),
+            "denied MCP tool leaked into the gateway registry; got {names:?}"
+        );
+        assert!(
+            names.contains(&"aa_mcp__find_npcs"),
+            "allowed MCP tool missing from the gateway registry; got {names:?}"
+        );
     }
 
     #[test]
