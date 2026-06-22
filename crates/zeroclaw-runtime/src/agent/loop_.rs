@@ -2331,50 +2331,52 @@ pub async fn run(
                                         crate::agent::history_trim::breadcrumb(),
                                     );
                                     history = trimmed;
+                                    {
+                                        let __zc_trim_span = ::zeroclaw_log::info_span!(
+                                            target: "zeroclaw_log_internal_scope",
+                                            "zeroclaw_scope",
+                                            model = %model_name,
+                                            model_provider = %provider_name,
+                                        );
+                                        let _zc_trim_guard = __zc_trim_span.entered();
+                                        ::zeroclaw_log::record!(
+                                            INFO,
+                                            ::zeroclaw_log::Event::new(
+                                                module_path!(),
+                                                ::zeroclaw_log::Action::Retry
+                                            )
+                                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                                            .with_attrs(::serde_json::json!({
+                                                "dropped_messages": result.dropped_messages,
+                                                "dropped_turns": result.dropped_turns,
+                                                "kept_turns": result.kept_turns,
+                                            })),
+                                            "Context recovered via whole-turn trim, retrying turn"
+                                        );
+                                    }
+                                    continue;
+                                }
+                                history = result.history;
+                                {
                                     let __zc_trim_span = ::zeroclaw_log::info_span!(
                                         target: "zeroclaw_log_internal_scope",
                                         "zeroclaw_scope",
                                         model = %model_name,
                                         model_provider = %provider_name,
                                     );
-                                    let __zc_trim_guard = __zc_trim_span.entered();
+                                    let _zc_trim_guard = __zc_trim_span.entered();
                                     ::zeroclaw_log::record!(
-                                        INFO,
+                                        WARN,
                                         ::zeroclaw_log::Event::new(
                                             module_path!(),
-                                            ::zeroclaw_log::Action::Retry
+                                            ::zeroclaw_log::Action::Fail
                                         )
                                         .with_category(::zeroclaw_log::EventCategory::Agent)
-                                        .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                                        .with_attrs(::serde_json::json!({
-                                            "dropped_messages": result.dropped_messages,
-                                            "dropped_turns": result.dropped_turns,
-                                            "kept_turns": result.kept_turns,
-                                        })),
-                                        "Context recovered via whole-turn trim, retrying turn"
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                                        "Context overflow but only one turn remains; cannot trim further"
                                     );
-                                    drop(__zc_trim_guard);
-                                    continue;
                                 }
-                                history = result.history;
-                                let __zc_trim_span = ::zeroclaw_log::info_span!(
-                                    target: "zeroclaw_log_internal_scope",
-                                    "zeroclaw_scope",
-                                    model = %model_name,
-                                    model_provider = %provider_name,
-                                );
-                                let __zc_trim_guard = __zc_trim_span.entered();
-                                ::zeroclaw_log::record!(
-                                    WARN,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Fail
-                                    )
-                                    .with_category(::zeroclaw_log::EventCategory::Agent)
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                                    "Context overflow but only one turn remains; cannot trim further"
-                                );
-                                drop(__zc_trim_guard);
                             }
 
                             eprintln!("\nError: {e}\n");
@@ -11814,7 +11816,108 @@ Let me check the result."#;
         assert_eq!(result, "ok");
     }
 
-    // ── Skill review fork cost-accounting tests ──
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn trim_record_carries_model_attribution() {
+        use super::{ToolLoop, run_tool_call_loop};
+        use crate::observability::noop::NoopObserver;
+
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let model_provider = ScriptedModelProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            }]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+        let observer = NoopObserver;
+
+        let big = "x".repeat(4000);
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("turn1 {big}")),
+            ChatMessage::assistant("a1"),
+            ChatMessage::user(format!("turn2 {big}")),
+            ChatMessage::assistant("a2"),
+            ChatMessage::user("turn3 short"),
+        ];
+
+        let _ = run_tool_call_loop(ToolLoop {
+            model_provider: &model_provider,
+            history: &mut history,
+            tools_registry: &[],
+            observer: &observer,
+            provider_name: "anthropic.personal",
+            model: "claude-opus-4-8",
+            temperature: Some(0.0),
+            silent: true,
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+            max_tool_iterations: 1,
+            cancellation_token: None,
+            on_delta: None,
+            hooks: None,
+            excluded_tools: &[],
+            dedup_exempt_tools: &[],
+            activated_tools: None,
+            model_switch_callback: None,
+            pacing: &zeroclaw_config::schema::PacingConfig::default(),
+            strict_tool_parsing: false,
+            parallel_tools: false,
+            max_tool_result_chars: 0,
+            context_token_budget: 50,
+            shared_budget: None,
+            channel: None,
+            receipt_generator: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            knobs: &LoopKnobs::default(),
+            image_cache: None,
+            ingress: IngressContext::internal(),
+        })
+        .await
+        .expect("loop should succeed");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut trim_event = None;
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|m| m.starts_with("History trimmed:"))
+                    {
+                        trim_event = Some(value);
+                        break;
+                    }
+                }
+                Ok(Err(_)) => break,
+                Err(_) => continue,
+            }
+        }
+
+        let value = trim_event.expect("trim record must be emitted when history exceeds budget");
+        assert_eq!(
+            value["zeroclaw"]["model"], "claude-opus-4-8",
+            "trim record must carry model attribution, got: {value}"
+        );
+        assert_eq!(
+            value["zeroclaw"]["model_provider"], "anthropic.personal",
+            "trim record must carry model_provider attribution, got: {value}"
+        );
+    }
     //
     // The post-turn skill-review fork (`crate::skills::review::maybe_run_skill_review`)
     // runs AFTER the parent turn's `TOOL_LOOP_COST_TRACKING_CONTEXT.scope(...)`
