@@ -224,6 +224,7 @@ keyactions! {
         DetailWidenDown  [Chord::shift(KeyCode::Down)] => "widen detail down",
         BeginSearch      [Chord::char('/')] => "search",
         CopyDetail       [Chord::char('c')] => "copy detail",
+        RenameAgent      [Chord::char('e')] => "rename agent",
         KillSession      [Chord::char('X')] => "kill session",
         Refresh          [Chord::char('r')] => "refresh",
         JumpStart        [Chord::char('g'), Chord::key(KeyCode::Home)] => "jump to start",

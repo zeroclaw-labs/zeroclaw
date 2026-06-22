@@ -30,6 +30,23 @@ pub(crate) enum DashboardMouseAction {
     OpenAgentConfig(String),
 }
 
+struct AgentRenameState {
+    from: String,
+    buf: String,
+}
+
+#[derive(Clone, Copy)]
+enum DashboardMessageLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+struct DashboardMessage {
+    text: String,
+    level: DashboardMessageLevel,
+}
+
 // ── Tab enum ─────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -124,6 +141,8 @@ pub(crate) struct Dashboard {
     search_buf: String,
     search_query: String,
     search_query_saved: String, // saved on search entry for Esc restore
+    agent_rename: Option<AgentRenameState>,
+    agent_rename_message: Option<DashboardMessage>,
     // Layout tracking for mouse
     tab_area: Rect,
     list_area: Rect,
@@ -170,6 +189,8 @@ impl Dashboard {
             search_buf: String::new(),
             search_query: String::new(),
             search_query_saved: String::new(),
+            agent_rename: None,
+            agent_rename_message: None,
             tab_area: Rect::default(),
             list_area: Rect::default(),
             overview_agents_area: Rect::default(),
@@ -391,11 +412,19 @@ impl Dashboard {
             .map(|s| s.server_version.as_str())
             .unwrap_or("?");
         let active = self.status.as_ref().map(|s| s.active_sessions).unwrap_or(0);
-        let help: String = if self.search_active {
+        let help: String = if self.search_active || self.agent_rename.is_some() {
             format!(
                 "Enter:{apply}  Esc:{cancel}",
-                apply = crate::i18n::t("zc-dashboard-search-action-apply"),
-                cancel = crate::i18n::t("zc-dashboard-search-action-cancel"),
+                apply = if self.agent_rename.is_some() {
+                    crate::i18n::t("zc-dashboard-agent-rename-action-apply")
+                } else {
+                    crate::i18n::t("zc-dashboard-search-action-apply")
+                },
+                cancel = if self.agent_rename.is_some() {
+                    crate::i18n::t("zc-dashboard-agent-rename-action-cancel")
+                } else {
+                    crate::i18n::t("zc-dashboard-search-action-cancel")
+                },
             )
         } else {
             String::new()
@@ -404,7 +433,35 @@ impl Dashboard {
         // Process stats from health
         let process_info = self.process_stats_line();
 
-        let line = if self.search_active {
+        let line = if let Some(rename) = &self.agent_rename {
+            let mut spans = vec![
+                Span::styled(
+                    format!(" v{version} sessions:{active}{process_info} "),
+                    theme::dim_style(),
+                ),
+                Span::styled(
+                    crate::i18n::t("zc-dashboard-agent-rename-prefix"),
+                    theme::accent_style(),
+                ),
+                Span::styled(" ", theme::dim_style()),
+                Span::styled(&rename.from, theme::body_style()),
+                Span::styled(" -> ", theme::dim_style()),
+                Span::styled(&rename.buf, theme::input_style()),
+                Span::styled("\u{2588} ", theme::accent_style()),
+                Span::styled(help, theme::dim_style()),
+            ];
+            if let Some(message) = &self.agent_rename_message {
+                let style = match message.level {
+                    DashboardMessageLevel::Info => theme::accent_style(),
+                    DashboardMessageLevel::Warn | DashboardMessageLevel::Error => {
+                        theme::warn_style()
+                    }
+                };
+                spans.push(Span::styled("  ", theme::dim_style()));
+                spans.push(Span::styled(&message.text, style));
+            }
+            Line::from(spans)
+        } else if self.search_active {
             Line::from(vec![
                 Span::styled(
                     format!(" v{version} sessions:{active}{process_info} "),
@@ -425,6 +482,18 @@ impl Dashboard {
                     theme::dim_style(),
                 ));
                 spans.push(Span::styled(&self.search_query, theme::accent_style()));
+                spans.push(Span::styled(" ", theme::dim_style()));
+            }
+            if self.tab == Tab::Agents
+                && let Some(message) = &self.agent_rename_message
+            {
+                let style = match message.level {
+                    DashboardMessageLevel::Info => theme::accent_style(),
+                    DashboardMessageLevel::Warn | DashboardMessageLevel::Error => {
+                        theme::warn_style()
+                    }
+                };
+                spans.push(Span::styled(&message.text, style));
                 spans.push(Span::styled(" ", theme::dim_style()));
             }
             spans.push(Span::styled(help, theme::dim_style()));
@@ -1653,6 +1722,9 @@ impl Dashboard {
     // ── Key handling ─────────────────────────────────────────────
 
     pub(crate) async fn handle_key(&mut self, key: KeyEvent) -> bool {
+        if self.agent_rename.is_some() {
+            return self.handle_agent_rename_key(key).await;
+        }
         if self.search_active {
             return self.handle_search_key(key);
         }
@@ -1744,6 +1816,9 @@ impl Dashboard {
                 self.search_active = true;
                 self.search_buf = self.search_query.clone();
             }
+            Some(DashboardTabAction::RenameAgent) if self.tab == Tab::Agents => {
+                self.begin_agent_rename();
+            }
             Some(DashboardTabAction::CopyDetail) => {
                 self.search_query.clear();
                 self.search_buf.clear();
@@ -1775,13 +1850,13 @@ impl Dashboard {
         match DashboardTabAction::from_chord(&key) {
             Some(DashboardTabAction::NextTab) => self.next_tab(),
             Some(DashboardTabAction::PrevTab) => self.prev_tab(),
-            Some(DashboardTabAction::Tab1) => self.tab = Tab::Overview,
-            Some(DashboardTabAction::Tab2) => self.tab = Tab::Sessions,
-            Some(DashboardTabAction::Tab3) => self.tab = Tab::Agents,
-            Some(DashboardTabAction::Tab4) => self.tab = Tab::Memories,
-            Some(DashboardTabAction::Tab5) => self.tab = Tab::Health,
-            Some(DashboardTabAction::Tab6) => self.tab = Tab::Cost,
-            Some(DashboardTabAction::Tab7) => self.tab = Tab::Cron,
+            Some(DashboardTabAction::Tab1) => self.set_tab(Tab::Overview),
+            Some(DashboardTabAction::Tab2) => self.set_tab(Tab::Sessions),
+            Some(DashboardTabAction::Tab3) => self.set_tab(Tab::Agents),
+            Some(DashboardTabAction::Tab4) => self.set_tab(Tab::Memories),
+            Some(DashboardTabAction::Tab5) => self.set_tab(Tab::Health),
+            Some(DashboardTabAction::Tab6) => self.set_tab(Tab::Cost),
+            Some(DashboardTabAction::Tab7) => self.set_tab(Tab::Cron),
             Some(DashboardTabAction::Down) => self.move_list_down(),
             Some(DashboardTabAction::Up) => self.move_list_up(),
             Some(DashboardTabAction::OpenDetail) if self.has_detail_pane() => {
@@ -1794,6 +1869,9 @@ impl Dashboard {
                 self.search_query_saved = self.search_query.clone();
                 self.search_active = true;
                 self.search_buf = self.search_query.clone();
+            }
+            Some(DashboardTabAction::RenameAgent) if self.tab == Tab::Agents => {
+                self.begin_agent_rename();
             }
             Some(DashboardTabAction::CopyDetail) => {
                 self.search_query.clear();
@@ -1835,6 +1913,135 @@ impl Dashboard {
         }
 
         false
+    }
+
+    fn begin_agent_rename(&mut self) {
+        let Some(idx) = self.selected_agent_index() else {
+            self.agent_rename_message = Some(DashboardMessage {
+                text: crate::i18n::t("zc-dashboard-no-agent"),
+                level: DashboardMessageLevel::Warn,
+            });
+            return;
+        };
+        let from = self.agents[idx].alias.clone();
+        self.agent_rename = Some(AgentRenameState {
+            from: from.clone(),
+            buf: from,
+        });
+        self.agent_rename_message = None;
+    }
+
+    async fn handle_agent_rename_key(&mut self, key: KeyEvent) -> bool {
+        use crate::keymap::ConfigEditorAction;
+        let action = ConfigEditorAction::from_chord(&key);
+        match action {
+            Some(ConfigEditorAction::Cancel) => {
+                self.agent_rename = None;
+                self.agent_rename_message = None;
+            }
+            Some(ConfigEditorAction::Confirm) => {
+                self.apply_agent_rename().await;
+            }
+            Some(ConfigEditorAction::Backspace) => {
+                if let Some(rename) = self.agent_rename.as_mut() {
+                    rename.buf.pop();
+                }
+            }
+            _ => {
+                if let KeyCode::Char(c) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && let Some(rename) = self.agent_rename.as_mut()
+                {
+                    rename.buf.push(c);
+                }
+            }
+        }
+        false
+    }
+
+    async fn apply_agent_rename(&mut self) {
+        let Some(rename) = &self.agent_rename else {
+            return;
+        };
+        let from = rename.from.clone();
+        let to = rename.buf.trim().to_string();
+        if to.is_empty() {
+            self.agent_rename_message = Some(DashboardMessage {
+                text: crate::i18n::t("zc-dashboard-agent-rename-empty"),
+                level: DashboardMessageLevel::Error,
+            });
+            return;
+        }
+        if from == to {
+            self.agent_rename = None;
+            self.agent_rename_message = Some(DashboardMessage {
+                text: crate::i18n::t("zc-dashboard-agent-rename-unchanged"),
+                level: DashboardMessageLevel::Info,
+            });
+            return;
+        }
+
+        match self.rpc.config_map_key_rename("agents", &from, &to).await {
+            Ok(result) => {
+                self.agent_rename = None;
+                if let Ok(a) = self.rpc.agents_status().await {
+                    self.agents = a.agents;
+                    if !self.select_agent_alias(&to) {
+                        self.search_query.clear();
+                        self.search_buf.clear();
+                        self.select_agent_alias(&to);
+                    }
+                }
+                self.last_poll = None;
+                if result.renamed {
+                    if result.warnings.is_empty() {
+                        self.agent_rename_message = Some(DashboardMessage {
+                            text: crate::i18n::t_args(
+                                "zc-dashboard-agent-rename-success",
+                                &[("from", &from), ("to", &to)],
+                            ),
+                            level: DashboardMessageLevel::Info,
+                        });
+                    } else {
+                        let warnings = result.warnings.join("; ");
+                        self.agent_rename_message = Some(DashboardMessage {
+                            text: crate::i18n::t_args(
+                                "zc-dashboard-agent-rename-success-warnings",
+                                &[("from", &from), ("to", &to), ("warnings", &warnings)],
+                            ),
+                            level: DashboardMessageLevel::Warn,
+                        });
+                    }
+                } else {
+                    self.agent_rename_message = Some(DashboardMessage {
+                        text: crate::i18n::t("zc-dashboard-agent-rename-unchanged"),
+                        level: DashboardMessageLevel::Info,
+                    });
+                }
+            }
+            Err(e) => {
+                self.agent_rename_message = Some(DashboardMessage {
+                    text: crate::i18n::t_args(
+                        "zc-dashboard-agent-rename-failed",
+                        &[("error", &e.to_string())],
+                    ),
+                    level: DashboardMessageLevel::Error,
+                });
+            }
+        }
+    }
+
+    fn select_agent_alias(&mut self, alias: &str) -> bool {
+        let Some(pos) = self
+            .filtered_agent_indices()
+            .iter()
+            .position(|&idx| self.agents[idx].alias == alias)
+        else {
+            return false;
+        };
+        self.agent_state.select(Some(pos));
+        self.detail_scroll = 0;
+        true
     }
 
     /// Called when the list selection changes while the detail pane is open.
@@ -1909,7 +2116,7 @@ impl Dashboard {
                     .collect();
                 let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
                 if let Some(idx) = mouse::tab_click_index(col, row, self.tab_area, &label_refs, 3) {
-                    self.tab = TABS[idx];
+                    self.set_tab(TABS[idx]);
                     return None;
                 }
 
@@ -1960,13 +2167,19 @@ impl Dashboard {
 
     fn next_tab(&mut self) {
         let idx = TABS.iter().position(|t| *t == self.tab).unwrap_or(0);
-        self.tab = TABS[(idx + 1) % TABS.len()];
-        self.on_tab_change();
+        self.set_tab(TABS[(idx + 1) % TABS.len()]);
     }
 
     fn prev_tab(&mut self) {
         let idx = TABS.iter().position(|t| *t == self.tab).unwrap_or(0);
-        self.tab = TABS[(idx + TABS.len() - 1) % TABS.len()];
+        self.set_tab(TABS[(idx + TABS.len() - 1) % TABS.len()]);
+    }
+
+    fn set_tab(&mut self, tab: Tab) {
+        if self.tab == tab {
+            return;
+        }
+        self.tab = tab;
         self.on_tab_change();
     }
 
@@ -1975,6 +2188,8 @@ impl Dashboard {
         self.detail_scroll = 0;
         self.health_scroll = 0;
         self.cost_scroll = 0;
+        self.agent_rename = None;
+        self.agent_rename_message = None;
         // Force immediate data fetch for new tab
         self.last_poll = None;
     }
@@ -2046,9 +2261,9 @@ impl Dashboard {
         }
     }
 
-    /// Whether the pane is in a text-input mode (search bar active).
+    /// Whether the pane is in a text-input mode (search bar or rename prompt active).
     pub(crate) fn wants_text_input(&self) -> bool {
-        self.search_active
+        self.search_active || self.agent_rename.is_some()
     }
 
     /// Route a bracketed-paste payload into the search buffer when the
@@ -2057,6 +2272,10 @@ impl Dashboard {
     /// client-side tabs; server-side tabs (sessions, memories) still
     /// wait for Enter. Ignored when search isn't active.
     pub(crate) fn handle_paste(&mut self, text: &str) {
+        if let Some(rename) = self.agent_rename.as_mut() {
+            rename.buf.push_str(text);
+            return;
+        }
         if !self.search_active {
             return;
         }
@@ -2080,6 +2299,13 @@ impl crate::widgets::HelpContext for Dashboard {
             ]));
         }
 
+        if self.agent_rename.is_some() {
+            return HelpNode::entries(entries_for([
+                crate::keymap::SearchBoxAction::Accept,
+                crate::keymap::SearchBoxAction::Cancel,
+            ]));
+        }
+
         // Global tab-switching always available.
         let tab_nav = entries_for([D::NextTab, D::PrevTab, D::Tab1, D::Refresh]);
 
@@ -2097,6 +2323,8 @@ impl crate::widgets::HelpContext for Dashboard {
             ];
             if self.tab == Tab::Sessions {
                 detail.push(D::KillSession);
+            } else if self.tab == Tab::Agents {
+                detail.push(D::RenameAgent);
             }
             return HelpNode::entries(entries_for(detail));
         }
@@ -2109,14 +2337,18 @@ impl crate::widgets::HelpContext for Dashboard {
             }
             Tab::Sessions | Tab::Agents | Tab::Memories | Tab::Cron => {
                 entries.push(E::spacer());
-                entries.extend(entries_for([
+                let mut tab_actions = vec![
                     D::Up,
                     D::Down,
                     D::JumpEnd,
                     D::JumpStart,
                     D::OpenDetail,
                     D::BeginSearch,
-                ]));
+                ];
+                if self.tab == Tab::Agents {
+                    tab_actions.push(D::RenameAgent);
+                }
+                entries.extend(entries_for(tab_actions));
             }
         }
         HelpNode::entries(entries)
