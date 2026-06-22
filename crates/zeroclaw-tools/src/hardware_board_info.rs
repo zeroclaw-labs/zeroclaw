@@ -255,4 +255,14 @@ mod tests {
         assert!(result.output.contains("custom-board"));
         assert!(result.output.contains("No static info available"));
     }
+
+    #[cfg(feature = "probe")]
+    #[tokio::test]
+    async fn execute_nucleo_probe_failure_falls_back_to_static_info() {
+        let tool = HardwareBoardInfoTool::new(vec!["nucleo-f401re".into()]);
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains("probe-rs attach failed"));
+        assert!(result.output.contains("STM32F401RET6"));
+    }
 }
