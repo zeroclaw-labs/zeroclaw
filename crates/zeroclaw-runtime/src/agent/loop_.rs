@@ -414,6 +414,102 @@ fn compute_excluded_mcp_tools(
         .collect()
 }
 
+fn native_tool_specs_present_for_turn(
+    model_provider: &dyn ModelProvider,
+    tools_registry: &[Box<dyn Tool>],
+    excluded_tools: &[String],
+    activated_tools: Option<&Arc<Mutex<crate::tools::ActivatedToolSet>>>,
+) -> Result<bool> {
+    if !model_provider.supports_native_tools() {
+        return Ok(false);
+    }
+
+    let iteration_tool_specs = super::turn::build_iteration_tool_specs(
+        model_provider,
+        tools_registry,
+        excluded_tools,
+        activated_tools,
+    )?;
+    Ok(!iteration_tool_specs.tool_specs.is_empty())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_system_prompt_for_turn(
+    agent_workspace: &std::path::Path,
+    model_name: &str,
+    tool_descs: &[(&str, &str)],
+    deferred_section: &str,
+    skills: &[crate::skills::Skill],
+    identity_config: Option<&zeroclaw_config::schema::IdentityConfig>,
+    bootstrap_max_chars: Option<usize>,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    model_provider: &dyn ModelProvider,
+    tools_registry: &[Box<dyn Tool>],
+    excluded_tools: &[String],
+    activated_tools: Option<&Arc<Mutex<crate::tools::ActivatedToolSet>>>,
+    strict_tool_parsing: bool,
+    skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
+    compact_context: bool,
+    max_system_prompt_chars: usize,
+    inject_memory: bool,
+    show_tool_calls: bool,
+    thinking_prefix: Option<&str>,
+) -> Result<String> {
+    let native_tools = model_provider.supports_native_tools();
+    let native_tool_specs_present = native_tool_specs_present_for_turn(
+        model_provider,
+        tools_registry,
+        excluded_tools,
+        activated_tools,
+    )?;
+    let excluded_tool_names: HashSet<&str> = excluded_tools.iter().map(String::as_str).collect();
+    let effective_tool_names: HashSet<&str> = tools_registry
+        .iter()
+        .map(|tool| tool.name())
+        .filter(|name| !excluded_tool_names.contains(*name))
+        .collect();
+    let mut turn_tool_descs = tool_descs.to_vec();
+    turn_tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
+    let mut turn_deferred_section = deferred_section.to_string();
+    let expose_text_tool_protocol = apply_text_tool_prompt_policy(
+        native_tools,
+        strict_tool_parsing,
+        &mut turn_tool_descs,
+        &mut turn_deferred_section,
+    );
+    let mut system_prompt = crate::agent::system_prompt::build_system_prompt_with_mode_and_autonomy(
+        agent_workspace,
+        model_name,
+        &turn_tool_descs,
+        skills,
+        identity_config,
+        bootstrap_max_chars,
+        Some(risk_profile),
+        native_tool_specs_present,
+        skills_prompt_mode,
+        compact_context,
+        max_system_prompt_chars,
+        inject_memory,
+        show_tool_calls,
+    );
+
+    if expose_text_tool_protocol {
+        system_prompt.push_str(&build_tool_instructions_for_names(
+            tools_registry,
+            &effective_tool_names,
+        ));
+    }
+    if !turn_deferred_section.is_empty() {
+        system_prompt.push('\n');
+        system_prompt.push_str(&turn_deferred_section);
+    }
+    if let Some(prefix) = thinking_prefix {
+        system_prompt = format!("{prefix}\n\n{system_prompt}");
+    }
+
+    Ok(system_prompt)
+}
+
 /// Build a `query_summary` field for memory observability events from a raw
 /// user query.
 ///
@@ -1525,41 +1621,34 @@ pub async fn run(
         } else {
             None
         };
-        let native_tools = model_provider.supports_native_tools();
-        let expose_text_tool_protocol = apply_text_tool_prompt_policy(
-            native_tools,
-            agent.resolved.strict_tool_parsing,
-            &mut tool_descs,
-            &mut deferred_section,
-        );
+        let prompt_excluded_tools = message
+            .as_deref()
+            .map(|msg| {
+                compute_excluded_mcp_tools(&tools_registry, &agent.resolved.tool_filter_groups, msg)
+            })
+            .unwrap_or_default();
         let agent_workspace = config.agent_workspace_dir(agent_alias);
-        let mut system_prompt =
-            crate::agent::system_prompt::build_system_prompt_with_mode_and_autonomy(
-                &agent_workspace,
-                &model_name,
-                &tool_descs,
-                &skills,
-                Some(&agent.identity),
-                bootstrap_max_chars,
-                Some(&risk_profile),
-                native_tools,
-                config.skills.prompt_injection_mode,
-                eff_compact_context,
-                eff_max_system_prompt_chars,
-                true,
-                config.channels.show_tool_calls,
-            );
-
-        // Append structured tool-use instructions with schemas (only for non-native model_providers)
-        if expose_text_tool_protocol {
-            system_prompt.push_str(&build_tool_instructions(&tools_registry));
-        }
-
-        // Append deferred MCP tool names so the LLM knows what is available
-        if !deferred_section.is_empty() {
-            system_prompt.push('\n');
-            system_prompt.push_str(&deferred_section);
-        }
+        let mut system_prompt = build_system_prompt_for_turn(
+            &agent_workspace,
+            &model_name,
+            &tool_descs,
+            &deferred_section,
+            &skills,
+            Some(&agent.identity),
+            bootstrap_max_chars,
+            &risk_profile,
+            model_provider.as_ref(),
+            &tools_registry,
+            &prompt_excluded_tools,
+            activated_handle.as_ref(),
+            agent.resolved.strict_tool_parsing,
+            config.skills.prompt_injection_mode,
+            eff_compact_context,
+            eff_max_system_prompt_chars,
+            true,
+            config.channels.show_tool_calls,
+            None,
+        )?;
 
         // ── Approval manager (supervised mode) ───────────────────────
         let approval_manager = if interactive {
@@ -1640,10 +1729,35 @@ pub async fn run(
                 )
             });
 
-            // Prepend thinking system prompt prefix when present.
-            if let Some(ref prefix) = thinking_params.system_prompt_prefix {
-                system_prompt = format!("{prefix}\n\n{system_prompt}");
-            }
+            // Compute per-turn excluded MCP tools from tool_filter_groups before
+            // building the turn prompt so tool availability matches the specs
+            // sent to the provider.
+            let excluded_tools = compute_excluded_mcp_tools(
+                &tools_registry,
+                &agent.resolved.tool_filter_groups,
+                &effective_msg,
+            );
+            system_prompt = build_system_prompt_for_turn(
+                &agent_workspace,
+                &model_name,
+                &tool_descs,
+                &deferred_section,
+                &skills,
+                Some(&agent.identity),
+                bootstrap_max_chars,
+                &risk_profile,
+                model_provider.as_ref(),
+                &tools_registry,
+                &excluded_tools,
+                activated_handle.as_ref(),
+                agent.resolved.strict_tool_parsing,
+                config.skills.prompt_injection_mode,
+                eff_compact_context,
+                eff_max_system_prompt_chars,
+                true,
+                config.channels.show_tool_calls,
+                thinking_params.system_prompt_prefix.as_deref(),
+            )?;
 
             let runtime_capability_names = tools_registry
                 .iter()
@@ -1730,16 +1844,34 @@ pub async fn run(
                 );
             }
 
-            // Compute per-turn excluded MCP tools from tool_filter_groups.
-            let excluded_tools = compute_excluded_mcp_tools(
-                &tools_registry,
-                &agent.resolved.tool_filter_groups,
-                &effective_msg,
-            );
-
             #[allow(unused_assignments)]
             let mut response = String::new();
             loop {
+                if let Some(sys_msg) = history.first_mut()
+                    && sys_msg.role == "system"
+                {
+                    sys_msg.content = build_system_prompt_for_turn(
+                        &agent_workspace,
+                        &model_name,
+                        &tool_descs,
+                        &deferred_section,
+                        &skills,
+                        Some(&agent.identity),
+                        bootstrap_max_chars,
+                        &risk_profile,
+                        model_provider.as_ref(),
+                        &tools_registry,
+                        &excluded_tools,
+                        activated_handle.as_ref(),
+                        agent.resolved.strict_tool_parsing,
+                        config.skills.prompt_injection_mode,
+                        eff_compact_context,
+                        eff_max_system_prompt_chars,
+                        true,
+                        config.channels.show_tool_calls,
+                        thinking_params.system_prompt_prefix.as_deref(),
+                    )?;
+                }
                 match zeroclaw_api::NATIVE_THINKING_OVERRIDE
                     .scope(
                         thinking_params.native_thinking,
@@ -2080,17 +2212,14 @@ pub async fn run(
                     )
                 });
 
-                // For non-Medium levels, temporarily patch the system prompt with prefix.
-                let turn_system_prompt;
-                if let Some(ref prefix) = thinking_params.system_prompt_prefix {
-                    turn_system_prompt = format!("{prefix}\n\n{system_prompt}");
-                    // Update the system message in history for this turn.
-                    if let Some(sys_msg) = history.first_mut()
-                        && sys_msg.role == "system"
-                    {
-                        sys_msg.content = turn_system_prompt.clone();
-                    }
-                }
+                // Compute per-turn excluded MCP tools from tool_filter_groups
+                // before the provider call; the system prompt is rebuilt from
+                // this same set immediately before each attempt.
+                let excluded_tools = compute_excluded_mcp_tools(
+                    &tools_registry,
+                    &agent.resolved.tool_filter_groups,
+                    &effective_input,
+                );
 
                 let runtime_capability_names = tools_registry
                     .iter()
@@ -2116,8 +2245,7 @@ pub async fn run(
                         eprintln!("\nError sending CLI response: {e}\n");
                     }
                     observer.record_event(&ObserverEvent::TurnComplete);
-                    if thinking_params.system_prompt_prefix.is_some()
-                        && let Some(sys_msg) = history.first_mut()
+                    if let Some(sys_msg) = history.first_mut()
                         && sys_msg.role == "system"
                     {
                         sys_msg.content.clone_from(&base_system_prompt);
@@ -2184,13 +2312,6 @@ pub async fn run(
 
                 history.push(ChatMessage::user(&enriched));
 
-                // Compute per-turn excluded MCP tools from tool_filter_groups.
-                let excluded_tools = compute_excluded_mcp_tools(
-                    &tools_registry,
-                    &agent.resolved.tool_filter_groups,
-                    &effective_input,
-                );
-
                 // Set up streaming channel so tool progress and response
                 // content are printed progressively instead of buffered.
                 let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
@@ -2231,6 +2352,31 @@ pub async fn run(
                 });
 
                 let response = loop {
+                    if let Some(sys_msg) = history.first_mut()
+                        && sys_msg.role == "system"
+                    {
+                        sys_msg.content = build_system_prompt_for_turn(
+                            &agent_workspace,
+                            &model_name,
+                            &tool_descs,
+                            &deferred_section,
+                            &skills,
+                            Some(&agent.identity),
+                            bootstrap_max_chars,
+                            &risk_profile,
+                            model_provider.as_ref(),
+                            &tools_registry,
+                            &excluded_tools,
+                            activated_handle.as_ref(),
+                            agent.resolved.strict_tool_parsing,
+                            config.skills.prompt_injection_mode,
+                            eff_compact_context,
+                            eff_max_system_prompt_chars,
+                            true,
+                            config.channels.show_tool_calls,
+                            thinking_params.system_prompt_prefix.as_deref(),
+                        )?;
+                    }
                     match zeroclaw_api::NATIVE_THINKING_OVERRIDE
                         .scope(
                             thinking_params.native_thinking,
@@ -2467,9 +2613,9 @@ pub async fn run(
                 // Hard cap as a safety net.
                 trim_history(&mut history, eff_max_history_messages);
 
-                // Restore base system prompt (remove per-turn thinking prefix).
-                if thinking_params.system_prompt_prefix.is_some()
-                    && let Some(sys_msg) = history.first_mut()
+                // Restore base system prompt after the per-turn tool framing
+                // and optional thinking prefix have been applied.
+                if let Some(sys_msg) = history.first_mut()
                     && sys_msg.role == "system"
                 {
                     sys_msg.content.clone_from(&base_system_prompt);
@@ -2988,6 +3134,12 @@ pub async fn process_message(
             None
         };
         let native_tools = model_provider.supports_native_tools();
+        let native_tool_specs_present = native_tool_specs_present_for_turn(
+            model_provider.as_ref(),
+            &tools_registry,
+            &excluded_tools,
+            activated_handle_pm.as_ref(),
+        )?;
         let expose_text_tool_protocol = apply_text_tool_prompt_policy(
             native_tools,
             agent.resolved.strict_tool_parsing,
@@ -3004,7 +3156,7 @@ pub async fn process_message(
                 Some(&agent.identity),
                 bootstrap_max_chars,
                 Some(&risk_profile),
-                native_tools,
+                native_tool_specs_present,
                 config.skills.prompt_injection_mode,
                 eff_compact_context,
                 eff_max_system_prompt_chars,
@@ -11042,9 +11194,10 @@ Let me check the result."#;
         assert_eq!(history[1].content, "recent");
     }
 
-    /// When `build_system_prompt_with_mode` is called with `native_tools = true`,
-    /// the output must contain ZERO XML protocol artifacts and must not inject
-    /// the duplicate non-native tools summary.
+    /// When `build_system_prompt_with_mode` is called with
+    /// `native_tool_specs_present = true`, the output must contain ZERO XML
+    /// protocol artifacts and must not inject the duplicate non-native tools
+    /// summary.
     #[test]
     fn native_tools_system_prompt_contains_zero_xml() {
         use crate::agent::system_prompt::build_system_prompt_with_mode;
@@ -11062,7 +11215,7 @@ Let me check the result."#;
             &[],  // no skills
             None, // no identity config
             None, // no bootstrap_max_chars
-            true, // native_tools
+            true, // native_tool_specs_present
             zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             crate::security::AutonomyLevel::default(),
         );
@@ -11098,6 +11251,212 @@ Let me check the result."#;
             system_prompt.contains("## Your Task"),
             "Native prompt should contain task instructions"
         );
+    }
+
+    #[test]
+    fn native_tool_specs_prompt_allows_actions_without_text_tools() {
+        use crate::agent::system_prompt::build_system_prompt_with_mode;
+
+        let workspace = tempdir().unwrap();
+        let provider =
+            ScriptedModelProvider::from_text_responses(vec!["ok"]).with_native_tool_support();
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn crate::tools::Tool>> =
+            vec![Box::new(CountingTool::new("shell", invocations))];
+
+        let native_tool_specs_present =
+            super::native_tool_specs_present_for_turn(&provider, &tools_registry, &[], None)
+                .expect("native spec availability should be derivable");
+        assert!(native_tool_specs_present);
+
+        let system_prompt = build_system_prompt_with_mode(
+            workspace.path(),
+            "test-model",
+            &[],
+            &[],
+            None,
+            None,
+            native_tool_specs_present,
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            crate::security::AutonomyLevel::default(),
+        );
+
+        assert!(
+            !system_prompt.contains("No tools are available"),
+            "Native prompt with effective native specs must not deny tool availability"
+        );
+        assert!(
+            system_prompt.contains("Use tools when the request requires action"),
+            "Native prompt with effective native specs should authorize action tool use"
+        );
+    }
+
+    #[test]
+    fn native_capable_provider_with_zero_effective_tools_keeps_no_tools_boundary() {
+        use crate::agent::system_prompt::build_system_prompt_with_mode;
+
+        let provider =
+            ScriptedModelProvider::from_text_responses(vec!["ok"]).with_native_tool_support();
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn crate::tools::Tool>> =
+            vec![Box::new(CountingTool::new("shell", invocations))];
+        let excluded_tools = vec!["shell".to_string()];
+
+        let native_tool_specs_present = super::native_tool_specs_present_for_turn(
+            &provider,
+            &tools_registry,
+            &excluded_tools,
+            None,
+        )
+        .expect("native spec availability should be derivable");
+        assert!(!native_tool_specs_present);
+
+        let system_prompt = build_system_prompt_with_mode(
+            std::path::Path::new("/tmp"),
+            "test-model",
+            &[],
+            &[],
+            None,
+            None,
+            native_tool_specs_present,
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            crate::security::AutonomyLevel::default(),
+        );
+
+        assert!(
+            system_prompt.contains("No tools are available for this turn"),
+            "Native-capable providers with zero effective specs must keep the no-tools boundary"
+        );
+    }
+
+    #[test]
+    fn native_tool_specs_present_signal_uses_effective_specs_not_provider_capability() {
+        let provider =
+            ScriptedModelProvider::from_text_responses(vec!["ok"]).with_native_tool_support();
+        assert!(zeroclaw_providers::ModelProvider::supports_native_tools(
+            &provider
+        ));
+
+        let no_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let native_tool_specs_present =
+            super::native_tool_specs_present_for_turn(&provider, &no_tools, &[], None)
+                .expect("native spec availability should be derivable");
+
+        assert!(
+            !native_tool_specs_present,
+            "Provider native-tool capability alone must not imply tools are available"
+        );
+    }
+
+    #[test]
+    fn interactive_turn_system_prompt_uses_effective_dynamic_mcp_specs() {
+        use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
+        use zeroclaw_config::schema::{
+            RiskProfileConfig, SkillsPromptInjectionMode, ToolFilterGroup, ToolFilterGroupMode,
+        };
+
+        let workspace = tempdir().unwrap();
+        let provider =
+            ScriptedModelProvider::from_text_responses(vec!["ok"]).with_native_tool_support();
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(CountingTool::new(
+            "mcp_browser_navigate",
+            invocations,
+        ))];
+        let groups = vec![ToolFilterGroup {
+            mode: ToolFilterGroupMode::Dynamic,
+            tools: vec!["mcp_browser_*".into()],
+            keywords: vec!["browse".into()],
+            filter_builtins: false,
+        }];
+        let tool_descs: Vec<(&str, &str)> = Vec::new();
+        let risk_profile = RiskProfileConfig::default();
+
+        // Interactive startup with no message used to save this as
+        // `base_system_prompt`, which advertises native tool availability.
+        let startup_prompt = super::build_system_prompt_for_turn(
+            workspace.path(),
+            "test-model",
+            &tool_descs,
+            "",
+            &[],
+            None,
+            None,
+            &risk_profile,
+            &provider,
+            &tools_registry,
+            &[],
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            false,
+            usize::MAX,
+            true,
+            false,
+            None,
+        )
+        .expect("startup prompt should build");
+        assert!(startup_prompt.contains(NATIVE_TOOLS_TASK_FRAMING));
+        assert!(!startup_prompt.contains(NO_TOOLS_TASK_FRAMING));
+
+        let excluded_tools =
+            super::compute_excluded_mcp_tools(&tools_registry, &groups, "read the local file");
+        assert_eq!(excluded_tools, vec!["mcp_browser_navigate".to_string()]);
+        let no_tools_turn_prompt = super::build_system_prompt_for_turn(
+            workspace.path(),
+            "test-model",
+            &tool_descs,
+            "",
+            &[],
+            None,
+            None,
+            &risk_profile,
+            &provider,
+            &tools_registry,
+            &excluded_tools,
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            false,
+            usize::MAX,
+            true,
+            false,
+            None,
+        )
+        .expect("no-tools turn prompt should build");
+        assert!(
+            no_tools_turn_prompt.contains(NO_TOOLS_TASK_FRAMING),
+            "turn prompt must not inherit startup native-tool framing when dynamic filters exclude all MCP specs"
+        );
+        assert!(!no_tools_turn_prompt.contains(NATIVE_TOOLS_TASK_FRAMING));
+
+        let included_tools =
+            super::compute_excluded_mcp_tools(&tools_registry, &groups, "browse the site");
+        assert!(included_tools.is_empty());
+        let tools_turn_prompt = super::build_system_prompt_for_turn(
+            workspace.path(),
+            "test-model",
+            &tool_descs,
+            "",
+            &[],
+            None,
+            None,
+            &risk_profile,
+            &provider,
+            &tools_registry,
+            &included_tools,
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            false,
+            usize::MAX,
+            true,
+            false,
+            None,
+        )
+        .expect("tools turn prompt should build");
+        assert!(tools_turn_prompt.contains(NATIVE_TOOLS_TASK_FRAMING));
+        assert!(!tools_turn_prompt.contains(NO_TOOLS_TASK_FRAMING));
     }
 
     #[test]
