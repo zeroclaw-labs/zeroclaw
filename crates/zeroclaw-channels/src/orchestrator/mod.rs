@@ -139,6 +139,21 @@ use zeroclaw_runtime::util::truncate_with_ellipsis;
 
 type CronChannelRegistry = Arc<HashMap<String, Arc<dyn Channel>>>;
 
+#[cfg(feature = "channel-lark")]
+fn lark_effective_channel_type(config: &zeroclaw_config::schema::LarkConfig) -> &'static str {
+    if config.use_feishu { "feishu" } else { "lark" }
+}
+
+#[cfg(feature = "channel-lark")]
+fn lark_peer_resolver(
+    config_arc: &Arc<RwLock<Config>>,
+    alias: String,
+    channel_type: &'static str,
+) -> Arc<dyn Fn() -> Vec<String> + Send + Sync> {
+    let cfg_arc = Arc::clone(config_arc);
+    Arc::new(move || cfg_arc.read().channel_external_peers(channel_type, &alias))
+}
+
 /// Live channel registry consulted by `deliver_announcement` so cron sends reuse the
 /// authenticated channel instance (Matrix E2EE can't tolerate per-send session restore).
 /// Replaced wholesale by each `start_channels` call.
@@ -6266,11 +6281,8 @@ fn build_channel_by_id(
                     .get("default")
                     .context("Lark channel is not configured")?;
                 let alias = "default".to_string();
-                let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-                    let cfg_arc = config_arc.clone();
-                    let alias = alias.clone();
-                    Arc::new(move || cfg_arc.read().channel_external_peers("lark", &alias))
-                };
+                let peer_resolver =
+                    lark_peer_resolver(config_arc, alias.clone(), lark_effective_channel_type(lk));
                 Ok(Arc::new(
                     LarkChannel::from_config(lk, alias, peer_resolver)
                         .with_approval_timeout_secs(lk.approval_timeout_secs)
@@ -7860,11 +7872,8 @@ fn collect_configured_channels(
         if !lk.enabled {
             continue;
         }
-        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-            let cfg_arc = config_arc.clone();
-            let alias = alias.clone();
-            Arc::new(move || cfg_arc.read().channel_external_peers("lark", &alias))
-        };
+        let peer_resolver =
+            lark_peer_resolver(config_arc, alias.clone(), lark_effective_channel_type(lk));
         let display_name = if lk.use_feishu { "Feishu" } else { "Lark" };
         channels.push(ConfiguredChannel {
             display_name,
@@ -9786,7 +9795,7 @@ pub async fn deliver_announcement(
                     )
                 );
             }
-            let peers = config.channel_external_peers("lark", alias);
+            let peers = config.channel_external_peers(lark_effective_channel_type(lk), alias);
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
             let ch = LarkChannel::from_config(lk, alias, peer_resolver)
@@ -18437,6 +18446,93 @@ This is an example JSON object for profile settings."#;
                 .any(|entry| entry.display_name == "Mattermost"),
             "enabled channels should still load when no enabled agent declares channel bindings"
         );
+    }
+
+    #[cfg(feature = "channel-lark")]
+    #[tokio::test]
+    async fn collect_configured_channels_feishu_peer_group_passes_ingress_gate_before_routing() {
+        use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig, PeerUsername};
+
+        let mut config = Config::default();
+        config.channels.lark.insert(
+            "work".to_string(),
+            zeroclaw_config::schema::LarkConfig {
+                enabled: true,
+                app_id: "cli_feishu_app123".to_string(),
+                app_secret: "test-secret".to_string(),
+                use_feishu: true,
+                ack_reactions: Some(false),
+                ..Default::default()
+            },
+        );
+        config.agents.clear();
+        config.agents.insert(
+            "feishu-agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["feishu.work".into()],
+                ..Default::default()
+            },
+        );
+        config.peer_groups.insert(
+            "feishu_ops".to_string(),
+            PeerGroupConfig {
+                channel: "feishu.work".into(),
+                agents: vec![AgentAlias::new("feishu-agent")],
+                external_peers: vec![PeerUsername::new("ou_feishu_operator")],
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let configured_channels = collect_configured_channels(&config_arc, "test", &[]);
+        let feishu = configured_channels
+            .iter()
+            .find(|entry| entry.alias.as_deref() == Some("work"))
+            .expect("feishu.work binding must be collected from [channels.lark.work]");
+        assert_eq!(feishu.display_name, "Feishu");
+        assert_eq!(feishu.channel.name(), "feishu");
+
+        let lk = config_arc
+            .read()
+            .channels
+            .lark
+            .get("work")
+            .expect("test config must include [channels.lark.work]")
+            .clone();
+        let peer_resolver = lark_peer_resolver(
+            &config_arc,
+            "work".to_string(),
+            lark_effective_channel_type(&lk),
+        );
+        let ch = LarkChannel::from_config(&lk, "work", peer_resolver);
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": {
+                    "sender_id": {
+                        "open_id": "ou_feishu_operator"
+                    }
+                },
+                "message": {
+                    "message_id": "om_feishu_ingress",
+                    "message_type": "text",
+                    "content": "{\"text\":\"Feishu ingress\"}",
+                    "chat_id": "oc_feishu_chat",
+                    "create_time": "1699999999000"
+                }
+            }
+        });
+
+        let msgs = ch.parse_event_payload(&payload).await;
+        assert_eq!(
+            msgs.len(),
+            1,
+            "Feishu peer group external_peers must authorize before routing"
+        );
+        assert_eq!(msgs[0].channel, "feishu");
+        assert_eq!(msgs[0].channel_alias.as_deref(), Some("work"));
+        assert_eq!(msgs[0].content, "Feishu ingress");
     }
 
     #[cfg(feature = "channel-lark")]
