@@ -3,14 +3,16 @@
 ## What this crate is
 
 WASM plugin host for ZeroClaw. Handles plugin discovery, manifest parsing,
-Ed25519 signature verification, and Extism-based WASM execution. Bridges
-plugin-exported functions into ZeroClaw's `Tool` and `Channel` traits so
-plugins appear as native capabilities to the agent runtime.
+Ed25519 signature verification, and the current Extism-based WASM execution
+bridge while the WIT / direct `wasmtime` host lands. Bridges plugin-exported
+functions into ZeroClaw's `Tool` and `Channel` traits so plugins appear as
+native capabilities to the agent runtime.
 
 ## What this crate is allowed to depend on
 
 - `zeroclaw-api` (traits only — `Tool`, `Channel`, `ToolResult`)
-- `extism` (WASM runtime)
+- `extism` (current WASM runtime bridge)
+- `wasmtime` (optional Component Model host transition)
 - `reqwest` (blocking, for host function HTTP support)
 - `ring` (Ed25519 signatures)
 - `serde`, `serde_json`, `toml` (serialization)
@@ -40,4 +42,4 @@ schemas. This crate knows how to run plugins, not what they do.
 
 ## Related ADRs
 
-- ADR-003: WASM + Extism plugin execution model
+- ADR-003: WASM plugin model and the Extism-to-WIT transition

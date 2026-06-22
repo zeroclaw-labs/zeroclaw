@@ -440,6 +440,17 @@ impl Memory for LucidMemory {
         self.local.export_agent(agent_alias).await
     }
 
+    async fn rename_agent(&self, from: &str, to: &str) -> anyhow::Result<usize> {
+        // The remote Lucid daemon has no agent_id concept; alias→UUID lives in
+        // the local SQLite mirror, so rename is a local update (mirrors purge).
+        self.local.rename_agent(from, to).await
+    }
+
+    async fn count_agent(&self, agent_alias: &str) -> anyhow::Result<usize> {
+        // Attribution lives only on the local SQLite mirror (see rename_agent).
+        self.local.count_agent(agent_alias).await
+    }
+
     async fn count(&self) -> anyhow::Result<usize> {
         self.local.count().await
     }
