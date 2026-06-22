@@ -102,7 +102,11 @@ export interface CronRun {
 export interface Integration {
   name: string;
   description: string;
+  /** Stable enum-variant key (e.g. `"ToolsAutomation"`); use for grouping and
+   *  filtering, not display. */
   category: string;
+  /** Human-readable display label derived by the API from the category enum. */
+  category_label: string;
   status: "Available" | "Active";
 }
 
@@ -241,6 +245,7 @@ export interface WsMessage {
   name?: string;
   args?: any;
   output?: string;
+  id?: string;
   message?: string;
   code?: string;
   session_id?: string;

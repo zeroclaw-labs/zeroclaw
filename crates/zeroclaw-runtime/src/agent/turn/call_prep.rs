@@ -50,11 +50,12 @@ pub(crate) async fn prepare_tool_calls(
                 .await
             {
                 crate::hooks::HookResult::Cancel(reason) => {
-                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"tool": call.name, "reason": reason.to_string()})), "tool call cancelled by hook");
+                    ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel).with_category(::zeroclaw_log::EventCategory::Tool).with_attrs(::serde_json::json!({"tool": call.name, "reason": reason.to_string()})), "tool call cancelled by hook");
                     let cancelled = format!("Cancelled by hook: {reason}");
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel)
+                            .with_category(::zeroclaw_log::EventCategory::Tool)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
                                 "model": ctx.model,
@@ -78,7 +79,7 @@ pub(crate) async fn prepare_tool_calls(
                     let outcome = ToolExecutionOutcome {
                         output: cancelled,
                         success: false,
-                        error_reason: Some(scrub_credentials(&reason)),
+                        error_reason: Some(reason),
                         duration: Duration::ZERO,
                         receipt: None,
                     };
@@ -140,6 +141,7 @@ pub(crate) async fn prepare_tool_calls(
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "model": ctx.model,
@@ -176,15 +178,15 @@ pub(crate) async fn prepare_tool_calls(
 
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start).with_attrs(
-                ::serde_json::json!({
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
+                .with_category(::zeroclaw_log::EventCategory::Tool)
+                .with_attrs(::serde_json::json!({
                     "model": ctx.model,
                     "iteration": iteration + 1,
                     "tool": tool_name.clone(),
                     "arguments": scrub_credentials(&tool_args.to_string()),
                     "trace_id": ctx.turn_id,
-                })
-            ),
+                })),
             "tool_call_start"
         );
 
@@ -212,6 +214,7 @@ pub(crate) async fn prepare_tool_calls(
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
                     .with_attrs(::serde_json::json!({"tool": tool_name})),
                 "Sending progress start to draft"
             );
@@ -219,10 +222,19 @@ pub(crate) async fn prepare_tool_calls(
         }
 
         executable_indices.push(idx);
+        let call_id = super::events::resolve_tool_call_id(&ParsedToolCall {
+            name: tool_name.clone(),
+            arguments: tool_args.clone(),
+            tool_call_id: call.tool_call_id.clone(),
+        });
+        // Pin the resolved id onto the executable call so the pending ToolCall
+        // and the terminal ToolResult (both emitted by the executor at dispatch
+        // and completion) share one correlation id, even for id-less
+        // text-protocol calls.
         executable_calls.push(ParsedToolCall {
             name: tool_name,
             arguments: tool_args,
-            tool_call_id: call.tool_call_id.clone(),
+            tool_call_id: Some(call_id),
         });
     }
 

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { AlertTriangle, Check, X, ShieldCheck } from 'lucide-react';
 import type { ApprovalDecision, PendingApproval } from '@/types/api';
+import { Button } from '@/components/ui';
 import { t } from '@/lib/i18n';
 
 interface ApprovalBannerProps {
@@ -24,51 +25,40 @@ export default function ApprovalBanner({ pending, onRespond }: ApprovalBannerPro
       role="alert"
       aria-live="assertive"
       aria-labelledby="approval-banner-title"
-      className="border-b px-4 py-3 animate-fade-in"
-      style={{
-        background: 'var(--color-status-warning-alpha-08, rgba(245, 158, 11, 0.08))',
-        borderColor: 'var(--color-status-warning-alpha-20, rgba(245, 158, 11, 0.2))',
-      }}
+      className="border-b border-status-warning/20 bg-status-warning/[0.08] px-4 py-3 animate-fade-in"
     >
       <div className="max-w-4xl mx-auto flex flex-col gap-2">
         <div className="flex items-start gap-3">
-          <AlertTriangle
-            className="h-5 w-5 shrink-0 mt-0.5"
-            style={{ color: 'var(--color-status-warning, #f59e0b)' }}
-          />
+          <AlertTriangle className="h-5 w-5 shrink-0 mt-0.5 text-status-warning" />
           <div className="flex-1 min-w-0">
             <div className="flex items-center justify-between gap-2 flex-wrap">
               <p
                 id="approval-banner-title"
-                className="text-sm font-semibold"
-                style={{ color: 'var(--pc-text-primary)' }}
+                className="text-sm font-semibold text-pc-text"
               >
                 {t('agent.approval_title')}
               </p>
               <span
-                className="text-xs font-mono"
-                style={{ color: 'var(--pc-text-muted)' }}
+                className="text-xs font-mono text-pc-text-muted"
                 aria-hidden="true"
               >
                 {t('agent.approval_timeout_in')}: {remainingSec}s
               </span>
             </div>
-            <p className="text-xs mt-1" style={{ color: 'var(--pc-text-secondary)' }}>
-              <span style={{ color: 'var(--pc-text-muted)' }}>{t('agent.approval_tool')}:</span>{' '}
+            <p className="text-xs mt-1 text-pc-text-secondary">
+              <span className="text-pc-text-muted">{t('agent.approval_tool')}:</span>{' '}
               <span className="font-mono">{pending.toolName}</span>
             </p>
             {pending.argumentsSummary && (
               <>
                 <p
-                  className="text-xs mt-1"
-                  style={{ color: 'var(--pc-text-muted)' }}
+                  className="text-xs mt-1 text-pc-text-muted"
                   id="approval-banner-args-label"
                 >
                   {t('agent.approval_arguments')}:
                 </p>
                 <pre
-                  className="text-xs mt-1 whitespace-pre-wrap break-words leading-relaxed p-2 rounded-lg max-h-40 overflow-auto"
-                  style={{ background: 'var(--pc-bg-surface)', color: 'var(--pc-text-secondary)' }}
+                  className="text-xs mt-1 whitespace-pre-wrap break-words leading-relaxed p-2 rounded-[var(--radius-md)] max-h-40 overflow-auto bg-pc-code text-pc-text-secondary border border-pc-border"
                   aria-labelledby="approval-banner-args-label"
                 >
                   {pending.argumentsSummary}
@@ -79,34 +69,31 @@ export default function ApprovalBanner({ pending, onRespond }: ApprovalBannerPro
         </div>
 
         <div className="flex items-center gap-2 justify-end">
-          <button
-            type="button"
+          <Button
+            size="sm"
+            variant="danger"
             onClick={() => onRespond('deny')}
-            className="btn-secondary flex items-center gap-1.5 text-xs"
-            style={{ padding: '0.35rem 0.85rem', borderRadius: '0.5rem' }}
           >
             <X className="h-3.5 w-3.5" />
             {t('agent.approval_deny')}
-          </button>
-          <button
-            type="button"
-            onClick={() => onRespond('approve')}
-            className="btn-electric flex items-center gap-1.5 text-xs"
-            style={{ padding: '0.35rem 0.85rem', borderRadius: '0.5rem', color: 'white' }}
-          >
-            <Check className="h-3.5 w-3.5" />
-            {t('agent.approval_approve')}
-          </button>
-          <button
-            type="button"
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
             onClick={() => onRespond('always')}
-            className="btn-secondary flex items-center gap-1.5 text-xs"
-            style={{ padding: '0.35rem 0.85rem', borderRadius: '0.5rem' }}
             title={t('agent.approval_always_hint')}
           >
             <ShieldCheck className="h-3.5 w-3.5" />
             {t('agent.approval_always')}
-          </button>
+          </Button>
+          <Button
+            size="sm"
+            variant="primary"
+            onClick={() => onRespond('approve')}
+          >
+            <Check className="h-3.5 w-3.5" />
+            {t('agent.approval_approve')}
+          </Button>
         </div>
       </div>
     </div>

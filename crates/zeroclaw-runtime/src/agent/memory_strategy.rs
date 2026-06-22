@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use zeroclaw_api::memory_traits::{Memory, MemoryStrategy};
 use zeroclaw_api::model_provider::ModelProvider;
+use zeroclaw_api::observability_traits::Observer;
 
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 
@@ -76,10 +77,15 @@ impl DefaultMemoryStrategy {
 
 #[async_trait::async_trait]
 impl MemoryStrategy for DefaultMemoryStrategy {
-    async fn load_context(&self, query: &str, session_id: Option<&str>) -> anyhow::Result<String> {
+    async fn load_context(
+        &self,
+        observer: &dyn Observer,
+        query: &str,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<String> {
         let loader = DefaultMemoryLoader::new(self.limit, self.min_relevance_score);
         loader
-            .load_context(self.memory.as_ref(), query, session_id)
+            .load_context(self.memory.as_ref(), observer, query, session_id)
             .await
     }
 

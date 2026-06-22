@@ -1,4 +1,4 @@
-use crate::agent::loop_::{LoopKnobs, TOOL_LOOP_SESSION_KEY, run_tool_call_loop};
+use crate::agent::loop_::{LoopKnobs, TOOL_LOOP_SESSION_KEY, ToolLoop, run_tool_call_loop};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::security::SecurityPolicy;
@@ -18,7 +18,7 @@ use zeroclaw_config::schema::{
 };
 use zeroclaw_log::Instrument as _;
 use zeroclaw_memory::Memory;
-use zeroclaw_providers::{self, ChatMessage, ModelProvider};
+use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
 use zeroclaw_tools::memory_export::MemoryExportTool;
 use zeroclaw_tools::memory_forget::MemoryForgetTool;
 use zeroclaw_tools::memory_purge::MemoryPurgeTool;
@@ -577,7 +577,21 @@ impl DelegateTool {
         resolved
     }
 
-    /// Materialize the tool gate from the named risk profile.
+    /// Materialize the tool gate from the named risk profile (authorization).
+    ///
+    /// Returns `None` when the risk profile is unnamed or not configured.
+    /// `allowed_tools = Some(vec![])` means "deny all" and is preserved as
+    /// `Some(empty)` so the caller can distinguish it from "no risk profile."
+    ///
+    /// The resulting `SecurityPolicy` only carries the tool authorization
+    /// fields (`allowed_tools` and `excluded_tools`). Callers in
+    /// `execute_agentic` must use [`Self::delegate_admits_with_mcp`] — not the
+    /// raw `SecurityPolicy::is_tool_allowed` — to filter `parent_tools`,
+    /// because the delegate path applies the MCP `<server>__<tool>`
+    /// auto-admit exception described on `RiskProfileConfig::allowed_tools`.
+    /// The exception is intentionally scoped to the risk-profile gate; it
+    /// does not apply to caller-supplied per-run allow-lists (cron jobs and
+    /// other narrowers) — see PR #7547 review.
     fn resolve_tool_policy(&self, risk_profile: &str) -> Option<SecurityPolicy> {
         if risk_profile.is_empty() {
             return None;
@@ -597,6 +611,38 @@ impl DelegateTool {
             },
             ..SecurityPolicy::default()
         })
+    }
+
+    /// MCP-aware admission check used to filter `parent_tools` in
+    /// `execute_agentic`.
+    ///
+    /// Same contract as `SecurityPolicy::is_tool_allowed`, with one
+    /// addition that the delegate path needs: when the risk profile's
+    /// `allowed_tools` is `Some(non-empty)`, any name containing `__`
+    /// (the `<server>__<tool>` MCP wrapper convention) is auto-admitted
+    /// even if it is not explicitly listed in `allowed_tools`. The
+    /// `excluded_tools` deny-list always applies last, so destructive
+    /// MCP capabilities like `filesystem__write_file` can be blocked
+    /// individually.
+    ///
+    /// This auto-admit applies only to the risk-profile gate. Callers
+    /// that need a per-run narrowing (cron jobs, narrowed delegate
+    /// invocations) intersect their own allow-list against this result
+    /// with a strict `list.contains(name)` check — see
+    /// `ToolAccessPolicy::is_tool_allowed` and PR #7547.
+    fn delegate_admits_with_mcp(policy: &SecurityPolicy, name: &str) -> bool {
+        let denied = policy
+            .excluded_tools
+            .as_ref()
+            .is_some_and(|list| list.iter().any(|t| t == name));
+        if denied {
+            return false;
+        }
+        match policy.allowed_tools.as_ref() {
+            None => true,
+            Some(list) if list.is_empty() => false,
+            Some(list) => list.iter().any(|t| t == name) || name.contains("__"),
+        }
     }
 
     /// Resolve every configured skill bundle alias to its directory.
@@ -949,9 +995,10 @@ impl DelegateTool {
         let timeout_secs = self
             .resolve_delegation_timeout(&agent_config.runtime_profile)
             .unwrap_or(self.delegate_config.timeout_secs);
+        let dispatcher = ProviderDispatch::from_ref(&*model_provider);
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
-            model_provider.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
+            dispatcher.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
         )
         .await;
 
@@ -1738,7 +1785,7 @@ impl DelegateTool {
             let parent_tools = self.parent_tools.read();
             parent_tools.iter().any(|tool| {
                 zeroclaw_tools::MEMORY_TOOL_NAMES.contains(&tool.name())
-                    && tool_policy.is_tool_allowed(tool.name())
+                    && Self::delegate_admits_with_mcp(&tool_policy, tool.name())
             })
         };
         let mut target_memory_tools: HashMap<String, Box<dyn Tool>> = if needs_memory_tools {
@@ -1767,7 +1814,7 @@ impl DelegateTool {
             parent_tools
                 .iter()
                 .filter(|tool| tool.name() != Self::NAME)
-                .filter(|tool| tool_policy.is_tool_allowed(tool.name()))
+                .filter(|tool| Self::delegate_admits_with_mcp(&tool_policy, tool.name()))
                 .map(|tool| {
                     target_memory_tools
                         .remove(tool.name())
@@ -1841,44 +1888,47 @@ impl DelegateTool {
         let collected_receipts = receipt_scope.as_ref().map(|s| s.collector.as_ref());
         let result = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
-            run_tool_call_loop(
+            run_tool_call_loop(ToolLoop {
                 model_provider,
-                &mut history,
-                &sub_tools,
-                &noop_observer,
-                provider_type,
+                history: &mut history,
+                tools_registry: &sub_tools,
+                observer: &noop_observer,
+                provider_name: provider_type,
                 model,
                 temperature,
-                true,
-                None,
-                "delegate",
-                None,
-                &self.multimodal_config,
-                loop_runtime.max_tool_iterations,
-                Some(self.cancellation_token.child_token()),
-                None,
-                None,
-                &[],
-                tool_policy.excluded_tools.as_deref().unwrap_or(&[]),
-                None,
-                None,
-                &zeroclaw_config::schema::PacingConfig::default(),
-                loop_runtime.strict_tool_parsing,
-                loop_runtime.parallel_tools,
-                loop_runtime.max_tool_result_chars,
+                silent: true,
+                approval: None,
+                channel_name: "delegate",
+                channel_reply_target: None,
+                multimodal_config: &self.multimodal_config,
+                max_tool_iterations: loop_runtime.max_tool_iterations,
+                cancellation_token: Some(self.cancellation_token.child_token()),
+                on_delta: None,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: tool_policy.excluded_tools.as_deref().unwrap_or(&[]),
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: loop_runtime.strict_tool_parsing,
+                parallel_tools: loop_runtime.parallel_tools,
+                max_tool_result_chars: loop_runtime.max_tool_result_chars,
                 // Keep delegate subagent context pruning aligned with top-level
                 // agents instead of preserving the old disabled-by-zero path.
-                loop_runtime.max_context_tokens,
-                None, // shared_budget: TODO thread from parent in future
-                None, // channel: delegate subagents don't support approval
+                context_token_budget: loop_runtime.max_context_tokens,
+                shared_budget: None, // TODO thread from parent in future
+                channel: None,       // delegate subagents don't support approval
                 receipt_generator,
                 collected_receipts,
-                None, // event_tx
-                None, // steering
-                None, // new_messages_out
-                &LoopKnobs::default(),
-                None,
-            )
+                event_tx: None,
+                steering: None,
+                new_messages_out: None,
+                knobs: &LoopKnobs::default(),
+                image_cache: None,
+                // Phase 1: stamp Internal/Trusted. Real per-transport
+                // stamping is PR C (RFC #6971 §4).
+                ingress: zeroclaw_api::ingress::IngressContext::internal(),
+            })
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(agent_name)
             )),
@@ -3918,6 +3968,114 @@ mod tests {
             result.output.contains("mcp done"),
             "Expected output containing 'mcp done', got: {}",
             result.output
+        );
+    }
+
+    /// PR #7547 review (Audacity88): the `<server>__<tool>` MCP-naming
+    /// convention must be auto-admitted by the delegate filter even when
+    /// the risk profile's explicit `allowed_tools` list does not mention
+    /// the tool. The pre-existing `mcp_tools_included_in_subagent_tool_list`
+    /// fixture uses `mcp_fake` (no double underscore) so it exercises the
+    /// explicit allow-list path, not the new auto-admit branch. This test
+    /// pins the new branch via the resolve_tool_policy + delegate_admits_with_mcp
+    /// pair that replaces the pre-#7608 resolve_allowed_tools helper.
+    #[test]
+    fn delegate_admits_with_mcp_auto_admits_double_underscore_mcp_names() {
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_risk_profiles(agentic_risk_profiles(vec!["shell".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+
+        let policy = tool
+            .resolve_tool_policy("agentic_test")
+            .expect("agentic_test risk profile is configured");
+
+        // The explicit allow-list entry is admitted.
+        assert!(
+            DelegateTool::delegate_admits_with_mcp(&policy, "shell"),
+            "explicit allow-list entry must be admitted"
+        );
+        // A runtime-discovered MCP wrapper (matching `<server>__<tool>`) is
+        // auto-admitted even though it is not in `allowed_tools`. This is
+        // the destructive capability the reviewer called out.
+        assert!(
+            DelegateTool::delegate_admits_with_mcp(&policy, "filesystem__write_file"),
+            "double-underscore MCP name must be auto-admitted"
+        );
+        // Non-MCP names outside the allow-list still get rejected.
+        assert!(
+            !DelegateTool::delegate_admits_with_mcp(&policy, "memory_recall"),
+            "non-MCP names outside allow-list must be rejected"
+        );
+    }
+
+    /// PR #7547 review (Audacity88) — blocking comment: the PR body
+    /// claims MCP tools can still be blocked via `excluded_tools`. A
+    /// target profile that allow-lists `shell` and excludes
+    /// `filesystem__write_file` must NOT receive the MCP wrapper in an
+    /// agentic delegate even though it matches the `__` auto-admit
+    /// heuristic.
+    #[test]
+    fn delegate_admits_with_mcp_honors_excluded_tools_for_auto_admitted_mcp() {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "agentic_test".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["shell".to_string()],
+                excluded_tools: vec!["filesystem__write_file".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_risk_profiles(profiles)
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+
+        let policy = tool
+            .resolve_tool_policy("agentic_test")
+            .expect("agentic_test risk profile is configured");
+
+        assert!(
+            DelegateTool::delegate_admits_with_mcp(&policy, "shell"),
+            "non-excluded allow-list entry must be admitted"
+        );
+        assert!(
+            !DelegateTool::delegate_admits_with_mcp(&policy, "filesystem__write_file"),
+            "excluded_tools must block auto-admitted MCP name"
+        );
+    }
+
+    /// Companion to the test above: `excluded_tools` must also subtract
+    /// from explicit allow-list entries, not just from the
+    /// double-underscore auto-admit set. delegate.rs previously ignored
+    /// `excluded_tools` entirely on the agentic path; this pins the fix
+    /// so it cannot regress.
+    #[test]
+    fn delegate_admits_with_mcp_honors_excluded_tools_for_explicit_allow_list_entries() {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "agentic_test".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["shell".to_string(), "memory_recall".to_string()],
+                excluded_tools: vec!["shell".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_risk_profiles(profiles)
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+
+        let policy = tool
+            .resolve_tool_policy("agentic_test")
+            .expect("agentic_test risk profile is configured");
+
+        assert!(
+            !DelegateTool::delegate_admits_with_mcp(&policy, "shell"),
+            "excluded entry must be rejected even when allow-listed"
+        );
+        assert!(
+            DelegateTool::delegate_admits_with_mcp(&policy, "memory_recall"),
+            "non-excluded entry must be admitted"
         );
     }
 

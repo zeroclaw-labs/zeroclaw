@@ -942,15 +942,15 @@ checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
 
 [[package]]
 name = "bitcoin-io"
-version = "0.1.100"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11301df0b06f22dea7bb1916403fdd88a371031e495c49b8f96931b28189e175"
+checksum = "2dee39a0ee5b4095224a0cfc6bf4cc1baf0f9624b96b367e53b66d974e51d953"
 
 [[package]]
 name = "bitcoin_hashes"
-version = "0.14.100"
+version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c9901a56e133a1fc86eeb1113e2591f45f4682451ca893bff494d2f88918e3f"
+checksum = "4ed83caece3afc59919481b33b472e1432d1abc4641ed9100be142ef5110b406"
 dependencies = [
  "bitcoin-io",
  "hex-conservative",
@@ -3538,7 +3538,7 @@ dependencies = [
 
 [[package]]
 name = "fill-translations"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -3547,6 +3547,7 @@ dependencies = [
  "toml 0.8.23",
  "xtask",
  "zeroclaw-api",
+ "zeroclaw-providers",
 ]
 
 [[package]]
@@ -9978,6 +9979,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sys-locale"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eab9a99a024a169fe8a903cf9d4a3b3601109bcc13bd9e3c6fff259138626c4"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "system-deps"
 version = "6.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13955,7 +13965,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -14104,7 +14114,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-api"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -14122,7 +14132,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-channels"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "aes 0.8.4",
  "anyhow",
@@ -14202,7 +14212,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-config"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -14244,7 +14254,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-desktop"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -14263,8 +14273,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-eval"
+version = "0.8.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "zeroclaw-api",
+ "zeroclaw-config",
+ "zeroclaw-memory",
+ "zeroclaw-runtime",
+]
+
+[[package]]
 name = "zeroclaw-gateway"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -14316,7 +14343,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-hardware"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "aardvark-sys",
  "anyhow",
@@ -14349,7 +14376,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-infra"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -14367,7 +14394,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-log"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -14387,7 +14414,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-macros"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -14396,7 +14423,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-memory"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -14415,12 +14442,13 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-config",
  "zeroclaw-log",
+ "zeroclaw-providers",
  "zeroclaw-spawn",
 ]
 
 [[package]]
 name = "zeroclaw-plugins"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -14441,7 +14469,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-providers"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -14500,9 +14528,8 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-runtime"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
- "aardvark-sys",
  "anyhow",
  "async-trait",
  "axum",
@@ -14515,6 +14542,7 @@ dependencies = [
  "dialoguer",
  "directories",
  "encoding_rs",
+ "filetime",
  "flate2",
  "fluent",
  "futures-util",
@@ -14541,7 +14569,6 @@ dependencies = [
  "regex",
  "reqwest 0.12.28",
  "ring",
- "rumqttc",
  "rusqlite",
  "rustls",
  "rustls-pemfile",
@@ -14552,6 +14579,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "shellexpand",
+ "sys-locale",
  "tar",
  "tempfile",
  "thiserror 2.0.18",
@@ -14584,7 +14612,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-spawn"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "serde_json",
  "tokio",
@@ -14595,7 +14623,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-tool-call-parser"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "regex",
  "serde",
@@ -14605,7 +14633,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclaw-tools"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "async-imap",
@@ -14632,6 +14660,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sys-locale",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -14657,9 +14686,8 @@ dependencies = [
 
 [[package]]
 name = "zeroclawlabs"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
- "aardvark-sys",
  "anyhow",
  "async-imap",
  "async-trait",
@@ -14734,6 +14762,7 @@ dependencies = [
  "zeroclaw-api",
  "zeroclaw-channels",
  "zeroclaw-config",
+ "zeroclaw-eval",
  "zeroclaw-gateway",
  "zeroclaw-hardware",
  "zeroclaw-infra",
@@ -14751,7 +14780,7 @@ dependencies = [
 
 [[package]]
 name = "zerocode"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -14775,8 +14804,8 @@ dependencies = [
  "tokio-tungstenite 0.29.0",
  "toml 1.1.2+spec-1.1.0",
  "unic-langid",
+ "unicode-segmentation",
  "unicode-width 0.2.2",
- "zeroclaw-providers",
 ]
 
 [[package]]

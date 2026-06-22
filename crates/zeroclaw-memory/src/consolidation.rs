@@ -12,6 +12,7 @@ use crate::conflict;
 use crate::importance;
 use crate::traits::{Memory, MemoryCategory};
 use zeroclaw_api::model_provider::ModelProvider;
+use zeroclaw_providers::ProviderDispatch;
 
 /// Output of consolidation extraction.
 #[derive(Debug, serde::Deserialize)]
@@ -80,7 +81,7 @@ pub async fn consolidate_turn(
         turn_text.clone()
     };
 
-    let raw = model_provider
+    let raw = ProviderDispatch::from_ref(model_provider)
         .chat_with_system(
             Some(CONSOLIDATION_SYSTEM_PROMPT),
             &truncated,

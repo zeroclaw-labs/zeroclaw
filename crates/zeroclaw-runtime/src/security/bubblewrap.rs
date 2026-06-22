@@ -2,6 +2,14 @@
 
 use crate::security::traits::Sandbox;
 use std::process::Command;
+use std::sync::OnceLock;
+
+const CAPABILITY_DROPS: &[&str] = &["CAP_SYS_ADMIN", "CAP_SYS_PTRACE"];
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BubblewrapHardeningSupport {
+    cap_drop: bool,
+}
 
 /// Bubblewrap sandbox backend
 #[derive(Debug, Clone, Default)]
@@ -30,10 +38,69 @@ impl BubblewrapSandbox {
             .map(|o| o.status.success())
             .unwrap_or(false)
     }
-}
 
-impl Sandbox for BubblewrapSandbox {
-    fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()> {
+    fn hardening_support() -> BubblewrapHardeningSupport {
+        static SUPPORT: OnceLock<BubblewrapHardeningSupport> = OnceLock::new();
+        *SUPPORT.get_or_init(Self::detect_hardening_support)
+    }
+
+    fn detect_hardening_support() -> BubblewrapHardeningSupport {
+        let support = Command::new("bwrap")
+            .arg("--help")
+            .env_clear()
+            .output()
+            .map(|output| {
+                Self::support_from_help(
+                    &String::from_utf8_lossy(&output.stdout),
+                    &String::from_utf8_lossy(&output.stderr),
+                )
+            })
+            .unwrap_or_default();
+
+        Self::log_incomplete_hardening_support(support);
+        support
+    }
+
+    fn support_from_help(stdout: &str, stderr: &str) -> BubblewrapHardeningSupport {
+        let contains = |flag| stdout.contains(flag) || stderr.contains(flag);
+
+        BubblewrapHardeningSupport {
+            cap_drop: contains("--cap-drop"),
+        }
+    }
+
+    fn log_incomplete_hardening_support(support: BubblewrapHardeningSupport) {
+        if support.cap_drop {
+            return;
+        }
+
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "backend": "bubblewrap",
+                    "cap_drop": support.cap_drop,
+                })),
+            "bubblewrap sandbox hardening support is incomplete"
+        );
+    }
+
+    fn append_capability_drops(cmd: &mut Command, support: BubblewrapHardeningSupport) {
+        if !support.cap_drop {
+            return;
+        }
+
+        for capability in CAPABILITY_DROPS {
+            cmd.args(["--cap-drop", capability]);
+        }
+    }
+
+    fn wrap_command_with_support(
+        &self,
+        cmd: &mut Command,
+        support: BubblewrapHardeningSupport,
+    ) -> std::io::Result<()> {
         let program = cmd.get_program().to_string_lossy().to_string();
         let args: Vec<String> = cmd
             .get_args()
@@ -64,6 +131,7 @@ impl Sandbox for BubblewrapSandbox {
             "--unshare-all",
             "--die-with-parent",
         ]);
+        Self::append_capability_drops(&mut bwrap_cmd, support);
         // Conditionally bind dynamic-loader library directories that may exist
         // on the host.  On Fedora / RHEL systems the ELF interpreter and shared
         // libraries live in /lib64; on some older or non-merged-usr distros they
@@ -80,6 +148,12 @@ impl Sandbox for BubblewrapSandbox {
 
         *cmd = bwrap_cmd;
         Ok(())
+    }
+}
+
+impl Sandbox for BubblewrapSandbox {
+    fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()> {
+        self.wrap_command_with_support(cmd, Self::hardening_support())
     }
 
     fn is_available(&self) -> bool {
@@ -98,6 +172,12 @@ impl Sandbox for BubblewrapSandbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args(cmd: &Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect()
+    }
 
     #[test]
     fn bubblewrap_sandbox_name() {
@@ -130,10 +210,7 @@ mod tests {
             "wrapped command should use bwrap as program"
         );
 
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|s| s.to_string_lossy().to_string())
-            .collect();
+        let args = args(&cmd);
 
         assert!(
             args.contains(&"--unshare-all".to_string()),
@@ -150,6 +227,77 @@ mod tests {
     }
 
     #[test]
+    fn bubblewrap_supported_capability_drops_include_admin_and_ptrace() {
+        let mut cmd = Command::new("bwrap");
+        BubblewrapSandbox::append_capability_drops(
+            &mut cmd,
+            BubblewrapHardeningSupport { cap_drop: true },
+        );
+
+        let args = args(&cmd);
+        let expected_capability_drops = ["CAP_SYS_ADMIN", "CAP_SYS_PTRACE"];
+        for capability in expected_capability_drops {
+            assert!(
+                args.windows(2)
+                    .any(|window| window == ["--cap-drop", capability]),
+                "supported bubblewrap hardening must drop {capability}"
+            );
+        }
+    }
+
+    #[test]
+    fn bubblewrap_skips_capability_drops_when_not_advertised() {
+        let mut cmd = Command::new("bwrap");
+        BubblewrapSandbox::append_capability_drops(
+            &mut cmd,
+            BubblewrapHardeningSupport { cap_drop: false },
+        );
+
+        assert!(
+            args(&cmd).is_empty(),
+            "unsupported bubblewrap capability drops should not be appended"
+        );
+    }
+
+    #[test]
+    fn bubblewrap_support_from_help_detects_stdout_and_stderr_flags() {
+        assert!(BubblewrapSandbox::support_from_help("--cap-drop", "").cap_drop);
+        assert!(BubblewrapSandbox::support_from_help("", "--cap-drop").cap_drop);
+        assert!(!BubblewrapSandbox::support_from_help("", "").cap_drop);
+    }
+
+    #[test]
+    fn bubblewrap_wrap_command_applies_supported_capability_drops() {
+        let sandbox = BubblewrapSandbox;
+        let mut cmd = Command::new("echo");
+        sandbox
+            .wrap_command_with_support(&mut cmd, BubblewrapHardeningSupport { cap_drop: true })
+            .unwrap();
+
+        let args = args(&cmd);
+        let expected_capability_drops = ["CAP_SYS_ADMIN", "CAP_SYS_PTRACE"];
+        for capability in expected_capability_drops {
+            assert!(
+                args.windows(2)
+                    .any(|window| window == ["--cap-drop", capability]),
+                "wrap_command must apply supported bubblewrap drop for {capability}"
+            );
+        }
+    }
+
+    #[test]
+    fn bubblewrap_wrap_command_does_not_add_bare_seccomp_without_profile_fd() {
+        let sandbox = BubblewrapSandbox;
+        let mut cmd = Command::new("echo");
+        sandbox.wrap_command(&mut cmd).unwrap();
+
+        assert!(
+            !args(&cmd).contains(&"--seccomp".to_string()),
+            "bubblewrap --seccomp requires a seccomp BPF profile fd and must not be added bare"
+        );
+    }
+
+    #[test]
     fn bubblewrap_wrap_command_preserves_original_command() {
         let sandbox = BubblewrapSandbox;
         let mut cmd = Command::new("ls");
@@ -157,10 +305,7 @@ mod tests {
         cmd.arg("/tmp");
         sandbox.wrap_command(&mut cmd).unwrap();
 
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|s| s.to_string_lossy().to_string())
-            .collect();
+        let args = args(&cmd);
 
         assert!(
             args.contains(&"ls".to_string()),
@@ -186,10 +331,7 @@ mod tests {
         let mut cmd = Command::new("echo");
         sandbox.wrap_command(&mut cmd).unwrap();
 
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|s| s.to_string_lossy().to_string())
-            .collect();
+        let args = args(&cmd);
 
         for lib_dir in &["/lib64", "/lib"] {
             if std::path::Path::new(lib_dir).exists() {
@@ -215,10 +357,7 @@ mod tests {
         let mut cmd = Command::new("echo");
         sandbox.wrap_command(&mut cmd).unwrap();
 
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|s| s.to_string_lossy().to_string())
-            .collect();
+        let args = args(&cmd);
 
         assert!(
             args.contains(&"--ro-bind".to_string()),

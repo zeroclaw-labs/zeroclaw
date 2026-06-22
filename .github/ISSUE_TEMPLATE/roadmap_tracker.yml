@@ -1,0 +1,89 @@
+name: Roadmap / Tracker Issue
+description: Create an active release, roadmap, RFC, or implementation tracker
+title: "[Tracker]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for an active coordination surface, not for a single ordinary bug or feature request.
+        Trackers can supply stale-exemption evidence while they remain current, but maintainers
+        still decide whether to apply `status:no-stale`.
+
+  - type: dropdown
+    id: tracker_kind
+    attributes:
+      label: Tracker kind
+      options:
+        - release / milestone tracker
+        - roadmap / epic tracker
+        - RFC / design tracker
+        - implementation batch tracker
+        - cleanup / audit tracker
+        - not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: purpose
+    attributes:
+      label: Purpose
+      description: What active decision, coordination, or rollout does this tracker own?
+      placeholder: This tracker coordinates ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and non-goals
+      description: What belongs here, and what should be tracked elsewhere?
+      placeholder: |
+        In scope:
+        Out of scope:
+    validations:
+      required: true
+
+  - type: textarea
+    id: linked_work
+    attributes:
+      label: Linked work
+      description: List related issues, PRs, RFCs, discussions, milestones, or docs.
+      placeholder: |
+        - #...
+        - PR #...
+    validations:
+      required: false
+
+  - type: textarea
+    id: routing_evidence
+    attributes:
+      label: Routing evidence and next decision
+      description: Required if this tracker should remain open long term or be considered for stale protection.
+      placeholder: |
+        Reason to stay open:
+        Next decision/revisit:
+        Visible owner, assignee, milestone, linked tracker, or review cadence:
+    validations:
+      required: true
+
+  - type: textarea
+    id: close_criteria
+    attributes:
+      label: Close criteria
+      description: What has to be true before this tracker closes or is replaced?
+      placeholder: Close when ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: stale_exemption
+    attributes:
+      label: Stale-exemption requested?
+      description: Maintainers decide the label separately; this field records the request and evidence.
+      options:
+        - "No"
+        - "Yes - tracker itself is the active coordination surface"
+        - "Yes - linked milestone/RFC/decision surface carries the reason"
+        - "Not sure"
+    validations:
+      required: true

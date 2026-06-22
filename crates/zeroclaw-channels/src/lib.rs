@@ -33,6 +33,8 @@ pub mod clawdtalk;
 pub mod dingtalk;
 #[cfg(feature = "channel-discord")]
 pub mod discord;
+#[cfg(feature = "channel-discord")]
+pub mod discord_slash_state;
 #[cfg(feature = "channel-email")]
 pub mod email_channel;
 #[cfg(feature = "channel-email")]

@@ -43,6 +43,10 @@ pub struct IrcChannel {
 
 type WriteHalf = tokio::io::WriteHalf<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
 
+fn is_irc_nick_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
 /// Style instruction prepended to every IRC message before it reaches the LLM.
 /// IRC clients render plain text only — no markdown, no HTML, no XML.
 const IRC_STYLE_PREFIX: &str = "\
@@ -279,8 +283,24 @@ impl IrcChannel {
     }
 
     fn is_mentioned(my_nick: &str, text: &str) -> bool {
-        text.to_ascii_lowercase()
-            .contains(&my_nick.to_ascii_lowercase())
+        let nick = my_nick.to_ascii_lowercase();
+        if nick.is_empty() {
+            return false;
+        }
+
+        let text = text.to_ascii_lowercase();
+        text.match_indices(&nick).any(|(start, matched)| {
+            let before = if start == 0 {
+                None
+            } else {
+                text[..start].chars().next_back()
+            };
+            let end = start + matched.len();
+            let after = text[end..].chars().next();
+
+            before.is_none_or(|ch| !is_irc_nick_char(ch))
+                && after.is_none_or(|ch| !is_irc_nick_char(ch))
+        })
     }
 
     /// Create a TLS connection to the IRC server.
@@ -1002,6 +1022,17 @@ mod tests {
             "bot",
             "This one doesn't mention."
         ));
+    }
+
+    #[test]
+    fn mention_only_requires_token_boundary() {
+        assert!(!IrcChannel::is_mentioned("bot", "robotics team update"));
+        assert!(!IrcChannel::is_mentioned("bot", "this is bothering me"));
+        assert!(!IrcChannel::is_mentioned("bot", "bot_away status update"));
+
+        assert!(IrcChannel::is_mentioned("bot", "bot: status?"));
+        assert!(IrcChannel::is_mentioned("bot", "@bot status?"));
+        assert!(IrcChannel::is_mentioned("bot", "hey bot, status?"));
     }
 
     #[test]

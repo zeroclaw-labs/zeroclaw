@@ -23,9 +23,29 @@ type ActivationHook = Arc<dyn Fn(Arc<dyn Tool>) + Send + Sync>;
 /// When set on `ToolSearchTool`, deferred tools that fail this check are
 /// never surfaced to the LLM and never activated — keeping them out of
 /// the context window entirely.
+///
+/// The policy carries two independent allow-list gates that are AND-ed
+/// together, plus a single deny-list:
+///
+/// - `allowed`: the agent's risk-profile allow-list. The MCP
+///   `<server>__<tool>` auto-admit exception (any name containing `__`
+///   passes when the list is non-empty) applies **only** to this gate.
+///   This is the high-risk default-accept-unless-denied shift introduced
+///   in PR #7547 so that the post-#7464 `mcp.enabled = true` default
+///   actually surfaces discovered MCP tools to agents.
+/// - `caller_allowed`: a caller-supplied per-run allow-list (cron job
+///   `allowed_tools`, narrowed delegate invocations, etc.). This is a
+///   strict explicit-list intersection — there is **no** MCP auto-admit
+///   on this gate. PR #7547 review (Audacity88, singlerider) called out
+///   that collapsing this list into `allowed` made per-run narrowing
+///   stop working as a capability boundary the moment an MCP server was
+///   configured.
+/// - `denied`: subtracts from the final set. Applies to both gates and
+///   to auto-admitted MCP names.
 #[derive(Clone, Default)]
 pub struct ToolAccessPolicy {
     pub allowed: Option<Vec<String>>,
+    pub caller_allowed: Option<Vec<String>>,
     pub denied: Option<Vec<String>>,
 }
 
@@ -33,6 +53,13 @@ impl ToolAccessPolicy {
     /// Construct from a `SecurityPolicy`'s tool fields and an optional
     /// caller-supplied allowlist. Used by both `run()` and
     /// `process_message()` to keep policy construction in sync.
+    ///
+    /// The risk-profile `allowed_tools` and the caller-supplied
+    /// `caller_allowed` are kept as two separate gates inside the
+    /// returned policy. Per PR #7547 review, this is required so the
+    /// MCP `<server>__<tool>` auto-admit exception that applies to the
+    /// risk-profile gate does **not** silently widen narrower per-run
+    /// allow-lists.
     pub fn from_security(
         allowed_tools: Option<&[String]>,
         excluded_tools: Option<&[String]>,
@@ -40,18 +67,15 @@ impl ToolAccessPolicy {
     ) -> Option<Self> {
         let mut policy = Self::default();
         if let Some(list) = allowed_tools {
-            let mut merged = list.to_vec();
-            if let Some(caller) = caller_allowed {
-                merged.retain(|t| caller.iter().any(|c| c == t));
-            }
-            policy.allowed = Some(merged);
-        } else if let Some(caller) = caller_allowed {
-            policy.allowed = Some(caller.to_vec());
+            policy.allowed = Some(list.to_vec());
+        }
+        if let Some(caller) = caller_allowed {
+            policy.caller_allowed = Some(caller.to_vec());
         }
         if let Some(list) = excluded_tools {
             policy.denied = Some(list.to_vec());
         }
-        if policy.allowed.is_some() || policy.denied.is_some() {
+        if policy.allowed.is_some() || policy.caller_allowed.is_some() || policy.denied.is_some() {
             Some(policy)
         } else {
             None
@@ -59,15 +83,36 @@ impl ToolAccessPolicy {
     }
 
     pub fn is_tool_allowed(&self, name: &str) -> bool {
-        let in_allow = self
-            .allowed
-            .as_ref()
-            .is_none_or(|list| list.iter().any(|t| t == name));
+        // Deny-list always wins.
         let in_deny = self
             .denied
             .as_ref()
             .is_some_and(|list| list.iter().any(|t| t == name));
-        in_allow && !in_deny
+        if in_deny {
+            return false;
+        }
+
+        // Risk-profile gate: MCP `<server>__<tool>` names are auto-admitted
+        // when the list is non-empty. An explicit empty list (`Some(vec![])`)
+        // still means "deny everything".
+        let risk_ok = match self.allowed.as_ref() {
+            None => true,
+            Some(list) if list.is_empty() => false,
+            Some(list) => list.iter().any(|t| t == name) || name.contains("__"),
+        };
+        if !risk_ok {
+            return false;
+        }
+
+        // Caller-supplied per-run gate: strict explicit-list intersection.
+        // No MCP auto-admit here — per PR #7547 review, that exception is
+        // scoped to the risk-profile gate so per-run narrowing (cron jobs,
+        // narrowed delegate invocations) remains a reliable capability
+        // boundary even when an MCP server is configured.
+        match self.caller_allowed.as_ref() {
+            None => true,
+            Some(list) => list.iter().any(|t| t == name),
+        }
     }
 }
 
@@ -193,7 +238,22 @@ impl Tool for ToolSearchTool {
         let mut activated_count = 0;
         let mut returned_count = 0;
         let mut newly_activated = Vec::new();
-        let mut guard = self.activated.lock().unwrap();
+        let mut guard = match self.activated.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "query": query,
+                            "mode": "keyword_search",
+                        })),
+                    "tool_search activated-tool lock poisoned during keyword activation; recovering guard"
+                );
+                poisoned.into_inner()
+            }
+        };
 
         for stub in &results {
             if returned_count >= max_results {
@@ -257,7 +317,22 @@ impl ToolSearchTool {
         let mut not_found = Vec::new();
         let mut activated_count = 0;
         let mut newly_activated = Vec::new();
-        let mut guard = self.activated.lock().unwrap();
+        let mut guard = match self.activated.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "requested_names": names,
+                            "mode": "select",
+                        })),
+                    "tool_search activated-tool lock poisoned during select activation; recovering guard"
+                );
+                poisoned.into_inner()
+            }
+        };
 
         for name in names {
             if name.is_empty() {
@@ -343,6 +418,16 @@ mod tests {
         DeferredMcpToolStub::new(name.to_string(), def)
     }
 
+    fn assert_poisoned_activated_contains(
+        activated: &Arc<Mutex<ActivatedToolSet>>,
+        tool_name: &str,
+    ) {
+        let guard = activated
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(guard.is_activated(tool_name));
+    }
+
     #[tokio::test]
     async fn tool_metadata() {
         let tool = ToolSearchTool::new(
@@ -413,6 +498,31 @@ mod tests {
         assert!(activated.lock().unwrap().is_activated("fs__read"));
     }
 
+    #[tokio::test]
+    async fn keyword_search_recovers_poisoned_activated_lock() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let poisoned = Arc::clone(&activated);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().expect("test mutex should lock");
+            panic!("poison activated-tools lock");
+        })
+        .join();
+        let tool = ToolSearchTool::new(
+            make_deferred_set(vec![make_stub("fs__read", "Read a file from disk")]).await,
+            Arc::clone(&activated),
+        );
+
+        let result = tool
+            .execute(serde_json::json!({"query": "read file"}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("<function>"));
+        assert!(result.output.contains("fs__read"));
+        assert_poisoned_activated_contains(&activated, "fs__read");
+    }
+
     /// Verify tool_search works with stubs from multiple MCP servers,
     /// simulating a daemon-mode setup where several servers are deferred.
     #[tokio::test]
@@ -478,6 +588,32 @@ mod tests {
         assert_eq!(guard.tool_specs().len(), 2);
     }
 
+    #[tokio::test]
+    async fn select_recovers_poisoned_activated_lock() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let poisoned = Arc::clone(&activated);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().expect("test mutex should lock");
+            panic!("poison activated-tools lock");
+        })
+        .join();
+        let stubs = vec![
+            make_stub("srv__tool_a", "Tool A"),
+            make_stub("srv__tool_b", "Tool B"),
+        ];
+        let tool = ToolSearchTool::new(make_deferred_set(stubs).await, Arc::clone(&activated));
+
+        let result = tool
+            .execute(serde_json::json!({"query": "select:srv__tool_a"}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("<function>"));
+        assert!(result.output.contains("srv__tool_a"));
+        assert_poisoned_activated_contains(&activated, "srv__tool_a");
+    }
+
     /// Verify re-activating an already-activated tool does not duplicate it.
     #[tokio::test]
     async fn reactivation_is_idempotent() {
@@ -531,7 +667,7 @@ mod tests {
     fn policy_allowlist_admits_only_listed() {
         let p = ToolAccessPolicy {
             allowed: Some(vec!["shell".into(), "file_read".into()]),
-            denied: None,
+            ..ToolAccessPolicy::default()
         };
         assert!(p.is_tool_allowed("shell"));
         assert!(!p.is_tool_allowed("file_write"));
@@ -540,8 +676,8 @@ mod tests {
     #[test]
     fn policy_denylist_rejects_listed() {
         let p = ToolAccessPolicy {
-            allowed: None,
             denied: Some(vec!["shell".into()]),
+            ..ToolAccessPolicy::default()
         };
         assert!(!p.is_tool_allowed("shell"));
         assert!(p.is_tool_allowed("file_read"));
@@ -552,6 +688,7 @@ mod tests {
         let p = ToolAccessPolicy {
             allowed: Some(vec!["shell".into(), "file_read".into()]),
             denied: Some(vec!["shell".into()]),
+            ..ToolAccessPolicy::default()
         };
         assert!(!p.is_tool_allowed("shell"));
         assert!(p.is_tool_allowed("file_read"));
@@ -565,8 +702,8 @@ mod tests {
             make_stub("srv__blocked_tool", "A blocked tool"),
         ];
         let policy = ToolAccessPolicy {
-            allowed: None,
             denied: Some(vec!["srv__blocked_tool".into()]),
+            ..ToolAccessPolicy::default()
         };
         let tool = ToolSearchTool::new(make_deferred_set(stubs).await, Arc::clone(&activated))
             .with_access_policy(policy);
@@ -591,8 +728,8 @@ mod tests {
             make_stub("srv__allowed_tool", "tool for files"),
         ];
         let policy = ToolAccessPolicy {
-            allowed: None,
             denied: Some(vec!["srv__denied_tool".into()]),
+            ..ToolAccessPolicy::default()
         };
         let tool = ToolSearchTool::new(make_deferred_set(stubs).await, Arc::clone(&activated))
             .with_access_policy(policy);
@@ -616,9 +753,14 @@ mod tests {
             make_stub("srv__ok", "OK tool"),
             make_stub("srv__nope", "Blocked tool"),
         ];
+        // Runtime-discovered MCP tools (names containing "__") are auto-admitted
+        // when an allow-list is present, so the operator-visible way to block a
+        // specific MCP tool is the deny-list (the `excluded_tools` equivalent).
+        // See `ToolAccessPolicy::is_tool_allowed` and PR #7547.
         let policy = ToolAccessPolicy {
             allowed: Some(vec!["srv__ok".into()]),
-            denied: None,
+            denied: Some(vec!["srv__nope".into()]),
+            ..ToolAccessPolicy::default()
         };
         let tool = ToolSearchTool::new(make_deferred_set(stubs).await, Arc::clone(&activated))
             .with_access_policy(policy);
@@ -632,5 +774,90 @@ mod tests {
         assert!(!result.output.contains("\"name\": \"srv__nope\""));
         assert!(result.output.contains("Not found"));
         assert!(!activated.lock().unwrap().is_activated("srv__nope"));
+    }
+
+    /// PR #7547 review (Audacity88 / singlerider) — second-round blocking:
+    /// the MCP `<server>__<tool>` auto-admit exception must apply ONLY to
+    /// the risk-profile allow-list, not to the caller-supplied per-run
+    /// `allowed_tools`. Otherwise a cron job that narrows
+    /// `allowed_tools = ["cron_add"]` would still surface every
+    /// runtime-discovered MCP wrapper, breaking per-job capability
+    /// narrowing the moment an MCP server is configured.
+    ///
+    /// This test fixes `from_security` semantics so an MCP name the
+    /// caller did not explicitly include is rejected even when the
+    /// risk-profile allow-list would auto-admit it.
+    #[test]
+    fn caller_allowed_per_run_gate_does_not_auto_admit_mcp_names() {
+        // The risk-profile gate is wide (unrestricted), so the MCP
+        // auto-admit would happily pass any `__` name. The caller-supplied
+        // per-run list narrows down to a single non-MCP tool (`cron_add`).
+        let policy = ToolAccessPolicy::from_security(None, None, Some(&["cron_add".to_string()]))
+            .expect("caller-supplied list should produce a policy");
+
+        assert!(
+            policy.is_tool_allowed("cron_add"),
+            "cron_add must pass — it is in the caller list"
+        );
+        assert!(
+            !policy.is_tool_allowed("filesystem__write_file"),
+            "MCP wrapper outside the caller list must be rejected, but \
+             was admitted — the per-run gate is leaking the risk-profile \
+             MCP auto-admit exception (PR #7547 review regression)"
+        );
+        assert!(
+            !policy.is_tool_allowed("github__search"),
+            "second MCP wrapper outside the caller list must also be \
+             rejected (PR #7547 review regression)"
+        );
+    }
+
+    /// Companion to the test above: even when the risk profile DOES have
+    /// a non-empty allow-list (so the auto-admit branch is live on that
+    /// gate), the caller-supplied per-run list still narrows the final
+    /// set strictly. The risk-profile auto-admit must not leak past the
+    /// per-run gate.
+    #[test]
+    fn caller_allowed_per_run_gate_narrows_after_risk_profile_auto_admit() {
+        let policy = ToolAccessPolicy::from_security(
+            Some(&["shell".to_string()]),
+            None,
+            Some(&["shell".to_string(), "github__search".to_string()]),
+        )
+        .expect("risk + caller lists should produce a policy");
+
+        // `shell`: in risk allow + in caller list → admitted.
+        assert!(policy.is_tool_allowed("shell"));
+        // `github__search`: auto-admitted by risk MCP exception + in caller
+        // list → admitted.
+        assert!(policy.is_tool_allowed("github__search"));
+        // `filesystem__write_file`: auto-admitted by risk MCP exception
+        // (would pass the risk gate) but NOT in caller list → rejected.
+        // This is the per-run narrowing the bug used to break.
+        assert!(
+            !policy.is_tool_allowed("filesystem__write_file"),
+            "MCP wrapper not in caller list must be rejected even when \
+             the risk-profile auto-admit would let it through"
+        );
+        // Non-MCP outside both lists: rejected.
+        assert!(!policy.is_tool_allowed("memory_recall"));
+    }
+
+    /// `excluded_tools` must subtract regardless of which gate admitted
+    /// the name. Pins the deny-list contract across the refactor.
+    #[test]
+    fn caller_allowed_per_run_gate_still_honors_denylist() {
+        let policy = ToolAccessPolicy::from_security(
+            Some(&["shell".to_string()]),
+            Some(&["filesystem__write_file".to_string()]),
+            Some(&["shell".to_string(), "filesystem__write_file".to_string()]),
+        )
+        .expect("policy with all three fields should be constructed");
+
+        assert!(policy.is_tool_allowed("shell"));
+        assert!(
+            !policy.is_tool_allowed("filesystem__write_file"),
+            "denylist subtracts even when both gates would admit"
+        );
     }
 }

@@ -24,6 +24,10 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+pub const PRUNED_TOOL_EXCHANGE_SUMMARY_PREFIX: &str = "[Tool exchange:";
+pub const PRUNED_TOOL_EXCHANGE_SUMMARY_SUFFIX: &str = "results collapsed]";
+pub const PRUNED_CONTEXT_SEPARATOR: &str = "[context continues]";
+
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
@@ -51,6 +55,28 @@ impl ChatMessage {
             role: "tool".into(),
             content: content.into(),
         }
+    }
+
+    pub fn pruned_tool_exchange_summary(tool_count: usize) -> String {
+        format!(
+            "{PRUNED_TOOL_EXCHANGE_SUMMARY_PREFIX} {tool_count} tool call(s) — {PRUNED_TOOL_EXCHANGE_SUMMARY_SUFFIX}"
+        )
+    }
+
+    pub fn pruned_context_separator() -> Self {
+        Self::user(PRUNED_CONTEXT_SEPARATOR)
+    }
+
+    pub fn is_pruned_tool_exchange_summary(&self) -> bool {
+        self.role == "assistant"
+            && self
+                .content
+                .starts_with(PRUNED_TOOL_EXCHANGE_SUMMARY_PREFIX)
+            && self.content.contains(PRUNED_TOOL_EXCHANGE_SUMMARY_SUFFIX)
+    }
+
+    pub fn is_pruned_context_separator(&self) -> bool {
+        self.role == "user" && self.content.trim() == PRUNED_CONTEXT_SEPARATOR
     }
 }
 

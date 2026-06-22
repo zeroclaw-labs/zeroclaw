@@ -8,7 +8,7 @@ use anyhow::Result;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::PacingConfig;
-use zeroclaw_providers::{ChatMessage, ModelProvider};
+use zeroclaw_providers::{ChatMessage, ModelProvider, ProviderDispatch};
 
 /// Graceful shutdown after the loop exhausts `max_iterations` (upstream loop
 /// body, max-iteration exit): log exhaustion, push a summary-request user
@@ -34,6 +34,7 @@ pub(crate) async fn finish_after_max_iterations(
     ::zeroclaw_log::record!(
         WARN,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_category(::zeroclaw_log::EventCategory::Agent)
             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
             .with_attrs(::serde_json::json!({
                 "model": model,
@@ -53,6 +54,7 @@ pub(crate) async fn finish_after_max_iterations(
     ::zeroclaw_log::record!(
         WARN,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_category(::zeroclaw_log::EventCategory::Agent)
             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
             .with_attrs(::serde_json::json!({"max_iterations": max_iterations})),
         "Max iterations reached, requesting final summary"
@@ -85,7 +87,8 @@ pub(crate) async fn finish_after_max_iterations(
                 .ok()
                 .flatten(),
         };
-        let summary_future = model_provider.chat(summary_request, model, temperature);
+        let dispatcher = ProviderDispatch::from_ref(model_provider);
+        let summary_future = dispatcher.chat(summary_request, model, temperature);
         match pacing.step_timeout_secs {
             Some(step_secs) if step_secs > 0 => {
                 let step_timeout = Duration::from_secs(step_secs);
@@ -130,6 +133,7 @@ pub(crate) async fn finish_after_max_iterations(
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Provider)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "model": model,

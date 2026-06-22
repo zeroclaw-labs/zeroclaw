@@ -226,6 +226,23 @@ pub async fn poll_device_code_tokens(
 }
 
 pub async fn receive_loopback_code(expected_state: &str, timeout: Duration) -> Result<String> {
+    // OAuth callback receiver has no concrete provider alias at this
+    // level (it's a low-level helper used during the OAuth dance,
+    // before the provider is constructed). Attribute with the provider
+    // type so on-disk events still slot under the right
+    // model_provider_type bucket. The "oauth" alias is a sentinel for
+    // "this happened during the OAuth dance".
+    ::zeroclaw_log::scope!(
+        model_provider_type: "openai",
+        model_provider_alias: "oauth",
+        => async move {
+            receive_loopback_code_inner(expected_state, timeout).await
+        }
+    )
+    .await
+}
+
+async fn receive_loopback_code_inner(expected_state: &str, timeout: Duration) -> Result<String> {
     let listener = TcpListener::bind("127.0.0.1:1455")
         .await
         .context("Failed to bind callback listener at 127.0.0.1:1455")?;
@@ -395,6 +412,21 @@ async fn parse_token_response(response: reqwest::Response) -> Result<TokenSet> {
 /// ZeroClaw's auth store. Replaces the `import_openai_codex_auth_profile`
 /// helper formerly in `src/main.rs`.
 pub async fn import_codex_auth_profile(
+    auth_service: &super::AuthService,
+    profile: &str,
+    import_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    ::zeroclaw_log::scope!(
+        model_provider_type: "openai",
+        model_provider_alias: profile,
+        => async move {
+            import_codex_auth_profile_inner(auth_service, profile, import_path).await
+        }
+    )
+    .await
+}
+
+async fn import_codex_auth_profile_inner(
     auth_service: &super::AuthService,
     profile: &str,
     import_path: &std::path::Path,

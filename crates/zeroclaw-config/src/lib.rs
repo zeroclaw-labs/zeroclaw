@@ -6,6 +6,7 @@
 #![allow(clippy::to_string_in_format_args)]
 #![allow(clippy::useless_format)]
 
+pub mod alias_refs;
 pub mod api_error;
 pub mod autonomy;
 pub mod comment_writer;

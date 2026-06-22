@@ -186,6 +186,29 @@ for f in "${docs_files[@]}"; do
   esac
 done
 
+# ── Docs stable-version pointer ────────────────────────────────────
+# Single source of truth for "which deployed docs version is Stable". The
+# docs-deploy workflow reads this to resolve the "Stable (latest release)"
+# selector entry and the root redirect, with no numeric guessing and no duplicate
+# stable/ tree. Running bump-version IS the declaration that this version is
+# the new stable; landing this change on master refreshes the stable metadata
+# (root redirect and selector entry resolve to this release's existing version
+# dir). It does not rebuild or republish the release tag's docs.
+echo "Docs stable-version pointer..."
+STABLE_PTR="$REPO_ROOT/docs/book/stable-version.txt"
+if [[ -f "$STABLE_PTR" ]]; then
+  before="$(cat "$STABLE_PTR")"
+  printf 'v%s\n' "$VERSION" > "$STABLE_PTR"
+  if [[ "$before" != "$(cat "$STABLE_PTR")" ]]; then
+    echo "  updated: docs/book/stable-version.txt"
+    changed=$((changed + 1))
+  fi
+else
+  printf 'v%s\n' "$VERSION" > "$STABLE_PTR"
+  echo "  created: docs/book/stable-version.txt"
+  changed=$((changed + 1))
+fi
+
 # ── Generated install surfaces (single source of truth) ───────────
 # After the workspace version is bumped, regenerate every spec-driven install
 # surface so version and feature sets stay canonical. This OWNS the version and

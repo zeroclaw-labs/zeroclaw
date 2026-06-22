@@ -19,6 +19,14 @@ Cloud API mode is the Meta Business Platform integration. It requires a Meta Bus
 
 The gateway must be reachable by Meta for inbound webhooks. Configure a tunnel under the top-level `[tunnel]` section (`tunnel_provider` and the related provider blocks, see the [config reference](../reference/config.md#tunnel)), or front the gateway with your own reverse proxy when developing locally.
 
+Point Meta's Callback URL at the alias of the `[channels.whatsapp.<alias>]`
+instance that should receive it: `GET`/`POST https://<your-public-url>/whatsapp/<alias>`
+(e.g. `[channels.whatsapp.work]` → `/whatsapp/work`). This per-alias routing
+(#6312) lets multiple WhatsApp numbers run side by side. The bare `/whatsapp`
+path still works but is **deprecated**: it resolves to the lexicographically-first
+alias (deterministic across restarts) and sets an `X-Zeroclaw-Deprecation` response
+header. An unknown alias returns `404`. Single-instance deployments need no change.
+
 ## Web mode
 
 WhatsApp Web mode links a regular WhatsApp account through the optional Web backend. It does not need a Meta Business account. It does need a ZeroClaw build with the `whatsapp-web` feature enabled and a persistent session database path.

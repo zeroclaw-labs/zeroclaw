@@ -121,9 +121,10 @@ use zeroclaw_api::session_keys::sanitize_session_key;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
-use zeroclaw_providers::{self, ChatMessage, ModelProvider};
+use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
+use zeroclaw_runtime::agent::history::fast_trim_tool_results;
 use zeroclaw_runtime::agent::loop_::{
-    LoopKnobs, apply_policy_tool_filter, apply_text_tool_prompt_policy,
+    LoopKnobs, ToolLoop, apply_policy_tool_filter, apply_text_tool_prompt_policy,
     build_tool_instructions_for_names, clear_model_switch_request, get_model_switch_state,
     is_model_switch_requested, run_tool_call_loop, scope_session_key, scope_thread_id,
     scrub_credentials,
@@ -202,7 +203,7 @@ impl Observer for ChannelNotifyObserver {
 /// Per-sender conversation history for channel messages.
 /// Bounded by `MAX_CONVERSATION_SENDERS` — oldest-accessed senders are evicted.
 type ConversationHistoryMap = Arc<Mutex<lru::LruCache<String, Vec<ChatMessage>>>>;
-/// Senders that requested `/new` and must force a fresh prompt on their next message.
+/// Senders that requested `/new` or `/clear` and must force a fresh prompt on their next message.
 type PendingNewSessionSet = Arc<Mutex<HashSet<String>>>;
 /// Maximum conversation senders kept in memory (LRU eviction beyond this).
 const MAX_CONVERSATION_SENDERS: usize = 1000;
@@ -254,6 +255,10 @@ const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn ModelProvider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
+/// Session-only model overrides scoped above the per-sender [`RouteSelectionMap`].
+/// Keyed by a `scope_override_key` (prefixed `user::`/`guild::`/`agent::`), so all
+/// three tiers share one in-memory map. Never persisted — lost on restart by design.
+type ScopedRouteMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
 
 fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
     configured.max(MIN_CHANNEL_MESSAGE_TIMEOUT_SECS)
@@ -290,12 +295,35 @@ struct ChannelRouteSelection {
     api_key: Option<String>,
 }
 
+/// Selectable scope for a session-only `/model` override. The absence of any
+/// stored entry is the implicit "default" (config) tier, so it is not a variant.
+/// Precedence at resolution time is `User > Agent` (above the per-sender
+/// route override and the config default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverrideScope {
+    /// All chats for the invoking user under this bot alias (drops thread).
+    User,
+    /// The whole agent, everywhere (drops the sender).
+    Agent,
+}
+
+impl OverrideScope {
+    fn label(self) -> &'static str {
+        match self {
+            OverrideScope::User => "user",
+            OverrideScope::Agent => "agent",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ChannelRuntimeCommand {
     ShowProviders,
     SetProvider(String),
     ShowModel,
     SetModel(String),
+    /// `/model --user|--agent <ref>` — set the model at an explicit scope.
+    SetModelScoped(OverrideScope, String),
     ShowConfig,
     NewSession,
 }
@@ -438,6 +466,10 @@ struct ChannelRuntimeContext {
     pending_new_sessions: PendingNewSessionSet,
     provider_cache: ProviderCacheMap,
     route_overrides: RouteSelectionMap,
+    /// Session-only `/model` overrides scoped by user/guild/agent (see
+    /// [`ScopedRouteMap`]). Consulted above `route_overrides` in
+    /// [`get_route_selection`]; never persisted.
+    scope_overrides: ScopedRouteMap,
     reliability: Arc<zeroclaw_config::schema::ReliabilityConfig>,
     provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions,
     workspace_dir: Arc<PathBuf>,
@@ -526,14 +558,18 @@ fn conversation_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> Strin
     sanitize_session_key(&raw)
 }
 
-pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
-    // Channel prefix includes the zeroclaw alias when present so two bots
-    // on the same platform (e.g. `discord.clamps` + `discord.glados`)
-    // compute distinct session_keys and don't share conversation history.
-    let channel_scope = match &msg.channel_alias {
+/// The channel prefix used in session/route keys: the channel type plus the
+/// zeroclaw alias when present, so two bots on the same platform (e.g.
+/// `discord.clamps` + `discord.glados`) never share a keyspace.
+fn channel_scope(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    match &msg.channel_alias {
         Some(alias) => format!("{}.{}", msg.channel, alias),
         None => msg.channel.clone(),
-    };
+    }
+}
+
+pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    let channel_scope = channel_scope(msg);
     if msg.channel == "wecom_ws" {
         return sanitize_session_key(&format!("{channel_scope}_{}", msg.reply_target));
     }
@@ -543,16 +579,32 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
     // after a restart; otherwise hydration loads sessions under the on-disk
     // (sanitized) name while lookup keeps producing the un-sanitized form.
     let thread_scope = match msg.thread_ts.as_deref() {
-        // Matrix root events can be self-anchored when `reply_in_thread`
-        // is enabled so outbound replies open a thread. That anchor is a
-        // delivery detail, not a conversation-history boundary; otherwise
-        // every top-level Matrix message becomes a fresh session.
-        Some(tid) if is_matrix_channel_name(&msg.channel) && tid == msg.id => None,
+        // Matrix thread_ts is a delivery anchor, not a topic boundary: root
+        // and follow-ups must share one sender+room session. See #7700.
+        Some(_) if is_matrix_channel_name(&msg.channel) => None,
         other => other,
     };
     let raw = match thread_scope {
         Some(tid) => format!("{channel_scope}_{}_{tid}_{}", msg.reply_target, msg.sender),
         None => format!("{channel_scope}_{}_{}", msg.reply_target, msg.sender),
+    };
+    sanitize_session_key(&raw)
+}
+
+/// Build the [`ScopedRouteMap`] key for a `/model` override at `scope`.
+///
+/// Keyspaces are kept disjoint from [`conversation_history_key`] via a
+/// `user::`/`agent::` prefix applied before sanitizing. Each tier deliberately
+/// drops identifiers below its scope: `User` spans all of a sender's chats (no
+/// reply_target/thread), `Agent` spans everything (no sender).
+fn scope_override_key(
+    scope: OverrideScope,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    agent_alias: &str,
+) -> String {
+    let raw = match scope {
+        OverrideScope::User => format!("user::{}::{}", channel_scope(msg), msg.sender),
+        OverrideScope::Agent => format!("agent::{agent_alias}"),
     };
     sanitize_session_key(&raw)
 }
@@ -802,6 +854,16 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - For media attachments use markers: [IMAGE:<absolute-path>], [DOCUMENT:<absolute-path>], [VIDEO:<absolute-path>], [AUDIO:<absolute-path>], or [VOICE:<absolute-path>]\n\
              - Paths inside markers MUST be absolute (starting with /) and live inside the configured workspace directory. Never use relative paths.\n\
              - Remote media is also accepted via http:// or https:// URLs in the same marker form.\n\
+             - For a rich embed, emit [EMBED:{...}] where {...} is a Discord embed JSON object (keys: title, description, url, color, timestamp, footer{text,icon_url}, image, thumbnail, author{name,url,icon_url}, fields[{name,value,inline}]). Any image/thumbnail/icon/url MUST be an http(s) URL; local paths are not embeddable. Keep the JSON on one line.\n\
+             - To offer interactive buttons or a menu, emit one marker [COMPONENTS:{\"rows\":[[<component>, ...], ...]}] on a single line (up to 5 rows; a row holds up to 5 buttons OR exactly one select). Action button: {\"label\":\"Approve\",\"style\":\"primary|secondary|success|danger\",\"prompt\":\"<text run as a new turn when clicked>\"}; link button: {\"label\":\"Docs\",\"url\":\"https://...\"}; select: {\"select\":\"placeholder\",\"options\":[{\"label\":\"A\",\"value\":\"a\",\"prompt\":\"<run when chosen>\"}, ...]}. A button may instead carry a modal (a popup form) in place of prompt/url: {\"label\":\"Report\",\"style\":\"danger\",\"prompt\":\"<run on submit>\",\"modal\":{\"title\":\"Report\",\"fields\":[{\"id\":\"reason\",\"label\":\"Reason\",\"style\":\"short|paragraph\",\"required\":true,\"placeholder\":\"...\",\"min\":1,\"max\":500}]}} — clicking opens the form and the typed field values are appended to that button's prompt when submitted. Every action button and select option needs a prompt describing what should happen when it is clicked.\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n",
+        ),
+        "whatsapp" | "whatsapp-web" => Some(
+            "When responding on WhatsApp Web:\n\
+             - Be concise and direct\n\
+             - For media attachments use markers: [IMAGE:<path>], [DOCUMENT:<path>], [VIDEO:<path>], [AUDIO:<path>], or [VOICE:<path>]\n\
+             - Marker paths must refer to local files inside the configured workspace directory. Absolute paths and workspace-relative paths are accepted when they stay inside that workspace.\n\
+             - Do not use http://, https://, data:, file:, or any other URL scheme in WhatsApp Web media markers.\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n",
         ),
         "telegram" => Some(
@@ -1138,8 +1200,15 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         .to_ascii_lowercase();
 
     match base_command.as_str() {
-        // `/new` is available on every channel — no model-switch gate.
+        // `/new` and bare `/clear` are available on every channel — no model-switch gate.
         "/new" => Some(ChannelRuntimeCommand::NewSession),
+        "/clear" => {
+            if parts.next().is_none() {
+                Some(ChannelRuntimeCommand::NewSession)
+            } else {
+                None
+            }
+        }
         // Model/model_provider switching is channel-gated.
         "/models" if supports_runtime_model_switch(channel_name) => {
             if let Some(model_provider) = parts.next() {
@@ -1151,11 +1220,24 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
             }
         }
         "/model" if supports_runtime_model_switch(channel_name) => {
-            let model = parts.collect::<Vec<_>>().join(" ").trim().to_string();
-            if model.is_empty() {
-                Some(ChannelRuntimeCommand::ShowModel)
-            } else {
-                Some(ChannelRuntimeCommand::SetModel(model))
+            let rest: Vec<&str> = parts.collect();
+            // An optional leading `--user|--agent` flag selects the override
+            // scope; without it, bare `/model <ref>` keeps its existing
+            // per-sender behavior.
+            let (scope, model_tokens) = match rest.first() {
+                Some(&"--user") => (Some(OverrideScope::User), &rest[1..]),
+                Some(&"--agent") => (Some(OverrideScope::Agent), &rest[1..]),
+                // A mistyped `--flag` is a typo, not a model id — don't silently
+                // set a model literally named "--foo". Show the help/ladder.
+                Some(t) if t.starts_with("--") => return Some(ChannelRuntimeCommand::ShowModel),
+                _ => (None, &rest[..]),
+            };
+            let model = model_tokens.join(" ").trim().to_string();
+            match (scope, model.is_empty()) {
+                // `/model` or `/model --scope` (no ref): show current + scopes.
+                (_, true) => Some(ChannelRuntimeCommand::ShowModel),
+                (None, false) => Some(ChannelRuntimeCommand::SetModel(model)),
+                (Some(scope), false) => Some(ChannelRuntimeCommand::SetModelScoped(scope, model)),
             }
         }
         "/config" if supports_runtime_model_switch(channel_name) => {
@@ -1450,7 +1532,10 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     )?;
     let model_provider_instance: Arc<dyn ModelProvider> = Arc::from(model_provider_instance);
 
-    if let Err(err) = model_provider_instance.warmup().await {
+    if let Err(err) = ProviderDispatch::from_ref(&*model_provider_instance)
+        .warmup()
+        .await
+    {
         if zeroclaw_providers::reliable::is_non_retryable(&err) {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": next_defaults.default_model_provider, "model": next_defaults.model, "err": err.to_string()})), "Rejecting config reload: model not available (non-retryable)");
             return Ok(());
@@ -1508,17 +1593,46 @@ fn default_route_selection_from_snapshot(
     }
 }
 
+/// First scope override that matches `msg`, in precedence order
+/// `User > Agent`. Session-only — never consults disk.
+fn scope_override_lookup(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> Option<ChannelRouteSelection> {
+    let overrides = ctx
+        .scope_overrides
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // Hot path: nearly all deployments never set a scoped override, so avoid
+    // building (and sanitizing) the per-scope keys on every message.
+    if overrides.is_empty() {
+        return None;
+    }
+    [OverrideScope::User, OverrideScope::Agent]
+        .into_iter()
+        .find_map(|scope| {
+            overrides
+                .get(&scope_override_key(scope, msg, ctx.agent_alias.as_str()))
+                .cloned()
+        })
+}
+
 fn get_route_selection(
     ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
     sender_key: &str,
     defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
 ) -> ChannelRouteSelection {
-    ctx.route_overrides
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(sender_key)
-        .cloned()
-        .unwrap_or_else(|| default_route_selection_from_snapshot(defaults_snapshot))
+    // Precedence (most specific wins): user > agent scope override,
+    // then the per-sender route override, then the config default.
+    scope_override_lookup(ctx, msg).unwrap_or_else(|| {
+        ctx.route_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(sender_key)
+            .cloned()
+            .unwrap_or_else(|| default_route_selection_from_snapshot(defaults_snapshot))
+    })
 }
 
 fn set_route_selection(
@@ -1536,6 +1650,74 @@ fn set_route_selection(
         routes.remove(sender_key);
     } else {
         routes.insert(sender_key.to_string(), next);
+    }
+}
+
+/// Resolve a `/model <ref>` request into `sel`. If `model` matches a configured
+/// model route by model name or hint, copy that route's provider/model/api_key;
+/// otherwise set the model id verbatim, keeping `sel`'s current provider. Shared
+/// by the bare `/model` and the scoped `/model --<scope>` handlers so both
+/// resolve a ref identically.
+fn apply_model_ref(
+    sel: &mut ChannelRouteSelection,
+    model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
+    model: &str,
+) {
+    if let Some(route) = model_routes
+        .iter()
+        .find(|r| r.model.eq_ignore_ascii_case(model) || r.hint.eq_ignore_ascii_case(model))
+    {
+        sel.model_provider = route.model_provider.clone();
+        sel.model = route.model.clone();
+        sel.api_key = route.api_key.clone();
+    } else {
+        sel.model = model.to_string();
+    }
+}
+
+/// Warning line for a `/model` confirmation when the value just written is NOT
+/// the one that will actually be used because a higher-precedence override
+/// shadows it (e.g. setting the agent scope while a user-scope override is
+/// active, or a per-sender set while any scope override is active). Empty when
+/// the written selection is the effective one.
+fn shadow_note(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    sender_key: &str,
+    defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
+    wrote: &ChannelRouteSelection,
+) -> String {
+    let effective = get_route_selection(ctx, msg, sender_key, defaults_snapshot);
+    if effective.model == wrote.model && effective.model_provider == wrote.model_provider {
+        String::new()
+    } else {
+        format!(
+            "\n⚠️ A higher-precedence override is active, so messages will use `{}` (`{}`) instead — see `/model`.",
+            effective.model, effective.model_provider
+        )
+    }
+}
+
+/// Write (or clear) a session-only scope override. Returns `false` without
+/// Write (or clear) a session-only scope override. Setting a value equal to the
+/// config default clears the override (mirrors [`set_route_selection`]).
+fn set_scope_override(
+    ctx: &ChannelRuntimeContext,
+    scope: OverrideScope,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    next: ChannelRouteSelection,
+    defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
+) {
+    let key = scope_override_key(scope, msg, ctx.agent_alias.as_str());
+    let default_route = default_route_selection_from_snapshot(defaults_snapshot);
+    let mut overrides = ctx
+        .scope_overrides
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if next == default_route {
+        overrides.remove(&key);
+    } else {
+        overrides.insert(key, next);
     }
 }
 
@@ -1650,13 +1832,35 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
     true
 }
 
+/// Number of most-recent turns whose tool-result payloads are kept at full size
+/// when proactively trimming. The active exchange stays intact; only older
+/// tool results are shrunk to a bounded extract.
+const PROACTIVE_TRIM_PROTECT_LAST_N: usize = 4;
+
 /// Proactively trim conversation turns so that the total estimated character
-/// count stays within [`PROACTIVE_CONTEXT_BUDGET_CHARS`].  Drops the oldest
-/// turns first, but always preserves the most recent turn (the current user
-/// message).  Returns the number of turns dropped.
+/// count stays within [`PROACTIVE_CONTEXT_BUDGET_CHARS`].
+///
+/// Tool-result content is the bulk of an overflowing channel history, so before
+/// dropping any whole turns this first shrinks older `tool`-role payloads to a
+/// bounded head-extract in place (via [`fast_trim_tool_results`]). A trimmed
+/// tool result still tells the model what the tool returned; a *dropped* turn is
+/// gone entirely, which is what makes the bot "respond as if previous messages
+/// don't exist" (#6517). Only if the in-place extracts are still over budget are
+/// the oldest whole turns dropped, and the most recent turn (the current user
+/// message) is always preserved. Returns the number of whole turns dropped.
 fn proactive_trim_turns(turns: &mut Vec<ChatMessage>, budget: usize) -> usize {
     let total_chars: usize = turns.iter().map(|t| t.content.chars().count()).sum();
     if total_chars <= budget || turns.len() <= 1 {
+        return 0;
+    }
+
+    // Content-preserving pre-pass: shrink old tool-result payloads in place,
+    // keeping the messages and their tool-call pairing intact.
+    fast_trim_tool_results(turns, PROACTIVE_TRIM_PROTECT_LAST_N);
+
+    // Recompute after the in-place shrink — we may now fit with no turns dropped.
+    let total_chars: usize = turns.iter().map(|t| t.content.chars().count()).sum();
+    if total_chars <= budget {
         return 0;
     }
 
@@ -2062,7 +2266,7 @@ async fn get_or_create_provider(
     .await?;
     let model_provider: Arc<dyn ModelProvider> = Arc::from(model_provider);
 
-    if let Err(err) = model_provider.warmup().await {
+    if let Err(err) = ProviderDispatch::from_ref(&*model_provider).warmup().await {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -2330,6 +2534,48 @@ fn build_config_block_kit(
     blocks.to_string()
 }
 
+/// Render the per-scope override ladder appended to `/model` (no args), so a
+/// user can see what is set at each tier and the resolution precedence.
+fn build_scope_override_summary(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
+) -> String {
+    let fmt_sel =
+        |sel: &ChannelRouteSelection| format!("`{}` / `{}`", sel.model_provider, sel.model);
+    let (user, agent) = {
+        let overrides = ctx
+            .scope_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let scope_line = |scope: OverrideScope| -> String {
+            overrides
+                .get(&scope_override_key(scope, msg, ctx.agent_alias.as_str()))
+                .map(&fmt_sel)
+                .unwrap_or_else(|| "—".to_string())
+        };
+        (
+            scope_line(OverrideScope::User),
+            scope_line(OverrideScope::Agent),
+        )
+    };
+    let sender_key = conversation_history_key(msg);
+    let session = ctx
+        .route_overrides
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&sender_key)
+        .map(fmt_sel)
+        .unwrap_or_else(|| "—".to_string());
+    let default = default_route_selection_from_snapshot(defaults_snapshot);
+    format!(
+        "\n\n**Model overrides** (session-only; precedence user > agent > session > default):\n\
+         • user: {user}\n• agent: {agent}\n• session (this chat): {session}\n• default (config): {}\n\
+         Set a scope with `/model --user|--agent <model-id>`; clear by setting it back to the default.",
+        fmt_sel(&default),
+    )
+}
+
 async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
@@ -2345,7 +2591,7 @@ async fn handle_runtime_command_if_needed(
 
     let sender_key = conversation_history_key(msg);
     let defaults_snapshot = runtime_defaults_snapshot(ctx);
-    let mut current = get_route_selection(ctx, &sender_key, &defaults_snapshot);
+    let mut current = get_route_selection(ctx, msg, &sender_key, &defaults_snapshot);
 
     let response = match command {
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
@@ -2397,29 +2643,60 @@ async fn handle_runtime_command_if_needed(
             }
         }
         ChannelRuntimeCommand::ShowModel => {
-            build_models_help_response(&current, ctx.workspace_dir.as_path(), &ctx.model_routes)
+            let mut resp = build_models_help_response(
+                &current,
+                ctx.workspace_dir.as_path(),
+                &ctx.model_routes,
+            );
+            resp.push_str(&build_scope_override_summary(ctx, msg, &defaults_snapshot));
+            resp
+        }
+        ChannelRuntimeCommand::SetModelScoped(scope, raw_model) => {
+            let model = raw_model.trim().trim_matches('`').to_string();
+            if model.is_empty() {
+                "Model ID cannot be empty. Use `/model --user|--agent <model-id>`.".to_string()
+            } else {
+                // Resolve provider+model the same way bare `/model` does, then
+                // write it at the requested scope instead of the per-sender route.
+                let mut next = current.clone();
+                apply_model_ref(&mut next, &ctx.model_routes, &model);
+                set_scope_override(ctx, scope, msg, next.clone(), &defaults_snapshot);
+                let mut resp = format!(
+                    "Model set to `{}` (model_provider: `{}`) for the **{}** scope. Session-only — resets on restart.",
+                    next.model,
+                    next.model_provider,
+                    scope.label(),
+                );
+                resp.push_str(&shadow_note(
+                    ctx,
+                    msg,
+                    &sender_key,
+                    &defaults_snapshot,
+                    &next,
+                ));
+                resp
+            }
         }
         ChannelRuntimeCommand::SetModel(raw_model) => {
             let model = raw_model.trim().trim_matches('`').to_string();
             if model.is_empty() {
                 "Model ID cannot be empty. Use `/model <model-id>`.".to_string()
             } else {
-                // Resolve model_provider+model from model_routes (match by model name or hint)
-                if let Some(route) = ctx.model_routes.iter().find(|r| {
-                    r.model.eq_ignore_ascii_case(&model) || r.hint.eq_ignore_ascii_case(&model)
-                }) {
-                    current.model_provider = route.model_provider.clone();
-                    current.model = route.model.clone();
-                    current.api_key = route.api_key.clone();
-                } else {
-                    current.model = model.clone();
-                }
+                apply_model_ref(&mut current, &ctx.model_routes, &model);
                 set_route_selection(ctx, &sender_key, current.clone(), &defaults_snapshot);
 
-                format!(
+                let mut resp = format!(
                     "Model switched to `{}` (model_provider: `{}`). Context preserved.",
                     current.model, current.model_provider
-                )
+                );
+                resp.push_str(&shadow_note(
+                    ctx,
+                    msg,
+                    &sender_key,
+                    &defaults_snapshot,
+                    &current,
+                ));
+                resp
             }
         }
         ChannelRuntimeCommand::ShowConfig => {
@@ -2804,7 +3081,7 @@ async fn classify_channel_reply_intent(
         let _ = writeln!(convo, "[{role}] {safe_content}");
     }
 
-    let response = model_provider
+    let response = ProviderDispatch::from_ref(model_provider)
         .chat_with_system(Some(system_prompt), &convo, model, temperature)
         .await?;
     Ok(parse_reply_intent(&response))
@@ -3744,6 +4021,46 @@ async fn process_channel_message(
     .await;
 }
 
+/// Resolve the effective `ack_reactions` value for a channel message.
+///
+/// Per-channel overrides (e.g. `[channels.lark.work].ack_reactions`)
+/// take precedence over the global `[channels].ack_reactions` setting.
+/// This mirrors the resolution performed during channel construction
+/// (see `with_ack_reactions`), so the orchestrator's reaction gates
+/// agree with the channel's own internal gate.
+fn resolve_channel_ack_reactions(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> bool {
+    let Some(ref alias) = msg.channel_alias else {
+        return ctx.ack_reactions;
+    };
+    match msg.channel.as_str() {
+        "lark" | "feishu" => ctx
+            .prompt_config
+            .channels
+            .lark
+            .get(alias)
+            .and_then(|c| c.ack_reactions)
+            .unwrap_or(ctx.ack_reactions),
+        "telegram" => ctx
+            .prompt_config
+            .channels
+            .telegram
+            .get(alias)
+            .and_then(|c| c.ack_reactions)
+            .unwrap_or(ctx.ack_reactions),
+        "matrix" => ctx
+            .prompt_config
+            .channels
+            .matrix
+            .get(alias)
+            .and_then(|c| c.ack_reactions)
+            .unwrap_or(ctx.ack_reactions),
+        _ => ctx.ack_reactions,
+    }
+}
+
 async fn process_channel_message_body(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
@@ -3907,9 +4224,14 @@ async fn process_channel_message_body(
         }
     }
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
-    let mut route = get_route_selection(ctx.as_ref(), &history_key, &runtime_defaults);
+    let mut route = get_route_selection(ctx.as_ref(), &msg, &history_key, &runtime_defaults);
 
     // ── Query classification: override route when a rule matches ──
+    // NOTE: a configured query-classification rule routes per-message and takes
+    // precedence over BOTH the per-sender route override and the new user/guild/
+    // agent scope overrides resolved above — i.e. content-based routing wins over
+    // a manual `/model`, exactly as it already did for the per-chat `/model`.
+    // (Unconfigured = the default, so the scope ladder is fully honored there.)
     if let Some(hint) =
         zeroclaw_runtime::agent::classifier::classify(&ctx.query_classification, &msg.content)
         && let Some(matched_route) = ctx
@@ -4249,7 +4571,11 @@ async fn process_channel_message_body(
         // pattern so operators with reactions disabled don't suddenly see
         // them. Best-effort: log on failure, never propagate. Channels that
         // don't implement add_reaction get the trait's no-op default.
-        if ctx.ack_reactions
+        //
+        // Resolve per-channel overrides: channels like Lark, Telegram,
+        // and Matrix allow `<channel>.ack_reactions` to take precedence
+        // over the global `[channels].ack_reactions`.
+        if resolve_channel_ack_reactions(&ctx, &msg)
             && let Some(channel) = target_channel.as_ref()
         {
             let emoji = kind.emoji();
@@ -4387,7 +4713,7 @@ async fn process_channel_message_body(
     };
 
     // React with 👀 to acknowledge the incoming message
-    if ctx.ack_reactions
+    if resolve_channel_ack_reactions(&ctx, &msg)
         && let Some(channel) = target_channel.as_ref()
         && let Err(e) = channel
             .add_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
@@ -4513,57 +4839,63 @@ async fn process_channel_message_body(
                             cost_tracking_context.clone(),
                         zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT.scope(
                             receipt_scope.clone(),
-                        run_tool_call_loop(
-                        active_model_provider.as_ref(),
-                        &mut history,
-                        ctx.tools_registry.as_ref(),
-                        notify_observer.as_ref() as &dyn Observer,
-                        route.model_provider.as_str(),
-                        route.model.as_str(),
-                        runtime_defaults.defaults.temperature,
-                        true,
-                        Some(&*ctx.approval_manager),
-                        msg.channel.as_str(),
-                        Some(msg.reply_target.as_str()),
-                        &ctx.multimodal,
-                        ctx.max_tool_iterations,
-                        Some(cancellation_token.clone()),
-                        delta_tx.clone(),
-                        ctx.hooks.as_deref(),
-                        if msg.channel == "cli"
+                        run_tool_call_loop(ToolLoop {
+                        model_provider: active_model_provider.as_ref(),
+                        history: &mut history,
+                        tools_registry: ctx.tools_registry.as_ref(),
+                        observer: notify_observer.as_ref() as &dyn Observer,
+                        provider_name: route.model_provider.as_str(),
+                        model: route.model.as_str(),
+                        temperature: runtime_defaults.defaults.temperature,
+                        silent: true,
+                        approval: Some(&*ctx.approval_manager),
+                        channel_name: msg.channel.as_str(),
+                        channel_reply_target: Some(msg.reply_target.as_str()),
+                        multimodal_config: &ctx.multimodal,
+                        max_tool_iterations: ctx.max_tool_iterations,
+                        cancellation_token: Some(cancellation_token.clone()),
+                        on_delta: delta_tx.clone(),
+                        hooks: ctx.hooks.as_deref(),
+                        excluded_tools: if msg.channel == "cli"
                             || ctx.autonomy_level == AutonomyLevel::Full
                         {
                             &[]
                         } else {
                             ctx.non_cli_excluded_tools.as_ref()
                         },
-                        ctx.tool_call_dedup_exempt.as_ref(),
-                        ctx.activated_tools.as_ref(),
-                        Some(model_switch_callback.clone()),
-                        &ctx.pacing,
-                        ctx.prompt_config
+                        dedup_exempt_tools: ctx.tool_call_dedup_exempt.as_ref(),
+                        activated_tools: ctx.activated_tools.as_ref(),
+                        model_switch_callback: Some(model_switch_callback.clone()),
+                        pacing: &ctx.pacing,
+                        strict_tool_parsing: ctx
+                            .prompt_config
                             .agent(ctx.agent_alias.as_str())
                             .is_some_and(|agent| agent.resolved.strict_tool_parsing),
-                        ctx.prompt_config
+                        parallel_tools: ctx
+                            .prompt_config
                             .agent(ctx.agent_alias.as_str())
                             .is_some_and(|agent| agent.resolved.parallel_tools),
-                        ctx.max_tool_result_chars,
-                        ctx.context_token_budget,
-                        None, // shared_budget
-                        target_channel.as_deref(),
-                        ctx.receipt_generator.as_ref(),
+                        max_tool_result_chars: ctx.max_tool_result_chars,
+                        context_token_budget: ctx.context_token_budget,
+                        shared_budget: None,
+                        channel: target_channel.as_deref(),
+                        receipt_generator: ctx.receipt_generator.as_ref(),
                         // Collector is meaningful only when the generator is
                         // active. Pass None when receipts are disabled so the
                         // call site reflects that coupling explicitly.
-                        ctx.receipt_generator
+                        collected_receipts: ctx
+                            .receipt_generator
                             .as_ref()
                             .map(|_| tool_receipts_collector.as_ref()),
-                        None, // event_tx
-                        None, // steering
-                        None, // new_messages_out
-                        &loop_knobs,
-                    None,
-),
+                        event_tx: None,
+                        steering: None,
+                        new_messages_out: None,
+                        knobs: &loop_knobs,
+                        image_cache: None,
+                        // Phase 1: stamp Internal/Trusted. Real per-transport
+                        // stamping is PR C (RFC #6971 §4).
+                        ingress: zeroclaw_api::ingress::IngressContext::internal(),
+}),
                     ),
                     ),
                     ),
@@ -5211,7 +5543,7 @@ async fn process_channel_message_body(
     }
 
     // Swap 👀 → ✅ (or ⚠️ on error) to signal processing is complete
-    if ctx.ack_reactions
+    if resolve_channel_ack_reactions(&ctx, &msg)
         && let Some(channel) = target_channel.as_ref()
     {
         let _ = channel
@@ -5640,6 +5972,7 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
     feature = "channel-slack",
     feature = "channel-telegram",
     feature = "channel-wechat",
+    feature = "whatsapp-web",
 ))]
 fn one_shot_channel_workspace_dir(config: &Config, channel_type: &str, alias: &str) -> PathBuf {
     config.channel_workspace_dir(&format!("{channel_type}.{alias}"))
@@ -5668,6 +6001,11 @@ fn build_channel_by_id(
                 Arc::new(move || cfg_arc.read().channel_external_peers("telegram", &alias))
             };
             let workspace_dir = one_shot_channel_workspace_dir(&config, "telegram", &alias);
+            let voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || cfg_arc.read().channel_voice_peers("telegram", &alias))
+            };
             Ok(Arc::new(
                 TelegramChannel::new(
                     tg.bot_token.clone(),
@@ -5675,12 +6013,13 @@ fn build_channel_by_id(
                     peer_resolver,
                     tg.mention_only,
                 )
+                .with_voice_peer_resolver(voice_peer_resolver)
                 .with_persistence(config_arc.clone())
+                .with_api_base(tg.api_base_url.clone())
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_transcription(config.transcription.clone())
                 .with_tts(&config)
-                .with_voice_peer_prefs(&config, "telegram", alias)
                 .with_workspace_dir(workspace_dir)
                 .with_approval_timeout_secs(tg.approval_timeout_secs),
             ))
@@ -5722,7 +6061,8 @@ fn build_channel_by_id(
                 .with_transcription(config.transcription.clone())
                 .with_stall_timeout(dc.stall_timeout_secs)
                 .with_approval_timeout_secs(dc.approval_timeout_secs)
-                .with_intents_mask(dc.intents_mask),
+                .with_intents_mask(dc.intents_mask)
+                .with_reaction_notifications(dc.reaction_notifications),
             ))
         }
         #[cfg(not(feature = "channel-discord"))]
@@ -5743,10 +6083,17 @@ fn build_channel_by_id(
                 Arc::new(move || cfg_arc.read().channel_external_peers("slack", &alias))
             };
             let workspace_dir = one_shot_channel_workspace_dir(&config, "slack", &alias);
+            let bot_token = sl.resolved_bot_token().with_context(|| {
+                format!(
+                    "Slack channel '{alias}': bot_token is not set. Provide it in config \
+                     (channels.slack.{alias}.bot_token) or via the \
+                     ZEROCLAW_SLACK_BOT_TOKEN / SLACK_BOT_TOKEN environment variable."
+                )
+            })?;
             Ok(Arc::new(
                 SlackChannel::new(
-                    sl.bot_token.clone(),
-                    sl.app_token.clone(),
+                    bot_token,
+                    sl.resolved_app_token(),
                     sl.channel_ids.clone(),
                     alias,
                     peer_resolver,
@@ -5875,7 +6222,11 @@ fn build_channel_by_id(
                     let alias = alias.clone();
                     Arc::new(move || cfg_arc.read().channel_external_peers("whatsapp", &alias))
                 };
-                Ok(Arc::new(WhatsAppWebChannel::new(wa, alias, peer_resolver)))
+                let workspace_dir = one_shot_channel_workspace_dir(&config, "whatsapp", &alias);
+                Ok(Arc::new(
+                    WhatsAppWebChannel::new(wa, alias, peer_resolver)
+                        .with_workspace_dir(workspace_dir),
+                ))
             }
             #[cfg(not(feature = "whatsapp-web"))]
             {
@@ -5924,6 +6275,9 @@ fn build_channel_by_id(
                     LarkChannel::from_config(lk, alias, peer_resolver)
                         .with_approval_timeout_secs(lk.approval_timeout_secs)
                         .with_per_user_session(lk.per_user_session)
+                        .with_ack_reactions(
+                            lk.ack_reactions.unwrap_or(config.channels.ack_reactions),
+                        )
                         .with_streaming(lk.stream_mode, lk.draft_update_interval_ms),
                 ))
             }
@@ -6658,6 +7012,11 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_external_peers("telegram", &alias))
         };
+        let voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || cfg_arc.read().channel_voice_peers("telegram", &alias))
+        };
         channels.push(ConfiguredChannel {
             display_name: "Telegram",
             alias: Some(alias.clone()),
@@ -6669,12 +7028,13 @@ fn collect_configured_channels(
                         peer_resolver,
                         tg.mention_only,
                     )
+                    .with_voice_peer_resolver(voice_peer_resolver)
                     .with_persistence(config_arc.clone())
+                    .with_api_base(tg.api_base_url.clone())
                     .with_ack_reactions(ack)
                     .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                     .with_transcription(config.transcription.clone())
                     .with_tts(&config)
-                    .with_voice_peer_prefs(&config, "telegram", alias)
                     .with_workspace_dir(config.channel_workspace_dir(&format!("telegram.{alias}")))
                     .with_proxy_url(tg.proxy_url.clone())
                     .with_tool_command_specs(tool_specs.to_vec())
@@ -6728,7 +7088,38 @@ fn collect_configured_channels(
         .with_transcription(config.transcription.clone())
         .with_stall_timeout(dc.stall_timeout_secs)
         .with_approval_timeout_secs(dc.approval_timeout_secs)
-        .with_intents_mask(dc.intents_mask);
+        .with_slash_commands(dc.slash_commands)
+        .with_slash_command_scope(dc.slash_command_scope)
+        .with_intents_mask(dc.intents_mask)
+        .with_reaction_notifications(dc.reaction_notifications);
+        if dc.slash_commands {
+            // Skill-derived commands: resolved from canonical state at
+            // READY/interaction time (no cache), scoped to the agent that
+            // owns this channel alias. Orphan channels resolve to none —
+            // they register `/ask` only. The config is cloned out of the
+            // read guard before any skill IO: the loader hits the
+            // filesystem (and may sync the open-skills repo), and holding
+            // a read guard across that would stall every config consumer
+            // behind a queued writer.
+            let cfg_arc_for_slash = config_arc.clone();
+            let channel_ref = format!("discord.{alias}");
+            discord_ch = discord_ch.with_slash_command_resolver(std::sync::Arc::new(move || {
+                let config = { cfg_arc_for_slash.read().clone() };
+                let Some(agent_alias) = config
+                    .agent_for_channel(&channel_ref)
+                    .map(ToString::to_string)
+                else {
+                    return Vec::new();
+                };
+                let workspace = config.agent_workspace_dir(&agent_alias);
+                let skills = zeroclaw_runtime::skills::load_skills_for_agent(
+                    &workspace,
+                    &config,
+                    &agent_alias,
+                );
+                crate::discord::discord_slash_specs_from_skills(&skills)
+            }));
+        }
         if dc.archive {
             match zeroclaw_memory::SqliteMemory::new_named("sqlite", &config.data_dir, "discord") {
                 Ok(mem) => {
@@ -6776,14 +7167,33 @@ fn collect_configured_channels(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_external_peers("slack", &alias))
         };
+        let Some(bot_token) = sl.resolved_bot_token() else {
+            // `collect_configured_channels` returns `Vec<ConfiguredChannel>`
+            // (not `Result`) and is fail-soft by contract - one misconfigured
+            // channel must not abort startup for every other channel. So an
+            // enabled-but-tokenless Slack channel is skipped, but logged at
+            // ERROR (an operator's enabled channel failed to come up) with the
+            // alias and the exact env vars to set. The single-channel paths
+            // (`build_channel_by_id`, `deliver_announcement`) instead return a
+            // hard error, because there the caller requested that one channel.
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({ "alias": alias.clone() })),
+                "Slack channel skipped: bot_token not set in config or via \
+                 ZEROCLAW_SLACK_BOT_TOKEN / SLACK_BOT_TOKEN env"
+            );
+            continue;
+        };
         channels.push(ConfiguredChannel {
             display_name: "Slack",
             alias: Some(alias.clone()),
             channel: crate::paced_channel::PacedChannel::wrap(
                 Arc::new(
                     SlackChannel::new(
-                        sl.bot_token.clone(),
-                        sl.app_token.clone(),
+                        bot_token,
+                        sl.resolved_app_token(),
                         sl.channel_ids.clone(),
                         alias.clone(),
                         peer_resolver,
@@ -7082,6 +7492,7 @@ fn collect_configured_channels(
                         let alias = alias.clone();
                         Arc::new(move || cfg_arc.read().channel_external_peers("whatsapp", &alias))
                     };
+                    let workspace_dir = config.channel_workspace_dir(&format!("whatsapp.{alias}"));
                     channels.push(ConfiguredChannel {
                         display_name: "WhatsApp",
                         alias: Some(alias.clone()),
@@ -7090,6 +7501,7 @@ fn collect_configured_channels(
                                 WhatsAppWebChannel::new(wa, alias.clone(), peer_resolver)
                                     .with_transcription(config.transcription.clone())
                                     .with_tts(&config)
+                                    .with_workspace_dir(workspace_dir)
                                     .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
                                     .with_group_mention_patterns(wa.group_mention_patterns.clone()),
                             ),
@@ -7459,6 +7871,7 @@ fn collect_configured_channels(
                 LarkChannel::from_config(lk, alias.clone(), peer_resolver)
                     .with_approval_timeout_secs(lk.approval_timeout_secs)
                     .with_per_user_session(lk.per_user_session)
+                    .with_ack_reactions(lk.ack_reactions.unwrap_or(config.channels.ack_reactions))
                     .with_streaming(lk.stream_mode, lk.draft_update_interval_ms)
                     .with_transcription(config.transcription.clone()),
             ),
@@ -8375,7 +8788,7 @@ pub async fn start_channels(
             .await?,
         );
 
-        if let Err(e) = model_provider.warmup().await {
+        if let Err(e) = ProviderDispatch::from_ref(&*model_provider).warmup().await {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -8724,6 +9137,7 @@ pub async fn start_channels(
             agent.resolved.compact_context,
             agent.resolved.max_system_prompt_chars,
             true,
+            config.channels.show_tool_calls,
         );
         if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
@@ -8962,6 +9376,7 @@ pub async fn start_channels(
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(config.reliability.clone()),
             provider_runtime_options,
             // Use this agent's workspace (not the install-wide data dir): the
@@ -9013,45 +9428,12 @@ pub async fn start_channels(
             .map(|tracker| {
                 // The cost tracker's lookup site (`record_tool_loop_cost_usage`
                 // in zeroclaw-runtime) receives the bare provider type — the
-                // composite alias isn't threaded through the agent loop. Build
-                // the pricing map keyed by `<type>` and merge each alias's
-                // `pricing` table into the type-level slot. Rates are per
-                // (provider type, model); they don't differ between an
-                // operator's `anthropic.work` and `anthropic.personal` keys.
-                let mut by_type: std::collections::HashMap<
-                    String,
-                    std::collections::HashMap<String, f64>,
-                > = std::collections::HashMap::new();
-                for (type_k, _alias_k, profile) in config.providers.models.iter_entries() {
-                    if profile.pricing.is_empty() {
-                        continue;
-                    }
-                    let slot = by_type.entry(type_k.to_string()).or_default();
-                    for (key, value) in &profile.pricing {
-                        slot.insert(key.clone(), *value);
-                    }
-                }
-                // Merge the `[cost.rates.providers.models.<type>.<model>]`
-                // section. Keys land as `"<model>.input"` / `"<model>.output"`
-                // / `"<model>.cached_input"` so the existing lookup
-                // (`resolve_rates`) finds them with no further changes. The
-                // rate sheet wins on conflict — it's the forward-looking
-                // surface, the legacy per-alias `pricing` table is the
-                // fallback for installs that haven't migrated.
-                for (provider_type, model_id, rates) in
-                    config.cost.rates.providers.models.iter_entries()
-                {
-                    let slot = by_type.entry(provider_type.to_string()).or_default();
-                    if let Some(input) = rates.input_per_mtok {
-                        slot.insert(format!("{model_id}.input"), input);
-                    }
-                    if let Some(output) = rates.output_per_mtok {
-                        slot.insert(format!("{model_id}.output"), output);
-                    }
-                    if let Some(cached) = rates.cached_input_per_mtok {
-                        slot.insert(format!("{model_id}.cached_input"), cached);
-                    }
-                }
+                // composite alias isn't threaded through the channel agent
+                // loop. Build the pricing map keyed by `<type>`, merging each
+                // alias's legacy `pricing` table and the `cost.rates` sheet
+                // into the type-level slot. `cost.rates` wins on conflict.
+                let by_type =
+                    zeroclaw_runtime::agent::cost::build_type_level_model_provider_pricing(&config);
                 ChannelCostTrackingState {
                     tracker,
                     model_provider_pricing: Arc::new(by_type),
@@ -9247,7 +9629,8 @@ pub async fn deliver_announcement(
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
             let ch =
-                TelegramChannel::new(tg.bot_token.clone(), alias, peer_resolver, tg.mention_only);
+                TelegramChannel::new(tg.bot_token.clone(), alias, peer_resolver, tg.mention_only)
+                    .with_api_base(tg.api_base_url.clone());
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(not(feature = "channel-telegram"))]
@@ -9290,9 +9673,16 @@ pub async fn deliver_announcement(
             let peers = config.channel_external_peers("slack", alias);
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
+            let bot_token = sl.resolved_bot_token().with_context(|| {
+                format!(
+                    "Slack channel '{alias}': bot_token is not set. Provide it in config \
+                     (channels.slack.{alias}.bot_token) or via the \
+                     ZEROCLAW_SLACK_BOT_TOKEN / SLACK_BOT_TOKEN environment variable."
+                )
+            })?;
             let ch = SlackChannel::new(
-                sl.bot_token.clone(),
-                sl.app_token.clone(),
+                bot_token,
+                sl.resolved_app_token(),
                 sl.channel_ids.clone(),
                 alias,
                 peer_resolver,
@@ -9400,6 +9790,7 @@ pub async fn deliver_announcement(
             let ch = LarkChannel::from_config(lk, alias, peer_resolver)
                 .with_approval_timeout_secs(lk.approval_timeout_secs)
                 .with_per_user_session(lk.per_user_session)
+                .with_ack_reactions(lk.ack_reactions.unwrap_or(config.channels.ack_reactions))
                 .with_streaming(lk.stream_mode, lk.draft_update_interval_ms);
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
@@ -9465,12 +9856,15 @@ pub async fn deliver_announcement(
                 .get(alias)
                 .ok_or_else(not_configured)?;
             if !wa.is_web_config() {
-                anyhow::bail!("WhatsApp channel send requires Web mode (session_path must be set)");
+                anyhow::bail!(
+                    "WhatsApp channel send requires Web mode (set session_path, pair_phone, or mode = personal)"
+                );
             }
             let peers = config.channel_external_peers("whatsapp", alias);
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
-            let ch = WhatsAppWebChannel::new(wa, alias.to_string(), peer_resolver);
+            let ch = WhatsAppWebChannel::new(wa, alias.to_string(), peer_resolver)
+                .with_workspace_dir(config.channel_workspace_dir(&format!("whatsapp.{alias}")));
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(not(feature = "whatsapp-web"))]
@@ -9849,6 +10243,7 @@ temperature = 0.3
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -10459,6 +10854,7 @@ temperature = 0.3
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -10933,6 +11329,7 @@ api_key = "anthropic-key"
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -11041,6 +11438,50 @@ api_key = "anthropic-key"
         assert_eq!(turns.len(), 1);
     }
 
+    // #6517: large tool-result content is shrunk to a bounded extract in place
+    // before any whole turn is dropped, so the model keeps a record of what each
+    // tool returned instead of losing entire old turns ("responding as if
+    // previous messages don't exist").
+    #[test]
+    fn proactive_trim_shrinks_tool_results_before_dropping_turns() {
+        let mut turns: Vec<ChatMessage> = Vec::new();
+        for _ in 0..4 {
+            turns.push(ChatMessage::tool("x".repeat(5000)));
+        }
+        // Recent (protected) text turns; no tool payloads here.
+        turns.push(ChatMessage::user("u1".to_string()));
+        turns.push(ChatMessage::assistant("a1".to_string()));
+        turns.push(ChatMessage::user("u2".to_string()));
+        turns.push(ChatMessage::assistant("a2".to_string()));
+
+        let len_before = turns.len();
+        let total_before: usize = turns.iter().map(|t| t.content.chars().count()).sum();
+        let budget = 12_000;
+        assert!(total_before > budget, "test setup must start over budget");
+
+        let dropped = proactive_trim_turns(&mut turns, budget);
+
+        assert_eq!(
+            dropped, 0,
+            "in-place tool-result shrink should bring it under budget with no whole-turn drops"
+        );
+        assert_eq!(turns.len(), len_before, "no whole turn should be removed");
+        assert_eq!(
+            turns.iter().filter(|t| t.role == "tool").count(),
+            4,
+            "every tool turn must survive (shrunk, not dropped)"
+        );
+        assert!(
+            turns[0].content.chars().count() < 5000,
+            "an old tool result must be shrunk in place"
+        );
+        let total_after: usize = turns.iter().map(|t| t.content.chars().count()).sum();
+        assert!(
+            total_after <= budget,
+            "must be within budget after the in-place shrink: {total_after}"
+        );
+    }
+
     #[test]
     fn append_sender_turn_stores_single_turn_per_call() {
         let sender = "telegram_u2".to_string();
@@ -11072,6 +11513,7 @@ api_key = "anthropic-key"
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -11182,6 +11624,7 @@ api_key = "anthropic-key"
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -11296,6 +11739,7 @@ api_key = "anthropic-key"
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -11692,6 +12136,7 @@ api_key = "anthropic-key"
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -12351,6 +12796,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -12431,6 +12877,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -12543,6 +12990,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -12656,6 +13104,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -12808,6 +13257,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -12931,6 +13381,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -13069,6 +13520,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -13190,6 +13642,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -13296,6 +13749,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -13422,6 +13876,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -13565,6 +14020,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(route_overrides)),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -13771,6 +14227,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -13872,6 +14329,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -13983,6 +14441,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -14353,6 +14812,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -14493,6 +14953,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -14643,6 +15104,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -14803,6 +15265,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -14939,6 +15402,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -15064,6 +15528,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -15170,6 +15635,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -15329,6 +15795,7 @@ BTC is currently around $65,000 based on latest tool output."#
             false,
             0,
             false,
+            false,
         );
         if expose_text_protocol {
             let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
@@ -15459,6 +15926,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let skills = vec![zeroclaw_runtime::skills::Skill {
             name: "code-review".into(),
             description: "Review code for bugs".into(),
+            description_localizations: Default::default(),
             version: "1.0.0".into(),
             author: None,
             tags: vec![],
@@ -15473,6 +15941,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timeout_secs: None,
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
+            slash_options: Vec::new(),
             location: None,
         }];
 
@@ -15500,6 +15969,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let skills = vec![zeroclaw_runtime::skills::Skill {
             name: "code-review".into(),
             description: "Review code for bugs".into(),
+            description_localizations: Default::default(),
             version: "1.0.0".into(),
             author: None,
             tags: vec![],
@@ -15514,6 +15984,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timeout_secs: None,
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
+            slash_options: Vec::new(),
             location: None,
         }];
 
@@ -15551,6 +16022,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let skills = vec![zeroclaw_runtime::skills::Skill {
             name: "code<review>&".into(),
             description: "Review \"unsafe\" and 'risky' bits".into(),
+            description_localizations: Default::default(),
             version: "1.0.0".into(),
             author: None,
             tags: vec![],
@@ -15565,6 +16037,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timeout_secs: None,
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
+            slash_options: Vec::new(),
             location: None,
         }];
 
@@ -15671,6 +16144,7 @@ BTC is currently around $65,000 based on latest tool output."#
             false,
             0,
             false,
+            false,
         );
 
         assert!(
@@ -15702,6 +16176,7 @@ BTC is currently around $65,000 based on latest tool output."#
             zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
             false,
             0,
+            false,
             false,
         );
 
@@ -15951,12 +16426,12 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn matrix_thread_conversation_history_key_uses_thread_root() {
-        let msg = zeroclaw_api::channel::ChannelMessage {
-            id: "$reply:server".into(),
+    fn matrix_thread_follow_up_shares_root_session_key() {
+        let root = zeroclaw_api::channel::ChannelMessage {
+            id: "$root:server".into(),
             sender: "@alice:server".into(),
             reply_target: "!room:server".into(),
-            content: "thread reply".into(),
+            content: "open the thread".into(),
             channel: "matrix".into(),
             channel_alias: None,
             timestamp: 1,
@@ -15965,10 +16440,19 @@ BTC is currently around $65,000 based on latest tool output."#
             attachments: vec![],
             subject: None,
         };
+        let follow_up = zeroclaw_api::channel::ChannelMessage {
+            id: "$reply:server".into(),
+            content: "thread reply".into(),
+            timestamp: 2,
+            thread_ts: Some("$root:server".into()),
+            interruption_scope_id: Some("$root:server".into()),
+            ..root.clone()
+        };
 
-        let key = conversation_history_key(&msg);
-        assert!(key.contains("_root_server"));
-        assert!(!key.contains("_reply_server"));
+        let root_key = conversation_history_key(&root);
+        assert_eq!(root_key, conversation_history_key(&follow_up));
+        assert!(!root_key.contains("$root:server"));
+        assert!(!root_key.contains("$reply:server"));
     }
 
     #[test]
@@ -16004,6 +16488,171 @@ BTC is currently around $65,000 based on latest tool output."#
             parse_runtime_command("wecom_ws", "/model qwen-max"),
             Some(ChannelRuntimeCommand::SetModel("qwen-max".into()))
         );
+    }
+
+    fn scope_test_msg(
+        sender: &str,
+        channel_id: &str,
+        thread: Option<&str>,
+    ) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            sender: sender.into(),
+            reply_target: channel_id.into(),
+            channel: "discord".into(),
+            channel_alias: Some("clamps".into()),
+            thread_ts: thread.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn parse_runtime_command_parses_model_scope_flags() {
+        use ChannelRuntimeCommand::{SetModel, SetModelScoped, ShowModel};
+        assert_eq!(
+            parse_runtime_command("discord", "/model --user gpt-4o"),
+            Some(SetModelScoped(OverrideScope::User, "gpt-4o".into()))
+        );
+        assert_eq!(
+            parse_runtime_command("discord", "/model --agent claude-opus-4-8"),
+            Some(SetModelScoped(
+                OverrideScope::Agent,
+                "claude-opus-4-8".into()
+            ))
+        );
+        // No flag → unchanged per-sender behavior.
+        assert_eq!(
+            parse_runtime_command("discord", "/model gpt-4o"),
+            Some(SetModel("gpt-4o".into()))
+        );
+        // Bare /model, or a scope flag with no model id → show.
+        assert_eq!(parse_runtime_command("discord", "/model"), Some(ShowModel));
+        assert_eq!(
+            parse_runtime_command("discord", "/model --user"),
+            Some(ShowModel)
+        );
+        // A mistyped flag is NOT silently treated as a model id.
+        assert_eq!(
+            parse_runtime_command("discord", "/model --useer gpt-4o"),
+            Some(ShowModel)
+        );
+    }
+
+    #[test]
+    fn scope_override_key_drops_identifiers_below_each_scope() {
+        let a = scope_test_msg("alice", "chan-1", Some("t-1"));
+        let b = scope_test_msg("alice", "chan-2", Some("t-2"));
+        // User scope spans a sender's chats/threads → same key.
+        assert_eq!(
+            scope_override_key(OverrideScope::User, &a, "agentX"),
+            scope_override_key(OverrideScope::User, &b, "agentX"),
+        );
+        assert!(scope_override_key(OverrideScope::User, &a, "agentX").contains("alice"));
+        // Agent scope keys only on the agent alias (independent of sender/chat).
+        let c = scope_test_msg("bob", "chan-9", None);
+        assert_eq!(
+            scope_override_key(OverrideScope::Agent, &a, "agentX"),
+            scope_override_key(OverrideScope::Agent, &c, "agentX"),
+        );
+        assert_ne!(
+            scope_override_key(OverrideScope::Agent, &a, "agentX"),
+            scope_override_key(OverrideScope::Agent, &a, "agentY"),
+        );
+    }
+
+    #[test]
+    fn get_route_selection_precedence_user_over_agent_over_session() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "agentX",
+            "openrouter.default",
+            "config-default-model",
+        );
+        let msg = scope_test_msg("alice", "chan-1", None);
+        let snapshot = runtime_defaults_snapshot(&ctx);
+        let sender_key = conversation_history_key(&msg);
+        let sel = |m: &str| ChannelRouteSelection {
+            model_provider: "openrouter.default".into(),
+            model: m.into(),
+            api_key: None,
+        };
+
+        // Nothing set → config default (whatever the snapshot resolves to).
+        let default_model = get_route_selection(&ctx, &msg, &sender_key, &snapshot).model;
+        assert_ne!(default_model, "session-model");
+
+        // Per-sender route override (the session tier).
+        set_route_selection(&ctx, &sender_key, sel("session-model"), &snapshot);
+        assert_eq!(
+            get_route_selection(&ctx, &msg, &sender_key, &snapshot).model,
+            "session-model"
+        );
+        // Agent scope beats session.
+        set_scope_override(
+            &ctx,
+            OverrideScope::Agent,
+            &msg,
+            sel("agent-model"),
+            &snapshot,
+        );
+        assert_eq!(
+            get_route_selection(&ctx, &msg, &sender_key, &snapshot).model,
+            "agent-model"
+        );
+        // User scope beats agent.
+        set_scope_override(
+            &ctx,
+            OverrideScope::User,
+            &msg,
+            sel("user-model"),
+            &snapshot,
+        );
+        assert_eq!(
+            get_route_selection(&ctx, &msg, &sender_key, &snapshot).model,
+            "user-model"
+        );
+    }
+
+    #[test]
+    fn set_scope_override_clears_when_equal_to_default() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "agentX",
+            "openrouter.default",
+            "default-model",
+        );
+        let msg = scope_test_msg("alice", "chan", None);
+        let snapshot = runtime_defaults_snapshot(&ctx);
+        let default = default_route_selection_from_snapshot(&snapshot);
+        set_scope_override(
+            &ctx,
+            OverrideScope::User,
+            &msg,
+            ChannelRouteSelection {
+                model_provider: "openrouter.default".into(),
+                model: "other".into(),
+                api_key: None,
+            },
+            &snapshot,
+        );
+        assert_eq!(ctx.scope_overrides.lock().unwrap().len(), 1);
+        // Setting it back to the config default clears the entry.
+        set_scope_override(&ctx, OverrideScope::User, &msg, default, &snapshot);
+        assert!(ctx.scope_overrides.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_runtime_command_maps_clear_to_new_session() {
+        assert_eq!(
+            parse_runtime_command("telegram", "/clear"),
+            Some(ChannelRuntimeCommand::NewSession)
+        );
+        assert_eq!(
+            parse_runtime_command("telegram", "/clear@zeroclaw_bot"),
+            Some(ChannelRuntimeCommand::NewSession)
+        );
+        assert_eq!(parse_runtime_command("telegram", "/clear all"), None);
     }
 
     /// `/models <family>` must resolve to a configured alias-backed ref so the
@@ -16493,6 +17142,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -16659,6 +17309,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(config.data_dir.clone()),
@@ -17078,6 +17729,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -17222,6 +17874,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -17330,6 +17983,37 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             block.contains("[IMAGE:<absolute-path>]"),
             "discord block must show the absolute-path marker form"
+        );
+    }
+
+    #[test]
+    fn channel_delivery_instructions_for_whatsapp_web_match_local_marker_contract() {
+        let block = channel_delivery_instructions("whatsapp")
+            .expect("whatsapp channel must have a delivery-instructions block");
+        assert!(
+            block.contains("When responding on WhatsApp Web:"),
+            "whatsapp block must identify itself"
+        );
+        assert!(
+            block.contains("[IMAGE:<path>]"),
+            "whatsapp block must describe marker syntax"
+        );
+        assert!(
+            block.contains("inside the configured workspace directory"),
+            "whatsapp block must describe workspace bounds"
+        );
+        assert!(
+            block.contains("Absolute paths and workspace-relative paths are accepted"),
+            "whatsapp block must match the validator's local path contract"
+        );
+        assert!(
+            block.contains("Do not use http://, https://, data:, file:"),
+            "whatsapp block must say URL schemes are refused"
+        );
+        assert_eq!(
+            channel_delivery_instructions("whatsapp-web"),
+            Some(block),
+            "the compatibility alias should use the same WhatsApp Web guidance"
         );
     }
 
@@ -18335,6 +19019,7 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -18448,6 +19133,7 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -18601,6 +19287,7 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -18827,6 +19514,7 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -18973,6 +19661,7 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -19111,6 +19800,7 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -19269,6 +19959,7 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -19380,6 +20071,7 @@ This is an example JSON object for profile settings."#;
             zeroclaw_config::schema::TelegramConfig {
                 enabled: true,
                 bot_token: "test-token".to_string(),
+                api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: zeroclaw_config::schema::StreamMode::Off,
                 draft_update_interval_ms: 1000,
                 interrupt_on_new_message: false,
@@ -19665,6 +20357,7 @@ This is an example JSON object for profile settings."#;
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
@@ -20568,6 +21261,42 @@ Done."#;
     }
 
     #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn deliver_announcement_rejects_whatsapp_non_web_config_clearly() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.whatsapp.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                access_token: Some("test-token".to_string()),
+                phone_number_id: Some("phone-number-id".to_string()),
+                verify_token: Some("verify-token".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let err = deliver_announcement(&config, "whatsapp.default", "+15551234567", None, "hi")
+            .await
+            .expect_err("expected WhatsApp Cloud config to be rejected for cron delivery");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("WhatsApp channel send requires Web mode"),
+            "whatsapp.default must clearly explain the Web mode requirement; got: {msg}"
+        );
+        assert!(
+            msg.contains("session_path")
+                && msg.contains("pair_phone")
+                && msg.contains("mode = personal"),
+            "whatsapp.default must name the Web selectors accepted by cron delivery; got: {msg}"
+        );
+        assert!(
+            !msg.contains("unsupported delivery channel")
+                && !msg.contains("[channels.whatsapp.default] not configured"),
+            "whatsapp.default must reject the configured non-Web mode, not fall through; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
     #[cfg(feature = "channel-lark")]
     async fn deliver_announcement_rejects_feishu_value_when_use_feishu_false() {
         // Reject (not warn): otherwise the message silently lands on the
@@ -20582,6 +21311,7 @@ Done."#;
                 app_secret: "secret".to_string(),
                 approval_timeout_secs: 300,
                 per_user_session: false,
+                ack_reactions: None,
                 ..Default::default()
             },
         );
