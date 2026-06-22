@@ -63,6 +63,7 @@
   - [Slack](./channels/slack.md)
   - [Mattermost](./channels/mattermost.md)
   - [LINE](./channels/line.md)
+  - [WeCom WebSocket](./channels/wecom-ws.md)
   - [Nextcloud Talk](./channels/nextcloud-talk.md)
   - [Signal](./channels/signal.md)
   - [WhatsApp](./channels/whatsapp.md)

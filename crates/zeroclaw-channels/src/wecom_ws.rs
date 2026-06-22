@@ -15,13 +15,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
-use zeroclaw_api::media::MediaAttachment;
+use zeroclaw_api::media::{MediaAttachment, MediaKind};
 use zeroclaw_config::schema::{StreamMode, WeComWsConfig};
 use zeroclaw_runtime::i18n;
 
 // ── Constants ────────────────────────────────────────────────────────
 
 const WECOM_WS_URL: &str = "wss://openws.work.weixin.qq.com";
+const WECOM_QYAPI_BASE_URL: &str = "https://qyapi.weixin.qq.com";
 const WECOM_BACKOFF_INITIAL_SECS: u64 = 5;
 const WECOM_BACKOFF_MAX_SECS: u64 = 60;
 const WECOM_PING_INTERVAL_SECS: u64 = 30;
@@ -191,6 +192,8 @@ struct WeComRuntimeConfig {
     proxy_url: Option<String>,
 }
 
+type CorpCredentialsResolver = Arc<dyn Fn() -> Option<(String, String)> + Send + Sync>;
+
 #[derive(Debug, Clone)]
 struct CachedAccessToken {
     token: String,
@@ -251,6 +254,7 @@ pub struct WeComWsChannel {
     secret: String,
     alias: String,
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    corp_credentials_resolver: CorpCredentialsResolver,
     cfg: WeComRuntimeConfig,
     client: reqwest::Client,
     ws_tx: Arc<tokio::sync::Mutex<Option<mpsc::Sender<WsOutbound>>>>,
@@ -268,10 +272,15 @@ pub struct WeComWsChannel {
 impl WeComWsChannel {
     pub fn new(config: &WeComWsConfig, workspace_dir: &Path) -> Result<Self> {
         let allowed_users = normalize_wecom_allowlist(config.allowed_users.clone());
+        let corp_id = config.corp_id.clone();
+        let corp_secret = config.corp_secret.clone();
         Self::new_with_alias(
             config,
             "default",
             Arc::new(move || allowed_users.clone()),
+            Arc::new(move || {
+                normalize_corp_credentials(corp_id.as_deref(), corp_secret.as_deref())
+            }),
             workspace_dir,
         )
     }
@@ -280,6 +289,7 @@ impl WeComWsChannel {
         config: &WeComWsConfig,
         alias: impl Into<String>,
         peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+        corp_credentials_resolver: CorpCredentialsResolver,
         workspace_dir: &Path,
     ) -> Result<Self> {
         if config.stream_mode == StreamMode::MultiMessage {
@@ -300,6 +310,7 @@ impl WeComWsChannel {
             secret: config.secret.clone(),
             alias: alias.into(),
             peer_resolver,
+            corp_credentials_resolver,
             cfg: WeComRuntimeConfig {
                 workspace_dir: workspace_dir.to_path_buf(),
                 allowed_groups: normalize_wecom_allowlist(config.allowed_groups.clone()),
@@ -1460,17 +1471,13 @@ impl WeComWsChannel {
                 "WeCom external-scope attachments are not supported by the current HTTP external message path: {scope}"
             );
         }
+        let (media_type, msgtype) = wecom_attachment_wire_kind(attachment.kind());
 
         // Upload via WeCom media/upload CGI
         let upload_url = format!(
             "https://qyapi.weixin.qq.com/cgi-bin/media/upload?access_token={token}&type={media_type}",
             token = self.resolve_access_token().await?,
-            media_type = match attachment.kind() {
-                zeroclaw_api::media::MediaKind::Image => "image",
-                zeroclaw_api::media::MediaKind::Audio => "voice",
-                zeroclaw_api::media::MediaKind::Video => "video",
-                zeroclaw_api::media::MediaKind::Unknown => "file",
-            }
+            media_type = media_type,
         );
 
         // Part::mime_str returns Result<Part>; apply ? before adding to the form.
@@ -1519,14 +1526,6 @@ impl WeComWsChannel {
             )
         })?;
 
-        // Dispatch the actual message via aibot_send_msg
-        let msgtype = match attachment.kind() {
-            zeroclaw_api::media::MediaKind::Image => "image",
-            zeroclaw_api::media::MediaKind::Audio => "voice",
-            zeroclaw_api::media::MediaKind::Video => "video",
-            zeroclaw_api::media::MediaKind::Unknown => "file",
-        };
-
         let (frame, req_id) = build_attachment_send_command(chat_type, chatid, msgtype, &media_id);
 
         self.ws_send_frame_and_wait_for_response(frame, &req_id, "aibot_send_msg")
@@ -1571,8 +1570,11 @@ impl WeComWsChannel {
     }
 
     async fn fetch_access_token(&self) -> Result<CachedAccessToken> {
-        // TODO(review): Confirm that channel bot_id/secret are the qyapi
-        // corpid/corpsecret values for gettoken before changing credential wiring.
+        self.fetch_access_token_from_base(WECOM_QYAPI_BASE_URL)
+            .await
+    }
+
+    async fn fetch_access_token_from_base(&self, base_url: &str) -> Result<CachedAccessToken> {
         #[derive(serde::Deserialize)]
         struct TokenResp {
             #[serde(rename = "access_token")]
@@ -1582,14 +1584,22 @@ impl WeComWsChannel {
             errmsg: Option<String>,
         }
 
-        let url = format!(
-            "https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={}&corpsecret={}",
-            self.bot_id, self.secret,
-        );
+        let (corp_id, corp_secret) = (self.corp_credentials_resolver)().ok_or_else(|| {
+            anyhow::Error::msg(
+                "WeCom WebSocket corp application credentials are required for gettoken; \
+                 set channels.wecom_ws.<alias>.corp_id and corp_secret",
+            )
+        })?;
+        let mut url = reqwest::Url::parse(base_url)
+            .with_context(|| format!("invalid WeCom qyapi base URL: {base_url}"))?;
+        url.set_path("cgi-bin/gettoken");
+        url.query_pairs_mut()
+            .append_pair("corpid", &corp_id)
+            .append_pair("corpsecret", &corp_secret);
 
         let resp = self
             .client
-            .get(&url)
+            .get(url)
             .send()
             .await
             .with_context(|| "failed to fetch WeCom access token")?;
@@ -2390,6 +2400,26 @@ fn parse_scope(scope: &str) -> Result<(u32, &str)> {
         Ok((3, external_user_id))
     } else {
         anyhow::bail!("WeCom: invalid scope format: {scope}")
+    }
+}
+
+fn normalize_corp_credentials(
+    corp_id: Option<&str>,
+    corp_secret: Option<&str>,
+) -> Option<(String, String)> {
+    let corp_id = corp_id.map(str::trim).filter(|value| !value.is_empty())?;
+    let corp_secret = corp_secret
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some((corp_id.to_string(), corp_secret.to_string()))
+}
+
+fn wecom_attachment_wire_kind(kind: MediaKind) -> (&'static str, &'static str) {
+    match kind {
+        MediaKind::Image => ("image", "image"),
+        MediaKind::Audio => ("voice", "voice"),
+        MediaKind::Video => ("video", "video"),
+        MediaKind::Unknown => ("file", "file"),
     }
 }
 
@@ -3386,6 +3416,51 @@ mod tests {
         assert!(err.contains("api freq out of limit"));
     }
 
+    #[tokio::test]
+    async fn fetch_access_token_uses_corp_application_credentials() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/cgi-bin/gettoken"))
+            .and(query_param("corpid", "ww-corp-123"))
+            .and(query_param("corpsecret", "corp-secret-456"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "errcode": 0,
+                "access_token": "qyapi-token",
+                "expires_in": 7200
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let channel = WeComWsChannel::new(&test_wecom_ws_config(), Path::new("/tmp")).unwrap();
+        let token = channel
+            .fetch_access_token_from_base(&server.uri())
+            .await
+            .unwrap();
+
+        assert_eq!(token.token, "qyapi-token");
+    }
+
+    #[tokio::test]
+    async fn fetch_access_token_requires_corp_application_credentials() {
+        let mut config = test_wecom_ws_config();
+        config.corp_id = None;
+        let channel = WeComWsChannel::new(&config, Path::new("/tmp")).unwrap();
+
+        let err = channel
+            .fetch_access_token_from_base("http://127.0.0.1:9")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("corp application credentials are required"));
+        assert!(err.contains("corp_id"));
+        assert!(err.contains("corp_secret"));
+    }
+
     #[test]
     fn access_token_refresh_failure_uses_concurrently_populated_cache() {
         let channel = WeComWsChannel::new(&test_wecom_ws_config(), Path::new("/tmp")).unwrap();
@@ -3453,6 +3528,8 @@ mod tests {
             enabled: true,
             bot_id: "bot123".to_string(),
             secret: "secret456".to_string(),
+            corp_id: Some("ww-corp-123".to_string()),
+            corp_secret: Some("corp-secret-456".to_string()),
             allowed_users: vec![],
             allowed_groups: vec![],
             bot_name: None,

@@ -138,11 +138,31 @@ use zeroclaw_runtime::util::truncate_with_ellipsis;
 
 type CronChannelRegistry = Arc<HashMap<String, Arc<dyn Channel>>>;
 
+#[cfg(feature = "channel-wecom-ws")]
+type WeComWsCorpCredentialsResolver = Arc<dyn Fn() -> Option<(String, String)> + Send + Sync>;
+
 /// Live channel registry consulted by `deliver_announcement` so cron sends reuse the
 /// authenticated channel instance (Matrix E2EE can't tolerate per-send session restore).
 /// Replaced wholesale by each `start_channels` call.
 static CRON_CHANNEL_REGISTRY: std::sync::RwLock<Option<CronChannelRegistry>> =
     std::sync::RwLock::new(None);
+
+#[cfg(feature = "channel-wecom-ws")]
+fn wecom_ws_corp_credentials_resolver(
+    config_arc: Arc<RwLock<Config>>,
+    alias: String,
+) -> WeComWsCorpCredentialsResolver {
+    Arc::new(move || {
+        let config = config_arc.read();
+        let wc = config.channels.wecom_ws.get(&alias)?;
+        let corp_id = wc.corp_id.as_deref().map(str::trim)?;
+        let corp_secret = wc.corp_secret.as_deref().map(str::trim)?;
+        if corp_id.is_empty() || corp_secret.is_empty() {
+            return None;
+        }
+        Some((corp_id.to_string(), corp_secret.to_string()))
+    })
+}
 
 /// Observer wrapper that forwards tool-call events to a channel sender
 /// for real-time threaded notifications.
@@ -6102,10 +6122,13 @@ fn build_channel_by_id(
                     peers
                 })
             };
+            let corp_credentials_resolver =
+                wecom_ws_corp_credentials_resolver(config_arc.clone(), alias.clone());
             Ok(Arc::new(WeComWsChannel::new_with_alias(
                 wc,
                 alias.clone(),
                 peer_resolver,
+                corp_credentials_resolver,
                 &config.channel_workspace_dir(&format!("wecom_ws.{alias}")),
             )?))
         }
@@ -7863,10 +7886,13 @@ fn collect_configured_channels(
                 peers
             })
         };
+        let corp_credentials_resolver =
+            wecom_ws_corp_credentials_resolver(config_arc.clone(), alias.clone());
         match WeComWsChannel::new_with_alias(
             wc_ws,
             alias.clone(),
             peer_resolver,
+            corp_credentials_resolver,
             &config.channel_workspace_dir(&format!("wecom_ws.{alias}")),
         ) {
             Ok(channel) => channels.push(ConfiguredChannel {

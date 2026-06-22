@@ -14330,6 +14330,18 @@ pub struct WeComWsConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub secret: String,
+    /// WeCom corp ID for qyapi application calls such as proactive send,
+    /// gettoken, and media upload. This is distinct from the WebSocket
+    /// subscription `bot_id`.
+    #[serde(default)]
+    pub corp_id: Option<String>,
+    /// WeCom corp application secret for qyapi application calls such as
+    /// proactive send, gettoken, and media upload. This is distinct from the
+    /// WebSocket subscription `secret`.
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub corp_secret: Option<String>,
     /// Allowed WeCom user IDs. Empty = deny all, "*" = allow all users.
     #[serde(default)]
     pub allowed_users: Vec<String>,
@@ -14367,6 +14379,8 @@ impl Default for WeComWsConfig {
             enabled: false,
             bot_id: String::new(),
             secret: String::new(),
+            corp_id: None,
+            corp_secret: None,
             allowed_users: Vec::new(),
             allowed_groups: Vec::new(),
             bot_name: None,
@@ -20013,6 +20027,8 @@ auto_save = true
             enabled = true
             bot_id = "bot-123"
             secret = "sk-test"
+            corp_id = "ww-corp-123"
+            corp_secret = "corp-secret-test"
             allowed_users = ["zeroclaw_user"]
             allowed_groups = ["zeroclaw_group"]
             bot_name = "danya"
@@ -20023,6 +20039,8 @@ auto_save = true
         assert!(parsed.enabled);
         assert_eq!(parsed.bot_id, "bot-123");
         assert_eq!(parsed.secret, "sk-test");
+        assert_eq!(parsed.corp_id.as_deref(), Some("ww-corp-123"));
+        assert_eq!(parsed.corp_secret.as_deref(), Some("corp-secret-test"));
         assert_eq!(parsed.allowed_users, vec!["zeroclaw_user"]);
         assert_eq!(parsed.allowed_groups, vec!["zeroclaw_group"]);
         assert_eq!(parsed.bot_name.as_deref(), Some("danya"));
@@ -20036,7 +20054,12 @@ auto_save = true
         assert_eq!(WeComWsConfig::default().stream_mode, StreamMode::Partial);
         assert!(WeComWsConfig::default().bot_name.is_none());
         assert!(WeComWsConfig::default().proxy_url.is_none());
+        assert!(WeComWsConfig::default().corp_id.is_none());
+        assert!(WeComWsConfig::default().corp_secret.is_none());
         assert!(WeComWsConfig::prop_is_secret("channels.wecom_ws.secret"));
+        assert!(WeComWsConfig::prop_is_secret(
+            "channels.wecom_ws.corp_secret"
+        ));
     }
 
     #[test]
@@ -20050,6 +20073,8 @@ auto_save = true
             enabled = true
             bot_id = "bot-123"
             secret = "sk-test"
+            corp_id = "ww-corp-123"
+            corp_secret = "corp-secret-test"
             allowed_users = ["zeroclaw_user"]
         "#;
         let parsed: Config = toml::from_str(toml).unwrap();
@@ -20060,6 +20085,7 @@ auto_save = true
         );
         let ws = parsed.channels.wecom_ws.get("default").unwrap();
         assert_eq!(ws.bot_id, "bot-123");
+        assert_eq!(ws.corp_id.as_deref(), Some("ww-corp-123"));
         assert_eq!(ws.allowed_users, vec!["zeroclaw_user"]);
         assert_eq!(ws.stream_mode, StreamMode::Partial);
     }
