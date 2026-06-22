@@ -6,6 +6,7 @@ use serde_json::json;
 use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::schema::Config;
+use zeroclaw_providers::models_dev::list_models_for;
 
 fn configured_model_provider_profiles(config: &Config) -> Vec<String> {
     let mut profiles = config
@@ -276,8 +277,59 @@ impl ModelSwitchTool {
             .map(|(family, _alias)| family)
             .unwrap_or(model_provider.as_str());
 
-        // Return common models for known model_provider families.
-        let models = match provider_family.to_lowercase().as_str() {
+        // Map provider family to models.dev key and fetch live catalog.
+        // Falls back to hardcoded list when offline or fetch fails.
+        let models_dev_key = match provider_family.to_lowercase().as_str() {
+            "openai" => "openai",
+            "anthropic" => "anthropic",
+            "openrouter" => "openrouter",
+            "groq" => "groq",
+            "ollama" => "ollama",
+            "deepseek" => "deepseek",
+            "mistral" => "mistral",
+            "gemini" => "google", // models.dev uses "google" for Gemini
+            "xai" => "xai",
+            _ => "",
+        };
+
+        let models = if !models_dev_key.is_empty() {
+            // Try to fetch live models from models.dev catalog.
+            // This is async but we're in an async context.
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                list_models_for(models_dev_key),
+            )
+            .await
+            {
+                Ok(Ok(live_models)) => {
+                    zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fetch)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                            .with_attrs(::serde_json::json!({"model_provider": model_provider, "count": live_models.len()})),
+                        "model_switch: fetched live models from models.dev"
+                    );
+                    live_models
+                }
+                Ok(Err(e)) | Err(e) => {
+                    // Fetch failed or timed out - fall back to hardcoded list
+                    zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"model_provider": model_provider, "error": e.to_string()})),
+                        "model_switch: models.dev fetch failed, using fallback list"
+                    );
+                    // Fall through to hardcoded lists below
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Fallback: use hardcoded lists for offline / unknown providers
+        let models = models.unwrap_or_else(|| match provider_family.to_lowercase().as_str() {
             "openai" => vec![
                 "gpt-4o",
                 "gpt-4o-mini",
@@ -313,7 +365,7 @@ impl ModelSwitchTool {
             "gemini" => vec!["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"],
             "xai" => vec!["grok-2", "grok-2-vision", "grok-beta"],
             _ => vec![],
-        };
+        });
 
         if models.is_empty() {
             return Ok(ToolResult {
