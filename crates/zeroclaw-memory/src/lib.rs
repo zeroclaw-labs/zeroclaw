@@ -1433,4 +1433,59 @@ mod tests {
         );
         assert_eq!(embedder.name(), "openai");
     }
+
+    /// The "not silent" contract is the WARN itself: a resolved-but-unusable
+    /// route must emit an operator-visible, structured diagnostic. Asserting
+    /// only the keyword-only fallback (as the sibling test does) would stay
+    /// green if the WARN were deleted — so capture the broadcast event and
+    /// assert its severity + stable `error_key`.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn resolve_embedding_config_no_endpoint_emits_loud_warning() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let cfg = MemoryConfig {
+            embedding_provider: "none".into(),
+            embedding_model: "hint:semantic".into(),
+            embedding_dimensions: 1536,
+            ..MemoryConfig::default()
+        };
+        let routes = vec![EmbeddingRouteConfig {
+            hint: "semantic".into(),
+            model_provider: "custom.myembed".into(),
+            model: "text-embedding-3-small".into(),
+            dimensions: Some(1024),
+            api_key: None,
+        }];
+        let providers = catalog_with("custom", "myembed", None, Some("sk-provider"));
+
+        let _ =
+            resolve_embedding_config(&cfg, &routes, Some("chat-provider-key"), Some(&providers));
+
+        // Find our diagnostic among any concurrently-broadcast events.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut found = None;
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(value)) => {
+                    if value["attributes"]["error_key"] == "memory.embedding_route_no_endpoint" {
+                        found = Some(value);
+                        break;
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_elapsed) => {}
+            }
+        }
+
+        let value = found.expect("expected a loud memory.embedding_route_no_endpoint WARN event");
+        assert_eq!(value["severity_text"], "WARN");
+        assert_eq!(value["attributes"]["provider_ref"], "custom.myembed");
+        assert_eq!(value["attributes"]["provider_kind"], "custom");
+    }
 }
