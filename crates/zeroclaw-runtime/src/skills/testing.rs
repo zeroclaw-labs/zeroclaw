@@ -300,7 +300,11 @@ fn truncate_output(s: &str, max: usize) -> String {
     if trimmed.len() <= max {
         trimmed.replace('\n', " ")
     } else {
-        format!("{}...", &trimmed[..max].replace('\n', " "))
+        // `max` is a byte count; slicing at it directly panics when it lands
+        // inside a multi-byte UTF-8 char (non-ASCII skill output). Round down
+        // to the nearest char boundary first (matches skills/review.rs).
+        let end = trimmed.floor_char_boundary(max);
+        format!("{}...", &trimmed[..end].replace('\n', " "))
     }
 }
 
@@ -308,6 +312,27 @@ fn truncate_output(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn truncate_output_does_not_panic_on_multibyte_boundary() {
+        // Regression for #7828: `max` landing inside a multi-byte UTF-8 char
+        // must not panic. "🦀" is 4 bytes; max=2 is mid-char.
+        let out = truncate_output("🦀🦀🦀", 2);
+        assert!(
+            out.ends_with("..."),
+            "long output must be truncated: {out:?}"
+        );
+        // Whatever is kept must be valid UTF-8 (no byte-boundary split).
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+
+        // A multi-byte string longer than max but whose boundary is mid-char.
+        let out2 = truncate_output("héllo wörld with áccents", 5);
+        assert!(out2.ends_with("..."));
+        assert!(std::str::from_utf8(out2.as_bytes()).is_ok());
+
+        // ASCII within the limit is returned untruncated (newlines flattened).
+        assert_eq!(truncate_output("ok\nfine", 100), "ok fine");
+    }
 
     #[test]
     fn parse_comment_and_empty_lines() {

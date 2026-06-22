@@ -1,4 +1,7 @@
-use crate::agent::loop_::{LoopKnobs, TOOL_LOOP_SESSION_KEY, ToolLoop, run_tool_call_loop};
+use crate::agent::loop_::{
+    LoopKnobs, ResolvedAgentExecution, ResolvedModelAccess, TOOL_LOOP_SESSION_KEY, ToolLoop,
+    run_tool_call_loop,
+};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::security::SecurityPolicy;
@@ -1889,41 +1892,47 @@ impl DelegateTool {
         let result = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(ToolLoop {
-                model_provider,
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider,
+                        provider_name: provider_type,
+                        model,
+                        temperature,
+                    },
+                    tools_registry: &sub_tools,
+                    observer: &noop_observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &self.multimodal_config,
+                    max_tool_iterations: loop_runtime.max_tool_iterations,
+                    hooks: None,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: tool_policy.excluded_tools.as_deref().unwrap_or(&[]),
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                    strict_tool_parsing: loop_runtime.strict_tool_parsing,
+                    parallel_tools: loop_runtime.parallel_tools,
+                    max_tool_result_chars: loop_runtime.max_tool_result_chars,
+                    // Keep delegate subagent context pruning aligned with top-level
+                    // agents instead of preserving the old disabled-by-zero path.
+                    context_token_budget: loop_runtime.max_context_tokens,
+                    // delegate subagents don't support approval
+                    receipt_generator,
+                    knobs: &LoopKnobs::default(),
+                },
                 history: &mut history,
-                tools_registry: &sub_tools,
-                observer: &noop_observer,
-                provider_name: provider_type,
-                model,
-                temperature,
-                silent: true,
-                approval: None,
                 channel_name: "delegate",
                 channel_reply_target: None,
-                multimodal_config: &self.multimodal_config,
-                max_tool_iterations: loop_runtime.max_tool_iterations,
                 cancellation_token: Some(self.cancellation_token.child_token()),
                 on_delta: None,
-                hooks: None,
-                excluded_tools: &[],
-                dedup_exempt_tools: tool_policy.excluded_tools.as_deref().unwrap_or(&[]),
-                activated_tools: None,
-                model_switch_callback: None,
-                pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: loop_runtime.strict_tool_parsing,
-                parallel_tools: loop_runtime.parallel_tools,
-                max_tool_result_chars: loop_runtime.max_tool_result_chars,
-                // Keep delegate subagent context pruning aligned with top-level
-                // agents instead of preserving the old disabled-by-zero path.
-                context_token_budget: loop_runtime.max_context_tokens,
-                shared_budget: None, // TODO thread from parent in future
-                channel: None,       // delegate subagents don't support approval
-                receipt_generator,
+                shared_budget: None,
+                // TODO thread from parent in future
+                channel: None,
                 collected_receipts,
                 event_tx: None,
                 steering: None,
                 new_messages_out: None,
-                knobs: &LoopKnobs::default(),
                 image_cache: None,
                 // Phase 1: stamp Internal/Trusted. Real per-transport
                 // stamping is PR C (RFC #6971 §4).
