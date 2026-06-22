@@ -1145,6 +1145,7 @@ mod tests {
         let skill = Skill {
             name: "ops".to_string(),
             description: "d".to_string(),
+            description_localizations: Default::default(),
             version: "1".to_string(),
             author: None,
             tags: vec![],

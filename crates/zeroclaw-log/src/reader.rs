@@ -402,4 +402,119 @@ mod tests {
         assert_eq!(older_page.events[2].message.as_deref(), Some("event-0"));
         assert!(older_page.at_end);
     }
+
+    /// Regression test for issue #7694: when many events share the same
+    /// timestamp, pagination must walk through every event exactly once
+    /// — no duplicates across pages and no losses. The reader breaks
+    /// ties by `(timestamp, id)`: events with `id >= cursor_id` at the
+    /// same timestamp are excluded so the boundary event is never
+    /// repeated.
+    ///
+    /// Note: ids in this fixture are written in lexicographic order
+    /// matching file order. Out-of-scope: reader behavior when id
+    /// ordering diverges from file order — flagged for follow-up.
+    #[test]
+    fn same_timestamp_pagination_walks_all_events_exactly_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trace.jsonl");
+        let shared_ts = "2026-05-15T19:00:00.000Z";
+        let ids = ["evt-a", "evt-b", "evt-c", "evt-d", "evt-e"];
+        let mut events = Vec::new();
+        for id in ids {
+            let mut event = make_event("test", None);
+            event.timestamp = shared_ts.to_string();
+            event.id = id.to_string();
+            event.message = Some(format!("event-{id}"));
+            events.push(event);
+        }
+        write_jsonl(&path, &events);
+
+        let mut seen_ids: Vec<String> = Vec::new();
+        let mut page_filter = LogFilter::default();
+        let page_size = 2;
+        let mut pages_walked = 0;
+
+        loop {
+            pages_walked += 1;
+            assert!(pages_walked < 20, "pagination must terminate, did not");
+
+            let page = load_page(&path, &page_filter, page_size).unwrap();
+            for event in &page.events {
+                assert!(
+                    !seen_ids.contains(&event.id),
+                    "duplicate id {:?} across pages",
+                    event.id
+                );
+                seen_ids.push(event.id.clone());
+            }
+
+            if page.at_end {
+                // at_end means "no older events exist" but the cursor
+                // still points at the last event of the current page;
+                // the UI uses at_end to disable the "load older" button.
+                break;
+            }
+
+            let (cursor_ts, cursor_id) = page
+                .next_cursor
+                .expect("non-final page must expose a cursor so caller can request older events");
+            page_filter = LogFilter {
+                until_ts: Some(cursor_ts),
+                until_id: Some(cursor_id),
+                ..Default::default()
+            };
+        }
+
+        // Every shared-timestamp event was visited exactly once.
+        let mut expected: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        expected.sort();
+        let mut actual = seen_ids.clone();
+        actual.sort();
+        assert_eq!(
+            actual, expected,
+            "pagination must visit every tied event exactly once"
+        );
+    }
+
+    /// Regression test for issue #7694: when the page boundary lands on
+    /// a timestamp that matches multiple events, the cursor's `until_id`
+    /// must exclude events with id >= cursor_id, not silently drop them.
+    /// Without the id tie-break, the same event would appear in two
+    /// consecutive pages.
+    #[test]
+    fn same_timestamp_cursor_does_not_duplicate_boundary_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("trace.jsonl");
+        let shared_ts = "2026-05-15T19:00:00.000Z";
+        let mut events = Vec::new();
+        // ids ordered so that without id tie-break, evt-b could appear on
+        // both page 1 and page 2.
+        let ids = ["evt-a", "evt-b", "evt-c"];
+        for id in ids {
+            let mut event = make_event("test", None);
+            event.timestamp = shared_ts.to_string();
+            event.id = id.to_string();
+            event.message = Some(format!("event-{id}"));
+            events.push(event);
+        }
+        write_jsonl(&path, &events);
+
+        let page1 = load_page(&path, &LogFilter::default(), 1).unwrap();
+        assert_eq!(page1.events.len(), 1);
+        assert_eq!(page1.events[0].id, "evt-c");
+        let (cursor_ts, cursor_id) = page1.next_cursor.unwrap();
+        assert_eq!(cursor_id, "evt-c");
+
+        let page2_filter = LogFilter {
+            until_ts: Some(cursor_ts),
+            until_id: Some(cursor_id),
+            ..Default::default()
+        };
+        let page2 = load_page(&path, &page2_filter, 1).unwrap();
+        assert_eq!(page2.events.len(), 1);
+        // evt-c must NOT reappear; the next event under the cursor is
+        // evt-b (id strictly less than "evt-c" at the same timestamp).
+        assert_eq!(page2.events[0].id, "evt-b");
+        assert_ne!(page2.events[0].id, page1.events[0].id);
+    }
 }
