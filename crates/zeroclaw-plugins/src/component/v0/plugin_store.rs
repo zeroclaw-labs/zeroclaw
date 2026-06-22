@@ -241,12 +241,18 @@ impl PluginStore {
     /// Build a host from a plugin's `fine_grained_permissions` list.
     ///
     /// - `Dir` entries call `WasiCtxBuilder::preopened_dir`.
-    /// - `Http` + `Tcp` entries add rules to the TCP allow-list.
-    /// - `Udp` entries add rules to the UDP allow-list.
+    /// - `Http` entries only add rules to the `wasi:http` allow-list
+    ///   (enforced by `PluginHttpHooks::send_request`); they grant no raw
+    ///   socket access, since `wasi:http` outbound requests never touch the
+    ///   `wasi:sockets` layer here.
+    /// - `Tcp` entries add rules to the raw outbound-TCP allow-list.
+    /// - `Udp` entries add rules to the raw outbound-UDP allow-list.
     ///
     /// TCP bind (`TcpBind`) is unconditionally denied; outbound-only TCP is
-    /// allowed when matching rules are present. If no TCP/HTTP rules are
-    /// declared TCP is fully disabled; same for UDP.
+    /// allowed when matching `Tcp` rules are present — `Http` rules alone do
+    /// not enable raw TCP, so an HTTP-only grant cannot be used to open a
+    /// direct socket to the same host. If no TCP rules are declared, raw TCP
+    /// is fully disabled; same for UDP.
     ///
     /// Address rules:
     /// - IPv4/IPv6 literals are matched exactly at connect time.
@@ -288,13 +294,12 @@ impl PluginStore {
                         .map_err(PluginError::from)?;
                 }
                 crate::FineGrainedPermission::Http(addr) => {
+                    // Deliberately does not touch `tcp_rules`/`has_tcp`: wasi:http
+                    // outbound requests are fully intercepted by
+                    // `PluginHttpHooks::send_request` and never reach the
+                    // `wasi:sockets` layer, so an `Http` grant must not also
+                    // unlock raw TCP connect to the same host.
                     http_rules.push(HttpHostRule::parse(addr)?);
-                    has_tcp = true;
-                    if !addr.is_wildcard() {
-                        has_domain_lookup =
-                            has_domain_lookup || addr.as_str().parse::<IpAddr>().is_err();
-                    }
-                    tcp_rules.push(AddrRule::parse(addr).await?);
                 }
                 crate::FineGrainedPermission::Tcp(addr) => {
                     has_tcp = true;
