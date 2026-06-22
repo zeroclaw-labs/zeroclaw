@@ -34,7 +34,7 @@ Use assignees for active work. Use issue comments, issue body sections, public f
 
 Use no-space colon spelling for scoped labels: `provider:openai`, `channel:telegram`, `security:policy`, `risk:high`, `size:XS`, `type:docs`, and similar labels. Phrase labels without a namespace stay phrase-like: `good first issue`, `help wanted`, `trusted contributor`, and `stale-candidate`.
 
-Legacy duplicate labels such as `provider: openai`, `channel: telegram`, `tool: shell`, `risk: high`, `size: XS`, or `type: docs` are cleanup candidates. Some legacy labels may remain live during a staged migration; until the migration packet lands, copy the exact live label spelling from the GitHub UI when documenting current labels. Migrate open issues/PRs to the canonical label before deletion. Do not delete labels with open references, broadly rename label families, or remove stale-policy labels without a maintainer decision for that cleanup batch.
+Legacy duplicate labels such as `provider: openai`, `channel: telegram`, or `tool: shell` are cleanup candidates. Live spaced labels such as `risk: high`, `size: XS`, and `type: docs` are migration candidates only after the approved packet creates or confirms the no-space canonical labels. Some legacy labels may remain live during a staged migration; until the migration packet lands, copy the exact live label spelling from the GitHub UI when documenting current labels. Migrate open issues/PRs to the canonical label before deletion. Do not delete labels with open references, broadly rename label families, or remove stale-policy labels without a maintainer decision for that cleanup batch.
 
 ## Automation contract
 
@@ -62,6 +62,8 @@ Every live cleanup batch needs exact maintainer approval for the labels and issu
 ## Type labels
 
 Type labels capture the high-level work class. They are separate from path labels such as `docs`, `ci`, or `dependencies`.
+
+During the label-spelling migration, use the live GitHub UI spelling when applying labels. The table below records the target canonical spelling; live spaced labels remain valid until the approved migration packet changes them.
 
 | Label | Purpose |
 |---|---|
@@ -185,6 +187,8 @@ Tools are grouped by logical function rather than one label per file.
 
 Based on effective changed line count, normalized for docs-only and lockfile-heavy PRs. Currently applied **manually**; the size automation that previously computed these was removed during CI simplification. Future size automation should follow the [automation contract](#automation-contract).
 
+During the label-spelling migration, use the live GitHub UI spelling when applying labels. The table below records the target canonical spelling; live spaced labels remain valid until the approved migration packet changes them.
+
 | Label | Threshold |
 |---|---|
 | `size:XS` | ≤ 80 lines |
@@ -196,6 +200,8 @@ Based on effective changed line count, normalized for docs-only and lockfile-hea
 ## Risk labels
 
 For PRs, risk labels describe the actual diff under review: touched paths, behavior change, security boundary exposure, and rollback difficulty. For issues, risk labels describe the likely fix blast radius based on the report, help triage reviewer depth and contributor fit, and may change once a concrete PR shows the actual implementation path. Currently applied **manually**. Future risk automation should follow the [automation contract](#automation-contract).
+
+During the label-spelling migration, use the live GitHub UI spelling when applying labels. The table below records the target canonical spelling; live spaced labels remain valid until the approved migration packet changes them.
 
 | Label | Meaning |
 |---|---|
