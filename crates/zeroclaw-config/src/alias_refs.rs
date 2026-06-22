@@ -602,8 +602,9 @@ impl std::error::Error for CreateError {}
 ///
 /// The reserved-agent rule (the `default` runtime fallback) is enforced HERE, at
 /// the shared config boundary, so every operator-facing create surface (the
-/// gateway config-write handlers and the RPC dispatch) inherits it from one place
-/// instead of each re-deriving it, which is how the guard would drift per surface.
+/// gateway config-write handlers, the RPC dispatch, and the alias CLI) inherits
+/// it from one place instead of each re-deriving it, which is how the guard would
+/// drift per surface.
 /// First-run seeders (quickstart, env-override materialization) call the raw
 /// `create_map_key` directly on purpose: they may legitimately seed the fallback
 /// agent. Symmetric with

@@ -20,10 +20,6 @@ use zeroclaw_config::alias_refs::{
 };
 use zeroclaw_config::schema::Config;
 
-/// The agent alias reserved as the runtime fallback — protected from delete
-/// (rename is already guarded inside `rename_with_cascade`).
-const RESERVED_DEFAULT_AGENT: &str = "default";
-
 /// Resolve a `cli-*` Fluent key for alias-CRUD CLI output. Under `agent-runtime`
 /// (default + what CI/release build) this routes through Fluent; without it the
 /// runtime i18n crate is absent, so the English `fallback` is used.
@@ -117,10 +113,10 @@ fn list_section(config: &Config, section: &str) -> Result<()> {
 }
 
 fn create_entry(config: &mut Config, section: &str, alias: &str) -> Result<()> {
-    if config
-        .create_map_key(section, alias)
-        .map_err(anyhow::Error::msg)?
-    {
+    // Shared guarded boundary: refuses the reserved `default` agent here too (the
+    // CLI is the third operator create surface), and delegates unchanged for
+    // every other section. Symmetric with the reserved-delete guard below.
+    if alias_refs::create_map_key_checked(config, section, alias).map_err(anyhow::Error::msg)? {
         config.mark_dirty(&format!("{section}.{alias}"));
         println!(
             "{}",
@@ -382,7 +378,7 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
             dry_run,
             yes,
         } => {
-            if alias == RESERVED_DEFAULT_AGENT {
+            if alias_refs::is_reserved_agent_alias(&alias) {
                 bail!(
                     "{}",
                     mt(
