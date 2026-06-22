@@ -81,6 +81,20 @@ pub(crate) fn resolve_display_text(
     }
 }
 
+/// Narration to relay after the live stream, given what was already forwarded.
+/// Returns the suffix of `display_text` past `streamed_visible_text` when the
+/// latter is a genuine prefix. On any divergence the whole `display_text` is
+/// relayed: duplicate output is recoverable noise, a dropped tail is permanent
+/// loss, so the total function never truncates.
+pub(crate) fn unforwarded_narration<'a>(
+    display_text: &'a str,
+    streamed_visible_text: &str,
+) -> &'a str {
+    display_text
+        .strip_prefix(streamed_visible_text)
+        .unwrap_or(display_text)
+}
+
 /// The interpreted Ok-arm of one provider call.
 pub(crate) struct InterpretedResponse {
     pub(crate) response_text: String,
@@ -212,6 +226,7 @@ pub(crate) async fn interpret_chat_response(
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_category(::zeroclaw_log::EventCategory::Tool)
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                 .with_attrs(::serde_json::json!({
                     "model": ctx.model,
@@ -227,6 +242,7 @@ pub(crate) async fn interpret_chat_response(
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Receive)
+            .with_category(::zeroclaw_log::EventCategory::Provider)
             .with_outcome(::zeroclaw_log::EventOutcome::Success)
             .with_duration(u64::try_from(llm_started_at.elapsed().as_millis()).unwrap_or(u64::MAX))
             .with_attrs(::serde_json::json!({
@@ -272,5 +288,42 @@ pub(crate) async fn interpret_chat_response(
         assistant_history_content,
         native_tool_calls: native_calls,
         parse_issue_detected: parse_issue.is_some(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unforwarded_narration;
+
+    #[test]
+    fn returns_suffix_when_streamed_text_is_a_prefix() {
+        assert_eq!(
+            unforwarded_narration("About to check the count.", "About to "),
+            "check the count."
+        );
+    }
+
+    #[test]
+    fn returns_empty_when_everything_was_streamed() {
+        assert_eq!(
+            unforwarded_narration("fully streamed", "fully streamed"),
+            ""
+        );
+    }
+
+    #[test]
+    fn returns_whole_text_when_nothing_was_streamed() {
+        assert_eq!(
+            unforwarded_narration("never streamed", ""),
+            "never streamed"
+        );
+    }
+
+    #[test]
+    fn relays_whole_text_on_prefix_divergence_rather_than_truncating() {
+        assert_eq!(
+            unforwarded_narration("final visible text", "diverged live text"),
+            "final visible text"
+        );
     }
 }
