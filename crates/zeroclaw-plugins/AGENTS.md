@@ -13,8 +13,6 @@ secrets, workspace) are supplied by the agent runtime, not this crate.
 
 - `zeroclaw-api` (traits only — `Tool`, `Channel`, `ToolResult`)
 - `wasmtime` + `wasmtime-wasi` (component-model runtime; gated on `plugins-wasmtime`)
-- `reqwest` (blocking — used by the recording HTTP fixture; production egress
-  lives in `zeroclaw-runtime`)
 - `ring` (Ed25519 signatures)
 - `serde`, `serde_json`, `toml` (serialization)
 - `tokio` (async bridging via `spawn_blocking`)

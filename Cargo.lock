@@ -13741,7 +13741,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
- "reqwest 0.12.28",
  "ring",
  "serde",
  "serde_json",
