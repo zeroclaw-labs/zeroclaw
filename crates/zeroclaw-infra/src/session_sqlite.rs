@@ -552,6 +552,20 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(rows)
     }
 
+    fn count_agent_attribution(&self, agent_alias: &str) -> std::io::Result<usize> {
+        // Mirror the `WHERE agent_alias = ?1` predicate `rename_agent_attribution`
+        // re-points, so the residue probe matches exactly what a resume moves.
+        let conn = self.conn.lock();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_metadata WHERE agent_alias = ?1",
+                params![agent_alias],
+                |row| row.get(0),
+            )
+            .map_err(std::io::Error::other)?;
+        Ok(count.max(0) as usize)
+    }
+
     /// Cheap existence probe used by the gateway to skip cancelled-append
     /// writes against a session the user just deleted (#7126). Mirrors the
     /// row that `delete_session` wipes — once the metadata row is gone the

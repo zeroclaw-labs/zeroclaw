@@ -1229,7 +1229,8 @@ impl FamilyProviderFactory for GroqModelProviderConfig {
             key,
             AuthStyle::Bearer,
         )
-        .with_models_dev_key("groq");
+        .with_models_dev_key("groq")
+        .without_assistant_reasoning_replay();
         // Groq's llama-family models reject native tool calls with HTTP
         // 400; default to text-fallback. Operators can override per-alias
         // via `[providers.models.groq.<alias>] native_tools = true`.
