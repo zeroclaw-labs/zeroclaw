@@ -889,8 +889,8 @@ mod tests {
         let runner = HookRunner::from_config(&config);
         let names: Vec<&str> = runner.handlers.iter().map(|h| h.name()).collect();
         assert!(
-            names.contains(&"command_logger"),
-            "command_logger enabled → must be registered; got {names:?}"
+            names.contains(&"command-logger"),
+            "command-logger enabled → must be registered; got {names:?}"
         );
     }
 
