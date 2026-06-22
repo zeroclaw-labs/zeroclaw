@@ -90,38 +90,51 @@ impl PluginHost {
             return Ok(());
         }
 
-        let entries = std::fs::read_dir(&self.plugins_dir)?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let manifest_path = path.join("manifest.toml");
-                if manifest_path.exists()
-                    && let Ok(manifest) = self.load_manifest(&manifest_path)
-                {
-                    if let Err(e) = validate_manifest_shape(&manifest, &path) {
-                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"plugin": path.display().to_string(), "error": format!("{}", e)})), "skipping plugin due to invalid manifest shape");
-                        continue;
-                    }
+        // Deterministic order so discovery (and duplicate-name resolution) is
+        // reproducible regardless of filesystem `read_dir` ordering.
+        let mut dirs: Vec<std::path::PathBuf> = std::fs::read_dir(&self.plugins_dir)?
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect();
+        dirs.sort();
 
-                    // Verify plugin signature
-                    let manifest_toml = std::fs::read_to_string(&manifest_path).unwrap_or_default();
-                    match self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest) {
-                        Ok(verification) => {
-                            let wasm_path = manifest.wasm_path.as_deref().map(|p| path.join(p));
-                            self.loaded.insert(
-                                manifest.name.clone(),
-                                LoadedPlugin {
-                                    manifest,
-                                    plugin_dir: path.clone(),
-                                    wasm_path,
-                                    verification,
-                                },
-                            );
-                        }
-                        Err(e) => {
-                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"plugin": path.display().to_string(), "error": format!("{}", e)})), "skipping plugin due to signature verification failure");
-                        }
-                    }
+        for path in dirs {
+            let manifest_path = path.join("manifest.toml");
+            if !manifest_path.exists() {
+                continue;
+            }
+            let Ok(manifest) = self.load_manifest(&manifest_path) else {
+                continue;
+            };
+            if let Err(e) = validate_manifest_shape(&manifest, &path) {
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"plugin": path.display().to_string(), "error": format!("{}", e)})), "skipping plugin due to invalid manifest shape");
+                continue;
+            }
+            // Duplicate plugin name: keep the first discovered (deterministic)
+            // and warn, rather than silently overwriting it.
+            if self.loaded.contains_key(&manifest.name) {
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"plugin": manifest.name, "path": path.display().to_string()})), "duplicate plugin name; keeping the first discovered and ignoring this one");
+                continue;
+            }
+
+            // Verify plugin signature
+            let manifest_toml = std::fs::read_to_string(&manifest_path).unwrap_or_default();
+            match self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest) {
+                Ok(verification) => {
+                    let wasm_path = manifest.wasm_path.as_deref().map(|p| path.join(p));
+                    self.loaded.insert(
+                        manifest.name.clone(),
+                        LoadedPlugin {
+                            manifest,
+                            plugin_dir: path.clone(),
+                            wasm_path,
+                            verification,
+                        },
+                    );
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"plugin": path.display().to_string(), "error": format!("{}", e)})), "skipping plugin due to signature verification failure");
                 }
             }
         }

@@ -246,6 +246,82 @@ fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
     tools.into_iter().map(ArcDelegatingTool::boxed).collect()
 }
 
+/// Resolve a collision-free registered name for a plugin tool. Names already
+/// `taken` (built-ins, then earlier plugins) keep priority; a colliding plugin
+/// tool is namespaced as `<plugin>_<tool>`. Returns `None` only if even the
+/// namespaced form is taken (the loader then skips that tool).
+#[cfg(feature = "plugins-wasm")]
+fn resolve_unique_tool_name(
+    declared: &str,
+    plugin_name: &str,
+    taken: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if !taken.contains(declared) {
+        return Some(declared.to_string());
+    }
+    let namespaced = format!("{}_{}", sanitize_tool_ns(plugin_name), declared);
+    if !taken.contains(&namespaced) {
+        return Some(namespaced);
+    }
+    None
+}
+
+/// Sanitize a plugin name into a function-name-safe namespace segment
+/// (`[a-z0-9_]`) — tool names double as LLM function names, which cannot contain
+/// the `:`/`/` used by skill IDs.
+#[cfg(feature = "plugins-wasm")]
+fn sanitize_tool_ns(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_underscore = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_underscore = false;
+        } else if !prev_underscore {
+            out.push('_');
+            prev_underscore = true;
+        }
+    }
+    out.trim_matches('_').to_string()
+}
+
+#[cfg(all(test, feature = "plugins-wasm"))]
+mod plugin_tool_name_tests {
+    use super::{resolve_unique_tool_name, sanitize_tool_ns};
+    use std::collections::HashSet;
+
+    #[test]
+    fn keeps_bare_name_when_free() {
+        let taken = HashSet::new();
+        assert_eq!(
+            resolve_unique_tool_name("summary", "wikipedia-summary", &taken).as_deref(),
+            Some("summary")
+        );
+    }
+
+    #[test]
+    fn namespaces_rather_than_shadowing_a_builtin() {
+        let taken: HashSet<String> = ["shell".to_string()].into_iter().collect();
+        assert_eq!(
+            resolve_unique_tool_name("shell", "my-plugin", &taken).as_deref(),
+            Some("my_plugin_shell")
+        );
+    }
+
+    #[test]
+    fn skips_when_even_the_namespaced_name_is_taken() {
+        let taken: HashSet<String> = ["x".to_string(), "p_x".to_string()].into_iter().collect();
+        assert_eq!(resolve_unique_tool_name("x", "p", &taken), None);
+    }
+
+    #[test]
+    fn namespace_is_function_name_safe() {
+        assert_eq!(sanitize_tool_ns("wikipedia-summary"), "wikipedia_summary");
+        assert_eq!(sanitize_tool_ns("My.Cool Plugin!"), "my_cool_plugin");
+        assert_eq!(sanitize_tool_ns("--weird--"), "weird");
+    }
+}
+
 /// Create the default tool registry
 pub fn default_tools(security: Arc<SecurityPolicy>) -> Vec<Box<dyn Tool>> {
     default_tools_with_runtime(security, Arc::new(NativeRuntime::new()))
@@ -1398,7 +1474,6 @@ pub fn all_tools_with_runtime(
             ) {
                 Ok(host) => {
                     let details = host.tool_plugin_details();
-                    let count = details.len();
                     // Shared secret source for existence checks + host-side
                     // credential injection (values never cross into WASM).
                     let secret_source = std::sync::Arc::new(plugin_host::PluginSecretSource::new(
@@ -1408,6 +1483,14 @@ pub fn all_tools_with_runtime(
                             root_config.secrets.encrypt,
                         ),
                     ));
+                    // Built-in tools already in `tool_arcs` claim their names
+                    // first, so a plugin can never shadow a built-in; a plugin
+                    // tool whose name still collides is namespaced as
+                    // `<plugin>_<tool>` (mirroring the skill `plugin:<n>/<s>`
+                    // convention, adapted to the LLM function-name charset).
+                    let mut taken: std::collections::HashSet<String> =
+                        tool_arcs.iter().map(|t| t.name().to_string()).collect();
+                    let mut loaded = 0usize;
                     for (manifest, wasm_path) in details {
                         // Grant only the host capabilities the manifest declares;
                         // everything else stays deny-by-default in the sandbox.
@@ -1424,13 +1507,50 @@ pub fn all_tools_with_runtime(
                             manifest.description.clone().unwrap_or_default(),
                         )
                         .with_host(wit_host);
-                        tool_arcs.push(Arc::new(RateLimitedTool::new(tool, security.clone())));
+
+                        let declared = tool.registered_name().to_string();
+                        let Some(final_name) =
+                            resolve_unique_tool_name(&declared, &manifest.name, &taken)
+                        else {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note,
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({
+                                    "plugin": manifest.name, "tool": declared,
+                                })),
+                                "plugin tool name collides with an existing tool; skipping"
+                            );
+                            continue;
+                        };
+                        if final_name != declared {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note,
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "plugin": manifest.name, "from": declared, "to": final_name,
+                                })),
+                                "plugin tool renamed to avoid a name collision"
+                            );
+                        }
+                        taken.insert(final_name.clone());
+                        tool_arcs.push(Arc::new(RateLimitedTool::new(
+                            tool.renamed(final_name),
+                            security.clone(),
+                        )));
+                        loaded += 1;
                     }
                     ::zeroclaw_log::record!(
                         INFO,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({"count": count})),
-                        "Loaded  WASM plugin tools"
+                            .with_attrs(::serde_json::json!({"count": loaded})),
+                        "Loaded WASM plugin tools"
                     );
                 }
                 Err(e) => {

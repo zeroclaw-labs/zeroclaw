@@ -102,6 +102,20 @@ impl WitTool {
         self.host = host;
         self
     }
+
+    /// The tool name as registered with the agent (after any collision
+    /// namespacing applied by the loader).
+    pub fn registered_name(&self) -> &str {
+        &self.name
+    }
+
+    /// Override the registered tool name. Used by the loader to namespace a
+    /// plugin tool whose declared name would collide with an existing tool, so
+    /// plugins can never shadow a built-in or each other.
+    pub fn renamed(mut self, name: String) -> Self {
+        self.name = name;
+        self
+    }
 }
 
 fn load_prepared(
