@@ -283,11 +283,8 @@ mod tests {
                 .to_string(),
             )
         };
-        let tool_res = |id: &str| {
-            tool(
-                &serde_json::json!({"tool_call_id": id, "content": "ok"}).to_string(),
-            )
-        };
+        let tool_res =
+            |id: &str| tool(&serde_json::json!({"tool_call_id": id, "content": "ok"}).to_string());
         let h = vec![
             sys("system"),
             user(&format!("turn1 {big}")),

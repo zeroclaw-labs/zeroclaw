@@ -136,9 +136,9 @@ pub use super::cost::{
 
 // History management moved to `super::history`.
 pub use super::history::{
-    append_or_merge_system_message, canonicalize_tool_result_media_markers, estimate_history_tokens,
-    load_interactive_session_history, normalize_system_messages, save_interactive_session_history,
-    trim_history, truncate_tool_result,
+    append_or_merge_system_message, canonicalize_tool_result_media_markers,
+    estimate_history_tokens, load_interactive_session_history, normalize_system_messages,
+    save_interactive_session_history, trim_history, truncate_tool_result,
 };
 
 /// Minimum user-message length (in chars) for auto-save to memory.

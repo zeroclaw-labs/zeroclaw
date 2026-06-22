@@ -172,9 +172,7 @@ impl RpcContext {
             reload_tx: None,
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new(&tui_dir)),
-            acp_session_store: AcpSessionStore::new(data_dir.as_path())
-                .ok()
-                .map(Arc::new),
+            acp_session_store: AcpSessionStore::new(data_dir.as_path()).ok().map(Arc::new),
             sop_engine: None,
             sop_audit: None,
         })

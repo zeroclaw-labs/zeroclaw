@@ -3277,8 +3277,7 @@ impl ResolvedRuntime {
     /// the only trigger. Reuses the existing `history_pruning.*` idents.
     pub fn effective_context_budget(&self) -> usize {
         if self.history_pruning.enabled && self.history_pruning.max_tokens > 0 {
-            self.max_context_tokens
-                .min(self.history_pruning.max_tokens)
+            self.max_context_tokens.min(self.history_pruning.max_tokens)
         } else {
             self.max_context_tokens
         }

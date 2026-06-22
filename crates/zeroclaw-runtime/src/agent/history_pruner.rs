@@ -174,7 +174,6 @@ fn extract_assistant_tool_call_ids(content: &str) -> Option<Vec<String>> {
 // Public entry point
 // ---------------------------------------------------------------------------
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

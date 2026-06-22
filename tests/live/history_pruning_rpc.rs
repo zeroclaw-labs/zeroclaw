@@ -16,10 +16,10 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
+use zeroclaw_config::scattered_types::HistoryPrunerConfig;
 use zeroclaw_config::schema::{
     AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
 };
-use zeroclaw_config::scattered_types::HistoryPrunerConfig;
 use zeroclaw_config::secrets::SecretStore;
 use zeroclaw_runtime::rpc::context::RpcContext;
 use zeroclaw_runtime::rpc::dispatch::RpcDispatcher;
@@ -139,7 +139,9 @@ fn drain(rx: &mut mpsc::Receiver<String>) -> Vec<Value> {
 }
 
 fn event_type(v: &Value) -> Option<&str> {
-    v.get("params").and_then(|p| p.get("type")).and_then(|t| t.as_str())
+    v.get("params")
+        .and_then(|p| p.get("type"))
+        .and_then(|t| t.as_str())
 }
 
 fn is_history_trimmed(v: &Value) -> bool {
