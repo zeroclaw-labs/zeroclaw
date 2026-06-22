@@ -21,6 +21,8 @@ pub struct TrimResult {
     pub dropped_messages: usize,
     pub dropped_turns: usize,
     pub kept_turns: usize,
+    pub tokens_before: usize,
+    pub tokens_after: usize,
     pub trimmed: bool,
 }
 
@@ -37,12 +39,15 @@ fn is_system(msg: &ChatMessage) -> bool {
 /// When `budget_tokens` is zero the history is returned untouched.
 pub fn trim_to_recent_turns(history: Vec<ChatMessage>, budget_tokens: usize) -> TrimResult {
     let total_turns = count_turns(&history);
-    if budget_tokens == 0 || estimate_history_tokens(&history) <= budget_tokens {
+    let tokens_before = estimate_history_tokens(&history);
+    if budget_tokens == 0 || tokens_before <= budget_tokens {
         return TrimResult {
             history,
             dropped_messages: 0,
             dropped_turns: 0,
             kept_turns: total_turns,
+            tokens_before,
+            tokens_after: tokens_before,
             trimmed: false,
         };
     }
@@ -64,6 +69,8 @@ pub fn trim_to_recent_turns(history: Vec<ChatMessage>, budget_tokens: usize) -> 
             dropped_messages: 0,
             dropped_turns: 0,
             kept_turns: total_turns,
+            tokens_before,
+            tokens_after: tokens_before,
             trimmed: false,
         };
     }
@@ -85,6 +92,8 @@ pub fn trim_to_recent_turns(history: Vec<ChatMessage>, budget_tokens: usize) -> 
             dropped_messages: 0,
             dropped_turns: 0,
             kept_turns: total_turns,
+            tokens_before,
+            tokens_after: tokens_before,
             trimmed: false,
         };
     }
@@ -94,12 +103,15 @@ pub fn trim_to_recent_turns(history: Vec<ChatMessage>, budget_tokens: usize) -> 
     let mut kept = system;
     kept.extend_from_slice(&body[start..]);
     let kept_turns = total_turns - dropped_turns;
+    let tokens_after = estimate_history_tokens(&kept);
 
     TrimResult {
         history: kept,
         dropped_messages,
         dropped_turns,
         kept_turns,
+        tokens_before,
+        tokens_after,
         trimmed: true,
     }
 }
@@ -177,6 +189,37 @@ mod tests {
         assert!(r.kept_turns >= 1);
         // most recent turn survived
         assert!(r.history.iter().any(|m| m.content.contains("turn3 short")));
+    }
+
+    #[test]
+    fn token_accounting_is_populated_and_coherent() {
+        let big = "x".repeat(2000);
+        let h = vec![
+            sys("system"),
+            user(&format!("turn1 {big}")),
+            asst("a1"),
+            user(&format!("turn2 {big}")),
+            asst("a2"),
+            user("turn3 short"),
+            asst("a3"),
+        ];
+        let r = trim_to_recent_turns(h, 200);
+        assert!(r.trimmed);
+        // the sick-log fields must reflect a real reduction
+        assert!(r.tokens_before > r.tokens_after);
+        assert!(r.tokens_before > 200, "before should exceed budget");
+        assert!(
+            r.tokens_before.saturating_sub(r.tokens_after) > 0,
+            "reclaimed must be positive when trimmed"
+        );
+    }
+
+    #[test]
+    fn untouched_reports_equal_before_after() {
+        let h = vec![sys("s"), user("hi"), asst("yo")];
+        let r = trim_to_recent_turns(h, 1_000_000);
+        assert!(!r.trimmed);
+        assert_eq!(r.tokens_before, r.tokens_after);
     }
 
     #[test]

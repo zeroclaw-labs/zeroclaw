@@ -402,18 +402,39 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                 let system_count = trimmed.iter().take_while(|m| m.role == "system").count();
                 trimmed.insert(system_count, crate::agent::history_trim::breadcrumb());
                 *history = trimmed;
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Delete)
-                        .with_category(::zeroclaw_log::EventCategory::Agent)
-                        .with_attrs(::serde_json::json!({
-                            "dropped_messages": result.dropped_messages,
-                            "dropped_turns": result.dropped_turns,
-                            "kept_turns": result.kept_turns,
-                            "budget": context_token_budget,
-                        })),
-                    "History trimmed: dropped oldest whole turns to fit context budget"
-                );
+                {
+                    let __zc_trim_span = ::zeroclaw_log::info_span!(
+                        target: "zeroclaw_log_internal_scope",
+                        "zeroclaw_scope",
+                        model = %model,
+                        model_provider = %provider_name,
+                    );
+                    let _zc_trim_guard = __zc_trim_span.entered();
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Delete)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_attrs(::serde_json::json!({
+                                "dropped_messages": result.dropped_messages,
+                                "dropped_turns": result.dropped_turns,
+                                "kept_turns": result.kept_turns,
+                                "budget_tokens": context_token_budget,
+                                "tokens_before": result.tokens_before,
+                                "tokens_after": result.tokens_after,
+                                "tokens_reclaimed": result.tokens_before.saturating_sub(result.tokens_after),
+                                "budget_headroom": context_token_budget.saturating_sub(result.tokens_after),
+                            })),
+                        format!(
+                            "History trimmed: dropped {} oldest turn(s) ({} msgs), {} -> {} tok (budget {}), reclaimed {} tok",
+                            result.dropped_turns,
+                            result.dropped_messages,
+                            result.tokens_before,
+                            result.tokens_after,
+                            context_token_budget,
+                            result.tokens_before.saturating_sub(result.tokens_after)
+                        )
+                    );
+                }
                 if let Some(tx) = event_tx.as_ref() {
                     let _ = tx
                         .send(TurnEvent::HistoryTrimmed {

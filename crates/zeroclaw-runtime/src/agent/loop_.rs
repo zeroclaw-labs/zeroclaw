@@ -2305,7 +2305,8 @@ pub async fn run(
 
                                 continue;
                             }
-                            // Context overflow recovery: compress and retry
+                            // Context overflow recovery: drop oldest whole
+                            // turns and retry. No summarization, no splicing.
                             if zeroclaw_providers::reliable::is_context_window_exceeded(&e) {
                                 ::zeroclaw_log::record!(
                                     WARN,
@@ -2316,52 +2317,64 @@ pub async fn run(
                                     .with_category(::zeroclaw_log::EventCategory::Agent),
                                     "Context overflow in interactive loop, attempting recovery"
                                 );
-                                let mut compressor =
-                                    crate::agent::context_compressor::ContextCompressor::new(
-                                        agent.resolved.context_compression.clone(),
-                                        eff_max_context_tokens,
-                                    )
-                                    .with_memory(mem.clone());
-                                let error_msg = format!("{e}");
-                                match compressor
-                                    .compress_on_error(
-                                        &mut history,
-                                        model_provider.as_ref(),
-                                        &model_name,
-                                        temperature,
-                                        &error_msg,
-                                    )
-                                    .await
-                                {
-                                    Ok(true) => {
-                                        ::zeroclaw_log::record!(
-                                            INFO,
-                                            ::zeroclaw_log::Event::new(
-                                                module_path!(),
-                                                ::zeroclaw_log::Action::Retry
-                                            )
-                                            .with_category(::zeroclaw_log::EventCategory::Agent)
-                                            .with_outcome(::zeroclaw_log::EventOutcome::Success),
-                                            "Context recovered via compression, retrying turn"
-                                        );
-                                        continue;
-                                    }
-                                    Ok(false) => {
-                                        ::zeroclaw_log::record!(
-                                            WARN,
-                                            ::zeroclaw_log::Event::new(
-                                                module_path!(),
-                                                ::zeroclaw_log::Action::Fail
-                                            )
-                                            .with_category(::zeroclaw_log::EventCategory::Agent)
-                                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                                            "Compression ran but couldn't reduce enough"
-                                        );
-                                    }
-                                    Err(compress_err) => {
-                                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Agent).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{}", compress_err)})), "Compression failed during recovery");
-                                    }
+                                let taken = std::mem::take(&mut history);
+                                let result = crate::agent::history_trim::trim_to_recent_turns(
+                                    taken,
+                                    eff_max_context_tokens,
+                                );
+                                if result.trimmed {
+                                    let mut trimmed = result.history;
+                                    let system_count =
+                                        trimmed.iter().take_while(|m| m.role == "system").count();
+                                    trimmed.insert(
+                                        system_count,
+                                        crate::agent::history_trim::breadcrumb(),
+                                    );
+                                    history = trimmed;
+                                    let __zc_trim_span = ::zeroclaw_log::info_span!(
+                                        target: "zeroclaw_log_internal_scope",
+                                        "zeroclaw_scope",
+                                        model = %model_name,
+                                        model_provider = %provider_name,
+                                    );
+                                    let __zc_trim_guard = __zc_trim_span.entered();
+                                    ::zeroclaw_log::record!(
+                                        INFO,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Retry
+                                        )
+                                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                                        .with_attrs(::serde_json::json!({
+                                            "dropped_messages": result.dropped_messages,
+                                            "dropped_turns": result.dropped_turns,
+                                            "kept_turns": result.kept_turns,
+                                        })),
+                                        "Context recovered via whole-turn trim, retrying turn"
+                                    );
+                                    drop(__zc_trim_guard);
+                                    continue;
                                 }
+                                history = result.history;
+                                let __zc_trim_span = ::zeroclaw_log::info_span!(
+                                    target: "zeroclaw_log_internal_scope",
+                                    "zeroclaw_scope",
+                                    model = %model_name,
+                                    model_provider = %provider_name,
+                                );
+                                let __zc_trim_guard = __zc_trim_span.entered();
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail
+                                    )
+                                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                                    "Context overflow but only one turn remains; cannot trim further"
+                                );
+                                drop(__zc_trim_guard);
                             }
 
                             eprintln!("\nError: {e}\n");
@@ -2387,43 +2400,6 @@ pub async fn run(
                     eprintln!("\nError sending CLI response: {e}\n");
                 }
                 observer.record_event(&ObserverEvent::TurnComplete);
-
-                // Context compression before hard trimming to preserve long-context signal.
-                {
-                    let compressor = crate::agent::context_compressor::ContextCompressor::new(
-                        agent.resolved.context_compression.clone(),
-                        eff_max_context_tokens,
-                    )
-                    .with_memory(mem.clone());
-                    match compressor
-                        .compress_if_needed(
-                            &mut history,
-                            model_provider.as_ref(),
-                            &model_name,
-                            temperature,
-                        )
-                        .await
-                    {
-                        Ok(result) if result.compressed => {
-                            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete).with_category(::zeroclaw_log::EventCategory::Agent).with_outcome(::zeroclaw_log::EventOutcome::Success).with_attrs(::serde_json::json!({"passes": result.passes_used, "before": result.tokens_before, "after": result.tokens_after})), "Context compression complete");
-                        }
-                        Ok(_) => {} // No compression needed
-                        Err(e) => {
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Fail
-                                )
-                                .with_category(::zeroclaw_log::EventCategory::Agent)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                                "Context compression failed, falling back to history trim"
-                            );
-                            trim_history(&mut history, eff_max_history_messages / 2);
-                        }
-                    }
-                }
 
                 // Hard cap as a safety net.
                 trim_history(&mut history, eff_max_history_messages);
