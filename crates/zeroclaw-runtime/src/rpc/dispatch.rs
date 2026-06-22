@@ -20,7 +20,7 @@ use zeroclaw_api::jsonrpc::{
     JSONRPC_VERSION, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
     RpcOutbound,
 };
-use zeroclaw_api::model_provider::ChatMessage;
+use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
 
 /// Wire protocol version. Bump on breaking changes.
 pub const RPC_PROTOCOL_VERSION: u64 = 1;
@@ -324,6 +324,29 @@ fn model_provider_ref_from_provider_profile_prop(prop: &str) -> Option<String> {
     } else {
         Some(format!("{provider_type}.{provider_alias}"))
     }
+}
+
+/// Strip a trailing assistant tool intent that a cancel truncated before its
+/// results arrived. A cancelled turn persists whatever accumulated in history;
+/// if the cancel fired between the assistant emitting tool calls and the tool
+/// loop producing `ToolResults`, the slice ends on an `AssistantToolCalls`
+/// whose calls have no matching results. Persisting that teaches the next turn
+/// the work succeeded, so the model reports fabricated results. Returns the
+/// number of trailing messages removed.
+fn sanitize_cancelled_turn(messages: &mut Vec<ConversationMessage>) -> usize {
+    let before = messages.len();
+    while let Some(last) = messages.last() {
+        let dangling = match last {
+            ConversationMessage::AssistantToolCalls { tool_calls, .. } => !tool_calls.is_empty(),
+            _ => false,
+        };
+        if dangling {
+            messages.pop();
+        } else {
+            break;
+        }
+    }
+    before - messages.len()
 }
 
 /// Per-connection dispatcher. Shared state lives in [`RpcContext`].
@@ -1540,35 +1563,57 @@ impl RpcDispatcher {
                         outcome,
                         Ok(TurnOutcome::Completed { .. }) | Ok(TurnOutcome::Cancelled { .. })
                     )
-                    && let Some(new_msgs) = self
+                    && let Some(mut new_msgs) = self
                         .ctx
                         .sessions
                         .history_slice_from(sid, pre_history_len)
                         .await
-                    && !new_msgs.is_empty()
                 {
-                    let store = store.clone();
-                    let sid_owned = sid.to_string();
-                    let persisted = tokio::task::spawn_blocking(move || {
-                        store.append_turn(&sid_owned, &new_msgs)
-                    })
-                    .await;
-                    let error = match persisted {
-                        Ok(Ok(())) => None,
-                        Ok(Err(e)) => Some(e.to_string()),
-                        Err(join) => Some(join.to_string()),
-                    };
-                    if let Some(detail) = error {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"session_id": sid, "error": detail})),
-                            "Failed to persist ACP turn"
-                        );
+                    if matches!(outcome, Ok(TurnOutcome::Cancelled { .. })) {
+                        let dropped = sanitize_cancelled_turn(&mut new_msgs);
+                        if dropped > 0 {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_category(::zeroclaw_log::EventCategory::Agent)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                                .with_attrs(::serde_json::json!({
+                                    "session_id": sid,
+                                    "dropped_messages": dropped,
+                                })),
+                                "dropped dangling tool intent from cancelled turn before persisting"
+                            );
+                        }
+                    }
+                    if !new_msgs.is_empty() {
+                        let store = store.clone();
+                        let sid_owned = sid.to_string();
+                        let persisted = tokio::task::spawn_blocking(move || {
+                            store.append_turn(&sid_owned, &new_msgs)
+                        })
+                        .await;
+                        let error = match persisted {
+                            Ok(Ok(())) => None,
+                            Ok(Err(e)) => Some(e.to_string()),
+                            Err(join) => Some(join.to_string()),
+                        };
+                        if let Some(detail) = error {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(
+                                    ::serde_json::json!({"session_id": sid, "error": detail})
+                                ),
+                                "Failed to persist ACP turn"
+                            );
+                        }
                     }
                 }
             }
@@ -3606,6 +3651,56 @@ fn notification_for_turn_event(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    use zeroclaw_api::model_provider::{ToolCall, ToolResultMessage};
+
+    fn assistant_tool_call(id: &str) -> ConversationMessage {
+        ConversationMessage::AssistantToolCalls {
+            text: Some("written to tmp/foo.md".into()),
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                name: "file_write".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }],
+            reasoning_content: None,
+        }
+    }
+
+    #[test]
+    fn sanitize_drops_trailing_dangling_tool_call() {
+        let mut msgs = vec![
+            ConversationMessage::Chat(ChatMessage::user("do it")),
+            assistant_tool_call("toolu_1"),
+        ];
+        let dropped = sanitize_cancelled_turn(&mut msgs);
+        assert_eq!(dropped, 1);
+        assert_eq!(msgs.len(), 1);
+    }
+
+    #[test]
+    fn sanitize_keeps_resolved_tool_call() {
+        let mut msgs = vec![
+            assistant_tool_call("toolu_1"),
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "toolu_1".into(),
+                content: "ok".into(),
+            }]),
+        ];
+        let dropped = sanitize_cancelled_turn(&mut msgs);
+        assert_eq!(dropped, 0);
+        assert_eq!(msgs.len(), 2);
+    }
+
+    #[test]
+    fn sanitize_keeps_plain_assistant_text() {
+        let mut msgs = vec![ConversationMessage::Chat(ChatMessage::assistant(
+            "just text",
+        ))];
+        let dropped = sanitize_cancelled_turn(&mut msgs);
+        assert_eq!(dropped, 0);
+        assert_eq!(msgs.len(), 1);
+    }
 
     fn parse(s: &str) -> Value {
         serde_json::from_str(s).unwrap()
