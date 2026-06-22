@@ -39,6 +39,7 @@ pub(crate) fn build_iteration_tool_specs(
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Tool)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                     "activated-tool lock poisoned while assembling iteration tool specs; recovering guard for read"
                 );
