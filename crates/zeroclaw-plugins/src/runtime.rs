@@ -4,13 +4,9 @@
 //! (`zc_http_request`, `zc_env_read`) and calls plugin-exported functions
 //! (`tool_metadata`, `execute`).
 //!
-//! The host function `zc_http_request` enforces the plugin's
-//! `http_allowed_hosts` / `allow_private_hosts` allowlists (manifest
-//! fields) — see issue #5918 and ADR-003 §"Known gaps". Deny-by-default:
-//! empty allowlists reject every call.
-//!
-//! Issue #5919 (per-plugin `env_read_vars` allowlist) is added in a
-//! follow-up commit on top of this plumbing.
+//! The host functions enforce the plugin's `http_allowed_hosts` /
+//! `env_read_vars` allowlists (manifest fields) — see issues #5918 and
+//! #5919. Deny-by-default: empty allowlists reject every call.
 
 use crate::url_guard;
 use crate::{PluginManifest, PluginPermission};
@@ -25,13 +21,14 @@ use zeroclaw_api::tool::ToolResult;
 
 /// Permissions and policy available to a single plugin invocation.
 ///
-/// Carries the manifest's `http_allowed_hosts` / `allow_private_hosts`
-/// pre-parsed into a typed [`HttpPolicy`] so `zc_http_request` doesn't
-/// re-parse the manifest on every call.
+/// Carries the manifest's `http_allowed_hosts` / `allow_private_hosts` and
+/// `env_read_vars` pre-parsed into typed policy structs so the host
+/// functions don't re-parse the manifest on every call.
 #[derive(Debug, Clone)]
 struct HostContext {
     permissions: HashSet<PluginPermission>,
     http_policy: HttpPolicy,
+    env_policy: EnvPolicy,
 }
 
 /// HTTP host policy derived from the manifest.
@@ -39,6 +36,13 @@ struct HostContext {
 struct HttpPolicy {
     allow_private_hosts: bool,
     allowed_hosts: Vec<String>,
+}
+
+/// Env-read host policy derived from the manifest. The allowlist is a
+/// `HashSet` so the per-call check is O(1) regardless of size.
+#[derive(Debug, Clone, Default)]
+struct EnvPolicy {
+    allowed_vars: HashSet<String>,
 }
 
 // ── Data types exchanged with plugins ─────────────────────────────
@@ -193,10 +197,18 @@ fn handle_env_read(
 
     let var_name: String = plugin.memory_get_val(&inputs[0])?;
 
-    // Issue #5919 (per-plugin `env_read_vars` allowlist) lands in the
-    // follow-up commit that adds `validate_env_var` and `EnvPolicy`.
-    // Until then, the permission bit alone gates access — consistent with
-    // the pre-#5918 behavior so this commit is independently shippable.
+    // Issue #5919: per-plugin env-var allowlist. See `validate_env_var` —
+    // deny-by-default when the manifest declares no `env_read_vars`.
+    validate_env_var(&ctx, &var_name).map_err(|e| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"plugin_requested_var": var_name})),
+            "zc_env_read: read rejected"
+        );
+        Error::msg(e)
+    })?;
 
     let value = std::env::var(&var_name)
         .map_err(|_| Error::msg(format!("environment variable '{var_name}' not set")))?;
@@ -234,18 +246,37 @@ fn validate_request_url(ctx: &HostContext, url: &str) -> Result<String, String> 
     Ok(host)
 }
 
+/// Issue #5919: validate `var_name` against the plugin's env-var allowlist.
+///
+/// Deny-by-default: when the manifest declares no `env_read_vars`, every
+/// read is rejected — the permission token alone is not enough.
+fn validate_env_var(ctx: &HostContext, var_name: &str) -> Result<(), String> {
+    if ctx.env_policy.allowed_vars.is_empty() {
+        return Err(
+            "env: plugin manifest declares no env_read_vars; env_read is denied for all variables"
+                .into(),
+        );
+    }
+    if !ctx.env_policy.allowed_vars.contains(var_name) {
+        return Err(format!(
+            "env: variable '{var_name}' is not in env_read_vars allowlist"
+        ));
+    }
+    Ok(())
+}
+
 // ── Plugin creation and invocation ────────────────────────────────
 
 /// Create an Extism plugin from a WASM file with the given permissions.
 ///
 /// Retained for tests and external callers that only need the permission
-/// bit-set. The new `http_policy` defaults to deny-all (empty allowlist),
-/// so plugins calling `zc_http_request` through this entry point will be
-/// rejected at the host-function boundary.
+/// bit-set. New HTTP/env policies default to deny-all (empty allowlists),
+/// so plugins calling `zc_http_request` or `zc_env_read` through this
+/// entry point will be rejected at the host-function boundary.
 ///
 /// Prefer [`create_plugin_with_manifest`] when the full manifest is
-/// available — it carries `http_allowed_hosts` / `allow_private_hosts`
-/// into the host functions so allowlisted plugins can actually make calls.
+/// available — it carries `http_allowed_hosts` / `env_read_vars` into the
+/// host functions so allowlisted plugins can actually make calls.
 pub fn create_plugin(wasm_path: &Path, permissions: &[PluginPermission]) -> Result<extism::Plugin> {
     // Construct a minimal manifest carrying only the requested permissions.
     // All new fields default to deny-all (serde defaults).
@@ -259,18 +290,20 @@ pub fn create_plugin(wasm_path: &Path, permissions: &[PluginPermission]) -> Resu
         permissions: permissions.to_vec(),
         allow_private_hosts: false,
         http_allowed_hosts: Vec::new(),
+        env_read_vars: Vec::new(),
         signature: None,
         publisher_key: None,
     };
     create_plugin_with_manifest(wasm_path, &minimal)
 }
 
-/// Create an Extism plugin with the full manifest so `zc_http_request`
-/// can enforce the plugin's HTTP allowlists.
+/// Create an Extism plugin with the full manifest so the host functions
+/// can enforce HTTP allowlists and env-var allowlists.
 ///
-/// `manifest.http_allowed_hosts` and `manifest.allow_private_hosts` are
-/// parsed once at construction into [`HttpPolicy`]; the hot path is a
-/// short `Vec<String>` scan plus a single IP-classification match.
+/// `manifest.http_allowed_hosts`, `manifest.allow_private_hosts`, and
+/// `manifest.env_read_vars` are parsed once at construction into
+/// [`HttpPolicy`] / [`EnvPolicy`]; the hot path is a single `HashSet`
+/// membership test or short `Vec<String>` scan.
 pub fn create_plugin_with_manifest(
     wasm_path: &Path,
     manifest: &PluginManifest,
@@ -281,6 +314,9 @@ pub fn create_plugin_with_manifest(
         http_policy: HttpPolicy {
             allow_private_hosts: manifest.allow_private_hosts,
             allowed_hosts: manifest.http_allowed_hosts.clone(),
+        },
+        env_policy: EnvPolicy {
+            allowed_vars: manifest.env_read_vars.iter().cloned().collect(),
         },
     });
 
@@ -333,12 +369,13 @@ mod tests {
     use crate::PluginManifest;
 
     /// Helper: build a manifest carrying the requested permissions and
-    /// the new HTTP allowlist fields. Mirrors what the loader passes to
+    /// the new allowlist fields. Mirrors what the loader passes to
     /// `create_plugin_with_manifest` after parsing `manifest.toml`.
     fn manifest_with(
         perms: Vec<PluginPermission>,
         allow_private_hosts: bool,
         http_allowed_hosts: Vec<String>,
+        env_read_vars: Vec<String>,
     ) -> PluginManifest {
         PluginManifest {
             name: "test".into(),
@@ -350,6 +387,7 @@ mod tests {
             permissions: perms,
             allow_private_hosts,
             http_allowed_hosts,
+            env_read_vars,
             signature: None,
             publisher_key: None,
         }
@@ -360,12 +398,14 @@ mod tests {
         let ctx = HostContext {
             permissions: HashSet::from([PluginPermission::HttpClient]),
             http_policy: HttpPolicy::default(),
+            env_policy: EnvPolicy::default(),
         };
         assert!(ctx.permissions.contains(&PluginPermission::HttpClient));
         assert!(!ctx.permissions.contains(&PluginPermission::EnvRead));
         // Default policy fields are deny-all.
         assert!(ctx.http_policy.allowed_hosts.is_empty());
         assert!(!ctx.http_policy.allow_private_hosts);
+        assert!(ctx.env_policy.allowed_vars.is_empty());
     }
 
     #[test]
@@ -376,9 +416,24 @@ mod tests {
                 allow_private_hosts: true,
                 allowed_hosts: vec!["*.example.com".into(), "localhost".into()],
             },
+            env_policy: EnvPolicy::default(),
         };
         assert!(ctx.http_policy.allow_private_hosts);
         assert_eq!(ctx.http_policy.allowed_hosts.len(), 2);
+    }
+
+    #[test]
+    fn host_context_carries_env_policy() {
+        let ctx = HostContext {
+            permissions: HashSet::from([PluginPermission::EnvRead]),
+            http_policy: HttpPolicy::default(),
+            env_policy: EnvPolicy {
+                allowed_vars: HashSet::from(["FOO".to_string(), "BAR".to_string()]),
+            },
+        };
+        assert!(ctx.env_policy.allowed_vars.contains("FOO"));
+        assert!(ctx.env_policy.allowed_vars.contains("BAR"));
+        assert!(!ctx.env_policy.allowed_vars.contains("BAZ"));
     }
 
     #[test]
@@ -429,17 +484,18 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── PluginManifest deserialization tests (issue #5918) ──
+    // ── PluginManifest deserialization tests (issues #5918 + #5919) ──
 
     #[test]
-    fn plugin_manifest_deserializes_with_new_http_fields() {
+    fn plugin_manifest_deserializes_with_new_fields() {
         let toml_str = r#"
 name = "demo"
 version = "0.1.0"
 capabilities = ["tool"]
-permissions = ["http_client"]
+permissions = ["http_client", "env_read"]
 allow_private_hosts = true
 http_allowed_hosts = ["*.example.com", "fal.run"]
+env_read_vars = ["FAL_API_KEY"]
 "#;
         let manifest: PluginManifest = toml::from_str(toml_str).unwrap();
         assert!(manifest.allow_private_hosts);
@@ -447,20 +503,22 @@ http_allowed_hosts = ["*.example.com", "fal.run"]
             manifest.http_allowed_hosts,
             vec!["*.example.com".to_string(), "fal.run".to_string()]
         );
+        assert_eq!(manifest.env_read_vars, vec!["FAL_API_KEY".to_string()]);
     }
 
     #[test]
     fn plugin_manifest_deserializes_without_new_fields_for_backward_compat() {
-        // Existing manifest shape from before #5918 — must still load.
+        // Existing manifest shape from before #5918/#5919 — must still load.
         let toml_str = r#"
 name = "legacy"
 version = "0.1.0"
 capabilities = ["tool"]
-permissions = ["http_client"]
+permissions = ["http_client", "env_read"]
 "#;
         let manifest: PluginManifest = toml::from_str(toml_str).unwrap();
         assert!(!manifest.allow_private_hosts);
         assert!(manifest.http_allowed_hosts.is_empty());
+        assert!(manifest.env_read_vars.is_empty());
     }
 
     #[test]
@@ -469,30 +527,36 @@ permissions = ["http_client"]
             vec![PluginPermission::HttpClient, PluginPermission::EnvRead],
             true,
             vec!["fal.run".into(), "*.fal.run".into()],
+            vec!["FAL_API_KEY".into()],
         );
         let json = serde_json::to_string(&original).unwrap();
         let parsed: PluginManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.allow_private_hosts, original.allow_private_hosts);
         assert_eq!(parsed.http_allowed_hosts, original.http_allowed_hosts);
+        assert_eq!(parsed.env_read_vars, original.env_read_vars);
         assert_eq!(parsed.permissions.len(), 2);
     }
 
     // ── Host-function validation tests ────────────────────────────
     //
-    // These exercise `validate_request_url` (the extracted pure function)
-    // directly so we can pin the SSRF and allowlist semantics without
-    // spinning up a real WASM module.
+    // These exercise `validate_request_url` and `validate_env_var` (the
+    // extracted pure functions) directly so we can pin the SSRF and
+    // allowlist semantics without spinning up a real WASM module.
 
     fn ctx_with(
         perms: Vec<PluginPermission>,
         allow_private_hosts: bool,
         http_allowed_hosts: Vec<&str>,
+        env_read_vars: Vec<&str>,
     ) -> HostContext {
         HostContext {
             permissions: perms.into_iter().collect(),
             http_policy: HttpPolicy {
                 allow_private_hosts,
                 allowed_hosts: http_allowed_hosts.into_iter().map(String::from).collect(),
+            },
+            env_policy: EnvPolicy {
+                allowed_vars: env_read_vars.into_iter().map(String::from).collect(),
             },
         }
     }
@@ -503,6 +567,7 @@ permissions = ["http_client"]
             vec![PluginPermission::HttpClient],
             false,
             vec!["example.com"],
+            vec![],
         );
         let err = validate_request_url(&ctx, "ftp://example.com/x").unwrap_err();
         assert!(err.contains("non-http(s) URL rejected"), "got: {err}");
@@ -510,7 +575,7 @@ permissions = ["http_client"]
 
     #[test]
     fn validate_request_url_rejects_empty_allowlist_by_default() {
-        let ctx = ctx_with(vec![PluginPermission::HttpClient], false, vec![]);
+        let ctx = ctx_with(vec![PluginPermission::HttpClient], false, vec![], vec![]);
         let err = validate_request_url(&ctx, "https://example.com/x").unwrap_err();
         assert!(err.contains("is not in http_allowed_hosts"), "got: {err}");
     }
@@ -521,6 +586,7 @@ permissions = ["http_client"]
             vec![PluginPermission::HttpClient],
             false,
             vec!["example.com"],
+            vec![],
         );
         let err = validate_request_url(&ctx, "https://other.com/x").unwrap_err();
         assert!(
@@ -535,6 +601,7 @@ permissions = ["http_client"]
             vec![PluginPermission::HttpClient],
             false,
             vec!["example.com"],
+            vec![],
         );
         validate_request_url(&ctx, "https://example.com/x").unwrap();
         validate_request_url(&ctx, "https://EXAMPLE.com/x").unwrap(); // case-insensitive
@@ -546,6 +613,7 @@ permissions = ["http_client"]
             vec![PluginPermission::HttpClient],
             false,
             vec!["example.com"],
+            vec![],
         );
         validate_request_url(&ctx, "https://api.example.com/x").unwrap();
         validate_request_url(&ctx, "https://v2.api.example.com/x").unwrap();
@@ -553,7 +621,12 @@ permissions = ["http_client"]
 
     #[test]
     fn validate_request_url_accepts_wildcard_subdomain() {
-        let ctx = ctx_with(vec![PluginPermission::HttpClient], false, vec!["*.fal.run"]);
+        let ctx = ctx_with(
+            vec![PluginPermission::HttpClient],
+            false,
+            vec!["*.fal.run"],
+            vec![],
+        );
         validate_request_url(&ctx, "https://fal.run/x").unwrap();
         validate_request_url(&ctx, "https://api.fal.run/x").unwrap();
         let err = validate_request_url(&ctx, "https://other.com/x").unwrap_err();
@@ -562,14 +635,24 @@ permissions = ["http_client"]
 
     #[test]
     fn validate_request_url_rejects_localhost_by_default() {
-        let ctx = ctx_with(vec![PluginPermission::HttpClient], false, vec!["localhost"]);
+        let ctx = ctx_with(
+            vec![PluginPermission::HttpClient],
+            false,
+            vec!["localhost"],
+            vec![],
+        );
         let err = validate_request_url(&ctx, "http://localhost:8080/x").unwrap_err();
         assert!(err.contains("Blocked local/private host"), "got: {err}");
     }
 
     #[test]
     fn validate_request_url_allows_localhost_when_opt_in() {
-        let ctx = ctx_with(vec![PluginPermission::HttpClient], true, vec!["localhost"]);
+        let ctx = ctx_with(
+            vec![PluginPermission::HttpClient],
+            true,
+            vec!["localhost"],
+            vec![],
+        );
         validate_request_url(&ctx, "http://localhost:8080/x").unwrap();
     }
 
@@ -579,6 +662,7 @@ permissions = ["http_client"]
             vec![PluginPermission::HttpClient],
             false,
             vec!["192.168.1.5"],
+            vec![],
         );
         let err = validate_request_url(&ctx, "http://192.168.1.5/x").unwrap_err();
         assert!(err.contains("Blocked local/private host"), "got: {err}");
@@ -590,6 +674,7 @@ permissions = ["http_client"]
             vec![PluginPermission::HttpClient],
             false,
             vec!["169.254.169.254"],
+            vec![],
         );
         let err =
             validate_request_url(&ctx, "http://169.254.169.254/latest/meta-data").unwrap_err();
@@ -598,7 +683,12 @@ permissions = ["http_client"]
 
     #[test]
     fn validate_request_url_rejects_ipv6_loopback() {
-        let ctx = ctx_with(vec![PluginPermission::HttpClient], false, vec!["::1"]);
+        let ctx = ctx_with(
+            vec![PluginPermission::HttpClient],
+            false,
+            vec!["::1"],
+            vec![],
+        );
         let err = validate_request_url(&ctx, "http://[::1]/x").unwrap_err();
         assert!(err.contains("Blocked local/private host"), "got: {err}");
     }
@@ -609,6 +699,7 @@ permissions = ["http_client"]
             vec![PluginPermission::HttpClient],
             false,
             vec!["example.com"],
+            vec![],
         );
         let err = validate_request_url(&ctx, "https://user:pass@example.com/x").unwrap_err();
         assert!(err.contains("userinfo is not allowed"), "got: {err}");
@@ -620,6 +711,7 @@ permissions = ["http_client"]
             vec![PluginPermission::HttpClient],
             false,
             vec!["example.com"],
+            vec![],
         );
         // `reqwest::Url` rejects `[::1/x` at parse time with "invalid IPv6
         // address" before our bracket-checker runs. Accept either rejection
@@ -635,10 +727,50 @@ permissions = ["http_client"]
     fn validate_request_url_wildcard_star_still_rejects_private_host() {
         // `["*"]` allows any PUBLIC host but allow_private_hosts still gates
         // loopback / RFC1918 / link-local / IMDS.
-        let ctx = ctx_with(vec![PluginPermission::HttpClient], false, vec!["*"]);
+        let ctx = ctx_with(vec![PluginPermission::HttpClient], false, vec!["*"], vec![]);
         validate_request_url(&ctx, "https://news.ycombinator.com/").unwrap();
         let err = validate_request_url(&ctx, "http://localhost/x").unwrap_err();
         assert!(err.contains("Blocked local/private host"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_env_var_denies_when_allowlist_empty() {
+        let ctx = ctx_with(vec![PluginPermission::EnvRead], false, vec![], vec![]);
+        let err = validate_env_var(&ctx, "FAL_API_KEY").unwrap_err();
+        assert!(err.contains("no env_read_vars"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_env_var_denies_var_not_in_allowlist() {
+        let ctx = ctx_with(
+            vec![PluginPermission::EnvRead],
+            false,
+            vec![],
+            vec!["OTHER_VAR"],
+        );
+        let err = validate_env_var(&ctx, "FAL_API_KEY").unwrap_err();
+        assert!(
+            err.contains("'FAL_API_KEY' is not in env_read_vars"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_env_var_allows_var_in_allowlist() {
+        let ctx = ctx_with(
+            vec![PluginPermission::EnvRead],
+            false,
+            vec![],
+            vec!["FAL_API_KEY"],
+        );
+        validate_env_var(&ctx, "FAL_API_KEY").unwrap();
+    }
+
+    #[test]
+    fn validate_env_var_is_case_sensitive() {
+        let ctx = ctx_with(vec![PluginPermission::EnvRead], false, vec![], vec!["foo"]);
+        assert!(validate_env_var(&ctx, "foo").is_ok());
+        assert!(validate_env_var(&ctx, "FOO").is_err());
     }
 
     /// Integration tests that load the actual image-gen WASM plugin.
@@ -660,6 +792,7 @@ permissions = ["http_client"]
                 perms,
                 false,
                 vec!["*.fal.run".to_string(), "fal.run".to_string()],
+                vec!["FAL_API_KEY".to_string()],
             )
         }
 
@@ -732,10 +865,9 @@ permissions = ["http_client"]
         }
 
         /// End-to-end: missing `FAL_API_KEY` exercises the `zc_env_read` host
-        /// function — the host returns Err (var unset), which Extism
-        /// propagates as a plugin-call trap. Proves the env_read path is
-        /// wired. Per-plugin `env_read_vars` enforcement (issue #5919) is
-        /// added in the follow-up commit and lands with a separate test.
+        /// function — the host returns Err (var unset), which Extism propagates
+        /// as a plugin-call trap. Proves the env_read path is wired through
+        /// the new `env_read_vars` allowlist (issue #5919).
         #[test]
         fn execute_missing_api_key_exercises_env_read_host_fn() {
             let Some(path) = wasm_path() else { return };
@@ -769,6 +901,30 @@ permissions = ["http_client"]
             assert!(
                 msg.contains("permission") || msg.contains("env_read"),
                 "expected permission-denied error, got: {msg}"
+            );
+        }
+
+        /// Issue #5919: with `env_read` granted but an empty `env_read_vars`
+        /// allowlist, the host function denies the read even though the
+        /// permission bit is set.
+        #[test]
+        fn execute_with_empty_env_read_allowlist_denies_env_read() {
+            let Some(path) = wasm_path() else { return };
+            unsafe { std::env::remove_var("FAL_API_KEY") };
+            // Same permissions, but env_read_vars deliberately empty.
+            let manifest = manifest_with(
+                vec![PluginPermission::HttpClient, PluginPermission::EnvRead],
+                false,
+                vec!["*.fal.run".to_string()],
+                vec![],
+            );
+            let mut plugin = create_plugin_with_manifest(&path, &manifest).unwrap();
+            let args = serde_json::to_vec(&serde_json::json!({"prompt": "a sunset"})).unwrap();
+            let err = call_execute(&mut plugin, &args).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("no env_read_vars"),
+                "expected deny-by-default env_read error, got: {msg}"
             );
         }
     }

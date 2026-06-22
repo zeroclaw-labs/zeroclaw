@@ -13,7 +13,6 @@ permissions = ["http_client", "env_read"]
 # RFC1918 access need.
 http_allowed_hosts = ["*.fal.run", "fal.run"]
 
-# Issue #5919 (lands in follow-up commit): env_read allowlist. The plugin
-# only needs FAL_API_KEY. Until that commit lands, the empty allowlist
-# would deny every env read; the follow-up sets `env_read_vars = ["FAL_API_KEY"]`.
-env_read_vars = []
+# Issue #5919: env_read allowlist. The plugin only needs FAL_API_KEY. Without
+# this field the host function denies every env read (deny-by-default).
+env_read_vars = ["FAL_API_KEY"]

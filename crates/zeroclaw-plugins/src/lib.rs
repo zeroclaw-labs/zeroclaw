@@ -55,6 +55,15 @@ pub struct PluginManifest {
     /// See issue #5918.
     #[serde(default)]
     pub http_allowed_hosts: Vec<String>,
+    /// Explicit allowlist of environment variables the plugin's
+    /// `zc_env_read` host function may return when `env_read` is granted.
+    /// Matched by exact variable name (no wildcards). When empty, the
+    /// plugin is **deny-by-default** for env access — the host function
+    /// rejects every read.
+    ///
+    /// See issue #5919.
+    #[serde(default)]
+    pub env_read_vars: Vec<String>,
     /// Ed25519 signature over the canonical manifest (base64url-encoded).
     /// Set by the plugin publisher when signing the manifest.
     #[serde(default)]
@@ -111,6 +120,9 @@ pub struct PluginInfo {
     /// Hosts the plugin's `zc_http_request` host function may contact
     /// (issue #5918). Empty = deny-by-default.
     pub http_allowed_hosts: Vec<String>,
+    /// Environment variables the plugin's `zc_env_read` host function may
+    /// read (issue #5919). Empty = deny-by-default.
+    pub env_read_vars: Vec<String>,
     /// Resolved path to the WASM file. `None` for skill-only plugins.
     pub wasm_path: Option<PathBuf>,
     pub loaded: bool,

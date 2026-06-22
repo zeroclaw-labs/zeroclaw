@@ -339,6 +339,7 @@ fn plugin_info_from_loaded(p: &LoadedPlugin) -> PluginInfo {
         permissions: p.manifest.permissions.clone(),
         allow_private_hosts: p.manifest.allow_private_hosts,
         http_allowed_hosts: p.manifest.http_allowed_hosts.clone(),
+        env_read_vars: p.manifest.env_read_vars.clone(),
         wasm_path: p.wasm_path.clone(),
         loaded,
     }
@@ -398,8 +399,22 @@ fn validate_manifest_shape(
 
     // Issue #5919: same pattern for `env_read` — empty allowlist means
     // every read is rejected. Surface as WARN at startup.
-    // (Landed in the follow-up commit that adds `env_read_vars` enforcement;
-    // this commit introduces only the HTTP-side WARN for #5918.)
+    if manifest.permissions.contains(&PluginPermission::EnvRead)
+        && manifest.env_read_vars.is_empty()
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"plugin": manifest.name})),
+            &format!(
+                "plugin '{}' requests env_read but declares empty env_read_vars; \
+                 all zc_env_read calls will be rejected until the manifest is updated \
+                 (see issue #5919)",
+                manifest.name
+            )
+        );
+    }
 
     Ok(())
 }
