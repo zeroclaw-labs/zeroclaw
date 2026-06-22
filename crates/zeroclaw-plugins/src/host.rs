@@ -2,7 +2,7 @@
 
 use super::error::PluginError;
 use super::signature::{self, SignatureMode, VerificationResult};
-use super::{PluginCapability, PluginInfo, PluginManifest};
+use super::{PluginCapability, PluginInfo, PluginManifest, PluginPermission};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -337,6 +337,8 @@ fn plugin_info_from_loaded(p: &LoadedPlugin) -> PluginInfo {
         description: p.manifest.description.clone(),
         capabilities: p.manifest.capabilities.clone(),
         permissions: p.manifest.permissions.clone(),
+        allow_private_hosts: p.manifest.allow_private_hosts,
+        http_allowed_hosts: p.manifest.http_allowed_hosts.clone(),
         wasm_path: p.wasm_path.clone(),
         loaded,
     }
@@ -370,6 +372,34 @@ fn validate_manifest_shape(
     if manifest.capabilities.contains(&PluginCapability::Skill) {
         validate_skill_bundle(&manifest.name, plugin_dir)?;
     }
+
+    // Issue #5918: when `http_client` is requested without an allowlist
+    // (and `allow_private_hosts = false`), every `zc_http_request` call
+    // will be rejected at the host-function boundary. Emit a WARN so
+    // operators notice at startup — but still load the plugin so the
+    // regression surfaces in logs rather than breaking manifest parsing.
+    if manifest.permissions.contains(&PluginPermission::HttpClient)
+        && manifest.http_allowed_hosts.is_empty()
+        && !manifest.allow_private_hosts
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"plugin": manifest.name})),
+            &format!(
+                "plugin '{}' requests http_client but declares empty http_allowed_hosts \
+                 and allow_private_hosts=false; all zc_http_request calls will be rejected \
+                 until the manifest is updated (see issue #5918)",
+                manifest.name
+            )
+        );
+    }
+
+    // Issue #5919: same pattern for `env_read` — empty allowlist means
+    // every read is rejected. Surface as WARN at startup.
+    // (Landed in the follow-up commit that adds `env_read_vars` enforcement;
+    // this commit introduces only the HTTP-side WARN for #5918.)
 
     Ok(())
 }

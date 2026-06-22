@@ -84,7 +84,66 @@ skills and between bundles.
 | `file_read` | Can read files (not yet implemented) |
 | `file_write` | Can write files (not yet implemented) |
 | `memory_read` | Can read agent memory (not yet implemented) |
-| `memory_write` | Can write agent memory (not yet implemented) |
+| `memory_write` | Can write to agent memory (not yet implemented) |
+
+### Network and environment hardening (issues #5918, #5919)
+
+The `http_client` and `env_read` permission tokens grant access to a host
+function, but the host functions themselves enforce **per-plugin allowlists**
+declared in the manifest. The allowlists are deny-by-default — empty
+allowlists reject every call.
+
+This commit introduces the HTTP-side hardening (issue #5918). The matching
+`env_read_vars` allowlist for `zc_env_read` lands in a follow-up commit
+(issue #5919) on the same plumbing.
+
+| Field | Default | Effect |
+|-------|---------|--------|
+| `allow_private_hosts` | `false` | When `false`, the host function rejects any URL whose host is non-globally-routable (loopback, RFC-1918, link-local, IMDS at `169.254.169.254`, …). Set to `true` only if the plugin must reach private services. |
+| `http_allowed_hosts` | `[]` | Explicit allowlist of hosts the plugin's `zc_http_request` may contact. Empty = deny-by-default — every HTTP call is rejected regardless of the `http_client` permission bit. |
+| `env_read_vars` | `[]` | Exact-match allowlist of env-var names the plugin's `zc_env_read` may return. Lands in the follow-up commit — empty = deny-by-default once enforced. No wildcards in v1. |
+
+**Matching rules for `http_allowed_hosts`** (same as the native `http_request`
+tool's `allowed_domains`):
+
+- `"*"` allows every host (still gated by `allow_private_hosts`).
+- `"*.example.com"` matches `foo.example.com` and `example.com` itself.
+- Exact match or subdomain suffix match for domain names.
+- IP addresses match only **exactly** — no suffix/subdomain logic.
+
+**Example manifest** (a fal.ai image-generation plugin, after both #5918
+and #5919 have landed):
+
+```toml
+name = "image-gen-fal"
+version = "0.1.0"
+wasm_path = "image_gen_fal.wasm"
+capabilities = ["tool"]
+permissions = ["http_client", "env_read"]
+
+# Only the fal.ai API host is reachable.
+http_allowed_hosts = ["*.fal.run", "fal.run"]
+
+# The plugin only needs FAL_API_KEY.
+env_read_vars = ["FAL_API_KEY"]
+```
+
+**Security guidance:**
+
+- **Prefer narrow allowlists.** Avoid `["*"]` for plugins that take URL
+  input from untrusted sources — it disables the SSRF guard against
+  private hosts (relying solely on `allow_private_hosts = false`).
+- **DNS-rebinding check.** Before opening any socket, the host function
+  resolves the hostname and rejects resolved IPs that are non-global
+  (loopback / RFC-1918 / link-local). A domain that resolves to a private
+  IP is blocked even if the hostname looks public.
+- **Backwards compatibility.** Older manifests without these fields load
+  successfully but fail closed at the first host-function call (with a
+  WARN logged at startup so the regression is visible).
+
+These fields are governed by ADR-003 §"Known gaps". Until they landed,
+the permission model was a "documentation contract, not a hardened
+boundary" — they turn the contract into an enforced policy.
 
 ## Current Extism bridge exports
 

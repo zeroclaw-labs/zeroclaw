@@ -1387,11 +1387,12 @@ pub fn all_tools_with_runtime(
                     let details = host.tool_plugin_details();
                     let count = details.len();
                     for (manifest, wasm_path) in details {
+                        // Pass the full manifest so the host functions can enforce
+                        // http_allowed_hosts / env_read_vars at call time
+                        // (issues #5918, #5919).
                         tool_arcs.push(Arc::new(zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
+                            &manifest,
                             wasm_path.to_path_buf(),
-                            manifest.permissions.clone(),
-                            manifest.name.clone(),
-                            manifest.description.clone().unwrap_or_default(),
                         )));
                     }
                     ::zeroclaw_log::record!(

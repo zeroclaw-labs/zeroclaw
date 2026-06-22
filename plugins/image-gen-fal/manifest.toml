@@ -5,3 +5,15 @@ author = "ZeroClaw Labs"
 wasm_path = "image_gen_fal.wasm"
 capabilities = ["tool"]
 permissions = ["http_client", "env_read"]
+
+# Issue #5918: only the fal.ai API host is reachable. The plugin's WASM code
+# builds the URL as `https://fal.run/<model>` so a wildcard suffix match covers
+# all model endpoints without re-declaring each path. `allow_private_hosts`
+# is omitted (defaults to false) — the plugin has no legitimate loopback /
+# RFC1918 access need.
+http_allowed_hosts = ["*.fal.run", "fal.run"]
+
+# Issue #5919 (lands in follow-up commit): env_read allowlist. The plugin
+# only needs FAL_API_KEY. Until that commit lands, the empty allowlist
+# would deny every env read; the follow-up sets `env_read_vars = ["FAL_API_KEY"]`.
+env_read_vars = []

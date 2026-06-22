@@ -7,6 +7,7 @@ pub mod error;
 pub mod host;
 pub mod runtime;
 pub mod signature;
+pub mod url_guard;
 pub mod wasm_channel;
 pub mod wasm_tool;
 
@@ -34,6 +35,26 @@ pub struct PluginManifest {
     /// Permissions this plugin requests
     #[serde(default)]
     pub permissions: Vec<PluginPermission>,
+    /// Allow this plugin to call private/local hosts (RFC1918, link-local,
+    /// `localhost`, `::1`, …) when its `http_client` permission is granted.
+    ///
+    /// When `false` (the default) the host function rejects any URL whose
+    /// host is classified as non-globally-routable. Mirrors the native
+    /// `http_request` tool's `allow_private_hosts` flag.
+    ///
+    /// See ADR-003 §"Known gaps" and issue #5918.
+    #[serde(default)]
+    pub allow_private_hosts: bool,
+    /// Explicit allowlist of hosts the plugin's `zc_http_request` host
+    /// function may contact when `http_client` is granted. Entries are
+    /// matched using the same rules as the native `http_request` tool
+    /// (exact, subdomain suffix, `*.example.com`, or `*`). When empty, the
+    /// plugin is **deny-by-default** for HTTP — the host function rejects
+    /// every request until the manifest declares hosts.
+    ///
+    /// See issue #5918.
+    #[serde(default)]
+    pub http_allowed_hosts: Vec<String>,
     /// Ed25519 signature over the canonical manifest (base64url-encoded).
     /// Set by the plugin publisher when signing the manifest.
     #[serde(default)]
@@ -85,6 +106,11 @@ pub struct PluginInfo {
     pub description: Option<String>,
     pub capabilities: Vec<PluginCapability>,
     pub permissions: Vec<PluginPermission>,
+    /// Whether the plugin may reach private/local hosts (issue #5918).
+    pub allow_private_hosts: bool,
+    /// Hosts the plugin's `zc_http_request` host function may contact
+    /// (issue #5918). Empty = deny-by-default.
+    pub http_allowed_hosts: Vec<String>,
     /// Resolved path to the WASM file. `None` for skill-only plugins.
     pub wasm_path: Option<PathBuf>,
     pub loaded: bool,

@@ -43,3 +43,33 @@ schemas. This crate knows how to run plugins, not what they do.
 ## Related ADRs
 
 - ADR-003: WASM plugin model and the Extism-to-WIT transition
+
+## Security model
+
+The host functions `zc_http_request` and `zc_env_read` are
+**deny-by-default** for both network egress and environment-variable reads.
+The plugin manifest must declare explicit allowlists
+(`http_allowed_hosts`, `allow_private_hosts`, `env_read_vars`) — see
+issues #5918 and #5919 and ADR-003 §"Known gaps". Empty allowlists reject
+every call, regardless of the permission bit.
+
+The host functions also perform a DNS-rebinding check: before opening any
+socket, the hostname is resolved and any non-globally-routable resolved
+address is rejected. This guards against a hostname that *looks* public
+but resolves to a private IP.
+
+### `url_guard` helper duplication
+
+`src/url_guard.rs` duplicates four IP-classification helpers and one URL
+parser from `crates/zeroclaw-tools/src/helpers/domain_guard.rs` and
+`crates/zeroclaw-tools/src/http_request.rs`. The duplication is
+intentional: the `zeroclaw-plugins` crate cannot depend on `zeroclaw-tools`
+(see "What this crate is allowed to depend on" above — `domain_guard`
+counts as a "specific tool" surface). The long-term move is to relocate
+`domain_guard` to a shared crate (`zeroclaw-api` or a new
+`zeroclaw-infra`) and have both consumers depend on it; that's a
+follow-up refactor, not coupled to a security fix.
+
+**If you change `url_guard.rs`, change the canonical copies in the same
+commit.** The `parity_with_tools_helper` test in `url_guard.rs` re-runs a
+representative subset of cases to detect accidental drift.

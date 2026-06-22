@@ -3,8 +3,17 @@
 //! Creates Extism plugin instances with permission-gated host functions
 //! (`zc_http_request`, `zc_env_read`) and calls plugin-exported functions
 //! (`tool_metadata`, `execute`).
+//!
+//! The host function `zc_http_request` enforces the plugin's
+//! `http_allowed_hosts` / `allow_private_hosts` allowlists (manifest
+//! fields) — see issue #5918 and ADR-003 §"Known gaps". Deny-by-default:
+//! empty allowlists reject every call.
+//!
+//! Issue #5919 (per-plugin `env_read_vars` allowlist) is added in a
+//! follow-up commit on top of this plumbing.
 
-use crate::PluginPermission;
+use crate::url_guard;
+use crate::{PluginManifest, PluginPermission};
 use anyhow::{Context, Result};
 use extism::*;
 use serde::{Deserialize, Serialize};
@@ -14,10 +23,22 @@ use zeroclaw_api::tool::ToolResult;
 
 // ── Host function context ─────────────────────────────────────────
 
-/// Permissions available to a single plugin invocation.
+/// Permissions and policy available to a single plugin invocation.
+///
+/// Carries the manifest's `http_allowed_hosts` / `allow_private_hosts`
+/// pre-parsed into a typed [`HttpPolicy`] so `zc_http_request` doesn't
+/// re-parse the manifest on every call.
 #[derive(Debug, Clone)]
 struct HostContext {
     permissions: HashSet<PluginPermission>,
+    http_policy: HttpPolicy,
+}
+
+/// HTTP host policy derived from the manifest.
+#[derive(Debug, Clone, Default)]
+struct HttpPolicy {
+    allow_private_hosts: bool,
+    allowed_hosts: Vec<String>,
 }
 
 // ── Data types exchanged with plugins ─────────────────────────────
@@ -81,6 +102,20 @@ fn handle_http_request(
 
     let req: HttpRequest = serde_json::from_str(&request_json)
         .map_err(|e| Error::msg(format!("invalid HTTP request JSON: {e}")))?;
+
+    // Issue #5918: SSRF + host allowlist enforcement. See `validate_request_url`
+    // for the four-stage check (extract → allowlist → private → DNS-rebinding).
+    let url_for_log = req.url.clone();
+    validate_request_url(&ctx, &req.url).map_err(|e| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"url": url_for_log})),
+            "zc_http_request: request rejected"
+        );
+        Error::msg(e)
+    })?;
 
     // 120s ceiling covers legitimate slow cases: large file downloads and slow
     // model-inference endpoints (fal.ai image generation routinely takes 20-60s
@@ -158,6 +193,11 @@ fn handle_env_read(
 
     let var_name: String = plugin.memory_get_val(&inputs[0])?;
 
+    // Issue #5919 (per-plugin `env_read_vars` allowlist) lands in the
+    // follow-up commit that adds `validate_env_var` and `EnvPolicy`.
+    // Until then, the permission bit alone gates access — consistent with
+    // the pre-#5918 behavior so this commit is independently shippable.
+
     let value = std::env::var(&var_name)
         .map_err(|_| Error::msg(format!("environment variable '{var_name}' not set")))?;
 
@@ -166,13 +206,82 @@ fn handle_env_read(
     Ok(())
 }
 
+// ── Validation helpers (extracted for unit testing) ───────────────
+
+/// Issue #5918: validate `url` against the plugin's HTTP policy.
+///
+/// Order matters:
+/// 1. `url_guard::extract_host` — reject malformed / non-http(s) / userinfo / unmatched IPv6 brackets.
+/// 2. `host_matches_allowlist` — empty allowlist = deny-by-default.
+/// 3. `is_private_or_local_host` — reject loopback / RFC-1918 / IMDS unless `allow_private_hosts = true`.
+/// 4. `validate_resolved_host_is_public` — DNS-rebinding guard (`#[cfg(test)]`-stubbed).
+///
+/// Returns the extracted host on success. Error messages match the contract
+/// documented in the plan so tests can assert substrings.
+fn validate_request_url(ctx: &HostContext, url: &str) -> Result<String, String> {
+    let host = url_guard::extract_host(url).map_err(|e| e.to_string())?;
+
+    if !url_guard::host_matches_allowlist(&host, &ctx.http_policy.allowed_hosts) {
+        return Err(format!("http: host '{host}' is not in http_allowed_hosts"));
+    }
+
+    if url_guard::is_private_or_local_host(&host) && !ctx.http_policy.allow_private_hosts {
+        return Err(format!("Blocked local/private host: {host}"));
+    }
+
+    url_guard::validate_resolved_host_is_public(&host).map_err(|e| e.to_string())?;
+
+    Ok(host)
+}
+
 // ── Plugin creation and invocation ────────────────────────────────
 
 /// Create an Extism plugin from a WASM file with the given permissions.
+///
+/// Retained for tests and external callers that only need the permission
+/// bit-set. The new `http_policy` defaults to deny-all (empty allowlist),
+/// so plugins calling `zc_http_request` through this entry point will be
+/// rejected at the host-function boundary.
+///
+/// Prefer [`create_plugin_with_manifest`] when the full manifest is
+/// available — it carries `http_allowed_hosts` / `allow_private_hosts`
+/// into the host functions so allowlisted plugins can actually make calls.
 pub fn create_plugin(wasm_path: &Path, permissions: &[PluginPermission]) -> Result<extism::Plugin> {
-    let perm_set: HashSet<PluginPermission> = permissions.iter().cloned().collect();
+    // Construct a minimal manifest carrying only the requested permissions.
+    // All new fields default to deny-all (serde defaults).
+    let minimal = PluginManifest {
+        name: String::new(),
+        version: String::new(),
+        description: None,
+        author: None,
+        wasm_path: None,
+        capabilities: Vec::new(),
+        permissions: permissions.to_vec(),
+        allow_private_hosts: false,
+        http_allowed_hosts: Vec::new(),
+        signature: None,
+        publisher_key: None,
+    };
+    create_plugin_with_manifest(wasm_path, &minimal)
+}
+
+/// Create an Extism plugin with the full manifest so `zc_http_request`
+/// can enforce the plugin's HTTP allowlists.
+///
+/// `manifest.http_allowed_hosts` and `manifest.allow_private_hosts` are
+/// parsed once at construction into [`HttpPolicy`]; the hot path is a
+/// short `Vec<String>` scan plus a single IP-classification match.
+pub fn create_plugin_with_manifest(
+    wasm_path: &Path,
+    manifest: &PluginManifest,
+) -> Result<extism::Plugin> {
+    let perm_set: HashSet<PluginPermission> = manifest.permissions.iter().cloned().collect();
     let ctx = UserData::new(HostContext {
         permissions: perm_set,
+        http_policy: HttpPolicy {
+            allow_private_hosts: manifest.allow_private_hosts,
+            allowed_hosts: manifest.http_allowed_hosts.clone(),
+        },
     });
 
     let http_fn = Function::new(
@@ -185,9 +294,9 @@ pub fn create_plugin(wasm_path: &Path, permissions: &[PluginPermission]) -> Resu
 
     let env_fn = Function::new("zc_env_read", [PTR], [PTR], ctx, handle_env_read);
 
-    let manifest = Manifest::new([Wasm::file(wasm_path)]);
+    let plugin_manifest = Manifest::new([Wasm::file(wasm_path)]);
 
-    Plugin::new(manifest, [http_fn, env_fn], true)
+    Plugin::new(plugin_manifest, [http_fn, env_fn], true)
         .with_context(|| format!("failed to load WASM plugin from {}", wasm_path.display()))
 }
 
@@ -221,14 +330,55 @@ pub fn call_execute(plugin: &mut extism::Plugin, args_json: &[u8]) -> Result<Too
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PluginManifest;
+
+    /// Helper: build a manifest carrying the requested permissions and
+    /// the new HTTP allowlist fields. Mirrors what the loader passes to
+    /// `create_plugin_with_manifest` after parsing `manifest.toml`.
+    fn manifest_with(
+        perms: Vec<PluginPermission>,
+        allow_private_hosts: bool,
+        http_allowed_hosts: Vec<String>,
+    ) -> PluginManifest {
+        PluginManifest {
+            name: "test".into(),
+            version: "0.0.1".into(),
+            description: None,
+            author: None,
+            wasm_path: None,
+            capabilities: Vec::new(),
+            permissions: perms,
+            allow_private_hosts,
+            http_allowed_hosts,
+            signature: None,
+            publisher_key: None,
+        }
+    }
 
     #[test]
     fn host_context_permission_check() {
         let ctx = HostContext {
             permissions: HashSet::from([PluginPermission::HttpClient]),
+            http_policy: HttpPolicy::default(),
         };
         assert!(ctx.permissions.contains(&PluginPermission::HttpClient));
         assert!(!ctx.permissions.contains(&PluginPermission::EnvRead));
+        // Default policy fields are deny-all.
+        assert!(ctx.http_policy.allowed_hosts.is_empty());
+        assert!(!ctx.http_policy.allow_private_hosts);
+    }
+
+    #[test]
+    fn host_context_carries_http_policy() {
+        let ctx = HostContext {
+            permissions: HashSet::from([PluginPermission::HttpClient]),
+            http_policy: HttpPolicy {
+                allow_private_hosts: true,
+                allowed_hosts: vec!["*.example.com".into(), "localhost".into()],
+            },
+        };
+        assert!(ctx.http_policy.allow_private_hosts);
+        assert_eq!(ctx.http_policy.allowed_hosts.len(), 2);
     }
 
     #[test]
@@ -279,6 +429,218 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // ── PluginManifest deserialization tests (issue #5918) ──
+
+    #[test]
+    fn plugin_manifest_deserializes_with_new_http_fields() {
+        let toml_str = r#"
+name = "demo"
+version = "0.1.0"
+capabilities = ["tool"]
+permissions = ["http_client"]
+allow_private_hosts = true
+http_allowed_hosts = ["*.example.com", "fal.run"]
+"#;
+        let manifest: PluginManifest = toml::from_str(toml_str).unwrap();
+        assert!(manifest.allow_private_hosts);
+        assert_eq!(
+            manifest.http_allowed_hosts,
+            vec!["*.example.com".to_string(), "fal.run".to_string()]
+        );
+    }
+
+    #[test]
+    fn plugin_manifest_deserializes_without_new_fields_for_backward_compat() {
+        // Existing manifest shape from before #5918 — must still load.
+        let toml_str = r#"
+name = "legacy"
+version = "0.1.0"
+capabilities = ["tool"]
+permissions = ["http_client"]
+"#;
+        let manifest: PluginManifest = toml::from_str(toml_str).unwrap();
+        assert!(!manifest.allow_private_hosts);
+        assert!(manifest.http_allowed_hosts.is_empty());
+    }
+
+    #[test]
+    fn plugin_manifest_round_trips_with_new_fields() {
+        let original = manifest_with(
+            vec![PluginPermission::HttpClient, PluginPermission::EnvRead],
+            true,
+            vec!["fal.run".into(), "*.fal.run".into()],
+        );
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: PluginManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.allow_private_hosts, original.allow_private_hosts);
+        assert_eq!(parsed.http_allowed_hosts, original.http_allowed_hosts);
+        assert_eq!(parsed.permissions.len(), 2);
+    }
+
+    // ── Host-function validation tests ────────────────────────────
+    //
+    // These exercise `validate_request_url` (the extracted pure function)
+    // directly so we can pin the SSRF and allowlist semantics without
+    // spinning up a real WASM module.
+
+    fn ctx_with(
+        perms: Vec<PluginPermission>,
+        allow_private_hosts: bool,
+        http_allowed_hosts: Vec<&str>,
+    ) -> HostContext {
+        HostContext {
+            permissions: perms.into_iter().collect(),
+            http_policy: HttpPolicy {
+                allow_private_hosts,
+                allowed_hosts: http_allowed_hosts.into_iter().map(String::from).collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn validate_request_url_rejects_non_http_scheme() {
+        let ctx = ctx_with(
+            vec![PluginPermission::HttpClient],
+            false,
+            vec!["example.com"],
+        );
+        let err = validate_request_url(&ctx, "ftp://example.com/x").unwrap_err();
+        assert!(err.contains("non-http(s) URL rejected"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_request_url_rejects_empty_allowlist_by_default() {
+        let ctx = ctx_with(vec![PluginPermission::HttpClient], false, vec![]);
+        let err = validate_request_url(&ctx, "https://example.com/x").unwrap_err();
+        assert!(err.contains("is not in http_allowed_hosts"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_request_url_rejects_allowlist_miss() {
+        let ctx = ctx_with(
+            vec![PluginPermission::HttpClient],
+            false,
+            vec!["example.com"],
+        );
+        let err = validate_request_url(&ctx, "https://other.com/x").unwrap_err();
+        assert!(
+            err.contains("'other.com' is not in http_allowed_hosts"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_request_url_accepts_exact_match() {
+        let ctx = ctx_with(
+            vec![PluginPermission::HttpClient],
+            false,
+            vec!["example.com"],
+        );
+        validate_request_url(&ctx, "https://example.com/x").unwrap();
+        validate_request_url(&ctx, "https://EXAMPLE.com/x").unwrap(); // case-insensitive
+    }
+
+    #[test]
+    fn validate_request_url_accepts_subdomain_match() {
+        let ctx = ctx_with(
+            vec![PluginPermission::HttpClient],
+            false,
+            vec!["example.com"],
+        );
+        validate_request_url(&ctx, "https://api.example.com/x").unwrap();
+        validate_request_url(&ctx, "https://v2.api.example.com/x").unwrap();
+    }
+
+    #[test]
+    fn validate_request_url_accepts_wildcard_subdomain() {
+        let ctx = ctx_with(vec![PluginPermission::HttpClient], false, vec!["*.fal.run"]);
+        validate_request_url(&ctx, "https://fal.run/x").unwrap();
+        validate_request_url(&ctx, "https://api.fal.run/x").unwrap();
+        let err = validate_request_url(&ctx, "https://other.com/x").unwrap_err();
+        assert!(err.contains("'other.com' is not in http_allowed_hosts"));
+    }
+
+    #[test]
+    fn validate_request_url_rejects_localhost_by_default() {
+        let ctx = ctx_with(vec![PluginPermission::HttpClient], false, vec!["localhost"]);
+        let err = validate_request_url(&ctx, "http://localhost:8080/x").unwrap_err();
+        assert!(err.contains("Blocked local/private host"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_request_url_allows_localhost_when_opt_in() {
+        let ctx = ctx_with(vec![PluginPermission::HttpClient], true, vec!["localhost"]);
+        validate_request_url(&ctx, "http://localhost:8080/x").unwrap();
+    }
+
+    #[test]
+    fn validate_request_url_rejects_rfc1918_by_default() {
+        let ctx = ctx_with(
+            vec![PluginPermission::HttpClient],
+            false,
+            vec!["192.168.1.5"],
+        );
+        let err = validate_request_url(&ctx, "http://192.168.1.5/x").unwrap_err();
+        assert!(err.contains("Blocked local/private host"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_request_url_rejects_imds_link_local() {
+        let ctx = ctx_with(
+            vec![PluginPermission::HttpClient],
+            false,
+            vec!["169.254.169.254"],
+        );
+        let err =
+            validate_request_url(&ctx, "http://169.254.169.254/latest/meta-data").unwrap_err();
+        assert!(err.contains("Blocked local/private host"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_request_url_rejects_ipv6_loopback() {
+        let ctx = ctx_with(vec![PluginPermission::HttpClient], false, vec!["::1"]);
+        let err = validate_request_url(&ctx, "http://[::1]/x").unwrap_err();
+        assert!(err.contains("Blocked local/private host"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_request_url_rejects_userinfo() {
+        let ctx = ctx_with(
+            vec![PluginPermission::HttpClient],
+            false,
+            vec!["example.com"],
+        );
+        let err = validate_request_url(&ctx, "https://user:pass@example.com/x").unwrap_err();
+        assert!(err.contains("userinfo is not allowed"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_request_url_rejects_unmatched_ipv6_brackets() {
+        let ctx = ctx_with(
+            vec![PluginPermission::HttpClient],
+            false,
+            vec!["example.com"],
+        );
+        // `reqwest::Url` rejects `[::1/x` at parse time with "invalid IPv6
+        // address" before our bracket-checker runs. Accept either rejection
+        // — both are correct fail-closed outcomes.
+        let err = validate_request_url(&ctx, "https://[::1/x").unwrap_err();
+        assert!(
+            err.contains("unmatched IPv6 brackets") || err.contains("invalid URL"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_request_url_wildcard_star_still_rejects_private_host() {
+        // `["*"]` allows any PUBLIC host but allow_private_hosts still gates
+        // loopback / RFC1918 / link-local / IMDS.
+        let ctx = ctx_with(vec![PluginPermission::HttpClient], false, vec!["*"]);
+        validate_request_url(&ctx, "https://news.ycombinator.com/").unwrap();
+        let err = validate_request_url(&ctx, "http://localhost/x").unwrap_err();
+        assert!(err.contains("Blocked local/private host"), "got: {err}");
+    }
+
     /// Integration tests that load the actual image-gen WASM plugin.
     /// These require the plugin to be built first:
     ///   cd plugins/image-gen-fal && cargo build --target wasm32-wasip1 --release
@@ -291,14 +653,27 @@ mod tests {
             if path.exists() { Some(path) } else { None }
         }
 
+        /// Helper for integration tests: build the manifest shape that
+        /// matches the updated `image-gen-fal/manifest.toml`.
+        fn fal_manifest(perms: Vec<PluginPermission>) -> PluginManifest {
+            manifest_with(
+                perms,
+                false,
+                vec!["*.fal.run".to_string(), "fal.run".to_string()],
+            )
+        }
+
         #[test]
         fn load_and_read_metadata() {
             let Some(path) = wasm_path() else {
                 eprintln!("SKIP: image_gen_fal.wasm not found (build the plugin first)");
                 return;
             };
-            let perms = vec![PluginPermission::HttpClient, PluginPermission::EnvRead];
-            let mut plugin = create_plugin(&path, &perms).unwrap();
+            let manifest = fal_manifest(vec![
+                PluginPermission::HttpClient,
+                PluginPermission::EnvRead,
+            ]);
+            let mut plugin = create_plugin_with_manifest(&path, &manifest).unwrap();
             let meta = call_tool_metadata(&mut plugin).unwrap();
             assert_eq!(meta.name, "image_gen_fal");
             assert!(meta.description.contains("image"));
@@ -314,8 +689,11 @@ mod tests {
         #[test]
         fn execute_missing_prompt() {
             let Some(path) = wasm_path() else { return };
-            let perms = vec![PluginPermission::HttpClient, PluginPermission::EnvRead];
-            let mut plugin = create_plugin(&path, &perms).unwrap();
+            let manifest = fal_manifest(vec![
+                PluginPermission::HttpClient,
+                PluginPermission::EnvRead,
+            ]);
+            let mut plugin = create_plugin_with_manifest(&path, &manifest).unwrap();
             let args = serde_json::to_vec(&serde_json::json!({})).unwrap();
             let result = call_execute(&mut plugin, &args).unwrap();
             assert!(!result.success);
@@ -325,8 +703,11 @@ mod tests {
         #[test]
         fn execute_invalid_size() {
             let Some(path) = wasm_path() else { return };
-            let perms = vec![PluginPermission::HttpClient, PluginPermission::EnvRead];
-            let mut plugin = create_plugin(&path, &perms).unwrap();
+            let manifest = fal_manifest(vec![
+                PluginPermission::HttpClient,
+                PluginPermission::EnvRead,
+            ]);
+            let mut plugin = create_plugin_with_manifest(&path, &manifest).unwrap();
             let args =
                 serde_json::to_vec(&serde_json::json!({"prompt": "test", "size": "bad"})).unwrap();
             let result = call_execute(&mut plugin, &args).unwrap();
@@ -337,8 +718,11 @@ mod tests {
         #[test]
         fn execute_invalid_model_traversal() {
             let Some(path) = wasm_path() else { return };
-            let perms = vec![PluginPermission::HttpClient, PluginPermission::EnvRead];
-            let mut plugin = create_plugin(&path, &perms).unwrap();
+            let manifest = fal_manifest(vec![
+                PluginPermission::HttpClient,
+                PluginPermission::EnvRead,
+            ]);
+            let mut plugin = create_plugin_with_manifest(&path, &manifest).unwrap();
             let args =
                 serde_json::to_vec(&serde_json::json!({"prompt": "test", "model": "../../evil"}))
                     .unwrap();
@@ -348,15 +732,20 @@ mod tests {
         }
 
         /// End-to-end: missing `FAL_API_KEY` exercises the `zc_env_read` host
-        /// function — the host returns Err (var unset), which Extism propagates
-        /// as a plugin-call trap. Proves the env_read path is wired.
+        /// function — the host returns Err (var unset), which Extism
+        /// propagates as a plugin-call trap. Proves the env_read path is
+        /// wired. Per-plugin `env_read_vars` enforcement (issue #5919) is
+        /// added in the follow-up commit and lands with a separate test.
         #[test]
         fn execute_missing_api_key_exercises_env_read_host_fn() {
             let Some(path) = wasm_path() else { return };
             // SAFETY: test-only, single-threaded test runner.
             unsafe { std::env::remove_var("FAL_API_KEY") };
-            let perms = vec![PluginPermission::HttpClient, PluginPermission::EnvRead];
-            let mut plugin = create_plugin(&path, &perms).unwrap();
+            let manifest = fal_manifest(vec![
+                PluginPermission::HttpClient,
+                PluginPermission::EnvRead,
+            ]);
+            let mut plugin = create_plugin_with_manifest(&path, &manifest).unwrap();
             let args = serde_json::to_vec(&serde_json::json!({"prompt": "a sunset"})).unwrap();
             let err = call_execute(&mut plugin, &args).unwrap_err();
             let msg = format!("{err:#}");
@@ -371,9 +760,9 @@ mod tests {
         #[test]
         fn execute_without_env_read_permission_fails() {
             let Some(path) = wasm_path() else { return };
-            // Only HttpClient granted — EnvRead missing
-            let perms = vec![PluginPermission::HttpClient];
-            let mut plugin = create_plugin(&path, &perms).unwrap();
+            // Only HttpClient granted — EnvRead missing.
+            let manifest = fal_manifest(vec![PluginPermission::HttpClient]);
+            let mut plugin = create_plugin_with_manifest(&path, &manifest).unwrap();
             let args = serde_json::to_vec(&serde_json::json!({"prompt": "a sunset"})).unwrap();
             let err = call_execute(&mut plugin, &args).unwrap_err();
             let msg = format!("{err:#}");
