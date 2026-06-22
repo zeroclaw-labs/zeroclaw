@@ -8921,8 +8921,12 @@ pub async fn start_channels(
         // `mcp_bundles` name (omission is not a grant). Connecting to the
         // global server list here would let one agent's servers surface in a
         // co-resident agent that was never granted them.
-        let agent_mcp_servers = config.mcp_servers_for_agent(agent_alias);
-        if config.mcp.enabled && !agent_mcp_servers.is_empty() {
+        let agent_mcp_servers = if config.mcp.enabled {
+            config.mcp_servers_for_agent(agent_alias)
+        } else {
+            Vec::new()
+        };
+        if !agent_mcp_servers.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)

@@ -1130,8 +1130,12 @@ pub async fn run(
         let mut mcp_elevation_arcs: Vec<std::sync::Arc<dyn Tool>> = Vec::new();
         // Secure by default: only the MCP servers granted by this agent's
         // `mcp_bundles` (omission is not a grant).
-        let agent_mcp_servers = config.mcp_servers_for_agent(agent_alias);
-        if config.mcp.enabled && !agent_mcp_servers.is_empty() {
+        let agent_mcp_servers = if config.mcp.enabled {
+            config.mcp_servers_for_agent(agent_alias)
+        } else {
+            Vec::new()
+        };
+        if !agent_mcp_servers.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
@@ -2671,8 +2675,12 @@ pub async fn process_message(
         let mut mcp_elevation_arcs: Vec<std::sync::Arc<dyn Tool>> = Vec::new();
         // Secure by default: only the MCP servers granted by this agent's
         // `mcp_bundles` (omission is not a grant).
-        let agent_mcp_servers = config.mcp_servers_for_agent(agent_alias);
-        if config.mcp.enabled && !agent_mcp_servers.is_empty() {
+        let agent_mcp_servers = if config.mcp.enabled {
+            config.mcp_servers_for_agent(agent_alias)
+        } else {
+            Vec::new()
+        };
+        if !agent_mcp_servers.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
