@@ -1,0 +1,71 @@
+# Static analysis — fast pattern checks on every PR, deep taint on master+schedule.
+#
+# Semgrep (every PR): <60s, no build, catches injection/path-traversal/unsafe
+#   patterns. Community rules auto-detected for Rust.
+# CodeQL (master push + daily): 10-30 min, inter-procedural taint tracking,
+#   SARIF results published to GitHub Security tab.
+#
+# We deliberately do NOT gate every PR on CodeQL. A 20-minute analysis that
+# sometimes times out on Rust is a productivity tax, not a security guarantee.
+# Semgrep covers the fast path; CodeQL catches what Semgrep misses.
+
+name: Code Analysis
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  schedule:
+    - cron: '37 5 * * *'   # daily at 05:37 UTC — random offset to spread load
+
+permissions:
+  contents: read
+
+jobs:
+
+  # ── Fast pattern analysis (every PR, ~1 min) ─────────────────────────
+
+  semgrep:
+    name: Semgrep
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container:
+      image: semgrep/semgrep:latest
+    # dependabot PRs can't access secrets and Semgrep CE doesn't need them,
+    # but skip to avoid useless runner-seconds anyway.
+    if: github.actor != 'dependabot[bot]'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Run Semgrep CE
+        run: semgrep scan --config auto --error
+        env:
+          # Suppress telemetry / version-check noise.
+          SEMGREP_SEND_TELEMETRY: "off"
+          SEMGREP_VERSION_CHECK: "off"
+
+  # ── Deep taint analysis (master push + daily, ~15 min) ────────────────
+
+  codeql:
+    name: CodeQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      security-events: write
+    if: |
+      github.ref == 'refs/heads/master' &&
+      (github.event_name == 'push' || github.event_name == 'schedule')
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.93.0
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: rust
+          config-file: .github/codeql/codeql-config.yml
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
