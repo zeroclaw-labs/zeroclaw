@@ -753,4 +753,91 @@ mod tests {
         assert!(p.contains("xx"), "path must carry the locale: {p}");
         assert!(p.ends_with("cli.ftl"), "path must target the file: {p}");
     }
+
+    #[test]
+    fn non_english_locales_format_context_window_args() {
+        for locale in ["es", "fr", "ja", "zh-CN"] {
+            let sources = load_cli_ftl_sources(locale);
+
+            for (key, args) in [
+                (
+                    "cli-doctor-ctxwin-set",
+                    vec![("provider_ref", "groq.test"), ("ctx", "131072")],
+                ),
+                (
+                    "cli-doctor-ctxwin-would-set",
+                    vec![("provider_ref", "groq.test"), ("ctx", "131072")],
+                ),
+                (
+                    "cli-doctor-ctxwin-already-set",
+                    vec![("provider_ref", "groq.test"), ("ctx", "131072")],
+                ),
+                (
+                    "cli-doctor-ctxwin-not-found",
+                    vec![("provider_ref", "groq.test")],
+                ),
+                (
+                    "cli-doctor-ctxwin-fetch-failed",
+                    vec![("provider_ref", "groq.test")],
+                ),
+            ] {
+                let formatted = format_cli_string_with_args(&sources, key, &args)
+                    .unwrap_or_else(|| panic!("{locale}: {key} should format"));
+                assert!(
+                    formatted.contains("groq.test"),
+                    "{locale}: {key} missing provider_ref in: {formatted}"
+                );
+                if args.iter().any(|(k, _)| *k == "ctx") {
+                    assert!(
+                        formatted.contains("131072"),
+                        "{locale}: {key} missing ctx value in: {formatted}"
+                    );
+                }
+                assert!(
+                    !formatted.contains("{provider_ref}"),
+                    "{locale}: {key} has unformatted placeholder in: {formatted}"
+                );
+                assert!(
+                    !formatted.contains("{ctx}"),
+                    "{locale}: {key} has unformatted placeholder in: {formatted}"
+                );
+            }
+
+            let bar_formatted = format_cli_string_with_args(
+                &sources,
+                "cli-agent-context-bar",
+                &[
+                    ("used", "1000"),
+                    ("max", "8192"),
+                    ("bar", "██░░"),
+                    ("pct", "12"),
+                ],
+            )
+            .unwrap_or_else(|| panic!("{locale}: cli-agent-context-bar should format"));
+            assert!(
+                bar_formatted.contains("1000"),
+                "{locale}: cli-agent-context-bar missing used value in: {bar_formatted}"
+            );
+            assert!(
+                bar_formatted.contains("8192"),
+                "{locale}: cli-agent-context-bar missing max value in: {bar_formatted}"
+            );
+            assert!(
+                !bar_formatted.contains("{used}"),
+                "{locale}: cli-agent-context-bar has unformatted placeholder in: {bar_formatted}"
+            );
+            assert!(
+                !bar_formatted.contains("{max}"),
+                "{locale}: cli-agent-context-bar has unformatted placeholder in: {bar_formatted}"
+            );
+            assert!(
+                !bar_formatted.contains("{bar}"),
+                "{locale}: cli-agent-context-bar has unformatted placeholder in: {bar_formatted}"
+            );
+            assert!(
+                !bar_formatted.contains("{pct}"),
+                "{locale}: cli-agent-context-bar has unformatted placeholder in: {bar_formatted}"
+            );
+        }
+    }
 }

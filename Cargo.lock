@@ -14327,6 +14327,7 @@ dependencies = [
  "tower",
  "tower-http",
  "uuid",
+ "wiremock",
  "zeroclaw-api",
  "zeroclaw-channels",
  "zeroclaw-config",
