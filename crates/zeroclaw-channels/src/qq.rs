@@ -1322,52 +1322,99 @@ impl ::zeroclaw_api::attribution::Attributable for QQChannel {
 }
 
 #[async_trait]
+trait QQOutboundSender {
+    async fn send_text_markdown(
+        &self,
+        recipient: &str,
+        content: &str,
+        in_reply_to: Option<&str>,
+    ) -> anyhow::Result<()>;
+
+    async fn send_attachment(
+        &self,
+        recipient: &str,
+        attachment: &QQMediaAttachment,
+        in_reply_to: Option<&str>,
+    ) -> anyhow::Result<()>;
+}
+
+#[async_trait]
+impl QQOutboundSender for QQChannel {
+    async fn send_text_markdown(
+        &self,
+        recipient: &str,
+        content: &str,
+        in_reply_to: Option<&str>,
+    ) -> anyhow::Result<()> {
+        QQChannel::send_text_markdown(self, recipient, content, in_reply_to).await
+    }
+
+    async fn send_attachment(
+        &self,
+        recipient: &str,
+        attachment: &QQMediaAttachment,
+        in_reply_to: Option<&str>,
+    ) -> anyhow::Result<()> {
+        QQChannel::send_attachment(self, recipient, attachment, in_reply_to).await
+    }
+}
+
+async fn send_qq_message_with_sender(
+    sender: &impl QQOutboundSender,
+    message: &SendMessage,
+) -> anyhow::Result<()> {
+    let (cleaned_text, attachments) = parse_qq_attachment_markers(&message.content);
+    let in_reply_to = message.in_reply_to.as_deref();
+
+    if attachments.is_empty() {
+        // No media markers — send as markdown (original path)
+        return sender
+            .send_text_markdown(&message.recipient, &message.content, in_reply_to)
+            .await;
+    }
+
+    // Send cleaned text first (if non-empty)
+    if !cleaned_text.is_empty() {
+        sender
+            .send_text_markdown(&message.recipient, &cleaned_text, in_reply_to)
+            .await?;
+    }
+
+    // Send each media attachment
+    for attachment in &attachments {
+        if let Err(e) = sender
+            .send_attachment(&message.recipient, attachment, in_reply_to)
+            .await
+        {
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"target": attachment.target, "error": format!("{}", e)})), "failed to send media attachment; falling back to text");
+            // Degrade to text fallback
+            let fallback = format!(
+                "{}: {}",
+                match attachment.kind {
+                    QQMediaFileType::Image => "Image",
+                    QQMediaFileType::Video => "Video",
+                    QQMediaFileType::Voice => "Voice",
+                    QQMediaFileType::File => "File",
+                },
+                attachment.target
+            );
+            sender
+                .send_text_markdown(&message.recipient, &fallback, in_reply_to)
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
+#[async_trait]
 impl Channel for QQChannel {
     fn name(&self) -> &str {
         "qq"
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let (cleaned_text, attachments) = parse_qq_attachment_markers(&message.content);
-        let in_reply_to = message.in_reply_to.as_deref();
-
-        if attachments.is_empty() {
-            // No media markers — send as markdown (original path)
-            return self
-                .send_text_markdown(&message.recipient, &message.content, in_reply_to)
-                .await;
-        }
-
-        // Send cleaned text first (if non-empty)
-        if !cleaned_text.is_empty() {
-            self.send_text_markdown(&message.recipient, &cleaned_text, in_reply_to)
-                .await?;
-        }
-
-        // Send each media attachment
-        for attachment in &attachments {
-            if let Err(e) = self
-                .send_attachment(&message.recipient, attachment, in_reply_to)
-                .await
-            {
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"target": attachment.target, "error": format!("{}", e)})), "failed to send media attachment; falling back to text");
-                // Degrade to text fallback
-                let fallback = format!(
-                    "{}: {}",
-                    match attachment.kind {
-                        QQMediaFileType::Image => "Image",
-                        QQMediaFileType::Video => "Video",
-                        QQMediaFileType::Voice => "Voice",
-                        QQMediaFileType::File => "File",
-                    },
-                    attachment.target
-                );
-                self.send_text_markdown(&message.recipient, &fallback, None)
-                    .await?;
-            }
-        }
-
-        Ok(())
+        send_qq_message_with_sender(self, message).await
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2258,6 +2305,65 @@ allowed_users = ["user1"]
         assert_eq!(body["msg_type"], 2);
         assert_eq!(body["markdown"]["content"], "hello");
         assert!(body.get("refer_msg").is_none());
+    }
+
+    struct FailingAttachmentSender {
+        text_sends: tokio::sync::Mutex<Vec<(String, String, Option<String>)>>,
+    }
+
+    #[async_trait]
+    impl QQOutboundSender for FailingAttachmentSender {
+        async fn send_text_markdown(
+            &self,
+            recipient: &str,
+            content: &str,
+            in_reply_to: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.text_sends.lock().await.push((
+                recipient.to_string(),
+                content.to_string(),
+                in_reply_to.map(str::to_string),
+            ));
+            Ok(())
+        }
+
+        async fn send_attachment(
+            &self,
+            _recipient: &str,
+            attachment: &QQMediaAttachment,
+            in_reply_to: Option<&str>,
+        ) -> anyhow::Result<()> {
+            assert_eq!(attachment.kind, QQMediaFileType::Image);
+            assert_eq!(attachment.target, "https://cdn.example.com/fail.png");
+            assert_eq!(in_reply_to, Some("qq_msg_123"));
+            anyhow::bail!("simulated QQ attachment upload failure");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_attachment_fallback_send_preserves_in_reply_to() {
+        let sender = FailingAttachmentSender {
+            text_sends: tokio::sync::Mutex::new(Vec::new()),
+        };
+        let message = SendMessage {
+            content: "[IMAGE:https://cdn.example.com/fail.png]".to_string(),
+            recipient: "group:group_123".to_string(),
+            subject: None,
+            thread_ts: None,
+            cancellation_token: None,
+            attachments: vec![],
+            in_reply_to: Some("qq_msg_123".to_string()),
+        };
+
+        send_qq_message_with_sender(&sender, &message)
+            .await
+            .expect("fallback text send succeeds");
+
+        let text_sends = sender.text_sends.lock().await;
+        assert_eq!(text_sends.len(), 1);
+        assert_eq!(text_sends[0].0, "group:group_123");
+        assert_eq!(text_sends[0].1, "Image: https://cdn.example.com/fail.png");
+        assert_eq!(text_sends[0].2.as_deref(), Some("qq_msg_123"));
     }
 
     #[test]
