@@ -1,0 +1,77 @@
+name: Validate Translations Pin
+
+# Gates the docs/book/po submodule at the exact commit a PR pins it to. The
+# pin only advances through scripts/release/bump-version.sh on a release PR, so
+# this runs whenever a PR moves the gitlink or .gitmodules and validates the
+# pinned catalogues in the main repo's own CI, before the bad SHA can merge.
+on:
+  pull_request:
+    paths:
+      - docs/book/po
+      - .gitmodules
+      - .github/workflows/validate-translations-pin.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-translations-pin-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-pin:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout with pinned submodule
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install gettext tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gettext
+
+      - name: Verify catalogues resolved at pinned commit
+        run: |
+          pinned="$(git -C docs/book/po rev-parse HEAD)"
+          echo "docs/book/po pinned at ${pinned}"
+          count="$(find docs/book/po -maxdepth 1 -name '*.po' | wc -l)"
+          if [ "$count" -eq 0 ]; then
+            echo "error: no .po catalogues at the pinned submodule commit" >&2
+            exit 1
+          fi
+          echo "found ${count} catalogue(s)"
+
+      - name: Validate .po format
+        run: |
+          ok=0
+          for po in docs/book/po/*.po; do
+            [ -f "$po" ] || continue
+            msgfmt --check-format "$po" -o /dev/null || ok=1
+          done
+          exit $ok
+
+      - name: Validate msgid parity across catalogues
+        run: |
+          ref=""
+          refname=""
+          ok=0
+          for po in docs/book/po/*.po; do
+            [ -f "$po" ] || continue
+            ids="$(mktemp)"
+            msgcat --sort-output "$po" 2>/dev/null \
+              | grep '^msgid ' | sort -u > "$ids"
+            if [ -z "$ref" ]; then
+              ref="$ids"
+              refname="$po"
+              continue
+            fi
+            if ! diff -q "$ref" "$ids" >/dev/null 2>&1; then
+              echo "error: msgid set in $po diverges from $refname" >&2
+              diff "$ref" "$ids" | head -20 >&2
+              ok=1
+            fi
+          done
+          exit $ok
