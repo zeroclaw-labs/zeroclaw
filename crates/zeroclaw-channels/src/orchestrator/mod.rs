@@ -10034,6 +10034,123 @@ fn expand_tilde_in_path(path: &str) -> PathBuf {
     PathBuf::from(shellexpand::tilde(path).as_ref())
 }
 
+// ── Concurrent persist lock test (#7753) ─────────────────────────
+// Lives outside `mod tests` so it has direct access to private parent items.
+
+#[cfg(test)]
+#[test]
+fn concurrent_persist_lock_serialization() {
+    use std::sync::Barrier;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_runtime::approval::ApprovalManager;
+    use zeroclaw_runtime::observability::NoopObserver;
+    use zeroclaw_providers::ChatMessage;
+
+    struct CountingBackend {
+        appends: Arc<Mutex<HashMap<String, usize>>>,
+    }
+    impl SessionBackend for CountingBackend {
+        fn load(&self, _key: &str) -> Vec<ChatMessage> { vec![] }
+        fn append(&self, key: &str, _msg: &ChatMessage) -> std::io::Result<()> {
+            *self.appends.lock().unwrap_or_else(|e| e.into_inner())
+                .entry(key.to_string()).or_insert(0) += 1;
+            Ok(())
+        }
+        fn remove_last(&self, _key: &str) -> std::io::Result<bool> { Ok(true) }
+        fn list_sessions(&self) -> Vec<String> { vec![] }
+    }
+
+    let sender = "concurrent_test_key".to_string();
+    let backend = CountingBackend { appends: Arc::new(Mutex::new(HashMap::new())) };
+    let appends = backend.appends.clone();
+
+    let ctx = Arc::new(ChannelRuntimeContext {
+        channels_by_name: Arc::new(HashMap::new()),
+        model_provider: Arc::new(tests::DummyModelProvider),
+        model_provider_ref: Arc::new("test".into()),
+        agent_alias: Arc::new("test".into()),
+        agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+        memory: Arc::new(tests::NoopMemory),
+        memory_strategy: Arc::new(
+            zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                Arc::new(tests::NoopMemory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            ),
+        ),
+        tools_registry: Arc::new(vec![]),
+        observer: Arc::new(NoopObserver),
+        system_prompt: Arc::new(String::new()),
+        model: Arc::new("test".into()),
+        temperature: Some(0.0),
+        auto_save_memory: false,
+        max_tool_iterations: 5,
+        min_relevance_score: 0.0,
+        conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
+        pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+        reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+        interrupt_on_new_message: InterruptOnNewMessageConfig {
+            telegram: false, slack: false, discord: false,
+            mattermost: false, matrix: false, whatsapp: false,
+        },
+        multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+        media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+        transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+        agent_transcription_provider: String::new(),
+        hooks: None,
+        provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(std::env::temp_dir()),
+        prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        non_cli_excluded_tools: Arc::new(Vec::new()),
+        autonomy_level: AutonomyLevel::default(),
+        tool_call_dedup_exempt: Arc::new(Vec::new()),
+        model_routes: Arc::new(Vec::new()),
+        query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+        ack_reactions: true,
+        show_tool_calls: true,
+        session_store: Some(Arc::new(backend) as Arc<dyn SessionBackend>),
+        approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        )),
+        activated_tools: None,
+        cost_tracking: None,
+        pacing: zeroclaw_config::schema::PacingConfig::default(),
+        max_tool_result_chars: 0,
+        context_token_budget: 0,
+        debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(Duration::ZERO)),
+        receipt_generator: None,
+        show_receipts_in_response: false,
+        last_applied_config_stamp: Arc::new(Mutex::new(None)),
+        runtime_defaults_override: Arc::new(Mutex::new(None)),
+        persist_locks: Arc::new(Mutex::new(HashMap::new())),
+    });
+    ctx.conversation_histories.lock().unwrap_or_else(|e| e.into_inner())
+        .push(sender.clone(), vec![ChatMessage::user("start")]);
+
+    let barrier = Arc::new(Barrier::new(4));
+    let mut handles = vec![];
+    for i in 0..4 {
+        let ctx = ctx.clone();
+        let key = sender.clone();
+        let b = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            b.wait();
+            append_sender_turn(&ctx, &key, ChatMessage::user(format!("msg-{i}")));
+        }));
+    }
+    for h in handles { h.join().unwrap(); }
+
+    let count = appends.lock().unwrap_or_else(|e| e.into_inner())
+        .get(&sender).copied().unwrap_or(0);
+    assert_eq!(count, 4,
+        "all 4 concurrent append_sender_turn calls must be persisted under the per-key lock");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11900,7 +12017,7 @@ api_key = "anthropic-key"
         assert_eq!(persisted[1].content, "ok");
     }
 
-    struct DummyModelProvider;
+    pub(crate) struct DummyModelProvider;
 
     #[async_trait::async_trait]
     impl ModelProvider for DummyModelProvider {
@@ -14721,7 +14838,7 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
-    struct NoopMemory;
+    pub(crate) struct NoopMemory;
 
     #[async_trait::async_trait]
     impl Memory for NoopMemory {
