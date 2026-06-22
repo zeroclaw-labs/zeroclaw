@@ -155,36 +155,47 @@ docs_files=()
 while IFS= read -r -d '' f; do
   docs_files+=("$f")
 done < <(find "$REPO_ROOT/docs/book/src" -type f -name '*.md' -print0)
-while IFS= read -r -d '' f; do
-  docs_files+=("$f")
-done < <(find "$REPO_ROOT/docs/book/po" -type f -name '*.po' -print0 2>/dev/null)
 for f in "${docs_files[@]}"; do
   rel="${f#$REPO_ROOT/}"
-  # Image tags share one form across .md and .po (no quotes involved).
   bump "$rel" \
     'zeroclawlabs/zeroclaw:v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?' \
     "zeroclawlabs/zeroclaw:v${VERSION}"
-  # Version literal needs per-format dispatch: the unescaped pattern is
-  # a strict substring of the escaped one, so running both blindly
-  # would have the unescaped pass clobber the .po backslashes and
-  # leave malformed gettext strings.
-  case "$f" in
-    *.md)
-      bump "$rel" \
-        '"version": "[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?"' \
-        "\"version\": \"${VERSION}\""
-      ;;
-    *.po)
-      # Single-quoted replacement so the literal backslashes survive
-      # bash *and* sed: sed sees `\\"` in the substitution, which it
-      # emits as a single backslash followed by a quote, restoring
-      # the gettext escaped form.
-      bump "$rel" \
-        '\\"version\\": \\"[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?\\"' \
-        '\\"version\\": \\"'"${VERSION}"'\\"'
-      ;;
-  esac
+  bump "$rel" \
+    '"version": "[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]*)?"' \
+    "\"version\": \"${VERSION}\""
 done
+
+# ── Docs translation submodule pin ─────────────────────────────────
+# The translated docs catalogues (.po) live in the zeroclaw-docs-translations
+# submodule mounted at docs/book/po, tagged v{version} to mirror each release.
+# Pin the gitlink to the matching tag so a release ships the catalogues cut for
+# that version; fall back to origin/main with a warning when the tag is not yet
+# published. The submodule's own release owns the in-catalogue version-literal
+# swaps, so the main-tree sweep above no longer touches .po files.
+echo "Docs translation submodule pin..."
+SUBMODULE_PATH="$REPO_ROOT/docs/book/po"
+if [[ -f "$REPO_ROOT/.gitmodules" ]] && [[ -d "$SUBMODULE_PATH/.git" || -f "$SUBMODULE_PATH/.git" ]]; then
+  before="$(git -C "$REPO_ROOT" rev-parse "HEAD:docs/book/po" 2>/dev/null || echo none)"
+  git -C "$SUBMODULE_PATH" fetch --tags --quiet origin 2>/dev/null || true
+  if git -C "$SUBMODULE_PATH" rev-parse --verify --quiet "refs/tags/v${VERSION}" >/dev/null; then
+    git -C "$SUBMODULE_PATH" checkout --quiet "v${VERSION}"
+    echo "  pinned docs/book/po to tag v${VERSION}"
+  else
+    git -C "$SUBMODULE_PATH" checkout --quiet origin/main 2>/dev/null \
+      || git -C "$SUBMODULE_PATH" checkout --quiet main 2>/dev/null || true
+    echo "  warn: tag v${VERSION} not found in docs-translations; pinned to main."
+    echo "        Cut and push v${VERSION} in zeroclaw-labs/zeroclaw-docs-translations,"
+    echo "        then re-run this step so the release pins the matching catalogues."
+  fi
+  ( cd "$REPO_ROOT" && git add docs/book/po )
+  after="$(git -C "$REPO_ROOT" rev-parse "HEAD:docs/book/po" 2>/dev/null || echo none)"
+  current="$(git -C "$SUBMODULE_PATH" rev-parse HEAD)"
+  if [[ "$before" != "$current" ]]; then
+    changed=$((changed + 1))
+  fi
+else
+  echo "  skip: docs/book/po submodule not initialised (git submodule update --init)"
+fi
 
 # ── Docs stable-version pointer ────────────────────────────────────
 # Single source of truth for "which deployed docs version is Stable". The
