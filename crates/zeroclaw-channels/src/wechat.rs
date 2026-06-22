@@ -922,7 +922,7 @@ impl WeChatChannel {
                 .peer_groups
                 .entry(group_name)
                 .or_insert_with(|| PeerGroupConfig {
-                    channel: channel_ref.to_string(),
+                    channel: channel_ref,
                     ..PeerGroupConfig::default()
                 });
             if group

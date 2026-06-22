@@ -75,6 +75,7 @@ impl XmlToolDispatcher {
                                 module_path!(),
                                 ::zeroclaw_log::Action::Note
                             )
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                             "Malformed <tool_call> JSON"
@@ -195,7 +196,7 @@ impl ToolDispatcher for NativeToolDispatcher {
             .map(|tc| ParsedToolCall {
                 name: tc.name.clone(),
                 arguments: serde_json::from_str(&tc.arguments).unwrap_or_else(|e| {
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"tool": tc.name, "error": format!("{}", e)})), "Failed to parse native tool call arguments as JSON; defaulting to empty object");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Tool).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"tool": tc.name, "error": format!("{}", e)})), "Failed to parse native tool call arguments as JSON; defaulting to empty object");
                     Value::Object(serde_json::Map::new())
                 }),
                 tool_call_id: Some(tc.id.clone()),

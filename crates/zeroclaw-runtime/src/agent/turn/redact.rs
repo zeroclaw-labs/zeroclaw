@@ -1,4 +1,6 @@
-//! Credential redaction for tool output and logs.
+//! Credential redaction for the rendering layer (logs, observer events, and
+//! UI-facing turn events). This never runs on the data path: tool results fed
+//! back to the model and signed by HMAC receipts always carry raw bytes.
 
 use regex::Regex;
 use std::sync::LazyLock;
@@ -7,9 +9,11 @@ static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\./+=]{8,}))"#).unwrap()
 });
 
-/// Scrub credentials from tool output to prevent accidental exfiltration.
-/// Replaces known credential patterns with a redacted placeholder while preserving
-/// a small prefix for context.
+/// Scrub credentials from text bound for a human-facing surface (log records,
+/// observer event fields, UI/editor turn events). Replaces known credential
+/// patterns with a redacted placeholder while preserving a small prefix for
+/// context. Callers must apply this only at the rendering boundary, never to
+/// the output that flows back into the agent loop.
 pub fn scrub_credentials(input: &str) -> String {
     SENSITIVE_KV_REGEX
         .replace_all(input, |caps: &regex::Captures| {

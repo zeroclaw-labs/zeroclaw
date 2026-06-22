@@ -43,7 +43,7 @@ flowchart TB
 |---|---|
 | `zeroclaw-runtime` | Agent loop, security policy enforcement, SOP engine, cron scheduler, SubAgents, RPC layer for zerocode |
 | `zeroclaw-config` | TOML schema, secrets encryption, autonomy levels, workspace resolution |
-| `zeroclaw-api` | Public traits: `ModelProvider`, `Channel`, `Tool`, `Memory`, `Observer`. The kernel ABI |
+| `zeroclaw-api` | Public traits: `ModelProvider`, `Channel`, `Tool`, `Memory`, `Observer`, `RuntimeAdapter`, and `Peripheral`. The kernel ABI |
 | `zeroclaw-providers` | All LLM client impls (Anthropic, OpenAI, Ollama, …) plus the hint-based router and same-provider retry wrapper |
 | `zeroclaw-channels` | 30+ messaging integrations (Discord, Slack, Telegram, Matrix, email, voice, …) |
 | `zeroclaw-gateway` | HTTP / WebSocket gateway, web dashboard, webhook ingress |
@@ -90,13 +90,17 @@ Full detail: [Request lifecycle](./request-lifecycle.md).
 
 ## Extension points
 
-Three trait-based extension points live in `zeroclaw-api`:
+Trait-based extension contracts live in `zeroclaw-api`. For built-in providers, channels, tools, memory backends, and peripherals, start with [First-party extensions](../developing/first-party-extensions.md); the bullets below point to the closest adjacent docs.
 
-- **`ModelProvider`**: implement for a new LLM endpoint. See [Custom providers](../providers/custom.md).
-- **`Channel`**: implement for a new messaging platform. Inbound and outbound are separate hooks.
-- **`Tool`**: implement for a new capability the agent can invoke. See [Developing → Plugin protocol](../developing/plugin-protocol.md).
+- **`ModelProvider`**: use `custom` or an existing provider family for OpenAI-compatible endpoints; implement this trait when adding a new provider family, auth model, capability declaration, or wire protocol. See [Custom providers](../providers/custom.md).
+- **`Channel`**: implement for a new messaging platform. Inbound and outbound are separate hooks. See [Channels overview](../channels/overview.md).
+- **`Tool`**: implement for a new built-in agent capability. See [Tools overview](../tools/overview.md).
+- **`Memory`**: implement for a memory backend that preserves agent/session scoping.
+- **`Peripheral`**: implement for hardware boards and device surfaces. See [Hardware overview](../hardware/index.md).
 
-All three are registered at startup via factory functions; the kernel doesn't know the concrete types. Compile-time feature flags decide which implementations ship in a given binary.
+Other public traits, including `Observer` and `RuntimeAdapter`, are lower-level contracts. Use the [architecture map](../contributing/architecture-map.md) and [RFC process](../contributing/rfcs.md) before changing them.
+
+New implementations should stay behind the `zeroclaw-api` trait contracts and wire through the owning factory, registry, or feature gate for that surface. RFC #5574 continues shrinking runtime implementation dependencies, so avoid adding new concrete runtime dependencies unless the design requires them.
 
 ## Where to read next
 
