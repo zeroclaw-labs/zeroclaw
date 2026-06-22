@@ -292,6 +292,16 @@ mod tests {
         FileWriteTool::new_with_persistence(security, false)
     }
 
+    #[cfg(target_os = "windows")]
+    fn absolute_path_outside_workspace() -> &'static str {
+        r"C:\Windows\win.ini"
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn absolute_path_outside_workspace() -> &'static str {
+        "/etc/evil"
+    }
+
     #[test]
     fn file_write_name() {
         let tool = test_tool(std::env::temp_dir());
@@ -353,6 +363,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn file_write_normalizes_workspace_prefixed_relative_path() {
         let root = std::env::temp_dir().join("zeroclaw_test_file_write_workspace_prefixed");
         let workspace = root.join("workspace");
@@ -431,7 +442,7 @@ mod tests {
     async fn file_write_blocks_absolute_path() {
         let tool = wrapped_tool(std::env::temp_dir());
         let result = tool
-            .execute(json!({"path": "/etc/evil", "content": "bad"}))
+            .execute(json!({"path": absolute_path_outside_workspace(), "content": "bad"}))
             .await
             .unwrap();
         assert!(!result.success);

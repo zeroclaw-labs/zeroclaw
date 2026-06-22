@@ -484,6 +484,7 @@ impl ModelProvider for OpenAiModelProvider {
             temperature.map(|t| Self::adjust_temperature_for_model(model, t));
 
         let tools = Self::convert_tools(request.tools);
+        let tools_count = tools.as_ref().map_or(0, Vec::len);
         let native_request = NativeChatRequest {
             model: model.to_string(),
             messages: Self::convert_messages(request.messages),
@@ -492,6 +493,22 @@ impl ModelProvider for OpenAiModelProvider {
             tools,
             max_tokens: self.max_tokens,
         };
+        if ::zeroclaw_log::debug_enabled() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                    .with_attrs(::serde_json::json!({
+                        "provider": "openai",
+                        "alias": &self.alias,
+                        "request_api": "chat_completions",
+                        "model": model,
+                        "stream": false,
+                        "tools_count": tools_count,
+                        "tool_choice": native_request.tool_choice.as_deref(),
+                    })),
+                "openai provider request prepared"
+            );
+        }
 
         let response = self
             .http_client()
@@ -1018,7 +1035,25 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             Some(instructions)
         };
         let tools = convert_tools(request.tools);
+        let tools_count = tools.as_ref().map_or(0, Vec::len);
         let req = self.build_request(instructions, input, tools, model, temperature, false);
+        if ::zeroclaw_log::debug_enabled() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                    .with_attrs(::serde_json::json!({
+                        "provider": "openai",
+                        "alias": &self.alias,
+                        "request_api": "responses",
+                        "model": model,
+                        "stream": false,
+                        "tools_count": tools_count,
+                        "tool_choice": req.tool_choice.as_deref(),
+                        "parallel_tool_calls": req.parallel_tool_calls,
+                    })),
+                "openai responses provider request prepared"
+            );
+        }
         let response = Client::new()
             .post(&self.responses_url)
             .header("Authorization", format!("Bearer {credential}"))
@@ -1064,6 +1099,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         let reasoning_effort = self.reasoning_effort.clone();
         let max_tokens = self.max_tokens;
         let client = self.streaming_client();
+        let alias = ::zeroclaw_log::debug_enabled().then(|| self.alias.clone());
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
         let handle = ::zeroclaw_spawn::spawn!(async move {
@@ -1074,6 +1110,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
                 Some(instructions)
             };
             let tools = convert_tools(tools_owned.as_deref());
+            let tools_count = tools.as_ref().map_or(0, Vec::len);
             let has_tools = tools.is_some();
             let reasoning = reasoning_effort
                 .as_deref()
@@ -1092,6 +1129,23 @@ impl ModelProvider for OpenAiResponsesModelProvider {
                 max_output_tokens: max_tokens,
                 reasoning,
             };
+            if let Some(alias) = alias.as_deref() {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                        .with_attrs(::serde_json::json!({
+                            "provider": "openai",
+                            "alias": alias,
+                            "request_api": "responses",
+                            "model": &req.model,
+                            "stream": true,
+                            "tools_count": tools_count,
+                            "tool_choice": req.tool_choice.as_deref(),
+                            "parallel_tool_calls": req.parallel_tool_calls,
+                        })),
+                    "openai responses streaming provider request prepared"
+                );
+            }
 
             let request_builder = client
                 .post(&responses_url)
