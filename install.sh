@@ -241,7 +241,18 @@ detect_target_triple() {
   arch=$(uname -m)
 
   case "$os" in
-  Darwin) echo "aarch64-apple-darwin" ;; # presume M-series
+  Darwin)
+    # Apple Silicon reports arm64; Intel reports x86_64. A Rosetta-translated
+    # shell on Apple Silicon also reports x86_64 from `uname -m`, so consult
+    # `sysctl hw.optional.arm64` to recover the true CPU. Without this an Intel
+    # Mac (or an M-series Mac run under Rosetta) is handed the wrong-arch
+    # binary and hits "bad CPU type in executable".
+    if [ "$arch" = "arm64" ] || [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ]; then
+      echo "aarch64-apple-darwin"
+    else
+      echo "x86_64-apple-darwin"
+    fi
+    ;;
   Linux)
     libc=$(detect_libc)
     case "$arch" in
@@ -302,14 +313,11 @@ install_prebuilt() {
   tmp_dir=$(mktemp -d)
   trap 'rm -rf "$tmp_dir"' EXIT
 
-  curl -fSL --progress-bar "$asset_url" -o "$tmp_dir/$asset_name" ||
-    {
-      warn "Download failed — falling back to source build"
-      rm -rf "$tmp_dir"
-      return 1
-    }
-
-  # Verify checksum — all failure modes fall back to source rather than install unverified
+  # Fetch the checksum manifest first — it lists every published asset, so we
+  # can tell "no pre-built binary for this platform" (e.g. Intel macOS, which
+  # ships no release tarball) from a genuine download failure, and we never
+  # pull a tarball we couldn't verify anyway. All failure modes fall back to
+  # source rather than install unverified.
   if ! curl -fsSL "$sha256_url" -o "$tmp_dir/SHA256SUMS" 2>/dev/null; then
     warn "Could not fetch SHA256SUMS — falling back to source build"
     rm -rf "$tmp_dir"
@@ -318,10 +326,17 @@ install_prebuilt() {
 
   expected=$(grep "$asset_name" "$tmp_dir/SHA256SUMS" | awk '{print $1}')
   if [ -z "$expected" ]; then
-    warn "Asset not found in SHA256SUMS — falling back to source build"
+    warn "No pre-built binary published for $triple — falling back to source build"
     rm -rf "$tmp_dir"
     return 1
   fi
+
+  curl -fSL --progress-bar "$asset_url" -o "$tmp_dir/$asset_name" ||
+    {
+      warn "Download failed — falling back to source build"
+      rm -rf "$tmp_dir"
+      return 1
+    }
 
   if command -v sha256sum >/dev/null 2>&1; then
     actual=$(sha256sum "$tmp_dir/$asset_name" | awk '{print $1}')
