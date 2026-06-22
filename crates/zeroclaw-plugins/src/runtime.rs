@@ -61,6 +61,42 @@ struct PluginToolResult {
 
 // ── Host function implementations ─────────────────────────────────
 
+struct SafeTarget {
+    host: String,
+    addrs: Vec<std::net::SocketAddr>,
+}
+
+fn reject_ssrf_url(raw_url: &str) -> Result<SafeTarget, Error> {
+    let parsed = reqwest::Url::parse(raw_url)
+        .map_err(|e| Error::msg(format!("invalid HTTP request URL: {e}")))?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(Error::msg(format!(
+            "blocked HTTP request URL scheme: {scheme}"
+        )));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| Error::msg("HTTP request URL has no host"))?
+        .to_string();
+    if zeroclaw_tools::helpers::domain_guard::is_private_or_local_host(&host) {
+        return Err(Error::msg(
+            "blocked HTTP request to a private or local host",
+        ));
+    }
+    let addrs: Vec<std::net::SocketAddr> = parsed
+        .socket_addrs(|| None)
+        .map_err(|e| Error::msg(format!("failed to resolve HTTP request host: {e}")))?;
+    for addr in &addrs {
+        if zeroclaw_tools::helpers::domain_guard::is_private_or_local_host(&addr.ip().to_string()) {
+            return Err(Error::msg(
+                "blocked HTTP request resolving to a private or local address",
+            ));
+        }
+    }
+    Ok(SafeTarget { host, addrs })
+}
+
 fn handle_http_request(
     plugin: &mut CurrentPlugin,
     inputs: &[Val],
@@ -82,16 +118,27 @@ fn handle_http_request(
     let req: HttpRequest = serde_json::from_str(&request_json)
         .map_err(|e| Error::msg(format!("invalid HTTP request JSON: {e}")))?;
 
+    let target = reject_ssrf_url(&req.url)?;
+
+    // Pin the connection to the exact addresses validated above so a second,
+    // independent DNS lookup inside reqwest cannot rebind the host to a private
+    // address. Disable redirect following so a public URL cannot 30x into a
+    // private or local target without re-validation.
+    //
     // 120s ceiling covers legitimate slow cases: large file downloads and slow
-    // model-inference endpoints (fal.ai image generation routinely takes 20-60s
-    // on cold models). A per-plugin override or tighter default is a candidate
-    // follow-up — see ADR-003 §"Known gaps". Note: this runs inside
-    // spawn_blocking, so a stalled request holds a blocking-pool thread for
-    // the full duration.
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|e| Error::msg(format!("failed to create HTTP client: {e}")))?;
+    // model-inference endpoints. Note: this runs inside spawn_blocking, so a
+    // stalled request holds a blocking-pool thread for the full duration.
+    let client = {
+        let mut builder = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .redirect(reqwest::redirect::Policy::none());
+        for addr in &target.addrs {
+            builder = builder.resolve(&target.host, *addr);
+        }
+        builder
+            .build()
+            .map_err(|e| Error::msg(format!("failed to create HTTP client: {e}")))?
+    };
 
     let mut builder = match req.method.to_uppercase().as_str() {
         "GET" => client.get(&req.url),
@@ -223,6 +270,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reject_ssrf_url_blocks_loopback_and_metadata() {
+        assert!(reject_ssrf_url("http://127.0.0.1/").is_err());
+        assert!(reject_ssrf_url("http://localhost:8080/admin").is_err());
+        assert!(reject_ssrf_url("http://169.254.169.254/latest/meta-data/").is_err());
+        assert!(reject_ssrf_url("http://10.0.0.5/internal").is_err());
+        assert!(reject_ssrf_url("http://[::1]/").is_err());
+    }
+
+    #[test]
+    fn reject_ssrf_url_blocks_non_http_scheme() {
+        assert!(reject_ssrf_url("file:///etc/passwd").is_err());
+        assert!(reject_ssrf_url("gopher://example.com/").is_err());
+    }
+
+    #[test]
+    fn reject_ssrf_url_returns_validated_addrs_for_public_literal() {
+        let target = reject_ssrf_url("http://8.8.8.8/").expect("public literal allowed");
+        assert_eq!(target.host, "8.8.8.8");
+        assert!(target.addrs.iter().all(|a| !a.ip().is_loopback()));
+        assert!(!target.addrs.is_empty());
+    }
+
+    #[test]
     fn host_context_permission_check() {
         let ctx = HostContext {
             permissions: HashSet::from([PluginPermission::HttpClient]),
@@ -348,7 +418,7 @@ mod tests {
         }
 
         /// End-to-end: missing `FAL_API_KEY` exercises the `zc_env_read` host
-        /// function — the host returns Err (var unset), which Extism propagates
+        /// function: the host returns Err (var unset), which Extism propagates
         /// as a plugin-call trap. Proves the env_read path is wired.
         #[test]
         fn execute_missing_api_key_exercises_env_read_host_fn() {
@@ -371,7 +441,7 @@ mod tests {
         #[test]
         fn execute_without_env_read_permission_fails() {
             let Some(path) = wasm_path() else { return };
-            // Only HttpClient granted — EnvRead missing
+            // Only HttpClient granted, EnvRead missing
             let perms = vec![PluginPermission::HttpClient];
             let mut plugin = create_plugin(&path, &perms).unwrap();
             let args = serde_json::to_vec(&serde_json::json!({"prompt": "a sunset"})).unwrap();
