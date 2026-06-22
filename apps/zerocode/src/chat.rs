@@ -2820,12 +2820,15 @@ fn render_approval_overlay(f: &mut Frame, state: &ChatState, area: Rect) {
         format!("{title}\n\n  {summary}\n\n  {keys}")
     };
 
+    let fill = theme::fill_style();
     let p = Paragraph::new(text)
+        .style(fill)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(Span::styled(" Approval Required ", theme::warn_style()))
-                .style(theme::approval_border_style()),
+                .border_style(theme::approval_border_style())
+                .style(fill),
         )
         .wrap(Wrap { trim: true });
     f.render_widget(p, overlay_area);
@@ -5146,6 +5149,44 @@ mod tests {
         let pa = s.pending_approval().unwrap();
         assert_eq!(pa.request_id, "req-1");
         assert_eq!(pa.tool_name, "shell");
+    }
+
+    #[test]
+    fn approval_overlay_uses_theme_background_after_clear() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let _theme_guard = theme::set_active_for_test(theme::default_theme());
+        let expected_bg = theme::background();
+        assert_ne!(
+            expected_bg,
+            ratatui::style::Color::Reset,
+            "default ZeroCode theme should provide a concrete modal background"
+        );
+
+        let mut s = state();
+        s.apply_update(SessionUpdate::ApprovalRequest {
+            session_id: "sess-1".to_string(),
+            request_id: "req-1".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_summary: "command: pwd".to_string(),
+            timeout_secs: 120,
+        });
+
+        let area = Rect::new(0, 0, 100, 30);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_approval_overlay(frame, &s, area);
+            })
+            .expect("draw approval overlay");
+
+        let cell = &terminal.backend().buffer()[(10, 28)];
+        assert_eq!(
+            cell.style().bg,
+            Some(expected_bg),
+            "approval overlay interior must use the active ZeroCode theme background"
+        );
     }
 
     #[test]
