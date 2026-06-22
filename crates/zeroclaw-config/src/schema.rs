@@ -5929,6 +5929,24 @@ pub struct ProviderCostRates {
     pub transcription: crate::providers::TranscriptionCostRatesByProvider,
 }
 
+/// The provider families that carry `[cost.rates.providers.*]` rate sheets, as
+/// the trailing segment shared by their `[providers.<category>]` section. One
+/// entry per `#[nested]` field on `ProviderCostRates`; this list is the registry
+/// the TUI and web surfaces resolve cost tabs from, never a per-surface literal.
+pub const PROVIDER_COST_CATEGORIES: [&str; 3] = ["models", "tts", "transcription"];
+
+/// Cost-rate category for a `providers.<category>` section key, or `None` for
+/// sections that carry no rate sheets. Resolves against
+/// [`PROVIDER_COST_CATEGORIES`] so a new rate-bearing family is added in one
+/// place.
+#[must_use]
+pub fn cost_category_for_provider_section(section_key: &str) -> Option<&'static str> {
+    let suffix = section_key.strip_prefix("providers.")?;
+    PROVIDER_COST_CATEGORIES
+        .into_iter()
+        .find(|category| *category == suffix)
+}
+
 /// Token-cost rates for a single chat / completion model, in USD per
 /// 1M tokens. Every field optional so partial sheets work without
 /// ceremony (an operator who only knows the input rate can record it).
@@ -19310,6 +19328,49 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+
+    #[::core::prelude::v1::test]
+    fn provider_cost_categories_match_rate_struct_fields() {
+        let json = serde_json::to_value(super::ProviderCostRates::default()).unwrap();
+        let mut fields: Vec<String> = json
+            .as_object()
+            .expect("ProviderCostRates serializes to a map")
+            .keys()
+            .cloned()
+            .collect();
+        fields.sort();
+        let mut registry: Vec<String> = super::PROVIDER_COST_CATEGORIES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        registry.sort();
+        assert_eq!(
+            fields, registry,
+            "PROVIDER_COST_CATEGORIES must list exactly the ProviderCostRates rate-sheet fields"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn cost_category_resolves_only_rate_bearing_sections() {
+        assert_eq!(
+            super::cost_category_for_provider_section("providers.models"),
+            Some("models")
+        );
+        assert_eq!(
+            super::cost_category_for_provider_section("providers.tts"),
+            Some("tts")
+        );
+        assert_eq!(
+            super::cost_category_for_provider_section("providers.transcription"),
+            Some("transcription")
+        );
+        assert_eq!(super::cost_category_for_provider_section("channels"), None);
+        assert_eq!(
+            super::cost_category_for_provider_section("providers.unknown"),
+            None
+        );
+        assert_eq!(super::cost_category_for_provider_section("models"), None);
+    }
 
     #[test]
     async fn amqp_validate_requires_paired_client_cert_and_key() {
