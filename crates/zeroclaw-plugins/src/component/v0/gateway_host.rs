@@ -21,8 +21,8 @@ use zeroclaw_infra::stall_watchdog::StallWatchdog;
 
 use super::bindings::channel::zeroclaw::plugin::gateway::{GatewayEvent, Host, HostGatewaySession};
 use super::bindings::channel::zeroclaw::plugin::websocket::WsMessage;
-use super::plugin_store::PluginStore;
 use super::websocket_host::{WsSink, ws_message_to_tungstenite};
+use crate::component::plugin_store::PluginStore;
 
 /// Host-side state backing one connected `gateway-session` resource.
 pub struct HostGatewaySessionState {
@@ -217,7 +217,7 @@ impl HostGatewaySession for PluginStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::component::v0::plugin_store::PluginStore;
+    use crate::component::plugin_store::PluginStore;
 
     async fn allowed_store() -> PluginStore {
         let perms = vec![crate::FineGrainedPermission::Http(

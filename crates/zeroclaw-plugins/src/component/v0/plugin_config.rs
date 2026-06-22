@@ -8,7 +8,7 @@
 // per-instance map, never into the host's global secret store.
 
 use super::bindings;
-use super::plugin_store::PluginStore;
+use crate::component::plugin_store::PluginStore;
 
 /// Generate `plugin-config::Host for PluginStore` for one bindgen world.
 macro_rules! impl_plugin_config_host {

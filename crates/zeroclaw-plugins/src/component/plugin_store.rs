@@ -1,5 +1,5 @@
-// Host-side WIT implementation for all three component-model plugin worlds
-// (`tool-plugin`, `memory-plugin`, `channel-plugin`).
+// Host-side `Store<T>` data type shared by all three component-model plugin
+// worlds (`tool-plugin`, `memory-plugin`, `channel-plugin`).
 //
 // [`PluginStore`] is the `Store<T>` data type for all three worlds.
 // It carries the `WasiCtx` built from the plugin's `fine_grained_permissions`,
@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use http_body_util::{BodyExt, Full};
 use serde_json::json;
-use wasmtime::component::{HasSelf, ResourceTable};
+use wasmtime::component::ResourceTable;
 use wasmtime_wasi::sockets::SocketAddrUse;
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::WasiHttpCtx;
@@ -25,25 +25,23 @@ use zeroclaw_log::{Action, Event, EventOutcome, record};
 use crate::PluginNetworkConfig;
 use crate::error::PluginError;
 
-use super::bindings;
-
 // ── PluginStore ────────────────────────────────────────────────────────────────
 
 /// Store-data type for all three component plugin worlds.
-pub struct PluginStore {
+pub(crate) struct PluginStore {
     wasi: WasiCtx,
     http: WasiHttpCtx,
     http_hooks: PluginHttpHooks,
     table: ResourceTable,
     /// Per-instance proxy/secrets config, exposed to guests read-only via the
-    /// `plugin-config` WIT interface (see `plugin_config.rs`).
-    pub(super) network_config: PluginNetworkConfig,
+    /// `plugin-config` WIT interface (see `v0::plugin_config`).
+    pub(crate) network_config: PluginNetworkConfig,
     /// Opaque gateway resume-state blob (see `gateway.wit`'s `save-session`/
     /// `saved-session`). Lives on the store, not the per-connection resource,
     /// so it survives a `close` followed by a fresh `connect` — channel
     /// plugins are the warm-store world, so this persists for the channel
     /// instance's whole lifetime, same as `DiscordGatewaySession` does today.
-    pub(super) gateway_resume_state: Option<String>,
+    pub(crate) gateway_resume_state: Option<String>,
 }
 
 impl Default for PluginStore {
@@ -261,7 +259,7 @@ impl PluginStore {
     /// - Wildcard domain names (e.g. `*.example.com`) are resolved at connect
     ///   time using a reverse-DNS lookup; the resulting hostname is matched
     ///   against the pattern. If reverse DNS fails, the connection is denied.
-    pub async fn with_permissions(
+    pub(crate) async fn with_permissions(
         perms: &[crate::FineGrainedPermission],
         network_config: &PluginNetworkConfig,
     ) -> Result<Self, PluginError> {
@@ -365,14 +363,14 @@ impl PluginStore {
 
     /// Resource table accessor for host implementations of custom resources
     /// (e.g. `websocket`) that live outside this module.
-    pub(super) fn resource_table_mut(&mut self) -> &mut ResourceTable {
+    pub(crate) fn resource_table_mut(&mut self) -> &mut ResourceTable {
         &mut self.table
     }
 
     /// Whether `url`'s host passes this instance's `FineGrainedPermission::Http`
     /// allow-list — the same check `send_request` applies, reused so
     /// `websocket.connect` cannot reach a host the operator hasn't permitted.
-    pub(super) fn is_url_host_allowed(&self, url: &str) -> bool {
+    pub(crate) fn is_url_host_allowed(&self, url: &str) -> bool {
         let Ok(parsed) = url.parse::<http::Uri>() else {
             return false;
         };
@@ -392,7 +390,7 @@ impl PluginStore {
     /// `send_request` dispatches through. Exposed so `http-helpers`'s
     /// `send-multipart`/`download-to-attachment` reuse it rather than
     /// building a second, unproxied client.
-    pub(super) fn proxy_client(&self) -> reqwest::Client {
+    pub(crate) fn proxy_client(&self) -> reqwest::Client {
         self.http_hooks.proxy_client.clone()
     }
 }
@@ -594,71 +592,6 @@ fn normalize_authority_host(authority: &str) -> Option<String> {
     }
 
     Some(normalized.to_lowercase())
-}
-
-// ── types::Host (empty marker trait) ─────────────────────────────────────────
-
-impl bindings::tool::zeroclaw::plugin::types::Host for PluginStore {}
-impl bindings::memory::zeroclaw::plugin::types::Host for PluginStore {}
-impl bindings::channel::zeroclaw::plugin::types::Host for PluginStore {}
-
-// ── Linker wiring helpers ─────────────────────────────────────────────────────
-
-/// Wire all host interfaces for the `tool-plugin` world into `linker`.
-pub fn add_to_linker_tool(
-    linker: &mut wasmtime::component::Linker<PluginStore>,
-) -> Result<(), PluginError> {
-    // Use feature flags to allow developers to link in wit bindings that aren't stabilized yet.
-    let mut options = crate::component::v0::bindings::tool::LinkOptions::default();
-    #[cfg(feature = "plugins-wit-v0")]
-    {
-        options.plugins_wit_v0(true);
-    }
-    bindings::tool::ToolPlugin::add_to_linker::<PluginStore, HasSelf<PluginStore>>(
-        linker,
-        &options,
-        |x| x,
-    )
-    .map_err(PluginError::from)?;
-    Ok(())
-}
-
-/// Wire all host interfaces for the `memory-plugin` world into `linker`.
-pub fn add_to_linker_memory(
-    linker: &mut wasmtime::component::Linker<PluginStore>,
-) -> Result<(), PluginError> {
-    // Use feature flags to allow developers to link in wit bindings that aren't stabilized yet.
-    let mut options = crate::component::v0::bindings::memory::LinkOptions::default();
-    #[cfg(feature = "plugins-wit-v0")]
-    {
-        options.plugins_wit_v0(true);
-    }
-    bindings::memory::MemoryPlugin::add_to_linker::<PluginStore, HasSelf<PluginStore>>(
-        linker,
-        &options,
-        |x| x,
-    )
-    .map_err(PluginError::from)?;
-    Ok(())
-}
-
-/// Wire all host interfaces for the `channel-plugin` world into `linker`.
-pub fn add_to_linker_channel(
-    linker: &mut wasmtime::component::Linker<PluginStore>,
-) -> Result<(), PluginError> {
-    // Use feature flags to allow developers to link in wit bindings that aren't stabilized yet.
-    let mut options = crate::component::v0::bindings::channel::LinkOptions::default();
-    #[cfg(feature = "plugins-wit-v0")]
-    {
-        options.plugins_wit_v0(true);
-    }
-    bindings::channel::ChannelPlugin::add_to_linker::<PluginStore, HasSelf<PluginStore>>(
-        linker,
-        &options,
-        |x| x,
-    )
-    .map_err(PluginError::from)?;
-    Ok(())
 }
 
 #[cfg(test)]

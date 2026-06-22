@@ -9,14 +9,12 @@ pub use memory_component::ComponentMemory;
 pub use tool_component::ComponentTool;
 
 mod bindings;
-mod call_plugin;
 mod channel_component;
 pub(super) mod gateway_host;
 pub(super) mod http_helpers_host;
 pub(super) mod logging;
 mod memory_component;
 pub(super) mod plugin_config;
-mod plugin_store;
+mod plugin_linker;
 mod tool_component;
 pub(super) mod websocket_host;
-mod wrap_plugin;

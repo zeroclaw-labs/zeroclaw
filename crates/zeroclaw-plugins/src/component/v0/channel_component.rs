@@ -27,8 +27,9 @@ use super::bindings::channel::{
         MediaAttachment as WitMediaAttachment, SendMessage as WitSendMessage,
     },
 };
-use super::plugin_store::{self, PluginStore};
+use super::plugin_linker;
 use crate::component::engine::ComponentEngine;
+use crate::component::plugin_store::PluginStore;
 use crate::error::PluginError;
 use crate::{FineGrainedPermission, call_plugin};
 
@@ -85,7 +86,7 @@ impl ComponentChannel {
         wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(PluginError::from)?;
         wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
             .map_err(PluginError::from)?;
-        plugin_store::add_to_linker_channel(&mut linker)?;
+        plugin_linker::add_to_linker_channel(&mut linker)?;
         let host = PluginStore::with_permissions(permissions, &network_config).await?;
         let mut store = wasmtime::Store::new(engine.engine(), host);
 
@@ -270,7 +271,7 @@ impl Channel for ComponentChannel {
                         .ok()
                         .flatten()
                 };
-                let result = super::wrap_plugin::wrap_plugin_call(
+                let result = crate::component::wrap_plugin::wrap_plugin_call(
                     &plugin_name,
                     &plugin_version,
                     "poll_message",

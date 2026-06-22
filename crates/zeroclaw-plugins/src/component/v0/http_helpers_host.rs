@@ -8,7 +8,7 @@ use super::bindings::channel::zeroclaw::plugin::http_helpers::{
     Host, HttpHeader, HttpResponse, MultipartField,
 };
 use super::bindings::channel::zeroclaw::plugin::types::MediaAttachment;
-use super::plugin_store::PluginStore;
+use crate::component::plugin_store::PluginStore;
 
 fn apply_headers(
     mut builder: reqwest::RequestBuilder,
@@ -137,7 +137,7 @@ impl Host for PluginStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::component::v0::plugin_store::PluginStore;
+    use crate::component::plugin_store::PluginStore;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn allowed_store() -> PluginStore {

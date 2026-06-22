@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::Message;
 use wasmtime::component::Resource;
 
 use super::bindings::channel::zeroclaw::plugin::websocket::{Host, HostWebsocket, WsMessage};
-use super::plugin_store::PluginStore;
+use crate::component::plugin_store::PluginStore;
 
 pub(super) type WsSink =
     futures_util::stream::SplitSink<zeroclaw_config::schema::ProxiedWsStream, Message>;
@@ -184,7 +184,7 @@ impl HostWebsocket for PluginStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::component::v0::plugin_store::PluginStore;
+    use crate::component::plugin_store::PluginStore;
 
     /// Spin up a local WS server that echoes the first text frame it
     /// receives, then closes. Returns the `ws://` URL to connect to.

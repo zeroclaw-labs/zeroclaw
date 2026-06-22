@@ -7,7 +7,7 @@ macro_rules! call_plugin {
         let plugin_version = $self.plugin_version.clone();
         let mut guard = state.lock().await;
         let (ref mut store, ref mut bindings) = *guard;
-        super::wrap_plugin::wrap_plugin_call(
+        $crate::component::wrap_plugin::wrap_plugin_call(
             &plugin_name,
             &plugin_version,
             $op,
