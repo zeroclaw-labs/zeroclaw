@@ -1,8 +1,9 @@
 ---
 type: reference
 status: accepted
-last-reviewed: 2026-04-19
+last-reviewed: 2026-06-21
 relates-to:
+  - FND-001
   - ADR-003
   - crates/zeroclaw-plugins
 ---
@@ -11,6 +12,14 @@ relates-to:
 
 This document defines the protocol between ZeroClaw's plugin host and WASM
 plugin modules.
+
+## Implementation status
+
+The current runtime bridge is transitional. `crates/zeroclaw-plugins` still supports the Extism-era string/JSON tool protocol documented below so existing prototype plugins can keep running while the WIT host lands.
+
+The accepted target architecture is the next contract: #6943 and FND-001 move ZeroClaw plugins to WIT-defined WASI components, compiled for `wasm32-wasip2` and hosted through direct `wasmtime`. The WIT interfaces live under `wit/v0/`; see `wit/VERSIONING.md` for the current compatibility rules.
+
+Treat new plugin-host design work as WIT / `wasm32-wasip2` work. Additions to the Extism-specific protocol should be limited to compatibility fixes needed during the migration.
 
 ## Plugin structure
 
@@ -77,7 +86,9 @@ skills and between bundles.
 | `memory_read` | Can read agent memory (not yet implemented) |
 | `memory_write` | Can write agent memory (not yet implemented) |
 
-## Required WASM exports
+## Current Extism bridge exports
+
+The exports below describe the current Extism bridge. WIT components use the interfaces in `wit/v0/`.
 
 ### `tool_metadata`
 
@@ -179,7 +190,9 @@ Timeout: 120 seconds.
 **Output:** Environment variable value (plain string). Returns an error if the
 variable is not set.
 
-## Writing a plugin in Rust
+## Writing a plugin in Rust for the current bridge
+
+This section describes the current Extism bridge.
 
 ### Dependencies
 
@@ -234,6 +247,8 @@ pub fn execute(input: String) -> FnResult<String> {
 
 ### Building
 
+For the current Extism bridge, compile the plugin as a WASI Preview 1 module:
+
 <div class="os-tabs-src">
 
 #### sh
@@ -251,6 +266,8 @@ cargo build --target wasm32-wasip1 --release
 The output `.wasm` file is at
 `target/wasm32-wasip1/release/<crate_name>.wasm`. Copy it alongside your
 `manifest.toml`.
+
+For the accepted WIT / Component Model target, compile plugin components for `wasm32-wasip2` and use `wit/v0/` as the interface source.
 
 ### Installing
 
@@ -272,4 +289,4 @@ cp -r my-plugin/ ~/.zeroclaw/plugins/my-plugin/
 
 Enable the plugin system via the `plugins` and `plugins.security` sections (gateway, zerocode, or `zeroclaw config set`): see the [Config reference](../reference/config.md) for all fields, defaults, and the `signature_mode` enum.
 
-The `plugins-wasm` feature flag must be enabled at compile time (included in the default `ci-all` feature set).
+The `plugins-wasm` feature enables the current plugin runtime integration. The direct `wasmtime` host path uses `plugins-wasm-runtime-only`, `plugins-wasm-cranelift`, and `plugins-wasm-pulley` to choose the smallest execution strategy that matches the target platform.
