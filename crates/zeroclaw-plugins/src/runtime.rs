@@ -176,16 +176,18 @@ pub fn call_tool_metadata(plugin: &mut extism::Plugin) -> Result<ToolMetadata> {
 }
 
 /// Merge the plugin's resolved config section into its `execute` input under the
-/// reserved `__config` key. Returns the serialized input string. Kept pure so
-/// the injection contract is unit-testable without a live plugin.
+/// reserved `__config` key, stripping any caller-supplied `__config` first so the
+/// section cannot be spoofed through tool args. Kept pure so the injection
+/// contract is unit-testable without a live plugin.
 fn inject_config(args_json: &[u8], config: &HashMap<String, String>) -> Result<String> {
     let mut args: serde_json::Value =
         serde_json::from_slice(args_json).context("plugin args are not valid JSON")?;
 
+    let obj = args
+        .as_object_mut()
+        .context("plugin args must be a JSON object")?;
+    obj.remove("__config");
     if !config.is_empty() {
-        let obj = args
-            .as_object_mut()
-            .context("plugin args must be a JSON object")?;
         obj.insert(
             "__config".to_string(),
             serde_json::to_value(config).context("failed to serialize plugin config")?,
@@ -304,5 +306,23 @@ mod tests {
         let args = br#"[1,2,3]"#;
         let config = HashMap::from([("k".to_string(), "v".to_string())]);
         assert!(inject_config(args, &config).is_err());
+    }
+
+    #[test]
+    fn inject_config_strips_caller_supplied_config_when_section_empty() {
+        let args = br#"{"prompt":"x","__config":{"api_key":"forged"}}"#;
+        let out = inject_config(args, &HashMap::new()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("__config").is_none());
+        assert_eq!(v["prompt"], "x");
+    }
+
+    #[test]
+    fn inject_config_overrides_caller_supplied_config_when_section_present() {
+        let args = br#"{"prompt":"x","__config":{"api_key":"forged"}}"#;
+        let config = HashMap::from([("api_key".to_string(), "real".to_string())]);
+        let out = inject_config(args, &config).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["__config"]["api_key"], "real");
     }
 }
