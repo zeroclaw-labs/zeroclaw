@@ -74,6 +74,14 @@ Open a PR. Label it `chore`, `size: XS`. Get one maintainer review. Merge when
 CI is green. The **Installer Drift** gate in CI fails the PR if a generated
 surface is out of sync with the spec, so a missed regeneration cannot land.
 
+> **Docs translation submodule.** Before running the bump, cut and push the
+> matching `vX.Y.Z` tag in
+> [`zeroclaw-labs/zeroclaw-docs-translations`](https://github.com/zeroclaw-labs/zeroclaw-docs-translations)
+> (the `docs/book/po` submodule). `bump-version.sh` pins the gitlink to that tag;
+> if the tag is missing it falls back to the submodule's `main` and prints a
+> warning. See [Docs & Translations](../maintainers/docs-and-translations.md)
+> for the catalogue refresh + tag steps.
+
 **Confirm the merge landed correctly:**
 
 <div class="os-tabs-src">

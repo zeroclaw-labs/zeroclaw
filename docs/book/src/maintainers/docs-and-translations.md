@@ -181,15 +181,25 @@ Maintainers should accept the routine English docs exception documented in [Buil
 
 Everything else, `lang-switcher.js`, CI deploy target list, `cargo mdbook locales` output, reads from `locales.toml` automatically.
 
+## Translation catalogue submodule
+
+The translated `.po` catalogues are not in this repo's main tree. They live in the dedicated [`zeroclaw-labs/zeroclaw-docs-translations`](https://github.com/zeroclaw-labs/zeroclaw-docs-translations) repo, mounted as a git submodule at `docs/book/po` (default branch `main`). The mount point is path-transparent: `book.toml`'s gettext preprocessor, `cargo mdbook sync`, and `cargo mdbook build` all read `po/` exactly as before.
+
+The Rust crate dev loop never needs the submodule. Only docs builds and the docs-deploy / release jobs require it; those checkouts pass `submodules: recursive`. Everything else stays submodule-free.
+
+Per release, the submodule is tagged `v{version}` to mirror the main repo, and `scripts/release/bump-version.sh` pins the gitlink to that tag (falling back to `main` with a warning if the tag is not yet cut). `messages.pot` and `*.failures.log` are regenerated artifacts and are gitignored in both repos, not tracked.
+
 ## Release translation workflow
 
-Before tagging a release, run a full translation pass locally and commit the updated `.po` files.
+Before tagging a release, run a full translation pass locally inside the submodule and commit the updated `.po` files **to the submodule repo**, then advance the main repo's gitlink.
 
 <div class="os-tabs-src">
 
 #### sh
 
 ```sh
+git submodule update --init docs/book/po          # ensure the submodule is present
+
 # Fast delta pass (only new or changed strings since last release)
 cargo mdbook sync --model-provider ollama
 
@@ -198,6 +208,15 @@ cargo mdbook sync --model-provider ollama --force
 
 cargo mdbook check   # validate before committing
 cargo mdbook stats   # review coverage
+
+# Commit catalogues in the submodule, then tag it to mirror the release
+git -C docs/book/po add -A
+git -C docs/book/po commit -m "chore: refresh catalogues for vX.Y.Z"
+git -C docs/book/po push origin main
+git -C docs/book/po tag vX.Y.Z && git -C docs/book/po push origin vX.Y.Z
+
+# bump-version.sh pins the main-repo gitlink to the tag during the version bump
+bash scripts/release/bump-version.sh X.Y.Z
 ```
 
 </div>
