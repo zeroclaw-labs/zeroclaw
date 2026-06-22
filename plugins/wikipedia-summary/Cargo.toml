@@ -1,0 +1,23 @@
+[package]
+name = "wikipedia-summary"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "ZeroClaw WIT plugin: look up a short summary of a topic from Wikipedia."
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.46"
+serde_json = "1.0"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
+
+# Standalone crate: built for wasm32-wasip2, not part of the host workspace.
+[workspace]

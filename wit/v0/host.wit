@@ -1,0 +1,76 @@
+package zeroclaw:plugin@0.1.0;
+
+/// Host-provided capabilities for sandboxed WASM tool plugins.
+///
+/// These are the only ways a sandboxed plugin can reach the outside world. The
+/// set is intentionally minimal to keep the attack surface small.
+///
+/// Security model:
+/// - Plugins are untrusted and run in a wasmtime component sandbox.
+/// - Every capability is opt-in. A capability the host did not grant resolves
+///   to a fail-closed implementation that denies the call.
+/// - Secrets are NEVER exposed to the guest. `secret-exists` reports only
+///   existence; real credentials are injected by the host at the HTTP boundary.
+///
+/// Logging is intentionally NOT part of this interface — plugins emit structured
+/// logs through the separate `logging` interface (`log-record`) so they flow
+/// through `zeroclaw-log` like every other event.
+@unstable(feature = plugins-wit-v0)
+interface host {
+    @unstable(feature = plugins-wit-v0)
+    use types.{json-string};
+
+    /// Current wall-clock time in milliseconds since the Unix epoch.
+    now-millis: func() -> u64;
+
+    /// Read a file from the workspace, if the capability is granted.
+    ///
+    /// `path` must be relative (no leading `/`) and must not contain `..`.
+    /// Returns `none` if the file does not exist or the capability is denied.
+    workspace-read: func(path: string) -> option<string>;
+
+    /// Response returned by `http-request`.
+    @unstable(feature = plugins-wit-v0)
+    record http-response {
+        /// HTTP status code.
+        status: u16,
+        /// Response headers as a JSON object string.
+        headers-json: json-string,
+        /// Response body bytes.
+        body: list<u8>,
+    }
+
+    /// Make an HTTP request, if the capability is granted.
+    ///
+    /// Security:
+    /// - Only host-allowlisted endpoints can be reached.
+    /// - Credentials are injected by the host; the guest never sees them.
+    /// - Rate-limited per plugin.
+    ///
+    /// `timeout-ms` defaults to 30000 (30s) when omitted and is capped to the
+    /// remaining execution deadline. Returns `err` with a message on denial,
+    /// timeout, size-limit, or network failure.
+    http-request: func(
+        method: string,
+        url: string,
+        headers-json: json-string,
+        body: option<list<u8>>,
+        timeout-ms: option<u32>,
+    ) -> result<http-response, string>;
+
+    /// Invoke another tool by host-assigned alias, if the capability is granted.
+    ///
+    /// Security:
+    /// - Plugins call tools by alias, never by real name (indirection layer).
+    /// - Only aliased tools can be invoked; rate-limited per plugin.
+    ///
+    /// Returns the invoked tool's output as a JSON string, or `err`.
+    tool-invoke: func(alias: string, params-json: json-string) -> result<json-string, string>;
+
+    /// Check whether a named secret exists, if the capability is granted.
+    ///
+    /// Security:
+    /// - The guest can only check existence, NEVER read the value.
+    /// - Only host-allowlisted secret names can be checked.
+    secret-exists: func(name: string) -> bool;
+}

@@ -26,6 +26,8 @@ pub mod cron_update;
 pub mod delegate;
 pub mod file_read;
 pub mod model_switch;
+#[cfg(feature = "plugins-wasm")]
+mod plugin_host;
 pub mod read_skill;
 pub mod schedule;
 pub mod security_ops;
@@ -1382,17 +1384,47 @@ pub fn all_tools_with_runtime(
         let plugin_path = config.plugins.resolved_plugins_dir();
 
         if plugin_path.exists() && config.plugins.enabled {
-            match zeroclaw_plugins::host::PluginHost::from_plugins_dir(&plugin_path) {
+            // Honor the configured signature policy on the path that actually
+            // executes plugin code (mirrors the skills loader); `from_plugins_dir`
+            // alone hardcodes SignatureMode::Disabled and would bypass strict mode.
+            let signature_mode = zeroclaw_plugins::host::PluginHost::parse_signature_mode(
+                &config.plugins.security.signature_mode,
+            );
+            let trusted_keys = config.plugins.security.trusted_publisher_keys.clone();
+            match zeroclaw_plugins::host::PluginHost::from_plugins_dir_with_security(
+                &plugin_path,
+                signature_mode,
+                trusted_keys,
+            ) {
                 Ok(host) => {
                     let details = host.tool_plugin_details();
                     let count = details.len();
+                    // Shared secret source for existence checks + host-side
+                    // credential injection (values never cross into WASM).
+                    let secret_source = std::sync::Arc::new(plugin_host::PluginSecretSource::new(
+                        http_config.secrets.clone(),
+                        zeroclaw_config::secrets::SecretStore::new(
+                            &root_config.data_dir,
+                            root_config.secrets.encrypt,
+                        ),
+                    ));
                     for (manifest, wasm_path) in details {
-                        tool_arcs.push(Arc::new(zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
+                        // Grant only the host capabilities the manifest declares;
+                        // everything else stays deny-by-default in the sandbox.
+                        let wit_host = plugin_host::build_wit_host(
+                            manifest,
+                            http_config,
+                            workspace_dir,
+                            secret_source.clone(),
+                        );
+                        let tool = zeroclaw_plugins::wit_tool::WitTool::from_wasm(
                             wasm_path.to_path_buf(),
                             manifest.permissions.clone(),
                             manifest.name.clone(),
                             manifest.description.clone().unwrap_or_default(),
-                        )));
+                        )
+                        .with_host(wit_host);
+                        tool_arcs.push(Arc::new(RateLimitedTool::new(tool, security.clone())));
                     }
                     ::zeroclaw_log::record!(
                         INFO,

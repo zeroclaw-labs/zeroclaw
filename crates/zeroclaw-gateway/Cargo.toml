@@ -83,7 +83,7 @@ tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 
 [features]
 default = ["schema-export"]
-plugins-wasm = ["dep:zeroclaw-plugins"]
+plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasmtime"]
 webauthn = ["zeroclaw-runtime/webauthn"]
 observability-prometheus = ["zeroclaw-runtime/observability-prometheus"]
 channel-acp-server = ["zeroclaw-channels/channel-acp-server"]

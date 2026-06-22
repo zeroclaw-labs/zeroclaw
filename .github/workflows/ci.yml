@@ -294,6 +294,14 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # The WASM plugin contract suite needs a wasmtime compiler backend, which
+      # is not a default feature, so the workspace run above skips it. Exercise
+      # it explicitly with cranelift.
+      - name: Run WASM plugin runtime contract tests
+        run: cargo nextest run --locked -p zeroclaw-plugins --features plugins-wasm-cranelift
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
   # ── Post-format security checks ───────────────────────────────────────────
 

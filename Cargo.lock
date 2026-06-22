@@ -24,15 +24,6 @@ dependencies = [
 
 [[package]]
 name = "addr2line"
-version = "0.25.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b5d307320b3181d6d7954e663bd7c774a838b8220fe0593c86d9fb09f498b4b"
-dependencies = [
- "gimli 0.32.3",
-]
-
-[[package]]
-name = "addr2line"
 version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "59317f77929f0e679d39364702289274de2f0f0b22cbf50b2b8cff2169a0b27a"
@@ -994,15 +985,6 @@ dependencies = [
 
 [[package]]
 name = "bitmaps"
-version = "2.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "031043d04099746d8db04daf1fa424b2bc8bd69d92b25962dcde24da39ab64a2"
-dependencies = [
- "typenum",
-]
-
-[[package]]
-name = "bitmaps"
 version = "3.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1d084b0137aaa901caf9f1e8b21daa6aa24d41cd806e111335541eff9683bd6"
@@ -1230,6 +1212,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cap-net-ext"
+version = "3.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20a158160765c6a7d0d8c072a53d772e4cb243f38b04bfcf6b4939cfbe7482e7"
+dependencies = [
+ "cap-primitives",
+ "cap-std",
+ "rustix 1.1.4",
+ "smallvec",
+]
+
+[[package]]
 name = "cap-primitives"
 version = "3.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1361,24 +1355,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce2dc9ee5f88d11e0beb842c88b33c8a5cf0d1329c4b19494af42b07dbfe8896"
 dependencies = [
  "cipher 0.5.2",
-]
-
-[[package]]
-name = "cbindgen"
-version = "0.29.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "befbfd072a8e81c02f8c507aefce431fe5e7d051f83d48a23ffc9b9fe5a11799"
-dependencies = [
- "heck 0.5.0",
- "indexmap 2.14.0",
- "log",
- "proc-macro2",
- "quote",
- "serde",
- "serde_json",
- "syn 2.0.117",
- "tempfile",
- "toml 0.9.12+spec-1.1.0",
 ]
 
 [[package]]
@@ -1939,74 +1915,37 @@ dependencies = [
 
 [[package]]
 name = "cranelift-assembler-x64"
-version = "0.128.4"
+version = "0.131.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50a04121a197fde2fe896f8e7cac9812fc41ed6ee9c63e1906090f9f497845f6"
+checksum = "3867f7a56768640a79fc660d2f60298251dc6d65b5d1c907706cd1afff024957"
 dependencies = [
- "cranelift-assembler-x64-meta 0.128.4",
-]
-
-[[package]]
-name = "cranelift-assembler-x64"
-version = "0.130.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adc822414b18d1f5b1b33ce1441534e311e62fef86ebb5b9d382af857d0272c9"
-dependencies = [
- "cranelift-assembler-x64-meta 0.130.2",
+ "cranelift-assembler-x64-meta",
 ]
 
 [[package]]
 name = "cranelift-assembler-x64-meta"
-version = "0.128.4"
+version = "0.131.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a09e699a94f477303820fb2167024f091543d6240783a2d3b01a3f21c42bc744"
+checksum = "a0661d63dcf8fc4a6538c1ee4d523917c5b27e9fce7a4114cdf9e2b30b4043cf"
 dependencies = [
- "cranelift-srcgen 0.128.4",
-]
-
-[[package]]
-name = "cranelift-assembler-x64-meta"
-version = "0.130.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c646808b06f4532478d8d6057d74f15c3322f10d995d9486e7dcea405bf521a"
-dependencies = [
- "cranelift-srcgen 0.130.2",
+ "cranelift-srcgen",
 ]
 
 [[package]]
 name = "cranelift-bforest"
-version = "0.128.4"
+version = "0.131.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f07732c662a9755529e332d86f8c5842171f6e98ba4d5976a178043dad838654"
+checksum = "a8d535b489159ea63e3c40dfbe8d0e12bfb71f2a14845ef2407353e06c5a697c"
 dependencies = [
- "cranelift-entity 0.128.4",
-]
-
-[[package]]
-name = "cranelift-bforest"
-version = "0.130.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b5996f01a686b2349cdb379083ec5ad3e8cb8767fb2d495d3a4f2ee4163a18d"
-dependencies = [
- "cranelift-entity 0.130.2",
+ "cranelift-entity",
  "wasmtime-internal-core",
 ]
 
 [[package]]
 name = "cranelift-bitset"
-version = "0.128.4"
+version = "0.131.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18391da761cf362a06def7a7cf11474d79e55801dd34c2e9ba105b33dc0aef88"
-dependencies = [
- "serde",
- "serde_derive",
-]
-
-[[package]]
-name = "cranelift-bitset"
-version = "0.130.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "523fea83273f6a985520f57788809a4de2165794d9ab00fb1254fceb4f5aa00c"
+checksum = "c3af4f7d421b2354deb01d714266022f38fcdbebc9f5f1ec6d310d3c27286d9e"
 dependencies = [
  "serde",
  "serde_derive",
@@ -2015,52 +1954,25 @@ dependencies = [
 
 [[package]]
 name = "cranelift-codegen"
-version = "0.128.4"
+version = "0.131.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b3a09b3042c69810d255aef59ddc3b3e4c0644d1d90ecfd6e3837798cc88a3c"
+checksum = "09fe4c289e67e0221d1705734a57f95e25c289ed0ead7728743ea21285fc4cf1"
 dependencies = [
  "bumpalo",
- "cranelift-assembler-x64 0.128.4",
- "cranelift-bforest 0.128.4",
- "cranelift-bitset 0.128.4",
- "cranelift-codegen-meta 0.128.4",
- "cranelift-codegen-shared 0.128.4",
- "cranelift-control 0.128.4",
- "cranelift-entity 0.128.4",
- "cranelift-isle 0.128.4",
- "gimli 0.32.3",
- "hashbrown 0.15.5",
- "log",
- "pulley-interpreter 41.0.4",
- "regalloc2 0.13.5",
- "rustc-hash 2.1.2",
- "serde",
- "smallvec",
- "target-lexicon 0.13.5",
- "wasmtime-internal-math",
-]
-
-[[package]]
-name = "cranelift-codegen"
-version = "0.130.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d73d1e372730b5f64ed1a2bd9f01fe4686c8ec14a28034e3084e530c8d951878"
-dependencies = [
- "bumpalo",
- "cranelift-assembler-x64 0.130.2",
- "cranelift-bforest 0.130.2",
- "cranelift-bitset 0.130.2",
- "cranelift-codegen-meta 0.130.2",
- "cranelift-codegen-shared 0.130.2",
- "cranelift-control 0.130.2",
- "cranelift-entity 0.130.2",
- "cranelift-isle 0.130.2",
+ "cranelift-assembler-x64",
+ "cranelift-bforest",
+ "cranelift-bitset",
+ "cranelift-codegen-meta",
+ "cranelift-codegen-shared",
+ "cranelift-control",
+ "cranelift-entity",
+ "cranelift-isle",
  "gimli 0.33.0",
  "hashbrown 0.16.1",
  "libm",
  "log",
- "pulley-interpreter 43.0.2",
- "regalloc2 0.15.1",
+ "pulley-interpreter",
+ "regalloc2",
  "rustc-hash 2.1.2",
  "serde",
  "smallvec",
@@ -2070,78 +1982,39 @@ dependencies = [
 
 [[package]]
 name = "cranelift-codegen-meta"
-version = "0.128.4"
+version = "0.131.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75817926ec812241889208d1b190cadb7fedded4592a4bb01b8524babb9e4849"
+checksum = "b3063e5363dc5ee6ee8edd930314582c08eb91c209b9564da1cd667f6424b9b3"
 dependencies = [
- "cranelift-assembler-x64-meta 0.128.4",
- "cranelift-codegen-shared 0.128.4",
- "cranelift-srcgen 0.128.4",
+ "cranelift-assembler-x64-meta",
+ "cranelift-codegen-shared",
+ "cranelift-srcgen",
  "heck 0.5.0",
- "pulley-interpreter 41.0.4",
-]
-
-[[package]]
-name = "cranelift-codegen-meta"
-version = "0.130.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0319c18165e93dc1ebf78946a8da0b1c341c95b4a39729a69574671639bdb5f"
-dependencies = [
- "cranelift-assembler-x64-meta 0.130.2",
- "cranelift-codegen-shared 0.130.2",
- "cranelift-srcgen 0.130.2",
- "heck 0.5.0",
- "pulley-interpreter 43.0.2",
+ "pulley-interpreter",
 ]
 
 [[package]]
 name = "cranelift-codegen-shared"
-version = "0.128.4"
+version = "0.131.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "859158f87a59476476eda3884d883c32e08a143cf3d315095533b362a3250a63"
-
-[[package]]
-name = "cranelift-codegen-shared"
-version = "0.130.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9195cd8aeecb55e401aa96b2eaa55921636e8246c127ed7908f7ef7e0d40f270"
+checksum = "c34b9c8dbc9edf37744918e56898d4979ef1e764e8e4bbe8b4d50250838ddfe8"
 
 [[package]]
 name = "cranelift-control"
-version = "0.128.4"
+version = "0.131.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03b65a9aec442d715cbf54d14548b8f395476c09cef7abe03e104a378291ab88"
-dependencies = [
- "arbitrary",
-]
-
-[[package]]
-name = "cranelift-control"
-version = "0.130.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8976c2154b74136322befc74222ab5c7249edd7e2604f8cbef2b94975541ffb9"
+checksum = "4eed9dc54204dc99aad19669bca50142659ed583396d9a99a2aef34d7c136ef4"
 dependencies = [
  "arbitrary",
 ]
 
 [[package]]
 name = "cranelift-entity"
-version = "0.128.4"
+version = "0.131.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8334c99a7e86060c24028732efd23bac84585770dcb752329c69f135d64f2fc1"
+checksum = "9aa2846b239a046217ecf95cfed0e31be4e86843785d07438ad33f456871e888"
 dependencies = [
- "cranelift-bitset 0.128.4",
- "serde",
- "serde_derive",
-]
-
-[[package]]
-name = "cranelift-entity"
-version = "0.130.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6038b3147c7982f4951150d5f96c7c06c1e7214b99d4b4a98607aadf8ded89d1"
-dependencies = [
- "cranelift-bitset 0.130.2",
+ "cranelift-bitset",
  "serde",
  "serde_derive",
  "wasmtime-internal-core",
@@ -2149,23 +2022,11 @@ dependencies = [
 
 [[package]]
 name = "cranelift-frontend"
-version = "0.128.4"
+version = "0.131.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43ac6c095aa5b3e845d7ca3461e67e2b65249eb5401477a5ff9100369b745111"
+checksum = "144f70fa9cd07efb83497c12dc8fb73f360a690cd990c44e8ceebc293d8c13b5"
 dependencies = [
- "cranelift-codegen 0.128.4",
- "log",
- "smallvec",
- "target-lexicon 0.13.5",
-]
-
-[[package]]
-name = "cranelift-frontend"
-version = "0.130.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cbd294abe236e23cc3d907b0936226b6a8342db7636daa9c7c72be1e323420e"
-dependencies = [
- "cranelift-codegen 0.130.2",
+ "cranelift-codegen",
  "log",
  "smallvec",
  "target-lexicon 0.13.5",
@@ -2173,49 +2034,26 @@ dependencies = [
 
 [[package]]
 name = "cranelift-isle"
-version = "0.128.4"
+version = "0.131.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69d3d992870ed4f0f2e82e2175275cb3a123a46e9660c6558c46417b822c91fa"
-
-[[package]]
-name = "cranelift-isle"
-version = "0.130.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5a90b6ed3aba84189352a87badeb93b2126d3724225a42dc67fdce53d1b139c"
+checksum = "0733ca5b2aaa5f6d5d6a1439e3c44280d34730d4d5c262ca08c6775c8d83f191"
 
 [[package]]
 name = "cranelift-native"
-version = "0.128.4"
+version = "0.131.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee32e36beaf80f309edb535274cfe0349e1c5cf5799ba2d9f42e828285c6b52e"
+checksum = "75b1290d6193b171172d5fe9a6e42326edf487a79f211fbf1e76f912a4aed035"
 dependencies = [
- "cranelift-codegen 0.128.4",
- "libc",
- "target-lexicon 0.13.5",
-]
-
-[[package]]
-name = "cranelift-native"
-version = "0.130.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3ec0cc1a54e22925eacf4fc3dc815f907734d3b377899d19d52bec04863e853"
-dependencies = [
- "cranelift-codegen 0.130.2",
+ "cranelift-codegen",
  "libc",
  "target-lexicon 0.13.5",
 ]
 
 [[package]]
 name = "cranelift-srcgen"
-version = "0.128.4"
+version = "0.131.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "903adeaf4938e60209a97b53a2e4326cd2d356aab9764a1934630204bae381c9"
-
-[[package]]
-name = "cranelift-srcgen"
-version = "0.130.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "948865622f87f30907bb46fbb081b235ae63c1896a99a83c26a003305c1fa82d"
+checksum = "ce0d5c2b4d719566816a0f1c9a9712d35d61e27df0ffd6c72a9afec9048db6c0"
 
 [[package]]
 name = "crc32fast"
@@ -2632,15 +2470,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "debugid"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bef552e6f588e446098f6ba40d89ac146c8c7b64aade83c051ee00bb5d2bc18d"
-dependencies = [
- "uuid",
-]
-
-[[package]]
 name = "decancer"
 version = "3.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2848,16 +2677,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "directories-next"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "339ee130d97a610ea5a5872d2bbb130fdf68884ff09d3028b81bec8a1ac23bbc"
-dependencies = [
- "cfg-if",
- "dirs-sys-next",
-]
-
-[[package]]
 name = "dirs"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2874,19 +2693,8 @@ checksum = "e01a3366d27ee9890022452ee61b2b63a67e6f13f58900b651ff5665f0bb1fab"
 dependencies = [
  "libc",
  "option-ext",
- "redox_users 0.5.2",
+ "redox_users",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "dirs-sys-next"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ebda144c4fe02d1f7ea1a7d9641b6fc6b580adcfa024ae48797ecdeb6825b4d"
-dependencies = [
- "libc",
- "redox_users 0.4.6",
- "winapi",
 ]
 
 [[package]]
@@ -3307,73 +3115,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c39dff9342e4e0e16ce96be751eb21a94e94a87bb2f6e63ad1961c2ce109bf"
 dependencies = [
  "async-trait",
-]
-
-[[package]]
-name = "extism"
-version = "1.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed8c5859bdab81d2eb4cd963eeacd8031d353b1ffb2fde43ee9179a0d6295120"
-dependencies = [
- "anyhow",
- "async-trait",
- "cbindgen",
- "extism-convert",
- "extism-manifest",
- "glob",
- "libc",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "toml 0.9.12+spec-1.1.0",
- "tracing",
- "tracing-subscriber",
- "ureq",
- "url",
- "uuid",
- "wasi-common",
- "wasmtime 41.0.4",
- "wiggle",
-]
-
-[[package]]
-name = "extism-convert"
-version = "1.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec1a8eac059a1730a21aa47f99a0c2075ba0ab88fd0c4e52e35027cf99cdf3e7"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "bytemuck",
- "extism-convert-macros",
- "prost",
- "rmp-serde",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "extism-convert-macros"
-version = "1.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "848f105dd6e1af2ea4bb4a76447658e8587167df3c4e4658c4258e5b14a5b051"
-dependencies = [
- "manyhow",
- "proc-macro-crate 3.5.0",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "extism-manifest"
-version = "1.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "953a22ad322939ae4567ec73a34913a3a43dcbdfa648b8307d38fe56bb3a0acd"
-dependencies = [
- "base64 0.22.1",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -3849,20 +3590,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fxprof-processed-profile"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25234f20a3ec0a962a61770cfe39ecf03cb529a6e474ad8cff025ed497eda557"
-dependencies = [
- "bitflags 2.11.1",
- "debugid",
- "rustc-hash 2.1.2",
- "serde",
- "serde_derive",
- "serde_json",
-]
-
-[[package]]
 name = "gdk"
 version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4292,7 +4019,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
  "foldhash 0.1.5",
- "serde",
 ]
 
 [[package]]
@@ -4313,6 +4039,9 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "hashify"
@@ -4830,20 +4559,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "365a784774bb381e8c19edb91190a90d7f2625e057b55de2bc0f6b57bc779ff2"
 
 [[package]]
-name = "im-rc"
-version = "15.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af1955a75fa080c677d3972822ec4bad316169ab1cfc6c257a942c2265dbe5fe"
-dependencies = [
- "bitmaps 2.1.0",
- "rand_core 0.6.4",
- "rand_xoshiro 0.6.0",
- "sized-chunks",
- "typenum",
- "version_check",
-]
-
-[[package]]
 name = "image"
 version = "0.25.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4885,10 +4600,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fade8ae6828627ad1fa094a891eccfb25150b383047190a3648d66d06186501"
 dependencies = [
  "archery",
- "bitmaps 3.2.1",
+ "bitmaps",
  "imbl-sized-chunks",
  "rand_core 0.9.5",
- "rand_xoshiro 0.7.0",
+ "rand_xoshiro",
  "serde",
  "version_check",
 ]
@@ -4899,7 +4614,7 @@ version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f4241005618a62f8d57b2febd02510fb96e0137304728543dfc5fd6f052c22d"
 dependencies = [
- "bitmaps 3.2.1",
+ "bitmaps",
 ]
 
 [[package]]
@@ -5175,26 +4890,6 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
-
-[[package]]
-name = "ittapi"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b996fe614c41395cdaedf3cf408a9534851090959d90d54a535f675550b64b1"
-dependencies = [
- "anyhow",
- "ittapi-sys",
- "log",
-]
-
-[[package]]
-name = "ittapi-sys"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52f5385394064fa2c886205dba02598013ce83d3e92d33dbdc0c52fe0e7bf4fc"
-dependencies = [
- "cc",
-]
 
 [[package]]
 name = "javascriptcore-rs"
@@ -5753,29 +5448,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8a2420e9ce11c2b0583ca97ddff7ab2398c8a613154e9b72e3bafdbf767f1d7"
 dependencies = [
  "hashify",
-]
-
-[[package]]
-name = "manyhow"
-version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b33efb3ca6d3b07393750d4030418d594ab1139cee518f0dc88db70fec873587"
-dependencies = [
- "manyhow-macros",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "manyhow-macros"
-version = "0.11.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46fce34d199b78b6e6073abf984c9cf5fd3e9330145a93ee0738a7443e371495"
-dependencies = [
- "proc-macro-utils",
- "proc-macro2",
- "quote",
 ]
 
 [[package]]
@@ -6891,25 +6563,10 @@ dependencies = [
 
 [[package]]
 name = "object"
-version = "0.37.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe"
-dependencies = [
- "crc32fast",
- "hashbrown 0.15.5",
- "indexmap 2.14.0",
- "memchr",
-]
-
-[[package]]
-name = "object"
 version = "0.38.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "271638cd5fa9cca89c4c304675ca658efc4e64a66c716b7cfe1afb4b9611dbbc"
 dependencies = [
- "crc32fast",
- "hashbrown 0.16.1",
- "indexmap 2.14.0",
  "memchr",
 ]
 
@@ -6919,7 +6576,10 @@ version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
 dependencies = [
+ "crc32fast",
  "flate2",
+ "hashbrown 0.17.1",
+ "indexmap 2.14.0",
  "memchr",
  "ruzstd",
 ]
@@ -7314,16 +6974,6 @@ checksum = "89815c69d36021a140146f26659a81d6c2afa33d216d736dd4be5381a7362220"
 dependencies = [
  "pest",
  "sha2 0.10.9",
-]
-
-[[package]]
-name = "petgraph"
-version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4c5cc86750666a3ed20bdaf5ca2a0344f9c67674cae0515bec2da16fbaa47db"
-dependencies = [
- "fixedbitset 0.4.2",
- "indexmap 2.14.0",
 ]
 
 [[package]]
@@ -7907,17 +7557,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "proc-macro-utils"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eeaf08a13de400bc215877b5bdc088f241b12eb42f0a548d3390dc1c56bb7071"
-dependencies = [
- "proc-macro2",
- "quote",
- "smallvec",
-]
-
-[[package]]
 name = "proc-macro2"
 version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7984,44 +7623,21 @@ checksum = "007d8adb5ddab6f8e3f491ac63566a7d5002cc7ed73901f72057943fa71ae1ae"
 
 [[package]]
 name = "pulley-interpreter"
-version = "41.0.4"
+version = "44.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9812652c1feb63cf39f8780cecac154a32b22b3665806c733cd4072547233a4"
+checksum = "34dff5fd3d9ac4845939fcb4597cd413cb244bc530448ed4766d11b1725e53d0"
 dependencies = [
- "cranelift-bitset 0.128.4",
+ "cranelift-bitset",
  "log",
- "pulley-macros 41.0.4",
- "wasmtime-internal-math",
-]
-
-[[package]]
-name = "pulley-interpreter"
-version = "43.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ec12fe19a9588315a49fe5704502a9c02d6a198303314b0c7c86123b06d29e5"
-dependencies = [
- "cranelift-bitset 0.130.2",
- "log",
- "pulley-macros 43.0.2",
+ "pulley-macros",
  "wasmtime-internal-core",
 ]
 
 [[package]]
 name = "pulley-macros"
-version = "41.0.4"
+version = "44.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56000349b6896e3d44286eb9c330891237f40b27fd43c1ccc84547d0b463cb40"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "pulley-macros"
-version = "43.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36f7d5ef31ebf1b46cd7e722ffef934e670d7e462f49aa01cde07b9b76dca580"
+checksum = "6c60fb1c885bdb1efd7c50e8e973714de558b75a65f20c3e9a41398c652aa44b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8225,15 +7841,6 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "rand_xoshiro"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f97cdb2a36ed4183de61b2f824cc45c9f1037f28afe0a322e9fff4c108b5aaa"
-dependencies = [
- "rand_core 0.6.4",
-]
-
-[[package]]
-name = "rand_xoshiro"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f703f4665700daf5512dcca5f43afa6af89f09db47fb56be587f80636bda2d41"
@@ -8417,17 +8024,6 @@ dependencies = [
 
 [[package]]
 name = "redox_users"
-version = "0.4.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba009ff324d1fc1b900bd1fdb31564febe58a8ccc8a6fdbb93b543d33b13ca43"
-dependencies = [
- "getrandom 0.2.17",
- "libredox",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "redox_users"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4e608c6638b9c18977b00b475ac1f28d14e84b27d8d42f70e0bf1e3dec127ac"
@@ -8455,20 +8051,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "regalloc2"
-version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08effbc1fa53aaebff69521a5c05640523fab037b34a4a2c109506bc938246fa"
-dependencies = [
- "allocator-api2",
- "bumpalo",
- "hashbrown 0.15.5",
- "log",
- "rustc-hash 2.1.2",
- "smallvec",
 ]
 
 [[package]]
@@ -9699,16 +9281,6 @@ name = "siphasher"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
-
-[[package]]
-name = "sized-chunks"
-version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16d69225bde7a69b235da73377861095455d298f2b970996eec25ddbb42b3d1e"
-dependencies = [
- "bitmaps 2.1.0",
- "typenum",
-]
 
 [[package]]
 name = "slab"
@@ -11047,7 +10619,6 @@ version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
- "log",
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
@@ -11071,18 +10642,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
- "valuable",
-]
-
-[[package]]
-name = "tracing-log"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
-dependencies = [
- "log",
- "once_cell",
- "tracing-core",
 ]
 
 [[package]]
@@ -11100,7 +10659,6 @@ dependencies = [
  "thread_local",
  "tracing",
  "tracing-core",
- "tracing-log",
 ]
 
 [[package]]
@@ -11492,7 +11050,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dea7109cdcd5864d4eeb1b58a1648dc9bf520360d7af16ec26d0a9354bafcfc0"
 dependencies = [
  "base64 0.22.1",
- "flate2",
  "log",
  "percent-encoding",
  "rustls",
@@ -11581,12 +11138,6 @@ dependencies = [
  "serde_core",
  "wasm-bindgen",
 ]
-
-[[package]]
-name = "valuable"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vcpkg"
@@ -11860,32 +11411,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wasi-common"
-version = "41.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f49ffbbd04665d04028f66aee8f24ae7a1f46063f59a28fddfa52ca3091754a2"
-dependencies = [
- "anyhow",
- "async-trait",
- "bitflags 2.11.1",
- "cap-fs-ext",
- "cap-rand",
- "cap-std",
- "cap-time-ext",
- "fs-set-times",
- "io-extras",
- "io-lifetimes 2.0.4",
- "log",
- "rustix 1.1.4",
- "system-interface",
- "thiserror 2.0.18",
- "tracing",
- "wasmtime 41.0.4",
- "wiggle",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "wasip2"
 version = "1.0.3+wasi-0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11968,37 +11493,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wasm-compose"
-version = "0.243.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af801b6f36459023eaec63fdbaedad2fd5a4ab7dc74ecc110a8b5d375c5775e4"
-dependencies = [
- "anyhow",
- "heck 0.5.0",
- "im-rc",
- "indexmap 2.14.0",
- "log",
- "petgraph",
- "serde",
- "serde_derive",
- "serde_yaml",
- "smallvec",
- "wasm-encoder 0.243.0",
- "wasmparser 0.243.0",
- "wat",
-]
-
-[[package]]
-name = "wasm-encoder"
-version = "0.243.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c55db9c896d70bd9fa535ce83cd4e1f2ec3726b0edd2142079f594fc3be1cb35"
-dependencies = [
- "leb128fmt",
- "wasmparser 0.243.0",
-]
-
-[[package]]
 name = "wasm-encoder"
 version = "0.244.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12016,6 +11510,16 @@ checksum = "3f9dca005e69bf015e45577e415b9af8c67e8ee3c0e38b5b0add5aa92581ed5c"
 dependencies = [
  "leb128fmt",
  "wasmparser 0.245.1",
+]
+
+[[package]]
+name = "wasm-encoder"
+version = "0.246.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61fb705ce81adde29d2a8e99d87995e39a6e927358c91398f374474746070ef7"
+dependencies = [
+ "leb128fmt",
+ "wasmparser 0.246.2",
 ]
 
 [[package]]
@@ -12038,6 +11542,18 @@ dependencies = [
  "indexmap 2.14.0",
  "wasm-encoder 0.244.0",
  "wasmparser 0.244.0",
+]
+
+[[package]]
+name = "wasm-metadata"
+version = "0.245.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da55e60097e8b37b475a0fa35c3420dd71d9eb7bd66109978ab55faf56a57efb"
+dependencies = [
+ "anyhow",
+ "indexmap 2.14.0",
+ "wasm-encoder 0.245.1",
+ "wasmparser 0.245.1",
 ]
 
 [[package]]
@@ -12086,19 +11602,6 @@ dependencies = [
 
 [[package]]
 name = "wasmparser"
-version = "0.243.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6d8db401b0528ec316dfbe579e6ab4152d61739cfe076706d2009127970159d"
-dependencies = [
- "bitflags 2.11.1",
- "hashbrown 0.15.5",
- "indexmap 2.14.0",
- "semver",
- "serde",
-]
-
-[[package]]
-name = "wasmparser"
 version = "0.244.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47b807c72e1bac69382b3a6fb3dbe8ea4c0ed87ff5629b8685ae6b9a611028fe"
@@ -12114,6 +11617,18 @@ name = "wasmparser"
 version = "0.245.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f08c9adee0428b7bddf3890fc27e015ac4b761cc608c822667102b8bfd6995e"
+dependencies = [
+ "bitflags 2.11.1",
+ "hashbrown 0.16.1",
+ "indexmap 2.14.0",
+ "semver",
+]
+
+[[package]]
+name = "wasmparser"
+version = "0.246.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71cde4757396defafd25417cfb36aa3161027d06d865b0c24baaae229aac005d"
 dependencies = [
  "bitflags 2.11.1",
  "hashbrown 0.16.1",
@@ -12135,90 +11650,22 @@ dependencies = [
 
 [[package]]
 name = "wasmprinter"
-version = "0.243.0"
+version = "0.246.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb2b6035559e146114c29a909a3232928ee488d6507a1504d8934e8607b36d7b"
+checksum = "6e41f7493ba994b8a779430a4c25ff550fd5a40d291693af43a6ef48688f00e3"
 dependencies = [
  "anyhow",
  "termcolor",
- "wasmparser 0.243.0",
-]
-
-[[package]]
-name = "wasmprinter"
-version = "0.245.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f41517a3716fbb8ccf46daa9c1325f760fcbff5168e75c7392288e410b91ac8"
-dependencies = [
- "anyhow",
- "termcolor",
- "wasmparser 0.245.1",
+ "wasmparser 0.246.2",
 ]
 
 [[package]]
 name = "wasmtime"
-version = "41.0.4"
+version = "44.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2a83182bf04af87571b4c642300479501684f26bab5597f68f68cded5b098fd"
+checksum = "d807f646bfecc1dbb4990d8c864beebccbdb3f2cd1b39b2b82957b4e294c6058"
 dependencies = [
- "addr2line 0.25.1",
- "anyhow",
- "async-trait",
- "bitflags 2.11.1",
- "bumpalo",
- "cc",
- "cfg-if",
- "encoding_rs",
- "futures",
- "fxprof-processed-profile",
- "gimli 0.32.3",
- "hashbrown 0.15.5",
- "indexmap 2.14.0",
- "ittapi",
- "libc",
- "log",
- "mach2 0.4.3",
- "memfd",
- "object 0.37.3",
- "once_cell",
- "postcard",
- "pulley-interpreter 41.0.4",
- "rayon",
- "rustix 1.1.4",
- "semver",
- "serde",
- "serde_derive",
- "serde_json",
- "smallvec",
- "target-lexicon 0.13.5",
- "tempfile",
- "wasm-compose",
- "wasm-encoder 0.243.0",
- "wasmparser 0.243.0",
- "wasmtime-environ 41.0.4",
- "wasmtime-internal-cache",
- "wasmtime-internal-component-macro 41.0.4",
- "wasmtime-internal-component-util 41.0.4",
- "wasmtime-internal-cranelift 41.0.4",
- "wasmtime-internal-fiber 41.0.4",
- "wasmtime-internal-jit-debug 41.0.4",
- "wasmtime-internal-jit-icache-coherence 41.0.4",
- "wasmtime-internal-math",
- "wasmtime-internal-slab",
- "wasmtime-internal-unwinder 41.0.4",
- "wasmtime-internal-versioned-export-macros 41.0.4",
- "wasmtime-internal-winch 41.0.4",
- "wat",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "wasmtime"
-version = "43.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "efb1ed5899dde98357cfdcf647a4614498798719793898245b4b34e663addabf"
-dependencies = [
- "addr2line 0.26.1",
+ "addr2line",
  "async-trait",
  "bitflags 2.11.1",
  "bumpalo",
@@ -12229,154 +11676,88 @@ dependencies = [
  "log",
  "mach2 0.4.3",
  "memfd",
- "object 0.38.1",
+ "object 0.39.1",
  "once_cell",
  "postcard",
- "pulley-interpreter 43.0.2",
+ "pulley-interpreter",
  "rustix 1.1.4",
  "semver",
  "serde",
  "serde_derive",
  "smallvec",
  "target-lexicon 0.13.5",
- "wasmparser 0.245.1",
- "wasmtime-environ 43.0.2",
- "wasmtime-internal-component-macro 43.0.2",
- "wasmtime-internal-component-util 43.0.2",
+ "wasmparser 0.246.2",
+ "wasmtime-environ",
+ "wasmtime-internal-component-macro",
+ "wasmtime-internal-component-util",
  "wasmtime-internal-core",
- "wasmtime-internal-cranelift 43.0.2",
- "wasmtime-internal-fiber 43.0.2",
- "wasmtime-internal-jit-debug 43.0.2",
- "wasmtime-internal-jit-icache-coherence 43.0.2",
- "wasmtime-internal-unwinder 43.0.2",
- "wasmtime-internal-versioned-export-macros 43.0.2",
- "wasmtime-internal-winch 43.0.2",
+ "wasmtime-internal-cranelift",
+ "wasmtime-internal-fiber",
+ "wasmtime-internal-jit-debug",
+ "wasmtime-internal-jit-icache-coherence",
+ "wasmtime-internal-unwinder",
+ "wasmtime-internal-versioned-export-macros",
+ "wasmtime-internal-winch",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "wasmtime-environ"
-version = "41.0.4"
+version = "44.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb201c41aa23a3642365cfb2e4a183573d85127a3c9d528f56b9997c984541ab"
+checksum = "48b945309908f22473ebcd585ac2993948044228491cd96941d367aa81a49c3f"
 dependencies = [
  "anyhow",
  "cpp_demangle",
- "cranelift-bitset 0.128.4",
- "cranelift-entity 0.128.4",
- "gimli 0.32.3",
+ "cranelift-bforest",
+ "cranelift-bitset",
+ "cranelift-entity",
+ "gimli 0.33.0",
+ "hashbrown 0.16.1",
  "indexmap 2.14.0",
  "log",
- "object 0.37.3",
+ "object 0.39.1",
  "postcard",
  "rustc-demangle",
  "semver",
  "serde",
  "serde_derive",
- "smallvec",
- "target-lexicon 0.13.5",
- "wasm-encoder 0.243.0",
- "wasmparser 0.243.0",
- "wasmprinter 0.243.0",
- "wasmtime-internal-component-util 41.0.4",
-]
-
-[[package]]
-name = "wasmtime-environ"
-version = "43.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4172382dcc785c31d0e862c6780a18f5dd437914d22c4691351f965ef751c821"
-dependencies = [
- "anyhow",
- "cranelift-bforest 0.130.2",
- "cranelift-bitset 0.130.2",
- "cranelift-entity 0.130.2",
- "gimli 0.33.0",
- "hashbrown 0.16.1",
- "indexmap 2.14.0",
- "log",
- "object 0.38.1",
- "postcard",
- "semver",
- "serde",
- "serde_derive",
  "sha2 0.10.9",
  "smallvec",
  "target-lexicon 0.13.5",
- "wasm-encoder 0.245.1",
- "wasmparser 0.245.1",
- "wasmprinter 0.245.1",
- "wasmtime-internal-component-util 43.0.2",
+ "wasm-encoder 0.246.2",
+ "wasmparser 0.246.2",
+ "wasmprinter",
+ "wasmtime-internal-component-util",
  "wasmtime-internal-core",
 ]
 
 [[package]]
-name = "wasmtime-internal-cache"
-version = "41.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb5b3069d1a67ba5969d0eb1ccd7e141367d4e713f4649aa90356c98e8f19bea"
-dependencies = [
- "base64 0.22.1",
- "directories-next",
- "log",
- "postcard",
- "rustix 1.1.4",
- "serde",
- "serde_derive",
- "sha2 0.10.9",
- "toml 0.9.12+spec-1.1.0",
- "wasmtime-environ 41.0.4",
- "windows-sys 0.61.2",
- "zstd",
-]
-
-[[package]]
 name = "wasmtime-internal-component-macro"
-version = "41.0.4"
+version = "44.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c924400db7b6ca996fef1b23beb0f41d5c809836b1ec60fc25b4057e2d25d9b"
+checksum = "7307dec6251a18ffa9df03120d2945ac2476ce150b5b099f39b199e8f81464dc"
 dependencies = [
  "anyhow",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
- "wasmtime-internal-component-util 41.0.4",
- "wasmtime-internal-wit-bindgen 41.0.4",
- "wit-parser 0.243.0",
-]
-
-[[package]]
-name = "wasmtime-internal-component-macro"
-version = "43.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae5ec9fff073ff13b81732d56a9515d761c245750bcda09093827f84130ebc25"
-dependencies = [
- "anyhow",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
- "wasmtime-internal-component-util 43.0.2",
- "wasmtime-internal-wit-bindgen 43.0.2",
- "wit-parser 0.245.1",
+ "wasmtime-internal-component-util",
+ "wasmtime-internal-wit-bindgen",
+ "wit-parser 0.246.2",
 ]
 
 [[package]]
 name = "wasmtime-internal-component-util"
-version = "41.0.4"
+version = "44.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d3f65daf4bf3d74ca2fbbe20af0589c42e2b398a073486451425d94fd4afef4"
-
-[[package]]
-name = "wasmtime-internal-component-util"
-version = "43.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "935d9ab293ba27d1ec9aa7bc1b3a43993dbe961af2a8f23f90a11e1331b4c13f"
+checksum = "7a3d899b0270bcf04852f141bd9538cb162a436e7f56b2c6e0f4e57ecc70743a"
 
 [[package]]
 name = "wasmtime-internal-core"
-version = "43.0.2"
+version = "44.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a3820b174f477d2a7083209d1ad5353fcdb11eaea434b2137b8681029460dd3"
+checksum = "aedd3947487d0afdd37accb981466fcd60571e898004c8955111f88686581dfc"
 dependencies = [
  "hashbrown 0.16.1",
  "libm",
@@ -12385,127 +11766,61 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-cranelift"
-version = "41.0.4"
+version = "44.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "633e889cdae76829738db0114ab3b02fce51ea4a1cd9675a67a65fce92e8b418"
+checksum = "512fd846630c064bfc42909eeba90a7d26703b6ded09ad4778ff6afcbdc868dd"
 dependencies = [
  "cfg-if",
- "cranelift-codegen 0.128.4",
- "cranelift-control 0.128.4",
- "cranelift-entity 0.128.4",
- "cranelift-frontend 0.128.4",
- "cranelift-native 0.128.4",
- "gimli 0.32.3",
- "itertools 0.14.0",
- "log",
- "object 0.37.3",
- "pulley-interpreter 41.0.4",
- "smallvec",
- "target-lexicon 0.13.5",
- "thiserror 2.0.18",
- "wasmparser 0.243.0",
- "wasmtime-environ 41.0.4",
- "wasmtime-internal-math",
- "wasmtime-internal-unwinder 41.0.4",
- "wasmtime-internal-versioned-export-macros 41.0.4",
-]
-
-[[package]]
-name = "wasmtime-internal-cranelift"
-version = "43.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1679d205caf9766c6aa309d45bb3e7c634d7725e3164404df33824b9f7c4fb7"
-dependencies = [
- "cfg-if",
- "cranelift-codegen 0.130.2",
- "cranelift-control 0.130.2",
- "cranelift-entity 0.130.2",
- "cranelift-frontend 0.130.2",
- "cranelift-native 0.130.2",
+ "cranelift-codegen",
+ "cranelift-control",
+ "cranelift-entity",
+ "cranelift-frontend",
+ "cranelift-native",
  "gimli 0.33.0",
  "itertools 0.14.0",
  "log",
- "object 0.38.1",
- "pulley-interpreter 43.0.2",
+ "object 0.39.1",
+ "pulley-interpreter",
  "smallvec",
  "target-lexicon 0.13.5",
  "thiserror 2.0.18",
- "wasmparser 0.245.1",
- "wasmtime-environ 43.0.2",
+ "wasmparser 0.246.2",
+ "wasmtime-environ",
  "wasmtime-internal-core",
- "wasmtime-internal-unwinder 43.0.2",
- "wasmtime-internal-versioned-export-macros 43.0.2",
+ "wasmtime-internal-unwinder",
+ "wasmtime-internal-versioned-export-macros",
 ]
 
 [[package]]
 name = "wasmtime-internal-fiber"
-version = "41.0.4"
+version = "44.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "deb126adc5d0c72695cfb77260b357f1b81705a0f8fa30b3944e7c2219c17341"
+checksum = "15629ea71394be5812a52cb8fbc6cd039484ab1dd48fce5e1ef58ae89606289a"
 dependencies = [
  "cc",
  "cfg-if",
  "libc",
  "rustix 1.1.4",
- "wasmtime-environ 41.0.4",
- "wasmtime-internal-versioned-export-macros 41.0.4",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "wasmtime-internal-fiber"
-version = "43.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1e505254058be5b0df458d670ee42d9eafe2349d04c1296e9dc01071dc20a85"
-dependencies = [
- "cc",
- "cfg-if",
- "libc",
- "rustix 1.1.4",
- "wasmtime-environ 43.0.2",
- "wasmtime-internal-versioned-export-macros 43.0.2",
+ "wasmtime-environ",
+ "wasmtime-internal-versioned-export-macros",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "wasmtime-internal-jit-debug"
-version = "41.0.4"
+version = "44.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e66ff7f90a8002187691ff6237ffd09f954a0ebb9de8b2ff7f5c62632134120"
+checksum = "f5fce5fedc1c952a64cdf3c87e4632af072d2aca0bc2c460d53296fb2654757d"
 dependencies = [
  "cc",
- "object 0.37.3",
- "rustix 1.1.4",
- "wasmtime-internal-versioned-export-macros 41.0.4",
-]
-
-[[package]]
-name = "wasmtime-internal-jit-debug"
-version = "43.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c2e05b345f1773e59c20e6ad7298fd6857cdea245023d88bb659c96d8f0ea72"
-dependencies = [
- "cc",
- "wasmtime-internal-versioned-export-macros 43.0.2",
+ "wasmtime-internal-versioned-export-macros",
 ]
 
 [[package]]
 name = "wasmtime-internal-jit-icache-coherence"
-version = "41.0.4"
+version = "44.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b96df23179ae16d54fb3a420f84ffe4383ec9dd06fad3e5bc782f85f66e8e08"
-dependencies = [
- "anyhow",
- "cfg-if",
- "libc",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "wasmtime-internal-jit-icache-coherence"
-version = "43.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b86701b234a4643e3f111869aa792b3a05a06e02d486ee9cb6c04dae16b52dab"
+checksum = "10005b038e662775ac002f233e429447a58892e89918580fa67ce8cdd9192d0a"
 dependencies = [
  "cfg-if",
  "libc",
@@ -12514,62 +11829,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "wasmtime-internal-math"
-version = "41.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86d1380926682b44c383e9a67f47e7a95e60c6d3fa8c072294dab2c7de6168a0"
-dependencies = [
- "libm",
-]
-
-[[package]]
-name = "wasmtime-internal-slab"
-version = "41.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b63cbea1c0192c7feb7c0dfb35f47166988a3742f29f46b585ef57246c65764"
-
-[[package]]
 name = "wasmtime-internal-unwinder"
-version = "41.0.4"
+version = "44.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f25c392c7e5fb891a7416e3c34cfbd148849271e8c58744fda875dde4bec4d6a"
+checksum = "03f3e0f474281b405a3e9d97239f83f643b572324d292e1ef9dc5e3e0ab04c68"
 dependencies = [
  "cfg-if",
- "cranelift-codegen 0.128.4",
+ "cranelift-codegen",
  "log",
- "object 0.37.3",
- "wasmtime-environ 41.0.4",
-]
-
-[[package]]
-name = "wasmtime-internal-unwinder"
-version = "43.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f63558d801beb83dde9b336eb4ae049019aee26627926edb32cd119d7e4c83cd"
-dependencies = [
- "cfg-if",
- "cranelift-codegen 0.130.2",
- "log",
- "object 0.38.1",
- "wasmtime-environ 43.0.2",
+ "object 0.39.1",
+ "wasmtime-environ",
 ]
 
 [[package]]
 name = "wasmtime-internal-versioned-export-macros"
-version = "41.0.4"
+version = "44.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70f8b9796a3f0451a7b702508b303d654de640271ac80287176de222f187a237"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "wasmtime-internal-versioned-export-macros"
-version = "43.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "737c4d956fc3a848541a064afb683dd2771132a6b125be5baaf95c4379aa47df"
+checksum = "910e5393af4aca456113581a5913b8d499cd2189013e983f8764d06ebc42b2ed"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -12578,62 +11854,75 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-winch"
-version = "41.0.4"
+version = "44.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0063e61f1d0b2c20e9cfc58361a6513d074a23c80b417aac3033724f51648a0"
+checksum = "55481651bea5b8336fb200fa49914ccf802f5e7617ba9ab0b4691f16d4f97ff8"
 dependencies = [
- "cranelift-codegen 0.128.4",
- "gimli 0.32.3",
- "log",
- "object 0.37.3",
- "target-lexicon 0.13.5",
- "wasmparser 0.243.0",
- "wasmtime-environ 41.0.4",
- "wasmtime-internal-cranelift 41.0.4",
- "winch-codegen 41.0.4",
-]
-
-[[package]]
-name = "wasmtime-internal-winch"
-version = "43.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f599b79545e3bba0b7913406055ebede5bb0dabee9ba2015ef25a9f4c9f47807"
-dependencies = [
- "cranelift-codegen 0.130.2",
+ "cranelift-codegen",
  "gimli 0.33.0",
  "log",
- "object 0.38.1",
+ "object 0.39.1",
  "target-lexicon 0.13.5",
- "wasmparser 0.245.1",
- "wasmtime-environ 43.0.2",
- "wasmtime-internal-cranelift 43.0.2",
- "winch-codegen 43.0.2",
+ "wasmparser 0.246.2",
+ "wasmtime-environ",
+ "wasmtime-internal-cranelift",
+ "winch-codegen",
 ]
 
 [[package]]
 name = "wasmtime-internal-wit-bindgen"
-version = "41.0.4"
+version = "44.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "587699ca7cae16b4a234ffcc834f37e75675933d533809919b52975f5609e2ef"
+checksum = "d890c3804d0e46000fa901c86ac1a9fdedf684e72dfd64e582b56bb4a78a6746"
 dependencies = [
  "anyhow",
  "bitflags 2.11.1",
  "heck 0.5.0",
  "indexmap 2.14.0",
- "wit-parser 0.243.0",
+ "wit-parser 0.246.2",
 ]
 
 [[package]]
-name = "wasmtime-internal-wit-bindgen"
-version = "43.0.2"
+name = "wasmtime-wasi"
+version = "44.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2192a77a00b9a67800c2b4e1c70fb6abca79d6b529e53a2ef9dcdcc36090330d"
+checksum = "5aa7f927779d92863a1447c1d88192b2242080608cb91ece69c177321488948b"
 dependencies = [
- "anyhow",
+ "async-trait",
  "bitflags 2.11.1",
- "heck 0.5.0",
- "indexmap 2.14.0",
- "wit-parser 0.245.1",
+ "bytes",
+ "cap-fs-ext",
+ "cap-net-ext",
+ "cap-rand",
+ "cap-std",
+ "cap-time-ext",
+ "fs-set-times",
+ "futures",
+ "io-extras",
+ "io-lifetimes 2.0.4",
+ "rustix 1.1.4",
+ "system-interface",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+ "wasmtime",
+ "wasmtime-wasi-io",
+ "wiggle",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "wasmtime-wasi-io"
+version = "44.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6fd8b702c2aa82bb4907da5ad44120b4385048f6a20731908a6e2485ea7567e"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "tracing",
+ "wasmtime",
 ]
 
 [[package]]
@@ -12992,38 +12281,37 @@ dependencies = [
 
 [[package]]
 name = "wiggle"
-version = "41.0.4"
+version = "44.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a69a60bcbe1475c5dc9ec89210ade54823d44f742e283cba64f98f89697c4cec"
+checksum = "165512f7870210d0fd45911990b832782b5fb82d40f4ce28cf86b40aaecd453c"
 dependencies = [
- "anyhow",
  "bitflags 2.11.1",
  "thiserror 2.0.18",
  "tracing",
- "wasmtime 41.0.4",
+ "wasmtime",
+ "wasmtime-environ",
  "wiggle-macro",
- "witx",
 ]
 
 [[package]]
 name = "wiggle-generate"
-version = "41.0.4"
+version = "44.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21f3dc0fd4dcfc7736434bb216179a2147835309abc09bf226736a40d484548f"
+checksum = "f7f63d06fdf2e9a133407b318574574f66ea6590ea7a42c4a7554c029824454a"
 dependencies = [
- "anyhow",
  "heck 0.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+ "wasmtime-environ",
  "witx",
 ]
 
 [[package]]
 name = "wiggle-macro"
-version = "41.0.4"
+version = "44.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fea2aea744eded58ae092bf57110c27517dab7d5a300513ff13897325c5c5021"
+checksum = "1b976b7285ca32a637e21721021442691a2d7938ab4650cb99472a672e9def6c"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -13070,41 +12358,21 @@ checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "winch-codegen"
-version = "41.0.4"
+version = "44.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c55de3ac5b8bd71e5f6c87a9e511dd3ceb194bdb58183c6a7bf21cd8c0e46fbc"
+checksum = "436a7fa4109b13b0e555d01ec615ab8b928b7834639aca7b2fdc1f55d70a1f0c"
 dependencies = [
- "anyhow",
- "cranelift-assembler-x64 0.128.4",
- "cranelift-codegen 0.128.4",
- "gimli 0.32.3",
- "regalloc2 0.13.5",
- "smallvec",
- "target-lexicon 0.13.5",
- "thiserror 2.0.18",
- "wasmparser 0.243.0",
- "wasmtime-environ 41.0.4",
- "wasmtime-internal-cranelift 41.0.4",
- "wasmtime-internal-math",
-]
-
-[[package]]
-name = "winch-codegen"
-version = "43.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52dbb0cf07b0dfe7b7a1ca8efb8f94ba98bd0fb144c411ea1665c78f0449e958"
-dependencies = [
- "cranelift-assembler-x64 0.130.2",
- "cranelift-codegen 0.130.2",
+ "cranelift-assembler-x64",
+ "cranelift-codegen",
  "gimli 0.33.0",
- "regalloc2 0.15.1",
+ "regalloc2",
  "smallvec",
  "target-lexicon 0.13.5",
  "thiserror 2.0.18",
- "wasmparser 0.245.1",
- "wasmtime-environ 43.0.2",
+ "wasmparser 0.246.2",
+ "wasmtime-environ",
  "wasmtime-internal-core",
- "wasmtime-internal-cranelift 43.0.2",
+ "wasmtime-internal-cranelift",
 ]
 
 [[package]]
@@ -13721,9 +12989,9 @@ dependencies = [
  "indexmap 2.14.0",
  "prettyplease",
  "syn 2.0.117",
- "wasm-metadata",
+ "wasm-metadata 0.244.0",
  "wit-bindgen-core",
- "wit-component",
+ "wit-component 0.244.0",
 ]
 
 [[package]]
@@ -13755,27 +13023,28 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "wasm-encoder 0.244.0",
- "wasm-metadata",
+ "wasm-metadata 0.244.0",
  "wasmparser 0.244.0",
  "wit-parser 0.244.0",
 ]
 
 [[package]]
-name = "wit-parser"
-version = "0.243.0"
+name = "wit-component"
+version = "0.245.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df983a8608e513d8997f435bb74207bf0933d0e49ca97aa9d8a6157164b9b7fc"
+checksum = "4894f10d2d5cbc17c77e91f86a1e48e191a788da4425293b55c98b44ba3fcac9"
 dependencies = [
  "anyhow",
- "id-arena",
+ "bitflags 2.11.1",
  "indexmap 2.14.0",
  "log",
- "semver",
  "serde",
  "serde_derive",
  "serde_json",
- "unicode-xid",
- "wasmparser 0.243.0",
+ "wasm-encoder 0.245.1",
+ "wasm-metadata 0.245.1",
+ "wasmparser 0.245.1",
+ "wit-parser 0.245.1",
 ]
 
 [[package]]
@@ -13813,6 +13082,25 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser 0.245.1",
+]
+
+[[package]]
+name = "wit-parser"
+version = "0.246.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd979042b5ff288607ccf3b314145435453f20fc67173195f91062d2289b204d"
+dependencies = [
+ "anyhow",
+ "hashbrown 0.16.1",
+ "id-arena",
+ "indexmap 2.14.0",
+ "log",
+ "semver",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "unicode-xid",
+ "wasmparser 0.246.2",
 ]
 
 [[package]]
@@ -14453,7 +13741,6 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
- "extism",
  "reqwest 0.12.28",
  "ring",
  "serde",
@@ -14462,7 +13749,11 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
- "wasmtime 43.0.2",
+ "wasmtime",
+ "wasmtime-wasi",
+ "wat",
+ "wit-component 0.245.1",
+ "wit-parser 0.245.1",
  "zeroclaw-api",
  "zeroclaw-log",
 ]
@@ -14949,34 +14240,6 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
-
-[[package]]
-name = "zstd"
-version = "0.13.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
-dependencies = [
- "zstd-safe",
-]
-
-[[package]]
-name = "zstd-safe"
-version = "7.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f49c4d5f0abb602a93fb8736af2a4f4dd9512e36f7f570d66e65ff867ed3b9d"
-dependencies = [
- "zstd-sys",
-]
-
-[[package]]
-name = "zstd-sys"
-version = "2.0.16+zstd.1.5.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91e19ebc2adc8f83e43039e79776e3fda8ca919132d68a1fed6a5faca2683748"
-dependencies = [
- "cc",
- "pkg-config",
-]
 
 [[package]]
 name = "zune-core"

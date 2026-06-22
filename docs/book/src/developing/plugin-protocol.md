@@ -1,25 +1,29 @@
 ---
 type: reference
 status: accepted
-last-reviewed: 2026-06-21
+last-reviewed: 2026-06-22
 relates-to:
   - FND-001
-  - ADR-003
   - crates/zeroclaw-plugins
 ---
 
 # Plugin Protocol
 
-This document defines the protocol between ZeroClaw's plugin host and WASM
-plugin modules.
+This document defines the protocol between ZeroClaw's plugin host and WASM tool
+plugins.
 
-## Implementation status
+## Runtime: wasmtime component model (WIT)
 
-The current runtime bridge is transitional. `crates/zeroclaw-plugins` still supports the Extism-era string/JSON tool protocol documented below so existing prototype plugins can keep running while the WIT host lands.
+ZeroClaw plugins are **WebAssembly components** defined by the WIT interfaces
+under [`wit/v0/`](https://github.com/zeroclaw-labs/zeroclaw/tree/master/wit/v0)
+(package `zeroclaw:plugin@0.1.0`), compiled for `wasm32-wasip2`, and executed
+directly on [`wasmtime`](https://wasmtime.dev). The earlier Extism string/JSON
+bridge has been removed.
 
-The accepted target architecture is the next contract: #6943 and FND-001 move ZeroClaw plugins to WIT-defined WASI components, compiled for `wasm32-wasip2` and hosted through direct `wasmtime`. The WIT interfaces live under `wit/v0/`; see `wit/VERSIONING.md` for the current compatibility rules.
-
-Treat new plugin-host design work as WIT / `wasm32-wasip2` work. Additions to the Extism-specific protocol should be limited to compatibility fixes needed during the migration.
+The runtime is **deny-by-default and resource-bounded**: each invocation runs in
+a fresh component instance with fuel metering, an epoch-interruption wall-clock
+deadline, and a memory limit; host capabilities a plugin was not granted resolve
+to fail-closed stubs. See `wit/VERSIONING.md` for compatibility rules.
 
 ## Plugin structure
 
@@ -27,266 +31,205 @@ A plugin is a directory containing:
 
 ```
 my-plugin/
-  manifest.toml    # Plugin metadata and permissions
-  plugin.wasm      # Compiled WASM module (optional for skill-only plugins)
+  manifest.toml    # Plugin metadata, capabilities, permissions
+  plugin.wasm      # Compiled WIT component (optional for skill-only plugins)
 ```
 
-Plugins are discovered from `~/.zeroclaw/plugins/` (configurable via
-`plugins.plugins_dir` in config).
+Plugins are discovered from the configured `plugins.plugins_dir` (default
+`~/.zeroclaw/plugins/`).
 
 ### Skill-only plugin layout (markdown bundle)
 
 A plugin whose only capability is `skill` ships skills under a `skills/`
 directory in [agentskills.io](https://agentskills.io) format and omits
-`wasm_path`:
+`wasm_path` (no WASM is involved):
 
 ```
 my-toolkit/
   manifest.toml              # capabilities = ["skill"]
-  README.md                  # optional bundle-level overview
   skills/
     design-review/
       SKILL.md
-      scripts/
-      references/
-    code-review/
-      SKILL.md
-    data-analysis/
-      SKILL.md
-      references/
 ```
 
-Each `SKILL.md` must include YAML frontmatter with `name` and `description`
-fields; the runtime rejects bundles whose skills omit either at discovery time
-rather than at first invocation. Skills register under plugin-namespaced IDs
-of the form `plugin:<plugin-name>/<skill-name>` (e.g.
-`plugin:my-toolkit/design-review`) to avoid collisions with user-authored
-skills and between bundles.
+Each `SKILL.md` must include YAML frontmatter with `name` and `description`;
+invalid bundles are rejected at discovery. Skills register under
+`plugin:<plugin-name>/<skill-name>` to avoid collisions.
 
 ## Manifest format
+
+```toml
+name = "wikipedia-summary"
+version = "0.1.0"
+description = "Look up a short summary of a topic from Wikipedia"
+author = "ZeroClaw Labs"
+wasm_path = "wikipedia_summary.wasm"
+capabilities = ["tool"]
+permissions = ["http_client"]
+```
 
 ### Capabilities
 
 | Value | Description |
 |-------|-------------|
-| `tool` | Provides tools callable by the LLM |
-| `channel` | Provides a communication channel (not yet implemented) |
-| `memory` | Provides a memory backend (not yet implemented) |
-| `observer` | Provides an observability backend (not yet implemented) |
-| `skill` | Provides one or more agentskills.io-format skills under `skills/`; no WASM payload |
+| `tool` | Provides a tool callable by the LLM |
+| `skill` | Provides agentskills.io-format skills under `skills/`; no WASM payload |
+| `channel`, `memory`, `observer` | Reserved; not yet implemented |
 
 ### Permissions
 
-| Value | Description |
-|-------|-------------|
-| `http_client` | Can make HTTP requests via `zc_http_request` |
-| `env_read` | Can read environment variables via `zc_env_read` |
-| `file_read` | Can read files (not yet implemented) |
-| `file_write` | Can write files (not yet implemented) |
-| `memory_read` | Can read agent memory (not yet implemented) |
-| `memory_write` | Can write agent memory (not yet implemented) |
+Each permission maps to a WIT `host` import. A permission the manifest does not
+declare resolves to a deny-by-default host service, so the capability is
+unreachable from the guest.
 
-## Current Extism bridge exports
+| Value | Host import | Description |
+|-------|-------------|-------------|
+| `http_client` | `http-request` | Make HTTP requests (host applies the SSRF allowlist and injects credentials) |
+| `workspace_read` | `workspace-read` | Read workspace files (rooted, no `..`) |
+| `secret_exists` | `secret-exists` | Check whether a named secret exists (never its value) |
+| `tool_invoke` | `tool-invoke` | Invoke other agent tools by alias *(host wiring is a follow-up)* |
+| `memory_read`, `memory_write` | — | Reserved |
+| `env_read`, `file_read`, `file_write` | — | Deprecated; accepted for back-compat, grant nothing new |
 
-The exports below describe the current Extism bridge. WIT components use the interfaces in `wit/v0/`.
+The clock (`now-millis`) and structured logging (`log-record`) are always
+available — they expose no secret surface.
 
-### `tool_metadata`
+### Credential injection
 
-**Signature:** `(String) -> String`
+Secrets are **never exposed to the guest**. A plugin checks existence via
+`secret_exists`; the *host* injects the actual value into matching outbound HTTP
+requests at the egress boundary, declared by signed `[[credentials]]` entries:
 
-Called once at plugin load time to retrieve tool metadata. The input string is
-ignored (pass empty string). Returns JSON:
+```toml
+permissions = ["http_client", "secret_exists"]
 
-```json
-{
-  "name": "my_tool",
-  "description": "What this tool does",
-  "parameters_schema": {
-    "type": "object",
-    "required": ["prompt"],
-    "properties": {
-      "prompt": {
-        "type": "string",
-        "description": "The input prompt"
-      }
+[[credentials]]
+secret = "MY_API_KEY"            # resolved from [http_request].secrets or env
+header = "Authorization"
+value_template = "Bearer {secret}"
+url_prefix = "https://api.example.com/"   # optional; default = any allowed URL
+```
+
+## The WIT contract
+
+The component implements the `tool-plugin` world (`wit/v0/tool.wit`):
+
+```wit
+world tool-plugin {
+    import logging;     // structured log-record
+    import host;        // now-millis, workspace-read, http-request,
+                        // tool-invoke, secret-exists
+    export plugin-info; // plugin-name, plugin-version
+    export tool;        // name, description, parameters-schema, execute
+}
+```
+
+The `tool` interface a plugin exports:
+
+```wit
+record tool-result { success: bool, output: string, error: option<string> }
+
+name: func() -> string;                 // tool name for LLM function calling
+description: func() -> string;          // human-readable, for the LLM
+parameters-schema: func() -> string;    // JSON Schema (object) for the args
+execute: func(args: string) -> result<tool-result, string>;
+```
+
+The `host` interface a plugin may import (per its permissions):
+
+```wit
+now-millis: func() -> u64;
+workspace-read: func(path: string) -> option<string>;
+http-request: func(method, url, headers-json, body: option<list<u8>>,
+                   timeout-ms: option<u32>) -> result<http-response, string>;
+tool-invoke: func(alias: string, params-json: string) -> result<string, string>;
+secret-exists: func(name: string) -> bool;
+```
+
+## Writing a plugin in Rust (`wit-bindgen`)
+
+See [`plugins/wikipedia-summary`](https://github.com/zeroclaw-labs/zeroclaw/tree/master/plugins/wikipedia-summary)
+for a complete, working example.
+
+```toml
+# Cargo.toml
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.46"
+serde_json = "1"
+
+[workspace]   # standalone crate, not part of the host workspace
+```
+
+```rust
+wit_bindgen::generate!({
+    world: "tool-plugin",
+    path: "../../wit/v0",
+    features: ["plugins-wit-v0"],
+});
+
+use exports::zeroclaw::plugin::plugin_info::Guest as PluginInfoGuest;
+use exports::zeroclaw::plugin::tool::{Guest as ToolGuest, ToolResult};
+use zeroclaw::plugin::host;
+
+struct MyPlugin;
+
+impl PluginInfoGuest for MyPlugin {
+    fn plugin_name() -> String { "my-plugin".into() }
+    fn plugin_version() -> String { "0.1.0".into() }
+}
+
+impl ToolGuest for MyPlugin {
+    fn name() -> String { "my_tool".into() }
+    fn description() -> String { "Does something useful".into() }
+    fn parameters_schema() -> String {
+        r#"{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}"#.into()
     }
-  }
-}
-```
-
-The `parameters_schema` follows JSON Schema format and is presented to the LLM
-for tool calling.
-
-### `execute`
-
-**Signature:** `(String) -> String`
-
-Called each time the tool is invoked. Input is JSON matching the
-`parameters_schema`. Returns JSON:
-
-```json
-{
-  "success": true,
-  "output": "Result text shown to the LLM",
-  "error": null
-}
-```
-
-On failure:
-
-```json
-{
-  "success": false,
-  "output": "",
-  "error": "Description of what went wrong"
-}
-```
-
-## Host functions
-
-Host functions are provided by the ZeroClaw runtime and callable from within
-the WASM plugin. Each is gated on a manifest permission, calling without the
-required permission returns an error.
-
-### `zc_http_request`
-
-**Permission:** `http_client`
-
-**Input:** JSON string
-
-```json
-{
-  "method": "POST",
-  "url": "https://api.example.com/v1/generate",
-  "headers": {
-    "Authorization": "Bearer token123",
-    "Content-Type": "application/json"
-  },
-  "body": "{\"prompt\": \"hello\"}"
-}
-```
-
-Supported methods: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`.
-Timeout: 120 seconds.
-
-**Output:** JSON string
-
-```json
-{
-  "status": 200,
-  "body": "{\"result\": \"world\"}",
-  "headers": {
-    "content-type": "application/json"
-  }
-}
-```
-
-### `zc_env_read`
-
-**Permission:** `env_read`
-
-**Input:** Environment variable name (plain string, not JSON).
-
-**Output:** Environment variable value (plain string). Returns an error if the
-variable is not set.
-
-## Writing a plugin in Rust for the current bridge
-
-This section describes the current Extism bridge.
-
-### Dependencies
-
-The `[workspace]` table is needed to prevent Cargo from searching for a parent
-workspace.
-
-### Declaring host functions
-
-```rust
-use extism_pdk::*;
-
-#[host_fn]
-extern "ExtismHost" {
-    fn zc_http_request(input: String) -> String;
-    fn zc_env_read(input: String) -> String;
-}
-```
-
-Call them with `unsafe { zc_http_request(json_string)? }`.
-
-### Implementing exports
-
-```rust
-#[plugin_fn]
-pub fn tool_metadata(_input: String) -> FnResult<String> {
-    Ok(serde_json::to_string(&serde_json::json!({
-        "name": "my_tool",
-        "description": "Does something useful",
-        "parameters_schema": {
-            "type": "object",
-            "required": ["input"],
-            "properties": {
-                "input": { "type": "string" }
-            }
-        }
-    }))?)
+    fn execute(args: String) -> Result<ToolResult, String> {
+        let v: serde_json::Value = serde_json::from_str(&args).map_err(|e| e.to_string())?;
+        let q = v.get("q").and_then(|x| x.as_str()).ok_or("missing 'q'")?;
+        // Call host capabilities, e.g. host::http_request(...).
+        Ok(ToolResult { success: true, output: format!("got {q}"), error: None })
+    }
 }
 
-#[plugin_fn]
-pub fn execute(input: String) -> FnResult<String> {
-    let args: serde_json::Value = serde_json::from_str(&input)?;
-    let input_val = args["input"].as_str().unwrap_or("");
-
-    // ... do work, call host functions as needed ...
-
-    Ok(serde_json::to_string(&serde_json::json!({
-        "success": true,
-        "output": format!("Processed: {input_val}")
-    }))?)
-}
+export!(MyPlugin);
 ```
 
 ### Building
 
-For the current Extism bridge, compile the plugin as a WASI Preview 1 module:
-
-<div class="os-tabs-src">
-
-#### sh
-
 ```sh
-# Install the WASM target (once)
-rustup target add wasm32-wasip1
-
-# Build
-cargo build --target wasm32-wasip1 --release
+rustup target add wasm32-wasip2          # once
+cargo build --target wasm32-wasip2 --release
 ```
 
-</div>
-
-The output `.wasm` file is at
-`target/wasm32-wasip1/release/<crate_name>.wasm`. Copy it alongside your
-`manifest.toml`.
-
-For the accepted WIT / Component Model target, compile plugin components for `wasm32-wasip2` and use `wit/v0/` as the interface source.
+`wasm32-wasip2` produces a component directly. Copy
+`target/wasm32-wasip2/release/<crate>.wasm` next to your `manifest.toml`.
 
 ### Installing
 
-<div class="os-tabs-src">
-
-#### sh
-
 ```sh
-# Copy to plugin directory
 zeroclaw plugin install /path/to/my-plugin/
-
-# Or manually
-cp -r my-plugin/ ~/.zeroclaw/plugins/my-plugin/
+# or: cp -r my-plugin/ ~/.zeroclaw/plugins/my-plugin/
 ```
 
-</div>
+## Configuration and build features
 
-## Configuration
+Enable the system via the `[plugins]` / `[plugins.security]` config sections
+(see the [Config reference](../reference/config.md), including the
+`signature_mode` enum). Plugin HTTP egress reuses the `[http_request]`
+allowlist and named secrets.
 
-Enable the plugin system via the `plugins` and `plugins.security` sections (gateway, zerocode, or `zeroclaw config set`): see the [Config reference](../reference/config.md) for all fields, defaults, and the `signature_mode` enum.
+The host needs a **compiler backend** to load components: build with
+`plugins-wasm` **plus** `plugins-wasm-cranelift` (x86-64/aarch64) or
+`plugins-wasm-pulley` (portable). `plugins-wasm` alone is runtime-only and will
+refuse to compile components with a clear error.
 
-The `plugins-wasm` feature enables the current plugin runtime integration. The direct `wasmtime` host path uses `plugins-wasm-runtime-only`, `plugins-wasm-cranelift`, and `plugins-wasm-pulley` to choose the smallest execution strategy that matches the target platform.
+## Known limitations
+
+- `tool-invoke` host wiring (alias indirection from inside a plugin) is not yet
+  connected; the capability is reserved.
+- The manifest signature covers the manifest, not a digest of the `.wasm`; a
+  signed manifest paired with a swapped component is a tracked follow-up.
