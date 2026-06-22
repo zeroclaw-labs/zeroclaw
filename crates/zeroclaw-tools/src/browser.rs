@@ -1873,7 +1873,7 @@ mod native_backend {
     count: nodes.length,
     nodes,
   }};
-})();"#
+}})();"#
         )
     }
 
