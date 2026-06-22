@@ -42,7 +42,7 @@ pub struct ToolExecutionOutcome {
 
 // ── Single tool execution ────────────────────────────────────────────────
 
-pub async fn execute_one_tool(
+pub(crate) async fn execute_one_tool(
     call_name: &str,
     call_arguments: serde_json::Value,
     tool_call_id: Option<&str>,
@@ -371,7 +371,7 @@ pub fn should_execute_tools_in_parallel(
 /// future was cancelled in flight. Collapsing the mixed set to one `Err` would
 /// drop completed siblings and let cleanup emit a second terminal update for an
 /// already-closed `tool_call_id`. Non-cancellation errors still abort.
-pub async fn execute_tools_parallel(
+pub(crate) async fn execute_tools_parallel(
     tool_calls: &[ParsedToolCall],
     tools_registry: &[Box<dyn Tool>],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
@@ -418,7 +418,7 @@ pub async fn execute_tools_parallel(
 /// for the cut-short tail. Never an error. The token is checked before each call
 /// so a tool that fires the token never lets a later call start, and a cancel
 /// that interrupts a running tool leaves that call's slot `None`.
-pub async fn execute_tools_sequential(
+pub(crate) async fn execute_tools_sequential(
     tool_calls: &[ParsedToolCall],
     tools_registry: &[Box<dyn Tool>],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
@@ -558,12 +558,18 @@ mod tests {
 
         // execute_one_tool must recover the poisoned lock and resolve
         // the activated tool without panicking.
+        let meta = crate::agent::turn::TurnMeta {
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
         let outcome = execute_one_tool(
             "docker-mcp__extract_text",
             serde_json::json!({}),
             None,
             &[], // no static tools — force activated-tools path
             Some(&activated),
+            &meta,
             &NoopObserver,
             None,
             None,

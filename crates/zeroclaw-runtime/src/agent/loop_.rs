@@ -3888,12 +3888,18 @@ mod tests {
         })
         .join();
 
+        let meta = crate::agent::turn::context::TurnMeta {
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
         let outcome = execute_one_tool(
             "extract_text",
             serde_json::json!({ "value": "ok" }),
             None,
             &[],
             Some(&activated),
+            &meta,
             &observer,
             None,
             None,
@@ -3963,12 +3969,18 @@ mod tests {
         };
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(CredentialOutputTool)];
 
+        let meta = crate::agent::turn::context::TurnMeta {
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
         let outcome = execute_one_tool(
             "credential_output",
             serde_json::json!({}),
             None,
             &tools,
             None,
+            &meta,
             &observer,
             None,
             None, // receipt_generator
@@ -5486,6 +5498,7 @@ mod tests {
             let mut history = vec![ChatMessage::user("hello".to_string())];
             let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
             let observer = NoopObserver;
+            let turn_id = uuid::Uuid::new_v4().to_string();
 
             run_tool_call_loop(ToolLoop {
                 exec: ResolvedAgentExecution {
@@ -5527,6 +5540,8 @@ mod tests {
                 new_messages_out: None,
                 image_cache: None,
                 ingress: ctx,
+                agent_alias: None,
+                turn_id: &turn_id,
             })
             .await
             .expect("default-Loop ingress must run the turn exactly as today")
@@ -6145,8 +6160,8 @@ mod tests {
     // its real terminal ToolResult; the cancel cleanup must not emit a second,
     // interrupted result for that same tool_call_id (#7778 regression).
     #[tokio::test]
-        let turn_id = uuid::Uuid::new_v4().to_string();
     async fn run_tool_call_loop_parallel_cancel_no_double_terminal_for_completed_call() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider = ScriptedModelProvider::from_native_tool_calls(
             vec![
                 ("call_fast", "fast_tool", "{}"),
@@ -6223,6 +6238,8 @@ mod tests {
             // Phase 1: stamp Internal/Trusted. Real per-transport
             // stamping is PR C (RFC #6971 §4).
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await;
 
@@ -6281,6 +6298,8 @@ mod tests {
             ChatMessage::user("schedule a reminder"),
         ];
         let observer = NoopObserver;
+
+        let turn_id = uuid::Uuid::new_v4().to_string();
 
         let result = run_tool_call_loop(ToolLoop {
             exec: ResolvedAgentExecution {
@@ -9521,7 +9540,6 @@ This is an example, not an invocation."#;
     #[tokio::test]
     async fn consume_provider_streaming_response_preserves_malformed_unknown_tool_calls_json_with_tools()
      {
-        let turn_id = uuid::Uuid::new_v4().to_string();
         let response = r#"{"tool_calls":[{"name":"support_case","arguments":{"id":"A1"}}"#;
         let provider = StreamingScriptedModelProvider::from_text_responses(vec![response]);
         let messages = vec![ChatMessage::user(
@@ -9648,7 +9666,6 @@ This is an example, not an invocation."#;
 
     #[tokio::test]
     async fn consume_provider_streaming_response_drops_truncated_protocol_at_finish() {
-        let turn_id = uuid::Uuid::new_v4().to_string();
         struct TruncatedProtocolProvider;
         impl_test_model_provider_attribution!(TruncatedProtocolProvider);
 
@@ -10194,6 +10211,8 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
+        let turn_id = uuid::Uuid::new_v4().to_string();
+
         let result = run_tool_call_loop(ToolLoop {
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -10234,6 +10253,8 @@ This is an example, not an invocation."#;
             new_messages_out: None,
             image_cache: None,
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("narration-then-tool streaming should preserve tool loop semantics");
@@ -10290,6 +10311,8 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
         let (tx, mut rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
 
+        let turn_id = uuid::Uuid::new_v4().to_string();
+
         let result = run_tool_call_loop(ToolLoop {
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
@@ -10330,6 +10353,8 @@ This is an example, not an invocation."#;
             new_messages_out: None,
             image_cache: None,
             ingress: IngressContext::internal(),
+            agent_alias: None,
+            turn_id: &turn_id,
         })
         .await
         .expect("guard-withheld narration tail should not break the tool loop");
