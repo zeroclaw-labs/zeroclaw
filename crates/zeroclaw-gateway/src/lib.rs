@@ -728,6 +728,7 @@ pub async fn run_gateway(
             config.resolve_active_storage(),
             &config.data_dir,
             fallback.and_then(|e| e.api_key.as_deref()),
+            Some(&config.providers.models),
         ) {
             Ok(m) => Arc::from(m),
             Err(e) => {

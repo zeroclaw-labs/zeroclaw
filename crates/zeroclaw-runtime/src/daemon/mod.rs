@@ -340,6 +340,7 @@ pub async fn run(
                 config.resolve_active_storage(),
                 &config.data_dir,
                 None,
+                Some(&config.providers.models),
             ) {
                 Ok(mem) => Some(std::sync::Arc::from(mem)),
                 Err(_e) => {
