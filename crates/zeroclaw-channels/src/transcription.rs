@@ -204,12 +204,14 @@ impl OpenAiWhisperProvider {
             .or_else(|| {
                 std::env::var("TRANSCRIPTION_API_KEY")
                     .ok()
-                    .filter(|v| !v.trim().is_empty())
+                    .map(|v| v.trim().to_owned())
+                    .filter(|v| !v.is_empty())
             })
             .or_else(|| {
                 std::env::var("OPENAI_API_KEY")
                     .ok()
-                    .filter(|v| !v.trim().is_empty())
+                    .map(|v| v.trim().to_owned())
+                    .filter(|v| !v.is_empty())
             })
             .context(
                 "Missing OpenAI STT API key: set `[transcription.openai].api_key` (or via the \
@@ -1526,6 +1528,114 @@ mod tests {
         assert!(config.google.is_none());
         assert!(config.local_whisper.is_none());
         assert!(!config.transcribe_non_ptt_audio);
+    }
+
+    // ── OpenAiWhisperProvider env-credential fallback tests ─────────
+
+    fn openai_stt_config(api_key: Option<&str>) -> zeroclaw_config::schema::OpenAiSttConfig {
+        zeroclaw_config::schema::OpenAiSttConfig {
+            api_key: api_key.map(String::from),
+            model: "whisper-1".to_string(),
+        }
+    }
+
+    /// Helper: clean up env vars that the OpenAI STT provider reads so that
+    /// tests don't leak state into each other.  Call before each test.
+    fn clean_openai_env() {
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe {
+            std::env::remove_var("TRANSCRIPTION_API_KEY");
+            std::env::remove_var("OPENAI_API_KEY");
+        }
+    }
+
+    #[test]
+    fn openai_stt_config_key_wins_over_env() {
+        clean_openai_env();
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("TRANSCRIPTION_API_KEY", "env-key") };
+
+        let cfg = openai_stt_config(Some("config-key"));
+        let provider = OpenAiWhisperProvider::from_config("openai", &cfg).unwrap();
+        assert_eq!(provider.api_key, "config-key");
+    }
+
+    #[test]
+    fn openai_stt_transcription_api_key_wins_over_openai_api_key() {
+        clean_openai_env();
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe {
+            std::env::set_var("TRANSCRIPTION_API_KEY", "transcription-key");
+            std::env::set_var("OPENAI_API_KEY", "openai-key");
+        }
+
+        let cfg = openai_stt_config(None);
+        let provider = OpenAiWhisperProvider::from_config("openai", &cfg).unwrap();
+        assert_eq!(provider.api_key, "transcription-key");
+    }
+
+    #[test]
+    fn openai_stt_falls_back_to_openai_api_key() {
+        clean_openai_env();
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("OPENAI_API_KEY", "openai-key") };
+
+        let cfg = openai_stt_config(None);
+        let provider = OpenAiWhisperProvider::from_config("openai", &cfg).unwrap();
+        assert_eq!(provider.api_key, "openai-key");
+    }
+
+    #[test]
+    fn openai_stt_blank_env_values_are_ignored() {
+        clean_openai_env();
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe {
+            std::env::set_var("TRANSCRIPTION_API_KEY", "   ");
+            std::env::set_var("OPENAI_API_KEY", "");
+        }
+
+        let cfg = openai_stt_config(None);
+        let err = OpenAiWhisperProvider::from_config("openai", &cfg)
+            .err()
+            .unwrap();
+        let msg = err.to_string();
+        assert!(msg.contains("Missing OpenAI STT API key"), "got: {msg}");
+    }
+
+    #[test]
+    fn openai_stt_missing_key_error_names_all_sources() {
+        clean_openai_env();
+
+        let cfg = openai_stt_config(None);
+        let err = OpenAiWhisperProvider::from_config("openai", &cfg)
+            .err()
+            .unwrap();
+        let msg = err.to_string();
+        assert!(msg.contains("[transcription.openai].api_key"), "got: {msg}");
+        assert!(msg.contains("TRANSCRIPTION_API_KEY"), "got: {msg}");
+        assert!(msg.contains("OPENAI_API_KEY"), "got: {msg}");
+    }
+
+    #[test]
+    fn openai_stt_env_values_are_trimmed() {
+        clean_openai_env();
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("TRANSCRIPTION_API_KEY", "  padded-key  ") }
+
+        let cfg = openai_stt_config(None);
+        let provider = OpenAiWhisperProvider::from_config("openai", &cfg).unwrap();
+        assert_eq!(provider.api_key, "padded-key");
+    }
+
+    #[test]
+    fn openai_stt_openai_api_key_value_is_trimmed() {
+        clean_openai_env();
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("OPENAI_API_KEY", "  spaced-openai-key  ") }
+
+        let cfg = openai_stt_config(None);
+        let provider = OpenAiWhisperProvider::from_config("openai", &cfg).unwrap();
+        assert_eq!(provider.api_key, "spaced-openai-key");
     }
 
     // ── LocalWhisperProvider tests (TDD — added below as red/green cycles) ──
