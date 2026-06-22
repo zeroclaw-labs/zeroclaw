@@ -464,7 +464,7 @@ export default function Config() {
                 );
                 // BackendPicker sections (Memory, Tunnel) collapse the
                 // pick into a single field on the section root
-                // (memory.backend, tunnel.tunnel-provider). The form
+                // (memory.backend, tunnel.tunnel_provider). The form
                 // renders against the section's own prefix, so the URL
                 // is `/config/<section>` with no trailing type segment.
                 // Two-tier paths (providers/channels) still navigate
@@ -914,7 +914,7 @@ function AliasListView({
 // BackendPicker sections have a discriminator field that the top picker
 // sets; the settings form below excludes it to avoid the duplicate input.
 const BACKEND_PICKER_FIELD: Record<string, string> = {
-  tunnel: "tunnel.tunnel-provider",
+  tunnel: "tunnel.tunnel_provider",
   memory: "memory.backend",
 };
 

@@ -4,13 +4,35 @@ ZeroClaw is an MCP client: it connects to external [Model Context Protocol](http
 
 ## Configure MCP
 
-MCP support is enabled by default, but no external MCP tools are exposed until at least one server is configured under `mcp.servers`. Configure through the gateway, zerocode, or `zeroclaw config set`:
+MCP support is enabled by default, but no external MCP tools are exposed until at least one server is configured under `mcp.servers` and an agent is granted that server through its `mcp_bundles` (see Per-agent server scoping below). Configure through the gateway, zerocode, or `zeroclaw config set`:
 
 ```sh
 zeroclaw config set mcp.servers.filesystem.command npx
 ```
 
 Set `mcp.enabled = false` to disable MCP tool loading without removing server definitions.
+
+## Per-agent server scoping (`mcp_bundles`)
+
+A `[[mcp.servers]]` entry only *defines* a server. Which servers an agent actually connects to is decided by that agent's `agents.<alias>.mcp_bundles`, and the model is secure by default: omission is not a grant.
+
+- An agent with no `mcp_bundles` connects to **no** MCP servers, even when `mcp.servers` is non-empty.
+- A bundle `[mcp_bundles.<alias>]` names the servers it grants by their `mcp.servers` `name`, with an optional `exclude` list. An agent's grant is the union of the servers across every bundle it references, minus any name excluded by any of those bundles (deny wins).
+- An unknown bundle alias, or a bundle server name that matches no configured server, grants nothing. Both fail closed and are reported as non-fatal warnings by config validation, so a typo narrows an agent's access instead of widening it.
+
+```toml
+[[mcp.servers]]
+name = "filesystem"
+command = "npx"
+
+[mcp_bundles.files]
+servers = ["filesystem"]
+
+[agents.assistant]
+mcp_bundles = ["files"]   # connects to `filesystem`; an agent without this gets no MCP servers
+```
+
+This is the *connection* boundary (which servers an agent talks to at all). The `allowed_tools` / `excluded_tools` controls below are the per-tool *capability* boundary applied on top of whatever a granted server exposes.
 
 ## Transports
 
