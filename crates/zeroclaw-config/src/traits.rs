@@ -230,6 +230,9 @@ impl HasPropKind for Vec<crate::schema::McpServerConfig> {
 impl HasPropKind for Vec<crate::schema::ModelRouteConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
 }
+impl HasPropKind for Vec<crate::schema::ExternalRegistry> {
+    const PROP_KIND: PropKind = PropKind::ObjectArray;
+}
 impl HasPropKind for Vec<crate::schema::NevisRoleMappingConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
 }
