@@ -392,6 +392,29 @@ impl KnowledgeGraph {
         Ok(results)
     }
 
+    /// Find nodes reached by edges leaving the given node.
+    pub fn find_outbound(&self, node_id: &str) -> anyhow::Result<Vec<(KnowledgeNode, Relation)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT n.id, n.node_type, n.title, n.content, n.tags,
+                    n.created_at, n.updated_at, n.source_project,
+                    e.relation
+             FROM edges e
+             JOIN nodes n ON n.id = e.to_id
+             WHERE e.from_id = ?1",
+        )?;
+
+        let mut results = Vec::new();
+        let mut rows = stmt.query(params![node_id])?;
+        while let Some(row) = rows.next()? {
+            let node = row_to_node(row)?;
+            let relation_str: String = row.get(8)?;
+            let relation = Relation::parse(&relation_str)?;
+            results.push((node, relation));
+        }
+        Ok(results)
+    }
+
     /// Find nodes with edges pointing to the given node.
     pub fn find_inbound(&self, node_id: &str) -> anyhow::Result<Vec<(KnowledgeNode, Relation)>> {
         let conn = self.conn.lock();
@@ -721,14 +744,22 @@ mod tests {
         graph.add_edge(&id1, &id2, Relation::Uses).unwrap();
 
         // Outbound: from id1 → id2
-        let related = graph.find_related(&id1).unwrap();
+        let outbound = graph.find_outbound(&id1).unwrap();
         assert!(
-            related
+            outbound
                 .iter()
                 .any(|(n, r)| n.id == id2 && *r == Relation::Uses)
         );
 
         // Inbound: id2 sees id1 via the same edge
+        let inbound = graph.find_inbound(&id2).unwrap();
+        assert!(
+            inbound
+                .iter()
+                .any(|(n, r)| n.id == id1 && *r == Relation::Uses)
+        );
+
+        // Bidirectional related lookup still sees both directions.
         let related = graph.find_related(&id2).unwrap();
         assert!(
             related

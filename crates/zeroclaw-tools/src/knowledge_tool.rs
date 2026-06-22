@@ -2,7 +2,7 @@
 //!
 //! Exposes the knowledge graph to the agent via the `Tool` trait with actions:
 //! capture, search, relate, suggest, expert_find, lessons_extract, graph_stats,
-//! client_network, interaction_log.
+//! graph_neighbors, client_network, interaction_log.
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -20,6 +20,7 @@ const KNOWLEDGE_ACTIONS: &[&str] = &[
     "expert_find",
     "lessons_extract",
     "graph_stats",
+    "graph_neighbors",
     "client_network",
     "interaction_log",
 ];
@@ -42,7 +43,7 @@ impl Tool for KnowledgeTool {
     }
 
     fn description(&self) -> &str {
-        "Manage a knowledge graph of architecture decisions, solution patterns, lessons learned, experts, and client relationships. Actions: capture, search, relate, suggest, expert_find, lessons_extract, graph_stats, client_network, interaction_log."
+        "Manage a knowledge graph of architecture decisions, solution patterns, lessons learned, experts, and relationship links. Actions: capture, search, relate, suggest, expert_find, lessons_extract, graph_stats, graph_neighbors, client_network, interaction_log."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -93,6 +94,10 @@ impl Tool for KnowledgeTool {
                     "enum": Relation::schema_values(),
                     "description": "Relationship type (for relate)"
                 },
+                "node_id": {
+                    "type": "string",
+                    "description": "Knowledge node ID (for graph_neighbors)"
+                },
                 "client_id": {
                     "type": "string",
                     "description": "Client node ID (for client_network, interaction_log)"
@@ -100,7 +105,7 @@ impl Tool for KnowledgeTool {
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Maximum number of results to return (for interaction_log)"
+                    "description": "Maximum number of results to return (for graph_neighbors, interaction_log)"
                 },
                 "filters": {
                     "type": "object",
@@ -136,6 +141,7 @@ impl Tool for KnowledgeTool {
             "expert_find" => self.handle_expert_find(&args),
             "lessons_extract" => self.handle_lessons_extract(&args),
             "graph_stats" => self.handle_graph_stats(),
+            "graph_neighbors" => self.handle_graph_neighbors(&args),
             "client_network" => self.handle_client_network(&args),
             "interaction_log" => self.handle_interaction_log(&args),
             other => Ok(ToolResult {
@@ -557,6 +563,70 @@ impl KnowledgeTool {
         }
     }
 
+    fn handle_graph_neighbors(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        let node_id = match args.get("node_id").and_then(|v| v.as_str()) {
+            Some(node_id) => node_id,
+            None => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("missing 'node_id' for graph_neighbors".into()),
+                });
+            }
+        };
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| usize::try_from(v).ok())
+            .unwrap_or(25)
+            .max(1);
+
+        let root = match self.graph.get_node(node_id)? {
+            Some(root) => root,
+            None => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("node not found: {node_id}")),
+                });
+            }
+        };
+
+        let mut outbound = self.graph.find_outbound(node_id)?;
+        let mut inbound = self.graph.find_inbound(node_id)?;
+        outbound.truncate(limit);
+        inbound.truncate(limit);
+
+        let outbound: Vec<_> = outbound
+            .iter()
+            .map(|(node, relation)| neighbor_json(node, *relation))
+            .collect();
+        let inbound: Vec<_> = inbound
+            .iter()
+            .map(|(node, relation)| neighbor_json(node, *relation))
+            .collect();
+        let outbound_count = outbound.len();
+        let inbound_count = inbound.len();
+
+        Ok(ToolResult {
+            success: true,
+            output: json!({
+                "node": {
+                    "id": &root.id,
+                    "type": root.node_type,
+                    "title": &root.title,
+                    "tags": &root.tags,
+                },
+                "outbound": outbound,
+                "inbound": inbound,
+                "outbound_count": outbound_count,
+                "inbound_count": inbound_count,
+            })
+            .to_string(),
+            error: None,
+        })
+    }
+
     fn handle_client_network(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
         let client = match self.client_node(args, "client_network") {
             Ok(client) => client,
@@ -712,6 +782,20 @@ impl KnowledgeTool {
             limit,
         )
     }
+}
+
+fn neighbor_json(
+    node: &zeroclaw_memory::knowledge_graph::KnowledgeNode,
+    relation: Relation,
+) -> serde_json::Value {
+    json!({
+        "id": &node.id,
+        "type": node.node_type,
+        "title": &node.title,
+        "relation": relation,
+        "content_preview": truncate_str(&node.content, 200),
+        "tags": &node.tags,
+    })
 }
 
 fn truncate_str(s: &str, max_len: usize) -> String {
@@ -883,8 +967,15 @@ mod tests {
             schema["properties"]["action"]["enum"]
                 .as_array()
                 .unwrap()
+                .contains(&json!("graph_neighbors"))
+        );
+        assert!(
+            schema["properties"]["action"]["enum"]
+                .as_array()
+                .unwrap()
                 .contains(&json!("client_network"))
         );
+        assert!(schema["properties"]["node_id"].is_object());
         assert!(
             schema["properties"]["node_type"]["enum"]
                 .as_array()
@@ -897,6 +988,49 @@ mod tests {
                 .unwrap()
                 .contains(&json!("contact_of"))
         );
+    }
+
+    #[tokio::test]
+    async fn graph_neighbors_returns_generic_inbound_and_outbound_edges() {
+        let (_tmp, tool) = test_tool();
+
+        let pattern_id = capture_node(
+            &tool,
+            "pattern",
+            "Event sourcing",
+            "Persist events and rebuild state from them",
+        )
+        .await;
+        let tech_id = capture_node(&tool, "technology", "Kafka", "Event log technology").await;
+        let lesson_id = capture_node(
+            &tool,
+            "lesson",
+            "Audit requirements",
+            "Audit-heavy systems need durable event trails",
+        )
+        .await;
+
+        relate_nodes(&tool, &pattern_id, &tech_id, "uses").await;
+        relate_nodes(&tool, &lesson_id, &pattern_id, "applies_to").await;
+
+        let result = tool
+            .execute(json!({
+                "action": "graph_neighbors",
+                "node_id": pattern_id,
+                "limit": 10
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["node"]["title"], "Event sourcing");
+        assert_eq!(output["outbound_count"], 1);
+        assert_eq!(output["inbound_count"], 1);
+        assert_eq!(output["outbound"][0]["title"], "Kafka");
+        assert_eq!(output["outbound"][0]["relation"], "uses");
+        assert_eq!(output["inbound"][0]["title"], "Audit requirements");
+        assert_eq!(output["inbound"][0]["relation"], "applies_to");
     }
 
     #[tokio::test]
