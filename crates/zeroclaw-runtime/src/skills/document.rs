@@ -355,6 +355,9 @@ impl OptionBuilder {
         Some(SkillSlashOption {
             name: self.name,
             description: self.description,
+            // SKILL.md markdown frontmatter has no localization syntax; locale
+            // dictionaries are a `[[skill.slash_options]]` (TOML) feature.
+            description_localizations: Default::default(),
             kind: self.kind,
             required: self.required,
             choices: self.choices,
@@ -697,6 +700,7 @@ mod tests {
                     SkillSlashOption {
                         name: "format".into(),
                         description: "Output format.".into(),
+                        description_localizations: Default::default(),
                         kind: "string".into(),
                         required: true,
                         choices: vec![
@@ -717,6 +721,7 @@ mod tests {
                     SkillSlashOption {
                         name: "words".into(),
                         description: String::new(),
+                        description_localizations: Default::default(),
                         kind: "integer".into(),
                         required: false,
                         choices: vec![],

@@ -46,6 +46,10 @@ pub struct OpenAiCompatibleModelProvider {
     extra_headers: std::collections::HashMap<String, String>,
     /// Optional reasoning effort for GPT-5/Codex-compatible backends.
     reasoning_effort: Option<String>,
+    /// Whether stored assistant reasoning should be replayed on outbound
+    /// assistant history messages. Some providers reject reasoning fields as
+    /// input even though they may return them in responses.
+    replay_assistant_reasoning: bool,
     /// Custom API path suffix (e.g. "/v2/generate").
     /// When set, overrides the default `/chat/completions` path detection.
     api_path: Option<String>,
@@ -321,6 +325,7 @@ impl OpenAiCompatibleModelProvider {
             timeout_secs: 120,
             extra_headers: std::collections::HashMap::new(),
             reasoning_effort: None,
+            replay_assistant_reasoning: true,
             api_path: None,
             max_tokens: None,
             models_dev_key: None,
@@ -421,6 +426,13 @@ impl OpenAiCompatibleModelProvider {
     /// Set reasoning effort for GPT-5/Codex-compatible chat-completions APIs.
     pub fn with_reasoning_effort(mut self, reasoning_effort: Option<String>) -> Self {
         self.reasoning_effort = reasoning_effort;
+        self
+    }
+
+    /// Disable replay of stored assistant reasoning on outbound assistant
+    /// history messages.
+    pub fn without_assistant_reasoning_replay(mut self) -> Self {
+        self.replay_assistant_reasoning = false;
         self
     }
 
@@ -727,6 +739,37 @@ impl OpenAiCompatibleModelProvider {
         let is_likely_codex_supported = id.contains("codex") && id.starts_with("gpt-");
 
         (is_openai_reasoning_model || is_likely_codex_supported).then(|| effort.clone())
+    }
+
+    fn assistant_reasoning_value(value: &serde_json::Value) -> Option<&str> {
+        value
+            .get("reasoning_content")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| value.get("reasoning").and_then(serde_json::Value::as_str))
+    }
+
+    /// Returns the `(reasoning_content, reasoning)` pair to replay on an
+    /// outbound assistant message, preserving whichever field name the value
+    /// originally carried so it round-trips faithfully on multi-turn requests
+    /// (#6584). Returns `(None, None)` when this provider has reasoning replay
+    /// disabled - Groq rejects `reasoning_content`/`reasoning` on input
+    /// assistant messages (#7616).
+    fn assistant_reasoning_pair_for_replay(
+        &self,
+        value: &serde_json::Value,
+    ) -> (Option<String>, Option<String>) {
+        if !self.replay_assistant_reasoning {
+            return (None, None);
+        }
+        let reasoning_content = value
+            .get("reasoning_content")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string);
+        let reasoning = value
+            .get("reasoning")
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string);
+        (reasoning_content, reasoning)
     }
 }
 
@@ -1988,19 +2031,13 @@ impl OpenAiCompatibleModelProvider {
                         .and_then(serde_json::Value::as_str)
                         .map(|value| MessageContent::Text(value.to_string()));
 
-                    // Accept both `reasoning_content` (canonical) and
-                    // `reasoning` (OpenRouter / vLLM >= v0.16.0).
-                    // Preserve whichever field name was originally
-                    // received so the value round-trips faithfully on
-                    // multi-turn requests.  See #6584.
-                    let reasoning_content = value
-                        .get("reasoning_content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string);
-                    let reasoning = value
-                        .get("reasoning")
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string);
+                    // `reasoning` (OpenRouter / vLLM >= v0.16.0). Preserve
+                    // whichever field name was originally received so the
+                    // value round-trips faithfully on multi-turn requests
+                    // (#6584) - unless this provider has reasoning replay
+                    // disabled (Groq), in which case both are stripped (#7616).
+                    let (reasoning_content, reasoning) =
+                        self.assistant_reasoning_pair_for_replay(&value);
 
                     return NativeMessage {
                         role: "assistant".to_string(),
@@ -2024,16 +2061,7 @@ impl OpenAiCompatibleModelProvider {
                 if message.role == "assistant"
                     && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
                     && value.get("tool_calls").is_none()
-                    && let Some((reasoning_content, reasoning)) = value
-                        .get("reasoning_content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(|s| (Some(s.to_string()), None))
-                        .or_else(|| {
-                            value
-                                .get("reasoning")
-                                .and_then(serde_json::Value::as_str)
-                                .map(|s| (None, Some(s.to_string())))
-                        })
+                    && Self::assistant_reasoning_value(&value).is_some()
                     && matches!(
                         value.get("content"),
                         None | Some(serde_json::Value::Null | serde_json::Value::String(_))
@@ -2043,6 +2071,9 @@ impl OpenAiCompatibleModelProvider {
                         .get("content")
                         .and_then(serde_json::Value::as_str)
                         .map(|value| MessageContent::Text(value.to_string()));
+
+                    let (reasoning_content, reasoning) =
+                        self.assistant_reasoning_pair_for_replay(&value);
 
                     return NativeMessage {
                         role: "assistant".to_string(),
@@ -5475,6 +5506,76 @@ mod tests {
             Some("Let me think about this...")
         );
         assert!(native[0].tool_calls.is_some());
+    }
+
+    #[test]
+    fn groq_outbound_omits_reasoning_replay_but_default_preserves_it() {
+        let history_json = serde_json::json!({
+            "content": "I will check",
+            "tool_calls": [{
+                "id": "tc_1",
+                "name": "shell",
+                "arguments": "{\"cmd\":\"ls\"}"
+            }],
+            "reasoning_content": "canonical thought",
+            "reasoning": "alias thought"
+        });
+
+        let messages = vec![ChatMessage::assistant(history_json.to_string())];
+        let default_provider =
+            make_model_provider("OpenRouter", "https://openrouter.ai/api/v1", None);
+        let default_request = default_provider.build_native_tool_chat_request(
+            &messages,
+            None,
+            "openai/gpt-oss-120b",
+            None,
+            true,
+        );
+        let default_message = &default_request.messages[0];
+        assert_eq!(default_message.role, "assistant");
+        assert_eq!(
+            default_message.reasoning_content.as_deref(),
+            Some("canonical thought")
+        );
+        // Default provider preserves BOTH field names faithfully so the value
+        // round-trips on multi-turn requests (#6584): `reasoning_content` and
+        // `reasoning` are carried independently, not collapsed into one.
+        assert_eq!(default_message.reasoning.as_deref(), Some("alias thought"));
+        assert!(default_message.tool_calls.is_some());
+        let default_json = serde_json::to_value(default_message).unwrap();
+        assert_eq!(
+            default_json.get("reasoning_content"),
+            Some(&serde_json::json!("canonical thought"))
+        );
+        assert_eq!(
+            default_json.get("reasoning"),
+            Some(&serde_json::json!("alias thought"))
+        );
+
+        let groq_provider = make_model_provider("Groq", "https://api.groq.com/openai/v1", None)
+            .without_assistant_reasoning_replay();
+        let groq_request = groq_provider.build_native_tool_chat_request(
+            &messages,
+            None,
+            "openai/gpt-oss-120b",
+            None,
+            true,
+        );
+        let groq_message = &groq_request.messages[0];
+        assert_eq!(groq_message.role, "assistant");
+        assert!(groq_message.reasoning_content.is_none());
+        assert!(groq_message.tool_calls.is_some());
+        let groq_json = serde_json::to_value(groq_message).unwrap();
+        assert_eq!(groq_json.get("role"), Some(&serde_json::json!("assistant")));
+        assert_eq!(
+            groq_json
+                .get("tool_calls")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        assert!(groq_json.get("reasoning_content").is_none());
+        assert!(groq_json.get("reasoning").is_none());
     }
 
     #[test]

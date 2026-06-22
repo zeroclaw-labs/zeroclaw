@@ -33,6 +33,7 @@ pub(crate) async fn record_executed_outcomes(
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                .with_category(::zeroclaw_log::EventCategory::Tool)
                 .with_outcome(if outcome.success {
                     ::zeroclaw_log::EventOutcome::Success
                 } else {
@@ -74,6 +75,7 @@ pub(crate) async fn record_executed_outcomes(
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
                     .with_attrs(::serde_json::json!({"tool": call.name, "secs": secs})),
                 "Sending progress complete to draft"
             );
