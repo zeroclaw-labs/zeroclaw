@@ -29,6 +29,9 @@ pub fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn T
 pub struct ToolExecutionOutcome {
     pub output: String,
     pub success: bool,
+    /// Raw failure text on the data path. Credential scrubbing is a rendering
+    /// concern applied at each human-facing surface (observer events,
+    /// post-execution log line, CLI progress), never stored pre-scrubbed here.
     pub error_reason: Option<String>,
     pub duration: Duration,
     /// Cryptographic HMAC receipt proving this tool actually executed.
@@ -80,6 +83,7 @@ pub async fn execute_one_tool(
                                 module_path!(),
                                 ::zeroclaw_log::Action::Note
                             )
+                            .with_category(::zeroclaw_log::EventCategory::Tool)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                             .with_attrs(::serde_json::json!({
                                 "tool": call_name,
@@ -100,22 +104,21 @@ pub async fn execute_one_tool(
     let Some(tool) = static_tool.or(activated_arc.as_deref()) else {
         let reason = format!("Unknown tool: {call_name}");
         let duration = start.elapsed();
-        let scrubbed_reason = scrub_credentials(&reason);
         observer.record_event(&ObserverEvent::ToolCall {
             tool: call_name.to_string(),
             tool_call_id: tool_call_id_owned.clone(),
             duration,
             success: false,
             arguments: Some(full_args.clone()),
-            result: Some(scrubbed_reason.clone()),
+            result: Some(scrub_credentials(&reason)),
             channel: None,
             agent_alias: None,
             turn_id: None,
         });
         return Ok(ToolExecutionOutcome {
-            output: reason,
+            output: reason.clone(),
             success: false,
-            error_reason: Some(scrubbed_reason),
+            error_reason: Some(reason),
             duration,
             receipt: None,
         });
@@ -228,9 +231,8 @@ pub async fn execute_one_tool(
                     } else {
                         &r.output
                     };
-                    let output = scrub_credentials(normalized_output);
                     let receipt = receipt_generator.map(|receipt_gen| {
-                        receipt_gen.generate_now(call_name, &call_arguments, &output)
+                        receipt_gen.generate_now(call_name, &call_arguments, normalized_output)
                     });
                     observer.record_event(&ObserverEvent::ToolCall {
                         tool: call_name.to_string(),
@@ -238,13 +240,13 @@ pub async fn execute_one_tool(
                         duration,
                         success: true,
                         arguments: Some(full_args.clone()),
-                        result: Some(output.clone()),
+                        result: Some(scrub_credentials(normalized_output)),
                         channel: None,
                         agent_alias: None,
                         turn_id: None,
                     });
                     Ok(ToolExecutionOutcome {
-                        output,
+                        output: normalized_output.to_string(),
                         success: true,
                         error_reason: None,
                         duration,
@@ -252,14 +254,13 @@ pub async fn execute_one_tool(
                     })
                 } else {
                     let reason = r.error.unwrap_or(r.output);
-                    let scrubbed_reason = scrub_credentials(&reason);
                     observer.record_event(&ObserverEvent::ToolCall {
                         tool: call_name.to_string(),
                         tool_call_id: tool_call_id_owned.clone(),
                         duration,
                         success: false,
                         arguments: Some(full_args.clone()),
-                        result: Some(scrubbed_reason.clone()),
+                        result: Some(scrub_credentials(&reason)),
                         channel: None,
                         agent_alias: None,
                         turn_id: None,
@@ -267,7 +268,7 @@ pub async fn execute_one_tool(
                     Ok(ToolExecutionOutcome {
                         output: format!("Error: {reason}"),
                         success: false,
-                        error_reason: Some(scrubbed_reason),
+                        error_reason: Some(reason),
                         duration,
                         receipt: None,
                     })
@@ -290,22 +291,21 @@ pub async fn execute_one_tool(
                     format!("tool error: {call_name}")
                 );
                 let reason = format!("Error executing {call_name}: {e}");
-                let scrubbed_reason = scrub_credentials(&reason);
                 observer.record_event(&ObserverEvent::ToolCall {
                     tool: call_name.to_string(),
                     tool_call_id: tool_call_id_owned.clone(),
                     duration,
                     success: false,
                     arguments: Some(full_args.clone()),
-                    result: Some(scrubbed_reason.clone()),
+                    result: Some(scrub_credentials(&reason)),
                     channel: None,
                     agent_alias: None,
                     turn_id: None,
                 });
                 Ok(ToolExecutionOutcome {
-                    output: reason,
+                    output: reason.clone(),
                     success: false,
-                    error_reason: Some(scrubbed_reason),
+                    error_reason: Some(reason),
                     duration,
                     receipt: None,
                 })
@@ -325,7 +325,7 @@ pub async fn execute_one_tool(
             .send(TurnEvent::ToolResult {
                 id: event_call_id.clone(),
                 name: call_name.to_string(),
-                output: out.output.clone(),
+                output: scrub_credentials(&out.output),
             })
             .await;
     }
@@ -451,4 +451,135 @@ pub async fn execute_tools_sequential(
 
     slots.resize_with(tool_calls.len(), || None);
     Ok(slots)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::execute_one_tool;
+    use crate::observability::noop::NoopObserver;
+    use crate::tools::ActivatedToolSet;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use zeroclaw_api::tool::Tool;
+
+    /// Minimal tool that records invocations. Used to verify that the
+    /// poisoned-lock recovery path still resolves an activated tool and
+    /// calls its execute method successfully.
+    struct CountingTool {
+        name: String,
+        invocations: Arc<AtomicUsize>,
+    }
+
+    impl CountingTool {
+        fn new(name: &str, invocations: Arc<AtomicUsize>) -> Self {
+            Self {
+                name: name.to_string(),
+                invocations,
+            }
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for CountingTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+        fn alias(&self) -> &str {
+            "test-counting-tool"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for CountingTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "Counts executions for poisoned-lock tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            })
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            self.invocations.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "executed via poisoned lock recovery".into(),
+                error: None,
+            })
+        }
+    }
+
+    /// Regression: execute_one_tool must recover a poisoned
+    /// ActivatedToolSet mutex and still resolve the activated tool
+    /// instead of panicking.
+    ///
+    /// Before the fix, the code used `.lock().unwrap()`, which panics
+    /// on a poisoned mutex. The recovery path (`into_inner()`) allows
+    /// the turn to proceed with the last valid state of the activated
+    /// tool set.
+    #[tokio::test]
+    async fn execute_one_tool_recovers_poisoned_activated_tool_lock() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let activated_tool: Arc<dyn Tool> = Arc::new(CountingTool::new(
+            "docker-mcp__extract_text",
+            Arc::clone(&invocations),
+        ));
+        activated
+            .lock()
+            .unwrap()
+            .activate("docker-mcp__extract_text".into(), activated_tool);
+
+        // Poison the mutex by panicking while holding the lock in a
+        // separate thread.
+        let poisoned = Arc::clone(&activated);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().expect("test mutex should lock");
+            panic!("deliberately poison the activated-tools lock");
+        })
+        .join();
+
+        // execute_one_tool must recover the poisoned lock and resolve
+        // the activated tool without panicking.
+        let outcome = execute_one_tool(
+            "docker-mcp__extract_text",
+            serde_json::json!({}),
+            None,
+            &[], // no static tools — force activated-tools path
+            Some(&activated),
+            &NoopObserver,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("execute_one_tool should recover from poisoned lock");
+
+        assert!(
+            outcome.success,
+            "activated tool execution should succeed after poisoned lock recovery"
+        );
+        assert!(
+            outcome
+                .output
+                .contains("executed via poisoned lock recovery"),
+            "tool output should come from the recovered activated tool"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "recovered activated tool should have been invoked exactly once"
+        );
+    }
 }

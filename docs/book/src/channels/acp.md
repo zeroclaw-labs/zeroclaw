@@ -188,7 +188,7 @@ The canonical parameter is `sessionId`; `session_id` is accepted as a compatibil
 ← {"jsonrpc":"2.0","id":3,"result":{
     "sessionId": "s-ab12cd",
     "stopReason": "cancelled",
-    "content": "partial...\n\n[interrupted by user]"
+    "content": "partial...\n\n[turn cancelled via client]"
   }}
 ```
 

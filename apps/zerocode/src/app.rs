@@ -17,6 +17,7 @@ use crate::client::{ConnectionState, RpcClient};
 use crate::config;
 use crate::config_manager;
 use crate::dashboard;
+use crate::doctor;
 use crate::keymap::{GlobalAction, ModalAction};
 use crate::logs;
 use crate::mouse;
@@ -48,12 +49,13 @@ pub type SharedReconnectState = Arc<Mutex<CrossReconnectState>>;
 const TICK: Duration = Duration::from_millis(200);
 
 /// Mode bar entries. Shared between drawing and click detection.
-const MODES: [Mode; 6] = [
+const MODES: [Mode; 7] = [
     Mode::Dashboard,
     Mode::Config,
     Mode::Acp,
     Mode::Chat,
     Mode::Logs,
+    Mode::Doctor,
     Mode::Quickstart,
 ];
 
@@ -63,6 +65,7 @@ const MODES: [Mode; 6] = [
 enum Mode {
     Dashboard,
     Config,
+    Doctor,
     Acp, // displayed as "Code" in the UI
     Chat,
     Logs,
@@ -74,6 +77,7 @@ impl Mode {
         match self {
             Mode::Dashboard => "zc-pane-dashboard",
             Mode::Config => "zc-pane-config",
+            Mode::Doctor => "zc-pane-doctor",
             Mode::Acp => "zc-pane-code",
             Mode::Chat => "zc-pane-chat",
             Mode::Logs => "zc-pane-logs",
@@ -199,6 +203,7 @@ pub async fn run(
                 dashboard_pane.init().await?;
                 let mut config_app = config_manager::App::new(rpc.clone(), config_dir);
                 config_app.init().await?;
+                let doctor_pane = doctor::Doctor::new(rpc.clone());
                 let mut acp_pane = acp::Acp::new(rpc.clone());
                 // Carry the pre-disconnect session across a reconnect rebuild so
                 // the rebuilt pane resumes the daemon-retained session (#7182)
@@ -232,6 +237,7 @@ pub async fn run(
                 anyhow::Ok((
                     dashboard_pane,
                     config_app,
+                    doctor_pane,
                     acp_pane,
                     chat_pane,
                     logs_pane,
@@ -245,6 +251,7 @@ pub async fn run(
     let (
         mut dashboard_pane,
         mut config_app,
+        mut doctor_pane,
         mut acp_pane,
         mut chat_pane,
         mut logs_pane,
@@ -257,6 +264,10 @@ pub async fn run(
     loop {
         // Draw
         let conn_state = rpc.connection_state();
+        doctor_pane.poll_refresh().await;
+        if mode == Mode::Doctor && !matches!(conn_state, ConnectionState::Disconnected { .. }) {
+            doctor_pane.refresh_if_inactive();
+        }
 
         // Per-agent theme override: while the Code or Chat pane is focused on
         // an agent with a configured override, swap that palette in for the
@@ -318,6 +329,7 @@ pub async fn run(
             match mode {
                 Mode::Dashboard => dashboard_pane.draw(frame, chunks[1]),
                 Mode::Config => config_app.draw_into(frame, chunks[1]),
+                Mode::Doctor => doctor_pane.draw(frame, chunks[1]),
                 Mode::Acp => acp_pane.draw(frame, chunks[1]),
                 Mode::Chat => chat_pane.draw(frame, chunks[1]),
                 Mode::Logs => logs_pane.draw(frame, chunks[1]),
@@ -378,6 +390,7 @@ pub async fn run(
                 let pane_node = match mode {
                     Mode::Dashboard => dashboard_pane.help_context(),
                     Mode::Config => config_app.help_context(),
+                    Mode::Doctor => doctor_pane.help_context(),
                     Mode::Acp => acp_pane.help_context(),
                     Mode::Chat => chat_pane.help_context(),
                     Mode::Logs => logs_pane.help_context(),
@@ -471,10 +484,11 @@ pub async fn run(
                             Ok(panes) => {
                                 dashboard_pane = panes.0;
                                 config_app = panes.1;
-                                acp_pane = panes.2;
-                                chat_pane = panes.3;
-                                logs_pane = panes.4;
-                                quickstart = panes.5;
+                                doctor_pane = panes.2;
+                                acp_pane = panes.3;
+                                chat_pane = panes.4;
+                                logs_pane = panes.5;
+                                quickstart = panes.6;
                                 reconnect_last_attempt = None;
                                 ephemeral_respawn_done = false;
                                 needs_intervention = false;
@@ -523,6 +537,7 @@ pub async fn run(
                 let in_text_input = match mode {
                     Mode::Dashboard => dashboard_pane.wants_text_input(),
                     Mode::Config => config_app.wants_text_input(),
+                    Mode::Doctor => doctor_pane.wants_text_input(),
                     Mode::Acp => acp_pane.wants_text_input(),
                     Mode::Chat => chat_pane.wants_text_input(),
                     Mode::Logs => logs_pane.wants_text_input(),
@@ -627,6 +642,7 @@ pub async fn run(
                 let quit = match mode {
                     Mode::Dashboard => dashboard_pane.handle_key(key).await,
                     Mode::Config => config_app.handle_key(key, term).await?,
+                    Mode::Doctor => doctor_pane.handle_key(key).await,
                     Mode::Acp => acp_pane.handle_key(key, term).await,
                     Mode::Chat => chat_pane.handle_key(key, term).await,
                     Mode::Logs => logs_pane.handle_key(key).await,
@@ -704,6 +720,9 @@ pub async fn run(
                         Mode::Config => {
                             config_app.handle_mouse(mouse, content_area, term).await?;
                         }
+                        Mode::Doctor => {
+                            doctor_pane.handle_mouse(mouse, content_area);
+                        }
                         Mode::Logs => {
                             logs_pane.handle_mouse(mouse, content_area);
                         }
@@ -725,6 +744,7 @@ pub async fn run(
                     Mode::Chat => chat_pane.handle_paste(&text),
                     Mode::Acp => acp_pane.handle_paste(&text),
                     Mode::Config => config_app.handle_paste(&text),
+                    Mode::Doctor => doctor_pane.handle_paste(&text),
                     Mode::Quickstart => quickstart.handle_paste(&text),
                     Mode::Dashboard => dashboard_pane.handle_paste(&text),
                     Mode::Logs => logs_pane.handle_paste(&text),
