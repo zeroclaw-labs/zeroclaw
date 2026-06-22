@@ -30,7 +30,7 @@ use super::bindings::channel::{
 use super::plugin_store::{self, PluginStore};
 use crate::component::engine::ComponentEngine;
 use crate::error::PluginError;
-use crate::{FineGrainedPermission, call_plugin, call_plugin_sync};
+use crate::{FineGrainedPermission, call_plugin};
 
 // ── Attributable ──────────────────────────────────────────────────────────────
 
@@ -43,6 +43,15 @@ pub struct ComponentChannel {
     plugin_name: String,
     /// Plugin version string as self-reported by `plugin-info`. Source of truth.
     plugin_version: String,
+    /// Cached result of `self-handle`, fetched once during construction so
+    /// the sync `Channel::self_handle` trait method never touches the store.
+    cached_self_handle: Option<String>,
+    /// Cached result of `self-addressed-mention`, fetched once during
+    /// construction for the same reason as `cached_self_handle`.
+    cached_self_addressed_mention: Option<String>,
+    /// Cached result of `multi-message-delay-ms`, fetched once during
+    /// construction for the same reason as `cached_self_handle`.
+    cached_multi_message_delay_ms: u64,
 }
 
 impl Attributable for ComponentChannel {
@@ -103,12 +112,50 @@ impl ComponentChannel {
             .await
             .map_err(PluginError::from)?;
 
+        // Fetch the static-identity exports once here, while we still hold
+        // direct access to the store, so the sync `Channel` trait methods
+        // never need to lock the store at call time.
+        let cached_self_handle = if capabilities.contains(ChannelCapabilities::SELF_HANDLE) {
+            bindings
+                .zeroclaw_plugin_channel()
+                .call_self_handle(&mut store)
+                .await
+                .map_err(PluginError::from)?
+        } else {
+            None
+        };
+        let cached_self_addressed_mention = if capabilities
+            .contains(ChannelCapabilities::SELF_ADDRESSED_MENTION)
+        {
+            bindings
+                .zeroclaw_plugin_channel()
+                .call_self_addressed_mention(&mut store)
+                .await
+                .map_err(PluginError::from)?
+        } else {
+            None
+        };
+        let cached_multi_message_delay_ms = if capabilities
+            .contains(ChannelCapabilities::MULTI_MESSAGE_DELAY_MS)
+        {
+            bindings
+                .zeroclaw_plugin_channel()
+                .call_multi_message_delay_ms(&mut store)
+                .await
+                .map_err(PluginError::from)?
+        } else {
+            800
+        };
+
         Ok(Self {
             alias: alias.into(),
             capabilities,
             state: Arc::new(Mutex::new((store, bindings))),
             plugin_name,
             plugin_version,
+            cached_self_handle,
+            cached_self_addressed_mention,
+            cached_multi_message_delay_ms,
         })
     }
 }
@@ -288,43 +335,14 @@ impl Channel for ComponentChannel {
     }
 
     fn self_handle(&self) -> Option<String> {
-        if !self.capabilities.contains(ChannelCapabilities::SELF_HANDLE) {
-            return None;
-        }
-        call_plugin_sync!(
-            self,
-            "self_handle",
-            move |store, bindings: &mut ChannelPlugin| {
-                bindings
-                    .zeroclaw_plugin_channel()
-                    .call_self_handle(store)
-                    .ok()
-                    .flatten()
-            }
-        )
+        self.cached_self_handle.clone()
     }
 
     fn self_addressed_mention(&self) -> Option<String> {
-        if !self
-            .capabilities
-            .contains(ChannelCapabilities::SELF_ADDRESSED_MENTION)
-        {
-            return None;
-        }
-        call_plugin_sync!(
-            self,
-            "self_addressed_mention",
-            move |store, bindings: &mut ChannelPlugin| {
-                bindings
-                    .zeroclaw_plugin_channel()
-                    .call_self_addressed_mention(store)
-                    .ok()
-                    .flatten()
-            }
-        )
+        self.cached_self_addressed_mention.clone()
     }
 
-    fn drop_self_messages(&self, msg: &ChannelMessage) -> bool {
+    async fn drop_self_messages(&self, msg: &ChannelMessage) -> bool {
         if !self
             .capabilities
             .contains(ChannelCapabilities::DROP_SELF_MESSAGE)
@@ -351,13 +369,14 @@ impl Channel for ComponentChannel {
             attachments: msg.attachments.iter().map(to_wit_media).collect(),
             subject: msg.subject.clone(),
         };
-        call_plugin_sync!(
+        call_plugin!(
             self,
             "drop_self_messages",
-            move |store, bindings: &mut ChannelPlugin| {
+            async move |store, bindings: &mut ChannelPlugin| {
                 bindings
                     .zeroclaw_plugin_channel()
                     .call_drop_self_message(store, &wit_msg)
+                    .await
                     .unwrap_or_else(|e| {
                         ::zeroclaw_log::record!(
                             WARN,
@@ -558,36 +577,7 @@ impl Channel for ComponentChannel {
     }
 
     fn multi_message_delay_ms(&self) -> u64 {
-        if !self
-            .capabilities
-            .contains(ChannelCapabilities::MULTI_MESSAGE_DELAY_MS)
-        {
-            return 800;
-        }
-        call_plugin_sync!(
-            self,
-            "multi_message_delay_ms",
-            move |store, bindings: &mut ChannelPlugin| {
-                bindings
-                    .zeroclaw_plugin_channel()
-                    .call_multi_message_delay_ms(store)
-                    .unwrap_or_else(|e| {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                            &format!(
-                                "multi_message_delay_ms call failed for plugin '{}' (channel '{}'): {}",
-                                self.plugin_name, self.alias, e
-                            )
-                        );
-                        800
-                    })
-            }
-        )
+        self.cached_multi_message_delay_ms
     }
 
     async fn add_reaction(

@@ -330,7 +330,7 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// platforms whose identity comparison is non-string (e.g. a
     /// numeric Discord user ID is `as_str` already; this default
     /// works there too).
-    fn drop_self_messages(&self, msg: &ChannelMessage) -> bool {
+    async fn drop_self_messages(&self, msg: &ChannelMessage) -> bool {
         let Some(handle) = self.self_handle() else {
             return false;
         };
@@ -651,44 +651,44 @@ mod tests {
         assert!(invite.to_string().contains("does not support room invites"));
     }
 
-    #[test]
-    fn drop_self_messages_default_returns_false_when_handle_unknown() {
+    #[tokio::test]
+    async fn drop_self_messages_default_returns_false_when_handle_unknown() {
         let channel = StubChannel { handle: None };
-        assert!(!channel.drop_self_messages(&msg_from("@anyone")));
+        assert!(!channel.drop_self_messages(&msg_from("@anyone")).await);
     }
 
-    #[test]
-    fn drop_self_messages_matches_exact_handle() {
+    #[tokio::test]
+    async fn drop_self_messages_matches_exact_handle() {
         let channel = StubChannel {
             handle: Some("@my_bot".into()),
         };
-        assert!(channel.drop_self_messages(&msg_from("@my_bot")));
-        assert!(!channel.drop_self_messages(&msg_from("@other_bot")));
+        assert!(channel.drop_self_messages(&msg_from("@my_bot")).await);
+        assert!(!channel.drop_self_messages(&msg_from("@other_bot")).await);
     }
 
-    #[test]
-    fn drop_self_messages_normalizes_at_prefix_and_case() {
+    #[tokio::test]
+    async fn drop_self_messages_normalizes_at_prefix_and_case() {
         let channel = StubChannel {
             handle: Some("My_Bot".into()),
         };
         // SDK delivered with @ prefix, handle stored without. Match.
-        assert!(channel.drop_self_messages(&msg_from("@my_bot")));
+        assert!(channel.drop_self_messages(&msg_from("@my_bot")).await);
         // Both with @, mixed case. Match.
         let channel = StubChannel {
             handle: Some("@My_Bot".into()),
         };
-        assert!(channel.drop_self_messages(&msg_from("@MY_BOT")));
+        assert!(channel.drop_self_messages(&msg_from("@MY_BOT")).await);
     }
 
-    #[test]
-    fn drop_self_messages_does_not_match_empty_handle() {
+    #[tokio::test]
+    async fn drop_self_messages_does_not_match_empty_handle() {
         // A handle of "@" (effectively empty after normalization) must
         // not match every inbound message; the guard only fires when
         // the bot has a real handle to compare against.
         let channel = StubChannel {
             handle: Some("@".into()),
         };
-        assert!(!channel.drop_self_messages(&msg_from("@anyone")));
+        assert!(!channel.drop_self_messages(&msg_from("@anyone")).await);
     }
 
     #[test]

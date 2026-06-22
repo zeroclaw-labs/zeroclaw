@@ -4138,7 +4138,7 @@ async fn process_channel_message_body(
     // fired with `None`) still has a guard available; both layers use
     // identical normalization so they agree on what "self" means.
     if let Some(channel) = target_channel.as_ref() {
-        if channel.drop_self_messages(&msg) {
+        if channel.drop_self_messages(&msg).await {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)

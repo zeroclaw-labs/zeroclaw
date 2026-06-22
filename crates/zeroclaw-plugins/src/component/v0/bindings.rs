@@ -39,19 +39,6 @@ pub mod channel {
             default: async,
         },
         exports: {
-            // These four are called at runtime from synchronous
-            // `zeroclaw_api::channel::Channel` trait methods (via
-            // `call_plugin_sync!`/`blocking_lock`), unlike plugin-info and
-            // get-channel-capabilities above which are only probed once
-            // inside an async constructor. Left `trappable` pending the
-            // channel-plugin SDK feature work, which will need to prove
-            // (or fix) whether sync export calls actually survive
-            // `validate_sync_call` at runtime once exercised by a real
-            // component — untested today.
-            "zeroclaw:plugin/channel.self-handle": trappable,
-            "zeroclaw:plugin/channel.self-addressed-mention": trappable,
-            "zeroclaw:plugin/channel.drop-self-message": trappable,
-            "zeroclaw:plugin/channel.multi-message-delay-ms": trappable,
             default: async
         },
         with: {
