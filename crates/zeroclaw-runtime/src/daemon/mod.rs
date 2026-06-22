@@ -172,12 +172,17 @@ async fn wait_for_ephemeral(client_count: std::sync::Arc<std::sync::atomic::Atom
 }
 
 pub async fn run(
-    config: Config,
+    mut config: Config,
     host: String,
     port: u16,
     mut registry: DaemonRegistry,
     ephemeral: bool,
 ) -> Result<DaemonExit> {
+    config.gateway.host = host.clone();
+    if port != 0 {
+        config.gateway.port = port;
+    }
+
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config
         .reliability

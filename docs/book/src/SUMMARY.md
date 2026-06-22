@@ -41,6 +41,7 @@
   - [Environment variables](./reference/env-vars.md)
   - [API (rustdoc)](./api.md)
   - [Gateway HTTP API](./gateway/api.md)
+  - [A2A agent discovery](./gateway/a2a-discovery.md)
   - [Web dashboard (web_dist_dir)](./gateway/web-dashboard.md)
 - [Agents](./agents/overview.md)
   - [Anatomy of an agent](./agents/anatomy.md)
