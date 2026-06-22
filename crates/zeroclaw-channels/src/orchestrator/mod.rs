@@ -4144,21 +4144,32 @@ async fn process_channel_message_body(
     {
         let reply_target = msg.reply_target.clone();
         let message_id = msg.id.clone();
+        let message_id_label = message_id.clone();
+        let agent_alias = Arc::clone(&ctx.agent_alias);
+        let sender = msg.sender.clone();
+        let channel_label = channel.name().to_string();
         let span = ::zeroclaw_log::attribution_span!(&*channel);
         zeroclaw_spawn::spawn!(
-            async move {
-                if let Err(e) = channel
-                    .add_reaction(&reply_target, &message_id, "\u{1F440}")
-                    .await
-                {
-                    ::zeroclaw_log::record!(
-                        DEBUG,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "Failed to add ack reaction"
-                    );
+            ::zeroclaw_log::scope!(
+                category: "channel",
+                agent_alias: agent_alias.as_str(),
+                channel: channel_label.as_str(),
+                sender: sender.as_str(),
+                message_id: message_id_label.as_str(),
+                => async move {
+                    if let Err(e) = channel
+                        .add_reaction(&reply_target, &message_id, "\u{1F440}")
+                        .await
+                    {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "Failed to add ack reaction"
+                        );
+                    }
                 }
-            }
+            )
             .instrument(span)
         );
     }
