@@ -269,4 +269,69 @@ mod tests {
     fn breadcrumb_is_user_role() {
         assert_eq!(breadcrumb().role, "user");
     }
+
+    #[test]
+    fn trimmed_history_has_no_orphan_tool_calls() {
+        use crate::agent::history_pruner::remove_orphaned_tool_messages;
+        let big = "q".repeat(3000);
+        let asst_call = |id: &str| {
+            asst(
+                &serde_json::json!({
+                    "content": "",
+                    "tool_calls": [{"id": id, "name": "file_read", "arguments": "{}"}]
+                })
+                .to_string(),
+            )
+        };
+        let tool_res = |id: &str| {
+            tool(
+                &serde_json::json!({"tool_call_id": id, "content": "ok"}).to_string(),
+            )
+        };
+        let h = vec![
+            sys("system"),
+            user(&format!("turn1 {big}")),
+            asst_call("call_1"),
+            tool_res("call_1"),
+            asst("summary1"),
+            user("turn2"),
+            asst_call("call_2"),
+            tool_res("call_2"),
+            asst("summary2"),
+        ];
+        let r = trim_to_recent_turns(h, 200);
+        assert!(r.trimmed, "oversized history must trim");
+        let mut kept = r.history.clone();
+        let swept = remove_orphaned_tool_messages(&mut kept);
+        assert_eq!(
+            swept.removed, 0,
+            "whole-turn trim must leave zero orphan tool messages; the orphan \
+             sweep (the anti-400 net) should find nothing to remove"
+        );
+        assert_eq!(kept.len(), r.history.len(), "no messages removed by sweep");
+    }
+
+    #[test]
+    fn breadcrumb_inserts_after_leading_system() {
+        let big = "w".repeat(3000);
+        let h = vec![
+            sys("sysA"),
+            sys("sysB"),
+            user(&format!("old {big}")),
+            asst("a"),
+            user("recent"),
+            asst("a2"),
+        ];
+        let r = trim_to_recent_turns(h, 120);
+        assert!(r.trimmed);
+        let mut trimmed = r.history;
+        let system_count = trimmed.iter().take_while(|m| m.role == "system").count();
+        trimmed.insert(system_count, breadcrumb());
+        assert_eq!(trimmed[0].role, "system");
+        assert_eq!(trimmed[system_count].role, "user");
+        assert!(
+            trimmed[..system_count].iter().all(|m| m.role == "system"),
+            "breadcrumb must sit after every leading system message"
+        );
+    }
 }
