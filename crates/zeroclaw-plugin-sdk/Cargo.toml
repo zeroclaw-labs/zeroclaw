@@ -36,6 +36,10 @@ name = "spike_tool"
 required-features = ["tool"]
 
 [[test]]
+name = "spike_tcp_permission"
+required-features = ["tool"]
+
+[[test]]
 name = "spike_memory"
 required-features = ["memory"]
 
