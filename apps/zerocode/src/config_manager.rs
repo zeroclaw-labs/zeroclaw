@@ -3265,6 +3265,16 @@ impl App {
             );
         }
 
+        let cursor = if self.filter.is_some() {
+            self.filter_cursor
+        } else {
+            visible
+                .iter()
+                .position(|&i| i == self.field_cursor)
+                .unwrap_or(0)
+        };
+        let selected_field = visible.get(cursor).copied();
+
         let items: Vec<ListItem> = visible
             .iter()
             .map(|&i| {
@@ -3287,9 +3297,10 @@ impl App {
                 // In the field list (selection) screen, the row is only
                 // *selected*; it is not yet editable. Make this explicit so the
                 // affordance no longer mimics an active text input. The press
-                // hint only appears on the row that currently has the cursor
-                // and is omitted once the user enters the edit screen.
-                let press_hint = if i == self.field_cursor {
+                // hint is derived from the same row used for ListState
+                // selection, so it stays aligned with the highlight even when
+                // a field-list filter is active.
+                let press_hint = if Some(i) == selected_field {
                     "  \u{2500}\u{2192} press Enter to edit"
                 } else {
                     ""
@@ -3304,15 +3315,6 @@ impl App {
                 ListItem::new(Line::from(Span::styled(line, style)))
             })
             .collect();
-
-        let cursor = if self.filter.is_some() {
-            self.filter_cursor
-        } else {
-            visible
-                .iter()
-                .position(|&i| i == self.field_cursor)
-                .unwrap_or(0)
-        };
 
         let mut state = ListState::default();
         if !items.is_empty() {
