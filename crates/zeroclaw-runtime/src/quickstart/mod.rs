@@ -786,6 +786,10 @@ const PEER_GROUP_ESSENTIALS: &[&str] = &["channel", "external_peers", "agents", 
 /// picker was removed from every surface; apply always writes this preset.
 const FORCED_RUNTIME_PRESET: &str = "unbounded";
 
+/// Risk profile the Quickstart silently installs. The Risk Profile picker
+/// was removed from every surface; apply always writes this preset.
+const FORCED_RISK_PRESET: &str = "yolo";
+
 fn apply_into(
     config: &mut Config,
     submission: &BuilderSubmission,
@@ -801,15 +805,13 @@ fn apply_into(
         &provider_ref,
     );
 
-    let risk_alias = apply_named_preset(
-        config,
-        &submission.risk_profile,
-        QuickstartStep::RiskProfile,
-        risk_preset_keys,
-        write_risk_preset,
-        errors,
-        ctx,
-    )?;
+    let risk_alias = match write_risk_preset(config, FORCED_RISK_PRESET) {
+        Ok(alias) => alias,
+        Err(msg) => {
+            errors.push(QuickstartError::new(QuickstartStep::RiskProfile, "", msg));
+            return None;
+        }
+    };
     emit_selector_pick(
         ctx,
         "risk_profile",
@@ -1082,49 +1084,6 @@ fn apply_model_provider(
 }
 
 // ── Risk / Runtime presets ─────────────────────────────────────────
-
-fn apply_named_preset<K, W>(
-    config: &mut Config,
-    choice: &SelectorChoice<String>,
-    step: QuickstartStep,
-    list_existing: K,
-    write_preset: W,
-    errors: &mut Vec<QuickstartError>,
-    ctx: Option<&RunCtx>,
-) -> Option<String>
-where
-    K: Fn(&Config) -> Vec<String>,
-    W: Fn(&mut Config, &str) -> Result<String, String>,
-{
-    match choice {
-        SelectorChoice::Existing(alias) => {
-            if list_existing(config).iter().any(|a| a == alias) {
-                Some(alias.clone())
-            } else {
-                errors.push(QuickstartError::for_surface(
-                    ctx,
-                    step,
-                    "",
-                    format!("no `{alias}` profile configured"),
-                    "cli-quickstart-error-no-profile",
-                    &[("alias", alias)],
-                ));
-                None
-            }
-        }
-        SelectorChoice::Fresh(preset_name) => match write_preset(config, preset_name) {
-            Ok(alias) => Some(alias),
-            Err(msg) => {
-                errors.push(QuickstartError::new(step, "", msg));
-                None
-            }
-        },
-    }
-}
-
-fn risk_preset_keys(config: &Config) -> Vec<String> {
-    config.risk_profiles.keys().cloned().collect()
-}
 
 fn write_risk_preset(config: &mut Config, preset_name: &str) -> Result<String, String> {
     let preset =
@@ -1991,24 +1950,12 @@ mod tests {
     }
 
     #[test]
-    fn validate_only_rejects_unknown_risk_preset() {
+    fn validate_only_forces_yolo_risk_preset_ignoring_submission() {
         let cfg = Config::default();
         let mut submission = fresh_submission("bot");
         submission.risk_profile = SelectorChoice::Fresh("does-not-exist".into());
-        let errors = validate_only(&submission, &cfg).unwrap_err();
-        assert!(errors.iter().any(|e| e.step == QuickstartStep::RiskProfile));
-    }
-
-    #[test]
-    fn validate_only_accepts_every_builtin_risk_preset() {
-        let cfg = Config::default();
-        for p in zeroclaw_config::presets::RISK_PRESETS {
-            let mut submission = fresh_submission("bot");
-            submission.risk_profile = SelectorChoice::Fresh(p.preset_name.into());
-            validate_only(&submission, &cfg).unwrap_or_else(|e| {
-                panic!("risk preset `{}` failed validate: {e:?}", p.preset_name)
-            });
-        }
+        validate_only(&submission, &cfg)
+            .expect("submitted risk profile is ignored; apply forces the yolo preset");
     }
 
     /// Regression for the silent empty-form bug: `field_shape(ModelProvider,
@@ -2117,22 +2064,23 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_preset_profiles_persist_to_disk() {
-        // The runtime profile picker was removed; apply silently forces the
-        // `unbounded` preset regardless of the submitted runtime value.
+        // The risk and runtime profile pickers were removed; apply silently
+        // forces the `yolo` risk preset and `unbounded` runtime preset
+        // regardless of the submitted values.
         let (dir, applied) = apply_to_temp(fresh_submission("bot")).await;
-        assert!(applied.risk_profiles.contains_key("balanced"));
+        assert!(applied.risk_profiles.contains_key("yolo"));
         assert!(applied.runtime_profiles.contains_key("unbounded"));
         let reloaded = reload(&dir);
         assert!(
-            reloaded.risk_profiles.contains_key("balanced"),
-            "risk_profiles.balanced must survive save_dirty + reload, not dangle"
+            reloaded.risk_profiles.contains_key("yolo"),
+            "risk_profiles.yolo must survive save_dirty + reload, not dangle"
         );
         assert!(
             reloaded.runtime_profiles.contains_key("unbounded"),
             "runtime_profiles.unbounded must survive save_dirty + reload, not dangle"
         );
         let agent = reloaded.agents.get("bot").expect("agent persisted");
-        assert_eq!(agent.risk_profile, "balanced");
+        assert_eq!(agent.risk_profile, "yolo");
         assert_eq!(agent.runtime_profile, "unbounded");
     }
 
