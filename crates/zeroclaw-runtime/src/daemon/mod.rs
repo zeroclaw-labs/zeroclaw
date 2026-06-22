@@ -600,7 +600,16 @@ pub async fn run(
 
         let hooks: Option<std::sync::Arc<crate::hooks::HookRunner>> =
             if config.hooks.enabled {
-                Some(std::sync::Arc::new(crate::hooks::HookRunner::new()))
+                let mut runner = crate::hooks::HookRunner::new();
+                if config.hooks.builtin.command_logger {
+                    runner.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
+                }
+                if config.hooks.builtin.webhook_audit.enabled {
+                    runner.register(Box::new(crate::hooks::builtin::WebhookAuditHook::new(
+                        config.hooks.builtin.webhook_audit.clone(),
+                    )));
+                }
+                Some(std::sync::Arc::new(runner))
             } else {
                 None
             };

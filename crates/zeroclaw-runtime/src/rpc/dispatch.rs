@@ -1162,11 +1162,11 @@ impl RpcDispatcher {
             // promptly.
             drop(agent);
         }
-        if let Some(ref hooks) = self.ctx.hooks {
-            hooks.fire_session_end(&req.session_id, "rpc").await;
-        }
         if !self.ctx.sessions.remove(&req.session_id).await {
             return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+        }
+        if let Some(ref hooks) = self.ctx.hooks {
+            hooks.fire_session_end(&req.session_id, "rpc").await;
         }
         crate::util::release_freed_heap();
         {
@@ -2285,10 +2285,12 @@ impl RpcDispatcher {
                 .channel_handles()
                 .unregister_channel("rpc");
         }
-        if let Some(ref hooks) = self.ctx.hooks {
-            hooks.fire_session_end(&req.session_id, "rpc").await;
+        let existed = self.ctx.sessions.remove(&req.session_id).await;
+        if existed {
+            if let Some(ref hooks) = self.ctx.hooks {
+                hooks.fire_session_end(&req.session_id, "rpc").await;
+            }
         }
-        self.ctx.sessions.remove(&req.session_id).await;
         // Remove from persistent backend — try raw id, then prefixed variants.
         if let Some(ref backend) = self.ctx.session_backend {
             for key in &[
