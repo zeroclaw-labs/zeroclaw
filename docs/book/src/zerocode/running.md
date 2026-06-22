@@ -22,14 +22,14 @@ zerocode spawns an ephemeral one.
 
 In the **Chat** and **Code** panes you can load or switch existing sessions without restarting zerocode:
 
-| Action | Shortcut |
-|--------|----------|
-| Open the session picker | `Ctrl+S` |
-| Move selection up/down | `Up` / `Down` |
-| Switch to the selected session | `Enter` |
-| Start a new session | `Ctrl+N` |
+- **Switch session** opens the session list (default chord: Ctrl+S; rebindable in the keymap).
+- Use the list-navigation keys to move the selection (defaults: Up/Down).
+- **Enter** switches to the highlighted session.
+- **New session** starts fresh (default chord: Ctrl+N; rebindable).
 
-Chat/Code sessions and ACP-backed sessions use different stores. If you use the ACP protocol directly, use `session/load` when you need transcript replay and `session/resume` when you only need the server-side session state restored. See the [ACP documentation](../acp/index.md) for protocol-level details.
+The in-app help overlay shows your live key bindings for these actions.
+
+Chat/Code sessions and ACP-backed sessions use different stores. If you use the ACP protocol directly, use `session/load` when you need transcript replay and `session/resume` when you only need the server-side session state restored. See the [ACP documentation](../channels/acp.md) for protocol-level details.
 
 ## CLI flags
 
