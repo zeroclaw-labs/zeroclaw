@@ -91,6 +91,18 @@ impl SopMetricsCollector {
         }
     }
 
+    /// Process-wide shared collector (production). The engine feeds it
+    /// (`record_run_complete` in `finish_run`) and the SOP tools report from it
+    /// (`sop_status`) / feed it (`sop_approve`), so they observe one set of
+    /// metrics. Tests use a fresh `new()` per engine for isolation.
+    pub fn shared() -> std::sync::Arc<SopMetricsCollector> {
+        static SHARED: std::sync::OnceLock<std::sync::Arc<SopMetricsCollector>> =
+            std::sync::OnceLock::new();
+        SHARED
+            .get_or_init(|| std::sync::Arc::new(SopMetricsCollector::new()))
+            .clone()
+    }
+
     // ── Push methods (sync, write lock) ────────────────────────
 
     /// Record a terminal run (Completed/Failed/Cancelled).

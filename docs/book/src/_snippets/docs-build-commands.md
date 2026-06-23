@@ -1,6 +1,23 @@
 <!-- Canonical local docs-build commands and tooling. Edit here; reuse via
      {{#include}}. Shared by developing/building-docs and
      maintainers/docs-and-translations. -->
+## Translation catalogues (git submodule)
+
+The translated `.po` catalogues live in the `zeroclaw-labs/zeroclaw-docs-translations` submodule mounted at `docs/book/po`. The Rust dev loop (`cargo build`, `cargo test`, `cargo clippy`) does not need it, but **building or syncing the docs does**. Initialise it once:
+
+<div class="os-tabs-src">
+
+#### sh
+
+```sh
+git clone --recurse-submodules https://github.com/zeroclaw-labs/zeroclaw   # fresh clone
+git submodule update --init docs/book/po                                   # existing clone
+```
+
+</div>
+
+Without the submodule checked out, English still builds (the English source lives in `docs/book/src/`), but translated locales render as empty.
+
 ## One-command quickstart
 
 <div class="os-tabs-src">

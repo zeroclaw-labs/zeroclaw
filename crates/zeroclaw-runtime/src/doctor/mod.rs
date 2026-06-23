@@ -447,7 +447,8 @@ pub async fn run_models(
 /// --check` (configured-model verification) and future interactive flows (the
 /// `quickstart` model picker, which also wants pricing) share one fetch path.
 pub async fn fetch_provider_catalog(config: &Config, provider_ref: &str) -> Result<Vec<String>> {
-    create_doctor_model_provider(config, provider_ref)?
+    let provider = create_doctor_model_provider(config, provider_ref)?;
+    zeroclaw_providers::ProviderDispatch::from_ref(&*provider)
         .list_models()
         .await
 }
