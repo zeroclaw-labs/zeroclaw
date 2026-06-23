@@ -452,6 +452,17 @@ impl RpcClient {
             .unwrap_or("unknown")
             .to_string();
 
+        // Check for version mismatch between TUI and daemon.
+        // See issue #8186.
+        let client_version = env!("CARGO_PKG_VERSION");
+        if client_version != server_version {
+            return Err(anyhow::Error::msg(format!(
+                "Version mismatch: zerocode is v{} but the daemon is v{}. \
+                 Rebuild and restart the daemon from the same checkout as zerocode.",
+                client_version, server_version
+            )));
+        }
+
         let tui_id = resp.get("tui_id").and_then(Value::as_str).map(String::from);
         let tui_sig = resp
             .get("tui_sig")
@@ -600,6 +611,17 @@ impl RpcClient {
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_string();
+
+        // Check for version mismatch between TUI and daemon.
+        // See issue #8186.
+        let client_version = env!("CARGO_PKG_VERSION");
+        if client_version != server_version {
+            return Err(anyhow::Error::msg(format!(
+                "Version mismatch: zerocode is v{} but the daemon is v{}. \
+                 Rebuild and restart the daemon from the same checkout as zerocode.",
+                client_version, server_version
+            )));
+        }
 
         let tui_id = resp.get("tui_id").and_then(Value::as_str).map(String::from);
         let tui_sig = resp
