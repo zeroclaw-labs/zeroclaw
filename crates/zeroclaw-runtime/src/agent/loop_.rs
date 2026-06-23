@@ -3659,7 +3659,25 @@ pub async fn run(
                         config.data_dir.clone(),
                         config.skills.skill_creation.clone(),
                     );
-                    match creator.create_from_execution(&msg, &tool_calls, None).await {
+                    // Opt-in reflection synthesizes a `SKILL.md` from a bounded
+                    // slice of the execution; it falls back to `SKILL.toml`
+                    // internally when the provider call or its output is
+                    // unusable. Default path stays the deterministic generator.
+                    let creation_result = if config.skills.skill_creation.reflection_enabled {
+                        creator
+                            .create_from_execution_reflected(
+                                &msg,
+                                &tool_calls,
+                                &response,
+                                None,
+                                model_provider.as_ref(),
+                                &model_name,
+                            )
+                            .await
+                    } else {
+                        creator.create_from_execution(&msg, &tool_calls, None).await
+                    };
+                    match creation_result {
                         Ok(Some(slug)) => {
                             ::zeroclaw_log::record!(
                                 INFO,
