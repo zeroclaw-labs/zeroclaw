@@ -36,7 +36,7 @@ hmac = "0.12"
 hostname = "0.4.2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 indicatif = "0.18"
-lru = "0.16"
+lru = "0.18"
 mime_guess = "2"
 nanohtml2text = "0.2"
 parking_lot = "0.12"

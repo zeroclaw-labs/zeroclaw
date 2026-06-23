@@ -173,7 +173,7 @@ async-trait = "0.1"
 ring = { version = "0.17", optional = true }
 
 # LRU cache for bounded sender state
-lru = { version = "0.16", optional = true }
+lru = { version = "0.18", optional = true }
 
 # Memory / persistence (migration.rs, behind agent-runtime)
 rusqlite = { version = "0.37", features = ["bundled"], optional = true }
