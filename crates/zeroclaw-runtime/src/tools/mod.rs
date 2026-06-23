@@ -1384,7 +1384,19 @@ pub fn all_tools_with_runtime(
         if plugin_path.exists() && config.plugins.enabled {
             let signature_mode = zeroclaw_plugins::host::PluginHost::parse_signature_mode(
                 &config.plugins.security.signature_mode,
-            );
+            )
+            .unwrap_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "signature_mode": config.plugins.security.signature_mode.clone()
+                        })),
+                    "Unrecognized plugins.security.signature_mode; failing safe to strict"
+                );
+                zeroclaw_plugins::host::SignatureMode::Strict
+            });
             let trusted_publisher_keys = config.plugins.security.trusted_publisher_keys.clone();
             match zeroclaw_plugins::host::PluginHost::from_plugins_dir_with_security(
                 &plugin_path,
