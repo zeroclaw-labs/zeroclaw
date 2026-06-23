@@ -95,39 +95,47 @@ pub async fn maybe_run_skill_review(
     let result = SKILL_REVIEW_ACTIVE
         .scope((), async {
             crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
-                model_provider: provider,
+                exec: crate::agent::loop_::ResolvedAgentExecution {
+                    model_access: crate::agent::loop_::ResolvedModelAccess {
+                        model_provider: provider,
+                        provider_name,
+                        model: model_name,
+                        temperature: Some(0.3),
+                    },
+                    tools_registry: &tools,
+                    observer,
+                    // low so the fork doesn't ramble
+                    silent: true,
+                    approval: None,
+                    multimodal_config: multimodal,
+                    max_tool_iterations: config.max_review_iterations as usize,
+                    hooks: None,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    pacing,
+                    strict_tool_parsing: false,
+                    // lenient for the restricted fork
+                    parallel_tools: false,
+                    // sequential for the mutation-capable fork
+                    max_tool_result_chars,
+                    context_token_budget: max_context_tokens,
+                    receipt_generator: None,
+                    knobs: &crate::agent::loop_::LoopKnobs::default(),
+                },
                 history: &mut review_history,
-                tools_registry: &tools,
-                observer,
-                provider_name,
-                model: model_name,
-                temperature: Some(0.3), // low so the fork doesn't ramble
-                silent: true,
-                approval: None, // no human in the loop here
+                // no human in the loop here
                 channel_name: "skill_review",
                 channel_reply_target: None,
-                multimodal_config: multimodal,
-                max_tool_iterations: config.max_review_iterations as usize,
                 cancellation_token: cancellation_token.cloned(),
                 on_delta: None,
-                hooks: None,
-                excluded_tools: &[],
-                dedup_exempt_tools: &[],
-                activated_tools: None,
-                model_switch_callback: None,
-                pacing,
-                strict_tool_parsing: false, // lenient for the restricted fork
-                parallel_tools: false,      // sequential for the mutation-capable fork
-                max_tool_result_chars,
-                context_token_budget: max_context_tokens,
                 shared_budget: None,
                 channel: None,
-                receipt_generator: None,
                 collected_receipts: Some(&receipts),
                 event_tx: None,
                 steering: None,
                 new_messages_out: None,
-                knobs: &crate::agent::loop_::LoopKnobs::default(),
                 image_cache: None,
                 // Phase 1: stamp Internal/Trusted. Real per-transport
                 // stamping is PR C (RFC #6971 §4).
