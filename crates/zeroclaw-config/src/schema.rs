@@ -19265,10 +19265,10 @@ pub struct SopConfig {
     #[serde(default)]
     pub persist_runs: bool,
 
-    /// Durable run-state backend when `persist_runs` is true:
-    /// `sqlite` (default) or `memory` (explicitly non-durable, for tests/degraded).
-    #[serde(default = "default_sop_run_store_backend")]
-    pub run_store_backend: String,
+    /// Durable run-state backend when `persist_runs` is true: `sqlite` (default,
+    /// durable) or `memory` (explicitly non-durable, for tests/degraded).
+    #[serde(default)]
+    pub run_store_backend: SopRunStoreBackend,
 
     /// Directory for the durable run store (created mode-0700). When omitted,
     /// `<data_dir>/sop`. Never OS-temp.
@@ -19280,8 +19280,20 @@ fn default_sop_execution_mode() -> String {
     "supervised".to_string()
 }
 
-fn default_sop_run_store_backend() -> String {
-    "sqlite".to_string()
+/// Durable SOP run-state backend selector. A closed, compile-time-known set, so it
+/// is a serde enum rather than free text (mirrors `SandboxBackend` /
+/// `ObservabilityBackend` in this file); unknown values are rejected at parse time.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum SopRunStoreBackend {
+    /// Durable WAL-mode SQLite store (default).
+    #[default]
+    Sqlite,
+    /// Ephemeral in-memory store: explicitly non-durable, for tests / degraded boot.
+    Memory,
 }
 
 fn default_sop_max_concurrent_total() -> usize {
@@ -19305,7 +19317,7 @@ impl Default for SopConfig {
             approval_timeout_secs: default_sop_approval_timeout_secs(),
             max_finished_runs: default_sop_max_finished_runs(),
             persist_runs: false,
-            run_store_backend: default_sop_run_store_backend(),
+            run_store_backend: SopRunStoreBackend::Sqlite,
             run_state_dir: None,
         }
     }

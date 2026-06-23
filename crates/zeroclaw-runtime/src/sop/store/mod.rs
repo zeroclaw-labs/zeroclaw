@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use zeroclaw_config::schema::SopConfig;
+use zeroclaw_config::schema::{SopConfig, SopRunStoreBackend};
 
 pub use model::{
     ClaimToken, PersistedRun, ProposalRecord, ProposalStatus, RetentionPolicy, SOP_STORE_VERSION,
@@ -161,7 +161,9 @@ impl From<serde_json::Error> for StoreError {
 /// - `persist_runs = true`, backend `"sqlite"` (default) -> [`SqliteRunStore`] at
 ///   `<run_state_dir | data_dir/sop>/runs.db` (dir created mode-0700).
 /// - `persist_runs = true`, backend `"memory"` -> ephemeral [`InMemoryRunStore`] (degraded/tests).
-/// - any other backend -> fail-loud `StoreError`.
+///
+/// The backend is the closed `SopRunStoreBackend` enum, so an out-of-set value is
+/// rejected at config-deserialize time rather than here (no runtime unknown arm).
 ///
 /// Called by `build_sop_engine`, which injects the result via `with_store` and
 /// then calls `restore_runs()` to rehydrate in-flight runs at startup. A
@@ -174,8 +176,10 @@ pub fn build_run_store(
     if !cfg.persist_runs {
         return Ok(Arc::new(InMemoryRunStore::new()));
     }
-    match cfg.run_store_backend.trim().to_ascii_lowercase().as_str() {
-        "sqlite" => {
+    // Closed set: a serde enum, matched on variants. serde rejects unknown values
+    // at deserialize time, so there is no runtime unknown-backend arm.
+    match cfg.run_store_backend {
+        SopRunStoreBackend::Sqlite => {
             let dir: PathBuf = match cfg.run_state_dir.as_deref() {
                 Some(d) if !d.is_empty() => PathBuf::from(shellexpand::tilde(d).as_ref()),
                 _ => data_dir.join("sop"),
@@ -191,10 +195,7 @@ pub fn build_run_store(
                 &dir.join("runs.db"),
             )?))
         }
-        "memory" => Ok(Arc::new(InMemoryRunStore::new())),
-        other => Err(StoreError::Backend(format!(
-            "unknown sop run_store_backend: {other:?} (expected \"sqlite\" or \"memory\")"
-        ))),
+        SopRunStoreBackend::Memory => Ok(Arc::new(InMemoryRunStore::new())),
     }
 }
 
@@ -797,18 +798,31 @@ mod tests {
     }
 
     #[test]
-    fn factory_backend_selection_and_unknown_is_error() {
+    fn factory_backend_selection_memory() {
         let mut c = cfg();
         c.persist_runs = true;
-        c.run_store_backend = "memory".to_string();
+        c.run_store_backend = SopRunStoreBackend::Memory;
         assert_eq!(
             build_run_store(&c, Path::new("/nonexistent"))
                 .unwrap()
                 .backend(),
             "in-memory"
         );
-        c.run_store_backend = "bogus".to_string();
-        assert!(build_run_store(&c, Path::new("/nonexistent")).is_err());
+    }
+
+    #[test]
+    fn unknown_backend_is_rejected_at_deserialize() {
+        // The backend is a closed serde enum, so an out-of-set value fails at parse
+        // time rather than at first use; there is no runtime unknown-backend arm.
+        let r: Result<SopConfig, _> = serde_json::from_str(r#"{"run_store_backend":"bogus"}"#);
+        assert!(
+            r.is_err(),
+            "an unknown run_store_backend must fail to deserialize"
+        );
+        // A known value still deserializes (back-compat with existing configs).
+        let ok: SopConfig = serde_json::from_str(r#"{"run_store_backend":"sqlite"}"#)
+            .expect("known backend deserializes");
+        assert_eq!(ok.run_store_backend, SopRunStoreBackend::Sqlite);
     }
 
     #[test]
@@ -817,7 +831,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mut c = cfg();
         c.persist_runs = true;
-        c.run_store_backend = "sqlite".to_string();
+        c.run_store_backend = SopRunStoreBackend::Sqlite;
         c.run_state_dir = Some(dir.to_string_lossy().into_owned());
         let s = build_run_store(&c, Path::new("/unused")).unwrap();
         assert_eq!(s.backend(), "sqlite");
