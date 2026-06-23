@@ -1923,7 +1923,10 @@ impl DelegateTool {
                 event_tx: None,
                 steering: None,
                 new_messages_out: None,
-                knobs: &LoopKnobs::default(),
+                knobs: &LoopKnobs {
+                    history_pruning: loop_runtime.history_pruning.clone(),
+                    ..LoopKnobs::default()
+                },
                 image_cache: None,
                 // Phase 1: stamp Internal/Trusted. Real per-transport
                 // stamping is PR C (RFC #6971 §4).

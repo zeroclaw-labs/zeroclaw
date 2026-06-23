@@ -639,6 +639,7 @@ pub async fn agent_turn(
     parallel_tools: bool,
     max_tool_result_chars: usize,
     context_token_budget: usize,
+    history_pruning: &crate::agent::history_pruner::HistoryPrunerConfig,
     channel: Option<&dyn Channel>,
 ) -> Result<String> {
     run_tool_call_loop(ToolLoop {
@@ -674,7 +675,10 @@ pub async fn agent_turn(
         event_tx: None,
         steering: None,
         new_messages_out: None,
-        knobs: &LoopKnobs::default(),
+        knobs: &LoopKnobs {
+            history_pruning: history_pruning.clone(),
+            ..LoopKnobs::default()
+        },
         image_cache: None,
         // Phase 1: stamp Internal/Trusted. Real per-transport
         // stamping is PR C (RFC #6971 §4).
@@ -1755,7 +1759,10 @@ pub async fn run(
                                 event_tx: None,
                                 steering: None,
                                 new_messages_out: None,
-                                knobs: &LoopKnobs::default(),
+                                knobs: &LoopKnobs {
+                                    history_pruning: agent.resolved.history_pruning.clone(),
+                                    ..LoopKnobs::default()
+                                },
                                 image_cache: None,
                                 // Phase 1: stamp Internal/Trusted. Real per-transport
                                 // stamping is PR C (RFC #6971 §4).
@@ -1918,6 +1925,7 @@ pub async fn run(
                             &config.pacing,
                             agent.resolved.max_tool_result_chars,
                             agent.resolved.max_context_tokens,
+                            &agent.resolved.history_pruning,
                             None, // cancellation_token — no parent token in single-shot run
                         ),
                     )
@@ -2242,7 +2250,10 @@ pub async fn run(
                                     event_tx: None,
                                     steering: None,
                                     new_messages_out: None,
-                                    knobs: &LoopKnobs::default(),
+                                    knobs: &LoopKnobs {
+                                        history_pruning: agent.resolved.history_pruning.clone(),
+                                        ..LoopKnobs::default()
+                                    },
                                     image_cache: None,
                                     // Phase 1: stamp Internal/Trusted. Real per-transport
                                     // stamping is PR C (RFC #6971 §4).
@@ -3102,6 +3113,7 @@ pub async fn process_message(
                     agent.resolved.parallel_tools,
                     agent.resolved.max_tool_result_chars,
                     agent.resolved.max_context_tokens,
+                    &agent.resolved.history_pruning,
                     None, // channel: process_message path has no channel ref
                 ),
             )
@@ -9626,7 +9638,8 @@ This is an example, not an invocation."#;
                 false, // parallel_tools
                 0,     // max_tool_result_chars: disabled for test
                 0,     // context_token_budget: disabled for test
-                None,  // channel
+                &crate::agent::history_pruner::HistoryPrunerConfig::default(),
+                None, // channel
             )
             .await
             .expect("wrapper path should execute activated tools");
@@ -9694,7 +9707,8 @@ This is an example, not an invocation."#;
                 false, // parallel_tools
                 0,     // max_tool_result_chars: disabled for test
                 0,     // context_token_budget: disabled for test
-                None,  // channel
+                &crate::agent::history_pruner::HistoryPrunerConfig::default(),
+                None, // channel
             )
             .await
             .expect("strict wrapper path should preserve fallback-looking text");
@@ -9823,6 +9837,7 @@ This is an example, not an invocation."#;
                 false,
                 100, // max_tool_result_chars: truncate at 100 chars
                 0,   // context_token_budget: disabled
+                &crate::agent::history_pruner::HistoryPrunerConfig::default(),
                 None,
             )
             .await
@@ -9901,6 +9916,7 @@ This is an example, not an invocation."#;
                 false,
                 0, // max_tool_result_chars: disabled (no truncation)
                 0, // context_token_budget: disabled
+                &crate::agent::history_pruner::HistoryPrunerConfig::default(),
                 None,
             )
             .await
@@ -11933,6 +11949,7 @@ Let me check the result."#;
                     &zeroclaw_config::schema::PacingConfig::default(),
                     0,
                     0,
+                    &crate::agent::history_pruner::HistoryPrunerConfig::default(),
                     None,
                 ),
             )
@@ -12016,6 +12033,7 @@ Let me check the result."#;
                     &zeroclaw_config::schema::PacingConfig::default(),
                     0,
                     0,
+                    &crate::agent::history_pruner::HistoryPrunerConfig::default(),
                     None,
                 ),
             )

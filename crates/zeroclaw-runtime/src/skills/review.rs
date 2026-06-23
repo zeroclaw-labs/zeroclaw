@@ -55,6 +55,7 @@ pub async fn maybe_run_skill_review(
     pacing: &PacingConfig,
     max_tool_result_chars: usize,
     max_context_tokens: usize,
+    history_pruning: &crate::agent::history_pruner::HistoryPrunerConfig,
     cancellation_token: Option<&CancellationToken>,
 ) {
     if !config.enabled {
@@ -127,7 +128,10 @@ pub async fn maybe_run_skill_review(
                 event_tx: None,
                 steering: None,
                 new_messages_out: None,
-                knobs: &crate::agent::loop_::LoopKnobs::default(),
+                knobs: &crate::agent::loop_::LoopKnobs {
+                    history_pruning: history_pruning.clone(),
+                    ..crate::agent::loop_::LoopKnobs::default()
+                },
                 image_cache: None,
                 // Phase 1: stamp Internal/Trusted. Real per-transport
                 // stamping is PR C (RFC #6971 §4).
