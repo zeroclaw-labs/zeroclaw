@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::pricing::ModelRates;
+use crate::pricing::{ModelRates, sane_mtok};
 use anyhow::Result;
 use serde::Deserialize;
 use tokio::sync::OnceCell;
@@ -129,11 +129,13 @@ pub(crate) fn pricing_from_catalog(
     };
     for model in entry.models.values() {
         let Some(cost) = model.cost else { continue };
-        // models.dev `cost` is already USD per 1M tokens — no scaling.
+        // models.dev `cost` is already USD per 1M tokens — no scaling. Each
+        // dimension is sanity-bounded so a malformed catalog entry can't bill
+        // an absurd cost (same ceiling as the gateway path).
         let rates = ModelRates {
-            input_per_mtok: cost.input,
-            output_per_mtok: cost.output,
-            cached_input_per_mtok: cost.cache_read,
+            input_per_mtok: cost.input.and_then(sane_mtok),
+            output_per_mtok: cost.output.and_then(sane_mtok),
+            cached_input_per_mtok: cost.cache_read.and_then(sane_mtok),
         };
         if !rates.is_empty() {
             out.insert(model.id.clone(), rates);

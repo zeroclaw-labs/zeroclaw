@@ -75,15 +75,30 @@ impl ModelRates {
     }
 }
 
+/// Upper bound on a sane per-1M-token rate. At `$1`/token this sits orders of
+/// magnitude above any real model price, so a genuine rate never trips it; it
+/// only catches a parsing artifact or a hostile/buggy gateway reporting an
+/// absurd value (which would otherwise bill a fortune).
+const MAX_SANE_PER_MTOK: f64 = 1_000_000.0;
+
+/// Accept a per-1M-token rate only when it lands in `0.0..=MAX_SANE_PER_MTOK`.
+/// The range check also rejects non-finite values (NaN and the infinities fall
+/// outside the bounds), so a rejected dimension is treated as unpriced: it
+/// falls back to the other source, or stays `$0`, rather than billing an
+/// absurd cost.
+pub(crate) fn sane_mtok(rate: f64) -> Option<f64> {
+    (0.0..=MAX_SANE_PER_MTOK).contains(&rate).then_some(rate)
+}
+
 /// Parse one per-token decimal string (e.g. `"0.000003"`) to USD per 1M tokens.
-/// `None` for absent/empty/unparseable/non-finite/negative values.
+/// `None` for absent/empty/unparseable/non-finite/negative/implausible values.
 ///
 /// The web rates editor prefill applies the same per-token → per-MTok
 /// convention in `web/src/components/sections/CostRatesEditor.tsx`; if the
 /// wire unit ever changes, both must move together.
 fn per_token_str_to_mtok(value: &Option<String>) -> Option<f64> {
     let parsed: f64 = value.as_deref()?.trim().parse().ok()?;
-    (parsed.is_finite() && parsed >= 0.0).then_some(parsed * 1_000_000.0)
+    sane_mtok(parsed * 1_000_000.0)
 }
 
 /// Normalize a provider's `/models` [`ModelPricing`] (per-token strings) into
@@ -225,9 +240,16 @@ pub fn spawn_refresher(config: Arc<RwLock<Config>>) {
             let groups = enabled_pricing_groups(&cfg);
             if groups.is_empty() {
                 // Every provider opted back out (e.g. via reload): clear the
-                // snapshot so stale prices stop filling. A deliberate opt-out
-                // is not a failed refresh — only the latter keeps old data.
-                store_snapshot(PriceSnapshot::new());
+                // snapshot once, on the transition to empty, so stale prices
+                // stop filling. Skip the rewrite when it is already empty so an
+                // idle refresher does not churn a fresh Arc every cycle. The
+                // loop stays alive (it does not break) so a later reload that
+                // re-enables a provider is picked up without a restart. A
+                // deliberate opt-out is not a failed refresh — only the latter
+                // keeps old data.
+                if !current_snapshot().is_empty() {
+                    store_snapshot(PriceSnapshot::new());
+                }
             } else {
                 refresh_once(&groups).await;
             }
@@ -381,8 +403,10 @@ fn rates_catalog(models: Vec<ModelInfo>) -> HashMap<String, ModelRates> {
 /// Assemble the price snapshot from the per-gateway catalogs and the models.dev
 /// catalogs. Pure (no I/O) so the precedence + fallback logic is unit-tested.
 ///
-/// For each flagged model: the gateway's own price wins; otherwise the
-/// models.dev price for that provider's catalog key fills the gap. A model
+/// For each flagged model the gateway's price wins per dimension, and the
+/// models.dev price for that provider's catalog key backfills only the
+/// dimensions the gateway left unset — so a gateway that prices input+output
+/// but not `cache_read` still gets `cache_read` from models.dev. A model
 /// neither source prices is simply absent (cost recording leaves it at $0, as
 /// before).
 fn assemble_snapshot(
@@ -392,19 +416,26 @@ fn assemble_snapshot(
     let mut out = PriceSnapshot::new();
     for (wanted, catalog) in gateway_results {
         for want in *wanted {
-            // Gateway first; models.dev (keyed by the provider's catalog name)
-            // fills what the gateway didn't price. Both catalogs drop empty
-            // rates at construction, so any hit carries at least one rate.
-            let rates = match_pricing(catalog, &want.model_id).or_else(|| {
-                want.models_dev_key
-                    .as_deref()
-                    .and_then(|md_key| models_dev.get(md_key))
-                    .and_then(|md_catalog| match_pricing(md_catalog, &want.model_id))
-            });
+            let gw = match_pricing(catalog, &want.model_id).copied();
+            let md = want
+                .models_dev_key
+                .as_deref()
+                .and_then(|md_key| models_dev.get(md_key))
+                .and_then(|md_catalog| match_pricing(md_catalog, &want.model_id))
+                .copied();
+            // Per-dimension precedence: gateway wins each dimension it sets,
+            // models.dev fills the rest. Both catalogs drop empty rates at
+            // construction, so a present entry carries at least one rate.
+            let rates = match (gw, md) {
+                (Some(g), Some(m)) => Some(g.or(m)),
+                (Some(g), None) => Some(g),
+                (None, Some(m)) => Some(m),
+                (None, None) => None,
+            };
             if let Some(rates) = rates {
                 out.entry(want.provider_key.clone())
                     .or_default()
-                    .insert(want.model_id.clone(), *rates);
+                    .insert(want.model_id.clone(), rates);
             }
         }
     }
@@ -557,6 +588,16 @@ mod tests {
             input_cache_write: None,
         };
         assert!(normalize_pricing(&empty).is_empty());
+
+        // An absurd per-token value ("5" -> $5M per 1M tokens) is rejected by
+        // the sanity ceiling rather than billed.
+        let absurd = ModelPricing {
+            prompt: Some("5".into()),
+            completion: None,
+            input_cache_read: None,
+            input_cache_write: None,
+        };
+        assert!(normalize_pricing(&absurd).is_empty());
     }
 
     #[test]
@@ -589,6 +630,14 @@ mod tests {
         }
     }
 
+    fn full_rate(input: Option<f64>, output: Option<f64>, cached: Option<f64>) -> ModelRates {
+        ModelRates {
+            input_per_mtok: input,
+            output_per_mtok: output,
+            cached_input_per_mtok: cached,
+        }
+    }
+
     #[test]
     fn assemble_gateway_wins_then_models_dev_fills_gaps() {
         let wanted = vec![
@@ -596,11 +645,14 @@ mod tests {
             want("kilo.b", "only-on-mdev", Some("kilo")), // gateway blank → models.dev
             want("kilo.c", "vendor/slug", Some("kilo")),  // suffix match on gateway
             want("kilo.d", "nowhere", Some("kilo")),      // neither source
+            want("kilo.f", "partial", Some("kilo")),      // gateway in+out, mdev cache
             want("x.e", "no-key", None),                  // no fallback key
         ];
         let mut gateway = HashMap::new();
         gateway.insert("minimax/m2.7".to_string(), rate(0.3));
         gateway.insert("slug".to_string(), rate(0.7)); // matched via suffix
+        // Gateway prices input+output for `partial` but leaves cache_read unset.
+        gateway.insert("partial".to_string(), full_rate(Some(2.0), Some(4.0), None));
         let gateway_results = vec![(wanted.as_slice(), gateway)];
 
         let mut md = HashMap::new();
@@ -608,21 +660,44 @@ mod tests {
         // the gateway must win.
         md.insert("minimax/m2.7".to_string(), rate(9.9));
         md.insert("only-on-mdev".to_string(), rate(0.5));
+        // models.dev has all three for `partial`; only cache_read should be used.
+        md.insert(
+            "partial".to_string(),
+            full_rate(Some(9.9), Some(9.9), Some(0.5)),
+        );
         let models_dev = HashMap::from([("kilo".to_string(), md)]);
 
         let snap = assemble_snapshot(&gateway_results, &models_dev);
 
         // The family's opted-in aliases collapse under one `<type>` key, keyed
-        // by model id (kilo.a/b/c all live under "kilo").
+        // by model id (kilo.a/b/c/f all live under "kilo").
         // Gateway price wins over models.dev for the shared model.
         assert_eq!(snap["kilo"]["minimax/m2.7"].input_per_mtok, Some(0.3));
         // models.dev fills a model the gateway didn't price.
         assert_eq!(snap["kilo"]["only-on-mdev"].input_per_mtok, Some(0.5));
         // Suffix match against the gateway catalog.
         assert_eq!(snap["kilo"]["vendor/slug"].input_per_mtok, Some(0.7));
+        // Per-dimension merge: gateway wins input+output, models.dev backfills
+        // ONLY the cache_read dimension the gateway left unset.
+        let partial = &snap["kilo"]["partial"];
+        assert_eq!(partial.input_per_mtok, Some(2.0)); // gateway
+        assert_eq!(partial.output_per_mtok, Some(4.0)); // gateway
+        assert_eq!(partial.cached_input_per_mtok, Some(0.5)); // models.dev backfill
         // Neither source: the model is absent from the family map (left at $0).
         assert!(!snap["kilo"].contains_key("nowhere"));
         // The no-key case priced nothing, so its family never appears.
         assert!(!snap.contains_key("x"));
+    }
+
+    #[test]
+    fn sane_mtok_rejects_nonfinite_negative_and_absurd() {
+        assert_eq!(sane_mtok(3.0), Some(3.0));
+        assert_eq!(sane_mtok(0.0), Some(0.0));
+        assert_eq!(sane_mtok(MAX_SANE_PER_MTOK), Some(MAX_SANE_PER_MTOK));
+        assert!(sane_mtok(-1.0).is_none());
+        assert!(sane_mtok(f64::INFINITY).is_none());
+        assert!(sane_mtok(f64::NAN).is_none());
+        // Above the ceiling ($1/token) -> rejected (parsing artifact / hostile gateway).
+        assert!(sane_mtok(MAX_SANE_PER_MTOK * 2.0).is_none());
     }
 }
