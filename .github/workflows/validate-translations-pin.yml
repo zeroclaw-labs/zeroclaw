@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout with pinned submodule
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: recursive
           fetch-depth: 1
@@ -55,14 +55,23 @@ jobs:
 
       - name: Validate msgid parity across catalogues
         run: |
+          # Extract complete msgids (including multi-line continuation strings),
+          # not just `^msgid ` heads. A bad submodule commit that alters a
+          # multi-line source string must not compare equal. We canonicalize each
+          # catalogue with `msgcat --no-wrap` so continuation lines collapse onto
+          # the msgid line, then capture every full msgid entry.
+          extract_ids() {
+            msgcat --no-wrap --sort-output "$1" 2>/dev/null \
+              | awk '/^msgid /{print} /^msgid_plural /{print}' \
+              | sort -u
+          }
           ref=""
           refname=""
           ok=0
           for po in docs/book/po/*.po; do
             [ -f "$po" ] || continue
             ids="$(mktemp)"
-            msgcat --sort-output "$po" 2>/dev/null \
-              | grep '^msgid ' | sort -u > "$ids"
+            extract_ids "$po" > "$ids"
             if [ -z "$ref" ]; then
               ref="$ids"
               refname="$po"
