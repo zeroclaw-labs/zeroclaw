@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# bump-version.sh — Update every hardcoded version reference in the repo.
+# bump-version.sh: update every hardcoded version reference in the repo.
 #
 # Usage:
 #   scripts/release/bump-version.sh           # reads version from Cargo.toml
@@ -79,7 +79,7 @@ echo "Workspace Cargo.toml..."
 ROOT_CARGO="$REPO_ROOT/Cargo.toml"
 if [[ -f "$ROOT_CARGO" ]]; then
   before="$(sha256sum "$ROOT_CARGO" | awk '{print $1}')"
-  # [workspace.package] version — first bare `version = "..."` line in the file
+  # [workspace.package] version, first bare `version = "..."` line in the file
   sed -i -E '0,/^version = "[^"]+"/s||version = "'"$VERSION"'"|' "$ROOT_CARGO" 2>/dev/null \
     || sed -i '' -E '/^version = "[^"]+"/{s//version = "'"$VERSION"'"/;:a;n;ba;}' "$ROOT_CARGO"
   # [workspace.dependencies] path-dep version pins, skipping aardvark*. Covers
@@ -169,24 +169,22 @@ done
 # The translated docs catalogues (.po) live in the zeroclaw-docs-translations
 # submodule mounted at docs/book/po, tagged v{version} to mirror each release.
 # Pin the gitlink to the matching tag so a release ships the catalogues cut for
-# that version; fall back to origin/main with a warning when the tag is not yet
-# published. The submodule's own release owns the in-catalogue version-literal
-# swaps, so the main-tree sweep above no longer touches .po files.
+# that version. Fail closed when the tag is not yet published: a release must
+# never pin to a moving ref. Cut the tag first with refresh-translations.sh.
+# The submodule's own release owns the in-catalogue version-literal swaps, so
+# the main-tree sweep above no longer touches .po files.
 echo "Docs translation submodule pin..."
 SUBMODULE_PATH="$REPO_ROOT/docs/book/po"
 if [[ -f "$REPO_ROOT/.gitmodules" ]] && [[ -d "$SUBMODULE_PATH/.git" || -f "$SUBMODULE_PATH/.git" ]]; then
   before="$(git -C "$REPO_ROOT" rev-parse "HEAD:docs/book/po" 2>/dev/null || echo none)"
-  git -C "$SUBMODULE_PATH" fetch --tags --quiet origin 2>/dev/null || true
-  if git -C "$SUBMODULE_PATH" rev-parse --verify --quiet "refs/tags/v${VERSION}" >/dev/null; then
-    git -C "$SUBMODULE_PATH" checkout --quiet "v${VERSION}"
-    echo "  pinned docs/book/po to tag v${VERSION}"
-  else
-    git -C "$SUBMODULE_PATH" checkout --quiet origin/main 2>/dev/null \
-      || git -C "$SUBMODULE_PATH" checkout --quiet main 2>/dev/null || true
-    echo "  warn: tag v${VERSION} not found in docs-translations; pinned to main."
-    echo "        Cut and push v${VERSION} in zeroclaw-labs/zeroclaw-docs-translations,"
-    echo "        then re-run this step so the release pins the matching catalogues."
+  git -C "$SUBMODULE_PATH" fetch --tags origin
+  if ! git -C "$SUBMODULE_PATH" rev-parse --verify --quiet "refs/tags/v${VERSION}" >/dev/null; then
+    echo "error: tag v${VERSION} not found in zeroclaw-docs-translations." >&2
+    echo "       cut the catalogue tag first: ./scripts/release/refresh-translations.sh ${VERSION}" >&2
+    exit 1
   fi
+  git -C "$SUBMODULE_PATH" checkout --quiet "v${VERSION}"
+  echo "  pinned docs/book/po to tag v${VERSION}"
   ( cd "$REPO_ROOT" && git add docs/book/po )
   after="$(git -C "$REPO_ROOT" rev-parse "HEAD:docs/book/po" 2>/dev/null || echo none)"
   current="$(git -C "$SUBMODULE_PATH" rev-parse HEAD)"
@@ -238,7 +236,7 @@ fi
 
 echo ""
 if [[ $changed -gt 0 ]]; then
-  echo "Done — $changed file(s) updated to v$VERSION."
+  echo "Done. $changed file(s) updated to v$VERSION."
 else
-  echo "Done — all files already at v$VERSION."
+  echo "Done. all files already at v$VERSION."
 fi

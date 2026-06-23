@@ -191,35 +191,21 @@ Per release, the submodule is tagged `v{version}` to mirror the main repo, and `
 
 ## Release translation workflow
 
-Before tagging a release, run a full translation pass locally inside the submodule and commit the updated `.po` files **to the submodule repo**, then advance the main repo's gitlink.
+Before tagging a release, refresh the catalogues and cut the matching submodule tag. This is one command: it derives the version from `Cargo.toml`, runs the translation pass, commits and pushes the catalogues to the submodule repo, tags it `v{version}`, and pins the main-repo gitlink to that tag. No `git -C` by hand, no version typed into git commands.
 
 <div class="os-tabs-src">
 
 #### sh
 
 ```sh
-git submodule update --init docs/book/po          # ensure the submodule is present
+git submodule update --init docs/book/po     # ensure the submodule is present (once)
 
-# Fast delta pass (only new or changed strings since last release)
-cargo mdbook sync --model-provider ollama
-
-# OR: quality pass — re-translate everything
-cargo mdbook sync --model-provider ollama --force
-
-cargo mdbook check   # validate before committing
-cargo mdbook stats   # review coverage
-
-# Commit catalogues in the submodule, then tag it to mirror the release
-git -C docs/book/po add -A
-git -C docs/book/po commit -m "chore: refresh catalogues for vX.Y.Z"
-git -C docs/book/po push origin main
-git -C docs/book/po tag vX.Y.Z && git -C docs/book/po push origin vX.Y.Z
-
-# bump-version.sh pins the main-repo gitlink to the tag during the version bump
-bash scripts/release/bump-version.sh X.Y.Z
+./scripts/release/refresh-translations.sh    # version from Cargo.toml
 ```
 
 </div>
+
+The script fetches the submodule tag and `bump-version.sh` pins the gitlink to it; if the tag is missing the bump fails closed rather than pinning to a moving `main`. To review coverage or validate format without cutting a tag, run `cargo mdbook stats` / `cargo mdbook check` in the working tree first. Pass `--no-translate` to skip the sync pass when the catalogues are already current, or an explicit version (`./scripts/release/refresh-translations.sh 0.8.2`) to override the `Cargo.toml` default.
 
 The model used is whatever is configured under `providers.models.<name>`.
 

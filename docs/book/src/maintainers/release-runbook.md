@@ -45,17 +45,21 @@ review it for accuracy before reusing it.
 
 ## Step 2: Bump and merge the version PR
 
-Bump `workspace.package.version` in the workspace `Cargo.toml`, then sync all other version references:
+Bump `workspace.package.version` in the workspace `Cargo.toml`, then run the release sync. This one command refreshes the docs translation catalogues, cuts the matching `v{version}` tag in the [`zeroclaw-labs/zeroclaw-docs-translations`](https://github.com/zeroclaw-labs/zeroclaw-docs-translations) submodule, pins the main-repo gitlink to that tag, and syncs every other version reference. The version is derived from `Cargo.toml`, so nothing is typed by hand:
 
 <div class="os-tabs-src">
 
 #### sh
 
 ```sh
-bash scripts/release/bump-version.sh X.Y.Z
+git submodule update --init docs/book/po     # ensure the submodule is present (once)
+
+./scripts/release/refresh-translations.sh    # refresh catalogues, tag, pin, bump
 ```
 
 </div>
+
+`refresh-translations.sh` runs `bump-version.sh` as its final step, so the version-reference sweep below happens automatically. The submodule pin fails closed: if the `v{version}` catalogue tag cannot be cut or found, the release aborts rather than pinning to a moving `main`. To run the version sweep alone after the tag already exists, call `./scripts/release/bump-version.sh` directly (version from `Cargo.toml`).
 
 This updates README badges, the Tauri config, and workflow description
 examples, then regenerates every spec-driven install surface via
@@ -74,13 +78,8 @@ Open a PR. Label it `chore`, `size: XS`. Get one maintainer review. Merge when
 CI is green. The **Installer Drift** gate in CI fails the PR if a generated
 surface is out of sync with the spec, so a missed regeneration cannot land.
 
-> **Docs translation submodule.** Before running the bump, cut and push the
-> matching `vX.Y.Z` tag in
-> [`zeroclaw-labs/zeroclaw-docs-translations`](https://github.com/zeroclaw-labs/zeroclaw-docs-translations)
-> (the `docs/book/po` submodule). `bump-version.sh` pins the gitlink to that tag;
-> if the tag is missing it falls back to the submodule's `main` and prints a
-> warning. See [Docs & Translations](../maintainers/docs-and-translations.md)
-> for the catalogue refresh + tag steps.
+See [Docs & Translations](../maintainers/docs-and-translations.md) for the
+catalogue refresh details and the `--no-translate` / explicit-version options.
 
 **Confirm the merge landed correctly:**
 
