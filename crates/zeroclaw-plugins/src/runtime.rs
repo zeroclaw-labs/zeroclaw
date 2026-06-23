@@ -201,12 +201,30 @@ fn inject_config(args_json: &[u8], config: &HashMap<String, String>) -> Result<S
 /// config section, returning a `ToolResult`. The config is injected into the
 /// input under the reserved `__config` key so the plugin reads it from its own
 /// input rather than calling back into the host.
+/// Resolve the config map a plugin actually receives: the configured section
+/// only when the manifest grants `ConfigRead`, otherwise empty. Gating here
+/// (not at injection) keeps `inject_config`'s caller-`__config` stripping intact
+/// for permissionless plugins while honoring the manifest permission contract.
+fn effective_config<'a>(
+    config: &'a HashMap<String, String>,
+    permissions: &[PluginPermission],
+) -> &'a HashMap<String, String> {
+    if permissions.contains(&PluginPermission::ConfigRead) {
+        config
+    } else {
+        EMPTY_CONFIG.get_or_init(HashMap::new)
+    }
+}
+
+static EMPTY_CONFIG: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+
 pub fn call_execute(
     plugin: &mut extism::Plugin,
     args_json: &[u8],
     config: &HashMap<String, String>,
+    permissions: &[PluginPermission],
 ) -> Result<ToolResult> {
-    let input = inject_config(args_json, config)?;
+    let input = inject_config(args_json, effective_config(config, permissions))?;
 
     let output = plugin
         .call::<&str, String>("execute", &input)
@@ -324,5 +342,34 @@ mod tests {
         let out = inject_config(args, &config).unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["__config"]["api_key"], "real");
+    }
+
+    #[test]
+    fn effective_config_withholds_section_without_config_read_permission() {
+        let config = HashMap::from([("api_key".to_string(), "secret".to_string())]);
+        let resolved = effective_config(&config, &[PluginPermission::HttpClient]);
+        assert!(
+            resolved.is_empty(),
+            "a plugin without ConfigRead must not receive its configured section"
+        );
+        // And the resulting injected args carry no __config, even with a caller forging it.
+        let args = br#"{"prompt":"x","__config":{"api_key":"forged"}}"#;
+        let out = inject_config(args, resolved).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            v.get("__config").is_none(),
+            "no __config injected for a permissionless plugin; caller-supplied value is stripped"
+        );
+    }
+
+    #[test]
+    fn effective_config_passes_section_with_config_read_permission() {
+        let config = HashMap::from([("api_key".to_string(), "secret".to_string())]);
+        let resolved = effective_config(&config, &[PluginPermission::ConfigRead]);
+        assert_eq!(
+            resolved.get("api_key").map(String::as_str),
+            Some("secret"),
+            "a plugin with ConfigRead must receive its configured section"
+        );
     }
 }
