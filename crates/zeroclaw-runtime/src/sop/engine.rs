@@ -779,12 +779,22 @@ impl SopEngine {
                 )
             );
 
+            // Mirror the paused checkpoint into the shared run store (alongside
+            // the deterministic state file) so a restart leaves a non-terminal
+            // row for restore_runs() to rehydrate.
+            self.persist_active(run_id);
+
             Ok(SopRunAction::CheckpointWait {
                 run_id: run_id.to_string(),
                 step: step.clone(),
                 state_file,
             })
         } else {
+            // Persist the active (Running) deterministic run so a restart mid-run
+            // leaves a non-terminal row for restore_runs() to rehydrate. This is
+            // the single sink for start / advance / resume deterministic steps.
+            self.persist_active(run_id);
+
             Ok(SopRunAction::DeterministicStep {
                 run_id: run_id.to_string(),
                 step: step.clone(),
@@ -2706,6 +2716,52 @@ type = "manual"
             "terminal excluded from active"
         );
         assert_eq!(store.load_run("r-persist").unwrap().unwrap().revision, 2);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn deterministic_active_run_persists_and_restores_before_terminal() {
+        use super::super::store::SqliteRunStore;
+        let path =
+            std::env::temp_dir().join(format!("zc-sop-det-restore-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = std::sync::Arc::new(SqliteRunStore::open(&path).unwrap());
+
+        let mut engine = SopEngine::new(SopConfig::default()).with_store(store.clone());
+        engine.set_sops_for_test(vec![deterministic_sop("det-sop")]);
+
+        // Start: the first deterministic step (Running) must be persisted as active,
+        // not only on terminal completion.
+        let action = engine.start_run("det-sop", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        let active = store.load_active_runs().unwrap();
+        assert_eq!(
+            active.len(),
+            1,
+            "deterministic start must persist an active run"
+        );
+        assert_eq!(active[0].run.run_id, run_id);
+        assert_eq!(active[0].run.current_step, 1);
+
+        // Advance into the checkpoint: still non-terminal, must stay persisted in
+        // the shared store (not only in the deterministic state file).
+        let action = engine
+            .advance_deterministic_step(&run_id, serde_json::json!({"r": 1}), None)
+            .unwrap();
+        assert!(matches!(action, SopRunAction::CheckpointWait { .. }));
+        let stored = store.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(stored.run.current_step, 2);
+        assert_eq!(stored.run.status, SopRunStatus::PausedCheckpoint);
+
+        // Simulate a daemon restart mid-run: a fresh engine on the same store must
+        // rehydrate the in-flight deterministic run (the gap this fixes).
+        let mut restarted = SopEngine::new(SopConfig::default()).with_store(store.clone());
+        restarted.restore_runs();
+        assert!(
+            restarted.active_runs().contains_key(&run_id),
+            "deterministic in-flight run must rehydrate after restart"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
