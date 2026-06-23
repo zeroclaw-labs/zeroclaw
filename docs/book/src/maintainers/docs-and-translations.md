@@ -181,26 +181,29 @@ Maintainers should accept the routine English docs exception documented in [Buil
 
 Everything else, `lang-switcher.js`, CI deploy target list, `cargo mdbook locales` output, reads from `locales.toml` automatically.
 
+## Translation catalogue submodule
+
+The translated `.po` catalogues are not in this repo's main tree. They live in the dedicated [`zeroclaw-labs/zeroclaw-docs-translations`](https://github.com/zeroclaw-labs/zeroclaw-docs-translations) repo, mounted as a git submodule at `docs/book/po` (default branch `main`). The mount point is path-transparent: `book.toml`'s gettext preprocessor, `cargo mdbook sync`, and `cargo mdbook build` all read `po/` exactly as before.
+
+The Rust crate dev loop never needs the submodule. Only docs builds and the docs-deploy / release jobs require it; those checkouts pass `submodules: recursive`. Everything else stays submodule-free.
+
+Per release, the submodule is tagged `v{version}` to mirror the main repo, and `scripts/release/bump-version.sh` pins the gitlink to that tag (falling back to `main` with a warning if the tag is not yet cut). `messages.pot` and `*.failures.log` are regenerated artifacts and are gitignored in both repos, not tracked.
+
 ## Release translation workflow
 
-Before tagging a release, run a full translation pass locally and commit the updated `.po` files.
+During a release, after `./scripts/release/bump-version.sh` has set the version in `Cargo.toml`, refresh the catalogues and cut the matching submodule tag. This is one command: it reads the version from `Cargo.toml`, runs the translation pass, commits and pushes the catalogues to the submodule repo, tags it `v{version}`, and stages the main-repo gitlink pinned to that tag. No `git -C` by hand, no version typed into git commands. It initialises the submodule if needed.
 
 <div class="os-tabs-src">
 
 #### sh
 
 ```sh
-# Fast delta pass (only new or changed strings since last release)
-cargo mdbook sync --model-provider ollama
-
-# OR: quality pass — re-translate everything
-cargo mdbook sync --model-provider ollama --force
-
-cargo mdbook check   # validate before committing
-cargo mdbook stats   # review coverage
+./scripts/release/refresh-translations.sh    # version from Cargo.toml
 ```
 
 </div>
+
+Run it after `bump-version.sh` so the version it reads is the release version. To review coverage or validate format without cutting a tag, run `cargo mdbook stats` / `cargo mdbook check` in the working tree first. Pass `--no-translate` to skip the sync pass when the catalogues are already current, or an explicit version (`./scripts/release/refresh-translations.sh 0.8.2`) to override the `Cargo.toml` default. The `Validate Translations Pin` CI gate validates the pinned catalogues before merge.
 
 The model used is whatever is configured under `providers.models.<name>`.
 

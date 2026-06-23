@@ -5,6 +5,7 @@
 //! one table so adding one is data, not control flow.
 
 pub mod container;
+pub mod container_base;
 pub mod docker_tags;
 pub mod flake;
 pub mod install_sh;
@@ -83,7 +84,8 @@ fn registry() -> Vec<Surface> {
 /// heavyweight), build-time overridable via --build-arg.
 fn render_docker_arg(root: &Path, current: &str) -> anyhow::Result<String> {
     let body = container::render_features_arg(root, &Sel::Dist)?;
-    container::splice(current, "docker-features-arg", &body)
+    let spliced = container::splice(current, "docker-features-arg", &body)?;
+    container_base::splice_zones(root, &spliced)
 }
 
 /// Containerfile surface: standard image ships Dist (all channels, no
@@ -128,6 +130,10 @@ pub fn run(targets: &[String], check: bool) -> anyhow::Result<()> {
 
     let root = workspace_root();
     let mut drift = false;
+
+    if !check {
+        container_base::refresh_source(&root)?;
+    }
 
     for s in selected {
         let path = root.join(s.file);

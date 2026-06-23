@@ -1,0 +1,92 @@
+name: Validate Translations Pin
+
+# Gates the docs/book/po submodule at the exact commit a PR pins it to. The
+# pin only advances through scripts/release/bump-version.sh on a release PR, so
+# this runs whenever a PR moves the gitlink or .gitmodules and validates the
+# pinned catalogues in the main repo's own CI, before the bad SHA can merge.
+on:
+  pull_request:
+    paths:
+      - docs/book/po
+      - .gitmodules
+      - .github/workflows/validate-translations-pin.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-translations-pin-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-pin:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout with pinned submodule
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install gettext tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gettext
+
+      - name: Verify catalogues resolved at pinned commit
+        run: |
+          pinned="$(git -C docs/book/po rev-parse HEAD)"
+          echo "docs/book/po pinned at ${pinned}"
+          count="$(find docs/book/po -maxdepth 1 -name '*.po' | wc -l)"
+          if [ "$count" -eq 0 ]; then
+            echo "error: no .po catalogues at the pinned submodule commit" >&2
+            exit 1
+          fi
+          echo "found ${count} catalogue(s)"
+
+      - name: Validate .po format
+        run: |
+          ok=0
+          for po in docs/book/po/*.po; do
+            [ -f "$po" ] || continue
+            msgfmt --check-format "$po" -o /dev/null || ok=1
+          done
+          exit $ok
+
+      - name: Validate msgid parity across catalogues
+        run: |
+          # Compare complete gettext entries, not just `^msgid ` heads. msgcat
+          # --no-wrap stops line wrapping but cannot collapse msgids containing
+          # real embedded newlines, so accumulate every continuation string line
+          # of each msgid / msgid_plural entry into one NUL-delimited record.
+          # A change to any multi-line source string then changes the record.
+          extract_ids() {
+            msgcat --no-wrap --sort-output "$1" 2>/dev/null | awk '
+              function flush() { if (cur != "") { printf "%s\0", cur; cur="" } }
+              /^msgid / || /^msgid_plural / { flush(); cur=$0; capturing=1; next }
+              /^msgstr/ || /^msgstr\[/ { capturing=0; next }
+              /^"/ { if (capturing) cur=cur "\n" $0; next }
+              /^$/ { capturing=0; next }
+              { capturing=0 }
+              END { flush() }
+            ' | sort -z
+          }
+          ref=""
+          refname=""
+          ok=0
+          for po in docs/book/po/*.po; do
+            [ -f "$po" ] || continue
+            ids="$(mktemp)"
+            extract_ids "$po" > "$ids"
+            if [ -z "$ref" ]; then
+              ref="$ids"
+              refname="$po"
+              continue
+            fi
+            if ! cmp -s "$ref" "$ids"; then
+              echo "error: msgid set in $po diverges from $refname" >&2
+              diff <(tr '\0' '\n' < "$ref") <(tr '\0' '\n' < "$ids") | head -20 >&2
+              ok=1
+            fi
+          done
+          exit $ok
