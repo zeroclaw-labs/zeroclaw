@@ -2386,7 +2386,7 @@ pub fn install_extra_registry_skill_source(
             }
         })?;
 
-    if registry.kind != "git" {
+    if registry.kind != zeroclaw_config::schema::ExternalRegistryKind::Git {
         anyhow::bail!(
             "registry '{registry_name}' uses unsupported kind '{}'; only 'git' is supported",
             registry.kind

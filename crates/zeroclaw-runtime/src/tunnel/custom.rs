@@ -167,7 +167,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_without_pattern_returns_local_url() {
-        let tunnel = CustomTunnel::new("sleep 1".into(), None, None);
+        let tunnel = CustomTunnel::new(long_running_command(), None, None);
 
         let url = tunnel.start("127.0.0.1", 4455).await.unwrap();
         assert_eq!(url, "http://127.0.0.1:4455");
@@ -182,7 +182,7 @@ mod tests {
     #[tokio::test]
     async fn start_with_pattern_extracts_url() {
         let tunnel = CustomTunnel::new(
-            "echo https://public.example".into(),
+            echo_command("https://public.example"),
             None,
             Some("public.example".into()),
         );
@@ -201,7 +201,7 @@ mod tests {
     #[tokio::test]
     async fn start_replaces_host_and_port_placeholders() {
         let tunnel = CustomTunnel::new(
-            "echo http://{host}:{port}".into(),
+            echo_command("http://{host}:{port}"),
             None,
             Some("http://".into()),
         );
@@ -215,11 +215,31 @@ mod tests {
     #[tokio::test]
     async fn health_check_with_unreachable_health_url_returns_false() {
         let tunnel = CustomTunnel::new(
-            "sleep 1".into(),
+            long_running_command(),
             Some("http://127.0.0.1:9/healthz".into()),
             None,
         );
 
         assert!(!tunnel.health_check().await);
+    }
+
+    #[cfg(windows)]
+    fn long_running_command() -> String {
+        "cmd /C ping -n 2 127.0.0.1".into()
+    }
+
+    #[cfg(not(windows))]
+    fn long_running_command() -> String {
+        "sleep 1".into()
+    }
+
+    #[cfg(windows)]
+    fn echo_command(message: &str) -> String {
+        format!("cmd /C echo {message}")
+    }
+
+    #[cfg(not(windows))]
+    fn echo_command(message: &str) -> String {
+        format!("echo {message}")
     }
 }

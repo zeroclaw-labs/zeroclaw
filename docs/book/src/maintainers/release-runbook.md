@@ -93,7 +93,7 @@ Commit everything together:
 chore: bump version to vX.Y.Z
 ```
 
-Open a PR. Label it `chore`, `size: XS`. Get one maintainer review. Merge when
+Open a PR. Label it `chore`, `size:XS`. Get one maintainer review. Merge when
 CI is green. The **Installer Drift** gate in CI fails the PR if a generated
 surface is out of sync with the spec, so a missed regeneration cannot land. The
 **Validate Translations Pin** gate resolves the submodule at the pinned commit

@@ -3278,6 +3278,20 @@ pub struct ResolvedRuntime {
     pub tool_receipts: ToolReceiptsConfig,
 }
 
+impl ResolvedRuntime {
+    /// Effective token budget for preemptive whole-turn history trimming.
+    /// When `history_pruning.enabled` is set, an explicit `max_tokens` floor
+    /// trims earlier than the hard context ceiling; otherwise the ceiling is
+    /// the only trigger. Reuses the existing `history_pruning.*` idents.
+    pub fn effective_context_budget(&self) -> usize {
+        if self.history_pruning.enabled && self.history_pruning.max_tokens > 0 {
+            self.max_context_tokens.min(self.history_pruning.max_tokens)
+        } else {
+            self.max_context_tokens
+        }
+    }
+}
+
 impl Default for ResolvedRuntime {
     fn default() -> Self {
         Self {
@@ -5416,6 +5430,62 @@ pub enum SkillsPromptInjectionMode {
 ///
 /// Reuses the same git-clone mechanism as the default `zeroclaw-skills`
 /// registry. Install a skill from it with `registry:<name>/<skill>`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ExternalRegistryKind {
+    #[default]
+    Git,
+    Unsupported(String),
+}
+
+impl ExternalRegistryKind {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Git => "git",
+            Self::Unsupported(kind) => kind.as_str(),
+        }
+    }
+}
+
+impl From<String> for ExternalRegistryKind {
+    fn from(kind: String) -> Self {
+        if kind == "git" {
+            Self::Git
+        } else {
+            Self::Unsupported(kind)
+        }
+    }
+}
+
+impl From<ExternalRegistryKind> for String {
+    fn from(kind: ExternalRegistryKind) -> Self {
+        kind.as_str().to_string()
+    }
+}
+
+impl std::fmt::Display for ExternalRegistryKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for ExternalRegistryKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ExternalRegistryKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(String::deserialize(deserializer)?.into())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ExternalRegistry {
@@ -5425,8 +5495,9 @@ pub struct ExternalRegistry {
     pub url: String,
     /// Registry protocol. Only `"git"` is supported today; other protocols
     /// are reserved for a future additive release.
-    #[serde(default = "default_extra_registry_kind")]
-    pub kind: String,
+    #[serde(default)]
+    #[cfg_attr(feature = "schema-export", schemars(with = "String"))]
+    pub kind: ExternalRegistryKind,
     /// Whether this registry is eligible for installs. Default: `true`.
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -5444,10 +5515,6 @@ impl ExternalRegistry {
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
     }
-}
-
-fn default_extra_registry_kind() -> String {
-    "git".to_string()
 }
 
 /// Skills loading configuration (`[skills]` section).
@@ -7602,6 +7669,20 @@ fn default_linkedin_api_version() -> String {
     "202602".to_string()
 }
 
+/// Per-plugin config section keyed by plugin alias; values are secret so they
+/// encrypt at rest under the same adjacent `.secret_key` as every other secret.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "plugins.entries"]
+pub struct PluginEntryConfig {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub config: HashMap<String, String>,
+}
+
 /// Plugin system configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -7623,6 +7704,20 @@ pub struct PluginsConfig {
     #[serde(default)]
     #[nested]
     pub security: PluginSecurityConfig,
+    #[serde(default)]
+    #[nested]
+    #[natural_key = "name"]
+    pub entries: Vec<PluginEntryConfig>,
+}
+
+impl PluginsConfig {
+    #[must_use]
+    pub fn entry_config(&self, alias: &str) -> Option<&HashMap<String, String>> {
+        self.entries
+            .iter()
+            .find(|e| e.name == alias)
+            .map(|e| &e.config)
+    }
 }
 
 impl PluginsConfig {
@@ -7685,6 +7780,7 @@ impl Default for PluginsConfig {
             auto_discover: false,
             max_plugins: default_max_plugins(),
             security: PluginSecurityConfig::default(),
+            entries: Vec::new(),
         }
     }
 }
@@ -17821,7 +17917,7 @@ impl Config {
                         reg.name
                     );
                 }
-                if reg.kind != "git" {
+                if reg.kind != ExternalRegistryKind::Git {
                     anyhow::bail!(
                         "skills.extra_registries[{}].kind must be 'git' (got '{}'); other protocols are not yet supported",
                         reg.name,
@@ -19612,6 +19708,29 @@ mod tests {
     }
 
     #[test]
+    async fn plugin_entry_config_resolves_own_section_and_isolates_others() {
+        let mut plugins = super::PluginsConfig::default();
+        plugins.entries.push(super::PluginEntryConfig {
+            name: "image_gen_fal".into(),
+            config: std::collections::HashMap::from([("api_key".into(), "secret-a".into())]),
+        });
+        plugins.entries.push(super::PluginEntryConfig {
+            name: "sd_webui".into(),
+            config: std::collections::HashMap::from([("base_url".into(), "http://host".into())]),
+        });
+
+        let fal = plugins.entry_config("image_gen_fal").unwrap();
+        assert_eq!(fal.get("api_key").map(String::as_str), Some("secret-a"));
+        assert!(fal.get("base_url").is_none());
+
+        let sd = plugins.entry_config("sd_webui").unwrap();
+        assert_eq!(sd.get("base_url").map(String::as_str), Some("http://host"));
+        assert!(sd.get("api_key").is_none());
+
+        assert!(plugins.entry_config("unknown").is_none());
+    }
+
+    #[test]
     async fn amqp_validate_requires_paired_client_cert_and_key() {
         let base = AmqpConfig {
             enabled: true,
@@ -20240,7 +20359,7 @@ enabled = true
         ExternalRegistry {
             name: name.to_string(),
             url: url.to_string(),
-            kind: kind.to_string(),
+            kind: kind.to_string().into(),
             enabled: true,
         }
     }
