@@ -85,13 +85,14 @@ A manifest declares two separate things, and the distinction matters.
   HTTP egress, configuration, memory. A permission the manifest does not declare
   is a host function the plugin cannot reach.
 
-The host grants permissions narrowly. HTTP egress reuses the same SSRF guard the
-built-in HTTP tool uses, so a plugin holding the HTTP permission still cannot
-reach loopback, private, link-local, or cloud-metadata addresses, and cannot
-follow a redirect into one. Per-plugin configuration is injected by the host
-into the plugin's input under a reserved key, scoped to that plugin alias, so a
-plugin reads only its own resolved configuration and never the raw process
-environment or another plugin's secrets.
+The host grants permissions narrowly: a permission the manifest does not declare
+is a host function the plugin cannot reach. The HTTP-egress and per-plugin
+configuration boundaries (SSRF-guarded egress that cannot reach loopback,
+private, link-local, or cloud-metadata addresses or redirect into one; config
+injected per-alias so a plugin reads only its own resolved values and never the
+raw process environment or another plugin's secrets) are delivered by the
+companion plugin-hardening work and are documented alongside those changes. This
+page covers the signature-policy boundary.
 
 ## Configuration reference
 
@@ -122,12 +123,13 @@ that runs only plugins you build yourself can leave `signature_mode` at its
 
 Even with every permission granted, the sandbox bounds a plugin:
 
-- It runs as a WebAssembly module with no ambient access to the host process,
-  the filesystem outside its rooted workspace, or the network outside the
-  guarded HTTP egress.
-- It cannot read secret values. Where a credential is needed for an outbound
-  request, the host injects it at the egress boundary; the plugin only ever
-  learns whether a secret exists, never its value.
+- It runs as a WebAssembly module with no ambient access to the host process or
+  the filesystem outside its rooted workspace. Network egress is gated by the
+  HTTP permission; the SSRF-guarded egress boundary itself is delivered by the
+  companion plugin-hardening work.
+- Secret-value isolation at the egress boundary (the host injecting credentials
+  so the plugin learns only that a secret exists, never its value) is part of
+  that same companion work; this PR does not add it.
 - It cannot shadow or impersonate a built-in tool; the built-ins claim their
   names first and a colliding plugin tool is namespaced.
 
