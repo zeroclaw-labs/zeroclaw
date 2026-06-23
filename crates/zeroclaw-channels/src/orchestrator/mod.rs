@@ -11801,7 +11801,63 @@ api_key = "anthropic-key"
             "must be within budget after the in-place shrink: {total_after}"
         );
     }
+    #[test]
+    fn proactive_trim_preserves_tool_call_id_in_json_envelopes(){
+        use serde_json::Value;
 
+        let make_tool_msg = |id: &str, size: usize| {
+            let payload = "x".repeat(size);
+            let json = serde_json::json!({
+                "tool_call_id": id,
+                "content": payload
+            });
+            ChatMessage::tool(json.to_string())
+        };
+
+        let mut turns: Vec<ChatMessage> = Vec::new();
+
+        // Older tool turns eligible for proactive trimming
+        turns.push(make_tool_msg("call_1", 6000));
+        turns.push(make_tool_msg("call_2", 6000));
+
+        // Recent protected turns
+        turns.push(ChatMessage::user("u1".to_string()));
+        turns.push(ChatMessage::assistant("a1".to_string()));
+        turns.push(ChatMessage::user("u2".to_string()));
+        turns.push(ChatMessage::assistant("a2".to_string()));
+
+        let budget = 10_000;
+        let total_before: usize = turns.iter().map(|t| t.content.chars().count()).sum();
+        assert!(total_before > budget);
+
+        let dropped = proactive_trim_turns(&mut turns, budget);
+
+        // === Behavior (same level as existing test) ===
+        assert_eq!(dropped, 0, "in-place shrink must avoid dropping whole turns");
+        assert_eq!(turns.len(), 6, "no whole turns may be removed");
+
+        // === Structural contract (this is the entire point of the Issue) ===
+        for tool in turns.iter().filter(|t| t.role == "tool") {
+            let parsed: Value =
+                serde_json::from_str(&tool.content).expect("tool content must remain valid JSON");
+
+            let tool_call_id = parsed
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .expect("tool_call_id must be preserved after trimming");
+
+            let content = parsed
+                .get("content")
+                .and_then(Value::as_str)
+                .expect("content field must still exist after trimming");
+
+            assert!(!tool_call_id.is_empty(), "tool_call_id must not be emptied");
+            assert!(content.len() < 6000, "tool content must be shrunk");
+        }
+
+        let total_after: usize = turns.iter().map(|t| t.content.chars().count()).sum();
+        assert!(total_after <= budget, "history must fit within budget after trimming");
+    }
     #[test]
     fn append_sender_turn_stores_single_turn_per_call() {
         let sender = "telegram_u2".to_string();
