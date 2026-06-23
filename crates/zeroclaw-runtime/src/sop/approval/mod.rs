@@ -16,6 +16,7 @@ pub mod decision;
 pub mod ledger;
 pub mod principal;
 pub mod resolve;
+pub mod timeout;
 
 pub use decision::{ApprovalDecision, ResolveOutcome};
 pub use ledger::{GateEventKind, GateLedgerEntry};
