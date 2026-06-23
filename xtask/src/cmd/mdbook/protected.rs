@@ -63,14 +63,21 @@ enum FenceLanguage {
     Generic,
 }
 
+const FENCE_LANGUAGE_TAGS: &[(&str, FenceLanguage)] = &[
+    ("toml", FenceLanguage::Toml),
+    ("yaml", FenceLanguage::Yaml),
+    ("yml", FenceLanguage::Yaml),
+    ("json", FenceLanguage::Json),
+    ("jsonc", FenceLanguage::Json),
+];
+
 impl FenceLanguage {
     fn from_tag(tag: &str) -> Self {
-        match tag.to_ascii_lowercase().as_str() {
-            "toml" => Self::Toml,
-            "yaml" | "yml" => Self::Yaml,
-            "json" | "jsonc" => Self::Json,
-            _ => Self::Generic,
-        }
+        FENCE_LANGUAGE_TAGS
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(tag))
+            .map(|(_, language)| *language)
+            .unwrap_or(Self::Generic)
     }
 }
 
@@ -719,6 +726,15 @@ mod tests {
             "```jsonc\n// args: { \"output\": \"Bumped bzip2; source hash verified.\" }\n```",
         );
         assert!(!literals.contains(&"source hash verified.\"".to_string()));
+    }
+
+    #[test]
+    fn parses_fence_language_tags_from_table() {
+        assert_eq!(FenceLanguage::from_tag("toml"), FenceLanguage::Toml);
+        assert_eq!(FenceLanguage::from_tag("YAML"), FenceLanguage::Yaml);
+        assert_eq!(FenceLanguage::from_tag("yml"), FenceLanguage::Yaml);
+        assert_eq!(FenceLanguage::from_tag("jsonc"), FenceLanguage::Json);
+        assert_eq!(FenceLanguage::from_tag("shell"), FenceLanguage::Generic);
     }
 
     #[test]
