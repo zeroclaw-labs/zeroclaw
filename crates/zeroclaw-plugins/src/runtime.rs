@@ -352,6 +352,70 @@ mod tests {
         );
     }
 
+    /// Serve a single HTTP/1.1 response on a fresh loopback listener and return
+    /// its bound address. The closure receives nothing; it always returns the
+    /// raw response bytes. The thread handles exactly one connection.
+    fn spawn_one_shot_http(response: &'static [u8]) -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(response);
+                let _ = stream.flush();
+            }
+        });
+        addr
+    }
+
+    // Behavioral: a guarded client must NOT follow redirects. The server
+    // returns a 302 to a dead target; with Policy::none() the client surfaces
+    // the 302 itself. This fails if `.redirect(Policy::none())` is removed
+    // (the client would try to follow to the dead Location and error/differ).
+    #[test]
+    fn guarded_client_does_not_follow_redirects() {
+        let addr = spawn_one_shot_http(
+            b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/internal\r\nContent-Length: 0\r\n\r\n",
+        );
+        let target = SafeTarget {
+            host: addr.ip().to_string(),
+            addrs: vec![addr],
+        };
+        let client = build_guarded_client(&target).expect("client builds");
+        let resp = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .expect("request reaches the one-shot server");
+        assert_eq!(
+            resp.status().as_u16(),
+            302,
+            "guarded client must surface the redirect, not follow it"
+        );
+    }
+
+    // Behavioral: resolve()-pinning must route an arbitrary hostname to the
+    // prevalidated socket address. We pin a name that does not resolve in DNS
+    // to the loopback listener; the request only succeeds because of the
+    // resolve() loop. This fails if the pinning loop is removed (the bogus
+    // hostname would fail to resolve).
+    #[test]
+    fn guarded_client_pins_host_to_validated_address() {
+        let addr = spawn_one_shot_http(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        let host = "ssrf-pin-test.invalid";
+        let target = SafeTarget {
+            host: host.to_string(),
+            addrs: vec![addr],
+        };
+        let client = build_guarded_client(&target).expect("client builds");
+        let resp = client
+            .get(format!("http://{host}:{}/", addr.port()))
+            .send()
+            .expect("pinned hostname reaches the validated address");
+        assert_eq!(resp.status().as_u16(), 200);
+    }
+
     #[test]
     fn host_context_permission_check() {
         let ctx = HostContext {
