@@ -990,8 +990,9 @@ fn format_step_context(sop: &Sop, run: &SopRun, step: &SopStep) -> String {
 
     // Untrusted trigger metadata (topic + payload) can carry injected
     // instructions, so it is capped, sanitized, and framed before it ever
-    // reaches the model, never raw (audit finding E). The per-run marker id is
-    // unpredictable to the payload author, so a forged end-marker can't escape.
+    // reaches the model, never raw (audit finding E). A forged end-marker can't
+    // escape the block because sanitize_untrusted defangs the SOP_UNTRUSTED token;
+    // the marker id (run_id) is provenance/correlation only, NOT a secret.
     ctx.push_str(&super::payload_safety::frame_trigger(
         run.trigger_event.payload.as_deref(),
         run.trigger_event.topic.as_deref(),
