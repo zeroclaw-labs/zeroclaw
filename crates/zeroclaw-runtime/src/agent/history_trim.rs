@@ -131,7 +131,7 @@ fn count_turns(history: &[ChatMessage]) -> usize {
 /// Front breadcrumb injected after the system messages so the model SEES that
 /// earlier turns were cut and cannot confabulate dropped work as present.
 pub fn breadcrumb() -> ChatMessage {
-    ChatMessage::user("[earlier turns omitted to fit the context window]")
+    ChatMessage::user(crate::i18n::get_required_cli_string("history-trim-breadcrumb").as_str())
 }
 
 #[cfg(test)]
