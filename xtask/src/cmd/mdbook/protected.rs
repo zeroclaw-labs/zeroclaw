@@ -68,7 +68,7 @@ impl FenceLanguage {
         match tag.to_ascii_lowercase().as_str() {
             "toml" => Self::Toml,
             "yaml" | "yml" => Self::Yaml,
-            "json" => Self::Json,
+            "json" | "jsonc" => Self::Json,
             _ => Self::Generic,
         }
     }
@@ -116,8 +116,8 @@ pub fn contains_generated_toml_block(source: &str, translation: &str) -> bool {
 
 fn collect_protected_terms(text: &str, literals: &mut Vec<ProtectedLiteral>) {
     for term in protected_terms() {
-        if contains_protected_term(text, &term) {
-            push_literal(literals, &term, "protected product/protocol name changed");
+        if contains_protected_term(text, term) {
+            push_literal(literals, term, "protected product/protocol name changed");
         }
     }
 }
@@ -341,17 +341,23 @@ fn command_literal(text: &str) -> Option<String> {
     if !COMMAND_PREFIXES.contains(&command) {
         return None;
     }
-    if trimmed.chars().all(is_command_literal_char) {
+    let has_placeholder = trimmed.split_whitespace().any(is_placeholder);
+    if !has_placeholder && trimmed.chars().all(is_command_literal_char) {
         return Some(trimmed.to_string());
     }
 
     let mut keep = vec![command];
     for part in trimmed.split_whitespace().skip(1) {
-        if is_cli_flag(part) || is_placeholder(part) || is_path_like(part) {
+        if is_placeholder(part) {
+            break;
+        }
+        if part.chars().all(is_command_literal_char) {
             keep.push(part);
+        } else {
+            break;
         }
     }
-    (keep.len() > 1).then(|| keep.join(" "))
+    Some(keep.join(" "))
 }
 
 fn is_cli_flag(text: &str) -> bool {
@@ -633,10 +639,18 @@ mod tests {
 
     #[test]
     fn extracts_cli_command_and_placeholders() {
-        assert!(
-            texts("Run `zeroclaw [OPTIONS] <COMMAND>`.")
-                .contains(&"zeroclaw [OPTIONS] <COMMAND>".to_string())
-        );
+        let literals = texts("Run `zeroclaw [OPTIONS] <COMMAND>`.");
+        assert!(literals.contains(&"zeroclaw".to_string()));
+        assert!(!literals.contains(&"[OPTIONS]".to_string()));
+        assert!(!literals.contains(&"<COMMAND>".to_string()));
+    }
+
+    #[test]
+    fn does_not_synthesize_non_contiguous_command_fragments() {
+        let literals = texts("Run `gh pr view <pr> --json body`.");
+        assert!(literals.contains(&"gh pr view".to_string()));
+        assert!(literals.contains(&"--json".to_string()));
+        assert!(!literals.contains(&"gh --json".to_string()));
     }
 
     #[test]
@@ -697,6 +711,14 @@ mod tests {
         let literals = texts(source);
         assert!(literals.contains(&"api_key".to_string()));
         assert!(literals.contains(&"runtime_profile".to_string()));
+    }
+
+    #[test]
+    fn treats_jsonc_fences_as_json_not_shell() {
+        let literals = texts(
+            "```jsonc\n// args: { \"output\": \"Bumped bzip2; source hash verified.\" }\n```",
+        );
+        assert!(!literals.contains(&"source hash verified.\"".to_string()));
     }
 
     #[test]
