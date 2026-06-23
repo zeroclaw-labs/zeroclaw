@@ -49,12 +49,33 @@ pub fn respawn_requested() -> bool {
     RESPAWN_REQUESTED.load(Ordering::SeqCst)
 }
 
+/// In-process graceful-shutdown trigger. On unix the gateway self-signals
+/// SIGTERM; on platforms without that (Windows), it fires this instead, and the
+/// daemon's `wait_for_exit_signal` selects on [`shutdown_notify`] to return
+/// `Shutdown`.
+fn shutdown_cell() -> &'static tokio::sync::Notify {
+    static SHUTDOWN: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    SHUTDOWN.get_or_init(tokio::sync::Notify::new)
+}
+
+/// Request a graceful daemon shutdown in-process (cross-platform). Pairs with a
+/// prior [`request_respawn`] to turn the shutdown into a self-restart.
+pub fn request_shutdown() {
+    shutdown_cell().notify_one();
+}
+
+/// The global in-process shutdown trigger, for the daemon loop to await.
+pub fn shutdown_notify() -> &'static tokio::sync::Notify {
+    shutdown_cell()
+}
+
 /// If a respawn was requested, launch a detached child running the captured
 /// launch command (now the new on-disk binary), and return its PID.
 ///
 /// Call this *after* the daemon has torn down, so the listening port is free.
-/// The child is detached (new session on unix) and inherits this process's
-/// stdio, so it logs wherever the daemon did. A bare process has no supervisor,
+/// The child is detached (new session on unix; `DETACHED_PROCESS` on windows)
+/// and inherits this process's stdio, so it logs wherever the daemon did. A bare
+/// process has no supervisor,
 /// so if the child fails to start the service stays down until restarted by
 /// hand (the previous binary remains as a `.bak`).
 pub fn respawn_if_requested() -> Option<u32> {
@@ -77,6 +98,18 @@ pub fn respawn_if_requested() -> Option<u32> {
                 Ok(())
             });
         }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS: no inherited console, so the child survives the
+        // launching console closing. CREATE_NEW_PROCESS_GROUP: a Ctrl+C/Break to
+        // the old group doesn't reach it. (Inherited file-handle stdio — e.g.
+        // the daemon wrapper's log redirects — stays valid.)
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
 
     match command.spawn() {

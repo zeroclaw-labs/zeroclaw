@@ -118,9 +118,9 @@ fn detect_restart_uncached() -> RestartInfo {
             hint: "launchctl kickstart -k <your-zeroclaw-label>".to_string(),
         };
     }
-    // Bare process. On unix we can relaunch ourselves (detached respawn after
-    // teardown); elsewhere there's no safe self-relaunch, so stay manual.
-    if cfg!(unix) {
+    // Bare process. On unix/windows we can relaunch ourselves (detached respawn
+    // after teardown); elsewhere there's no safe self-relaunch, so stay manual.
+    if cfg!(unix) || cfg!(windows) {
         RestartInfo {
             mode: RestartMode::SelfRespawn,
             hint: "restart the `zeroclaw daemon` process".to_string(),
@@ -599,16 +599,22 @@ async fn run_upgrade(
     }
 }
 
-/// Send ourselves SIGTERM so the daemon's signal handler runs its graceful
-/// teardown (`DaemonExit::Shutdown`). Whether the process is then relaunched by
-/// a supervisor or self-respawned by `main` is decided by the caller. No-op on
-/// non-unix (auto_restart is only offered on unix).
+/// Trigger the daemon's graceful teardown (`DaemonExit::Shutdown`). Whether the
+/// process is then relaunched by a supervisor or self-respawned by `main` is
+/// decided by the caller. Unix self-signals SIGTERM (reusing the existing signal
+/// path); Windows fires the daemon's in-process shutdown trigger instead.
 fn trigger_graceful_shutdown() {
     #[cfg(unix)]
-    // SAFETY: `raise` is async-signal-safe and merely posts SIGTERM to this
-    // process, which the daemon already handles for graceful shutdown.
-    unsafe {
-        libc::raise(libc::SIGTERM);
+    {
+        // SAFETY: `raise` is async-signal-safe and merely posts SIGTERM to this
+        // process, which the daemon already handles for graceful shutdown.
+        unsafe {
+            libc::raise(libc::SIGTERM);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        zeroclaw_runtime::restart::request_shutdown();
     }
 }
 
