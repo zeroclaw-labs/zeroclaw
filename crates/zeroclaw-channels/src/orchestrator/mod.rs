@@ -15648,6 +15648,170 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(removed[0].2, "\u{1F440}");
     }
 
+    struct AckTimingChannel {
+        start: Instant,
+        ack_elapsed_ms: tokio::sync::Mutex<Option<u128>>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for AckTimingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "ack-timing"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for AckTimingChannel {
+        fn name(&self) -> &str {
+            "ack-timing-channel"
+        }
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn add_reaction(
+            &self,
+            _channel_id: &str,
+            _message_id: &str,
+            emoji: &str,
+        ) -> anyhow::Result<()> {
+            if emoji == "\u{1F440}" {
+                let mut slot = self.ack_elapsed_ms.lock().await;
+                if slot.is_none() {
+                    *slot = Some(self.start.elapsed().as_millis());
+                }
+            }
+            Ok(())
+        }
+    }
+
+    // Pins the early-ack ordering: with a slow model_provider, the 👀 ack must
+    // land well before the model completes. Fails on the old order where the
+    // ack was awaited after enrichment / the model call. A regression back to
+    // the late position would record the ack at >= the model delay.
+    #[tokio::test]
+    async fn process_channel_message_acks_before_slow_model_completes() {
+        let model_delay = Duration::from_millis(400);
+        let channel_impl = Arc::new(AckTimingChannel {
+            start: Instant::now(),
+            ack_elapsed_ms: tokio::sync::Mutex::new(None),
+        });
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: Arc::new(SlowModelProvider { delay: model_delay }),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "ack-msg".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-ack".to_string(),
+                content: "hello".to_string(),
+                channel: "ack-timing-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let ack_elapsed = channel_impl
+            .ack_elapsed_ms
+            .lock()
+            .await
+            .expect("eyes ack must have been attempted");
+        assert!(
+            ack_elapsed < model_delay.as_millis(),
+            "ack fired at {ack_elapsed}ms, must precede the {}ms model delay (early-ack ordering)",
+            model_delay.as_millis()
+        );
+    }
+
     #[test]
     fn prompt_contains_all_sections() {
         let ws = make_workspace();
