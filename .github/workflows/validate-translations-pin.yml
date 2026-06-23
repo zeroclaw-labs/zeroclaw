@@ -55,15 +55,21 @@ jobs:
 
       - name: Validate msgid parity across catalogues
         run: |
-          # Extract complete msgids (including multi-line continuation strings),
-          # not just `^msgid ` heads. A bad submodule commit that alters a
-          # multi-line source string must not compare equal. We canonicalize each
-          # catalogue with `msgcat --no-wrap` so continuation lines collapse onto
-          # the msgid line, then capture every full msgid entry.
+          # Compare complete gettext entries, not just `^msgid ` heads. msgcat
+          # --no-wrap stops line wrapping but cannot collapse msgids containing
+          # real embedded newlines, so accumulate every continuation string line
+          # of each msgid / msgid_plural entry into one NUL-delimited record.
+          # A change to any multi-line source string then changes the record.
           extract_ids() {
-            msgcat --no-wrap --sort-output "$1" 2>/dev/null \
-              | awk '/^msgid /{print} /^msgid_plural /{print}' \
-              | sort -u
+            msgcat --no-wrap --sort-output "$1" 2>/dev/null | awk '
+              function flush() { if (cur != "") { printf "%s\0", cur; cur="" } }
+              /^msgid / || /^msgid_plural / { flush(); cur=$0; capturing=1; next }
+              /^msgstr/ || /^msgstr\[/ { capturing=0; next }
+              /^"/ { if (capturing) cur=cur "\n" $0; next }
+              /^$/ { capturing=0; next }
+              { capturing=0 }
+              END { flush() }
+            ' | sort -z
           }
           ref=""
           refname=""
@@ -77,9 +83,9 @@ jobs:
               refname="$po"
               continue
             fi
-            if ! diff -q "$ref" "$ids" >/dev/null 2>&1; then
+            if ! cmp -s "$ref" "$ids"; then
               echo "error: msgid set in $po diverges from $refname" >&2
-              diff "$ref" "$ids" | head -20 >&2
+              diff <(tr '\0' '\n' < "$ref") <(tr '\0' '\n' < "$ids") | head -20 >&2
               ok=1
             fi
           done
