@@ -955,30 +955,22 @@ impl Chat {
         // navigation key (j/k/↑/↓/Esc/Enter/Ctrl+C), exit browse mode
         // so they can type without an extra Esc press.
         if state.in_browse_mode() {
-            let is_browse_key = match key.code {
-                KeyCode::Up | KeyCode::Down => true,
-                KeyCode::Esc | KeyCode::Enter => true,
-                KeyCode::Home | KeyCode::End => true,
-                // Ctrl+K to move cursor up in browse mode.
-                KeyCode::Char('k')
-                    if key
-                        .modifiers
-                        .contains(crossterm::event::KeyModifiers::CONTROL)
-                        && !key.modifiers.contains(crossterm::event::KeyModifiers::ALT) =>
-                {
-                    true
-                }
-                // In browse mode, 'j' and 'k' are vim-style navigation
-                // (except when combined with Ctrl or Alt).
-                KeyCode::Char(c)
-                    if !key.modifiers.intersects(
-                        crossterm::event::KeyModifiers::CONTROL
-                            | crossterm::event::KeyModifiers::ALT,
-                    ) =>
-                {
-                    matches!(c, 'j' | 'k' | 'J' | 'K' | 'y' | 'Y')
-                }
-                _ => false,
+            let is_browse_key = {
+                use crate::keymap::ChatTabAction;
+                matches!(
+                    ChatTabAction::from_chord(&key),
+                    Some(
+                        ChatTabAction::BrowseEnter
+                            | ChatTabAction::BrowseUp
+                            | ChatTabAction::BrowseDown
+                            | ChatTabAction::BrowseUpVim
+                            | ChatTabAction::BrowseDownVim
+                            | ChatTabAction::BrowseSelectExtend
+                            | ChatTabAction::BrowseSelectExtendDown
+                            | ChatTabAction::BrowseExitSelection
+                            | ChatTabAction::CopySelection
+                    )
+                )
             };
             if !is_browse_key {
                 state.exit_browse_mode();
@@ -997,20 +989,16 @@ impl Chat {
         // NOTE: Ctrl+K (BrowseEnter) must be intercepted here, before the
         // input bar, because the textarea consumes Ctrl+K as "kill to end of
         // line" and never passes it through to the action dispatch.
-        if matches!(key.code, KeyCode::Char('k'))
-            && key
-                .modifiers
-                .contains(crossterm::event::KeyModifiers::CONTROL)
-            && !key.modifiers.contains(crossterm::event::KeyModifiers::ALT)
-            && state.pending_approval().is_none()
-            && !state.turn_in_flight
-        {
-            if state.in_browse_mode() {
-                state.browse_move_up(1, false);
-            } else {
-                state.enter_browse_mode();
+        if state.pending_approval().is_none() && !state.turn_in_flight {
+            use crate::keymap::ChatTabAction;
+            if let Some(ChatTabAction::BrowseEnter) = ChatTabAction::from_chord(&key) {
+                if state.in_browse_mode() {
+                    state.browse_move_up(1, false);
+                } else {
+                    state.enter_browse_mode();
+                }
+                return false;
             }
-            return false;
         }
 
         if state.in_browse_mode() && key.code == KeyCode::Enter {
@@ -2010,7 +1998,7 @@ impl Chat {
 
 impl crate::widgets::HelpContext for Chat {
     fn help_context(&self) -> crate::widgets::HelpNode {
-        use crate::keymap::ChatTabAction;
+        use crate::keymap::{ChatTabAction, RebindableActions};
         use crate::widgets::{HelpEntry as E, HelpNode};
         match &self.phase {
             ChatPhase::PickAgent { loading, .. } => {
@@ -2078,8 +2066,14 @@ impl crate::widgets::HelpContext for Chat {
                 }
                 // Idle: compose pane-level bindings + input bar as child.
                 let mut pane_entries = vec![
+                    // Browse-mode bindings rendered from the registry so
+                    // rebinds always stay in sync — see also the browse-mode
+                    // dispatch code in `handle_key`.
                     E::new(
-                        vec!["Ctrl+↑", "Ctrl+K"],
+                        ChatTabAction::BrowseEnter
+                            .resolved()
+                            .iter()
+                            .map(|c| c.display().to_string()),
                         crate::i18n::t("zc-chat-help-browse-mode"),
                     ),
                     E::key(
@@ -3931,11 +3925,9 @@ impl ChatState {
         self.mark_dirty_full();
     }
 
-    /// Move the cursor up by `n` entries.  Clamps at 0.
+    /// Move the cursor up by `n` entries (older messages).  Clamps at 0.
     /// If `extend` is true, sets/keeps the anchor for range selection.
-    /// Scrolls up by the height of the entry we leave, so the viewport
-    /// follows the cursor — the cursor entry ends up at the bottom of
-    /// the viewport.
+    /// Scrolls so the cursor entry is at the top of the viewport.
     fn browse_move_up(&mut self, n: usize, extend: bool) {
         let len = self.entries.len();
         if len == 0 {
@@ -3948,27 +3940,14 @@ impl ChatState {
             self.browse_anchor = None;
         }
         self.browse_cursor = Some(cur.saturating_sub(n));
-
-        // Scroll up so the cursor entry stays visible: use the entry height
-        // from the cached screen ranges, or fall back to 1 line if the cache
-        // hasn't been populated yet.
-        let scroll_by = self
-            .cached_screen_ranges
-            .iter()
-            .find(|(idx, _, _)| *idx == cur)
-            .map(|&(_, lo, hi)| hi - lo)
-            .unwrap_or(1);
-        self.scroll_offset = self.scroll_offset.saturating_sub(scroll_by);
+        self.scroll_entry_into_view(self.browse_cursor.unwrap());
         self.pinned_to_bottom = false;
-
         self.mark_dirty_full();
     }
 
-    /// Move the cursor down by `n` entries.  Clamps at last entry.
+    /// Move the cursor down by `n` entries (newer messages).  Clamps at last entry.
     /// If `extend` is true, sets/keeps the anchor for range selection.
-    /// Scrolls down by the height of the entry we leave, so the viewport
-    /// follows the cursor — the cursor entry ends up at the top of the
-    /// viewport.
+    /// Scrolls so the cursor entry is at the top of the viewport.
     fn browse_move_down(&mut self, n: usize, extend: bool) {
         let len = self.entries.len();
         if len == 0 {
@@ -3981,19 +3960,33 @@ impl ChatState {
             self.browse_anchor = None;
         }
         self.browse_cursor = Some((cur + n).min(len - 1));
+        self.scroll_entry_into_view(self.browse_cursor.unwrap());
+        self.pinned_to_bottom =
+            self.scroll_offset >= self.last_total_rows.saturating_sub(self.last_inner_height);
+        self.mark_dirty_full();
+    }
 
-        // Scroll down so the cursor entry stays visible.
-        let scroll_by = self
+    /// Adjust `scroll_offset` so the entry at `entry_idx` is visible at the
+    /// top of the viewport. If the entry is taller than the viewport, its
+    /// top is shown.  Does nothing when `cached_screen_ranges` is empty
+    /// (pre-render path).
+    fn scroll_entry_into_view(&mut self, entry_idx: usize) {
+        let Some(&(_, lo, _hi)) = self
             .cached_screen_ranges
             .iter()
-            .find(|(idx, _, _)| *idx == cur)
-            .map(|&(_, lo, hi)| hi - lo)
-            .unwrap_or(1);
-        let max = self.last_total_rows.saturating_sub(self.last_inner_height);
-        self.scroll_offset = self.scroll_offset.saturating_add(scroll_by).min(max);
-        self.pinned_to_bottom = self.scroll_offset >= max;
+            .find(|(idx, _, _)| *idx == entry_idx)
+        else {
+            return;
+        };
+        let inner_h = self.last_inner_height;
+        if inner_h == 0 {
+            return;
+        }
+        let total = self.last_total_rows;
+        let max = total.saturating_sub(inner_h);
 
-        self.mark_dirty_full();
+        // Align the entry's top with the viewport top.
+        self.scroll_offset = lo.min(max);
     }
 
     /// The selected range as `(lo, hi)` indices, inclusive.
