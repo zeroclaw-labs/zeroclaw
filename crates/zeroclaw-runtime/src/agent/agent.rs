@@ -2463,11 +2463,17 @@ impl Agent {
                                 crate::agent::loop_::ResolvedRuntimeKnobs {
                                     max_tool_iterations: self.config.resolved.max_tool_iterations,
                                     excluded_tools: &[],
-                                    dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
+                                    dedup_exempt_tools: &self
+                                        .config
+                                        .resolved
+                                        .tool_call_dedup_exempt,
                                     pacing: &pacing,
                                     strict_tool_parsing: self.config.resolved.strict_tool_parsing,
                                     parallel_tools: self.config.resolved.parallel_tools,
-                                    max_tool_result_chars: self.config.resolved.max_tool_result_chars,
+                                    max_tool_result_chars: self
+                                        .config
+                                        .resolved
+                                        .max_tool_result_chars,
                                     context_token_budget: self.config.resolved.max_context_tokens,
                                     knobs: &knobs,
                                 },
