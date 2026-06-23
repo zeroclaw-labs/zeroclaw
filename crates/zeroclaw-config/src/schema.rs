@@ -5363,6 +5363,67 @@ pub enum SkillsPromptInjectionMode {
 ///
 /// Reuses the same git-clone mechanism as the default `zeroclaw-skills`
 /// registry. Install a skill from it with `registry:<name>/<skill>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalRegistryKind {
+    Git,
+    Unsupported(String),
+}
+
+impl ExternalRegistryKind {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Git => "git",
+            Self::Unsupported(kind) => kind.as_str(),
+        }
+    }
+}
+
+impl Default for ExternalRegistryKind {
+    fn default() -> Self {
+        Self::Git
+    }
+}
+
+impl From<String> for ExternalRegistryKind {
+    fn from(kind: String) -> Self {
+        if kind == "git" {
+            Self::Git
+        } else {
+            Self::Unsupported(kind)
+        }
+    }
+}
+
+impl From<ExternalRegistryKind> for String {
+    fn from(kind: ExternalRegistryKind) -> Self {
+        kind.as_str().to_string()
+    }
+}
+
+impl std::fmt::Display for ExternalRegistryKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for ExternalRegistryKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ExternalRegistryKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(String::deserialize(deserializer)?.into())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ExternalRegistry {
@@ -5372,8 +5433,9 @@ pub struct ExternalRegistry {
     pub url: String,
     /// Registry protocol. Only `"git"` is supported today; other protocols
     /// are reserved for a future additive release.
-    #[serde(default = "default_extra_registry_kind")]
-    pub kind: String,
+    #[serde(default)]
+    #[cfg_attr(feature = "schema-export", schemars(with = "String"))]
+    pub kind: ExternalRegistryKind,
     /// Whether this registry is eligible for installs. Default: `true`.
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -5391,10 +5453,6 @@ impl ExternalRegistry {
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
     }
-}
-
-fn default_extra_registry_kind() -> String {
-    "git".to_string()
 }
 
 /// Skills loading configuration (`[skills]` section).
@@ -17608,7 +17666,7 @@ impl Config {
                         reg.name
                     );
                 }
-                if reg.kind != "git" {
+                if reg.kind != ExternalRegistryKind::Git {
                     anyhow::bail!(
                         "skills.extra_registries[{}].kind must be 'git' (got '{}'); other protocols are not yet supported",
                         reg.name,
@@ -19928,7 +19986,7 @@ enabled = true
         ExternalRegistry {
             name: name.to_string(),
             url: url.to_string(),
-            kind: kind.to_string(),
+            kind: kind.to_string().into(),
             enabled: true,
         }
     }

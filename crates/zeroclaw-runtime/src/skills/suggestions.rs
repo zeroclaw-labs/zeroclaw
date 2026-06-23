@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
+use zeroclaw_config::schema::ExternalRegistryKind;
 
 /// Server-side, post-submit install suggestions for cached skill registry metadata.
 ///
@@ -103,7 +104,7 @@ fn load_cached_installable_skill_capabilities(
 
     for registry in extra_registries
         .iter()
-        .filter(|registry| registry.enabled && registry.kind == "git")
+        .filter(|registry| registry.enabled && registry.kind == ExternalRegistryKind::Git)
     {
         if !zeroclaw_config::schema::ExternalRegistry::is_valid_name(&registry.name) {
             continue;
@@ -376,7 +377,7 @@ mod tests {
         zeroclaw_config::schema::ExternalRegistry {
             name: name.to_string(),
             url: format!("file:///tmp/{name}"),
-            kind: kind.to_string(),
+            kind: kind.to_string().into(),
             enabled,
         }
     }
