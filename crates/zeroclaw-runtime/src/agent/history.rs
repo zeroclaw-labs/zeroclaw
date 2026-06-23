@@ -247,61 +247,6 @@ pub fn truncate_tool_message(msg_content: &str, max_chars: usize) -> String {
     truncate_tool_result(msg_content, max_chars)
 }
 
-/// Aggressively trim old tool result messages in history to recover from
-/// context overflow. Keeps the last `protect_last_n` messages untouched.
-/// Returns total characters saved.
-pub fn fast_trim_tool_results(
-    history: &mut [zeroclaw_providers::ChatMessage],
-    protect_last_n: usize,
-) -> usize {
-    let trim_to = 2000;
-    let mut saved = 0;
-    let cutoff = history.len().saturating_sub(protect_last_n);
-    for msg in &mut history[..cutoff] {
-        if msg.role == "tool" && msg.content.len() > trim_to {
-            let original_len = msg.content.len();
-            msg.content = truncate_tool_message(&msg.content, trim_to);
-            saved += original_len - msg.content.len();
-        }
-    }
-    saved
-}
-
-/// Emergency: drop oldest non-system, non-recent messages from history.
-/// Tool groups (assistant + consecutive tool messages) are dropped
-/// atomically to preserve tool_use/tool_result pairing.
-/// Returns number of messages dropped.
-pub fn emergency_history_trim(
-    history: &mut Vec<zeroclaw_providers::ChatMessage>,
-    keep_recent: usize,
-) -> usize {
-    let mut dropped = 0;
-    let target_drop = history.len() / 3;
-    let mut i = 0;
-    while dropped < target_drop && i < history.len().saturating_sub(keep_recent) {
-        if history[i].role == "system" {
-            i += 1;
-        } else if history[i].role == "assistant" {
-            // Count following tool messages — drop as atomic group
-            let mut tool_count = 0;
-            while i + 1 + tool_count < history.len().saturating_sub(keep_recent)
-                && history[i + 1 + tool_count].role == "tool"
-            {
-                tool_count += 1;
-            }
-            for _ in 0..=tool_count {
-                history.remove(i);
-                dropped += 1;
-            }
-        } else {
-            history.remove(i);
-            dropped += 1;
-        }
-    }
-    dropped += remove_orphaned_tool_messages(history).removed;
-    dropped
-}
-
 /// Estimate token count for a message history using ~4 chars/token heuristic.
 /// Includes a small overhead per message for role/framing tokens.
 pub fn estimate_history_tokens(history: &[ChatMessage]) -> usize {

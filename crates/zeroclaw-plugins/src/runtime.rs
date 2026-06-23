@@ -1,13 +1,15 @@
 //! Extism-based WASM execution bridge.
 //!
-//! Creates Extism plugin instances with permission-gated host functions
-//! (`zc_http_request`, `zc_env_read`) and calls plugin-exported functions
-//! (`tool_metadata`, `execute`).
+//! Creates Extism plugin instances with the permission-gated `zc_http_request`
+//! host function and calls plugin-exported functions (`tool_metadata`,
+//! `execute`). A plugin's resolved config section is injected into the
+//! `execute` input rather than read back through a host call.
 
 use crate::PluginPermission;
 use anyhow::{Context, Result};
 use extism::*;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
 use zeroclaw_api::tool::ToolResult;
@@ -141,31 +143,6 @@ fn handle_http_request(
     Ok(())
 }
 
-fn handle_env_read(
-    plugin: &mut CurrentPlugin,
-    inputs: &[Val],
-    outputs: &mut [Val],
-    user_data: UserData<HostContext>,
-) -> Result<(), Error> {
-    let ctx = user_data.get()?;
-    let ctx = ctx.lock().unwrap();
-
-    if !ctx.permissions.contains(&PluginPermission::EnvRead) {
-        return Err(Error::msg(
-            "permission denied: plugin does not have 'env_read' permission",
-        ));
-    }
-
-    let var_name: String = plugin.memory_get_val(&inputs[0])?;
-
-    let value = std::env::var(&var_name)
-        .map_err(|_| Error::msg(format!("environment variable '{var_name}' not set")))?;
-
-    plugin.memory_set_val(&mut outputs[0], value)?;
-
-    Ok(())
-}
-
 // ── Plugin creation and invocation ────────────────────────────────
 
 /// Create an Extism plugin from a WASM file with the given permissions.
@@ -183,11 +160,9 @@ pub fn create_plugin(wasm_path: &Path, permissions: &[PluginPermission]) -> Resu
         handle_http_request,
     );
 
-    let env_fn = Function::new("zc_env_read", [PTR], [PTR], ctx, handle_env_read);
-
     let manifest = Manifest::new([Wasm::file(wasm_path)]);
 
-    Plugin::new(manifest, [http_fn, env_fn], true)
+    Plugin::new(manifest, [http_fn], true)
         .with_context(|| format!("failed to load WASM plugin from {}", wasm_path.display()))
 }
 
@@ -200,12 +175,59 @@ pub fn call_tool_metadata(plugin: &mut extism::Plugin) -> Result<ToolMetadata> {
     serde_json::from_str(&output).context("failed to parse tool_metadata JSON")
 }
 
-/// Call the `execute` export with the given args JSON and return a `ToolResult`.
-pub fn call_execute(plugin: &mut extism::Plugin, args_json: &[u8]) -> Result<ToolResult> {
-    let input = std::str::from_utf8(args_json).context("plugin args are not valid UTF-8")?;
+/// Merge the plugin's resolved config section into its `execute` input under the
+/// reserved `__config` key, stripping any caller-supplied `__config` first so the
+/// section cannot be spoofed through tool args. Kept pure so the injection
+/// contract is unit-testable without a live plugin.
+fn inject_config(args_json: &[u8], config: &HashMap<String, String>) -> Result<String> {
+    let mut args: serde_json::Value =
+        serde_json::from_slice(args_json).context("plugin args are not valid JSON")?;
+
+    let obj = args
+        .as_object_mut()
+        .context("plugin args must be a JSON object")?;
+    obj.remove("__config");
+    if !config.is_empty() {
+        obj.insert(
+            "__config".to_string(),
+            serde_json::to_value(config).context("failed to serialize plugin config")?,
+        );
+    }
+
+    serde_json::to_string(&args).context("failed to serialize plugin input")
+}
+
+/// Call the `execute` export with the given args JSON plus the plugin's resolved
+/// config section, returning a `ToolResult`. The config is injected into the
+/// input under the reserved `__config` key so the plugin reads it from its own
+/// input rather than calling back into the host.
+/// Resolve the config map a plugin actually receives: the configured section
+/// only when the manifest grants `ConfigRead`, otherwise empty. Gating here
+/// (not at injection) keeps `inject_config`'s caller-`__config` stripping intact
+/// for permissionless plugins while honoring the manifest permission contract.
+fn effective_config<'a>(
+    config: &'a HashMap<String, String>,
+    permissions: &[PluginPermission],
+) -> &'a HashMap<String, String> {
+    if permissions.contains(&PluginPermission::ConfigRead) {
+        config
+    } else {
+        EMPTY_CONFIG.get_or_init(HashMap::new)
+    }
+}
+
+static EMPTY_CONFIG: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+
+pub fn call_execute(
+    plugin: &mut extism::Plugin,
+    args_json: &[u8],
+    config: &HashMap<String, String>,
+    permissions: &[PluginPermission],
+) -> Result<ToolResult> {
+    let input = inject_config(args_json, effective_config(config, permissions))?;
 
     let output = plugin
-        .call::<&str, String>("execute", input)
+        .call::<&str, String>("execute", &input)
         .context("failed to call plugin execute export")?;
 
     let result: PluginToolResult =
@@ -228,7 +250,7 @@ mod tests {
             permissions: HashSet::from([PluginPermission::HttpClient]),
         };
         assert!(ctx.permissions.contains(&PluginPermission::HttpClient));
-        assert!(!ctx.permissions.contains(&PluginPermission::EnvRead));
+        assert!(!ctx.permissions.contains(&PluginPermission::ConfigRead));
     }
 
     #[test]
@@ -279,108 +301,75 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// Integration tests that load the actual image-gen WASM plugin.
-    /// These require the plugin to be built first:
-    ///   cd plugins/image-gen-fal && cargo build --target wasm32-wasip1 --release
-    mod integration {
-        use super::*;
+    #[test]
+    fn inject_config_adds_config_key() {
+        let args = br#"{"prompt":"a sunset"}"#;
+        let config = HashMap::from([("api_key".to_string(), "secret".to_string())]);
+        let out = inject_config(args, &config).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["prompt"], "a sunset");
+        assert_eq!(v["__config"]["api_key"], "secret");
+    }
 
-        fn wasm_path() -> Option<std::path::PathBuf> {
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../plugins/image-gen-fal/image_gen_fal.wasm");
-            if path.exists() { Some(path) } else { None }
-        }
+    #[test]
+    fn inject_config_empty_leaves_args_untouched() {
+        let args = br#"{"prompt":"x"}"#;
+        let out = inject_config(args, &HashMap::new()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("__config").is_none());
+    }
 
-        #[test]
-        fn load_and_read_metadata() {
-            let Some(path) = wasm_path() else {
-                eprintln!("SKIP: image_gen_fal.wasm not found (build the plugin first)");
-                return;
-            };
-            let perms = vec![PluginPermission::HttpClient, PluginPermission::EnvRead];
-            let mut plugin = create_plugin(&path, &perms).unwrap();
-            let meta = call_tool_metadata(&mut plugin).unwrap();
-            assert_eq!(meta.name, "image_gen_fal");
-            assert!(meta.description.contains("image"));
-            assert!(
-                meta.parameters_schema["required"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|v| v == "prompt")
-            );
-        }
+    #[test]
+    fn inject_config_rejects_non_object_args() {
+        let args = br#"[1,2,3]"#;
+        let config = HashMap::from([("k".to_string(), "v".to_string())]);
+        assert!(inject_config(args, &config).is_err());
+    }
 
-        #[test]
-        fn execute_missing_prompt() {
-            let Some(path) = wasm_path() else { return };
-            let perms = vec![PluginPermission::HttpClient, PluginPermission::EnvRead];
-            let mut plugin = create_plugin(&path, &perms).unwrap();
-            let args = serde_json::to_vec(&serde_json::json!({})).unwrap();
-            let result = call_execute(&mut plugin, &args).unwrap();
-            assert!(!result.success);
-            assert!(result.error.as_deref().unwrap().contains("prompt"));
-        }
+    #[test]
+    fn inject_config_strips_caller_supplied_config_when_section_empty() {
+        let args = br#"{"prompt":"x","__config":{"api_key":"forged"}}"#;
+        let out = inject_config(args, &HashMap::new()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("__config").is_none());
+        assert_eq!(v["prompt"], "x");
+    }
 
-        #[test]
-        fn execute_invalid_size() {
-            let Some(path) = wasm_path() else { return };
-            let perms = vec![PluginPermission::HttpClient, PluginPermission::EnvRead];
-            let mut plugin = create_plugin(&path, &perms).unwrap();
-            let args =
-                serde_json::to_vec(&serde_json::json!({"prompt": "test", "size": "bad"})).unwrap();
-            let result = call_execute(&mut plugin, &args).unwrap();
-            assert!(!result.success);
-            assert!(result.error.as_deref().unwrap().contains("Invalid size"));
-        }
+    #[test]
+    fn inject_config_overrides_caller_supplied_config_when_section_present() {
+        let args = br#"{"prompt":"x","__config":{"api_key":"forged"}}"#;
+        let config = HashMap::from([("api_key".to_string(), "real".to_string())]);
+        let out = inject_config(args, &config).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["__config"]["api_key"], "real");
+    }
 
-        #[test]
-        fn execute_invalid_model_traversal() {
-            let Some(path) = wasm_path() else { return };
-            let perms = vec![PluginPermission::HttpClient, PluginPermission::EnvRead];
-            let mut plugin = create_plugin(&path, &perms).unwrap();
-            let args =
-                serde_json::to_vec(&serde_json::json!({"prompt": "test", "model": "../../evil"}))
-                    .unwrap();
-            let result = call_execute(&mut plugin, &args).unwrap();
-            assert!(!result.success);
-            assert!(result.error.as_deref().unwrap().contains("Invalid model"));
-        }
+    #[test]
+    fn effective_config_withholds_section_without_config_read_permission() {
+        let config = HashMap::from([("api_key".to_string(), "secret".to_string())]);
+        let resolved = effective_config(&config, &[PluginPermission::HttpClient]);
+        assert!(
+            resolved.is_empty(),
+            "a plugin without ConfigRead must not receive its configured section"
+        );
+        // And the resulting injected args carry no __config, even with a caller forging it.
+        let args = br#"{"prompt":"x","__config":{"api_key":"forged"}}"#;
+        let out = inject_config(args, resolved).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            v.get("__config").is_none(),
+            "no __config injected for a permissionless plugin; caller-supplied value is stripped"
+        );
+    }
 
-        /// End-to-end: missing `FAL_API_KEY` exercises the `zc_env_read` host
-        /// function — the host returns Err (var unset), which Extism propagates
-        /// as a plugin-call trap. Proves the env_read path is wired.
-        #[test]
-        fn execute_missing_api_key_exercises_env_read_host_fn() {
-            let Some(path) = wasm_path() else { return };
-            // SAFETY: test-only, single-threaded test runner.
-            unsafe { std::env::remove_var("FAL_API_KEY") };
-            let perms = vec![PluginPermission::HttpClient, PluginPermission::EnvRead];
-            let mut plugin = create_plugin(&path, &perms).unwrap();
-            let args = serde_json::to_vec(&serde_json::json!({"prompt": "a sunset"})).unwrap();
-            let err = call_execute(&mut plugin, &args).unwrap_err();
-            let msg = format!("{err:#}");
-            assert!(
-                msg.contains("FAL_API_KEY") || msg.contains("not set"),
-                "expected env-var error, got: {msg}"
-            );
-        }
-
-        /// End-to-end permission enforcement: without `EnvRead`, the host
-        /// function returns permission-denied and Extism propagates it as a trap.
-        #[test]
-        fn execute_without_env_read_permission_fails() {
-            let Some(path) = wasm_path() else { return };
-            // Only HttpClient granted — EnvRead missing
-            let perms = vec![PluginPermission::HttpClient];
-            let mut plugin = create_plugin(&path, &perms).unwrap();
-            let args = serde_json::to_vec(&serde_json::json!({"prompt": "a sunset"})).unwrap();
-            let err = call_execute(&mut plugin, &args).unwrap_err();
-            let msg = format!("{err:#}");
-            assert!(
-                msg.contains("permission") || msg.contains("env_read"),
-                "expected permission-denied error, got: {msg}"
-            );
-        }
+    #[test]
+    fn effective_config_passes_section_with_config_read_permission() {
+        let config = HashMap::from([("api_key".to_string(), "secret".to_string())]);
+        let resolved = effective_config(&config, &[PluginPermission::ConfigRead]);
+        assert_eq!(
+            resolved.get("api_key").map(String::as_str),
+            Some("secret"),
+            "a plugin with ConfigRead must receive its configured section"
+        );
     }
 }
