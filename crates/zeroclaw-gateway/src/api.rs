@@ -121,7 +121,10 @@ pub struct CronAddBody {
 #[derive(Deserialize)]
 pub struct CronPatchBody {
     /// Configured agent alias whose risk profile gates the new shell
-    /// command (when `command` is being patched). Required.
+    /// command. Only consulted when `command` is being patched; optional
+    /// otherwise (e.g. a pure schedule/name change or an enable/disable
+    /// toggle), so non-command patches need not supply it.
+    #[serde(default)]
     pub agent: String,
     pub name: Option<String>,
     pub schedule: Option<String>,
@@ -129,6 +132,9 @@ pub struct CronPatchBody {
     pub clear_tz: Option<bool>,
     pub command: Option<String>,
     pub prompt: Option<String>,
+    /// Toggle the job on/off without deleting it (pause/resume). `None` leaves
+    /// the current state unchanged.
+    pub enabled: Option<bool>,
 }
 
 enum CronTimezonePatch {
@@ -618,16 +624,6 @@ pub async fn handle_api_cron_patch(
     }
 
     let config = state.config.read().clone();
-    if config.agent(&body.agent).is_none() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!(
-                "Unknown agent {a:?} (no [agents.{a}] entry configured)",
-                a = body.agent
-            )})),
-        )
-            .into_response();
-    }
     let agent_alias = body.agent.clone();
     let CronPatchBody {
         agent: _,
@@ -637,6 +633,7 @@ pub async fn handle_api_cron_patch(
         clear_tz,
         command,
         prompt,
+        enabled,
     } = body;
     let timezone_patch = match parse_timezone_patch(tz, clear_tz) {
         Ok(patch) => patch,
@@ -653,6 +650,26 @@ pub async fn handle_api_cron_patch(
                 .into_response();
         }
     };
+    let is_agent = matches!(existing.job_type, zeroclaw_runtime::cron::JobType::Agent);
+    // The agent only gates a shell `command` change (risk profile). For a shell
+    // job the new command can arrive via either `command` OR `prompt` (the
+    // `prompt` field is folded into the command below), so the existence check
+    // must cover both. Skip it for patches that don't set a shell command —
+    // schedule, name, and enable/disable toggles don't need an agent supplied —
+    // and for agent-type jobs, where `prompt` is an LLM prompt, not a shell
+    // command, and so is not agent-gated. This needs `existing.job_type`, hence
+    // it runs after the job is fetched.
+    let setting_shell_command = !is_agent && (command.is_some() || prompt.is_some());
+    if setting_shell_command && config.agent(&agent_alias).is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!(
+                "Unknown agent {a:?} (no [agents.{a}] entry configured)",
+                a = agent_alias
+            )})),
+        )
+            .into_response();
+    }
     let new_expr = schedule_expr
         .as_deref()
         .map(str::trim)
@@ -687,7 +704,6 @@ pub async fn handle_api_cron_patch(
     } else {
         None
     };
-    let is_agent = matches!(existing.job_type, zeroclaw_runtime::cron::JobType::Agent);
     let (patch_command, patch_prompt) = if is_agent {
         (None, command.or(prompt))
     } else {
@@ -699,6 +715,7 @@ pub async fn handle_api_cron_patch(
         schedule,
         command: patch_command,
         prompt: patch_prompt,
+        enabled,
         ..zeroclaw_runtime::cron::CronJobPatch::default()
     };
 
@@ -1910,6 +1927,11 @@ pub async fn handle_claude_code_hook(
     Json(serde_json::json!({ "ok": true }))
 }
 
+// Shared test helper: `api_config` tests reuse this AppState builder for the
+// agent rename/delete cascade handlers (#7907 regression coverage).
+#[cfg(test)]
+pub(crate) use tests::test_state;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2075,7 +2097,7 @@ mod tests {
         config
     }
 
-    fn test_state(config: zeroclaw_config::schema::Config) -> AppState {
+    pub(crate) fn test_state(config: zeroclaw_config::schema::Config) -> AppState {
         AppState {
             config: Arc::new(RwLock::new(config)),
             model_provider: Arc::new(MockModelProvider),
@@ -3240,6 +3262,280 @@ mod tests {
                 tz: None,
             }
         );
+    }
+
+    // --- PATCH agent-requirement boundary (#7666) ---------------------------
+    // These pin the relaxed `agent` rule: it is required only when a patch sets a
+    // *shell command* (the risk-profile gate), and not for enable/disable,
+    // metadata-only patches, or agent-type jobs. Regression coverage for the
+    // `#[serde(default)] agent` + `setting_shell_command` scoping so a future
+    // refactor can't silently reopen the gate or re-require agent where it isn't.
+
+    #[tokio::test]
+    async fn cron_api_patch_enabled_without_agent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &state.config.read().clone(),
+            "test-agent",
+            Some("toggle-job".to_string()),
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "*/5 * * * *".to_string(),
+                tz: None,
+            },
+            "echo hello",
+            None,
+            true,
+        )
+        .expect("job added");
+
+        // No `agent` field at all — pause/resume must not require one.
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(job.id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(serde_json::json!({ "enabled": false }))
+                    .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "enable/disable toggle must not require an agent"
+        );
+        let updated = zeroclaw_runtime::cron::get_job(&state.config.read().clone(), &job.id)
+            .expect("updated job");
+        assert!(!updated.enabled, "job should be disabled after the patch");
+    }
+
+    #[tokio::test]
+    async fn cron_api_patch_name_and_schedule_without_agent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &state.config.read().clone(),
+            "test-agent",
+            Some("old-name".to_string()),
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "*/5 * * * *".to_string(),
+                tz: None,
+            },
+            "echo hello",
+            None,
+            true,
+        )
+        .expect("job added");
+
+        // Metadata-only patch (no command/prompt) — agent must be optional.
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(job.id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(serde_json::json!({
+                    "name": "new-name",
+                    "schedule": "30 9 * * *"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "name/schedule patch must not require an agent"
+        );
+        let updated = zeroclaw_runtime::cron::get_job(&state.config.read().clone(), &job.id)
+            .expect("updated job");
+        assert_eq!(updated.name.as_deref(), Some("new-name"));
+        assert_eq!(
+            updated.schedule,
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "30 9 * * *".to_string(),
+                tz: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_patch_shell_command_requires_known_agent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &state.config.read().clone(),
+            "test-agent",
+            Some("shell-job".to_string()),
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "*/5 * * * *".to_string(),
+                tz: None,
+            },
+            "echo hello",
+            None,
+            true,
+        )
+        .expect("job added");
+
+        // Setting a shell `command` still hits the risk gate: a missing agent
+        // must be a clean 400, not a fall-through.
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(job.id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(
+                    serde_json::json!({ "command": "echo bye" }),
+                )
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "shell command patch with no agent must be rejected at the risk gate"
+        );
+        let json = response_json(response).await;
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Unknown agent"),
+            "error should name the unknown agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_patch_shell_prompt_unknown_agent_is_bad_request_not_500() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &state.config.read().clone(),
+            "test-agent",
+            Some("shell-job".to_string()),
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "*/5 * * * *".to_string(),
+                tz: None,
+            },
+            "echo hello",
+            None,
+            true,
+        )
+        .expect("job added");
+
+        // For a shell job a new command can arrive via `prompt`; it still routes
+        // through the command-risk gate, so an unknown agent is a 400 — not the
+        // 500 that an unguarded path would surface.
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(job.id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(serde_json::json!({
+                    "agent": "ghost",
+                    "prompt": "echo bye"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "shell-job prompt with unknown agent must be 400, not 500"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_patch_agent_prompt_without_agent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let add_response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "agent-job",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "job_type": "agent",
+                    "command": "ignored",
+                    "prompt": "old prompt"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+        assert_eq!(add_response.status(), StatusCode::OK);
+        let id = zeroclaw_runtime::cron::list_jobs(&state.config.read().clone()).unwrap()[0]
+            .id
+            .clone();
+
+        // For an agent-type job `prompt` is an LLM prompt, not a shell command,
+        // so it is not agent-gated and may omit `agent`.
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(
+                    serde_json::json!({ "prompt": "new prompt" }),
+                )
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "agent-type prompt patch must not require an agent"
+        );
+        let updated = zeroclaw_runtime::cron::get_job(&state.config.read().clone(), &id)
+            .expect("updated job");
+        assert_eq!(updated.prompt.as_deref(), Some("new prompt"));
     }
 
     #[tokio::test]

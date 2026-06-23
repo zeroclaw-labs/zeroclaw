@@ -1227,16 +1227,23 @@ impl Agent {
         let mut activated_tools: Option<Arc<std::sync::Mutex<tools::ActivatedToolSet>>> = None;
         // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
         let mut mcp_elevation_arcs: Vec<Arc<dyn tools::Tool>> = Vec::new();
-        if initialize_mcp && config.mcp.enabled && !config.mcp.servers.is_empty() {
+        // Secure by default: only the MCP servers granted by this agent's
+        // `mcp_bundles` (omission is not a grant).
+        let agent_mcp_servers = if initialize_mcp && config.mcp.enabled {
+            config.mcp_servers_for_agent(agent_alias)
+        } else {
+            Vec::new()
+        };
+        if !agent_mcp_servers.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                 &format!(
-                    "Initializing MCP client — {} server(s) configured",
-                    config.mcp.servers.len()
+                    "Initializing MCP client - {} server(s) granted via mcp_bundles",
+                    agent_mcp_servers.len()
                 )
             );
-            match tools::McpRegistry::connect_all(&config.mcp.servers).await {
+            match tools::McpRegistry::connect_all(&agent_mcp_servers).await {
                 Ok(registry) => {
                     let registry = std::sync::Arc::new(registry);
                     mcp_elevation_arcs = tools::collect_mcp_elevation_arcs(&registry).await;
@@ -1960,39 +1967,43 @@ impl Agent {
             .scope(
                 Some(cost_context.clone()),
                 crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
-                    model_provider: self.model_provider.as_ref(),
+                    exec: crate::agent::loop_::ResolvedAgentExecution {
+                        model_access: crate::agent::loop_::ResolvedModelAccess {
+                            model_provider: self.model_provider.as_ref(),
+                            provider_name: &self.model_provider_name,
+                            model: &effective_model,
+                            temperature: self.temperature,
+                        },
+                        tools_registry: &self.tools,
+                        observer: self.observer.as_ref(),
+                        silent: false,
+                        approval: self.approval_manager.as_deref(),
+                        multimodal_config: &self.multimodal_config,
+                        max_tool_iterations: self.config.resolved.max_tool_iterations,
+                        hooks: self.hook_runner.as_deref(),
+                        excluded_tools: &[],
+                        dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
+                        activated_tools: self.activated_tools.as_ref(),
+                        model_switch_callback: None,
+                        pacing: &pacing,
+                        strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                        parallel_tools: self.config.resolved.parallel_tools,
+                        max_tool_result_chars: self.config.resolved.max_tool_result_chars,
+                        context_token_budget: self.config.resolved.max_context_tokens,
+                        receipt_generator: None,
+                        knobs: &knobs,
+                    },
                     history: &mut loop_history,
-                    tools_registry: &self.tools,
-                    observer: self.observer.as_ref(),
-                    provider_name: &self.model_provider_name,
-                    model: &effective_model,
-                    temperature: self.temperature,
-                    silent: false,
-                    approval: self.approval_manager.as_deref(),
                     channel_name: "cli",
                     channel_reply_target: None,
-                    multimodal_config: &self.multimodal_config,
-                    max_tool_iterations: self.config.resolved.max_tool_iterations,
                     cancellation_token: None,
                     on_delta: None,
-                    hooks: self.hook_runner.as_deref(),
-                    excluded_tools: &[],
-                    dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
-                    activated_tools: self.activated_tools.as_ref(),
-                    model_switch_callback: None,
-                    pacing: &pacing,
-                    strict_tool_parsing: self.config.resolved.strict_tool_parsing,
-                    parallel_tools: self.config.resolved.parallel_tools,
-                    max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                    context_token_budget: self.config.resolved.max_context_tokens,
                     shared_budget: None,
                     channel: None,
-                    receipt_generator: None,
                     collected_receipts: None,
                     event_tx: None,
                     steering: None,
                     new_messages_out: Some(&mut loop_new_messages),
-                    knobs: &knobs,
                     image_cache: Some(&mut self.image_cache),
                     // Phase 1: stamp Internal/Trusted. Real per-transport
                     // stamping is PR C (RFC #6971 §4).
@@ -2353,39 +2364,43 @@ impl Agent {
                 .scope(
                     Some(cost_context.clone()),
                     crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
-                        model_provider: self.model_provider.as_ref(),
+                        exec: crate::agent::loop_::ResolvedAgentExecution {
+                            model_access: crate::agent::loop_::ResolvedModelAccess {
+                                model_provider: self.model_provider.as_ref(),
+                                provider_name: &self.model_provider_name,
+                                model: &effective_model,
+                                temperature: self.temperature,
+                            },
+                            tools_registry: &self.tools,
+                            observer: self.observer.as_ref(),
+                            silent: true,
+                            approval: self.approval_manager.as_deref(),
+                            multimodal_config: &self.multimodal_config,
+                            max_tool_iterations: self.config.resolved.max_tool_iterations,
+                            hooks: self.hook_runner.as_deref(),
+                            excluded_tools: &[],
+                            dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
+                            activated_tools: self.activated_tools.as_ref(),
+                            model_switch_callback: None,
+                            pacing: &pacing,
+                            strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                            parallel_tools: self.config.resolved.parallel_tools,
+                            max_tool_result_chars: self.config.resolved.max_tool_result_chars,
+                            context_token_budget: self.config.resolved.max_context_tokens,
+                            receipt_generator: None,
+                            knobs: &knobs,
+                        },
                         history: &mut loop_history,
-                        tools_registry: &self.tools,
-                        observer: self.observer.as_ref(),
-                        provider_name: &self.model_provider_name,
-                        model: &effective_model,
-                        temperature: self.temperature,
-                        silent: true,
-                        approval: self.approval_manager.as_deref(),
                         channel_name: "cli",
                         channel_reply_target: None,
-                        multimodal_config: &self.multimodal_config,
-                        max_tool_iterations: self.config.resolved.max_tool_iterations,
                         cancellation_token: cancel_token.clone(),
                         on_delta: None,
-                        hooks: self.hook_runner.as_deref(),
-                        excluded_tools: &[],
-                        dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
-                        activated_tools: self.activated_tools.as_ref(),
-                        model_switch_callback: None,
-                        pacing: &pacing,
-                        strict_tool_parsing: self.config.resolved.strict_tool_parsing,
-                        parallel_tools: self.config.resolved.parallel_tools,
-                        max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                        context_token_budget: self.config.resolved.max_context_tokens,
                         shared_budget: None,
                         channel: approval_bridge.as_deref(),
-                        receipt_generator: None,
                         collected_receipts: None,
                         event_tx: Some(event_tx.clone()),
                         steering: None,
                         new_messages_out: Some(&mut round_added),
-                        knobs: &knobs,
                         image_cache: Some(&mut self.image_cache),
                         // Phase 1: stamp Internal/Trusted. Real per-transport
                         // stamping is PR C (RFC #6971 §4).
@@ -2731,6 +2746,80 @@ mod tests {
         fn alias(&self) -> &str {
             "MockModelProvider"
         }
+    }
+
+    const BLANK_TURN_ERROR: &str = "empty user message: refusing to dispatch a blank turn";
+
+    fn blank_input_agent(model_provider: Box<dyn ModelProvider>) -> Agent {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        Agent::builder()
+            .model_provider(model_provider)
+            .tools(Vec::new())
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config")
+    }
+
+    #[tokio::test]
+    async fn turn_rejects_blank_input() {
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(Vec::new()),
+        });
+        let mut agent = blank_input_agent(model_provider);
+        let err = agent.turn("").await.expect_err("blank turn must fail");
+        assert_eq!(err.to_string(), BLANK_TURN_ERROR);
+    }
+
+    #[tokio::test]
+    async fn turn_rejects_whitespace_only_input() {
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(Vec::new()),
+        });
+        let mut agent = blank_input_agent(model_provider);
+        let err = agent
+            .turn("   \n\t")
+            .await
+            .expect_err("whitespace-only turn must fail");
+        assert_eq!(err.to_string(), BLANK_TURN_ERROR);
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_rejects_blank_input() {
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(Vec::new()),
+        });
+        let mut agent = blank_input_agent(model_provider);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
+        let err = agent
+            .turn_streamed("", event_tx, None)
+            .await
+            .expect_err("blank streamed turn must fail");
+        assert_eq!(err.to_string(), BLANK_TURN_ERROR);
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_rejects_whitespace_only_input() {
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(Vec::new()),
+        });
+        let mut agent = blank_input_agent(model_provider);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
+        let err = agent
+            .turn_streamed("  \n", event_tx, None)
+            .await
+            .expect_err("whitespace-only streamed turn must fail");
+        assert_eq!(err.to_string(), BLANK_TURN_ERROR);
     }
 
     struct ModelCaptureModelProvider {
@@ -6100,6 +6189,7 @@ mod tests {
         crate::skills::Skill {
             name: name.to_string(),
             description: format!("{name} skill"),
+            description_localizations: Default::default(),
             version: "0.1.0".to_string(),
             author: None,
             tags: vec![],
@@ -6192,6 +6282,7 @@ mod tests {
         let skill = Skill {
             name: "ops".to_string(),
             description: "d".to_string(),
+            description_localizations: Default::default(),
             version: "1".to_string(),
             author: None,
             tags: vec![],
@@ -6473,6 +6564,7 @@ mod tests {
             .workspace_dir(ws_dir.clone())
             .model_name("test-model".into())
             .temperature(Some(0.0))
+            .prompt_builder(SystemPromptBuilder::default())
             .build()
             .expect("agent builder should succeed with valid config");
 
@@ -6497,6 +6589,7 @@ mod tests {
             .workspace_dir(ws_dir)
             .model_name("test-model".into())
             .temperature(Some(0.0))
+            .prompt_builder(SystemPromptBuilder::default())
             .build()
             .expect("agent builder should succeed with valid config");
 

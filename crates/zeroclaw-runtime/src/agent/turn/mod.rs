@@ -53,6 +53,7 @@ pub(crate) mod context;
 pub(crate) mod context_recovery;
 pub(crate) mod delivery_defaults;
 pub(crate) mod events;
+pub(crate) mod execution;
 pub(crate) mod history_append;
 pub(crate) mod history_window;
 pub(crate) mod knobs;
@@ -76,6 +77,7 @@ pub(crate) use context_recovery::{record_llm_failure, try_recover_context_overfl
 #[cfg(test)]
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
 pub use events::{DraftEvent, PROGRESS_MIN_INTERVAL_MS, StreamDelta};
+pub use execution::{ResolvedAgentExecution, ResolvedModelAccess};
 pub(crate) use history_append::append_tool_round_to_history;
 pub(crate) use history_window::preflight_history_maintenance;
 pub use knobs::{LoopKnobs, MaxIterationBehavior};
@@ -87,7 +89,9 @@ pub use outcome::{
 };
 #[cfg(test)]
 pub(crate) use parse_response::build_native_assistant_history;
-pub(crate) use parse_response::{interpret_chat_response, resolve_display_text};
+pub(crate) use parse_response::{
+    interpret_chat_response, resolve_display_text, unforwarded_narration,
+};
 pub(crate) use post_exec::record_executed_outcomes;
 pub(crate) use provider_call::{
     ProviderCallOutcome, announce_llm_request, call_provider, enforce_tool_loop_budget,
@@ -105,10 +109,7 @@ pub(crate) use vision_route::{prepare_messages_for_iteration, resolve_vision_pro
 use crate::agent::tool_execution::{
     execute_tools_parallel, execute_tools_sequential, should_execute_tools_in_parallel,
 };
-use crate::approval::ApprovalManager;
-use crate::observability::Observer;
 use crate::security::ingress::{IngressPolicy, ingress_policy};
-use crate::tools::Tool;
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::collections::HashSet;
@@ -163,40 +164,22 @@ pub(crate) const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 /// destructures it once at entry, so the body reads exactly as it did when
 /// these were positional parameters.
 pub struct ToolLoop<'a> {
-    pub model_provider: &'a dyn ModelProvider,
+    /// The resolved per-agent execution context: model binding, gated tool
+    /// registry, approval, observability, and resolved runtime knobs. Stable
+    /// for every turn to this agent; built once and reused. See
+    /// [`ResolvedAgentExecution`]. Everything below is per-message turn state.
+    pub exec: ResolvedAgentExecution<'a>,
     pub history: &'a mut Vec<ChatMessage>,
-    pub tools_registry: &'a [Box<dyn Tool>],
-    pub observer: &'a dyn Observer,
-    pub provider_name: &'a str,
-    pub model: &'a str,
-    pub temperature: Option<f64>,
-    pub silent: bool,
-    pub approval: Option<&'a ApprovalManager>,
     pub channel_name: &'a str,
     pub channel_reply_target: Option<&'a str>,
-    pub multimodal_config: &'a zeroclaw_config::schema::MultimodalConfig,
-    pub max_tool_iterations: usize,
     pub cancellation_token: Option<CancellationToken>,
     pub on_delta: Option<tokio::sync::mpsc::Sender<DraftEvent>>,
-    pub hooks: Option<&'a crate::hooks::HookRunner>,
-    pub excluded_tools: &'a [String],
-    pub dedup_exempt_tools: &'a [String],
-    pub activated_tools:
-        Option<&'a std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
-    pub model_switch_callback: Option<ModelSwitchCallback>,
-    pub pacing: &'a zeroclaw_config::schema::PacingConfig,
-    pub strict_tool_parsing: bool,
-    pub parallel_tools: bool,
-    pub max_tool_result_chars: usize,
-    pub context_token_budget: usize,
     pub shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
     pub channel: Option<&'a dyn Channel>,
-    pub receipt_generator: Option<&'a crate::agent::tool_receipts::ReceiptGenerator>,
     pub collected_receipts: Option<&'a std::sync::Mutex<Vec<String>>>,
     pub event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
     pub steering: Option<&'a mut tokio::sync::mpsc::Receiver<String>>,
     pub new_messages_out: Option<&'a mut Vec<ChatMessage>>,
-    pub knobs: &'a LoopKnobs,
     pub image_cache: Option<&'a mut zeroclaw_providers::multimodal::LocalImageCache>,
     /// The ingress envelope stamped by the entry layer (RFC #6971). Travels
     /// with the turn into the engine, where the universal SOP policy layer
@@ -209,21 +192,35 @@ pub struct ToolLoop<'a> {
 
 pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
     let ToolLoop {
-        model_provider,
+        exec,
         history,
-        tools_registry,
-        observer,
-        provider_name,
-        model,
-        temperature,
-        silent,
-        approval,
         channel_name,
         channel_reply_target,
-        multimodal_config,
-        max_tool_iterations,
         cancellation_token,
         on_delta,
+        shared_budget,
+        channel,
+        collected_receipts,
+        event_tx,
+        mut steering,
+        mut new_messages_out,
+        mut image_cache,
+        ingress,
+    } = p;
+    let ResolvedAgentExecution {
+        model_access:
+            ResolvedModelAccess {
+                model_provider,
+                provider_name,
+                model,
+                temperature,
+            },
+        tools_registry,
+        observer,
+        silent,
+        approval,
+        multimodal_config,
+        max_tool_iterations,
         hooks,
         excluded_tools,
         dedup_exempt_tools,
@@ -234,17 +231,9 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         parallel_tools,
         max_tool_result_chars,
         context_token_budget,
-        shared_budget,
-        channel,
         receipt_generator,
-        collected_receipts,
-        event_tx,
-        mut steering,
-        mut new_messages_out,
         knobs,
-        mut image_cache,
-        ingress,
-    } = p;
+    } = exec;
 
     // ── Ingress policy · P1 (turn entry) ────────────────────────────────────
     // RFC #6971: every inbound turn passes the universal SOP policy layer before
@@ -378,10 +367,11 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             if remaining == 0 {
                 ::zeroclaw_log::record!(
                     WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({"iteration": iteration})),
-                    "Shared iteration budget exhausted at iteration "
+                    "Shared iteration budget exhausted at iteration"
                 );
                 break;
             }
@@ -398,7 +388,8 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         {
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Migrate)
+                    .with_category(::zeroclaw_log::EventCategory::Provider),
                 &format!(
                     "Model switch detected: {} {} -> {} {}",
                     provider_name, model, new_model_provider, new_model
@@ -482,6 +473,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
                     .with_attrs(::serde_json::json!({
                         "has_on_delta": on_delta.is_some(),
                         "has_event_tx": event_tx.is_some(),
@@ -502,6 +494,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             chat_result,
             streamed_live_deltas,
             streamed_protocol_suppressed,
+            streamed_visible_text,
         } = call_provider(
             &ctx,
             active_model_provider,
@@ -609,6 +602,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Provider)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(serde_json::json!({
                         "channel": channel_name,
@@ -622,6 +616,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Provider)
                     .with_attrs(serde_json::json!({
                     "iteration": iteration + 1,
                     "retry": malformed_tool_protocol_retries,
@@ -682,6 +677,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_attrs(::serde_json::json!({
                         "model": model,
@@ -724,17 +720,23 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
         // can still see it live through `on_delta` below, but the final
         // delivered response must only contain the final assistant turn.
 
-        // Native tool-call model_providers can return assistant text separately from
-        // the structured call payload; relay it to draft-capable channels.
+        // Relay only the portion of narration the live stream did not already
+        // deliver: re-sending the whole thing duplicates it.
         if !display_text.is_empty() {
+            // `protocol_suppressed` withholds the whole turn; the empty-remainder
+            // skip below handles the guard-passed case where the live stream already forwarded every byte.
             if !native_tool_calls.is_empty()
+                && !protocol_suppressed
                 && let Some(ref tx) = on_delta
             {
-                let mut narration = display_text.clone();
-                if !narration.ends_with('\n') {
-                    narration.push('\n');
+                let remainder = unforwarded_narration(&display_text, &streamed_visible_text);
+                if !remainder.is_empty() {
+                    let mut narration = remainder.to_string();
+                    if !narration.ends_with('\n') {
+                        narration.push('\n');
+                    }
+                    let _ = tx.send(StreamDelta::Text(narration)).await;
                 }
-                let _ = tx.send(StreamDelta::Text(narration)).await;
             }
             if !silent {
                 eprint!("{display_text}");
