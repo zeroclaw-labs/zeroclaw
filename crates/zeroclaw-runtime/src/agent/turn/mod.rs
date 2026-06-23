@@ -427,7 +427,9 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                         .send(TurnEvent::HistoryTrimmed {
                             dropped_messages: result.dropped_messages,
                             kept_turns: result.kept_turns,
-                            reason: "context token budget exceeded".to_string(),
+                            reason: crate::i18n::get_required_cli_string(
+                                "history-trim-reason-budget",
+                            ),
                         })
                         .await;
                 }
@@ -435,7 +437,7 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                     &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
                         dropped_messages: result.dropped_messages,
                         kept_turns: result.kept_turns,
-                        reason: "context token budget exceeded".to_string(),
+                        reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
                         channel: None,
                         agent_alias: None,
                         turn_id: None,
@@ -614,7 +616,14 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
                     &turn_id,
                     &e,
                 );
-                let recovered = try_recover_context_overflow(history, &e, iteration);
+                let recovered = try_recover_context_overflow(
+                    history,
+                    &e,
+                    iteration,
+                    event_tx.as_ref(),
+                    observer,
+                )
+                .await;
                 if recovered {
                     continue;
                 }

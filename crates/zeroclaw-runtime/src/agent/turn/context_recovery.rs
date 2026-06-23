@@ -58,10 +58,16 @@ pub(crate) fn record_llm_failure(
 /// Returns `true` when the history was trimmed and the caller should
 /// `continue` the loop; the orchestrator keeps
 /// `if recovered { continue; } return Err(e);` inline.
-pub(crate) fn try_recover_context_overflow(
+///
+/// Emits `TurnEvent::HistoryTrimmed` and `ObserverEvent::HistoryTrimmed` on the
+/// trimmed branch so the 400-recovery cut is never silent to ACP / WS / SSE
+/// subscribers, matching the preemptive turn-boundary path.
+pub(crate) async fn try_recover_context_overflow(
     history: &mut Vec<ChatMessage>,
     e: &anyhow::Error,
     iteration: usize,
+    event_tx: Option<&tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>>,
+    observer: &dyn Observer,
 ) -> bool {
     if zeroclaw_providers::reliable::is_context_window_exceeded(e) {
         ::zeroclaw_log::record!(
@@ -82,6 +88,7 @@ pub(crate) fn try_recover_context_overflow(
         let trimmed = result.trimmed;
         let dropped_turns = result.dropped_turns;
         let dropped_messages = result.dropped_messages;
+        let kept_turns = result.kept_turns;
         let tokens_after = result.tokens_after;
         *history = result.history;
         if trimmed {
@@ -97,6 +104,24 @@ pub(crate) fn try_recover_context_overflow(
                     })),
                 "Context recovery: dropped oldest whole turns, retrying"
             );
+            let reason = crate::i18n::get_required_cli_string("history-trim-reason-budget");
+            if let Some(tx) = event_tx {
+                let _ = tx
+                    .send(zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                        dropped_messages,
+                        kept_turns,
+                        reason: reason.clone(),
+                    })
+                    .await;
+            }
+            observer.record_event(&ObserverEvent::HistoryTrimmed {
+                dropped_messages,
+                kept_turns,
+                reason,
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+            });
             return true;
         }
 
@@ -110,4 +135,64 @@ pub(crate) fn try_recover_context_overflow(
         );
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::observability::NoopObserver;
+    use zeroclaw_providers::ChatMessage;
+
+    fn overflowing_history() -> Vec<ChatMessage> {
+        let big = "x".repeat(4000);
+        let mut h = vec![ChatMessage::system("system")];
+        for i in 0..6 {
+            h.push(ChatMessage::user(format!("turn {i} {big}").as_str()));
+            h.push(ChatMessage::assistant(format!("reply {i} {big}").as_str()));
+        }
+        h
+    }
+
+    #[tokio::test]
+    async fn recovery_emits_history_trimmed_event_on_trim() {
+        let mut history = overflowing_history();
+        let err = anyhow::Error::msg("maximum context length exceeded");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let observer = NoopObserver;
+
+        let recovered =
+            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer).await;
+
+        assert!(recovered, "an overflowing history must trim and recover");
+        let event = rx.try_recv().expect("recovery must emit a TurnEvent");
+        match event {
+            zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                dropped_messages,
+                kept_turns,
+                reason,
+            } => {
+                assert!(dropped_messages > 0, "must report dropped messages");
+                assert!(kept_turns >= 1, "must keep at least the current turn");
+                assert_eq!(
+                    reason,
+                    crate::i18n::get_required_cli_string("history-trim-reason-budget")
+                );
+            }
+            other => panic!("expected HistoryTrimmed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_overflow_error_is_not_recovered_and_emits_nothing() {
+        let mut history = overflowing_history();
+        let err = anyhow::Error::msg("some unrelated provider error");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let observer = NoopObserver;
+
+        let recovered =
+            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), &observer).await;
+
+        assert!(!recovered, "a non-overflow error must not trigger recovery");
+        assert!(rx.try_recv().is_err(), "no event on the non-overflow path");
+    }
 }
