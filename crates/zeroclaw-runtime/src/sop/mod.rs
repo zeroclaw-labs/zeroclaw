@@ -3,11 +3,17 @@ pub mod condition;
 pub mod dispatch;
 pub mod engine;
 pub mod metrics;
+pub mod payload_safety;
+pub mod store;
 pub mod types;
 
 pub use audit::SopAuditLogger;
 pub use engine::SopEngine;
 pub use metrics::SopMetricsCollector;
+pub use store::{
+    ClaimToken, PersistedRun, ProposalRecord, ProposalStatus, SopEventRecord, SopRunStore,
+    StoreError, build_run_store,
+};
 #[allow(unused_imports)]
 pub use types::{
     DeterministicRunState, DeterministicSavings, Sop, SopEvent, SopExecutionMode, SopPriority,

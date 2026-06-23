@@ -124,9 +124,11 @@ use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_f
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
 use zeroclaw_runtime::agent::history::fast_trim_tool_results;
 use zeroclaw_runtime::agent::loop_::{
-    LoopKnobs, ToolLoop, apply_policy_tool_filter, apply_text_tool_prompt_policy,
-    build_tool_instructions_for_names, clear_model_switch_request, get_model_switch_state,
-    is_model_switch_requested, run_tool_call_loop, scope_session_key, scope_thread_id,
+    LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
+    ToolLoop, apply_policy_tool_filter, apply_text_tool_prompt_policy,
+    build_tool_instructions_for_names, clear_model_switch_request, eager_mcp_tool_allowed,
+    get_model_switch_state, is_model_switch_requested, mcp_tool_access_policy,
+    register_eager_mcp_tool_if_allowed, run_tool_call_loop, scope_session_key, scope_thread_id,
     scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
@@ -3222,6 +3224,106 @@ async fn resolve_classifier_route(
     Some((provider, model, temperature))
 }
 
+/// Resolve the agent's effective context-compression summary provider to a
+/// `(provider, model)` pair for the proactive `compress_if_needed` call
+/// (the cross-provider fix for #7964). Returns `None` when no summary provider
+/// is configured for the agent, or on ANY resolution/build failure; the caller
+/// MUST then fall back to the active `active_model_provider` + `route.model`
+/// (with the deprecated `summary_model` swap still honored).
+///
+/// Sibling of `resolve_classifier_route`: same dotted-ref → `[providers.models]`
+/// lookup, same "every failure → None → caller reuses the main provider"
+/// fail-open contract, just keyed off `effective_summary_provider` and without
+/// a temperature.
+async fn resolve_summary_route(
+    ctx: &ChannelRuntimeContext,
+    defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
+) -> Option<(Arc<dyn ModelProvider>, String)> {
+    let provider_ref = defaults_snapshot
+        .config
+        .effective_summary_provider(ctx.agent_alias.as_str())?;
+    let provider_str = provider_ref.as_str().trim();
+    if provider_str.is_empty() {
+        return None;
+    }
+
+    let (type_key, alias_key) = match provider_str.split_once('.') {
+        Some(parts) => parts,
+        None => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"provider": provider_str})),
+                "summary_provider must be dotted `<type>.<alias>`; falling back to main agent"
+            );
+            return None;
+        }
+    };
+
+    let model_cfg = match defaults_snapshot
+        .config
+        .providers
+        .models
+        .find(type_key, alias_key)
+    {
+        Some(cfg) => cfg,
+        None => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"provider": provider_str})),
+                "summary_provider references an unknown [providers.models.<type>.<alias>] entry; falling back to main agent"
+            );
+            return None;
+        }
+    };
+
+    let model = model_cfg.model.clone().unwrap_or_default();
+    if model.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"provider": provider_str})),
+            "summary_provider points to a [providers.models] entry without a `model` field; falling back to main agent"
+        );
+        return None;
+    }
+
+    let provider = match get_or_create_provider(
+        ctx,
+        provider_str,
+        model_cfg.api_key.as_deref(),
+        defaults_snapshot,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            let safe_err = zeroclaw_providers::sanitize_api_error(&e.to_string());
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"provider": provider_str, "error": safe_err})),
+                "Failed to initialize summary_provider; falling back to main agent provider"
+            );
+            return None;
+        }
+    };
+
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_attrs(::serde_json::json!({"provider": provider_str, "model": model.as_str()})),
+        "summary_provider override active"
+    );
+
+    Some((provider, model))
+}
+
 /// Build the `NoReply` outcome, with a narrow rubric-echo failsafe scoped to
 /// the `Informational` kind only. When the classifier emits `NO_REPLY[INFO]`
 /// with a reason that restates its own rubric (the only failure mode observed
@@ -4453,12 +4555,50 @@ async fn process_channel_message_body(
             ctx.context_token_budget,
         )
         .with_memory(Arc::clone(&ctx.memory));
+        // Resolve the agent's effective summary provider (#7964). On any
+        // failure we fall back to the active provider + route model (with the
+        // deprecated `summary_model` swap), and only that path may preserve
+        // media markers when the active provider supports vision.
+        let resolved_summary = resolve_summary_route(ctx.as_ref(), &runtime_defaults).await;
+        let summary_target = match resolved_summary {
+            Some((ref provider, ref model)) => {
+                zeroclaw_runtime::agent::context_compressor::SummaryTarget {
+                    provider: provider.as_ref(),
+                    model: model.as_str(),
+                    preserve_media_markers: false,
+                }
+            }
+            None => {
+                // Deprecated `summary_model` fallback: dispatched on the agent's
+                // OWN provider. Warn-once (shared process-global set with the
+                // loop_ call sites) that a profile-shared bare model id can
+                // silently mismatch across providers (#7964).
+                let deprecated = ctx
+                    .agent_cfg
+                    .resolved
+                    .context_compression
+                    .summary_model
+                    .as_deref();
+                if let Some(sm) = deprecated.filter(|s| !s.trim().is_empty()) {
+                    zeroclaw_runtime::agent::loop_::warn_deprecated_summary_model_fallback(
+                        ctx.agent_alias.as_str(),
+                        sm,
+                    );
+                }
+                zeroclaw_runtime::agent::context_compressor::SummaryTarget {
+                    provider: active_model_provider.as_ref(),
+                    model: deprecated.unwrap_or(route.model.as_str()),
+                    preserve_media_markers: active_model_provider.supports_vision(),
+                }
+            }
+        };
         match compressor
             .compress_if_needed(
                 &mut history,
                 active_model_provider.as_ref(),
                 route.model.as_str(),
                 runtime_defaults.defaults.temperature,
+                summary_target,
             )
             .await
         {
@@ -4840,59 +4980,67 @@ async fn process_channel_message_body(
                         zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT.scope(
                             receipt_scope.clone(),
                         run_tool_call_loop(ToolLoop {
-                        model_provider: active_model_provider.as_ref(),
-                        history: &mut history,
-                        tools_registry: ctx.tools_registry.as_ref(),
-                        observer: notify_observer.as_ref() as &dyn Observer,
-                        provider_name: route.model_provider.as_str(),
-                        model: route.model.as_str(),
-                        temperature: runtime_defaults.defaults.temperature,
-                        silent: true,
-                        approval: Some(&*ctx.approval_manager),
-                        channel_name: msg.channel.as_str(),
-                        channel_reply_target: Some(msg.reply_target.as_str()),
-                        multimodal_config: &ctx.multimodal,
-                        max_tool_iterations: ctx.max_tool_iterations,
-                        cancellation_token: Some(cancellation_token.clone()),
-                        on_delta: delta_tx.clone(),
-                        hooks: ctx.hooks.as_deref(),
-                        excluded_tools: if msg.channel == "cli"
+exec: ResolvedAgentExecution::resolve(
+ResolvedModelAccess {
+model_provider: active_model_provider.as_ref(),
+provider_name: route.model_provider.as_str(),
+model: route.model.as_str(),
+temperature: runtime_defaults.defaults.temperature,
+},
+ResolvedIo {
+tools_registry: ctx.tools_registry.as_ref(),
+observer: notify_observer.as_ref() as &dyn Observer,
+silent: true,
+approval: Some(&*ctx.approval_manager),
+multimodal_config: &ctx.multimodal,
+hooks: ctx.hooks.as_deref(),
+activated_tools: ctx.activated_tools.as_ref(),
+model_switch_callback: Some(model_switch_callback.clone()),
+receipt_generator: ctx.receipt_generator.as_ref(),
+},
+ResolvedRuntimeKnobs {
+max_tool_iterations: ctx.max_tool_iterations,
+excluded_tools: if msg.channel == "cli"
                             || ctx.autonomy_level == AutonomyLevel::Full
                         {
                             &[]
                         } else {
                             ctx.non_cli_excluded_tools.as_ref()
                         },
-                        dedup_exempt_tools: ctx.tool_call_dedup_exempt.as_ref(),
-                        activated_tools: ctx.activated_tools.as_ref(),
-                        model_switch_callback: Some(model_switch_callback.clone()),
-                        pacing: &ctx.pacing,
-                        strict_tool_parsing: ctx
+dedup_exempt_tools: ctx.tool_call_dedup_exempt.as_ref(),
+pacing: &ctx.pacing,
+strict_tool_parsing: ctx
                             .prompt_config
                             .agent(ctx.agent_alias.as_str())
                             .is_some_and(|agent| agent.resolved.strict_tool_parsing),
-                        parallel_tools: ctx
+parallel_tools: ctx
                             .prompt_config
                             .agent(ctx.agent_alias.as_str())
                             .is_some_and(|agent| agent.resolved.parallel_tools),
-                        max_tool_result_chars: ctx.max_tool_result_chars,
-                        context_token_budget: ctx.context_token_budget,
-                        shared_budget: None,
-                        channel: target_channel.as_deref(),
-                        receipt_generator: ctx.receipt_generator.as_ref(),
-                        // Collector is meaningful only when the generator is
+max_tool_result_chars: ctx.max_tool_result_chars,
+context_token_budget: ctx.context_token_budget,
+knobs: &loop_knobs,
+},
+),
+history: &mut history,
+channel_name: msg.channel.as_str(),
+channel_reply_target: Some(msg.reply_target.as_str()),
+cancellation_token: Some(cancellation_token.clone()),
+on_delta: delta_tx.clone(),
+shared_budget: None,
+channel: target_channel.as_deref(),
+// Collector is meaningful only when the generator is
                         // active. Pass None when receipts are disabled so the
                         // call site reflects that coupling explicitly.
                         collected_receipts: ctx
                             .receipt_generator
                             .as_ref()
                             .map(|_| tool_receipts_collector.as_ref()),
-                        event_tx: None,
-                        steering: None,
-                        new_messages_out: None,
-                        knobs: &loop_knobs,
-                        image_cache: None,
-                        // Phase 1: stamp Internal/Trusted. Real per-transport
+event_tx: None,
+steering: None,
+new_messages_out: None,
+image_cache: None,
+// Phase 1: stamp Internal/Trusted. Real per-transport
                         // stamping is PR C (RFC #6971 §4).
                         ingress: zeroclaw_api::ingress::IngressContext::internal(),
 }),
@@ -6222,9 +6370,22 @@ fn build_channel_by_id(
                     let alias = alias.clone();
                     Arc::new(move || cfg_arc.read().channel_external_peers("whatsapp", &alias))
                 };
+                let allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                    let cfg_arc = config_arc.clone();
+                    let alias = alias.clone();
+                    Arc::new(move || {
+                        cfg_arc
+                            .read()
+                            .channels
+                            .whatsapp
+                            .get(&alias)
+                            .map(|wa| wa.allowed_groups.clone())
+                            .unwrap_or_default()
+                    })
+                };
                 let workspace_dir = one_shot_channel_workspace_dir(&config, "whatsapp", &alias);
                 Ok(Arc::new(
-                    WhatsAppWebChannel::new(wa, alias, peer_resolver)
+                    WhatsAppWebChannel::new(wa, alias, peer_resolver, allowed_groups_resolver)
                         .with_workspace_dir(workspace_dir),
                 ))
             }
@@ -6897,15 +7058,54 @@ fn channel_ref_matches_message_channel(channel_ref: &str, message_channel: &str)
 /// An empty set means no enabled agent declared channel bindings, so
 /// collection falls back to legacy behavior and accepts all enabled channels.
 struct ActiveChannelAliases {
-    /// Set of `<type>.<alias>` channel references from enabled agents.
-    aliases: HashSet<String>,
+    /// `<type>.<alias>` declared by ENABLED agents. Drives `contains` in
+    /// explicit-binding mode: only enabled owners' bindings count.
+    enabled_bindings: HashSet<String>,
+    /// `<type>.<alias>` declared by ALL agents (enabled or disabled).
+    /// Distinguishes "true legacy fallback" (no bindings anywhere) from
+    /// "bindings exist but every owner is disabled" — the #8013 bug path.
+    /// When non-empty and `enabled_bindings` is empty, legacy mode must
+    /// NOT fire; otherwise disabled owners would still bring their bound
+    /// channels online.
+    all_known_bindings: HashSet<String>,
 }
 
 impl ActiveChannelAliases {
     /// Returns true when `channel_ref` is explicitly bound, or when there are
-    /// no explicit bindings and legacy "accept all enabled channels" mode applies.
+    /// no explicit bindings anywhere and legacy "accept all enabled channels"
+    /// mode applies.
     fn contains(&self, channel_ref: &str) -> bool {
-        self.aliases.is_empty() || self.aliases.contains(channel_ref)
+        self.all_known_bindings.is_empty() || self.enabled_bindings.contains(channel_ref)
+    }
+
+    /// True when bindings exist somewhere in the config but every owner is
+    /// `enabled = false`. The #8013 bug fires when this returns true.
+    fn disabled_owners_exist(&self) -> bool {
+        !self.all_known_bindings.is_empty() && self.enabled_bindings.is_empty()
+    }
+
+    /// Build an `ActiveChannelAliases` from a config snapshot.
+    ///
+    /// Single source of truth for the "is this channel reference currently
+    /// active under the agent binding state?" decision. Used by
+    /// `collect_configured_channels` (Discord/Telegram/Mattermost/etc.) and
+    /// by the Nostr startup / health-check paths so the #8013 invariant
+    /// ("a disabled agent must not bring its bound channel online") is
+    /// enforced uniformly across the orchestrator.
+    fn compute(config: &Config) -> Self {
+        Self {
+            enabled_bindings: config
+                .agents
+                .values()
+                .filter(|a| a.enabled)
+                .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
+                .collect(),
+            all_known_bindings: config
+                .agents
+                .values()
+                .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
+                .collect(),
+        }
     }
 }
 
@@ -6989,14 +7189,21 @@ fn collect_configured_channels(
     // outlive the function capture `config_arc.clone()`.
     let config = config_arc.read();
 
-    let active_channel_aliases = ActiveChannelAliases {
-        aliases: config
-            .agents
-            .values()
-            .filter(|a| a.enabled)
-            .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
-            .collect(),
-    };
+    let active_channel_aliases = ActiveChannelAliases::compute(&config);
+
+    if active_channel_aliases.disabled_owners_exist() {
+        let skipped: Vec<&String> = active_channel_aliases.all_known_bindings.iter().collect();
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "skipped_bindings": skipped.len(),
+                    "bindings": skipped,
+                })),
+            "channel binding(s) skipped: all owning agent(s) are disabled (#8013)"
+        );
+    }
 
     #[cfg(feature = "channel-telegram")]
     for (alias, tg) in &config.channels.telegram {
@@ -7493,17 +7700,35 @@ fn collect_configured_channels(
                         Arc::new(move || cfg_arc.read().channel_external_peers("whatsapp", &alias))
                     };
                     let workspace_dir = config.channel_workspace_dir(&format!("whatsapp.{alias}"));
+                    let allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                        let cfg_arc = config_arc.clone();
+                        let alias = alias.clone();
+                        Arc::new(move || {
+                            cfg_arc
+                                .read()
+                                .channels
+                                .whatsapp
+                                .get(&alias)
+                                .map(|wa| wa.allowed_groups.clone())
+                                .unwrap_or_default()
+                        })
+                    };
                     channels.push(ConfiguredChannel {
                         display_name: "WhatsApp",
                         alias: Some(alias.clone()),
                         channel: crate::paced_channel::PacedChannel::wrap(
                             Arc::new(
-                                WhatsAppWebChannel::new(wa, alias.clone(), peer_resolver)
-                                    .with_transcription(config.transcription.clone())
-                                    .with_tts(&config)
-                                    .with_workspace_dir(workspace_dir)
-                                    .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
-                                    .with_group_mention_patterns(wa.group_mention_patterns.clone()),
+                                WhatsAppWebChannel::new(
+                                    wa,
+                                    alias.clone(),
+                                    peer_resolver,
+                                    allowed_groups_resolver,
+                                )
+                                .with_transcription(config.transcription.clone())
+                                .with_tts(&config)
+                                .with_workspace_dir(workspace_dir)
+                                .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
+                                .with_group_mention_patterns(wa.group_mention_patterns.clone()),
                             ),
                             wa,
                         ),
@@ -8455,6 +8680,17 @@ fn collect_configured_channels(
         );
     }
 
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({
+                "activated_bindings": active_channel_aliases.enabled_bindings.len(),
+                "bindings": active_channel_aliases.enabled_bindings.iter().collect::<Vec<_>>(),
+            })),
+        "channel binding(s) activated from enabled agents"
+    );
+
     channels
 }
 
@@ -8475,17 +8711,17 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         // runs (parking_lot guards are not Send).
         let nostr_jobs: Vec<(String, String, Vec<String>)> = {
             let config = config_arc.read();
-            let active_nostr: std::collections::HashSet<String> = config
-                .agents
-                .values()
-                .filter(|a| a.enabled)
-                .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
-                .collect();
+            // Share the same gate as the Discord/shared-collector path so
+            // the #8013 invariant ("a disabled agent must not bring its
+            // bound channel online") is enforced uniformly — see the
+            // `ActiveChannelAliases::compute` constructor for details.
+            let active = ActiveChannelAliases::compute(&config);
             config
                 .channels
                 .nostr
                 .iter()
-                .filter(|(alias, _)| active_nostr.contains(&format!("nostr.{alias}")))
+                .filter(|(alias, _)| active.contains(&format!("nostr.{alias}")))
+                .filter(|(_, ns)| ns.enabled)
                 .map(|(alias, ns)| (alias.clone(), ns.private_key.clone(), ns.relays.clone()))
                 .collect()
         };
@@ -8594,16 +8830,32 @@ fn build_owner_by_channel_key(
         }
     }
 
-    // Legacy fallback mode: when no enabled agent declares channel bindings,
-    // channel collection accepts all enabled channels. Those channels must
-    // also be routable, so bind collected channel keys to the runtime-active
-    // agent selection (explicit `"default"` alias when present, else
-    // lexicographically-smallest enabled alias).
-    // `owner_by_channel_key.is_empty()` means every enabled agent had an
-    // empty `agents.<alias>.channels` list; this is the same "legacy mode"
-    // signal used by `collect_configured_channels` to accept all enabled
-    // channel blocks.
-    if owner_by_channel_key.is_empty() && !collected_channel_keys.is_empty() {
+    // Distinguish "no enabled agent declared bindings" (true legacy mode)
+    // from "bindings exist but every owner is disabled" (active skip — see
+    // #8013). In the second case, we deliberately leave `owner_by_channel_key`
+    // empty so `AgentRouter::resolve` falls through and the inbound message
+    // is dropped at line 5667, instead of being silently routed to a
+    // now-disabled agent.
+    let any_binding_declared_anywhere = config.agents.values().any(|a| !a.channels.is_empty());
+
+    if any_binding_declared_anywhere {
+        if owner_by_channel_key.is_empty() && !collected_channel_keys.is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "channel bindings exist but no owning agent is enabled; \
+                 affected channels will be unbound and inbound messages dropped (#8013)"
+            );
+        }
+        return owner_by_channel_key;
+    }
+
+    // True legacy mode: no agent anywhere declares a binding. Preserve the
+    // existing deterministic fallback so on-disk session hydration and the
+    // pre-existing `build_owner_by_channel_key_legacy_fallback_*` tests
+    // continue to work.
+    if !collected_channel_keys.is_empty() {
         let fallback_owner = config
             .resolved_runtime_agent_alias()
             .filter(|alias| enabled_agents.iter().any(|enabled| enabled == *alias))
@@ -8916,89 +9168,132 @@ pub async fn start_channels(
         // Resolution-only MCP wrappers for skill MCP elevation (kind = "mcp").
         let mut ch_mcp_elevation_arcs: Vec<std::sync::Arc<dyn zeroclaw_runtime::tools::Tool>> =
             Vec::new();
-        if config.mcp.enabled && !config.mcp.servers.is_empty() {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"agent": agent_alias})),
-                &format!(
-                    "Initializing MCP client — {} server(s) configured",
-                    config.mcp.servers.len()
-                )
+        // Secure by default: an agent is granted only the MCP servers its
+        // `mcp_bundles` name (omission is not a grant). Connecting to the
+        // global server list here would let one agent's servers surface in a
+        // co-resident agent that was never granted them.
+        let agent_mcp_servers = if config.mcp.enabled {
+            config.mcp_servers_for_agent(agent_alias)
+        } else {
+            Vec::new()
+        };
+        if !agent_mcp_servers.is_empty() {
+            use ::zeroclaw_log::Instrument;
+            let mcp_model_provider = agent.model_provider.as_str().to_string();
+            let mcp_model = config
+                .model_provider_for_agent(agent_alias)
+                .and_then(|p| p.model.clone())
+                .unwrap_or_default();
+            let attribution_span = ::zeroclaw_log::attribution_span!(
+                &zeroclaw_runtime::agent::AgentAttribution(agent_alias)
             );
-            match zeroclaw_runtime::tools::McpRegistry::connect_all(&config.mcp.servers).await {
-                Ok(registry) => {
-                    let registry = std::sync::Arc::new(registry);
-                    ch_mcp_elevation_arcs =
-                        zeroclaw_runtime::tools::collect_mcp_elevation_arcs(&registry).await;
-                    if config.mcp.deferred_loading {
-                        let deferred_set =
-                            zeroclaw_runtime::tools::DeferredMcpToolSet::from_registry(
-                                std::sync::Arc::clone(&registry),
-                            )
-                            .await;
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({"agent": agent_alias})),
-                            &format!(
-                                "MCP deferred: {} tool stub(s) from {} server(s)",
-                                deferred_set.len(),
-                                registry.server_count()
-                            )
-                        );
-                        deferred_section =
-                            zeroclaw_runtime::tools::build_deferred_tools_section(&deferred_set);
-                        let activated = std::sync::Arc::new(std::sync::Mutex::new(
-                            zeroclaw_runtime::tools::ActivatedToolSet::new(),
-                        ));
-                        ch_activated_handle = Some(std::sync::Arc::clone(&activated));
-                        built_tools.push(Box::new(zeroclaw_runtime::tools::ToolSearchTool::new(
-                            deferred_set,
-                            activated,
-                        )));
-                    } else {
-                        let names = registry.tool_names();
-                        let mut registered = 0usize;
-                        for name in names {
-                            if let Some(def) = registry.get_tool_def(&name).await {
-                                let wrapper: std::sync::Arc<dyn Tool> = std::sync::Arc::new(
-                                    zeroclaw_runtime::tools::McpToolWrapper::new(
-                                        name,
-                                        def,
+            ::zeroclaw_log::scope!(
+                model_provider: mcp_model_provider,
+                model: mcp_model,
+                =>
+                async {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        &format!(
+                            "Initializing MCP client - {} server(s) granted via mcp_bundles",
+                            agent_mcp_servers.len()
+                        )
+                    );
+                    match zeroclaw_runtime::tools::McpRegistry::connect_all(&agent_mcp_servers).await {
+                        Ok(registry) => {
+                            let registry = std::sync::Arc::new(registry);
+                            ch_mcp_elevation_arcs =
+                                zeroclaw_runtime::tools::collect_mcp_elevation_arcs(&registry).await;
+                            let mcp_policy = mcp_tool_access_policy(security.as_ref(), None);
+                            if config.mcp.deferred_loading {
+                                let deferred_set =
+                                    zeroclaw_runtime::tools::DeferredMcpToolSet::from_registry(
                                         std::sync::Arc::clone(&registry),
+                                    )
+                                    .await;
+                                ::zeroclaw_log::record!(
+                                    INFO,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
                                     ),
+                                    &format!(
+                                        "MCP deferred: {} tool stub(s) from {} server(s)",
+                                        deferred_set.len(),
+                                        registry.server_count()
+                                    )
                                 );
-                                if let Some(ref handle) = delegate_handle_ch {
-                                    handle.write().push(std::sync::Arc::clone(&wrapper));
+                                deferred_section =
+                                    zeroclaw_runtime::tools::build_deferred_tools_section_filtered(
+                                        &deferred_set,
+                                        mcp_policy.as_ref(),
+                                    );
+                                let activated = std::sync::Arc::new(std::sync::Mutex::new(
+                                    zeroclaw_runtime::tools::ActivatedToolSet::new(),
+                                ));
+                                ch_activated_handle = Some(std::sync::Arc::clone(&activated));
+                                let mut tool_search =
+                                    zeroclaw_runtime::tools::ToolSearchTool::new(
+                                        deferred_set,
+                                        activated,
+                                    );
+                                if let Some(policy) = mcp_policy {
+                                    tool_search = tool_search.with_access_policy(policy);
                                 }
-                                built_tools
-                                    .push(Box::new(zeroclaw_runtime::tools::ArcToolRef(wrapper)));
-                                registered += 1;
+                                built_tools.push(Box::new(tool_search));
+                            } else {
+                                let names = registry.tool_names();
+                                let mut registered = 0usize;
+                                let mut skipped = 0usize;
+                                for name in names {
+                                    if !eager_mcp_tool_allowed(&name, mcp_policy.as_ref()) {
+                                        skipped += 1;
+                                        continue;
+                                    }
+                                    if let Some(def) = registry.get_tool_def(&name).await {
+                                        let wrapper: std::sync::Arc<dyn Tool> = std::sync::Arc::new(
+                                            zeroclaw_runtime::tools::McpToolWrapper::new(
+                                                name,
+                                                def,
+                                                std::sync::Arc::clone(&registry),
+                                            ),
+                                        );
+                                        if register_eager_mcp_tool_if_allowed(
+                                            wrapper,
+                                            &mut built_tools,
+                                            delegate_handle_ch.as_ref(),
+                                            mcp_policy.as_ref(),
+                                        ) {
+                                            registered += 1;
+                                        }
+                                    }
+                                }
+                                ::zeroclaw_log::record!(
+                                    INFO,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_attrs(::serde_json::json!({
+                                        "skipped": skipped,
+                                    })),
+                                    &format!(
+                                        "MCP: {} tool(s) registered from {} server(s)",
+                                        registered,
+                                        registry.server_count()
+                                    )
+                                );
                             }
                         }
-                        ::zeroclaw_log::record!(
-                            INFO,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_attrs(::serde_json::json!({"agent": agent_alias})),
-                            &format!(
-                                "MCP: {} tool(s) registered from {} server(s)",
-                                registered,
-                                registry.server_count()
-                            )
-                        );
+                        Err(e) => {
+                            ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "MCP registry failed to initialize");
+                        }
                     }
                 }
-                Err(e) => {
-                    ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"agent_alias": agent_alias, "error": format!("{}", e)})), "MCP registry failed to initialize");
-                }
-            }
+            )
+            .instrument(attribution_span)
+            .await;
         }
 
         // Skill tools share the workspace-loaded `skills` Vec but each
@@ -9187,25 +9482,42 @@ pub async fn start_channels(
                 collect_configured_channels(&config_arc, "runtime startup", &tool_specs);
 
             #[cfg(feature = "channel-nostr")]
-            if let Some((alias, ns)) = config.channels.nostr.iter().next() {
-                let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-                    let cfg_arc = config_arc.clone();
-                    let alias = alias.clone();
-                    Arc::new(move || cfg_arc.read().channel_external_peers("nostr", &alias))
-                };
-                configured_channels.push(ConfiguredChannel {
-                    display_name: "Nostr",
-                    alias: Some(alias.clone()),
-                    channel: Arc::new(
-                        NostrChannel::new(
-                            &ns.private_key,
-                            ns.relays.clone(),
-                            alias.clone(),
-                            peer_resolver,
-                        )
-                        .await?,
-                    ),
-                });
+            {
+                // Share the same gate as the Discord/shared-collector path
+                // and as `doctor_channels` so the #8013 invariant
+                // ("a disabled agent must not bring its bound channel
+                // online") is enforced uniformly — see
+                // `ActiveChannelAliases::compute` for details. The
+                // previous `config.channels.nostr.iter().next()` started
+                // the FIRST Nostr block regardless of agent binding
+                // state, which was a literal copy of the #8013 bug.
+                let active = ActiveChannelAliases::compute(&config);
+                // Materialize the work list into owned values BEFORE any
+                // `.await` so we don't hold any lock across the async
+                // constructor (parking_lot guards are not Send). Mirrors
+                // the same pattern in `doctor_channels`.
+                let nostr_jobs: Vec<(String, String, Vec<String>)> = config
+                    .channels
+                    .nostr
+                    .iter()
+                    .filter(|(alias, _)| active.contains(&format!("nostr.{alias}")))
+                    .filter(|(_, ns)| ns.enabled)
+                    .map(|(alias, ns)| (alias.clone(), ns.private_key.clone(), ns.relays.clone()))
+                    .collect();
+                for (alias, private_key, relays) in nostr_jobs {
+                    let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                        let cfg_arc = config_arc.clone();
+                        let alias = alias.clone();
+                        Arc::new(move || cfg_arc.read().channel_external_peers("nostr", &alias))
+                    };
+                    configured_channels.push(ConfiguredChannel {
+                        display_name: "Nostr",
+                        alias: Some(alias.clone()),
+                        channel: Arc::new(
+                            NostrChannel::new(&private_key, relays, alias, peer_resolver).await?,
+                        ),
+                    });
+                }
             }
             #[cfg(not(feature = "channel-nostr"))]
             if !config.channels.nostr.is_empty() {
@@ -9863,8 +10175,16 @@ pub async fn deliver_announcement(
             let peers = config.channel_external_peers("whatsapp", alias);
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
-            let ch = WhatsAppWebChannel::new(wa, alias.to_string(), peer_resolver)
-                .with_workspace_dir(config.channel_workspace_dir(&format!("whatsapp.{alias}")));
+            let allowed_groups = wa.allowed_groups.clone();
+            let allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+                Arc::new(move || allowed_groups.clone());
+            let ch = WhatsAppWebChannel::new(
+                wa,
+                alias.to_string(),
+                peer_resolver,
+                allowed_groups_resolver,
+            )
+            .with_workspace_dir(config.channel_workspace_dir(&format!("whatsapp.{alias}")));
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(not(feature = "whatsapp-web"))]
@@ -12759,6 +13079,83 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             names.contains(&"file_read"),
             "allowlisted tool must survive the filter; got {names:?}"
+        );
+    }
+
+    /// `start_channels` must apply the agent's risk-profile `excluded_tools`
+    /// denylist to MCP tools at registration, at parity with the runtime eager
+    /// path. Before this fix the channel path pushed every MCP tool into every
+    /// agent's registry unconditionally, so one agent's MCP server tools leaked
+    /// into a co-resident agent whose `excluded_tools` denied them (the Discord
+    /// tool leak). A non-denied `<server>__<tool>` name is still auto-admitted,
+    /// so a server the agent does want is not silently dropped.
+    #[test]
+    fn channel_path_excluded_tools_drops_denied_mcp_tool() {
+        use zeroclaw_runtime::agent::loop_::{
+            mcp_tool_access_policy, register_eager_mcp_tool_if_allowed,
+        };
+        let policy = SecurityPolicy {
+            excluded_tools: Some(vec!["aa_mcp__find_items".to_string()]),
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        };
+        let mcp_policy = mcp_tool_access_policy(&policy, None);
+        let mut built_tools: Vec<Box<dyn Tool>> = Vec::new();
+        let denied: Arc<dyn Tool> = Arc::new(NamedMockTool("aa_mcp__find_items"));
+        let allowed: Arc<dyn Tool> = Arc::new(NamedMockTool("aa_mcp__find_npcs"));
+        let registered_denied =
+            register_eager_mcp_tool_if_allowed(denied, &mut built_tools, None, mcp_policy.as_ref());
+        let registered_allowed = register_eager_mcp_tool_if_allowed(
+            allowed,
+            &mut built_tools,
+            None,
+            mcp_policy.as_ref(),
+        );
+        assert!(
+            !registered_denied,
+            "an `excluded_tools`-denied MCP tool must not be registered on the channel path"
+        );
+        assert!(
+            registered_allowed,
+            "a non-denied MCP tool must still be registered (allowlist auto-admit)"
+        );
+        let names: Vec<&str> = built_tools.iter().map(|t| t.name()).collect();
+        assert!(
+            !names.contains(&"aa_mcp__find_items"),
+            "denied MCP tool leaked into the channel registry; got {names:?}"
+        );
+        assert!(
+            names.contains(&"aa_mcp__find_npcs"),
+            "allowed MCP tool missing from the channel registry; got {names:?}"
+        );
+    }
+
+    /// Companion to the MCP denylist test, pinning the built-in side: the same
+    /// channel-path gate must drop a built-in named in the agent's
+    /// `excluded_tools` (e.g. a `readonly` profile denying `shell`). Built-ins
+    /// always went through `apply_policy_tool_filter`; this guards that the MCP
+    /// gate fix did not regress the built-in denylist, and that `shell` is not
+    /// leaked into a co-resident agent that excluded it.
+    #[test]
+    fn channel_path_excluded_tools_drops_denied_builtin() {
+        let mut built_tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(NamedMockTool("shell")),
+            Box::new(NamedMockTool("file_read")),
+        ];
+        let policy = SecurityPolicy {
+            excluded_tools: Some(vec!["shell".to_string()]),
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        };
+        apply_policy_tool_filter(&mut built_tools, Some(&policy), None);
+        let names: Vec<&str> = built_tools.iter().map(|t| t.name()).collect();
+        assert!(
+            !names.contains(&"shell"),
+            "an `excluded_tools`-denied built-in must be dropped on the channel path; got {names:?}"
+        );
+        assert!(
+            names.contains(&"file_read"),
+            "a non-excluded built-in must survive the filter; got {names:?}"
         );
     }
 
@@ -18434,6 +18831,303 @@ This is an example JSON object for profile settings."#;
                 .iter()
                 .any(|entry| entry.display_name == "Mattermost"),
             "enabled channels should still load when no enabled agent declares channel bindings"
+        );
+    }
+
+    // ----------------------------------------------------------
+    // Pinned regression for issue #8013: disabling an agent must
+    // stop its bound Discord channel from staying online. The
+    // legacy fallback in `ActiveChannelAliases::contains` used to
+    // collapse "no bindings anywhere" with "all explicit owners are
+    // disabled" — these tests pin both states.
+    // ----------------------------------------------------------
+
+    #[cfg(feature = "channel-discord")]
+    #[test]
+    fn collect_configured_channels_skips_channel_when_only_owner_is_disabled() {
+        // T1 — the bug path: an explicit binding exists, but the
+        // owner agent is `enabled = false`. Legacy fallback must NOT
+        // bring the channel online.
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "disco".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: false,
+                channels: vec!["discord.default".into()],
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "test-token".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[]);
+
+        assert!(
+            !channels.iter().any(|entry| entry.display_name == "Discord"),
+            "disabled-owner channel must not be collected (#8013)"
+        );
+    }
+
+    #[cfg(feature = "channel-discord")]
+    #[test]
+    fn collect_configured_channels_legacy_accepts_all_when_no_bindings_declared() {
+        // T2 — the legacy fallback: an enabled agent with no `channels`
+        // list (empty bindings). All enabled channels still load. Pins
+        // the same contract as
+        // `collect_configured_channels_falls_back_when_agent_bindings_missing`
+        // but mirrors it onto Discord so the surface stays obvious.
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "legacy".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![],
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "test-token".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[]);
+
+        assert!(
+            channels.iter().any(|entry| entry.display_name == "Discord"),
+            "no-bindings-anywhere must still trigger the legacy fallback"
+        );
+    }
+
+    #[cfg(feature = "channel-discord")]
+    #[test]
+    fn collect_configured_channels_respects_mixed_enabled_and_disabled_owners() {
+        // T3 — two bound channels, one owner enabled (keeper) and one
+        // owner disabled (loser). Only the enabled owner's channel
+        // comes online.
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "keeper".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["discord.a".into()],
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "loser".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: false,
+                channels: vec!["discord.b".into()],
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "a".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "token-a".to_string(),
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "b".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "token-b".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[]);
+
+        let discord_channels: Vec<_> = channels
+            .iter()
+            .filter(|entry| entry.display_name == "Discord")
+            .collect();
+        assert_eq!(
+            discord_channels.len(),
+            1,
+            "exactly one Discord channel should be active when only one owner is enabled"
+        );
+        assert_eq!(
+            discord_channels[0].alias.as_deref(),
+            Some("a"),
+            "only the enabled owner's channel should be active"
+        );
+    }
+
+    #[test]
+    fn build_owner_by_channel_key_skips_disabled_owners() {
+        // T4 — reload contract: when an admin flips an agent to
+        // `enabled = false` and the daemon re-runs `start_channels`,
+        // the resulting owner map must NOT bind the now-disabled
+        // owner's channel to any agent (legacy fallback must not fire
+        // because at least one binding exists in the config). Pairs
+        // with `build_owner_by_channel_key_legacy_fallback_is_deterministic_without_default`
+        // to pin both branches of the discriminator.
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "loser".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: false,
+                channels: vec!["discord.b".into()],
+                ..Default::default()
+            },
+        );
+
+        // Reload passes an empty enabled_agents slice because the only
+        // owner is disabled.
+        let owners = build_owner_by_channel_key(&config, &[], &["discord.b".to_string()]);
+
+        assert!(
+            owners.is_empty(),
+            "disabled-owner channels must not be rebound to any fallback agent (#8013)"
+        );
+    }
+
+    // ----------------------------------------------------------
+    // #8013 — Nostr startup / health-check gate
+    //
+    // The Nostr blocks in `doctor_channels` and `start_channels` were
+    // originally outside the `collect_configured_channels` gate. After
+    // the Phase 2 follow-up (Audacity88 review, 2026-06-21), both Nostr
+    // blocks now share `ActiveChannelAliases::compute` as their single
+    // source of truth. These tests pin that gate directly so the
+    // invariant cannot regress.
+    // ----------------------------------------------------------
+
+    /// Helper: returns the set of `nostr.<alias>` references that pass
+    /// the unified `ActiveChannelAliases` gate AND the channel-level
+    /// `enabled = true` check, in the same way `doctor_channels` and
+    /// `start_channels` use it after Phase 2.
+    #[cfg(feature = "channel-nostr")]
+    fn resolve_nostr_active(config: &Config) -> Vec<String> {
+        let active = ActiveChannelAliases::compute(config);
+        config
+            .channels
+            .nostr
+            .iter()
+            .filter(|(alias, _)| active.contains(&format!("nostr.{alias}")))
+            .filter(|(_, ns)| ns.enabled)
+            .map(|(alias, _)| format!("nostr.{alias}"))
+            .collect()
+    }
+
+    #[cfg(feature = "channel-nostr")]
+    #[test]
+    fn doctor_channels_skips_nostr_when_only_owner_is_disabled() {
+        // T5 — the #8013 bug path on the Nostr side. An explicit
+        // `nostr.default` binding exists, but the owner agent is
+        // `enabled = false`. Both the doctor and startup Nostr blocks
+        // must NOT bring this channel online.
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "disabled_owner".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: false,
+                channels: vec!["nostr.default".into()],
+                ..Default::default()
+            },
+        );
+        config.channels.nostr.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::NostrConfig {
+                enabled: true,
+                private_key: "nsec1test".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let active = resolve_nostr_active(&config);
+        assert!(
+            active.is_empty(),
+            "Nostr channel with only a disabled owner must not pass the gate (#8013): got {:?}",
+            active
+        );
+    }
+
+    #[cfg(feature = "channel-nostr")]
+    #[test]
+    fn start_channels_legacy_includes_nostr_when_no_bindings_declared() {
+        // T6 — the legacy fallback on the Nostr side. No agent declares
+        // any channel binding, so the `all_known_bindings.is_empty()`
+        // branch fires and every enabled Nostr alias is accepted. This
+        // pins parity with the Discord T2 behavior.
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "legacy".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![],
+                ..Default::default()
+            },
+        );
+        config.channels.nostr.insert(
+            "legacy_alias".to_string(),
+            zeroclaw_config::schema::NostrConfig {
+                enabled: true,
+                private_key: "nsec1test".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let active = resolve_nostr_active(&config);
+        assert_eq!(
+            active,
+            vec!["nostr.legacy_alias".to_string()],
+            "Legacy fallback must keep Nostr active when no agent declares bindings"
+        );
+    }
+
+    #[cfg(feature = "channel-nostr")]
+    #[test]
+    fn start_channels_nostr_skips_channel_level_disabled() {
+        // T7 — channel-level `enabled = false` still skips even when
+        // the agent binding path is satisfied. Pins the channel-level
+        // half of the gate that was previously missing in the
+        // `start_channels` Nostr block.
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "owner".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["nostr.muted".into()],
+                ..Default::default()
+            },
+        );
+        config.channels.nostr.insert(
+            "muted".to_string(),
+            zeroclaw_config::schema::NostrConfig {
+                enabled: false, // channel-level off
+                private_key: "nsec1test".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let active = resolve_nostr_active(&config);
+        assert!(
+            active.is_empty(),
+            "Nostr channel with `enabled = false` must not start regardless of agent binding"
         );
     }
 

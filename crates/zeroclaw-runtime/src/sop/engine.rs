@@ -988,16 +988,17 @@ fn format_step_context(sop: &Sop, run: &SopRun, step: &SopStep) -> String {
         sop.name, run.run_id, step.number, run.total_steps
     );
 
-    let _ = writeln!(
-        ctx,
-        "Trigger: {} {}",
+    // Untrusted trigger metadata (topic + payload) can carry injected
+    // instructions, so it is capped, sanitized, and framed before it ever
+    // reaches the model, never raw (audit finding E). A forged end-marker can't
+    // escape the block because sanitize_untrusted defangs the SOP_UNTRUSTED token;
+    // the marker id (run_id) is provenance/correlation only, NOT a secret.
+    ctx.push_str(&super::payload_safety::frame_trigger(
+        run.trigger_event.payload.as_deref(),
+        run.trigger_event.topic.as_deref(),
         run.trigger_event.source,
-        run.trigger_event.topic.as_deref().unwrap_or("(no topic)")
-    );
-
-    if let Some(ref payload) = run.trigger_event.payload {
-        let _ = writeln!(ctx, "Payload: {payload}");
-    }
+        &run.run_id,
+    ));
 
     // Previous step summary
     if let Some(prev) = run.step_results.last() {
