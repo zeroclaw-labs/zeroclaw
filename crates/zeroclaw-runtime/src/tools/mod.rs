@@ -1395,7 +1395,7 @@ pub fn all_tools_with_runtime(
                         })),
                     "Unrecognized plugins.security.signature_mode; failing safe to strict"
                 );
-                zeroclaw_plugins::host::SignatureMode::Strict
+                zeroclaw_plugins::signature::SignatureMode::Strict
             });
             let trusted_publisher_keys = config.plugins.security.trusted_publisher_keys.clone();
             match zeroclaw_plugins::host::PluginHost::from_plugins_dir_with_security(
