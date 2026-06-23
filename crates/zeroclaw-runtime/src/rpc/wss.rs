@@ -55,10 +55,9 @@ fn is_recoverable_accept_error(e: &std::io::Error) -> bool {
     }
     #[cfg(unix)]
     if let Some(errno) = e.raw_os_error() {
-        // `ENOBUFS` is reported as `ErrorKind::Other` by tokio on Linux
-        // (errno 55) and macOS (errno 105). Inline both values so the
-        // check compiles on every Unix target we support.
-        if matches!(errno, EMFILE | ENFILE | 55 | 105) {
+        // `ENOBUFS` is reported as `ErrorKind::Other` by tokio. Its errno is
+        // target-specific: Darwin/macOS uses 55, Linux/glibc uses 105.
+        if matches!(errno, EMFILE | ENFILE | libc::ENOBUFS) {
             return true;
         }
     }
@@ -340,8 +339,16 @@ mod accept_error_tests {
         // accept() error under memory / socket-skeleton pressure. The
         // listener itself stays valid — the serve loop must back off and
         // keep running, not tear down the daemon.
-        assert!(is_recoverable_accept_error(&Error::from_raw_os_error(55))); // Linux ENOBUFS
-        assert!(is_recoverable_accept_error(&Error::from_raw_os_error(105))); // macOS ENOBUFS
+        #[cfg(target_os = "macos")]
+        {
+            assert!(is_recoverable_accept_error(&Error::from_raw_os_error(55))); // macOS ENOBUFS
+            assert!(!is_recoverable_accept_error(&Error::from_raw_os_error(105))); // macOS EOWNERDEAD
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert!(is_recoverable_accept_error(&Error::from_raw_os_error(105))); // Linux/glibc ENOBUFS
+            assert!(!is_recoverable_accept_error(&Error::from_raw_os_error(55))); // Darwin/macOS ENOBUFS (55) — not recoverable on Linux
+        }
     }
 
     #[test]
