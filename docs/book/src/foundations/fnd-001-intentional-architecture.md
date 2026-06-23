@@ -1,8 +1,8 @@
 # FND-001: Intentional Architecture: ZeroClaw Microkernel Transition
 
-> Starting v0.7.0 · Type: Architecture · Rev. 3
+> Starting v0.7.0 · Type: Architecture · Rev. 4
 >
-> **Canonical reference** · Ratified by the team · Rev. 3
+> **Canonical reference** · Ratified by the team · Rev. 4
 > Discussion thread and full revision history: [#5574](https://github.com/zeroclaw-labs/zeroclaw/issues/5574)
 
 ---

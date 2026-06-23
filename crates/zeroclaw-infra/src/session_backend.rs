@@ -187,6 +187,16 @@ pub trait SessionBackend: Send + Sync {
         Ok(0)
     }
 
+    /// Read-only residue probe for the agent-rename cascade (#7940): the count of
+    /// session-metadata rows [`Self::rename_agent_attribution`] WOULD re-point for
+    /// `agent_alias`, without mutating anything. The gateway uses this to tell a
+    /// genuine post-persist partial failure (attribution still lagging at the old
+    /// alias) apart from an unrelated request, so a resume only fires on real
+    /// residue. No-op default (0) for backends without per-agent metadata.
+    fn count_agent_attribution(&self, _agent_alias: &str) -> std::io::Result<usize> {
+        Ok(0)
+    }
+
     /// Quick existence check used by the gateway to avoid resurrecting a
     /// session that the user just deleted (#7126). The default impl falls
     /// back to `get_session_metadata`; production backends should override

@@ -8,6 +8,10 @@ use super::context::RpcContext;
 use super::transport::RpcTransport;
 use super::turn::{TurnAttribution, TurnOutcome, execute_turn};
 use super::types::*;
+
+const RPC_RELOAD_REPLY_FLUSH_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+const RPC_RELOAD_GATEWAY_SHUTDOWN_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(200);
 use crate::agent::agent::TurnEvent;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -324,6 +328,19 @@ fn model_provider_ref_from_provider_profile_prop(prop: &str) -> Option<String> {
     } else {
         Some(format!("{provider_type}.{provider_alias}"))
     }
+}
+
+/// Whether a TUI session should eagerly initialize the agent's MCP servers when
+/// the agent is built for `session/new`.
+///
+/// ACP (Code) sessions skip MCP initialization so `session/new` returns
+/// promptly: user-configured MCP servers are external processes/services that
+/// can block startup while they connect or time out. Chat sessions initialize
+/// MCP so the Zerocode TUI exposes the same MCP tools — and, under deferred
+/// loading, the `tool_search` built-in — that the gateway already exposes for
+/// the same agent (#8193).
+fn session_should_initialize_mcp(chat_mode: &crate::rpc::types::ChatMode) -> bool {
+    !matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
 }
 
 /// Per-connection dispatcher. Shared state lives in [`RpcContext`].
@@ -721,6 +738,13 @@ impl RpcDispatcher {
         self.handle_session_messages(params).await
     }
 
+    /// Drive a full JSON-RPC request line through the dispatcher from an
+    /// external integration test, including notification emission on the
+    /// outbound channel. Mirrors the transport `process_line` path.
+    pub async fn process_line_for_test(&mut self, line: &str) {
+        self.process_line(line).await;
+    }
+
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
         let req: SessionNewParams = parse_params(params)?;
         let resuming = req.session_id.is_some();
@@ -782,11 +806,15 @@ impl RpcDispatcher {
         // session. A non-ACP caller may still opt in explicitly.
         let exclude_memory = matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
             || req.exclude_memory == Some(true);
+        // Chat sessions initialize MCP so the TUI sees the same MCP tools the
+        // gateway exposes for this agent; ACP (Code) sessions skip it to keep
+        // `session/new` prompt (#8193).
+        let initialize_mcp = session_should_initialize_mcp(&chat_mode);
         let agent = crate::agent::agent::Agent::from_config_with_tui_env(
             &config,
             &req.agent_alias,
             cwd_path,
-            false,
+            initialize_mcp,
             exclude_memory,
             tui_env,
             self.ctx.sop_engine.clone(),
@@ -1181,6 +1209,8 @@ impl RpcDispatcher {
         // session — otherwise session recovery silently restores the
         // long-term-memory backend and tools the ACP invariant forbids.
         let exclude_memory = true;
+        // Reaped sessions always rehydrate as ACP, which skips eager MCP init to
+        // stay prompt — matching `session_should_initialize_mcp(ChatMode::Acp)`.
         let agent = crate::agent::agent::Agent::from_config_with_tui_env(
             &config,
             &data.agent_alias,
@@ -2571,15 +2601,33 @@ impl RpcDispatcher {
     }
 
     fn handle_config_reload(&self) -> RpcResult {
-        let Some(reload_tx) = self.ctx.reload_tx.clone() else {
+        if !self.schedule_daemon_reload("config") {
             return Err(rpc_err(INTERNAL_ERROR, "Reload not available"));
-        };
-        // Delay so the RPC reply flushes before the daemon tears down.
-        zeroclaw_spawn::spawn!(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            let _ = reload_tx.send(true);
-        });
+        }
         to_result(ConfigReloadResult { reloading: true })
+    }
+
+    fn schedule_daemon_reload(&self, surface: &'static str) -> bool {
+        let Some(reload_tx) = self.ctx.reload_tx.clone() else {
+            return false;
+        };
+        let gateway_shutdown_tx = self.ctx.gateway_shutdown_tx.clone();
+        zeroclaw_spawn::spawn!(async move {
+            tokio::time::sleep(RPC_RELOAD_REPLY_FLUSH_DELAY).await;
+            if let Some(gateway_shutdown_tx) = gateway_shutdown_tx {
+                let _ = gateway_shutdown_tx.send(true);
+                tokio::time::sleep(RPC_RELOAD_GATEWAY_SHUTDOWN_DELAY).await;
+            }
+            let _ = reload_tx.send(true);
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({ "surface": surface })),
+                "daemon reload dispatched"
+            );
+        });
+        true
     }
 
     fn handle_config_list(&self, params: &Value) -> RpcResult {
@@ -3160,6 +3208,11 @@ impl RpcDispatcher {
                         .to_string(),
                     is_quickstart: wizard.is_some(),
                     shape: wizard.map(Section::shape),
+                    cost_category: zeroclaw_config::schema::cost_category_for_provider_section(
+                        &key,
+                    )
+                    .unwrap_or_default()
+                    .to_string(),
                     label,
                     key,
                 }
@@ -3462,7 +3515,7 @@ impl RpcDispatcher {
     /// use. Returns `true` when the supervisor was notified, `false`
     /// when no supervisor is attached (e.g. test harness).
     fn signal_daemon_reload(&self) -> bool {
-        let Some(reload_tx) = self.ctx.reload_tx.clone() else {
+        if self.ctx.reload_tx.is_none() {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -3484,22 +3537,7 @@ impl RpcDispatcher {
             ),
             "quickstart: daemon reload signalled"
         );
-        let started = std::time::Instant::now();
-        zeroclaw_spawn::spawn!(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            let _ = reload_tx.send(true);
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                    .with_attrs(::serde_json::json!({
-                        "elapsed_ms": started.elapsed().as_millis() as u64,
-                        "surface": crate::quickstart::Surface::Tui.as_str(),
-                    })),
-                "quickstart: daemon reload dispatched"
-            );
-        });
-        true
+        self.schedule_daemon_reload(crate::quickstart::Surface::Tui.as_str())
     }
 }
 
@@ -3578,6 +3616,16 @@ fn notification_for_turn_event(
             arguments_summary: arguments_summary.clone(),
             timeout_secs: *timeout_secs,
         },
+        TurnEvent::HistoryTrimmed {
+            dropped_messages,
+            kept_turns,
+            reason,
+        } => SessionUpdateEvent::HistoryTrimmed {
+            session_id: session_id.to_string(),
+            dropped_messages: *dropped_messages,
+            kept_turns: *kept_turns,
+            reason: reason.clone(),
+        },
         TurnEvent::Usage {
             input_tokens,
             cached_input_tokens: _,
@@ -3611,6 +3659,216 @@ mod tests {
         serde_json::from_str(s).unwrap()
     }
 
+    #[test]
+    fn session_initializes_mcp_for_chat_but_not_acp() {
+        use crate::rpc::types::ChatMode;
+        // Chat sessions must initialize MCP so the Zerocode TUI sees the same
+        // MCP tools (and the deferred-loading `tool_search`) the gateway
+        // already exposes for the agent (#8193).
+        assert!(
+            session_should_initialize_mcp(&ChatMode::Chat),
+            "Chat sessions must eagerly initialize MCP"
+        );
+        // ACP (Code) sessions intentionally skip eager MCP init to keep
+        // `session/new` prompt.
+        assert!(
+            !session_should_initialize_mcp(&ChatMode::Acp),
+            "ACP sessions must skip eager MCP init"
+        );
+    }
+
+    // ── #8193: behavioral `session/new` MCP coverage ─────────────────────────
+    //
+    // These drive the real `handle_session_new` path against a mock MCP server
+    // (HTTP transport, so the harness stays cross-platform — no stdio scripts)
+    // and assert on the resulting agent's tool list. They guard the call-site
+    // wiring, not just the `session_should_initialize_mcp` seam: reverting the
+    // `session/new` argument back to a hard-coded `false` makes the two Chat
+    // tests fail.
+
+    /// Spin up a wiremock server that speaks the minimum MCP HTTP handshake
+    /// (`initialize` → `notifications/initialized` → `tools/list`) and advertises
+    /// a single tool. The dotted `tool_name` exercises spec-valid names that
+    /// must survive `<server>__<tool>` prefixing (#8193).
+    async fn start_mock_mcp_http_server(tool_name: &str) -> wiremock::MockServer {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Mcp-Session-Id", "sess-1")
+                    .set_body_json(json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "remote", "version": "0.1.0"}
+                        }
+                    })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method": "notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "tools/list"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"tools": [{
+                    "name": tool_name,
+                    "description": "List domains",
+                    "inputSchema": {"type": "object"}
+                }]}
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// `make_acp_test_config` plus an MCP server granted to `test-agent` via an
+    /// `mcp_bundles` grant, pointed at `mock_uri`. `deferred` selects
+    /// deferred-loading (`tool_search`) vs eager registration.
+    fn make_mcp_granting_config(
+        tmp: &tempfile::TempDir,
+        mock_uri: String,
+        deferred: bool,
+    ) -> zeroclaw_config::schema::Config {
+        use zeroclaw_config::schema::{McpBundleConfig, McpServerConfig, McpTransport};
+
+        let mut config = make_acp_test_config(tmp);
+        config.mcp.enabled = true;
+        config.mcp.deferred_loading = deferred;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "remote".into(),
+            transport: McpTransport::Http,
+            url: Some(mock_uri),
+            ..Default::default()
+        }];
+        config.mcp_bundles.insert(
+            "b1".into(),
+            McpBundleConfig {
+                servers: vec!["remote".into()],
+                exclude: vec![],
+            },
+        );
+        config
+            .agents
+            .get_mut("test-agent")
+            .expect("test-agent must exist")
+            .mcp_bundles = vec!["b1".into()];
+        config
+    }
+
+    #[tokio::test]
+    async fn chat_session_new_exposes_tool_search_in_deferred_mcp_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = start_mock_mcp_http_server("domains.list").await;
+        let config = make_mcp_granting_config(&tmp, server.uri(), true);
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "chat",
+            "session_id": "chat-mcp-deferred-001"
+        });
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new should succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("chat-mcp-deferred-001")
+            .await
+            .expect("session must be registered after session/new");
+        let agent = agent_arc.lock().await;
+        let names = agent.tool_names();
+        assert!(
+            names.contains(&"tool_search"),
+            "Chat session with deferred MCP must expose `tool_search`; tools: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_session_new_exposes_prefixed_mcp_tool_in_eager_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = start_mock_mcp_http_server("domains.list").await;
+        let config = make_mcp_granting_config(&tmp, server.uri(), false);
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "chat",
+            "session_id": "chat-mcp-eager-001"
+        });
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new should succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("chat-mcp-eager-001")
+            .await
+            .expect("session must be registered after session/new");
+        let agent = agent_arc.lock().await;
+        let names = agent.tool_names();
+        // Eager mode registers the MCP tool directly; the dotted suffix keeps
+        // its `<server>__<tool>` prefix.
+        assert!(
+            names.contains(&"remote__domains.list"),
+            "Chat session with eager MCP must expose `remote__domains.list`; tools: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_session_new_skips_mcp_tools() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let server = start_mock_mcp_http_server("domains.list").await;
+        // Deferred mode would register `tool_search` for a Chat session; an ACP
+        // session must skip MCP init entirely regardless. ACP `session/new`
+        // requires the persistence dispatcher (it touches the ACP store).
+        let config = make_mcp_granting_config(&tmp, server.uri(), true);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let params = json!({
+            "agent_alias": "test-agent",
+            "chat_mode": "acp",
+            "session_id": "acp-mcp-001"
+        });
+        let result = dispatcher.handle_session_new_for_test(&params).await;
+        assert!(
+            result.is_ok(),
+            "session/new should succeed; got: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("acp-mcp-001")
+            .await
+            .expect("session must be registered after session/new");
+        let agent = agent_arc.lock().await;
+        let names = agent.tool_names();
+        assert!(
+            !names.contains(&"tool_search") && !names.contains(&"remote__domains.list"),
+            "ACP session must skip MCP init (no `tool_search`, no MCP tools); tools: {names:?}"
+        );
+    }
+
     fn make_approval_test_dispatcher() -> RpcDispatcher {
         use zeroclaw_infra::session_queue::SessionActorQueue;
         let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
@@ -3641,6 +3899,130 @@ mod tests {
     fn doctor_run_method_is_registered() {
         assert_eq!(Method::from_wire("doctor/run"), Some(Method::DoctorRun));
         assert_eq!(Method::DoctorRun.wire_name(), "doctor/run");
+    }
+
+    #[tokio::test]
+    async fn config_reload_shuts_down_gateway_before_daemon_reload() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (gateway_shutdown_tx, mut gateway_shutdown_rx) = tokio::sync::watch::channel(false);
+        let (reload_tx, mut reload_rx) = tokio::sync::watch::channel(false);
+        let ctx = RpcContext::minimal_with_reload_controls(
+            zeroclaw_config::schema::Config::default(),
+            sessions,
+            Some(gateway_shutdown_tx),
+            Some(reload_tx),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-reload:pid=1".into());
+
+        let result = dispatcher.handle_config_reload();
+        assert!(
+            result.is_ok(),
+            "config/reload should accept reload-capable contexts"
+        );
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            gateway_shutdown_rx.changed(),
+        )
+        .await
+        .expect("gateway shutdown must be signalled before daemon reload")
+        .expect("gateway shutdown sender should stay alive");
+        assert!(*gateway_shutdown_rx.borrow_and_update());
+        assert!(
+            !*reload_rx.borrow(),
+            "daemon reload must wait until the gateway listener has been asked to shut down"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), reload_rx.changed())
+            .await
+            .expect("daemon reload should follow gateway shutdown")
+            .expect("reload sender should stay alive");
+        assert!(*reload_rx.borrow_and_update());
+    }
+
+    #[tokio::test]
+    async fn quickstart_apply_shuts_down_gateway_before_daemon_reload() {
+        use zeroclaw_config::presets::{
+            AgentIdentity, BuilderSubmission, MemoryChoice, ModelProviderChoice, SelectorChoice,
+        };
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (gateway_shutdown_tx, mut gateway_shutdown_rx) = tokio::sync::watch::channel(false);
+        let (reload_tx, mut reload_rx) = tokio::sync::watch::channel(false);
+        let ctx = RpcContext::minimal_with_reload_controls(
+            config,
+            sessions,
+            Some(gateway_shutdown_tx),
+            Some(reload_tx),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-quickstart-reload:pid=1".into());
+
+        let submission = BuilderSubmission {
+            model_provider: SelectorChoice::Fresh(ModelProviderChoice {
+                provider_type: "anthropic".into(),
+                alias: "anthropic".into(),
+                model: "claude-sonnet-4-5".into(),
+                fields: std::collections::HashMap::from([(
+                    "api_key".to_string(),
+                    "sk-test".to_string(),
+                )]),
+            }),
+            risk_profile: SelectorChoice::Fresh("balanced".into()),
+            runtime_profile: SelectorChoice::Fresh("balanced".into()),
+            memory: SelectorChoice::Fresh(MemoryChoice::Sqlite),
+            channels: vec![],
+            peer_groups: vec![],
+            agent: AgentIdentity {
+                name: "quickstart_bot".into(),
+                system_prompt: "You are helpful.".into(),
+                personality_file: None,
+                personality_files: vec![],
+            },
+        };
+
+        let result = dispatcher
+            .handle_quickstart_apply(&json!({ "submission": submission }))
+            .await
+            .expect("quickstart/apply should accept reload-capable contexts");
+        assert_eq!(
+            result["kind"], "applied",
+            "quickstart/apply result: {result:#?}"
+        );
+        assert_eq!(result["daemon_restarted"], true);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            gateway_shutdown_rx.changed(),
+        )
+        .await
+        .expect("quickstart/apply must signal gateway shutdown before daemon reload")
+        .expect("gateway shutdown sender should stay alive");
+        assert!(*gateway_shutdown_rx.borrow_and_update());
+        assert!(
+            !*reload_rx.borrow(),
+            "quickstart/apply daemon reload must wait until the gateway listener has been asked to shut down"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), reload_rx.changed())
+            .await
+            .expect("quickstart/apply daemon reload should follow gateway shutdown")
+            .expect("reload sender should stay alive");
+        assert!(*reload_rx.borrow_and_update());
     }
 
     #[test]
@@ -3817,6 +4199,23 @@ mod tests {
         assert_eq!(v["params"]["request_id"], "ar_1");
         assert_eq!(v["params"]["tool_name"], "bash");
         assert_eq!(v["params"]["timeout_secs"], 30);
+    }
+
+    #[test]
+    fn history_trimmed_notification() {
+        let event = TurnEvent::HistoryTrimmed {
+            dropped_messages: 12,
+            kept_turns: 1,
+            reason: "context token budget exceeded".into(),
+        };
+        let json = notification_for_turn_event("s1", &event, None).unwrap();
+        let v = parse(&json);
+        assert_eq!(v["method"], "session/update");
+        assert_eq!(v["params"]["type"], "history_trimmed");
+        assert_eq!(v["params"]["session_id"], "s1");
+        assert_eq!(v["params"]["dropped_messages"], 12);
+        assert_eq!(v["params"]["kept_turns"], 1);
+        assert_eq!(v["params"]["reason"], "context token budget exceeded");
     }
 
     #[test]
@@ -4222,6 +4621,7 @@ mod tests {
                     ConversationMessage::ToolResults(vec![ToolResultMessage {
                         tool_call_id: "tc-1".into(),
                         content: "log contents".into(),
+                        tool_name: String::new(),
                     }]),
                     ConversationMessage::AssistantToolCalls {
                         text: None,
@@ -4236,6 +4636,7 @@ mod tests {
                     ConversationMessage::ToolResults(vec![ToolResultMessage {
                         tool_call_id: "tc-2".into(),
                         content: "no errors".into(),
+                        tool_name: String::new(),
                     }]),
                     ConversationMessage::Chat(ChatMessage {
                         role: "assistant".into(),
