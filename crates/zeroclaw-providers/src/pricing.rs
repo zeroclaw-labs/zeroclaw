@@ -97,10 +97,11 @@ pub(crate) fn normalize_pricing(pricing: &ModelPricing) -> ModelRates {
     }
 }
 
-/// Snapshot layout: provider composite `"<type>.<alias>"` (the ref the cost
-/// path uses) → gateway-reported model id → USD-per-1M-token rates. Nested
-/// `&str`-probeable maps so the per-call cost path looks up without
-/// allocating.
+/// Snapshot layout: provider family `"<type>"` (the bare name the cost path
+/// resolves to, matching `provider_pricing`) → gateway-reported model id →
+/// USD-per-1M-token rates. A family's opted-in aliases collapse into one map
+/// keyed by model id. Nested `&str`-probeable maps so the per-call cost path
+/// looks up without allocating.
 pub type PriceSnapshot = HashMap<String, HashMap<String, ModelRates>>;
 
 /// How often the background task re-fetches prices.
@@ -139,17 +140,26 @@ pub fn model_id_candidates(model_id: &str) -> impl Iterator<Item = &str> {
     std::iter::once(model_id).chain(model_id.rsplit_once('/').map(|(_, suffix)| suffix))
 }
 
-/// Pure lookup of one `(provider_composite, model_id)` against a snapshot.
-/// The provider ref must be the composite `"<type>.<alias>"` form the snapshot
-/// is keyed by; the model id is probed through [`model_id_candidates`].
+/// Pure lookup of one `(provider_ref, model_id)` against a snapshot. The
+/// snapshot is keyed by provider family (`"<type>"`); `provider_ref` is
+/// resolved the same way the config-rate path resolves it (`provider_pricing`):
+/// tried verbatim first, then by the bare family when it arrives as
+/// `"<type>.<alias>"`. The model id is probed through [`model_id_candidates`].
 #[must_use]
 pub fn lookup<'a>(
     snapshot: &'a PriceSnapshot,
-    provider_composite: &str,
+    provider_ref: &str,
     model_id: &str,
 ) -> Option<&'a ModelRates> {
-    let models = snapshot.get(provider_composite)?;
-    model_id_candidates(model_id).find_map(|id| models.get(id))
+    let probe = |key: &str| -> Option<&'a ModelRates> {
+        let models = snapshot.get(key)?;
+        model_id_candidates(model_id).find_map(|id| models.get(id))
+    };
+    probe(provider_ref).or_else(|| {
+        provider_ref
+            .split_once('.')
+            .and_then(|(family, _alias)| probe(family))
+    })
 }
 
 /// Replace the global snapshot. The refresher is the only production writer.
@@ -226,10 +236,16 @@ pub fn spawn_refresher(config: Arc<RwLock<Config>>) {
     });
 }
 
-/// One model whose price we want filled: the `"<type>.<alias>"` ref the cost
-/// path looks up by, the gateway's model id to match, and the models.dev
-/// provider key to fall back to when the gateway carries no price for it.
+/// One model whose price we want filled: the provider family (`<type>`) the
+/// cost path looks up by, the gateway's model id to match, the `<type>.<alias>`
+/// ref used only to build the provider handle, and the models.dev provider key
+/// to fall back to when the gateway carries no price for it.
 struct WantedModel {
+    /// Provider family (`<type>`, e.g. `kilo`). The snapshot is keyed by this,
+    /// matching the bare family name `provider_pricing` resolves to; the model
+    /// id disambiguates the family's opted-in aliases.
+    provider_key: String,
+    /// `<type>.<alias>` ref, used only to build the provider handle/options.
     composite: String,
     model_id: String,
     models_dev_key: Option<String>,
@@ -283,6 +299,7 @@ fn enabled_pricing_groups(config: &zeroclaw_config::schema::Config) -> Vec<Gatew
             .map_or_else(|| format!("type:{ty}"), str::to_string);
 
         let wanted = WantedModel {
+            provider_key: ty.to_string(),
             composite,
             model_id: model_id.to_string(),
             // models.dev provider key for this family, for the fallback path.
@@ -385,7 +402,7 @@ fn assemble_snapshot(
                     .and_then(|md_catalog| match_pricing(md_catalog, &want.model_id))
             });
             if let Some(rates) = rates {
-                out.entry(want.composite.clone())
+                out.entry(want.provider_key.clone())
                     .or_default()
                     .insert(want.model_id.clone(), *rates);
             }
@@ -484,9 +501,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lookup_matches_composite_and_model_with_suffix_probe() {
+    fn lookup_keyed_by_family_with_bare_type_fallback() {
         let mut snap = PriceSnapshot::new();
-        snap.entry("opencode.zen".to_string()).or_default().insert(
+        // Keyed by provider family `<type>`, NOT the `<type>.<alias>` composite:
+        // this is the bare name the cost path resolves to (see `provider_pricing`).
+        snap.entry("opencode".to_string()).or_default().insert(
             "minimax-m2.5".to_string(),
             ModelRates {
                 input_per_mtok: Some(0.3),
@@ -494,12 +513,15 @@ mod tests {
                 cached_input_per_mtok: Some(0.06),
             },
         );
-        let hit = lookup(&snap, "opencode.zen", "minimax-m2.5").expect("hit");
+        // The cost path passes the bare family: direct hit.
+        let hit = lookup(&snap, "opencode", "minimax-m2.5").expect("family hit");
         assert_eq!(hit.input_per_mtok, Some(0.3));
+        // A `<type>.<alias>` ref falls back to the bare family (provider_pricing parity).
+        assert!(lookup(&snap, "opencode.zen", "minimax-m2.5").is_some());
         // A recorded `vendor/slug` id degrades to the stored slug.
-        assert!(lookup(&snap, "opencode.zen", "minimax/minimax-m2.5").is_some());
-        assert!(lookup(&snap, "opencode.zen", "other-model").is_none());
-        assert!(lookup(&snap, "other.alias", "minimax-m2.5").is_none());
+        assert!(lookup(&snap, "opencode", "minimax/minimax-m2.5").is_some());
+        assert!(lookup(&snap, "opencode", "other-model").is_none());
+        assert!(lookup(&snap, "other", "minimax-m2.5").is_none());
     }
 
     #[test]
@@ -550,6 +572,9 @@ mod tests {
 
     fn want(composite: &str, model: &str, md_key: Option<&str>) -> WantedModel {
         WantedModel {
+            // Family is the part before the first `.` — the snapshot key, just
+            // as `enabled_pricing_groups` derives it from `<type>.<alias>`.
+            provider_key: composite.split('.').next().unwrap_or(composite).to_string(),
             composite: composite.to_string(),
             model_id: model.to_string(),
             models_dev_key: md_key.map(str::to_string),
@@ -587,14 +612,17 @@ mod tests {
 
         let snap = assemble_snapshot(&gateway_results, &models_dev);
 
+        // The family's opted-in aliases collapse under one `<type>` key, keyed
+        // by model id (kilo.a/b/c all live under "kilo").
         // Gateway price wins over models.dev for the shared model.
-        assert_eq!(snap["kilo.a"]["minimax/m2.7"].input_per_mtok, Some(0.3));
+        assert_eq!(snap["kilo"]["minimax/m2.7"].input_per_mtok, Some(0.3));
         // models.dev fills a model the gateway didn't price.
-        assert_eq!(snap["kilo.b"]["only-on-mdev"].input_per_mtok, Some(0.5));
+        assert_eq!(snap["kilo"]["only-on-mdev"].input_per_mtok, Some(0.5));
         // Suffix match against the gateway catalog.
-        assert_eq!(snap["kilo.c"]["vendor/slug"].input_per_mtok, Some(0.7));
-        // Neither source, and the no-key case — both absent (left at $0).
-        assert!(!snap.contains_key("kilo.d"));
-        assert!(!snap.contains_key("x.e"));
+        assert_eq!(snap["kilo"]["vendor/slug"].input_per_mtok, Some(0.7));
+        // Neither source: the model is absent from the family map (left at $0).
+        assert!(!snap["kilo"].contains_key("nowhere"));
+        // The no-key case priced nothing, so its family never appears.
+        assert!(!snap.contains_key("x"));
     }
 }

@@ -238,9 +238,10 @@ fn resolve_rates_opt(pricing: &HashMap<String, f64>, model: &str) -> ModelRates 
 }
 
 /// Live-price fallback for one `(model_provider_name, model)`. Reads the
-/// process-global price snapshot (non-blocking, never fetches). The snapshot
-/// is keyed by the composite `<type>.<alias>` ref this path already receives;
-/// model-id candidate forms are probed inside `pricing::lookup`. `None` when
+/// process-global price snapshot (non-blocking, never fetches). The snapshot is
+/// keyed by provider family (`<type>`); `pricing::lookup` resolves the
+/// `model_provider_name` this path receives (bare family, or `<type>.<alias>`
+/// via a bare-family fallback) and probes model-id candidate forms. `None` when
 /// live pricing is disabled (empty snapshot) or unmatched.
 fn live_pricing_for(model_provider_name: &str, model: &str) -> Option<ModelRates> {
     let snapshot = zeroclaw_providers::pricing::current_snapshot();
